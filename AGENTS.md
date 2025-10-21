@@ -851,6 +851,10 @@ so that if we get an unexpected result value, we immediately see the value.
 
 #### Type modeling examples
 
+**Principle**: Choose the type representation that most accurately models the
+domain. Don't blindly apply patterns - think carefully about whether structs,
+enums, newtypes, or other constructs best represent the concept at hand.
+
 ##### Make invalid states unrepresentable:
 
 Instead of using multiple fields that can contradict each other:
