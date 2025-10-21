@@ -253,3 +253,29 @@ implementation. Solutions will be developed in later iterations.
   bot cannot make offsetting offchain trades.
 - **Solver fails:** if the solver fails, again onchain trades won't happen but
   as above this is simply opportunity cost.
+
+---
+
+## **DDD/CQRS/ES Migration Proposal**
+
+### **Background**
+
+The current implementation provides some auditability through `onchain_trades`,
+`schwab_executions`, and `trade_execution_links`. However, these tables are
+mutable and don't form a complete event log:
+
+**Current Limitations:**
+
+- **Mutable state**: Tables can be updated/deleted, losing history of state
+  transitions (e.g., `schwab_executions.status` transitions from PENDING →
+  SUBMITTED → COMPLETED are lost, we only see final state)
+- **Partial audit trail**: Know which trades linked to which executions, but not
+  why batching decisions were made or when thresholds were crossed
+- **Can't rebuild from history**: If `trade_accumulators.net_position` gets
+  corrupted, can't reconstruct it from trades (trades are facts, but the
+  accumulation logic isn't captured)
+- **Schema evolution requires migrations**: Adding new metrics (e.g., PnL
+  tracking, fill quality analysis) requires ALTER TABLE and backfilling
+- **State machine in application code**: Position lifecycle rules (when to
+  execute, how to batch) are scattered across functions - hard to test in
+  isolation
