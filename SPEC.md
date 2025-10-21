@@ -347,7 +347,7 @@ Command → Aggregate.handle() → Validate & Produce Events → Persist Events
 ```sql
 -- Events table: stores all domain events
 CREATE TABLE events (
-    aggregate_type TEXT NOT NULL,      -- 'Position', 'BrokerExecution', etc.
+    aggregate_type TEXT NOT NULL,      -- 'Position', 'OffchainOrder', etc.
     aggregate_id TEXT NOT NULL,        -- Unique identifier for aggregate instance
     sequence BIGINT NOT NULL,          -- Sequence number (starts at 1)
     event_type TEXT NOT NULL,          -- Event name (e.g., 'OnChainTradeRecorded')
@@ -370,3 +370,196 @@ CREATE TABLE snapshots (
     PRIMARY KEY (aggregate_type, aggregate_id)
 );
 ```
+
+##### **View Tables** (Derived Read Models)
+
+Views are materialized projections built from events, optimized for specific
+query patterns. These views use SQLite generated columns to expose JSON fields
+as regular columns, maintaining backward compatibility with existing Grafana
+dashboards and queries.
+
+```sql
+-- Position view: current position state per symbol
+-- Replaces: trade_accumulators table
+CREATE TABLE position_view (
+    view_id TEXT PRIMARY KEY,         -- symbol
+    version BIGINT NOT NULL,          -- Last event sequence applied
+    payload JSON NOT NULL,            -- Current position state
+
+    -- Generated columns for backward compatibility with trade_accumulators
+    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
+    net_position REAL GENERATED ALWAYS AS (json_extract(payload, '$.net_position')) VIRTUAL,
+    accumulated_long REAL GENERATED ALWAYS AS (json_extract(payload, '$.accumulated_long')) VIRTUAL,
+    accumulated_short REAL GENERATED ALWAYS AS (json_extract(payload, '$.accumulated_short')) VIRTUAL,
+    pending_execution_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.pending_execution_id')) VIRTUAL,
+    last_updated TEXT GENERATED ALWAYS AS (json_extract(payload, '$.last_updated')) VIRTUAL
+);
+
+CREATE INDEX idx_position_view_symbol ON position_view(symbol);
+CREATE INDEX idx_position_view_net_position ON position_view(net_position);
+CREATE INDEX idx_position_view_last_updated ON position_view(last_updated);
+
+-- Offchain trade view: all broker trade executions
+-- Replaces: schwab_executions table
+CREATE TABLE offchain_trade_view (
+    view_id TEXT PRIMARY KEY,         -- execution_id
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL,
+
+    -- Generated columns for backward compatibility with schwab_executions
+    id INTEGER GENERATED ALWAYS AS (CAST(json_extract(payload, '$.execution_id') AS INTEGER)) VIRTUAL,
+    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
+    shares INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.shares')) VIRTUAL,
+    direction TEXT GENERATED ALWAYS AS (json_extract(payload, '$.direction')) VIRTUAL,
+    order_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.broker_order_id')) VIRTUAL,
+    price_cents INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.price_cents')) VIRTUAL,
+    status TEXT GENERATED ALWAYS AS (json_extract(payload, '$.status')) VIRTUAL,
+    executed_at TEXT GENERATED ALWAYS AS (json_extract(payload, '$.completed_at')) VIRTUAL
+);
+
+CREATE INDEX idx_offchain_trade_view_symbol ON offchain_trade_view(symbol);
+CREATE INDEX idx_offchain_trade_view_status ON offchain_trade_view(status);
+
+-- OnChain trade view: blockchain trade records
+-- Replaces: onchain_trades table
+CREATE TABLE onchain_trade_view (
+    view_id TEXT PRIMARY KEY,         -- tx_hash:log_index
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL,
+
+    -- Generated columns for backward compatibility with onchain_trades
+    id INTEGER GENERATED ALWAYS AS (CAST(json_extract(payload, '$.id') AS INTEGER)) VIRTUAL,
+    tx_hash TEXT GENERATED ALWAYS AS (json_extract(payload, '$.tx_hash')) VIRTUAL,
+    log_index INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.log_index')) VIRTUAL,
+    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
+    amount REAL GENERATED ALWAYS AS (json_extract(payload, '$.amount')) VIRTUAL,
+    direction TEXT GENERATED ALWAYS AS (json_extract(payload, '$.direction')) VIRTUAL,
+    price_usdc REAL GENERATED ALWAYS AS (json_extract(payload, '$.price_usdc')) VIRTUAL,
+    block_number INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.block_number')) VIRTUAL,
+    block_timestamp TEXT GENERATED ALWAYS AS (json_extract(payload, '$.block_timestamp')) VIRTUAL,
+    gas_used INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.gas_used')) VIRTUAL,
+    pyth_price_value TEXT GENERATED ALWAYS AS (json_extract(payload, '$.pyth_price.value')) VIRTUAL,
+    pyth_price_expo INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.pyth_price.expo')) VIRTUAL,
+    pyth_price_conf TEXT GENERATED ALWAYS AS (json_extract(payload, '$.pyth_price.conf')) VIRTUAL,
+    created_at TEXT GENERATED ALWAYS AS (json_extract(payload, '$.recorded_at')) VIRTUAL
+);
+
+CREATE INDEX idx_onchain_trade_view_symbol ON onchain_trade_view(symbol);
+CREATE INDEX idx_onchain_trade_view_block_number ON onchain_trade_view(block_number);
+CREATE INDEX idx_onchain_trade_view_created_at ON onchain_trade_view(created_at);
+CREATE INDEX idx_onchain_trade_view_direction ON onchain_trade_view(direction);
+
+-- PnL metrics view: profit/loss calculations
+-- Replaces: metrics_pnl table
+CREATE TABLE metrics_pnl_view (
+    view_id TEXT PRIMARY KEY,         -- unique metric id
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL,
+
+    -- Generated columns for backward compatibility with metrics_pnl
+    id INTEGER GENERATED ALWAYS AS (CAST(json_extract(payload, '$.id') AS INTEGER)) VIRTUAL,
+    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.symbol')) VIRTUAL,
+    timestamp TEXT GENERATED ALWAYS AS (json_extract(payload, '$.timestamp')) VIRTUAL,
+    trade_type TEXT GENERATED ALWAYS AS (json_extract(payload, '$.trade_type')) VIRTUAL,
+    trade_id INTEGER GENERATED ALWAYS AS (json_extract(payload, '$.trade_id')) VIRTUAL,
+    trade_direction TEXT GENERATED ALWAYS AS (json_extract(payload, '$.trade_direction')) VIRTUAL,
+    quantity REAL GENERATED ALWAYS AS (json_extract(payload, '$.quantity')) VIRTUAL,
+    price_per_share REAL GENERATED ALWAYS AS (json_extract(payload, '$.price_per_share')) VIRTUAL,
+    realized_pnl REAL GENERATED ALWAYS AS (json_extract(payload, '$.realized_pnl')) VIRTUAL,
+    cumulative_pnl REAL GENERATED ALWAYS AS (json_extract(payload, '$.cumulative_pnl')) VIRTUAL,
+    net_position_after REAL GENERATED ALWAYS AS (json_extract(payload, '$.net_position_after')) VIRTUAL
+);
+
+CREATE INDEX idx_metrics_pnl_view_symbol ON metrics_pnl_view(symbol);
+CREATE INDEX idx_metrics_pnl_view_timestamp ON metrics_pnl_view(timestamp);
+CREATE INDEX idx_metrics_pnl_view_symbol_timestamp ON metrics_pnl_view(symbol, timestamp);
+
+-- Schwab auth view: OAuth token storage for internal bot use only
+-- Replaces: schwab_auth table
+CREATE TABLE schwab_auth_view (
+    view_id TEXT PRIMARY KEY,         -- Always 'schwab' (singleton)
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL             -- Encrypted tokens
+);
+```
+
+**Grafana Dashboard Migration:**
+
+Most existing Grafana queries can migrate with only table name changes:
+
+Consider this hypothetical query:
+
+```sql
+-- Old query (using onchain_trades table)
+SELECT symbol, amount, price_usdc, created_at
+FROM onchain_trades
+WHERE symbol = 'AAPL' AND created_at > datetime('now', '-7 days');
+
+-- New query (using onchain_trade_view table) - only table name changes
+SELECT symbol, amount, price_usdc, created_at
+FROM onchain_trade_view
+WHERE symbol = 'AAPL' AND created_at > datetime('now', '-7 days');
+```
+
+Generated columns are indexed for query performance, ensuring dashboards
+maintain their current performance characteristics.
+
+**Opportunity for Dashboard Simplification:**
+
+The event-sourced architecture allows us to create specialized views that
+pre-compute complex metrics, replacing complex Grafana queries with simple
+SELECTs.
+
+For example, a dashboard showing buy and sell prices from both onchain and
+offchain trades would need to UNION data from multiple tables and convert price
+units:
+
+```sql
+-- Before: Complex query UNIONing onchain and offchain trades
+SELECT
+    created_at,
+    direction,
+    price,
+    'ONCHAIN' as trade_type
+FROM (
+    -- Onchain trades with price in USDC
+    SELECT
+        created_at,
+        direction,
+        price_usdc as price
+    FROM onchain_trades
+    WHERE symbol = '${Symbol}'
+
+    UNION ALL
+
+    -- Offchain trades with price in cents, converted to dollars
+    SELECT
+        executed_at as created_at,
+        direction,
+        CAST(price_cents AS REAL) / 100.0 as price
+    FROM schwab_executions
+    WHERE symbol = '${Symbol}'
+      AND status = 'FILLED'
+)
+ORDER BY created_at;
+
+-- After: Pre-computed unified view with normalized prices
+SELECT created_at, direction, price, trade_type
+FROM unified_trade_view
+WHERE symbol = '${Symbol}'
+ORDER BY created_at;
+```
+
+Complex queries can be identified and replaced with optimized views, improving
+both dashboard performance and maintainability.
+
+### **Aggregate Design**
+
+#### **Position Aggregate**
+
+**Purpose**: Manages the position lifecycle for a single symbol, tracking
+fractional share accumulation and whole share execution thresholds.
+
+**Aggregate ID**: `symbol` (e.g., "AAPL")
+
+**States**:
