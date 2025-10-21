@@ -339,3 +339,34 @@ be rebuilt at any time.
 Command → Aggregate.handle() → Validate & Produce Events → Persist Events
   → Apply to Aggregate → Update Views
 ```
+
+#### **Database Schema**
+
+##### **Event Store Tables** (Single Source of Truth)
+
+```sql
+-- Events table: stores all domain events
+CREATE TABLE events (
+    aggregate_type TEXT NOT NULL,      -- 'Position', 'BrokerExecution', etc.
+    aggregate_id TEXT NOT NULL,        -- Unique identifier for aggregate instance
+    sequence BIGINT NOT NULL,          -- Sequence number (starts at 1)
+    event_type TEXT NOT NULL,          -- Event name (e.g., 'OnChainTradeRecorded')
+    event_version TEXT NOT NULL,       -- Event schema version (e.g., '1.0')
+    payload JSON NOT NULL,             -- Event data as JSON
+    metadata JSON NOT NULL,            -- Correlation IDs, timestamps, etc.
+    PRIMARY KEY (aggregate_type, aggregate_id, sequence)
+);
+
+CREATE INDEX idx_events_type ON events(aggregate_type);
+CREATE INDEX idx_events_aggregate ON events(aggregate_id);
+
+-- Snapshots table: aggregate cache for performance
+CREATE TABLE snapshots (
+    aggregate_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    last_sequence BIGINT NOT NULL,    -- Last event sequence in snapshot
+    payload JSON NOT NULL,             -- Serialized aggregate state
+    timestamp TEXT NOT NULL,
+    PRIMARY KEY (aggregate_type, aggregate_id)
+);
+```
