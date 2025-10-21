@@ -317,3 +317,25 @@ an event-sourced architecture:
 - **Event Store**: Immutable append-only log (single source of truth)
 - **Snapshots**: Performance optimization for aggregate reconstruction
 - **Views**: Materialized projections optimized for queries
+
+**Grafana Dashboard Strategy**: The migration aims to minimize changes to
+existing Grafana dashboards by using SQLite generated columns to expose the same
+column names as current tables. This allows most queries to work with only table
+name changes (e.g., `onchain_trades` → `onchain_trade_view`). Additionally, we
+can create specialized views that pre-compute complex metrics, simplifying
+queries and improving performance.
+
+### **Core Architecture**
+
+#### **Event Sourcing Pattern**
+
+All state changes are captured as immutable domain events. The event store is
+the single source of truth. All other data (views, snapshots) is derived and can
+be rebuilt at any time.
+
+**Key Flow:**
+
+```
+Command → Aggregate.handle() → Validate & Produce Events → Persist Events
+  → Apply to Aggregate → Update Views
+```
