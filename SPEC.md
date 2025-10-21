@@ -347,10 +347,10 @@ Command → Aggregate.handle() → Validate & Produce Events → Persist Events
 ```sql
 -- Events table: stores all domain events
 CREATE TABLE events (
-    aggregate_type TEXT NOT NULL,      -- 'Position', 'OffchainOrder', etc.
+    aggregate_type TEXT NOT NULL,      -- 'OnChainTrade', 'Position', 'OffchainOrder', etc.
     aggregate_id TEXT NOT NULL,        -- Unique identifier for aggregate instance
     sequence BIGINT NOT NULL,          -- Sequence number (starts at 1)
-    event_type TEXT NOT NULL,          -- Event name (e.g., 'OnChainTradeRecorded')
+    event_type TEXT NOT NULL,          -- Event name (e.g., 'OnChainOrderFilled')
     event_version TEXT NOT NULL,       -- Event schema version (e.g., '1.0')
     payload JSON NOT NULL,             -- Event data as JSON
     metadata JSON NOT NULL,            -- Correlation IDs, timestamps, etc.
@@ -555,11 +555,107 @@ both dashboard performance and maintainability.
 
 ### **Aggregate Design**
 
+#### **OnChainTrade Aggregate**
+
+**Purpose**: Represents a single filled order from the blockchain. Decouples
+trade recording from position management, allowing metadata enrichment without
+affecting position calculations.
+
+**Aggregate ID**: `"{tx_hash}:{log_index}"` (e.g., "0x123...abc:5")
+
+**States**:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OnChainTrade {
+    Filled {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        filled_at: DateTime<Utc>,
+    },
+    Enriched {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        filled_at: DateTime<Utc>,
+        gas_used: u64,
+        pyth_price: PythPrice,
+        enriched_at: DateTime<Utc>,
+    },
+}
+```
+
+**Commands**:
+
+```rust
+enum OnChainTradeCommand {
+    Witness {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+    },
+    Enrich {
+        gas_used: u64,
+        pyth_price: PythPrice,
+    },
+}
+```
+
+**Events**:
+
+```rust
+enum OnChainTradeEvent {
+    Filled {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        filled_at: DateTime<Utc>,
+    },
+    Enriched {
+        gas_used: u64,
+        pyth_price: PythPrice,
+        enriched_at: DateTime<Utc>,
+    },
+}
+```
+
+**Business Rules** (enforced in `handle()`):
+
+- Can only enrich once
+- Cannot enrich before fill is witnessed
+
 #### **Position Aggregate**
 
-**Purpose**: Manages the position lifecycle for a single symbol, tracking
-fractional share accumulation and whole share execution thresholds.
+**Purpose**: Manages accumulated position for a single symbol, tracking
+fractional shares and coordinating offchain hedging when thresholds are reached.
 
 **Aggregate ID**: `symbol` (e.g., "AAPL")
+
+**State**:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Position {
+    symbol: Symbol,
+    net_position: Decimal,
+    accumulated_long: Decimal,
+    accumulated_short: Decimal,
+    pending_execution_id: Option<ExecutionId>,
+    last_updated: Option<DateTime<Utc>>,
+}
+```
 
 **States**:
