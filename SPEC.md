@@ -279,3 +279,41 @@ mutable and don't form a complete event log:
 - **State machine in application code**: Position lifecycle rules (when to
   execute, how to batch) are scattered across functions - hard to test in
   isolation
+
+**Event Sourcing Improvements:**
+
+Events ARE immutable facts, but the current system only captures some facts
+(trades executed, final execution state) while losing others (when thresholds
+were crossed, status transitions, why batching decisions occurred). An event
+store treats every significant occurrence as a fact:
+
+- **Complete history**: Every state change is a fact with timestamp and sequence
+- **Reproducible state**: Replay facts to rebuild any view, fixing corruption
+- **Temporal queries**: "What was the position at any point in time?"
+- **Zero-downtime projections**: Add new views by replaying existing events
+- **Testable business logic**: Given-When-Then tests validate rules without
+  database
+- **Type-safe state machines**: Invalid transitions become compilation errors
+
+We will migrate st0x.liquidity-a to DDD/CQRS/ES patterns for:
+
+- **Auditability**: Complete audit trail of all system state changes
+- **Debuggability**: Time-travel debugging by replaying events
+- **Schema Evolution**: Easy to add new projections without migrations
+- **Type Safety**: Make invalid states unrepresentable through ADTs
+- **Testability**: Given-When-Then testing pattern for business logic
+- **Reasoning**: Clear separation between facts (events) and derived data
+  (views)
+
+### **Migration Strategy Overview**
+
+This migration will transform the current database from a CRUD-style schema to
+an event-sourced architecture:
+
+**Before**: Multiple mutable state tables with potential contradictions
+
+**After**:
+
+- **Event Store**: Immutable append-only log (single source of truth)
+- **Snapshots**: Performance optimization for aggregate reconstruction
+- **Views**: Materialized projections optimized for queries
