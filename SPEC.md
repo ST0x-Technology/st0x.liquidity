@@ -970,3 +970,123 @@ enum SchwabAuthEvent {
     },
 }
 ```
+
+### **View Design**
+
+#### **Position View**
+
+**Purpose**: Current position state for all symbols, optimized for querying by
+symbol and position status.
+
+**View State**:
+
+```rust
+enum PositionView {
+    Unavailable,
+    Position {
+        symbol: Symbol,
+        net_position: Decimal,
+        accumulated_long: Decimal,
+        accumulated_short: Decimal,
+        pending_execution_id: Option<ExecutionId>,
+        last_updated: DateTime<Utc>,
+    },
+}
+```
+
+**Projection Logic**: Updates on `PositionEvent::*`
+
+#### **OffchainTradeView**
+
+**Purpose**: All broker executions with filtering by status and symbol.
+
+**View State**:
+
+```rust
+enum OffchainTradeView {
+    Unavailable,
+    Execution {
+        execution_id: ExecutionId,
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        status: ExecutionStatus,
+        broker_order_id: Option<String>,
+        price_cents: Option<i64>,
+        initiated_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
+    },
+}
+
+enum ExecutionStatus {
+    Pending,
+    Submitted,
+    Filled,
+    Failed,
+}
+```
+
+**Projection Logic**: Updates on `OffchainOrderEvent::*`, building view of
+filled orders (which become trades)
+
+#### **OnChainTradeView**
+
+**Purpose**: Immutable record of all blockchain trades.
+
+**View State**:
+
+```rust
+enum OnChainTradeView {
+    Unavailable,
+    Trade {
+        tx_hash: TxHash,
+        log_index: u64,
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+        recorded_at: DateTime<Utc>,
+    },
+}
+```
+
+**Projection Logic**: Builds from `OnChainTradeEvent::Filled` and
+`OnChainTradeEvent::Enriched`
+
+#### **MetricsPnLView**
+
+**Purpose**: Profit/loss calculations per symbol over time.
+
+**View State**:
+
+```rust
+enum MetricsPnLView {
+    Unavailable,
+    Metrics {
+        id: i64,
+        symbol: Symbol,
+        timestamp: DateTime<Utc>,
+        venue: Venue,
+        trade_id: i64,
+        trade_direction: Direction,
+        quantity: Decimal,
+        price_per_share: Decimal,
+        realized_pnl: Option<Decimal>,
+        cumulative_pnl: Decimal,
+        net_position_after: Decimal,
+    },
+}
+
+enum Venue {
+    OnChain,
+    OffChain { broker: SupportedBroker },
+}
+```
+
+**Projection Logic**: Calculates from both `OnChainTradeEvent::Filled` and
+`PositionEvent::OffChainOrderFilled` events
