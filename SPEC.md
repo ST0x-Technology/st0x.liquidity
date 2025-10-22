@@ -335,9 +335,13 @@ be rebuilt at any time.
 
 **Key Flow:**
 
-```
-Command -> Aggregate.handle() -> Validate & Produce Events -> Persist Events
-  -> Apply to Aggregate -> Update Views
+```mermaid
+flowchart LR
+    A[Command] --> B[Aggregate.handle]
+    B --> C[Validate & Produce Events]
+    C --> D[Persist Events]
+    D --> E[Apply to Aggregate]
+    E --> F[Update Views]
 ```
 
 #### **Database Schema**
@@ -1090,3 +1094,71 @@ enum Venue {
 
 **Projection Logic**: Calculates from both `OnChainTradeEvent::Filled` and
 `PositionEvent::OffChainOrderFilled` events
+
+### **Event Processing Flow**
+
+#### **OnChain Event Processing**
+
+**Current Flow** (CRUD):
+
+```mermaid
+flowchart LR
+    A[Blockchain Event] --> B[Parse]
+    B --> C[Write to onchain_trades table]
+    C --> D[Update trade_accumulators]
+    D --> E[Maybe Execute Broker Trade]
+    E --> F[Write to schwab_executions]
+```
+
+**New Flow** (CQRS/ES with Managers):
+
+```mermaid
+sequenceDiagram
+    participant BC as Blockchain
+    participant App as Application Layer
+    participant OT as OnChainTrade Aggregate
+    participant TM as TradeManager
+    participant P as Position Aggregate
+    participant OM as OrderManager
+    participant OO as OffchainOrder Aggregate
+    participant Broker as Broker API
+    participant Views as Views
+
+    BC->>App: Blockchain Event
+    App->>App: Parse
+    App->>OT: OnChainTradeCommand::Witness
+    OT->>OT: handle()
+    OT-->>App: OnChainTradeEvent::Filled
+    App->>Views: Persist & Publish
+
+    App->>TM: OnChainTradeEvent::Filled
+    TM->>TM: Extract trade data
+    TM->>P: PositionCommand::AcknowledgeOnChainFill
+    P->>P: Check threshold
+    alt Threshold not met
+        P-->>TM: [PositionEvent::OnChainOrderFilled]
+    else Threshold met
+        P-->>TM: [PositionEvent::OnChainOrderFilled,<br/>PositionEvent::OffChainOrderPlaced]
+    end
+    TM->>Views: Persist & Update
+
+    TM->>OM: PositionEvent::OffChainOrderPlaced
+    OM->>Broker: Execute trade
+    OM->>OO: OffchainOrderCommand::ConfirmSubmission
+    OO-->>OM: OffchainOrderEvent::Submitted
+    OM->>Views: Persist
+    OM->>OM: Poll for fill
+    OM->>OO: OffchainOrderCommand::CompleteFill
+    OO-->>OM: OffchainOrderEvent::Filled
+    OM->>Views: Persist & Publish
+
+    OM->>P: PositionCommand::CompleteOffChainOrder
+    P-->>OM: PositionEvent::OffChainOrderFilled
+    OM->>Views: Update
+
+    Note over App,Views: Metadata enrichment (async)
+    App->>App: Extract Pyth Price
+    App->>OT: OnChainTradeCommand::Enrich
+    OT-->>App: OnChainTradeEvent::Enriched
+    App->>Views: Update OnChainTradeView
+```
