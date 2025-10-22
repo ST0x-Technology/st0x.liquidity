@@ -1196,3 +1196,69 @@ sequenceDiagram
     OT-->>App: OnChainTradeEvent::Enriched
     App->>Views: Update OnChainTradeView
 ```
+
+#### **Manager Pattern**
+
+Managers coordinate between aggregates by subscribing to events and sending
+commands. They can be stateless (simple event->command reactions) or stateful
+(long-running processes with state).
+
+**Stateless Managers:**
+
+```rust
+// Simple event->command reaction
+struct TradeManager {
+    position_cqrs: Arc<SqliteCqrs<Position>>,
+}
+
+impl TradeManager {
+    async fn handle_onchain_trade_filled(&self, event: OnChainTradeEvent::Filled) {
+        // Extract data and send command to Position aggregate
+        let cmd = PositionCommand::AcknowledgeOnChainFill {
+            trade_id: TradeId::from_event(&event),
+            amount: event.amount,
+            direction: event.direction,
+            price_usdc: event.price_usdc,  // Needed for dollar threshold check
+        };
+        self.position_cqrs.execute(&event.symbol, cmd).await;
+    }
+}
+```
+
+**Stateful Manager:**
+
+```rust
+// Complex workflow with state tracking
+struct OrderManager {
+    position_cqrs: Arc<SqliteCqrs<Position>>,
+    order_cqrs: Arc<SqliteCqrs<OffchainOrder>>,
+    broker: Arc<dyn Broker>,
+    // State: tracks in-flight orders for polling
+    in_flight_orders: Arc<RwLock<HashMap<ExecutionId, OrderState>>>,
+}
+
+impl OrderManager {
+    async fn handle_offchain_order_placed(&self, event: PositionEvent::OffChainOrderPlaced) {
+        // 1. Execute broker trade
+        let result = self.broker.place_market_order(...).await;
+
+        // 2. Track order for polling
+        self.in_flight_orders.write().await.insert(event.execution_id, OrderState::Polling);
+
+        // 3. Send confirmation command
+        let cmd = OffchainOrderCommand::ConfirmSubmission {
+            broker_order_id: result.order_id
+        };
+        self.order_cqrs.execute(&event.execution_id, cmd).await;
+
+        // 4. Start polling task
+        self.poll_for_fill(event.execution_id).await;
+    }
+
+    async fn poll_for_fill(&self, execution_id: ExecutionId) {
+        // Poll broker API until filled or failed
+        // Send CompleteFill or MarkFailed command
+        // Send CompleteOffChainOrder to Position aggregate
+    }
+}
+```
