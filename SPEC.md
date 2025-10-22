@@ -1262,3 +1262,434 @@ impl OrderManager {
     }
 }
 ```
+
+#### **Future Consideration: Reorg Handling**
+
+**Note**: Reorg handling is not implemented currently, but the event-sourced
+architecture will make it significantly easier to add in the future.
+
+Blockchain reorganizations occur before block finalization. When we eventually
+implement reorg handling, the event-sourced architecture will make it
+significantly easier than the current CRUD approach.
+
+**CRUD Approach (Current):**
+
+Would require orchestrating multiple coordinated steps: identify affected
+trades, delete/mark invalid records in `onchain_trades`, update
+`trade_accumulators`, check triggered executions, potentially reverse offchain
+executions. This would be error-prone and lose audit trail.
+
+**Event-Sourced Approach (Future):**
+
+Simply append a reorg event that reverses the position change:
+
+```rust
+// Future implementation when reorg handling is added
+let reorg_command = PositionCommand::RecordReorg {
+    tx_hash, log_index, symbol, amount, direction, reorg_depth: 3
+};
+cqrs.execute(&symbol, reorg_command).await?;
+```
+
+The `OnChainTradeReorged` event would reverse the original trade's position
+impact. Views would update automatically. The `onchain_trade_view` could mark
+trades as `reorged: true` without deleting them.
+
+**Benefits (when implemented):**
+
+- Append-only: no cascading updates across tables
+- Complete audit trail: preserves both original trade and reorg event
+- Testable: Given-When-Then testing for reorg scenarios
+- Recoverable: fix bugs and replay events to correct state
+- Explicit: reorgs are first-class domain events, not special cases
+
+This demonstrates how the event-sourced architecture provides a cleaner
+foundation for future enhancements.
+
+### **Data Migration Strategy**
+
+#### **Backfilling Existing Data**
+
+The existing database contains production data that must be migrated into the
+event store. We cannot start fresh - all historical trades, positions, and
+executions must be preserved.
+
+**Approach**: Create synthetic events from existing table data
+
+##### **Migration Script Structure**
+
+```rust
+// src/bin/migrate_to_events.rs
+
+async fn migrate_existing_data(pool: &SqlitePool) -> Result<(), MigrationError> {
+    info!("Starting migration of existing data to event store");
+
+    // Step 1: Migrate onchain trades to Position events
+    migrate_onchain_trades(pool).await?;
+
+    // Step 2: Migrate offchain orders to OffchainOrder events
+    migrate_offchain_orders(pool).await?;
+
+    // Step 3: Migrate Schwab auth to SchwabAuth events
+    migrate_schwab_auth(pool).await?;
+
+    // Step 4: Verify event store matches old tables
+    verify_migration(pool).await?;
+
+    info!("Migration completed successfully");
+    Ok(())
+}
+```
+
+##### **Migrating OnChain Trades**
+
+```rust
+async fn migrate_onchain_trades(pool: &SqlitePool) -> Result<(), MigrationError> {
+    // Read all onchain_trades ordered by creation time
+    let trades = sqlx::query!(
+        r#"
+        SELECT tx_hash, log_index, symbol, amount, direction, price_usdc,
+               block_number, block_timestamp, gas_used,
+               pyth_price_value, pyth_price_expo, pyth_price_conf,
+               created_at
+        FROM onchain_trades
+        ORDER BY created_at, tx_hash, log_index
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // Process each trade: create OnChainTrade aggregate and Position event
+    for trade in trades {
+        let trade_id = format!("{}:{}", trade.tx_hash, trade.log_index);
+
+        // 1. Create OnChainTrade aggregate with Filled event
+        let filled_event = OnChainTradeEvent::Filled {
+            symbol: Symbol::new(trade.symbol.clone()),
+            amount: Decimal::from_str(&trade.amount.to_string())?,
+            direction: Direction::from_str(&trade.direction)?,
+            price_usdc: Decimal::from_str(&trade.price_usdc.to_string())?,
+            block_number: trade.block_number as u64,
+            block_timestamp: trade.block_timestamp,
+            filled_at: trade.created_at,
+        };
+
+        write_event(pool, "OnChainTrade", &trade_id, 1, filled_event).await?;
+
+        // 2. Add Enriched event if metadata is present
+        if let (Some(gas), Some(val), Some(expo), Some(conf)) = (
+            trade.gas_used,
+            trade.pyth_price_value,
+            trade.pyth_price_expo,
+            trade.pyth_price_conf
+        ) {
+            let enriched_event = OnChainTradeEvent::Enriched {
+                gas_used: gas as u64,
+                pyth_price: PythPrice { value: val, expo, conf },
+                enriched_at: trade.created_at,
+            };
+
+            write_event(pool, "OnChainTrade", &trade_id, 2, enriched_event).await?;
+        }
+    }
+
+    // Now create Position events grouped by symbol
+    let trades_by_symbol = group_by_symbol(trades);
+
+    for (symbol, symbol_trades) in trades_by_symbol {
+        let events = symbol_trades
+            .into_iter()
+            .map(|trade| {
+                let trade_id = TradeId::new(format!("{}:{}", trade.tx_hash, trade.log_index));
+
+                PositionEvent::OnChainOrderFilled {
+                    trade_id,
+                    amount: Decimal::from_str(&trade.amount.to_string())?,
+                    direction: Direction::from_str(&trade.direction)?,
+                    new_net_position: Decimal::ZERO, // Will be calculated during replay
+                    block_timestamp: trade.block_timestamp,
+                    seen_at: trade.created_at,
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (idx, event) in events.into_iter().enumerate() {
+            write_event(pool, "Position", &symbol, (idx + 1) as u64, event).await?;
+        }
+    }
+
+    Ok(())
+}
+```
+
+##### **Migrating OffChain Orders**
+
+```rust
+async fn migrate_offchain_orders(pool: &SqlitePool) -> Result<(), MigrationError> {
+    // Read all schwab_executions
+    let orders = sqlx::query!(
+        r#"
+        SELECT id, symbol, shares, direction, order_id, price_cents,
+               status, executed_at
+        FROM schwab_executions
+        ORDER BY id
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for order in orders {
+        let order_id = ExecutionId::new(order.id.to_string());
+        let aggregate_id = order_id.to_string();
+        let status = ExecutionStatus::from_str(&order.status)?;
+
+        // Build event sequence functionally based on status
+        let events = build_offchain_order_events(
+            order.symbol.clone(),
+            order.shares as u64,
+            Direction::from_str(&order.direction)?,
+            order.order_id.clone(),
+            order.price_cents,
+            order.executed_at,
+            status,
+        )?;
+
+        // Write all events with sequence numbers
+        for (idx, event) in events.into_iter().enumerate() {
+            write_event(
+                pool,
+                "OffchainOrder",
+                &aggregate_id,
+                (idx + 1) as u64,
+                event,
+            ).await?;
+        }
+
+        // Add corresponding Position events for filled orders
+        if matches!(status, ExecutionStatus::Filled) {
+            let broker_order_id = order.order_id.ok_or_else(|| {
+                MigrationError::MissingRequiredField {
+                    execution_id: order.id,
+                    field: "order_id".to_string(),
+                }
+            })?;
+
+            let price_cents = order.price_cents.ok_or_else(|| {
+                MigrationError::MissingRequiredField {
+                    execution_id: order.id,
+                    field: "price_cents".to_string(),
+                }
+            })?;
+
+            let filled_at = order.executed_at.ok_or_else(|| {
+                MigrationError::MissingRequiredField {
+                    execution_id: order.id,
+                    field: "executed_at".to_string(),
+                }
+            })?;
+
+            append_position_offchain_event(
+                pool,
+                &order.symbol,
+                order_id,
+                broker_order_id,
+                price_cents,
+                filled_at,
+            ).await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_offchain_order_events(
+    symbol: String,
+    shares: u64,
+    direction: Direction,
+    broker_order_id: Option<String>,
+    price_cents: Option<i64>,
+    executed_at: Option<DateTime<Utc>>,
+    status: ExecutionStatus,
+) -> Result<Vec<OffchainOrderEvent>, MigrationError> {
+    let placed_at = executed_at.unwrap_or_else(Utc::now);
+
+    let placed = OffchainOrderEvent::Placed {
+        symbol: Symbol::new(symbol),
+        shares,
+        direction,
+        broker: SupportedBroker::Schwab,
+        placed_at,
+    };
+
+    let submitted = broker_order_id
+        .as_ref()
+        .zip(executed_at)
+        .map(|(order_id, submitted_at)| OffchainOrderEvent::Submitted {
+            broker_order_id: order_id.clone(),
+            submitted_at,
+        });
+
+    let terminal = match status {
+        ExecutionStatus::Filled => {
+            let price = price_cents.ok_or_else(|| {
+                MigrationError::InvalidStatus {
+                    status: "FILLED".to_string(),
+                    reason: "Missing price_cents".to_string(),
+                }
+            })?;
+
+            let filled_at = executed_at.ok_or_else(|| {
+                MigrationError::InvalidStatus {
+                    status: "FILLED".to_string(),
+                    reason: "Missing executed_at".to_string(),
+                }
+            })?;
+
+            Some(OffchainOrderEvent::Filled {
+                price_cents: price,
+                filled_at,
+            })
+        }
+        ExecutionStatus::Failed => {
+            let failed_at = executed_at.ok_or_else(|| {
+                MigrationError::InvalidStatus {
+                    status: "FAILED".to_string(),
+                    reason: "Missing executed_at".to_string(),
+                }
+            })?;
+
+            Some(OffchainOrderEvent::Failed {
+                error: "Migrated from old schema".to_string(),
+                failed_at,
+            })
+        }
+        ExecutionStatus::Pending | ExecutionStatus::Submitted => None,
+    };
+
+    Ok(std::iter::once(placed)
+        .chain(submitted)
+        .chain(terminal)
+        .collect())
+}
+```
+
+##### **Migrating Schwab Auth**
+
+```rust
+async fn migrate_schwab_auth(pool: &SqlitePool) -> Result<(), MigrationError> {
+    // Read schwab_auth table
+    let auth = sqlx::query!(
+        r#"
+        SELECT access_token, access_token_fetched_at,
+               refresh_token, refresh_token_fetched_at
+        FROM schwab_auth
+        WHERE id = 1
+        "#
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(auth) = auth {
+        let event = SchwabAuthEvent::TokensStored {
+            access_token: EncryptedToken::new(auth.access_token),
+            access_token_fetched_at: auth.access_token_fetched_at,
+            refresh_token: EncryptedToken::new(auth.refresh_token),
+            refresh_token_fetched_at: auth.refresh_token_fetched_at,
+        };
+
+        write_event(pool, "SchwabAuth", "schwab", 1, event).await?;
+    }
+
+    Ok(())
+}
+```
+
+##### **Verification Strategy**
+
+```rust
+async fn verify_migration(pool: &SqlitePool) -> Result<(), MigrationError> {
+    info!("Verifying migration consistency");
+
+    // Rebuild views from events
+    rebuild_all_views(pool).await?;
+
+    // Compare old tables vs new views
+    verify_onchain_trades(pool).await?;
+    verify_offchain_executions(pool).await?;
+    verify_positions(pool).await?;
+
+    info!("Verification completed successfully");
+    Ok(())
+}
+
+async fn verify_onchain_trades(pool: &SqlitePool) -> Result<(), MigrationError> {
+    // Count records in old table
+    let old_count = sqlx::query!("SELECT COUNT(*) as count FROM onchain_trades")
+        .fetch_one(pool)
+        .await?
+        .count;
+
+    // Count records in new view
+    let new_count = sqlx::query!("SELECT COUNT(*) as count FROM onchain_trade_view")
+        .fetch_one(pool)
+        .await?
+        .count;
+
+    if old_count != new_count {
+        return Err(MigrationError::CountMismatch {
+            table: "onchain_trades".to_string(),
+            old_count,
+            new_count,
+        });
+    }
+
+    // Verify sample of records match
+    verify_random_sample(pool, "onchain_trades", 100).await?;
+
+    Ok(())
+}
+
+async fn verify_positions(pool: &SqlitePool) -> Result<(), MigrationError> {
+    // For each symbol in trade_accumulators
+    let symbols = sqlx::query!("SELECT symbol FROM trade_accumulators")
+        .fetch_all(pool)
+        .await?;
+
+    for symbol_row in symbols {
+        // Get old state
+        let old_state = sqlx::query!(
+            "SELECT net_position, accumulated_long, accumulated_short
+             FROM trade_accumulators WHERE symbol = ?",
+            symbol_row.symbol
+        )
+        .fetch_one(pool)
+        .await?;
+
+        // Get new state from view
+        let new_state = sqlx::query!(
+            r#"SELECT payload as "payload: String" FROM position_view WHERE view_id = ?"#,
+            symbol_row.symbol
+        )
+        .fetch_one(pool)
+        .await?;
+
+        let view: PositionView = serde_json::from_str(&new_state.payload)?;
+
+        // Compare
+        match view {
+            PositionView::Position { net_position, accumulated_long, accumulated_short, .. } => {
+                if net_position != Decimal::from_str(&old_state.net_position.to_string())? {
+                    return Err(MigrationError::PositionMismatch {
+                        symbol: symbol_row.symbol,
+                        field: "net_position".to_string(),
+                    });
+                }
+                // ... verify other fields
+            }
+            _ => return Err(MigrationError::ViewNotFound { symbol: symbol_row.symbol }),
+        }
+    }
+
+    Ok(())
+}
+```
