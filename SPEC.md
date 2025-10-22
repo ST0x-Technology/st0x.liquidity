@@ -1099,15 +1099,49 @@ enum Venue {
 
 #### **OnChain Event Processing**
 
-**Current Flow** (CRUD):
+**Current Flow** (Event-driven with Conductor):
 
 ```mermaid
-flowchart LR
-    A[Blockchain Event] --> B[Parse]
-    B --> C[Write to onchain_trades table]
-    C --> D[Update trade_accumulators]
-    D --> E[Maybe Execute Broker Trade]
-    E --> F[Write to schwab_executions]
+sequenceDiagram
+    participant BC as Blockchain
+    participant DER as DEX Event Receiver
+    participant EP as Event Processor
+    participant Q as Event Queue (SQLite)
+    participant QP as Queue Processor
+    participant Acc as Accumulator
+    participant Broker as Broker API
+    participant OP as Order Poller
+    participant PC as Position Checker
+
+    BC->>DER: ClearV2/TakeOrderV2 event
+    DER->>EP: Send via channel
+    EP->>Q: Enqueue event
+
+    loop Process Queue
+        QP->>Q: Get next unprocessed
+        Q-->>QP: Queued event
+        QP->>QP: Convert to OnchainTrade
+        QP->>Acc: Process trade
+        Acc->>Acc: Update accumulators
+        alt Threshold met
+            Acc-->>QP: Create pending execution
+            QP->>Broker: Place market order
+        end
+        QP->>Q: Mark processed
+    end
+
+    loop Poll Orders
+        OP->>Broker: Get order status
+        Broker-->>OP: Order filled
+        OP->>Acc: Update execution status
+    end
+
+    loop Periodic Check
+        PC->>Acc: Check accumulated positions
+        alt Position ready
+            PC->>Broker: Execute accumulated order
+        end
+    end
 ```
 
 **New Flow** (CQRS/ES with Managers):
