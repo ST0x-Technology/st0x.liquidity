@@ -74,7 +74,7 @@ and the system proves market fit.
 
 Example (Offchain Batching):
 
-- Onchain trades: 0.3 AAPL sold, 0.5 AAPL sold, 0.4 AAPL sold → net 1.2 AAPL
+- Onchain trades: 0.3 AAPL sold, 0.5 AAPL sold, 0.4 AAPL sold -> net 1.2 AAPL
   sold
 - Bot executes: Buy 1 AAPL share on broker (floor of 1.2), continues tracking
   0.2 AAPL net exposure
@@ -115,8 +115,8 @@ excellent async ecosystem for handling concurrent trading flows.
 - No artificial concurrency limits - process events as fast as they arrive
 - Tokio async runtime manages hundreds of concurrent trades efficiently on
   limited hardware
-- Each flow: Parse Event → Event Queue → Deduplication Check → Position
-  Accumulation → Broker Execution (when threshold reached) → Record Result
+- Each flow: Parse Event -> Event Queue -> Deduplication Check -> Position
+  Accumulation -> Broker Execution (when threshold reached) -> Record Result
 - Failed flows retry independently without affecting other trades
 
 ### **Trade Execution**
@@ -267,8 +267,8 @@ mutable and don't form a complete event log:
 **Current Limitations:**
 
 - **Mutable state**: Tables can be updated/deleted, losing history of state
-  transitions (e.g., `schwab_executions.status` transitions from PENDING →
-  SUBMITTED → COMPLETED are lost, we only see final state)
+  transitions (e.g., `schwab_executions.status` transitions from PENDING ->
+  SUBMITTED -> COMPLETED are lost, we only see final state)
 - **Partial audit trail**: Know which trades linked to which executions, but not
   why batching decisions were made or when thresholds were crossed
 - **Can't rebuild from history**: If `trade_accumulators.net_position` gets
@@ -321,7 +321,7 @@ an event-sourced architecture:
 **Grafana Dashboard Strategy**: The migration aims to minimize changes to
 existing Grafana dashboards by using SQLite generated columns to expose the same
 column names as current tables. This allows most queries to work with only table
-name changes (e.g., `onchain_trades` → `onchain_trade_view`). Additionally, we
+name changes (e.g., `onchain_trades` -> `onchain_trade_view`). Additionally, we
 can create specialized views that pre-compute complex metrics, simplifying
 queries and improving performance.
 
@@ -336,8 +336,8 @@ be rebuilt at any time.
 **Key Flow:**
 
 ```
-Command → Aggregate.handle() → Validate & Produce Events → Persist Events
-  → Apply to Aggregate → Update Views
+Command -> Aggregate.handle() -> Validate & Produce Events -> Persist Events
+  -> Apply to Aggregate -> Update Views
 ```
 
 #### **Database Schema**
@@ -553,6 +553,29 @@ ORDER BY created_at;
 Complex queries can be identified and replaced with optimized views, improving
 both dashboard performance and maintainability.
 
+### Architecture Decision: Position as Aggregate
+
+In DDD, entities are objects defined by their identity and continuity rather
+than their attributes - they have a lifecycle and change over time while
+maintaining the same identity. Aggregates are entities that enforce business
+rules and maintain consistency boundaries.
+
+OnChain trades, offchain orders, and positions are all entities with distinct
+lifecycles, so we model them as separate aggregates:
+
+- **OnChainTrade**: Lifecycle = blockchain fill -> enriched with metadata.
+  Immutable blockchain facts (reorgs not currently handled, see Future
+  Consideration section).
+- **OffchainOrder**: Lifecycle = placed -> submitted -> filled/failed. Broker
+  order tracking.
+- **Position**: Lifecycle = accumulates fills -> triggers hedging decisions.
+  Makes threshold check (|net_position| >= 1.0) and emits OffChainOrderPlaced
+  event atomically.
+
+This means blockchain fills are recorded in both OnChainTradeEvent::Filled
+(audit trail) and PositionEvent::OnChainOrderFilled (position tracking), but
+they serve different purposes in different bounded contexts.
+
 ### **Aggregate Design**
 
 #### **OnChainTrade Aggregate**
@@ -655,6 +678,32 @@ struct Position {
     accumulated_short: Decimal,
     pending_execution_id: Option<ExecutionId>,
     last_updated: Option<DateTime<Utc>>,
+}
+```
+
+**Commands**:
+
+```rust
+enum PositionCommand {
+    AcknowledgeOnChainFill {
+        trade_id: TradeId,
+        amount: Decimal,
+        direction: Direction,
+    },
+    PlaceOffChainOrder {
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+    },
+    CompleteOffChainOrder {
+        execution_id: ExecutionId,
+        broker_order_id: String,
+        price_cents: i64,
+    },
+    FailOffChainOrder {
+        execution_id: ExecutionId,
+        error: String,
+    },
 }
 ```
 
