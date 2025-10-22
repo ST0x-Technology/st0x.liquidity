@@ -569,8 +569,9 @@ lifecycles, so we model them as separate aggregates:
 - **OffchainOrder**: Lifecycle = placed -> submitted -> filled/failed. Broker
   order tracking.
 - **Position**: Lifecycle = accumulates fills -> triggers hedging decisions.
-  Makes threshold check (|net_position| >= 1.0) and emits OffChainOrderPlaced
-  event atomically.
+  Uses configurable threshold (shares or dollar value) to determine when to
+  place offsetting broker orders. Schwab uses shares threshold (1.0 minimum),
+  Alpaca can use dollar threshold ($1.00 minimum).
 
 This means blockchain fills are recorded in both OnChainTradeEvent::Filled
 (audit trail) and PositionEvent::OnChainOrderFilled (position tracking), but
@@ -677,7 +678,14 @@ struct Position {
     accumulated_long: Decimal,
     accumulated_short: Decimal,
     pending_execution_id: Option<ExecutionId>,
+    threshold: ExecutionThreshold,
     last_updated: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum ExecutionThreshold {
+    Shares(Decimal),      // Schwab: 1.0 shares minimum
+    DollarValue(Decimal), // Alpaca: $1.00 minimum trade value
 }
 ```
 
@@ -685,10 +693,14 @@ struct Position {
 
 ```rust
 enum PositionCommand {
+    Initialize {
+        threshold: ExecutionThreshold,
+    },
     AcknowledgeOnChainFill {
         trade_id: TradeId,
         amount: Decimal,
         direction: Direction,
+        price_usdc: Decimal,  // Needed for dollar threshold check
     },
     PlaceOffChainOrder {
         shares: u64,
@@ -704,7 +716,257 @@ enum PositionCommand {
         execution_id: ExecutionId,
         error: String,
     },
+    UpdateThreshold {
+        threshold: ExecutionThreshold,
+    },
 }
 ```
 
+**Events**:
+
+```rust
+enum PositionEvent {
+    Initialized {
+        threshold: ExecutionThreshold,
+        initialized_at: DateTime<Utc>,
+    },
+    OnChainOrderFilled {
+        trade_id: TradeId,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        new_net_position: Decimal,
+        block_timestamp: DateTime<Utc>,
+        seen_at: DateTime<Utc>,
+    },
+    OffChainOrderPlaced {
+        execution_id: ExecutionId,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        trigger_reason: TriggerReason,  // Records why execution triggered
+        placed_at: DateTime<Utc>,
+    },
+    OffChainOrderFilled {
+        execution_id: ExecutionId,
+        broker_order_id: String,
+        price_cents: i64,
+        new_net_position: Decimal,
+        broker_timestamp: DateTime<Utc>,
+        seen_at: DateTime<Utc>,
+    },
+    OffChainOrderFailed {
+        execution_id: ExecutionId,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+    ThresholdUpdated {
+        old_threshold: ExecutionThreshold,
+        new_threshold: ExecutionThreshold,
+        updated_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum TriggerReason {
+    SharesThreshold {
+        net_position_shares: Decimal,
+        threshold_shares: Decimal,
+    },
+    DollarThreshold {
+        net_position_shares: Decimal,
+        dollar_value: Decimal,
+        price_usdc: Decimal,
+        threshold_dollars: Decimal,
+    },
+}
+```
+
+**Business Rules** (enforced in `handle()`):
+
+- Threshold must be configured before processing any fills (Initialize command)
+- Can only place offchain order when threshold is met:
+  - **Shares threshold**: `|net_position| >= threshold` (e.g., 1.0 shares for
+    Schwab)
+  - **Dollar threshold**: `|net_position * price_usdc| >= threshold` (e.g.,
+    $1.00 for Alpaca)
+- Direction of offchain order must be opposite to accumulated position (positive
+  net = sell, negative net = buy)
+- Cannot have multiple pending executions for same symbol
+- OnChain fills are always applied (blockchain facts are immutable)
+- Threshold can be updated at any time, emits ThresholdUpdated event for audit
+  trail
+
+#### **OffchainOrder Aggregate**
+
+**Purpose**: Manages the lifecycle of a single broker order, tracking
+submission, filling, and settlement.
+
+**Aggregate ID**: `order_id` (UUID)
+
 **States**:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum OffchainOrder {
+    NotPlaced,
+    Pending {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        placed_at: DateTime<Utc>,
+    },
+    Submitted {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        broker_order_id: String,
+        placed_at: DateTime<Utc>,
+        submitted_at: DateTime<Utc>,
+    },
+    PartiallyFilled {
+        symbol: Symbol,
+        shares: u64,
+        shares_filled: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        broker_order_id: String,
+        avg_price_cents: i64,
+        placed_at: DateTime<Utc>,
+        submitted_at: DateTime<Utc>,
+        partially_filled_at: DateTime<Utc>,
+    },
+    Filled {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        broker_order_id: String,
+        price_cents: i64,
+        placed_at: DateTime<Utc>,
+        submitted_at: DateTime<Utc>,
+        filled_at: DateTime<Utc>,
+    },
+    Failed {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        error: String,
+        placed_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+**Commands**:
+
+```rust
+enum OffchainOrderCommand {
+    Place {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+    },
+    ConfirmSubmission {
+        broker_order_id: String,
+    },
+    UpdatePartialFill {
+        shares_filled: u64,
+        avg_price_cents: i64,
+    },
+    CompleteFill {
+        price_cents: i64,
+    },
+    MarkFailed {
+        error: String,
+    },
+}
+```
+
+**Events**:
+
+```rust
+enum OffchainOrderEvent {
+    Placed {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        placed_at: DateTime<Utc>,
+    },
+    Submitted {
+        broker_order_id: String,
+        submitted_at: DateTime<Utc>,
+    },
+    PartiallyFilled {
+        shares_filled: u64,
+        avg_price_cents: i64,
+        partially_filled_at: DateTime<Utc>,
+    },
+    Filled {
+        price_cents: i64,
+        filled_at: DateTime<Utc>,
+    },
+    Failed {
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+#### **SchwabAuth Aggregate**
+
+**Purpose**: Manages OAuth tokens for Charles Schwab broker. Alpaca uses simple
+API key/secret (configured via environment variables) and doesn't require
+database storage.
+
+**Aggregate ID**: `"schwab"` (singleton)
+
+**States**:
+
+```rust
+enum SchwabAuth {
+    NotAuthenticated,
+    Authenticated {
+        access_token: EncryptedToken,
+        access_token_fetched_at: DateTime<Utc>,
+        refresh_token: EncryptedToken,
+        refresh_token_fetched_at: DateTime<Utc>,
+    },
+}
+```
+
+**Commands**:
+
+```rust
+enum SchwabAuthCommand {
+    StoreTokens {
+        access_token: String,
+        refresh_token: String,
+    },
+    RefreshAccessToken {
+        new_access_token: String,
+    },
+}
+```
+
+**Events**:
+
+```rust
+enum SchwabAuthEvent {
+    TokensStored {
+        access_token: EncryptedToken,
+        access_token_fetched_at: DateTime<Utc>,
+        refresh_token: EncryptedToken,
+        refresh_token_fetched_at: DateTime<Utc>,
+    },
+    AccessTokenRefreshed {
+        access_token: EncryptedToken,
+        refreshed_at: DateTime<Utc>,
+    },
+}
+```
