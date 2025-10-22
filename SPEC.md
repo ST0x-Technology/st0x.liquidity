@@ -1314,7 +1314,87 @@ The existing database contains production data that must be migrated into the
 event store. We cannot start fresh - all historical trades, positions, and
 executions must be preserved.
 
-**Approach**: Create synthetic events from existing table data
+**Approach**: Use genesis events as snapshots from the legacy system
+
+Rather than synthesizing complete event histories with Option-polluted event
+types to handle missing data, we use special "genesis" events that represent
+snapshots of pre-existing state. The aggregate's `handle()` logic treats genesis
+events as valid initialization paths alongside normal events
+
+##### **Genesis Event Types**
+
+Genesis events represent snapshots from the legacy system. They initialize
+aggregates without synthesizing full event histories:
+
+```rust
+// Genesis events are part of each aggregate's event enum
+
+enum OnChainTradeEvent {
+    // Normal events (future system)
+    Filled { /* ... */ },
+    Enriched { /* ... */ },
+
+    // Genesis event (migration only)
+    Genesis {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+        migrated_at: DateTime<Utc>,
+    },
+}
+
+enum PositionEvent {
+    // Normal events (future system)
+    Initialized { /* ... */ },
+    OnChainOrderFilled { /* ... */ },
+    OffChainOrderPlaced { /* ... */ },
+    OffChainOrderFilled { /* ... */ },
+
+    // Genesis event (migration only)
+    Genesis {
+        symbol: Symbol,
+        net_position: Decimal,
+        accumulated_long: Decimal,
+        accumulated_short: Decimal,
+        threshold: ExecutionThreshold,
+        migrated_at: DateTime<Utc>,
+    },
+}
+
+enum OffchainOrderEvent {
+    // Normal events (future system)
+    Placed { /* ... */ },
+    Submitted { /* ... */ },
+    Filled { /* ... */ },
+    Failed { /* ... */ },
+
+    // Genesis event (migration only)
+    Genesis {
+        symbol: Symbol,
+        shares: u64,
+        direction: Direction,
+        broker: SupportedBroker,
+        status: GenesisOrderStatus,
+        broker_order_id: Option<String>,
+        price_cents: Option<i64>,
+        executed_at: Option<DateTime<Utc>>,
+        migrated_at: DateTime<Utc>,
+    },
+}
+
+// Genesis-specific status includes only observable states from legacy system
+enum GenesisOrderStatus {
+    Pending,
+    Submitted,
+    Filled,
+    Failed { error: String },
+}
+```
 
 ##### **Migration Script Structure**
 
@@ -1324,16 +1404,19 @@ executions must be preserved.
 async fn migrate_existing_data(pool: &SqlitePool) -> Result<(), MigrationError> {
     info!("Starting migration of existing data to event store");
 
-    // Step 1: Migrate onchain trades to Position events
+    // Step 1: Migrate onchain trades using genesis events
     migrate_onchain_trades(pool).await?;
 
-    // Step 2: Migrate offchain orders to OffchainOrder events
+    // Step 2: Migrate positions using genesis events
+    migrate_positions(pool).await?;
+
+    // Step 3: Migrate offchain orders using genesis events
     migrate_offchain_orders(pool).await?;
 
-    // Step 3: Migrate Schwab auth to SchwabAuth events
+    // Step 4: Migrate Schwab auth (no genesis needed - already simple)
     migrate_schwab_auth(pool).await?;
 
-    // Step 4: Verify event store matches old tables
+    // Step 5: Verify event store matches old tables
     verify_migration(pool).await?;
 
     info!("Migration completed successfully");
@@ -1345,7 +1428,6 @@ async fn migrate_existing_data(pool: &SqlitePool) -> Result<(), MigrationError> 
 
 ```rust
 async fn migrate_onchain_trades(pool: &SqlitePool) -> Result<(), MigrationError> {
-    // Read all onchain_trades ordered by creation time
     let trades = sqlx::query!(
         r#"
         SELECT tx_hash, log_index, symbol, amount, direction, price_usdc,
@@ -1359,63 +1441,57 @@ async fn migrate_onchain_trades(pool: &SqlitePool) -> Result<(), MigrationError>
     .fetch_all(pool)
     .await?;
 
-    // Process each trade: create OnChainTrade aggregate and Position event
     for trade in trades {
         let trade_id = format!("{}:{}", trade.tx_hash, trade.log_index);
 
-        // 1. Create OnChainTrade aggregate with Filled event
-        let filled_event = OnChainTradeEvent::Filled {
-            symbol: Symbol::new(trade.symbol.clone()),
+        let pyth_price = match (trade.pyth_price_value, trade.pyth_price_expo, trade.pyth_price_conf) {
+            (Some(val), Some(expo), Some(conf)) => Some(PythPrice { value: val, expo, conf }),
+            _ => None,
+        };
+
+        let genesis_event = OnChainTradeEvent::Genesis {
+            symbol: Symbol::new(trade.symbol),
             amount: Decimal::from_str(&trade.amount.to_string())?,
             direction: Direction::from_str(&trade.direction)?,
             price_usdc: Decimal::from_str(&trade.price_usdc.to_string())?,
             block_number: trade.block_number as u64,
             block_timestamp: trade.block_timestamp,
-            filled_at: trade.created_at,
+            gas_used: trade.gas_used.map(|g| g as u64),
+            pyth_price,
+            migrated_at: Utc::now(),
         };
 
-        write_event(pool, "OnChainTrade", &trade_id, 1, filled_event).await?;
-
-        // 2. Add Enriched event if metadata is present
-        if let (Some(gas), Some(val), Some(expo), Some(conf)) = (
-            trade.gas_used,
-            trade.pyth_price_value,
-            trade.pyth_price_expo,
-            trade.pyth_price_conf
-        ) {
-            let enriched_event = OnChainTradeEvent::Enriched {
-                gas_used: gas as u64,
-                pyth_price: PythPrice { value: val, expo, conf },
-                enriched_at: trade.created_at,
-            };
-
-            write_event(pool, "OnChainTrade", &trade_id, 2, enriched_event).await?;
-        }
+        write_event(pool, "OnChainTrade", &trade_id, 1, genesis_event).await?;
     }
 
-    // Now create Position events grouped by symbol
-    let trades_by_symbol = group_by_symbol(trades);
+    Ok(())
+}
+```
 
-    for (symbol, symbol_trades) in trades_by_symbol {
-        let events = symbol_trades
-            .into_iter()
-            .map(|trade| {
-                let trade_id = TradeId::new(format!("{}:{}", trade.tx_hash, trade.log_index));
+##### **Migrating Positions**
 
-                PositionEvent::OnChainOrderFilled {
-                    trade_id,
-                    amount: Decimal::from_str(&trade.amount.to_string())?,
-                    direction: Direction::from_str(&trade.direction)?,
-                    new_net_position: Decimal::ZERO, // Will be calculated during replay
-                    block_timestamp: trade.block_timestamp,
-                    seen_at: trade.created_at,
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+```rust
+async fn migrate_positions(pool: &SqlitePool) -> Result<(), MigrationError> {
+    let positions = sqlx::query!(
+        r#"
+        SELECT symbol, net_position, accumulated_long, accumulated_short
+        FROM trade_accumulators
+        "#
+    )
+    .fetch_all(pool)
+    .await?;
 
-        for (idx, event) in events.into_iter().enumerate() {
-            write_event(pool, "Position", &symbol, (idx + 1) as u64, event).await?;
-        }
+    for position in positions {
+        let genesis_event = PositionEvent::Genesis {
+            symbol: Symbol::new(position.symbol.clone()),
+            net_position: Decimal::from_str(&position.net_position.to_string())?,
+            accumulated_long: Decimal::from_str(&position.accumulated_long.to_string())?,
+            accumulated_short: Decimal::from_str(&position.accumulated_short.to_string())?,
+            threshold: ExecutionThreshold::Shares(Decimal::from(1)),  // Default for legacy data
+            migrated_at: Utc::now(),
+        };
+
+        write_event(pool, "Position", &position.symbol, 1, genesis_event).await?;
     }
 
     Ok(())
@@ -1426,7 +1502,6 @@ async fn migrate_onchain_trades(pool: &SqlitePool) -> Result<(), MigrationError>
 
 ```rust
 async fn migrate_offchain_orders(pool: &SqlitePool) -> Result<(), MigrationError> {
-    // Read all schwab_executions
     let orders = sqlx::query!(
         r#"
         SELECT id, symbol, shares, direction, order_id, price_cents,
@@ -1441,135 +1516,36 @@ async fn migrate_offchain_orders(pool: &SqlitePool) -> Result<(), MigrationError
     for order in orders {
         let order_id = ExecutionId::new(order.id.to_string());
         let aggregate_id = order_id.to_string();
-        let status = ExecutionStatus::from_str(&order.status)?;
 
-        // Build event sequence functionally based on status
-        let events = build_offchain_order_events(
-            order.symbol.clone(),
-            order.shares as u64,
-            Direction::from_str(&order.direction)?,
-            order.order_id.clone(),
-            order.price_cents,
-            order.executed_at,
+        let status = match order.status.as_str() {
+            "PENDING" => GenesisOrderStatus::Pending,
+            "SUBMITTED" => GenesisOrderStatus::Submitted,
+            "FILLED" => GenesisOrderStatus::Filled,
+            "FAILED" => GenesisOrderStatus::Failed {
+                error: "Legacy system failure".to_string()
+            },
+            _ => return Err(MigrationError::InvalidStatus {
+                status: order.status,
+                reason: "Unknown status in legacy system".to_string(),
+            }),
+        };
+
+        let genesis_event = OffchainOrderEvent::Genesis {
+            symbol: Symbol::new(order.symbol),
+            shares: order.shares as u64,
+            direction: Direction::from_str(&order.direction)?,
+            broker: SupportedBroker::Schwab,  // Legacy system only used Schwab
             status,
-        )?;
+            broker_order_id: order.order_id,
+            price_cents: order.price_cents,
+            executed_at: order.executed_at,
+            migrated_at: Utc::now(),
+        };
 
-        // Write all events with sequence numbers
-        for (idx, event) in events.into_iter().enumerate() {
-            write_event(
-                pool,
-                "OffchainOrder",
-                &aggregate_id,
-                (idx + 1) as u64,
-                event,
-            ).await?;
-        }
-
-        // Add corresponding Position events for filled orders
-        if matches!(status, ExecutionStatus::Filled) {
-            let broker_order_id = order.order_id.ok_or_else(|| {
-                MigrationError::MissingRequiredField {
-                    execution_id: order.id,
-                    field: "order_id".to_string(),
-                }
-            })?;
-
-            let price_cents = order.price_cents.ok_or_else(|| {
-                MigrationError::MissingRequiredField {
-                    execution_id: order.id,
-                    field: "price_cents".to_string(),
-                }
-            })?;
-
-            let filled_at = order.executed_at.ok_or_else(|| {
-                MigrationError::MissingRequiredField {
-                    execution_id: order.id,
-                    field: "executed_at".to_string(),
-                }
-            })?;
-
-            append_position_offchain_event(
-                pool,
-                &order.symbol,
-                order_id,
-                broker_order_id,
-                price_cents,
-                filled_at,
-            ).await?;
-        }
+        write_event(pool, "OffchainOrder", &aggregate_id, 1, genesis_event).await?;
     }
 
     Ok(())
-}
-
-fn build_offchain_order_events(
-    symbol: String,
-    shares: u64,
-    direction: Direction,
-    broker_order_id: Option<String>,
-    price_cents: Option<i64>,
-    executed_at: Option<DateTime<Utc>>,
-    status: ExecutionStatus,
-) -> Result<Vec<OffchainOrderEvent>, MigrationError> {
-    let placed_at = executed_at.unwrap_or_else(Utc::now);
-
-    let placed = OffchainOrderEvent::Placed {
-        symbol: Symbol::new(symbol),
-        shares,
-        direction,
-        broker: SupportedBroker::Schwab,
-        placed_at,
-    };
-
-    let submitted = broker_order_id
-        .as_ref()
-        .zip(executed_at)
-        .map(|(order_id, submitted_at)| OffchainOrderEvent::Submitted {
-            broker_order_id: order_id.clone(),
-            submitted_at,
-        });
-
-    let terminal = match status {
-        ExecutionStatus::Filled => {
-            let price = price_cents.ok_or_else(|| {
-                MigrationError::InvalidStatus {
-                    status: "FILLED".to_string(),
-                    reason: "Missing price_cents".to_string(),
-                }
-            })?;
-
-            let filled_at = executed_at.ok_or_else(|| {
-                MigrationError::InvalidStatus {
-                    status: "FILLED".to_string(),
-                    reason: "Missing executed_at".to_string(),
-                }
-            })?;
-
-            Some(OffchainOrderEvent::Filled {
-                price_cents: price,
-                filled_at,
-            })
-        }
-        ExecutionStatus::Failed => {
-            let failed_at = executed_at.ok_or_else(|| {
-                MigrationError::InvalidStatus {
-                    status: "FAILED".to_string(),
-                    reason: "Missing executed_at".to_string(),
-                }
-            })?;
-
-            Some(OffchainOrderEvent::Failed {
-                error: "Migrated from old schema".to_string(),
-                failed_at,
-            })
-        }
-        ExecutionStatus::Pending | ExecutionStatus::Submitted => None,
-    };
-
-    Ok(std::iter::once(placed)
-        .chain(submitted)
-        .chain(terminal)
-        .collect())
 }
 ```
 
@@ -1577,7 +1553,6 @@ fn build_offchain_order_events(
 
 ```rust
 async fn migrate_schwab_auth(pool: &SqlitePool) -> Result<(), MigrationError> {
-    // Read schwab_auth table
     let auth = sqlx::query!(
         r#"
         SELECT access_token, access_token_fetched_at,
@@ -1692,4 +1667,102 @@ async fn verify_positions(pool: &SqlitePool) -> Result<(), MigrationError> {
 
     Ok(())
 }
+```
+
+### **Testing Strategy**
+
+#### **Aggregate Testing**
+
+Use Given-When-Then pattern from `cqrs-es::test::TestFramework`:
+
+```rust
+#[test]
+fn test_position_accumulates_fills() {
+    PositionTestFramework::with(())
+        .given(vec![/* previous events */])
+        .when(PositionCommand::AcknowledgeOnChainFill { /* ... */ })
+        .then_expect_events(vec![PositionEvent::OnChainOrderFilled { /* ... */ }]);
+}
+```
+
+#### **View Testing**
+
+```rust
+#[test]
+fn test_view_updates_from_events() {
+    let event = PositionEvent::OnChainOrderFilled { /* ... */ };
+    let envelope = EventEnvelope { /* ... */ };
+
+    let mut view = PositionView::default();
+    view.update(&envelope);
+
+    // Assert view state matches expected
+}
+```
+
+#### **Integration Testing**
+
+```rust
+#[tokio::test]
+async fn test_full_flow_blockchain_to_broker() {
+    // Setup test pool and CQRS instances
+    // Execute commands across aggregates
+    // Verify events persisted and views updated
+}
+```
+
+### **Code Organization**
+
+```
+Cargo.toml                        - Workspace definition (st0x-hedge + crates/broker)
+src/                              - Main st0x-hedge library crate
+  lib.rs                          - Library exports, CQRS setup
+  bin/
+    server.rs                     - Main arbitrage bot server (existing)
+    cli.rs                        - CLI for manual operations (existing)
+    reporter.rs                   - Reporter binary (existing)
+    migrate_to_events.rs          - Migration script for event store (NEW)
+  onchain_trade/
+    mod.rs                        - OnChainTrade aggregate
+    cmd.rs                        - OnChainTradeCommand enum
+    event.rs                      - OnChainTradeEvent enum
+    view.rs                       - OnChainTradeView + queries
+  position/
+    mod.rs                        - Position aggregate
+    cmd.rs                        - PositionCommand enum
+    event.rs                      - PositionEvent enum
+    view.rs                       - PositionView + queries
+  offchain_order/
+    mod.rs                        - OffchainOrder aggregate
+    cmd.rs                        - OffchainOrderCommand enum
+    event.rs                      - OffchainOrderEvent enum
+    view.rs                       - OffchainTradeView + queries
+    manager.rs                    - OrderManager for broker workflows
+  managers/
+    trade.rs                      - TradeManager for onchain->position coordination
+    order.rs                      - OrderManager for broker order workflows
+crates/
+  broker/                         - Broker abstraction library (existing)
+    Cargo.toml
+    src/
+      lib.rs
+      broker.rs                   - Broker trait
+      schwab/
+        mod.rs                    - Schwab broker implementation
+        auth.rs                   - SchwabAuth aggregate
+        cmd.rs                    - SchwabAuthCommand enum
+        event.rs                  - SchwabAuthEvent enum
+        view.rs                   - SchwabAuthView
+      alpaca.rs                   - Alpaca broker implementation
+      test_broker.rs              - Mock broker for testing
+```
+
+### **Dependencies**
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+sqlite-es = "0.1"  # Will be published open source
+cqrs-es = "0.4"
 ```
