@@ -1860,6 +1860,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cqrs-es"
+version = "0.4.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5da025e9082adb74e8bb2b7e93feed51c711aa6c384cc18ad03b463ed776db64"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "crc"
 version = "3.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5359,6 +5372,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlite-es"
+version = "0.1.0"
+source = "git+https://github.com/ST0x-Technology/st0x.issuance#a30e1ece20f7ce7f7843e5d136c4563d4d57940e"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cqrs-es",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5595,6 +5624,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "cqrs-es",
  "dotenvy",
  "flate2",
  "futures-util",
@@ -5614,6 +5644,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sqlite-es",
  "sqlx",
  "st0x-broker",
  "thiserror 2.0.17",

@@ -35,20 +35,20 @@ Add required dependencies and create the foundational event store tables.
 **Reasoning**: Infrastructure must exist before implementing aggregates. The
 event store and snapshot tables are the single source of truth.
 
-- [ ] Update `Cargo.toml` workspace dependencies
-  - [ ] Add `sqlite-es` from GitHub:
+- [x] Update `Cargo.toml` workspace dependencies
+  - [x] Add `sqlite-es` from GitHub:
         `sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }`
-  - [ ] Add `cqrs-es = "0.4"`
-  - [ ] Add `async-trait` if not already present
-- [ ] Create migration using `sqlx migrate add event_store`
-  - [ ] Copy exact schema from
+  - [x] Add `cqrs-es = "0.4"`
+  - [x] Add `async-trait` if not already present
+- [x] Create migration using `sqlx migrate add event_store`
+  - [x] Copy exact schema from
         `../st0x.issuance-b/migrations/20251016210348_init.sql`
-  - [ ] Tables: `events`, `snapshots`
-  - [ ] Events table has composite PK: (aggregate_type, aggregate_id, sequence)
-  - [ ] Indexes: idx_events_type, idx_events_aggregate
-  - [ ] All columns use exact types from reference (TEXT, BIGINT, JSON)
-- [ ] Run migration: `sqlx migrate run`
-- [ ] Verify tables created: `sqlite3 data/schwab.db .schema events`
+  - [x] Tables: `events`, `snapshots`
+  - [x] Events table has composite PK: (aggregate_type, aggregate_id, sequence)
+  - [x] Indexes: idx_events_type, idx_events_aggregate
+  - [x] All columns use exact types from reference (TEXT, BIGINT, JSON)
+- [x] Run migration: `sqlx migrate run`
+- [x] Verify tables created: `sqlite3 schwab.db .schema events`
 
 ## Task 2. OnChainTrade Feature Module
 
