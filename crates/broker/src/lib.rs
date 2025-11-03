@@ -69,7 +69,7 @@ pub trait Broker: Send + Sync + 'static {
 ///
 /// Ensures symbols are non-empty and provides type safety to prevent
 /// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Symbol(String);
 
 impl Symbol {
@@ -175,7 +175,7 @@ impl std::str::FromStr for SupportedBroker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     Buy,
     Sell,

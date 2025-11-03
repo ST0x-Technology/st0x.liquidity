@@ -10,6 +10,7 @@ mod error;
 mod lock;
 mod offchain;
 mod onchain;
+mod onchain_trade;
 mod queue;
 pub mod reporter;
 mod symbol;

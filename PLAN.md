@@ -55,49 +55,53 @@ event store and snapshot tables are the single source of truth.
 Implement the OnChainTrade aggregate - the simplest aggregate with linear
 lifecycle.
 
-**Reasoning**: OnChainTrade has simple state (Filled → Enriched) and no complex
-business rules. It's a good template for understanding the aggregate pattern
-before tackling Position.
+**Reasoning**: OnChainTrade has simple state (Unfilled → Filled → Enriched) and
+no complex business rules. It's a good template for understanding the aggregate
+pattern before tackling Position. The aggregate enforces lifecycle rules (must
+fill before enriching), while the view provides query-optimized projection (just
+trade data with optional enrichment fields).
 
-- [ ] Create `src/onchain_trade/` directory
-- [ ] Create `src/onchain_trade/event.rs`
-  - [ ] Define `OnChainTradeEvent` enum with variants: Filled, Enriched, Genesis
-  - [ ] Fields as specified in "OnChainTrade Aggregate" section of SPEC.md
-  - [ ] Derive Serialize, Deserialize, Debug, Clone
-  - [ ] Genesis variant for migration
-- [ ] Create `src/onchain_trade/cmd.rs`
-  - [ ] Define `OnChainTradeCommand` enum: Witness, Enrich
-  - [ ] Fields from "OnChainTrade Aggregate" section of SPEC.md
-- [ ] Create `src/onchain_trade/mod.rs`
-  - [ ] Define `OnChainTrade` enum: Filled, Enriched
-  - [ ] State fields from SPEC.md
-  - [ ] Implement `Aggregate` trait following pattern in
+- [x] Create `src/onchain_trade/` directory
+- [x] Create `src/onchain_trade/event.rs`
+  - [x] Define `OnChainTradeEvent` enum with variants: Filled, Enriched, Genesis
+  - [x] Fields as specified in "OnChainTrade Aggregate" section of SPEC.md
+  - [x] Derive Serialize, Deserialize, Debug, Clone
+  - [x] Genesis variant for migration
+- [x] Create `src/onchain_trade/cmd.rs`
+  - [x] Define `OnChainTradeCommand` enum: Witness, Enrich
+  - [x] Fields from "OnChainTrade Aggregate" section of SPEC.md
+- [x] Create `src/onchain_trade/mod.rs`
+  - [x] Define `OnChainTrade` enum: Unfilled, Filled, Enriched
+  - [x] State fields from SPEC.md
+  - [x] Implement `Aggregate` trait following pattern in
         `../st0x.issuance-b/src/mint/mod.rs` (search for "impl Aggregate for
         Mint")
-  - [ ] Associated types: Command, Event, Error, Services
-  - [ ] `handle()` method dispatches commands
-  - [ ] Business rules: can only enrich once, cannot enrich before fill
-- [ ] Define `OnChainTradeError` enum in mod.rs for aggregate errors
-- [ ] Create `src/onchain_trade/view.rs`
-  - [ ] Define `OnChainTradeView` enum following pattern from
-        `../st0x.issuance-b/src/mint/view.rs`
-  - [ ] Implement `View` trait from cqrs-es
-  - [ ] `update()` method handles OnChainTradeEvent variants
-- [ ] Create migration using `sqlx migrate add onchain_trade_view`
-  - [ ] Follow pattern from
+  - [x] Associated types: Command, Event, Error, Services
+  - [x] `handle()` method dispatches commands
+  - [x] Business rules: can only enrich once, cannot enrich before fill
+- [x] Define `OnChainTradeError` enum in mod.rs for aggregate errors
+- [x] Create `src/onchain_trade/view.rs`
+  - [x] Define `OnChainTradeView` enum per "OnChainTradeView" section of SPEC.md
+  - [x] States: Unavailable, Trade (with all fields including tx_hash,
+        log_index)
+  - [x] Note: View structure differs from aggregate - optimized for queries, not
+        lifecycle
+  - [x] Implement `View` trait from cqrs-es
+  - [x] `update()` method handles OnChainTradeEvent variants
+- [x] Create migration using `sqlx migrate add onchain_trade_view`
+  - [x] Follow pattern from
         `../st0x.issuance-b/migrations/20251017184504_create_mint_view.sql`
-  - [ ] Table: `onchain_trade_view` with columns: view_id (PK), version, payload
+  - [x] Table: `onchain_trade_view` with columns: view_id (PK), version, payload
         (JSON)
-  - [ ] Add STORED generated columns for frequently queried fields (tx_hash,
+  - [x] Add STORED generated columns for frequently queried fields (tx_hash,
         symbol, block_number)
-  - [ ] Add json_extract indexes for less common fields
-  - [ ] Schema details in "OnChain trade view" section of SPEC.md
-- [ ] Write unit tests in `src/onchain_trade/mod.rs`
-  - [ ] Test Witness command creates Filled event
-  - [ ] Test Enrich command creates Enriched event
-  - [ ] Test cannot enrich twice
-  - [ ] Test Genesis event initialization
-- [ ] Export from `src/lib.rs`: `pub mod onchain_trade;`
+  - [x] Add json_extract indexes for less common fields
+  - [x] Schema details in "OnChain trade view" section of SPEC.md
+- [x] Write unit tests in `src/onchain_trade/mod.rs`
+  - [x] Test Witness command creates Filled event
+  - [x] Test Enrich command creates Enriched event
+  - [x] Test cannot enrich twice
+  - [x] Test Genesis event initialization
 
 ## Task 3. Position Feature Module
 
@@ -148,7 +152,6 @@ coordinates with broker orders. This needs careful testing.
   - [ ] Test pending execution prevents new execution
   - [ ] Test threshold update audit trail
   - [ ] Test Genesis event migration
-- [ ] Export from `src/lib.rs`
 
 ## Task 4. OffchainOrder Feature Module
 
@@ -187,7 +190,6 @@ multiple valid state transitions that need to be encoded correctly.
   - [ ] Test all valid state transitions
   - [ ] Test invalid transitions return errors
   - [ ] Test Genesis event with different statuses
-- [ ] Export from `src/lib.rs`
 
 ## Task 5. SchwabAuth Aggregate
 
@@ -219,7 +221,6 @@ event sourcing for audit trail of token refreshes. This goes in existing
   - [ ] view_id = 'schwab' (always)
   - [ ] payload contains encrypted tokens
 - [ ] Write tests for token storage and refresh
-- [ ] Update `src/schwab/mod.rs` exports
 
 ## Task 6. MetricsPnL View
 
@@ -241,7 +242,6 @@ calculates from both OnChainTrade and Position events to track profitability.
   - [ ] STORED generated columns for: symbol, timestamp, trade_type
   - [ ] Indexes on symbol, timestamp, and composite
 - [ ] Add query functions for PnL analysis
-- [ ] Export from `src/lib.rs`
 
 **Note**: MetricsPnLView registration with CQRS instances happens in Task 8.
 
