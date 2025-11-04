@@ -11,6 +11,7 @@ mod lock;
 mod offchain;
 mod onchain;
 mod onchain_trade;
+mod position;
 mod queue;
 pub mod reporter;
 mod symbol;

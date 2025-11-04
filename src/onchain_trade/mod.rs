@@ -158,7 +158,7 @@ impl Aggregate for OnChainTrade {
                     };
                 }
             }
-            OnChainTradeEvent::Genesis {
+            OnChainTradeEvent::Migrated {
                 symbol,
                 amount,
                 direction,
@@ -324,7 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_genesis_event_with_enrichment() {
+    async fn test_migrated_event_with_enrichment() {
         let mut aggregate = OnChainTrade::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
@@ -336,7 +336,7 @@ mod tests {
             publish_time: now,
         };
 
-        let genesis_event = OnChainTradeEvent::Genesis {
+        let migrated_event = OnChainTradeEvent::Migrated {
             symbol,
             amount: dec!(10.5),
             direction: Direction::Buy,
@@ -348,18 +348,18 @@ mod tests {
             migrated_at: now,
         };
 
-        aggregate.apply(genesis_event);
+        aggregate.apply(migrated_event);
 
         assert!(matches!(aggregate, OnChainTrade::Enriched { .. }));
     }
 
     #[tokio::test]
-    async fn test_genesis_event_without_enrichment() {
+    async fn test_migrated_event_without_enrichment() {
         let mut aggregate = OnChainTrade::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
-        let genesis_event = OnChainTradeEvent::Genesis {
+        let migrated_event = OnChainTradeEvent::Migrated {
             symbol,
             amount: dec!(10.5),
             direction: Direction::Buy,
@@ -371,7 +371,7 @@ mod tests {
             migrated_at: now,
         };
 
-        aggregate.apply(genesis_event);
+        aggregate.apply(migrated_event);
 
         assert!(matches!(aggregate, OnChainTrade::Filled { .. }));
     }

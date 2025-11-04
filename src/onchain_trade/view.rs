@@ -2,8 +2,8 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Sqlite};
 use st0x_broker::{Direction, Symbol};
+use tracing::error;
 
 use super::{OnChainTrade, OnChainTradeEvent, PythPrice};
 
@@ -71,15 +71,18 @@ impl OnChainTradeView {
     }
 
     fn handle_enriched(&mut self, gas_used: u64, pyth_price: PythPrice) {
-        if let Self::Trade {
+        let Self::Trade {
             gas_used: gas_ref,
             pyth_price: pyth_ref,
             ..
         } = self
-        {
-            *gas_ref = Some(gas_used);
-            *pyth_ref = Box::new(Some(pyth_price));
-        }
+        else {
+            error!("Enriched event received but OnChainTradeView is Unavailable. Event ignored.");
+            return;
+        };
+
+        *gas_ref = Some(gas_used);
+        *pyth_ref = Box::new(Some(pyth_price));
     }
 }
 
@@ -103,7 +106,7 @@ impl View<OnChainTrade> for OnChainTradeView {
             } => {
                 self.handle_enriched(*gas_used, pyth_price.clone());
             }
-            OnChainTradeEvent::Genesis {
+            OnChainTradeEvent::Migrated {
                 symbol,
                 amount,
                 direction,
@@ -132,76 +135,12 @@ impl View<OnChainTrade> for OnChainTradeView {
     }
 }
 
-pub(crate) async fn find_by_tx_hash_and_log_index(
-    pool: &Pool<Sqlite>,
-    tx_hash: &str,
-    log_index: u64,
-) -> Result<Option<OnChainTradeView>, OnChainTradeViewError> {
-    let view_id = format!("{tx_hash}:{log_index}");
-    let row = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM onchain_trade_view
-        WHERE view_id = ?
-        "#,
-        view_id
-    )
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-
-    let view: OnChainTradeView = serde_json::from_str(&row.payload)?;
-
-    Ok(Some(view))
-}
-
-pub(crate) async fn find_by_symbol(
-    pool: &Pool<Sqlite>,
-    symbol: &str,
-) -> Result<Vec<OnChainTradeView>, OnChainTradeViewError> {
-    let symbol_pattern = format!("%\"symbol\":\"{symbol}\"%");
-    let rows = sqlx::query!(
-        r#"
-        SELECT payload as "payload: String"
-        FROM onchain_trade_view
-        WHERE payload LIKE ?
-        ORDER BY view_id
-        "#,
-        symbol_pattern
-    )
-    .fetch_all(pool)
-    .await?;
-
-    rows.into_iter()
-        .map(|row| serde_json::from_str(&row.payload).map_err(OnChainTradeViewError::from))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
-    use sqlx::{Pool, Sqlite, sqlite::SqlitePoolOptions};
     use std::collections::HashMap;
-
-    async fn setup_test_db() -> Pool<Sqlite> {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect(":memory:")
-            .await
-            .expect("Failed to create in-memory database");
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
-
-        pool
-    }
 
     #[test]
     fn test_view_update_from_filled_event() {
@@ -326,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn test_view_update_from_genesis_event_with_enrichment() {
+    fn test_view_update_from_migrated_event_with_enrichment() {
         let symbol = Symbol::new("AAPL").unwrap();
         let amount = dec!(10.5);
         let direction = Direction::Buy;
@@ -342,7 +281,7 @@ mod tests {
             publish_time: chrono::Utc::now(),
         };
 
-        let event = OnChainTradeEvent::Genesis {
+        let event = OnChainTradeEvent::Migrated {
             symbol: symbol.clone(),
             amount,
             direction,
@@ -385,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn test_view_update_from_genesis_event_without_enrichment() {
+    fn test_view_update_from_migrated_event_without_enrichment() {
         let symbol = Symbol::new("AAPL").unwrap();
         let amount = dec!(10.5);
         let direction = Direction::Buy;
@@ -394,7 +333,7 @@ mod tests {
         let block_timestamp = chrono::Utc::now();
         let migrated_at = chrono::Utc::now();
 
-        let event = OnChainTradeEvent::Genesis {
+        let event = OnChainTradeEvent::Migrated {
             symbol: symbol.clone(),
             amount,
             direction,
@@ -459,133 +398,5 @@ mod tests {
         view.update(&envelope);
 
         assert!(matches!(view, OnChainTradeView::Unavailable));
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_returns_view() {
-        let pool = setup_test_db().await;
-
-        let symbol = Symbol::new("TSLA").unwrap();
-        let view = OnChainTradeView::Trade {
-            tx_hash: "0xfind123".to_string(),
-            log_index: 7,
-            symbol: symbol.clone(),
-            amount: dec!(50.0),
-            direction: Direction::Sell,
-            price_usdc: dec!(200.50),
-            block_number: 54321,
-            block_timestamp: chrono::Utc::now(),
-            gas_used: Some(60000),
-            pyth_price: Box::new(None),
-            recorded_at: chrono::Utc::now(),
-        };
-
-        let view_id = "0xfind123:7";
-        let payload = serde_json::to_string(&view).expect("Failed to serialize view");
-
-        sqlx::query!(
-            r"
-            INSERT INTO onchain_trade_view (view_id, version, payload)
-            VALUES (?, 1, ?)
-            ",
-            view_id,
-            payload
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to insert view");
-
-        let result = find_by_tx_hash_and_log_index(&pool, "0xfind123", 7)
-            .await
-            .expect("Query should succeed");
-
-        assert!(result.is_some());
-
-        let OnChainTradeView::Trade {
-            tx_hash,
-            log_index,
-            symbol: found_symbol,
-            ..
-        } = result.unwrap()
-        else {
-            panic!("Expected Trade variant");
-        };
-
-        assert_eq!(tx_hash, "0xfind123");
-        assert_eq!(log_index, 7);
-        assert_eq!(found_symbol, symbol);
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_returns_none_when_not_found() {
-        let pool = setup_test_db().await;
-
-        let result = find_by_tx_hash_and_log_index(&pool, "0xnonexistent", 999)
-            .await
-            .expect("Query should succeed");
-
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_find_by_symbol_returns_multiple_views() {
-        let pool = setup_test_db().await;
-
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        let view1 = OnChainTradeView::Trade {
-            tx_hash: "0xsym1".to_string(),
-            log_index: 1,
-            symbol: symbol.clone(),
-            amount: dec!(10.0),
-            direction: Direction::Buy,
-            price_usdc: dec!(150.0),
-            block_number: 1000,
-            block_timestamp: chrono::Utc::now(),
-            gas_used: None,
-            pyth_price: Box::new(None),
-            recorded_at: chrono::Utc::now(),
-        };
-
-        let view2 = OnChainTradeView::Trade {
-            tx_hash: "0xsym2".to_string(),
-            log_index: 2,
-            symbol: symbol.clone(),
-            amount: dec!(20.0),
-            direction: Direction::Sell,
-            price_usdc: dec!(151.0),
-            block_number: 1001,
-            block_timestamp: chrono::Utc::now(),
-            gas_used: Some(50000),
-            pyth_price: Box::new(None),
-            recorded_at: chrono::Utc::now(),
-        };
-
-        for (view_id, view) in [("0xsym1:1", &view1), ("0xsym2:2", &view2)] {
-            let payload = serde_json::to_string(view).expect("Failed to serialize view");
-            sqlx::query!(
-                r"
-                INSERT INTO onchain_trade_view (view_id, version, payload)
-                VALUES (?, 1, ?)
-                ",
-                view_id,
-                payload
-            )
-            .execute(&pool)
-            .await
-            .expect("Failed to insert view");
-        }
-
-        let results = find_by_symbol(&pool, "AAPL")
-            .await
-            .expect("Query should succeed");
-
-        assert_eq!(results.len(), 2);
-
-        let expected_symbol = Symbol::new("AAPL").unwrap();
-        assert!(results.iter().all(|v| matches!(
-            v,
-            OnChainTradeView::Trade { symbol, .. } if symbol == &expected_symbol
-        )));
     }
 }

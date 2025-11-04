@@ -14,6 +14,17 @@ pub(crate) struct PythPrice {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum OnChainTradeEvent {
+    Migrated {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+        migrated_at: DateTime<Utc>,
+    },
     Filled {
         symbol: Symbol,
         amount: Decimal,
@@ -28,25 +39,14 @@ pub(crate) enum OnChainTradeEvent {
         pyth_price: PythPrice,
         enriched_at: DateTime<Utc>,
     },
-    Genesis {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        gas_used: Option<u64>,
-        pyth_price: Option<PythPrice>,
-        migrated_at: DateTime<Utc>,
-    },
 }
 
 impl DomainEvent for OnChainTradeEvent {
     fn event_type(&self) -> String {
         match self {
+            Self::Migrated { .. } => "OnChainTradeEvent::Migrated".to_string(),
             Self::Filled { .. } => "OnChainTradeEvent::Filled".to_string(),
             Self::Enriched { .. } => "OnChainTradeEvent::Enriched".to_string(),
-            Self::Genesis { .. } => "OnChainTradeEvent::Genesis".to_string(),
         }
     }
 

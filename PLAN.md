@@ -63,10 +63,11 @@ trade data with optional enrichment fields).
 
 - [x] Create `src/onchain_trade/` directory
 - [x] Create `src/onchain_trade/event.rs`
-  - [x] Define `OnChainTradeEvent` enum with variants: Filled, Enriched, Genesis
+  - [x] Define `OnChainTradeEvent` enum with variants: Filled, Enriched,
+        Migrated
   - [x] Fields as specified in "OnChainTrade Aggregate" section of SPEC.md
   - [x] Derive Serialize, Deserialize, Debug, Clone
-  - [x] Genesis variant for migration
+  - [x] Migrated variant for migration
 - [x] Create `src/onchain_trade/cmd.rs`
   - [x] Define `OnChainTradeCommand` enum: Witness, Enrich
   - [x] Fields from "OnChainTrade Aggregate" section of SPEC.md
@@ -101,7 +102,7 @@ trade data with optional enrichment fields).
   - [x] Test Witness command creates Filled event
   - [x] Test Enrich command creates Enriched event
   - [x] Test cannot enrich twice
-  - [x] Test Genesis event initialization
+  - [x] Test Migrated event initialization
 
 ## Task 3. Position Feature Module
 
@@ -112,46 +113,57 @@ management.
 shares, decides when to execute based on configurable thresholds, and
 coordinates with broker orders. This needs careful testing.
 
-- [ ] Create `src/position/` directory
-- [ ] Create `src/position/event.rs`
-  - [ ] Define `PositionEvent` enum with all variants from "Position Aggregate"
+- [x] Create `src/position/` directory
+- [x] Create `src/position/event.rs`
+  - [x] Define newtypes: TradeId (struct with tx_hash, log_index), ExecutionId,
+        BrokerOrderId, PriceCents, FractionalShares
+  - [x] TradeId uses TxHash from alloy (not String)
+  - [x] FractionalShares wraps Decimal with arithmetic traits (Add, Sub,
+        AddAssign, SubAssign)
+  - [x] Define `PositionEvent` enum with all variants from "Position Aggregate"
         section of SPEC.md
-  - [ ] Variants: Initialized, OnChainOrderFilled, OffChainOrderPlaced,
-        OffChainOrderFilled, OffChainOrderFailed, ThresholdUpdated, Genesis
-  - [ ] Define `TriggerReason` enum
-  - [ ] Define `ExecutionThreshold` enum: Shares, DollarValue
-- [ ] Create `src/position/cmd.rs`
-  - [ ] Define `PositionCommand` enum from SPEC.md
-  - [ ] Commands: Initialize, AcknowledgeOnChainFill, PlaceOffChainOrder,
+  - [x] Variants: Initialized, OnChainOrderFilled, OffChainOrderPlaced,
+        OffChainOrderFilled, OffChainOrderFailed, ThresholdUpdated, Migrated
+  - [x] Define `TriggerReason` enum
+  - [x] Define `ExecutionThreshold` enum: Shares, DollarValue
+  - [x] Migrated event includes threshold field for migration
+- [x] Create `src/position/cmd.rs`
+  - [x] Define `PositionCommand` enum from SPEC.md
+  - [x] Commands: Initialize, AcknowledgeOnChainFill, PlaceOffChainOrder,
         CompleteOffChainOrder, FailOffChainOrder, UpdateThreshold
-- [ ] Create `src/position/mod.rs`
-  - [ ] Define `Position` struct with fields from "Position Aggregate" section
-  - [ ] Implement `Aggregate` trait
-  - [ ] `handle()` method with business rules from SPEC.md:
-    - [ ] Threshold required before processing fills
-    - [ ] Check shares vs dollar threshold
-    - [ ] Opposite direction for hedge
-    - [ ] No multiple pending executions
-    - [ ] Always apply onchain fills
-    - [ ] Emit OffChainOrderPlaced when threshold crossed
-  - [ ] Define `PositionError` enum
-- [ ] Create `src/position/view.rs`
-  - [ ] Define `PositionView` enum (Unavailable, Position)
-  - [ ] Implement `View` trait
-  - [ ] Replaces current `trade_accumulators` table
-- [ ] Create migration using `sqlx migrate add position_view`
-  - [ ] Table: `position_view` with schema from "Position view" section of
+- [x] Create `src/position/mod.rs`
+  - [x] Define `Position` struct with fields from "Position Aggregate" section
+  - [x] Field naming: `net` (not `net_position`) to avoid clippy
+        struct_field_names warning
+  - [x] Implement `Aggregate` trait
+  - [x] `handle()` method with business rules from SPEC.md:
+    - [x] Threshold required before processing fills
+    - [x] Check shares threshold (dollar threshold check returns None for now)
+    - [x] No multiple pending executions
+    - [x] Always apply onchain fills
+    - [x] Emit OffChainOrderPlaced when threshold crossed
+  - [x] Define `PositionError` enum
+  - [x] Migrated event handling in apply() method with threshold default to
+        Shares(Decimal::ONE)
+- [x] Create `src/position/view.rs`
+  - [x] Define `PositionView` enum (Unavailable, Position)
+  - [x] Implement `View` trait
+  - [x] Broke down large update() into smaller handler methods to satisfy clippy
+        too_many_lines
+  - [x] Replaces current `trade_accumulators` table
+- [x] Create migration using `sqlx migrate add position_view`
+  - [x] Table: `position_view` with schema from "Position view" section of
         SPEC.md
-  - [ ] STORED generated columns for: symbol, net_position, last_updated
-  - [ ] Indexes on symbol, net_position, last_updated
+  - [x] STORED generated columns for: symbol, net_position, last_updated
+  - [x] Indexes on symbol, net_position, last_updated
 - [ ] Write comprehensive unit tests
   - [ ] Test threshold initialization
   - [ ] Test onchain fill accumulation
   - [ ] Test shares threshold triggers execution
-  - [ ] Test dollar threshold triggers execution
+  - [ ] Test dollar threshold (when implemented)
   - [ ] Test pending execution prevents new execution
   - [ ] Test threshold update audit trail
-  - [ ] Test Genesis event migration
+  - [ ] Test Migrated event migration with default threshold
 
 ## Task 4. OffchainOrder Feature Module
 
@@ -164,8 +176,8 @@ multiple valid state transitions that need to be encoded correctly.
 - [ ] Create `src/offchain_order/event.rs`
   - [ ] Define `OffchainOrderEvent` enum from "OffchainOrder Aggregate" section
         of SPEC.md
-  - [ ] Variants: Placed, Submitted, PartiallyFilled, Filled, Failed, Genesis
-  - [ ] Define `GenesisOrderStatus` enum for migration
+  - [ ] Variants: Placed, Submitted, PartiallyFilled, Filled, Failed, Migrated
+  - [ ] Define `MigratedOrderStatus` enum for migration
 - [ ] Create `src/offchain_order/cmd.rs`
   - [ ] Define `OffchainOrderCommand` enum from SPEC.md
   - [ ] Commands: Place, ConfirmSubmission, UpdatePartialFill, CompleteFill,
@@ -189,7 +201,7 @@ multiple valid state transitions that need to be encoded correctly.
 - [ ] Write unit tests
   - [ ] Test all valid state transitions
   - [ ] Test invalid transitions return errors
-  - [ ] Test Genesis event with different statuses
+  - [ ] Test Migrated event with different statuses
 
 ## Task 5. SchwabAuth Aggregate
 
@@ -315,8 +327,8 @@ database access. Each aggregate gets its own CQRS instance.
 
 Implement the migration script to backfill existing data using genesis events.
 
-**Reasoning**: Production data must be preserved. Genesis events snapshot legacy
-state without synthesizing complete event histories.
+**Reasoning**: Production data must be preserved. Migrated events snapshot
+legacy state without synthesizing complete event histories.
 
 - [ ] Create `src/bin/migrate_to_events.rs`
 - [ ] Implement main migration flow
@@ -327,20 +339,20 @@ state without synthesizing complete event histories.
 - [ ] Implement
       `migrate_onchain_trades(pool: &SqlitePool, cqrs: &SqliteCqrs<OnChainTrade>)`
   - [ ] Query all rows from `onchain_trades` ordered by created_at
-  - [ ] For each row, execute command that produces Genesis event
+  - [ ] For each row, execute command that produces Migrated event
   - [ ] Handle optional pyth_price fields (NULL → None)
   - [ ] Use tx_hash:log_index as aggregate_id
 - [ ] Implement
       `migrate_positions(pool: &SqlitePool, cqrs: &SqliteCqrs<Position>)`
   - [ ] Query all rows from `trade_accumulators`
-  - [ ] For each row, execute command that produces Genesis event
+  - [ ] For each row, execute command that produces Migrated event
   - [ ] Default threshold: ExecutionThreshold::Shares(1.0)
   - [ ] Use symbol as aggregate_id
 - [ ] Implement
       `migrate_offchain_orders(pool: &SqlitePool, cqrs: &SqliteCqrs<OffchainOrder>)`
   - [ ] Query all rows from `offchain_trades` ordered by id
-  - [ ] For each row, execute command that produces Genesis event
-  - [ ] Map status strings to GenesisOrderStatus enum
+  - [ ] For each row, execute command that produces Migrated event
+  - [ ] Map status strings to MigratedOrderStatus enum
   - [ ] Use execution id as aggregate_id
 - [ ] Implement
       `migrate_schwab_auth(pool: &SqlitePool, cqrs: &SqliteCqrs<SchwabAuth>)`

@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tokio::task::JoinHandle;
 
@@ -141,7 +143,7 @@ impl std::fmt::Display for InvalidDirectionError {
 
 impl std::error::Error for InvalidDirectionError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum SupportedBroker {
     Schwab,
     Alpaca,
