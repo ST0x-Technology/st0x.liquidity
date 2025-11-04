@@ -150,20 +150,33 @@ coordinates with broker orders. This needs careful testing.
   - [x] Implement `View` trait
   - [x] Broke down large update() into smaller handler methods to satisfy clippy
         too_many_lines
+  - [x] Added error logging to all handlers (no silent failures or panics)
+  - [x] Fixed direction handling in OffChainOrderFilled (buy vs sell)
   - [x] Replaces current `trade_accumulators` table
 - [x] Create migration using `sqlx migrate add position_view`
   - [x] Table: `position_view` with schema from "Position view" section of
         SPEC.md
   - [x] STORED generated columns for: symbol, net_position, last_updated
   - [x] Indexes on symbol, net_position, last_updated
-- [ ] Write comprehensive unit tests
-  - [ ] Test threshold initialization
-  - [ ] Test onchain fill accumulation
-  - [ ] Test shares threshold triggers execution
-  - [ ] Test dollar threshold (when implemented)
-  - [ ] Test pending execution prevents new execution
-  - [ ] Test threshold update audit trail
-  - [ ] Test Migrated event migration with default threshold
+- [x] Write comprehensive unit tests (47 total: 32 aggregate + 15 view)
+  - [x] Aggregate tests in mod.rs:
+    - [x] Test threshold initialization
+    - [x] Test onchain fill accumulation
+    - [x] Test shares threshold triggers execution
+    - [x] Test pending execution prevents new execution
+    - [x] Test threshold update audit trail
+    - [x] Test Migrated event with non-optional threshold
+    - [x] Test error conditions (ThresholdNotMet, PendingExecution, etc.)
+  - [x] View tests in view.rs:
+    - [x] Test all event handlers update state correctly
+    - [x] Test onchain fills (buy and sell) update net and accumulators
+    - [x] Test offchain placed/filled/failed lifecycle
+    - [x] Test direction logic in OffChainOrderFilled (buy increases, sell
+          decreases)
+    - [x] Test threshold updated event
+    - [x] Test Migrated event reconstruction
+    - [x] Test error handling (events on Unavailable state log and are ignored)
+    - [x] Test invalid symbol remains Unavailable with error logging
 
 ## Task 4. OffchainOrder Feature Module
 
@@ -172,36 +185,48 @@ Implement the OffchainOrder aggregate tracking broker order lifecycle.
 **Reasoning**: OffchainOrder models the state machine for broker orders. It has
 multiple valid state transitions that need to be encoded correctly.
 
-- [ ] Create `src/offchain_order/` directory
-- [ ] Create `src/offchain_order/event.rs`
-  - [ ] Define `OffchainOrderEvent` enum from "OffchainOrder Aggregate" section
+- [x] Create `src/offchain_order/` directory
+- [x] Create `src/offchain_order/event.rs`
+  - [x] Define `OffchainOrderEvent` enum from "OffchainOrder Aggregate" section
         of SPEC.md
-  - [ ] Variants: Placed, Submitted, PartiallyFilled, Filled, Failed, Migrated
-  - [ ] Define `MigratedOrderStatus` enum for migration
-- [ ] Create `src/offchain_order/cmd.rs`
-  - [ ] Define `OffchainOrderCommand` enum from SPEC.md
-  - [ ] Commands: Place, ConfirmSubmission, UpdatePartialFill, CompleteFill,
+  - [x] Variants: Placed, Submitted, PartiallyFilled, Filled, Failed, Migrated
+  - [x] Define `MigratedOrderStatus` enum for migration
+- [x] Create `src/offchain_order/cmd.rs`
+  - [x] Define `OffchainOrderCommand` enum from SPEC.md
+  - [x] Commands: Place, ConfirmSubmission, UpdatePartialFill, CompleteFill,
         MarkFailed
-- [ ] Create `src/offchain_order/mod.rs`
-  - [ ] Define `OffchainOrder` enum from SPEC.md
-  - [ ] States: NotPlaced, Pending, Submitted, PartiallyFilled, Filled, Failed
-  - [ ] Implement `Aggregate` trait
-  - [ ] Valid state transitions in `handle()` method
-  - [ ] Define `OffchainOrderError` enum
-- [ ] Create `src/offchain_order/view.rs`
-  - [ ] Define `OffchainTradeView` enum
-  - [ ] Define `ExecutionStatus` enum (Pending, Submitted, Filled, Failed)
-  - [ ] Implement `View` trait
-  - [ ] Replaces current `offchain_trades` table
-- [ ] Create migration using `sqlx migrate add offchain_trade_view`
-  - [ ] Table: `offchain_trade_view` with schema from "Offchain trade view"
+- [x] Create `src/offchain_order/mod.rs`
+  - [x] Define `OffchainOrder` enum from SPEC.md
+  - [x] States: NotPlaced, Pending, Submitted, PartiallyFilled, Filled, Failed
+  - [x] Implement `Aggregate` trait with helper methods to satisfy clippy
+  - [x] Valid state transitions in `handle()` method
+  - [x] Define `OffchainOrderError` enum
+  - [x] Added error logging for inconsistent state transitions (no silent
+        failures)
+- [x] Create `src/offchain_order/view.rs`
+  - [x] Define `OffchainOrderView` enum (renamed from OffchainTradeView for
+        consistency)
+  - [x] Define `ExecutionStatus` enum (Pending, Submitted, Filled, Failed)
+  - [x] Implement `View` trait with error logging
+  - [x] Replaces current `offchain_trades` table
+- [x] Create migration using `sqlx migrate add offchain_order_view`
+  - [x] Table: `offchain_order_view` with schema from "Offchain trade view"
         section of SPEC.md
-  - [ ] STORED generated columns for: symbol, status, broker
-  - [ ] Indexes on symbol, status, broker
-- [ ] Write unit tests
-  - [ ] Test all valid state transitions
-  - [ ] Test invalid transitions return errors
-  - [ ] Test Migrated event with different statuses
+  - [x] STORED generated columns for: execution_id, symbol, status, broker,
+        broker_order_id
+  - [x] Indexes on execution_id, symbol, status, broker, broker_order_id
+- [x] Write comprehensive unit tests (35 total: 19 aggregate + 16 view)
+  - [x] Aggregate tests (19): Test all valid state transitions (Place → Pending
+        → Submitted → PartiallyFilled → Filled/Failed)
+  - [x] Aggregate tests: Test invalid transitions return errors (NotPlaced,
+        AlreadySubmitted, AlreadyCompleted)
+  - [x] Aggregate tests: Test Migrated event with different statuses (Pending,
+        Submitted, Filled, Failed with error)
+  - [x] View tests (16): Test all event handlers update state correctly
+  - [x] View tests: Test events on Unavailable state log errors and don't change
+        state
+  - [x] View tests: Test invalid aggregate_id remains Unavailable with error
+        logging
 
 ## Task 5. SchwabAuth Aggregate
 

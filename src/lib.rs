@@ -9,6 +9,7 @@ pub mod env;
 mod error;
 mod lock;
 mod offchain;
+mod offchain_order;
 mod onchain;
 mod onchain_trade;
 mod position;
