@@ -54,7 +54,7 @@ and the system proves market fit.
 2. Bot monitors Raindex for clears involving any orders from the arbitrageur's
    owner address
 3. Bot records onchain trades and accumulates net position changes per symbol
-4. When accumulated net position reaches an absolute value of ≥1.0 share,
+4. When accumulated net position reaches an absolute value of >=1.0 share,
    execute offsetting trade for floor(abs(net_position)) shares on the selected
    brokerage, using the sign of the net position to determine side (positive =
    sell to reduce a long, negative = buy to cover a short), and continue
@@ -81,13 +81,33 @@ Example (Offchain Batching):
 - Continue accumulating fractional amount until next whole share threshold is
   reached
 
-**Rebalancing Process (Manual for now):**
+**Rebalancing Process:**
 
-- Monitor inventory drift over time, executing st0x bridge transfers to
-  rebalance equity positions on/offchain
-- Move stablecoins/USD as needed to maintain adequate trading capital
-- Maintain sufficient offchain equity positions to match potential onchain sales
-  and vice versa
+**Alpaca (Automated):**
+
+- **Inventory Monitoring**: InventoryView tracks total inventory across venues
+  (onchain tokens + offchain shares, onchain USDC + offchain USDC)
+- **Imbalance Detection**: When imbalance ratios exceed thresholds (>60% equity
+  imbalance, >70% USDC imbalance), trigger automated rebalancing
+- **Equity Rebalancing**:
+  - Too many tokens onchain: Redeem tokens -> receive shares at Alpaca
+  - Too many shares offchain: Mint tokens from shares -> receive tokens onchain
+- **USDC Rebalancing**:
+  - Too much USDC onchain: Bridge via Circle CCTP (Base -> Ethereum) -> deposit
+    to Alpaca
+  - Too much USDC offchain: Withdraw from Alpaca -> bridge via Circle CCTP
+    (Ethereum -> Base) -> deposit to orderbook vault
+- **Complete Audit Trail**: All rebalancing operations tracked as events
+  (EquityMint, EquityRedemption, UsdcRebalance aggregates)
+- **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
+  cross-chain USDC transfers
+
+**Schwab (Manual):**
+
+- Rebalancing for Schwab-based operations remains manual
+- Monitor inventory drift over time
+- Execute manual transfers as needed to maintain adequate trading capital
+- No automated rebalancing infrastructure for Schwab
 
 ## **Bot Implementation Specification**
 
@@ -308,7 +328,7 @@ We will migrate st0x.liquidity-a to DDD/CQRS/ES patterns for:
 ### **Migration Strategy Overview**
 
 This migration will transform the current database from a CRUD-style schema to
-an event-sourced architecture:
+an event-sourced architecture through **three independently deployable phases**.
 
 **Before**: Multiple mutable state tables with potential contradictions
 
@@ -324,6 +344,144 @@ column names as current tables. This allows most queries to work with only table
 name changes (e.g., `onchain_trades` -> `onchain_trade_view`). Additionally, we
 can create specialized views that pre-compute complex metrics, simplifying
 queries and improving performance.
+
+#### **Phase 1: Dual-Write Foundation (Shadow Mode)**
+
+**Goal**: Run CQRS/ES alongside existing system to validate correctness before
+cutting over.
+
+**Implementation**:
+
+- Implement event sourcing infrastructure (sqlite-es integration)
+- Create event store and view tables via migrations
+- Implement all aggregates with command/event modeling (OnChainTrade, Position,
+  OffchainOrder, SchwabAuth)
+- Implement data import binary to convert existing CRUD data to events
+- Implement dual-write: Conductor writes to **BOTH** old tables AND event store
+- Events persist and update views, but **views are NOT yet used for reads**
+- Old tables remain the source of truth for all queries (API, CLI, Grafana)
+- Monitoring/logging to compare old table data vs new view data
+
+**Deployment sequence**:
+
+1. Deploy schema migrations (creates event store and view tables)
+2. Run data import binary once (`migrate_to_events`) to convert all existing
+   CRUD data into events
+3. Start application with dual-write enabled (reads from old tables, writes to
+   both)
+4. Verify views match old tables and new events appear in both systems
+5. Monitor for errors and performance issues
+
+**Benefits**:
+
+- **Low risk**: Old system continues working; new system validates in shadow
+  mode
+- **Complete data**: Event store contains all data from day one, enabling proper
+  validation
+- **Real-world validation**: Event sourcing logic tested against actual
+  production data
+- **Easy rollback**: Stop writing events; old system unaffected
+- **Catch discrepancies**: Identify any bugs in event logic before cutover
+
+**Deployment verification**:
+
+- After import: Verify view counts and sample records match old tables exactly
+- After dual-write starts: Spot check that new events appear in both systems
+- Monitor for any errors in event processing
+- Confirm no performance degradation
+
+**Phase complete when**:
+
+- Dual-write running in production for sufficient validation period
+- View data consistently matches old table data
+- No event processing errors
+- Performance acceptable
+
+#### **Phase 2: Rebalancing Feature (New Feature on CQRS/ES)**
+
+**Goal**: Implement inventory rebalancing using CQRS/ES architecture from day
+one.
+
+**Why now**:
+
+- Rebalancing is a business priority
+- Building on new architecture proves CQRS/ES works for new features
+- Avoids having to migrate rebalancing logic later
+- Demonstrates value of event sourcing (complete audit trail for all rebalancing
+  operations)
+
+**Implementation scope**:
+
+- Three rebalancing aggregates (EquityMint, EquityRedemption, UsdcRebalance)
+- Integration with Alpaca for share/USDC management
+- Integration with Circle CCTP bridge (Ethereum mainnet <-> Base for USDC)
+- InventoryView for monitoring imbalance ratios
+- RebalancingManager for triggering rebalancing operations
+- Complete event-sourced audit trail for all rebalancing operations
+
+**Integration points**:
+
+- Alpaca for share and USDC management
+- Circle's USDC native bridge via CCTP (cross-chain transfers between Ethereum
+  mainnet and Base)
+- Rain OrderBook (deposit2/withdraw2 for vault operations on Base)
+- Position aggregate (provides inventory data to InventoryView)
+
+**Benefits**:
+
+- New feature built using the new architecture
+- Proves CQRS/ES architecture in production
+- Complete audit trail for compliance and debugging
+- Easier to reason about rebalancing state transitions
+
+**Phase complete when**:
+
+- Rebalancing working in production with Alpaca
+- Complete audit trail visible in events
+- No issues with CQRS/ES patterns
+
+#### **Phase 3: Complete Migration (Cut Over to Views)**
+
+**Goal**: Make views the source of truth and remove old tables.
+
+**Implementation**:
+
+- Update Conductor to read from views instead of old tables
+- Update API/CLI to query views
+- Implement remaining managers (TradeManager, OrderManager)
+- Add MetricsPnL view for financial analysis
+- Stop writing to old tables
+- After validation period, drop old tables
+
+**Cutover approach**:
+
+- Switch application reads from old tables to views
+- Stop dual-write (only write to event store)
+- Monitor for issues
+- After validation period, drop old tables
+
+**Benefits**:
+
+- Old system completely removed
+- Full CQRS/ES benefits realized (time-travel debugging, easy projections,
+  complete audit trail)
+- Cleaner codebase
+- Foundation for future features
+
+**Phase complete when**:
+
+- All reads happening from views
+- No code querying old tables
+- Production running successfully on views
+- Old tables dropped
+
+#### **Phased Migration Benefits**
+
+- **Risk mitigation**: Each phase is independently deployable and reversible
+- **Incremental validation**: Catch issues early before they compound
+- **Business continuity**: System remains operational throughout migration
+- **Prove value early**: Rebalancing feature demonstrates CQRS/ES benefits
+- **Learn and adapt**: Each phase informs the next
 
 ### **Core Architecture**
 
@@ -892,7 +1050,7 @@ enum OffchainOrderCommand {
     CompleteFill {
         price_cents: PriceCents,
     },
-    MarkFailed {
+    Fail {
         error: String,
     },
 }
@@ -982,6 +1140,430 @@ enum SchwabAuthEvent {
 }
 ```
 
+### **Rebalancing Aggregates**
+
+**Note**: Automated rebalancing is **Alpaca-only**. These aggregates are not
+used for Schwab-based operations, which rely on manual rebalancing processes.
+
+Rebalancing manages inventory positions across venues (onchain vs offchain) by
+coordinating cross-venue asset movements. Three aggregates handle the different
+rebalancing flows for Alpaca operations.
+
+#### **EquityMint Aggregate**
+
+**Purpose**: Manages the process of converting offchain shares at Alpaca into
+onchain tokens.
+
+**Aggregate ID**: UUID for each mint request
+
+**States**:
+
+```rust
+enum EquityMint {
+    NotStarted,
+    MintRequested {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        requested_at: DateTime<Utc>,
+    },
+    MintAccepted {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        requested_at: DateTime<Utc>,
+        accepted_at: DateTime<Utc>,
+    },
+    TokensReceived {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        tx_hash: TxHash,
+        receipt_id: U256,
+        shares_minted: U256,
+        requested_at: DateTime<Utc>,
+        accepted_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+    },
+    Completed {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        tx_hash: TxHash,
+        receipt_id: U256,
+        shares_minted: U256,
+        requested_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        symbol: Symbol,
+        quantity: Decimal,
+        reason: String,
+        requested_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+**Commands**:
+
+```rust
+enum EquityMintCommand {
+    RequestMint {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+    },
+    AcknowledgeAcceptance {
+        issuer_request_id: String,
+        tokenization_request_id: String,
+    },
+    ReceiveTokens {
+        tx_hash: TxHash,
+        receipt_id: U256,
+        shares_minted: U256,
+    },
+    Finalize,
+    Fail {
+        reason: String,
+    },
+}
+```
+
+**Events**:
+
+```rust
+enum EquityMintEvent {
+    MintRequested {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        requested_at: DateTime<Utc>,
+    },
+    MintAccepted {
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        accepted_at: DateTime<Utc>,
+    },
+    TokensReceived {
+        tx_hash: TxHash,
+        receipt_id: U256,
+        shares_minted: U256,
+        received_at: DateTime<Utc>,
+    },
+    MintCompleted {
+        completed_at: DateTime<Utc>,
+    },
+    MintFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+**Business Rules**:
+
+- Can only request mint from NotStarted state
+- Mint acceptance requires valid issuer and tokenization request IDs
+- Tokens received requires transaction confirmation
+- Can mark failed from any non-terminal state
+
+#### **EquityRedemption Aggregate**
+
+**Purpose**: Manages the process of converting onchain tokens into offchain
+shares at Alpaca.
+
+**Aggregate ID**: UUID for each redeem request
+
+**States**:
+
+```rust
+enum EquityRedemption {
+    NotStarted,
+    TokensSent {
+        symbol: Symbol,
+        quantity: Decimal,
+        redemption_wallet: Address,
+        tx_hash: TxHash,
+        sent_at: DateTime<Utc>,
+    },
+    RedemptionDetected {
+        symbol: Symbol,
+        quantity: Decimal,
+        tx_hash: TxHash,
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        sent_at: DateTime<Utc>,
+        detected_at: DateTime<Utc>,
+    },
+    SharesJournaled {
+        symbol: Symbol,
+        quantity: Decimal,
+        tx_hash: TxHash,
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        sent_at: DateTime<Utc>,
+        detected_at: DateTime<Utc>,
+        journaled_at: DateTime<Utc>,
+    },
+    Completed {
+        symbol: Symbol,
+        quantity: Decimal,
+        tx_hash: TxHash,
+        issuer_request_id: String,
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        symbol: Symbol,
+        quantity: Decimal,
+        reason: String,
+        sent_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+**Commands**:
+
+```rust
+enum EquityRedemptionCommand {
+    SendTokens {
+        symbol: Symbol,
+        quantity: Decimal,
+        redemption_wallet: Address,
+    },
+    ConfirmRedemption {
+        issuer_request_id: String,
+        tokenization_request_id: String,
+    },
+    ConfirmJournaling,
+    Finalize,
+    Fail {
+        reason: String,
+    },
+}
+```
+
+**Events**:
+
+```rust
+enum EquityRedemptionEvent {
+    TokensSent {
+        symbol: Symbol,
+        quantity: Decimal,
+        redemption_wallet: Address,
+        tx_hash: TxHash,
+        sent_at: DateTime<Utc>,
+    },
+    RedemptionDetected {
+        issuer_request_id: String,
+        tokenization_request_id: String,
+        detected_at: DateTime<Utc>,
+    },
+    SharesJournaled {
+        journaled_at: DateTime<Utc>,
+    },
+    RedeemCompleted {
+        completed_at: DateTime<Utc>,
+    },
+    RedeemFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+**Business Rules**:
+
+- Can only send tokens from NotStarted state
+- Redemption detection waits for onchain transfer to be processed
+- Shares journaling confirmed via polling
+- Can mark failed from any non-terminal state
+
+#### **UsdcRebalance Aggregate**
+
+**Purpose**: Manages bidirectional USDC movements between Alpaca and Rain
+orderbook vaults via Circle CCTP bridge.
+
+**Aggregate ID**: Random UUID generated when rebalancing is initiated
+
+**States**:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum RebalancingDirection {
+    AlpacaToBase,
+    BaseToAlpaca,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AlpacaTransferId(String);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum TransferRef {
+    AlpacaId(AlpacaTransferId),
+    OnchainTx(TxHash),
+}
+
+enum UsdcRebalance {
+    NotStarted,
+    WithdrawalInitiated {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        withdrawal_ref: TransferRef,
+        initiated_at: DateTime<Utc>,
+    },
+    WithdrawalConfirmed {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        initiated_at: DateTime<Utc>,
+        confirmed_at: DateTime<Utc>,
+    },
+    BridgingInitiated {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: TxHash,
+        cctp_nonce: u64,
+        initiated_at: DateTime<Utc>,
+        burned_at: DateTime<Utc>,
+    },
+    BridgeAttestationReceived {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: TxHash,
+        cctp_nonce: u64,
+        attestation: Bytes,
+        initiated_at: DateTime<Utc>,
+        attested_at: DateTime<Utc>,
+    },
+    Bridged {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        minted_at: DateTime<Utc>,
+    },
+    DepositInitiated {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        deposit_ref: TransferRef,
+        initiated_at: DateTime<Utc>,
+        deposit_initiated_at: DateTime<Utc>,
+    },
+    DepositConfirmed {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        deposit_confirmed_at: DateTime<Utc>,
+    },
+    Completed {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    },
+    Failed {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
+**Commands**:
+
+```rust
+enum UsdcRebalanceCommand {
+    InitiateRebalancing {
+        direction: RebalancingDirection,
+        amount: Decimal,
+    },
+    InitiateWithdrawal {
+        withdrawal: TransferRef,
+    },
+    ConfirmWithdrawal,
+    InitiateBridging {
+        burn_tx: TxHash,
+        cctp_nonce: u64,
+    },
+    ReceiveAttestation {
+        attestation: Bytes,
+    },
+    ConfirmBridging {
+        mint_tx: TxHash,
+    },
+    InitiateDeposit {
+        deposit: TransferRef,
+    },
+    ConfirmDeposit,
+    Finalize,
+    Fail {
+        reason: String,
+    },
+}
+```
+
+        attestation: Bytes,
+**Business Rules**:
+
+- Direction determines source and destination (AlpacaToBase: Ethereum mainnet ->
+  Base, BaseToAlpaca: Base -> Ethereum mainnet)
+- Alpaca withdrawals/deposits are asynchronous: initiate with API call (get
+  transfer_id), poll status until COMPLETE
+- Onchain transactions are asynchronous: submit tx (get tx_hash), wait for
+  block inclusion and confirmation
+- Source withdrawal must be confirmed before bridge burn
+- Bridge burn transaction must be confirmed to extract CCTP nonce from event
+  logs
+- Attestation must be retrieved by polling Circle's REST API (~13 sec finality,
+  no websocket option available)
+- Bridge mint transaction requires valid attestation
+- Bridge mint transaction must be confirmed before destination deposit
+- Destination deposit must be confirmed to complete rebalancing
+- Can mark failed from any non-terminal state
+- Each rebalancing has unique UUID allowing multiple parallel operations
+
+**Integration Points**:
+
+- **Alpaca API**: Withdraw/deposit USDC
+- **Circle CCTP (Ethereum mainnet)**: TokenMessenger contract at
+  0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d
+- **Circle CCTP (Base)**: Same TokenMessenger contract address
+- **CCTP Domain IDs**: Ethereum = 0, Base = 6
+- **Circle Attestation API**: Poll for attestation using CCTP nonce
+- **Rain OrderBook**: deposit2()/withdraw2() for vault operations
+
+#### **Rebalancing Triggers**
+
+**Inventory Tracking**:
+
+The system tracks two separate inventory categories:
+
+1. **Per-Symbol Equity Inventory**: Each tokenized equity (AAPL, MSFT, etc.) has
+   independent inventory tracked across venues
+   - Onchain: Tokens in Rain orderbook vaults (Base)
+   - Offchain: Shares in Alpaca account
+   - Example: AAPL might be 80% onchain while MSFT is 30% onchain
+
+2. **Global USDC Inventory**: Total USDC across both venues
+   - Onchain: USDC in Rain orderbook vaults (Base)
+   - Offchain: USDC in Alpaca account
+   - Single global ratio (not per-symbol)
 ### **View Design**
 
 #### **Position View**
