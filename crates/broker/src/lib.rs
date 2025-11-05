@@ -346,10 +346,10 @@ mod tests {
 
     #[test]
     fn test_shares_new_max_boundary() {
-        let shares = Shares::new(u32::MAX as u64).unwrap();
+        let shares = Shares::new(u64::from(u32::MAX)).unwrap();
         assert_eq!(shares.to_string(), u32::MAX.to_string());
 
-        let result = Shares::new(u32::MAX as u64 + 1);
+        let result = Shares::new(u64::from(u32::MAX) + 1);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

@@ -230,34 +230,57 @@ multiple valid state transitions that need to be encoded correctly.
 
 ## Task 5. SchwabAuth Aggregate
 
-Update Schwab authentication to use CQRS pattern.
+Update Schwab authentication to use CQRS/ES pattern in broker crate.
 
-**Reasoning**: SchwabAuth is simple (NotAuthenticated → Authenticated) but needs
-event sourcing for audit trail of token refreshes. This goes in existing
-`src/schwab/` as it's Schwab-specific.
+**Reasoning**: SchwabAuth needs event sourcing for audit trail of token
+refreshes. Goes in broker crate alongside existing Schwab token management
+(`tokens.rs`, `auth.rs`, `encryption.rs`). Event sourcing becomes the single
+source of truth for token storage, replacing direct database writes in
+`tokens.rs`.
 
-- [ ] Create `src/schwab/auth_event.rs`
-  - [ ] Define `SchwabAuthEvent` enum from "SchwabAuth Aggregate" section of
+**Location**: `crates/broker/src/schwab/auth/` - follows feature module pattern
+like main crate aggregates
+
+- [x] Add dependencies to `crates/broker/Cargo.toml`
+  - [x] Add `cqrs-es = "0.4"`
+  - [x] Add
+        `sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }`
+- [x] Define `EncryptedToken` newtype in
+      `crates/broker/src/schwab/encryption.rs`
+  - [x] Move from `tokens.rs` type to proper newtype with Serialize/Deserialize
+  - [x] Wraps `Vec<u8>` with hex serialization via
+        `#[serde(with = "alloy::hex")]`
+- [x] Create `crates/broker/src/schwab/auth/` directory
+- [x] Create `crates/broker/src/schwab/auth/event.rs`
+  - [x] Define `SchwabAuthEvent` enum from "SchwabAuth Aggregate" section of
         SPEC.md
-  - [ ] Variants: TokensStored, AccessTokenRefreshed
-  - [ ] Use existing `EncryptedToken` type from `src/schwab/tokens.rs`
-- [ ] Create `src/schwab/auth_cmd.rs`
-  - [ ] Define `SchwabAuthCommand` enum from SPEC.md
-  - [ ] Commands: StoreTokens, RefreshAccessToken
-- [ ] Update `src/schwab/mod.rs` or create `src/schwab/auth_aggregate.rs`
-  - [ ] Define `SchwabAuth` enum (NotAuthenticated, Authenticated)
-  - [ ] Implement `Aggregate` trait
-  - [ ] Business rules: StoreTokens from NotAuthenticated, RefreshAccessToken
+  - [x] Variants: TokensStored, AccessTokenRefreshed
+  - [x] Use `EncryptedToken` type from `super::super::encryption`
+- [x] Create `crates/broker/src/schwab/auth/cmd.rs`
+  - [x] Define `SchwabAuthCommand` enum from SPEC.md
+  - [x] Commands: StoreTokens, RefreshAccessToken
+- [x] Create `crates/broker/src/schwab/auth/mod.rs`
+  - [x] Define `SchwabAuth` enum (NotAuthenticated, Authenticated)
+  - [x] Implement `Aggregate` trait
+  - [x] Business rules: StoreTokens from NotAuthenticated, RefreshAccessToken
         only when Authenticated
-- [ ] Create `src/schwab/auth_view.rs`
-  - [ ] Define `SchwabAuthView` for token storage
-  - [ ] Implement `View` trait
-- [ ] Create migration using `sqlx migrate add schwab_auth_view`
-  - [ ] Table: `schwab_auth_view` singleton with schema from "Schwab auth view"
+  - [x] Define `SchwabAuthError` enum
+- [x] Create `crates/broker/src/schwab/auth/view.rs`
+  - [x] Define `SchwabAuthView` enum for token storage
+  - [x] Implement `View` trait
+  - [x] Replaces current direct database access in `tokens.rs`
+- [x] Create migration using `sqlx migrate add schwab_auth_view`
+  - [x] Table: `schwab_auth_view` singleton with schema from "Schwab auth view"
         section
-  - [ ] view_id = 'schwab' (always)
-  - [ ] payload contains encrypted tokens
-- [ ] Write tests for token storage and refresh
+  - [x] view_id = 'schwab' (always)
+  - [x] version BIGINT
+  - [x] payload JSON (contains encrypted tokens)
+- [x] Write comprehensive unit tests
+  - [x] Test StoreTokens command creates Authenticated state
+  - [x] Test RefreshAccessToken updates access token only
+  - [x] Test cannot refresh when NotAuthenticated
+  - [x] Test view updates from events
+  - [x] Test token encryption/decryption round trip
 
 ## Task 6. MetricsPnL View
 

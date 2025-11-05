@@ -8,7 +8,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::{debug, info};
 
-use super::{SchwabError, tokens::SchwabTokens};
+use super::super::{SchwabError, tokens::SchwabTokens};
 
 #[derive(Parser, Debug, Clone)]
 pub struct SchwabAuthEnv {
