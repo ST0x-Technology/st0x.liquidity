@@ -18,6 +18,8 @@ pub(crate) enum OnChainTradeError {
     NotFilled,
     #[error("Trade has already been enriched")]
     AlreadyEnriched,
+    #[error("Trade has already been filled")]
+    AlreadyFilled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -76,19 +78,24 @@ impl Aggregate for OnChainTrade {
                 price_usdc,
                 block_number,
                 block_timestamp,
-            } => {
-                let now = Utc::now();
+            } => match self {
+                Self::Unfilled => {
+                    let now = Utc::now();
 
-                Ok(vec![OnChainTradeEvent::Filled {
-                    symbol,
-                    amount,
-                    direction,
-                    price_usdc,
-                    block_number,
-                    block_timestamp,
-                    filled_at: now,
-                }])
-            }
+                    Ok(vec![OnChainTradeEvent::Filled {
+                        symbol,
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_number,
+                        block_timestamp,
+                        filled_at: now,
+                    }])
+                }
+                Self::Filled { .. } | Self::Enriched { .. } => {
+                    Err(OnChainTradeError::AlreadyFilled)
+                }
+            },
             OnChainTradeCommand::Enrich {
                 gas_used,
                 pyth_price,
@@ -374,5 +381,81 @@ mod tests {
         aggregate.apply(migrated_event);
 
         assert!(matches!(aggregate, OnChainTrade::Filled { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_witness_twice_when_filled() {
+        let mut aggregate = OnChainTrade::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let filled_event = OnChainTradeEvent::Filled {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+        };
+        aggregate.apply(filled_event);
+
+        let command = OnChainTradeCommand::Witness {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+        };
+
+        let result = aggregate.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_witness_when_enriched() {
+        let mut aggregate = OnChainTrade::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let filled_event = OnChainTradeEvent::Filled {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+        };
+        aggregate.apply(filled_event);
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: now,
+        };
+
+        let enriched_event = OnChainTradeEvent::Enriched {
+            gas_used: 50000,
+            pyth_price,
+            enriched_at: now,
+        };
+        aggregate.apply(enriched_event);
+
+        let command = OnChainTradeCommand::Witness {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+        };
+
+        let result = aggregate.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
     }
 }
