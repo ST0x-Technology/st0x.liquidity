@@ -2152,7 +2152,11 @@ foundation for future enhancements.
 
 ### **Data Migration Strategy**
 
-#### **Backfilling Existing Data**
+**Note**: This data import occurs in **Phase 1** as part of initial deployment,
+before dual-write begins. This ensures the event store contains all existing
+data, allowing proper validation that views match old tables from day one.
+
+#### **Importing Existing Data**
 
 Use genesis events as snapshots from the legacy system. Migrated events
 initialize aggregates without synthesizing full event histories:
@@ -2232,9 +2236,13 @@ enum MigratedOrderStatus {
 }
 ```
 
-##### **Migration Script Structure**
+##### **Existing Data Import**
 
-Migration script: `src/bin/migrate_to_events.rs`
+One-time binary: `src/bin/migrate_to_events.rs`
+
+This binary converts existing CRUD data from old tables into the event store. It
+is separate from schema migrations (`sqlx migrate run`), which create tables
+automatically on every deployment.
 
 **Steps:**
 
@@ -2345,7 +2353,7 @@ src/                              - Main st0x-hedge library crate
     server.rs                     - Main arbitrage bot server (existing)
     cli.rs                        - CLI for manual operations (existing)
     reporter.rs                   - Reporter binary (existing)
-    migrate_to_events.rs          - Migration script for event store (NEW)
+    migrate_to_events.rs          - One-time existing data import (NEW)
   onchain_trade/
     mod.rs                        - OnChainTrade aggregate
     cmd.rs                        - OnChainTradeCommand enum
