@@ -1368,10 +1368,12 @@ enum EquityRedemptionEvent {
 **Business Rules**:
 
 - Can only send tokens from NotStarted state
-- Redemption transitions to Pending when detected in Alpaca API (via polling GET /v2/tokenization/requests)
+- Redemption transitions to Pending when detected in Alpaca API (via polling GET
+  /v2/tokenization/requests)
 - API returns status values: "pending", "completed", or "rejected"
 - Completed state indicates shares have been journaled to AP's account
-- Can mark failed from any non-terminal state (captures both API rejections and internal failures)
+- Can mark failed from any non-terminal state (captures both API rejections and
+  internal failures)
 
 #### **UsdcRebalance Aggregate**
 
@@ -1676,13 +1678,27 @@ know about cross-venue inventory.
 
 **InventoryView** listens to:
 
-- `PositionEvent::OnChainOrderFilled` - Updates onchain token count
-- `PositionEvent::OffChainOrderFilled` - Updates offchain share count
-- `TokenizedEquityMintEvent::MintCompleted` - Increases onchain, decreases
-  offchain
-- `EquityRedemptionEvent::RedeemCompleted` - Decreases onchain, increases
-  offchain
-- `UsdcRebalanceEvent::RebalancingCompleted` - Updates USDC distribution
+- `PositionEvent::OnChainOrderFilled` - Updates available balances (trading
+  activity)
+- `PositionEvent::OffChainOrderFilled` - Updates available balances (trading
+  activity)
+- `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
+  Alpaca)
+- `TokenizedEquityMintEvent::MintCompleted` - Moves from inflight to onchain
+  available
+- `TokenizedEquityMintEvent::MintFailed` - Reconciles inflight back to offchain
+  available
+- `EquityRedemptionEvent::TokensSent` - Moves tokens to inflight (sent to
+  redemption wallet)
+- `EquityRedemptionEvent::Completed` - Moves from inflight to offchain available
+- `EquityRedemptionEvent::Failed` - Reconciles inflight back to onchain
+  available
+- `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
+  source)
+- `UsdcRebalanceEvent::RebalancingCompleted` - Moves from inflight to
+  destination available
+- `UsdcRebalanceEvent::RebalancingFailed` - Reconciles inflight back to source
+  available
 
 **Separation of concerns**:
 
@@ -1933,55 +1949,119 @@ struct InventoryView {
     last_updated: DateTime<Utc>,
 }
 
+struct VenueBalance {
+    available: Decimal,
+    inflight: Decimal,
+}
+
 struct SymbolInventory {
     symbol: Symbol,
-    onchain_tokens: Decimal,
-    offchain_shares: Decimal,
-    imbalance_ratio: Decimal,  // onchain / (onchain + offchain)
+    onchain: VenueBalance,
+    offchain: VenueBalance,
     last_rebalancing: Option<DateTime<Utc>>,
 }
 
 struct UsdcInventory {
-    onchain_usdc: Decimal,
-    offchain_usdc: Decimal,
-    imbalance_ratio: Decimal,  // onchain / (onchain + offchain)
+    onchain: VenueBalance,
+    offchain: VenueBalance,
     last_rebalancing: Option<DateTime<Utc>>,
 }
 ```
 
-**Projection Logic**: Listens to multiple event streams and updates inventory:
+**Projection Logic**: Listens to multiple event streams and updates inventory.
 
-- `PositionEvent::OnChainOrderFilled` - Increases/decreases onchain token count
-- `PositionEvent::OffChainOrderFilled` - Increases/decreases offchain share
-  count
-- `TokenizedEquityMintEvent::MintCompleted` - Increases onchain tokens,
-  decreases offchain shares
-- `EquityRedemptionEvent::RedeemCompleted` - Decreases onchain tokens, increases
-  offchain shares
-- `UsdcRebalanceEvent::RebalancingCompleted` - Updates USDC distribution based
-  on direction
+**Trading Events**: Update available balances at the venue where trading occurs
+(onchain fills affect onchain available, offchain fills affect offchain
+available).
 
-**Imbalance Detection**: After each update, calculates imbalance ratios:
+**Equity Minting Events** (shares -> tokens):
 
-For each symbol independently:
+- When minting is accepted, shares move from offchain available to offchain
+  inflight
+- When minting completes, shares are removed from offchain inflight and tokens
+  are added to onchain available
+- When minting fails, shares move from offchain inflight back to offchain
+  available
 
-- `equity_ratio = onchain_tokens / (onchain_tokens + offchain_shares)`
-- `deviation = abs(equity_ratio - EQUITY_TARGET_RATIO)` (e.g., target = 0.5)
-- If `deviation > EQUITY_DEVIATION_THRESHOLD` (e.g., 0.2):
-  - If `equity_ratio > target`: Emit EquityImbalanceDetected for Redeem
-  - If `equity_ratio < target`: Emit EquityImbalanceDetected for Mint
-- Only trigger if total equity value exceeds minimum (e.g., $1000)
+**Equity Redemption Events** (tokens -> shares):
 
-For global USDC:
+- When tokens are sent to redemption wallet, tokens move from onchain available
+  to onchain inflight
+- When redemption completes, tokens are removed from onchain inflight and shares
+  are added to offchain available
+- When redemption fails, tokens move from onchain inflight back to onchain
+  available
 
-- `usdc_ratio = onchain_usdc / (onchain_usdc + offchain_usdc)`
-- `deviation = abs(usdc_ratio - USDC_TARGET_RATIO)` (e.g., target = 0.5)
-- If `deviation > USDC_DEVIATION_THRESHOLD` (e.g., 0.3):
-  - If `usdc_ratio > target`: Emit UsdcImbalanceDetected for BaseToAlpaca
-  - If `usdc_ratio < target`: Emit UsdcImbalanceDetected for AlpacaToBase
-- Only trigger if total USDC exceeds minimum (e.g., $5000)
+**USDC Rebalancing Events**: Similar pattern - withdrawal moves assets from
+source venue's available to inflight, completion moves from inflight to
+destination venue's available, failure reconciles inflight back to source
+venue's available.
+
+**Imbalance Detection**: After each update, calculates imbalance ratios using
+total inventory (available + inflight). Compares ratios against configured
+thresholds and minimum amounts. Only triggers rebalancing when no inflight
+operations exist for that symbol/USDC to prevent redundant operations.
+
+For each symbol independently, compares equity ratio against target (e.g., 0.5)
+with deviation threshold (e.g., 0.2). Triggers mint when too much offchain,
+triggers redeem when too much onchain.
+
+For global USDC, compares USDC ratio against target (e.g., 0.5) with deviation
+threshold (e.g., 0.3). Triggers AlpacaToBase when too much offchain, triggers
+BaseToAlpaca when too much onchain.
 
 Trigger events are emitted to RebalancingManager for execution.
+
+#### **Failure Handling and Reconciliation**
+
+**Automatic Reconciliation**: When rebalancing operations fail, the projection
+logic automatically reconciles inflight balances back to source venue's
+available balance. This ensures InventoryView remains accurate even when
+operations fail.
+
+**Manual Reconciliation Required**:
+
+Some failure scenarios may leave assets in states requiring manual intervention:
+
+1. **Redemption sent but Alpaca never recognizes**:
+   - Tokens successfully sent to redemption wallet (TokensSent)
+   - Alpaca API never shows the redemption request
+   - Tokens are neither in our orderbook vault nor credited to Alpaca
+   - **Resolution**: Contact Alpaca support with tx_hash to manually credit
+     shares
+
+2. **CCTP bridge stuck**:
+   - USDC burned on source chain (BridgingInitiated)
+   - Attestation retrieval fails or mint transaction repeatedly fails
+   - USDC is neither on source nor destination chain
+   - **Resolution**: Retry attestation fetching or mint transaction with
+     extended timeout
+
+3. **Mint accepted but tokens never arrive**:
+   - Shares taken from Alpaca (MintAccepted)
+   - Issuer/bridge never completes the mint
+   - Shares gone but tokens not received
+   - **Resolution**: Contact issuer/bridge provider to complete or reverse
+     transaction
+
+**Future Enhancement**: Add a `ReconciliationAggregate` to track manual
+interventions as first-class events:
+
+```rust
+enum ReconciliationCommand {
+    ReportStuckRedemption { redeem_id: Uuid, recovery_plan: String },
+    ResolveStuckRedemption { redeem_id: Uuid, resolution: Resolution },
+    // Similar commands for mint and USDC rebalancing
+}
+
+enum Resolution {
+    ManuallyCompleted { supporting_evidence: String },
+    ManuallyCancelled { refund_tx: Option<TxHash> },
+}
+```
+
+This would provide complete audit trail for all manual interventions and allow
+proper tracking of asset movements that required manual resolution.
 
 ### **Event Processing Flow**
 
