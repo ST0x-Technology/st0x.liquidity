@@ -28,6 +28,13 @@ pub(crate) enum PositionError {
     PendingExecution { execution_id: ExecutionId },
     #[error("Cannot complete offchain order: no pending execution")]
     NoPendingExecution,
+    #[error(
+        "Execution ID mismatch: expected {expected:?}, got {actual:?}"
+    )]
+    ExecutionIdMismatch {
+        expected: ExecutionId,
+        actual: ExecutionId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,8 +132,15 @@ impl Aggregate for Position {
                 price_cents,
                 broker_timestamp,
             } => {
-                if self.pending_execution_id.is_none() {
+                let Some(pending_id) = self.pending_execution_id else {
                     return Err(PositionError::NoPendingExecution);
+                };
+
+                if pending_id != execution_id {
+                    return Err(PositionError::ExecutionIdMismatch {
+                        expected: pending_id,
+                        actual: execution_id,
+                    });
                 }
 
                 Ok(vec![PositionEvent::OffChainOrderFilled {
@@ -142,8 +156,15 @@ impl Aggregate for Position {
                 execution_id,
                 error,
             } => {
-                if self.pending_execution_id.is_none() {
+                let Some(pending_id) = self.pending_execution_id else {
                     return Err(PositionError::NoPendingExecution);
+                };
+
+                if pending_id != execution_id {
+                    return Err(PositionError::ExecutionIdMismatch {
+                        expected: pending_id,
+                        actual: execution_id,
+                    });
                 }
 
                 Ok(vec![PositionEvent::OffChainOrderFailed {
