@@ -2,15 +2,41 @@ use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{Aes256Gcm, KeyInit};
 use alloy::primitives::FixedBytes;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 
 const NONCE_SIZE: usize = 12;
 
 pub(crate) type EncryptionKey = FixedBytes<32>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct EncryptedToken(#[serde(with = "alloy::hex")] Vec<u8>);
+
+impl EncryptedToken {
+    pub(crate) fn new(ciphertext: Vec<u8>) -> Self {
+        Self(ciphertext)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8]> for EncryptedToken {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for EncryptedToken {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
 pub(crate) fn encrypt_token(
     key: &EncryptionKey,
     plaintext: &str,
-) -> Result<Vec<u8>, EncryptionError> {
+) -> Result<EncryptedToken, EncryptionError> {
     let cipher = Aes256Gcm::new(key.as_slice().into());
 
     let mut nonce_bytes = [0u8; NONCE_SIZE];
@@ -21,17 +47,21 @@ pub(crate) fn encrypt_token(
         .encrypt(nonce, plaintext.as_bytes())
         .map_err(|_| EncryptionError::EncryptionFailed)?;
 
-    Ok(nonce_bytes
+    let combined: Vec<u8> = nonce_bytes
         .iter()
         .chain(ciphertext.iter())
         .copied()
-        .collect())
+        .collect();
+
+    Ok(EncryptedToken::new(combined))
 }
 
 pub(crate) fn decrypt_token(
     key: &EncryptionKey,
-    ciphertext: &[u8],
+    token: &EncryptedToken,
 ) -> Result<String, EncryptionError> {
+    let ciphertext = token.as_bytes();
+
     if ciphertext.len() < NONCE_SIZE {
         return Err(EncryptionError::InvalidCiphertext(format!(
             "Ciphertext too short: expected at least {} bytes, got {}",
@@ -69,9 +99,10 @@ pub enum EncryptionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::b256;
 
     fn create_test_key() -> EncryptionKey {
-        FixedBytes::from([0u8; 32])
+        b256!("0x0000000000000000000000000000000000000000000000000000000000000000")
     }
 
     #[test]
@@ -79,8 +110,8 @@ mod tests {
         let key = create_test_key();
         let plaintext = "test_access_token_12345";
 
-        let ciphertext = encrypt_token(&key, plaintext).unwrap();
-        let decrypted = decrypt_token(&key, &ciphertext).unwrap();
+        let token = encrypt_token(&key, plaintext).unwrap();
+        let decrypted = decrypt_token(&key, &token).unwrap();
 
         assert_eq!(plaintext, decrypted);
     }
@@ -90,21 +121,21 @@ mod tests {
         let key = create_test_key();
         let plaintext = "same_plaintext";
 
-        let ciphertext1 = encrypt_token(&key, plaintext).unwrap();
-        let ciphertext2 = encrypt_token(&key, plaintext).unwrap();
+        let token1 = encrypt_token(&key, plaintext).unwrap();
+        let token2 = encrypt_token(&key, plaintext).unwrap();
 
-        assert_ne!(ciphertext1, ciphertext2);
+        assert_ne!(token1, token2);
     }
 
     #[test]
     fn test_decryption_with_wrong_key() {
-        let key1 = FixedBytes::from([1u8; 32]);
-        let key2 = FixedBytes::from([2u8; 32]);
+        let key1 = b256!("0x0101010101010101010101010101010101010101010101010101010101010101");
+        let key2 = b256!("0x0202020202020202020202020202020202020202020202020202020202020202");
 
         let plaintext = "secret_token";
-        let ciphertext = encrypt_token(&key1, plaintext).unwrap();
+        let token = encrypt_token(&key1, plaintext).unwrap();
 
-        let result = decrypt_token(&key2, &ciphertext);
+        let result = decrypt_token(&key2, &token);
         assert!(matches!(
             result.unwrap_err(),
             EncryptionError::DecryptionFailed
@@ -115,8 +146,9 @@ mod tests {
     fn test_decrypt_short_ciphertext() {
         let key = create_test_key();
         let short_data = vec![0u8; NONCE_SIZE - 1];
+        let token = EncryptedToken::new(short_data);
 
-        let result = decrypt_token(&key, &short_data);
+        let result = decrypt_token(&key, &token);
         assert!(matches!(
             result.unwrap_err(),
             EncryptionError::InvalidCiphertext(_)
@@ -128,10 +160,12 @@ mod tests {
         let key = create_test_key();
         let plaintext = "test_token";
 
-        let mut ciphertext = encrypt_token(&key, plaintext).unwrap();
-        ciphertext[NONCE_SIZE] ^= 0xFF;
+        let token = encrypt_token(&key, plaintext).unwrap();
+        let mut bytes = token.0;
+        bytes[NONCE_SIZE] ^= 0xFF;
+        let corrupted_token = EncryptedToken::new(bytes);
 
-        let result = decrypt_token(&key, &ciphertext);
+        let result = decrypt_token(&key, &corrupted_token);
         assert!(matches!(
             result.unwrap_err(),
             EncryptionError::DecryptionFailed
@@ -143,8 +177,8 @@ mod tests {
         let key = create_test_key();
         let plaintext = "";
 
-        let ciphertext = encrypt_token(&key, plaintext).unwrap();
-        let decrypted = decrypt_token(&key, &ciphertext).unwrap();
+        let token = encrypt_token(&key, plaintext).unwrap();
+        let decrypted = decrypt_token(&key, &token).unwrap();
 
         assert_eq!(plaintext, decrypted);
     }
@@ -154,8 +188,8 @@ mod tests {
         let key = create_test_key();
         let plaintext = "a".repeat(10000);
 
-        let ciphertext = encrypt_token(&key, &plaintext).unwrap();
-        let decrypted = decrypt_token(&key, &ciphertext).unwrap();
+        let token = encrypt_token(&key, &plaintext).unwrap();
+        let decrypted = decrypt_token(&key, &token).unwrap();
 
         assert_eq!(plaintext, decrypted);
     }
@@ -165,9 +199,33 @@ mod tests {
         let key = create_test_key();
         let plaintext = "Hello 世界 🌍";
 
-        let ciphertext = encrypt_token(&key, plaintext).unwrap();
-        let decrypted = decrypt_token(&key, &ciphertext).unwrap();
+        let token = encrypt_token(&key, plaintext).unwrap();
+        let decrypted = decrypt_token(&key, &token).unwrap();
 
+        assert_eq!(plaintext, decrypted);
+    }
+
+    #[test]
+    fn test_encrypted_token_serialization() {
+        let key = create_test_key();
+        let plaintext = "test_token";
+
+        let token = encrypt_token(&key, plaintext).unwrap();
+
+        let json = serde_json::to_string(&token).unwrap();
+
+        assert!(
+            json.starts_with('"'),
+            "JSON should be a hex string, not an array"
+        );
+        assert!(
+            !json.contains('['),
+            "JSON should not contain array brackets"
+        );
+
+        let deserialized: EncryptedToken = serde_json::from_str(&json).unwrap();
+
+        let decrypted = decrypt_token(&key, &deserialized).unwrap();
         assert_eq!(plaintext, decrypted);
     }
 }

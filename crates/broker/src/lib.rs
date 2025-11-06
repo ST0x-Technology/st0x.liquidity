@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tokio::task::JoinHandle;
 
@@ -69,7 +71,7 @@ pub trait Broker: Send + Sync + 'static {
 ///
 /// Ensures symbols are non-empty and provides type safety to prevent
 /// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Symbol(String);
 
 impl Symbol {
@@ -141,7 +143,7 @@ impl std::fmt::Display for InvalidDirectionError {
 
 impl std::error::Error for InvalidDirectionError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum SupportedBroker {
     Schwab,
     Alpaca,
@@ -175,7 +177,7 @@ impl std::str::FromStr for SupportedBroker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     Buy,
     Sell,
@@ -344,10 +346,10 @@ mod tests {
 
     #[test]
     fn test_shares_new_max_boundary() {
-        let shares = Shares::new(u32::MAX as u64).unwrap();
+        let shares = Shares::new(u64::from(u32::MAX)).unwrap();
         assert_eq!(shares.to_string(), u32::MAX.to_string());
 
-        let result = Shares::new(u32::MAX as u64 + 1);
+        let result = Shares::new(u64::from(u32::MAX) + 1);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
