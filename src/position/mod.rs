@@ -11,8 +11,7 @@ pub(crate) mod view;
 
 pub(crate) use cmd::PositionCommand;
 pub(crate) use event::{
-    BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, PriceCents,
-    TriggerReason,
+    ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, TriggerReason,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -28,9 +27,7 @@ pub(crate) enum PositionError {
     PendingExecution { execution_id: ExecutionId },
     #[error("Cannot complete offchain order: no pending execution")]
     NoPendingExecution,
-    #[error(
-        "Execution ID mismatch: expected {expected:?}, got {actual:?}"
-    )]
+    #[error("Execution ID mismatch: expected {expected:?}, got {actual:?}")]
     ExecutionIdMismatch {
         expected: ExecutionId,
         actual: ExecutionId,
