@@ -1518,15 +1518,60 @@ enum UsdcRebalanceCommand {
 }
 ```
 
+**Events**:
+
+```rust
+enum UsdcRebalanceEvent {
+    RebalancingInitiated {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        initiated_at: DateTime<Utc>,
+    },
+    WithdrawalInitiated {
+        withdrawal_ref: TransferRef,
+        initiated_at: DateTime<Utc>,
+    },
+    WithdrawalConfirmed {
+        confirmed_at: DateTime<Utc>,
+    },
+    BridgingInitiated {
+        burn_tx_hash: TxHash,
+        cctp_nonce: u64,
+        burned_at: DateTime<Utc>,
+    },
+    BridgeAttestationReceived {
         attestation: Bytes,
+        attested_at: DateTime<Utc>,
+    },
+    Bridged {
+        mint_tx_hash: TxHash,
+        minted_at: DateTime<Utc>,
+    },
+    DepositInitiated {
+        deposit_ref: TransferRef,
+        deposit_initiated_at: DateTime<Utc>,
+    },
+    DepositConfirmed {
+        deposit_confirmed_at: DateTime<Utc>,
+    },
+    RebalancingCompleted {
+        completed_at: DateTime<Utc>,
+    },
+    RebalancingFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+```
+
 **Business Rules**:
 
 - Direction determines source and destination (AlpacaToBase: Ethereum mainnet ->
   Base, BaseToAlpaca: Base -> Ethereum mainnet)
 - Alpaca withdrawals/deposits are asynchronous: initiate with API call (get
   transfer_id), poll status until COMPLETE
-- Onchain transactions are asynchronous: submit tx (get tx_hash), wait for
-  block inclusion and confirmation
+- Onchain transactions are asynchronous: submit tx (get tx_hash), wait for block
+  inclusion and confirmation
 - Source withdrawal must be confirmed before bridge burn
 - Bridge burn transaction must be confirmed to extract CCTP nonce from event
   logs
@@ -1548,6 +1593,32 @@ enum UsdcRebalanceCommand {
 - **Circle Attestation API**: Poll for attestation using CCTP nonce
 - **Rain OrderBook**: deposit2()/withdraw2() for vault operations
 
+**CCTP Flow**:
+
+Alpaca to Base:
+
+1. Initiate USDC withdrawal from Alpaca (get transfer_id)
+2. Poll Alpaca API until withdrawal status is COMPLETE
+3. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
+4. Wait for burn tx confirmation and extract CCTP nonce from event logs
+5. Poll Circle attestation service for signature using CCTP nonce
+6. Submit receiveMessage() tx on Base MessageTransmitter with attestation
+7. Wait for mint tx confirmation
+8. Submit deposit tx to Rain orderbook vault on Base
+9. Wait for deposit tx confirmation
+
+Base to Alpaca:
+
+1. Submit withdraw tx from Rain orderbook vault on Base
+2. Wait for withdraw tx confirmation
+3. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0)
+4. Wait for burn tx confirmation and extract CCTP nonce from event logs
+5. Poll Circle attestation service for signature using CCTP nonce
+6. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
+7. Wait for mint tx confirmation
+8. Initiate USDC deposit to Alpaca (get transfer_id)
+9. Poll Alpaca API until deposit status is COMPLETE
+
 #### **Rebalancing Triggers**
 
 **Inventory Tracking**:
@@ -1564,6 +1635,74 @@ The system tracks two separate inventory categories:
    - Onchain: USDC in Rain orderbook vaults (Base)
    - Offchain: USDC in Alpaca account
    - Single global ratio (not per-symbol)
+
+**Imbalance Detection**:
+
+InventoryView calculates imbalances after each position or rebalancing event by
+checking per-symbol equity ratios and global USDC ratio against configured
+thresholds. When deviation exceeds the threshold and minimum amounts are met, it
+emits imbalance detection events.
+
+**Rebalancing Parameters** (configurable per environment):
+
+- **Equity per symbol**:
+  - Target ratio: 0.5 (aim for 50% onchain, 50% offchain)
+  - Deviation threshold: 0.2 (trigger when ratio deviates by +/-0.2 from target)
+  - Example: Triggers at <0.3 (mint) or >0.7 (redeem)
+  - Minimum rebalancing amount: e.g., $1000 equivalent to avoid tiny operations
+- **USDC global**:
+  - Target ratio: 0.5 (aim for 50% onchain, 50% offchain)
+  - Deviation threshold: 0.3 (trigger when ratio deviates by +/-0.3 from target)
+  - Example: Triggers at <0.2 (bridge to Base) or >0.8 (bridge to Alpaca)
+  - Minimum rebalancing amount: e.g., $5000 to avoid frequent small transfers
+
+**Trigger Events**:
+
+When thresholds crossed AND minimum amounts met, InventoryView emits:
+
+- `EquityImbalanceDetected { symbol, direction: Mint/Redeem, quantity,
+  estimated_value_usd }`
+- `UsdcImbalanceDetected { direction: AlpacaToBase/BaseToAlpaca, amount }`
+
+**Rebalancing Manager** (stateless) listens to these events and executes
+appropriate commands on EquityMint, EquityRedemption, or UsdcRebalance
+aggregates.
+
+**Example Scenarios**:
+
+1. **Heavy onchain trading in AAPL**: Sold lots of AAPL tokens onchain, now 85%
+   of AAPL inventory is offchain shares
+   - Trigger: Mint AAPL (shares -> tokens) to rebalance back toward 50/50
+
+2. **Depleted onchain USDC**: Bought lots of tokens with USDC, now only 15% of
+   USDC is onchain
+   - Trigger: Bridge USDC from Alpaca to Base to replenish trading capital
+
+3. **Mixed symbol imbalances**: AAPL 80% onchain, MSFT 25% onchain
+   - Trigger: Redeem AAPL (tokens -> shares) AND Mint MSFT (shares -> tokens)
+   - Each symbol rebalances independently
+
+#### **Coordination with Position Aggregate**
+
+**Position Aggregate** tracks net exposure from arbitrage trading but does NOT
+know about cross-venue inventory.
+
+**InventoryView** listens to:
+
+- `PositionEvent::OnChainOrderFilled` - Updates onchain token count
+- `PositionEvent::OffChainOrderFilled` - Updates offchain share count
+- `EquityMintEvent::MintCompleted` - Increases onchain, decreases offchain
+- `EquityRedemptionEvent::RedeemCompleted` - Decreases onchain, increases
+  offchain
+- `UsdcRebalanceEvent::RebalancingCompleted` - Updates USDC distribution
+
+**Separation of concerns**:
+
+- Position: Tracks trading-induced position changes
+- EquityMint/EquityRedemption: Tracks rebalancing-induced equity movements
+- UsdcRebalance: Tracks rebalancing-induced USDC movements
+- InventoryView: Combines all events to calculate total inventory
+
 ### **View Design**
 
 #### **Position View**
@@ -1683,6 +1822,179 @@ enum Venue {
 
 **Projection Logic**: Calculates from both `OnChainTradeEvent::Filled` and
 `PositionEvent::OffChainOrderFilled` events
+
+#### **EquityMintView**
+
+**Purpose**: Tracks all equity mint operations (Alpaca shares to onchain
+tokens).
+
+**View State**:
+
+```rust
+enum EquityMintView {
+    Unavailable,
+    Mint {
+        mint_id: Uuid,
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        status: MintStatus,
+        issuer_request_id: Option<String>,
+        tokenization_request_id: Option<String>,
+        tx_hash: Option<TxHash>,
+        receipt_id: Option<U256>,
+        requested_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
+    },
+}
+
+enum MintStatus {
+    Requested,
+    Accepted,
+    TokensReceived,
+    Completed,
+    Failed { reason: String },
+}
+```
+
+**Projection Logic**: Updates on `EquityMintEvent::*` events
+
+#### **EquityRedemptionView**
+
+**Purpose**: Tracks all equity redemption operations (onchain tokens to Alpaca
+shares).
+
+**View State**:
+
+```rust
+enum EquityRedemptionView {
+    Unavailable,
+    Redeem {
+        redeem_id: Uuid,
+        symbol: Symbol,
+        quantity: Decimal,
+        redemption_wallet: Address,
+        status: RedeemStatus,
+        issuer_request_id: Option<String>,
+        tokenization_request_id: Option<String>,
+        tx_hash: Option<TxHash>,
+        sent_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
+    },
+}
+
+enum RedeemStatus {
+    TokensSent,
+    RedemptionDetected,
+    SharesJournaled,
+    Completed,
+    Failed { reason: String },
+}
+```
+
+**Projection Logic**: Updates on `EquityRedemptionEvent::*` events
+
+#### **UsdcRebalanceView**
+
+**Purpose**: Tracks all USDC rebalancing operations across Alpaca and Base via
+Circle CCTP bridge.
+
+**View State**:
+
+```rust
+enum UsdcRebalanceView {
+    Unavailable,
+    Rebalancing {
+        rebalancing_id: Uuid,
+        direction: RebalancingDirection,
+        amount: Decimal,
+        status: RebalancingStatus,
+        burn_tx_hash: Option<TxHash>,
+        mint_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        initiated_at: DateTime<Utc>,
+        completed_at: Option<DateTime<Utc>>,
+    },
+}
+
+enum RebalancingStatus {
+    Initiated,
+    SourceWithdrawn,
+    BridgeBurned,
+    AttestationReceived,
+    BridgeMinted,
+    DestinationDeposited,
+    Completed,
+    Failed { reason: String },
+}
+```
+
+**Projection Logic**: Updates on `UsdcRebalanceEvent::*` events
+
+#### **InventoryView**
+
+**Purpose**: Aggregates inventory across all venues and detects imbalances that
+trigger rebalancing operations. This is the central view that monitors total
+system inventory.
+
+**View State**:
+
+```rust
+struct InventoryView {
+    per_symbol: HashMap<Symbol, SymbolInventory>,
+    usdc: UsdcInventory,
+    last_updated: DateTime<Utc>,
+}
+
+struct SymbolInventory {
+    symbol: Symbol,
+    onchain_tokens: Decimal,
+    offchain_shares: Decimal,
+    imbalance_ratio: Decimal,  // onchain / (onchain + offchain)
+    last_rebalancing: Option<DateTime<Utc>>,
+}
+
+struct UsdcInventory {
+    onchain_usdc: Decimal,
+    offchain_usdc: Decimal,
+    imbalance_ratio: Decimal,  // onchain / (onchain + offchain)
+    last_rebalancing: Option<DateTime<Utc>>,
+}
+```
+
+**Projection Logic**: Listens to multiple event streams and updates inventory:
+
+- `PositionEvent::OnChainOrderFilled` - Increases/decreases onchain token count
+- `PositionEvent::OffChainOrderFilled` - Increases/decreases offchain share
+  count
+- `EquityMintEvent::MintCompleted` - Increases onchain tokens, decreases
+  offchain shares
+- `EquityRedemptionEvent::RedeemCompleted` - Decreases onchain tokens, increases
+  offchain shares
+- `UsdcRebalanceEvent::RebalancingCompleted` - Updates USDC distribution based
+  on direction
+
+**Imbalance Detection**: After each update, calculates imbalance ratios:
+
+For each symbol independently:
+
+- `equity_ratio = onchain_tokens / (onchain_tokens + offchain_shares)`
+- `deviation = abs(equity_ratio - EQUITY_TARGET_RATIO)` (e.g., target = 0.5)
+- If `deviation > EQUITY_DEVIATION_THRESHOLD` (e.g., 0.2):
+  - If `equity_ratio > target`: Emit EquityImbalanceDetected for Redeem
+  - If `equity_ratio < target`: Emit EquityImbalanceDetected for Mint
+- Only trigger if total equity value exceeds minimum (e.g., $1000)
+
+For global USDC:
+
+- `usdc_ratio = onchain_usdc / (onchain_usdc + offchain_usdc)`
+- `deviation = abs(usdc_ratio - USDC_TARGET_RATIO)` (e.g., target = 0.5)
+- If `deviation > USDC_DEVIATION_THRESHOLD` (e.g., 0.3):
+  - If `usdc_ratio > target`: Emit UsdcImbalanceDetected for BaseToAlpaca
+  - If `usdc_ratio < target`: Emit UsdcImbalanceDetected for AlpacaToBase
+- Only trigger if total USDC exceeds minimum (e.g., $5000)
+
+Trigger events are emitted to RebalancingManager for execution.
 
 ### **Event Processing Flow**
 

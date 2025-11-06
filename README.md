@@ -315,9 +315,11 @@ to the `metrics_pnl` table, which is optimized for Grafana visualization.
   `schwab_executions` tables for auditing and reconciliation
 - **FIFO Accounting**: Maintains in-memory inventory state per symbol, rebuilt
   on startup by replaying all trades
-- **Composite Checkpoint**: Resumes from the last `(timestamp, trade_type,
-  trade_id)` tuple in metrics_pnl, ensuring deterministic ordering even when
-  multiple trades share identical timestamps (no trades are skipped)
+- **Composite Checkpoint**: Resumes from the last
+  `(timestamp, trade_type,
+  trade_id)` tuple in metrics_pnl, ensuring
+  deterministic ordering even when multiple trades share identical timestamps
+  (no trades are skipped)
 
 ## Project Structure
 
@@ -406,9 +408,11 @@ performance metrics in the `metrics_pnl` table for Grafana visualization.
 - **FIFO Accounting**: Oldest position lots are consumed first when closing
   positions
 - **In-Memory State**: FIFO inventory rebuilt on startup by replaying all trades
-- **Composite Checkpoint**: Resumes from the last `(timestamp, trade_type,
-  trade_id)` tuple in metrics_pnl, ensuring deterministic ordering even when
-  multiple trades share identical timestamps (no trades are skipped)
+- **Composite Checkpoint**: Resumes from the last
+  `(timestamp, trade_type,
+  trade_id)` tuple in metrics_pnl, ensuring
+  deterministic ordering even when multiple trades share identical timestamps
+  (no trades are skipped)
 - **All Trades Tracked**: Both position-increasing and position-reducing trades
   recorded
 
