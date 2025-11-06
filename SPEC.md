@@ -98,7 +98,7 @@ Example (Offchain Batching):
   - Too much USDC offchain: Withdraw from Alpaca -> bridge via Circle CCTP
     (Ethereum -> Base) -> deposit to orderbook vault
 - **Complete Audit Trail**: All rebalancing operations tracked as events
-  (EquityMint, EquityRedemption, UsdcRebalance aggregates)
+  (TokenizedEquityMint, EquityRedemption, UsdcRebalance aggregates)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
   cross-chain USDC transfers
 
@@ -412,7 +412,8 @@ one.
 
 **Implementation scope**:
 
-- Three rebalancing aggregates (EquityMint, EquityRedemption, UsdcRebalance)
+- Three rebalancing aggregates (TokenizedEquityMint, EquityRedemption,
+  UsdcRebalance)
 - Integration with Alpaca for share/USDC management
 - Integration with Circle CCTP bridge (Ethereum mainnet <-> Base for USDC)
 - InventoryView for monitoring imbalance ratios
@@ -1149,7 +1150,7 @@ Rebalancing manages inventory positions across venues (onchain vs offchain) by
 coordinating cross-venue asset movements. Three aggregates handle the different
 rebalancing flows for Alpaca operations.
 
-#### **EquityMint Aggregate**
+#### **TokenizedEquityMint Aggregate**
 
 **Purpose**: Manages the process of converting offchain shares at Alpaca into
 onchain tokens.
@@ -1159,7 +1160,7 @@ onchain tokens.
 **States**:
 
 ```rust
-enum EquityMint {
+enum TokenizedEquityMint {
     NotStarted,
     MintRequested {
         symbol: Symbol,
@@ -1214,7 +1215,7 @@ enum EquityMint {
 **Commands**:
 
 ```rust
-enum EquityMintCommand {
+enum TokenizedEquityMintCommand {
     RequestMint {
         symbol: Symbol,
         quantity: Decimal,
@@ -1239,7 +1240,7 @@ enum EquityMintCommand {
 **Events**:
 
 ```rust
-enum EquityMintEvent {
+enum TokenizedEquityMintEvent {
     MintRequested {
         symbol: Symbol,
         quantity: Decimal,
@@ -1665,7 +1666,7 @@ When thresholds crossed AND minimum amounts met, InventoryView emits:
 - `UsdcImbalanceDetected { direction: AlpacaToBase/BaseToAlpaca, amount }`
 
 **Rebalancing Manager** (stateless) listens to these events and executes
-appropriate commands on EquityMint, EquityRedemption, or UsdcRebalance
+appropriate commands on TokenizedEquityMint, EquityRedemption, or UsdcRebalance
 aggregates.
 
 **Example Scenarios**:
@@ -1691,7 +1692,8 @@ know about cross-venue inventory.
 
 - `PositionEvent::OnChainOrderFilled` - Updates onchain token count
 - `PositionEvent::OffChainOrderFilled` - Updates offchain share count
-- `EquityMintEvent::MintCompleted` - Increases onchain, decreases offchain
+- `TokenizedEquityMintEvent::MintCompleted` - Increases onchain, decreases
+  offchain
 - `EquityRedemptionEvent::RedeemCompleted` - Decreases onchain, increases
   offchain
 - `UsdcRebalanceEvent::RebalancingCompleted` - Updates USDC distribution
@@ -1699,7 +1701,8 @@ know about cross-venue inventory.
 **Separation of concerns**:
 
 - Position: Tracks trading-induced position changes
-- EquityMint/EquityRedemption: Tracks rebalancing-induced equity movements
+- TokenizedEquityMint/EquityRedemption: Tracks rebalancing-induced equity
+  movements
 - UsdcRebalance: Tracks rebalancing-induced USDC movements
 - InventoryView: Combines all events to calculate total inventory
 
@@ -1823,7 +1826,7 @@ enum Venue {
 **Projection Logic**: Calculates from both `OnChainTradeEvent::Filled` and
 `PositionEvent::OffChainOrderFilled` events
 
-#### **EquityMintView**
+#### **TokenizedEquityMintView**
 
 **Purpose**: Tracks all equity mint operations (Alpaca shares to onchain
 tokens).
@@ -1831,7 +1834,7 @@ tokens).
 **View State**:
 
 ```rust
-enum EquityMintView {
+enum TokenizedEquityMintView {
     Unavailable,
     Mint {
         mint_id: Uuid,
@@ -1857,7 +1860,7 @@ enum MintStatus {
 }
 ```
 
-**Projection Logic**: Updates on `EquityMintEvent::*` events
+**Projection Logic**: Updates on `TokenizedEquityMintEvent::*` events
 
 #### **EquityRedemptionView**
 
@@ -1967,8 +1970,8 @@ struct UsdcInventory {
 - `PositionEvent::OnChainOrderFilled` - Increases/decreases onchain token count
 - `PositionEvent::OffChainOrderFilled` - Increases/decreases offchain share
   count
-- `EquityMintEvent::MintCompleted` - Increases onchain tokens, decreases
-  offchain shares
+- `TokenizedEquityMintEvent::MintCompleted` - Increases onchain tokens,
+  decreases offchain shares
 - `EquityRedemptionEvent::RedeemCompleted` - Decreases onchain tokens, increases
   offchain shares
 - `UsdcRebalanceEvent::RebalancingCompleted` - Updates USDC distribution based
