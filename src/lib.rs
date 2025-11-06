@@ -10,6 +10,9 @@ mod error;
 mod lock;
 mod offchain;
 mod onchain;
+// TODO(#130): Remove dead_code allow when dual-write is implemented
+#[allow(dead_code)]
+mod onchain_trade;
 mod queue;
 pub mod reporter;
 mod symbol;
