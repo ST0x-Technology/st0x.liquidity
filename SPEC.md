@@ -1294,37 +1294,28 @@ enum EquityRedemption {
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
     },
-    RedemptionDetected {
+    Pending {
         symbol: Symbol,
         quantity: Decimal,
         tx_hash: TxHash,
-        issuer_request_id: String,
         tokenization_request_id: String,
         sent_at: DateTime<Utc>,
         detected_at: DateTime<Utc>,
-    },
-    SharesJournaled {
-        symbol: Symbol,
-        quantity: Decimal,
-        tx_hash: TxHash,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        sent_at: DateTime<Utc>,
-        detected_at: DateTime<Utc>,
-        journaled_at: DateTime<Utc>,
     },
     Completed {
         symbol: Symbol,
         quantity: Decimal,
         tx_hash: TxHash,
-        issuer_request_id: String,
+        tokenization_request_id: String,
         completed_at: DateTime<Utc>,
     },
     Failed {
         symbol: Symbol,
         quantity: Decimal,
+        tx_hash: Option<TxHash>,
+        tokenization_request_id: Option<String>,
         reason: String,
-        sent_at: DateTime<Utc>,
+        sent_at: Option<DateTime<Utc>>,
         failed_at: DateTime<Utc>,
     },
 }
@@ -1339,12 +1330,10 @@ enum EquityRedemptionCommand {
         quantity: Decimal,
         redemption_wallet: Address,
     },
-    ConfirmRedemption {
-        issuer_request_id: String,
+    Detect {
         tokenization_request_id: String,
     },
-    ConfirmJournaling,
-    Finalize,
+    Complete,
     Fail {
         reason: String,
     },
@@ -1362,18 +1351,14 @@ enum EquityRedemptionEvent {
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
     },
-    RedemptionDetected {
-        issuer_request_id: String,
+    Detected {
         tokenization_request_id: String,
         detected_at: DateTime<Utc>,
     },
-    SharesJournaled {
-        journaled_at: DateTime<Utc>,
-    },
-    RedeemCompleted {
+    Completed {
         completed_at: DateTime<Utc>,
     },
-    RedeemFailed {
+    Failed {
         reason: String,
         failed_at: DateTime<Utc>,
     },
@@ -1383,9 +1368,10 @@ enum EquityRedemptionEvent {
 **Business Rules**:
 
 - Can only send tokens from NotStarted state
-- Redemption detection waits for onchain transfer to be processed
-- Shares journaling confirmed via polling
-- Can mark failed from any non-terminal state
+- Redemption transitions to Pending when detected in Alpaca API (via polling GET /v2/tokenization/requests)
+- API returns status values: "pending", "completed", or "rejected"
+- Completed state indicates shares have been journaled to AP's account
+- Can mark failed from any non-terminal state (captures both API rejections and internal failures)
 
 #### **UsdcRebalance Aggregate**
 
@@ -1878,18 +1864,16 @@ enum EquityRedemptionView {
         quantity: Decimal,
         redemption_wallet: Address,
         status: RedeemStatus,
-        issuer_request_id: Option<String>,
         tokenization_request_id: Option<String>,
         tx_hash: Option<TxHash>,
-        sent_at: DateTime<Utc>,
+        sent_at: Option<DateTime<Utc>>,
         completed_at: Option<DateTime<Utc>>,
     },
 }
 
 enum RedeemStatus {
     TokensSent,
-    RedemptionDetected,
-    SharesJournaled,
+    Pending,
     Completed,
     Failed { reason: String },
 }
