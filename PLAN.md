@@ -34,14 +34,14 @@ with private implementation modules and minimal public API surface.
 extend the Alpaca broker crate to retrieve and cache it. This task is isolated
 to the broker crate to ensure changes work before moving to services.
 
-- [ ] Add `get_account_id()` method to `AlpacaClient` in
+- [x] Add `get_account_id()` method to `AlpacaClient` in
       `crates/broker/src/alpaca/auth.rs`
-- [ ] Call `/v2/account` endpoint and extract account ID field
-- [ ] Cache account ID in `AlpacaClient` after first retrieval to prevent
+- [x] Call `/v2/account` endpoint and extract account ID field
+- [x] Cache account ID in `AlpacaClient` after first retrieval to prevent
       repeated API calls
-- [ ] Add tests with `httpmock`: successful retrieval, caching behavior, error
+- [x] Add tests with `httpmock`: successful retrieval, caching behavior, error
       handling
-- [ ] Run `cargo test -p st0x-broker -q`,
+- [x] Run `cargo test -p st0x-broker -q`,
       `cargo clippy -p st0x-broker -- -D clippy::all`, `cargo fmt`
 
 ## Task 2. Implement Deposit Address Retrieval
@@ -51,7 +51,7 @@ state changes), making it ideal for establishing the HTTP client pattern and
 service architecture. This proves the design before adding complexity.
 
 - [ ] Create `src/services/mod.rs` with module declaration for `alpaca_wallet`
-- [ ] Add `mod services;` to `src/lib.rs` (with `#[allow(dead_code)]` for now)
+- [ ] Add `mod services;` to `src/lib.rs`
 - [ ] Create `src/services/alpaca_wallet/mod.rs` with private submodules
 - [ ] Create `src/services/alpaca_wallet/client.rs`:
   - [ ] Define `AlpacaWalletClient` struct with `reqwest::Client`, account ID,
@@ -217,7 +217,6 @@ prevent misuse. Final checks ensure production quality.
       flow, polling
 - [ ] Document all error variants with clear descriptions
 - [ ] Verify Debug implementations redact secrets (API keys)
-- [ ] Remove `#[allow(dead_code)]` from `src/lib.rs` services module
 - [ ] Run full test suite: `cargo test -q`
 - [ ] Run clippy: `cargo clippy --all-targets --all-features -- -D clippy::all`
 - [ ] Run formatter: `cargo fmt`
