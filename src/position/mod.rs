@@ -11,7 +11,8 @@ pub(crate) mod view;
 
 pub(crate) use cmd::PositionCommand;
 pub(crate) use event::{
-    ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, TriggerReason,
+    BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, PriceCents,
+    TriggerReason,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq)]
