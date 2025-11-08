@@ -13,6 +13,7 @@ mod offchain;
 #[allow(dead_code)]
 mod offchain_order;
 mod onchain;
+mod services;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
 #[allow(dead_code)]
 mod onchain_trade;

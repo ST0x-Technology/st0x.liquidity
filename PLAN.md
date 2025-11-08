@@ -50,29 +50,29 @@ to the broker crate to ensure changes work before moving to services.
 state changes), making it ideal for establishing the HTTP client pattern and
 service architecture. This proves the design before adding complexity.
 
-- [ ] Create `src/services/mod.rs` with module declaration for `alpaca_wallet`
-- [ ] Add `mod services;` to `src/lib.rs`
-- [ ] Create `src/services/alpaca_wallet/mod.rs` with private submodules
-- [ ] Create `src/services/alpaca_wallet/client.rs`:
-  - [ ] Define `AlpacaWalletClient` struct with `reqwest::Client`, account ID,
+- [x] Create `src/services/mod.rs` with module declaration for `alpaca_wallet`
+- [x] Add `mod services;` to `src/lib.rs`
+- [x] Create `src/services/alpaca_wallet/mod.rs` with private submodules
+- [x] Create `src/services/alpaca_wallet/client.rs`:
+  - [x] Define `AlpacaWalletClient` struct with `reqwest::Client`, account ID,
         base URL, credentials
-  - [ ] Define minimal `AlpacaWalletError` enum: `HttpError`, `ApiError`,
+  - [x] Define minimal `AlpacaWalletError` enum: `HttpError`, `ApiError`,
         `InvalidResponse`
-  - [ ] Implement `new()` using `AlpacaClient::get_account_id()` from Task 1
-  - [ ] Implement helper for HTTP GET with auth headers (APCA-API-KEY-ID,
+  - [x] Implement `new()` using `AlpacaClient::get_account_id()` from Task 1
+  - [x] Implement helper for HTTP GET with auth headers (APCA-API-KEY-ID,
         APCA-API-SECRET-KEY)
-  - [ ] Add tests: client construction, auth headers, error parsing
-- [ ] Create `src/services/alpaca_wallet/transfer.rs`:
-  - [ ] Define `DepositAddress` struct: `address: String`, `asset: String`,
+  - [x] Add tests: client construction, auth headers, error parsing
+- [x] Create `src/services/alpaca_wallet/transfer.rs`:
+  - [x] Define `DepositAddress` struct: `address: String`, `asset: String`,
         `network: String`
-  - [ ] Implement `get_deposit_address()` function calling
+  - [x] Implement `get_deposit_address()` function calling
         `GET /v1/crypto/funding_wallets?asset={asset}&network={network}`
-  - [ ] Add tests: successful retrieval for USDC/Ethereum, invalid
+  - [x] Add tests: successful retrieval for USDC/Ethereum, invalid
         asset/network, API errors, malformed JSON
-- [ ] Update `src/services/alpaca_wallet/mod.rs` to re-export
+- [x] Update `src/services/alpaca_wallet/mod.rs` to re-export
       `AlpacaWalletClient`, `AlpacaWalletError` (keep submodules private)
-- [ ] Update `src/services/mod.rs` to re-export `alpaca_wallet` module
-- [ ] Run `cargo test -q`,
+- [x] Update `src/services/mod.rs` to re-export `alpaca_wallet` module
+- [x] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
 ## Task 3. Implement Withdrawal Initiation
