@@ -96,6 +96,12 @@ impl Default for OnChainTrade {
     }
 }
 
+impl OnChainTrade {
+    pub(crate) fn aggregate_id(tx_hash: TxHash, log_index: i64) -> String {
+        format!("{tx_hash}:{log_index}")
+    }
+}
+
 #[async_trait]
 impl Aggregate for OnChainTrade {
     type Command = OnChainTradeCommand;
@@ -259,9 +265,23 @@ impl Aggregate for OnChainTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::b256;
     use chrono::Utc;
     use proptest::prelude::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_aggregate_id() {
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+        let log_index = 42;
+
+        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);
+
+        assert_eq!(
+            aggregate_id,
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef:42"
+        );
+    }
 
     #[tokio::test]
     async fn test_witness_command_creates_filled_event() {
