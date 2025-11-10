@@ -1,18 +1,33 @@
+use alloy::primitives::hex::FromHexError;
 use reqwest::{Client, Response, StatusCode};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use st0x_broker::alpaca::AlpacaAuthEnv;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
-    #[error("HTTP request failed: {0}")]
-    HttpError(#[from] reqwest::Error),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
 
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
 
-    #[error("Invalid response: {0}")]
-    InvalidResponse(String),
+    #[error("Invalid decimal value '{value}': {source}")]
+    InvalidDecimal {
+        value: String,
+        #[source]
+        source: rust_decimal::Error,
+    },
+
+    #[error(transparent)]
+    FromHex(#[from] FromHexError),
+
+    #[error("Amount must be positive and non-zero, got: {amount}")]
+    InvalidAmount { amount: Decimal },
+
+    #[error("Empty wallet list for asset '{asset}' on network '{network}'")]
+    NoWalletFound { asset: String, network: String },
 }
 
 #[derive(Deserialize)]
@@ -51,7 +66,7 @@ impl AlpacaWalletClient {
     }
 
     #[cfg(test)]
-    async fn new_with_base_url(
+    pub(super) async fn new_with_base_url(
         base_url: String,
         api_key: String,
         api_secret: String,
@@ -94,9 +109,7 @@ impl AlpacaWalletClient {
             return Err(AlpacaWalletError::ApiError { status, message });
         }
 
-        let account: AccountResponse = response.json().await.map_err(|e| {
-            AlpacaWalletError::InvalidResponse(format!("Failed to parse account response: {e}"))
-        })?;
+        let account: AccountResponse = response.json().await?;
 
         Ok(account.id)
     }
@@ -125,9 +138,47 @@ impl AlpacaWalletClient {
         Ok(response)
     }
 
-    #[cfg(test)]
-    fn account_id(&self) -> &str {
+    pub(super) async fn post<T: serde::Serialize>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<Response, AlpacaWalletError> {
+        let url = format!("{}{}", self.base_url, path);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .json(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+
+            return Err(AlpacaWalletError::ApiError { status, message });
+        }
+
+        Ok(response)
+    }
+
+    pub(super) fn account_id(&self) -> &str {
         &self.account_id
+    }
+
+    #[cfg(test)]
+    fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    #[cfg(test)]
+    fn api_secret(&self) -> &str {
+        &self.api_secret
     }
 }
 
@@ -286,6 +337,73 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::INTERNAL_SERVER_ERROR
+        ));
+
+        account_mock.assert();
+        error_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_post_with_json_body() {
+        let server = MockServer::start();
+        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
+        let account_mock = create_account_mock(&server, expected_account_id);
+
+        let test_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/test")
+                .header("APCA-API-KEY-ID", "test_key_id")
+                .header("APCA-API-SECRET-KEY", "test_secret_key")
+                .json_body(json!({"amount": "10.5", "asset": "USDC"}));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({"success": true}));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let body = json!({"amount": "10.5", "asset": "USDC"});
+        let response = client.post("/v1/test", &body).await.unwrap();
+
+        assert!(response.status().is_success());
+        account_mock.assert();
+        test_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_post_api_error() {
+        let server = MockServer::start();
+        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
+        let account_mock = create_account_mock(&server, expected_account_id);
+
+        let error_mock = server.mock(|when, then| {
+            when.method(POST).path("/v1/error");
+            then.status(400).json_body(json!({
+                "message": "Invalid request"
+            }));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let body = json!({"test": "data"});
+        let result = client.post("/v1/error", &body).await;
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST
         ));
 
         account_mock.assert();

@@ -50,10 +50,9 @@ to the broker crate to ensure changes work before moving to services.
 state changes), making it ideal for establishing the HTTP client pattern and
 service architecture. This proves the design before adding complexity.
 
-- [x] Create `src/services/mod.rs` with module declaration for `alpaca_wallet`
-- [x] Add `mod services;` to `src/lib.rs`
-- [x] Create `src/services/alpaca_wallet/mod.rs` with private submodules
-- [x] Create `src/services/alpaca_wallet/client.rs`:
+- [x] Create `src/alpaca_wallet/mod.rs` with private submodules
+- [x] Add `mod alpaca_wallet;` to `src/lib.rs`
+- [x] Create `src/alpaca_wallet/client.rs`:
   - [x] Define `AlpacaWalletClient` struct with `reqwest::Client`, account ID,
         base URL, credentials
   - [x] Define minimal `AlpacaWalletError` enum: `HttpError`, `ApiError`,
@@ -62,16 +61,15 @@ service architecture. This proves the design before adding complexity.
   - [x] Implement helper for HTTP GET with auth headers (APCA-API-KEY-ID,
         APCA-API-SECRET-KEY)
   - [x] Add tests: client construction, auth headers, error parsing
-- [x] Create `src/services/alpaca_wallet/transfer.rs`:
+- [x] Create `src/alpaca_wallet/transfer.rs`:
   - [x] Define `DepositAddress` struct: `address: String`, `asset: String`,
         `network: String`
   - [x] Implement `get_deposit_address()` function calling
         `GET /v1/crypto/funding_wallets?asset={asset}&network={network}`
   - [x] Add tests: successful retrieval for USDC/Ethereum, invalid
         asset/network, API errors, malformed JSON
-- [x] Update `src/services/alpaca_wallet/mod.rs` to re-export
-      `AlpacaWalletClient`, `AlpacaWalletError` (keep submodules private)
-- [x] Update `src/services/mod.rs` to re-export `alpaca_wallet` module
+- [x] Update `src/alpaca_wallet/mod.rs` to re-export `AlpacaWalletClient`,
+      `AlpacaWalletError` (keep submodules private)
 - [x] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
@@ -81,25 +79,25 @@ service architecture. This proves the design before adding complexity.
 This adds types, validation, and POST support building on the HTTP client
 pattern from Task 2. Financial validation prevents errors.
 
-- [ ] Update `src/services/alpaca_wallet/transfer.rs`:
-  - [ ] Define `TransferId` newtype wrapping `uuid::Uuid`
-  - [ ] Define `TransferDirection` enum: `Incoming`, `Outgoing`
-  - [ ] Define `TransferStatus` enum: `Pending`, `Processing`, `Complete`,
+- [x] Update `src/alpaca_wallet/transfer.rs`:
+  - [x] Define `TransferId` newtype wrapping `uuid::Uuid`
+  - [x] Define `TransferDirection` enum: `Incoming`, `Outgoing`
+  - [x] Define `TransferStatus` enum: `Pending`, `Processing`, `Complete`,
         `Failed`
-  - [ ] Define `Transfer` struct with all fields (id, direction, amount using
+  - [x] Define `Transfer` struct with all fields (id, direction, amount using
         `Decimal`, asset, addresses, status, tx_hash, created_at, network_fee)
-  - [ ] Add validation helper for amounts (must be positive, non-zero)
-  - [ ] Implement `initiate_withdrawal()` function calling
+  - [x] Add validation helper for amounts (must be positive, non-zero)
+  - [x] Implement `initiate_withdrawal()` function calling
         `POST /v1/accounts/{account_id}/wallets/transfers`
-  - [ ] Add tests: successful withdrawal, amount validation (reject
+  - [x] Add tests: successful withdrawal, amount validation (reject
         zero/negative/invalid), invalid asset/address, API errors
-- [ ] Update `src/services/alpaca_wallet/client.rs`:
-  - [ ] Add helper for HTTP POST with JSON body and auth headers
-  - [ ] Update `AlpacaWalletError` with variants: `InvalidAmount`,
+- [x] Update `src/alpaca_wallet/client.rs`:
+  - [x] Add helper for HTTP POST with JSON body and auth headers
+  - [x] Update `AlpacaWalletError` with variants: `InvalidAmount`,
         `InvalidAsset`
-  - [ ] Add tests for POST helper
-- [ ] Add `uuid` to `Cargo.toml` dependencies if not present
-- [ ] Run `cargo test -q`,
+  - [x] Add tests for POST helper
+- [x] Add `uuid` to `Cargo.toml` dependencies if not present
+- [x] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
 ## Task 4. Implement Transfer Status Query
@@ -107,7 +105,7 @@ pattern from Task 2. Financial validation prevents errors.
 **Design Reasoning**: Status querying is needed before polling can be
 implemented. Simple addition to existing transfer module.
 
-- [ ] Update `src/services/alpaca_wallet/transfer.rs`:
+- [ ] Update `src/alpaca_wallet/transfer.rs`:
   - [ ] Implement `get_transfer_status()` function calling
         `GET /v1/accounts/{account_id}/wallets/transfers?transfer_id={id}`
   - [ ] Parse response and map to `TransferStatus` enum, handling different
@@ -123,7 +121,7 @@ implemented. Simple addition to existing transfer module.
 Configurable behavior prevents hardcoded values. Exponential backoff reduces API
 load during retries.
 
-- [ ] Create `src/services/alpaca_wallet/status.rs`:
+- [ ] Create `src/alpaca_wallet/status.rs`:
   - [ ] Define `PollingConfig` struct: `interval: Duration` (default: 10s),
         `timeout: Duration` (default: 30m), `max_retries: u32` (default: 3)
   - [ ] Implement `poll_transfer_status()` function that loops until `Complete`
@@ -136,9 +134,9 @@ load during retries.
         failures
   - [ ] Add tests: successful polling (Processing → Complete), failed transfer,
         timeout, retry on 5xx errors, invalid status regression
-- [ ] Update `src/services/alpaca_wallet/client.rs`: add
+- [ ] Update `src/alpaca_wallet/client.rs`: add
       `AlpacaWalletError::TransferTimeout` variant
-- [ ] Update `src/services/alpaca_wallet/mod.rs`: add `mod status;` declaration
+- [ ] Update `src/alpaca_wallet/mod.rs`: add `mod status;` declaration
 - [ ] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
@@ -148,7 +146,7 @@ load during retries.
 Addresses must be whitelisted and approved (24-hour wait) before withdrawals.
 Separate module keeps concerns isolated.
 
-- [ ] Create `src/services/alpaca_wallet/whitelist.rs`:
+- [ ] Create `src/alpaca_wallet/whitelist.rs`:
   - [ ] Define `WhitelistEntry` struct: id, address, asset, chain, status,
         created_at
   - [ ] Define `WhitelistStatus` enum: `Pending`, `Approved`, `Rejected`
@@ -160,10 +158,9 @@ Separate module keeps concerns isolated.
   - [ ] Implement `is_address_whitelisted_and_approved()` helper
   - [ ] Add tests: successful whitelisting, getting list, checking approved
         status, pending/rejected handling, duplicates
-- [ ] Update `src/services/alpaca_wallet/client.rs`: add
+- [ ] Update `src/alpaca_wallet/client.rs`: add
       `AlpacaWalletError::AddressNotWhitelisted` variant
-- [ ] Update `src/services/alpaca_wallet/mod.rs`: add `mod whitelist;`
-      declaration
+- [ ] Update `src/alpaca_wallet/mod.rs`: add `mod whitelist;` declaration
 - [ ] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
@@ -173,21 +170,14 @@ Separate module keeps concerns isolated.
 abstraction allows future alternative implementations. Integration tests verify
 full workflows work end-to-end.
 
-- [ ] Update `src/services/mod.rs`:
-  - [ ] Define `TransferStatus` enum (move from transfer.rs, re-export)
-  - [ ] Define `TransferId` newtype (move from transfer.rs, re-export)
-  - [ ] Define `WalletService` trait with methods: `get_deposit_address()`,
-        `initiate_withdrawal()`, `get_transfer_status()`,
-        `poll_transfer_until_complete()`
-  - [ ] Add module-level docs explaining service pattern and when to use
-        services vs other abstractions
-- [ ] Update `src/services/alpaca_wallet/mod.rs`:
+- [ ] Update `src/alpaca_wallet/mod.rs`:
   - [ ] Define `AlpacaWalletService` struct: `client: Arc<AlpacaWalletClient>`,
         `polling_config: PollingConfig`
   - [ ] Define `AlpacaWalletConfig` struct: `auth_env: AlpacaAuthEnv`,
         `polling_config: Option<PollingConfig>`
-  - [ ] Implement `WalletService` trait for `AlpacaWalletService`, delegating to
-        appropriate module functions
+  - [ ] Implement methods delegating to appropriate module functions:
+        `get_deposit_address()`, `initiate_withdrawal()`,
+        `get_transfer_status()`, `poll_transfer_until_complete()`
   - [ ] In `initiate_withdrawal()`, check whitelist before delegating
   - [ ] Implement `new()` async constructor: build client, set up polling config
         with defaults, verify account access
@@ -206,12 +196,9 @@ full workflows work end-to-end.
 **Design Reasoning**: Documentation eases maintenance and onboarding. Examples
 prevent misuse. Final checks ensure production quality.
 
-- [ ] Add doc comments to all public types and methods in `src/services/mod.rs`,
-      `src/services/alpaca_wallet/mod.rs`,
-      `src/services/alpaca_wallet/client.rs`
-- [ ] Add module-level documentation to `src/services/mod.rs` (service pattern,
-      related issues #132, #133, #134)
-- [ ] Add module-level documentation to `src/services/alpaca_wallet/mod.rs` (API
+- [ ] Add doc comments to all public types and methods in
+      `src/alpaca_wallet/mod.rs`, `src/alpaca_wallet/client.rs`
+- [ ] Add module-level documentation to `src/alpaca_wallet/mod.rs` (API
       overview, authentication, whitelisting process, transfer lifecycle)
 - [ ] Add usage examples in doc comments: getting deposit address, withdrawal
       flow, polling
