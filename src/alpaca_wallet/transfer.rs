@@ -28,6 +28,12 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct TokenSymbol(pub(super) String);
 
+impl TokenSymbol {
+    pub(super) fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+}
+
 impl From<String> for TokenSymbol {
     fn from(s: String) -> Self {
         Self(s)
@@ -110,9 +116,15 @@ pub(super) struct Transfer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Network(pub(super) String);
 
+impl Network {
+    pub(super) fn new(s: impl Into<String>) -> Self {
+        Self(s.into().to_lowercase())
+    }
+}
+
 impl From<String> for Network {
     fn from(s: String) -> Self {
-        Self(s)
+        Self(s.to_lowercase())
     }
 }
 
@@ -1047,5 +1059,17 @@ mod tests {
 
         account_mock.assert();
         status_mock.assert();
+    }
+
+    #[test]
+    fn test_network_normalizes_to_lowercase() {
+        let network = Network::new("Ethereum");
+        assert_eq!(network.as_ref(), "ethereum");
+    }
+
+    #[test]
+    fn test_network_from_string_normalizes() {
+        let network = Network::from("EtHeReuM".to_string());
+        assert_eq!(network.as_ref(), "ethereum");
     }
 }
