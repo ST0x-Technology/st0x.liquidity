@@ -121,23 +121,23 @@ implemented. Simple addition to existing transfer module.
 Configurable behavior prevents hardcoded values. Exponential backoff reduces API
 load during retries.
 
-- [ ] Create `src/alpaca_wallet/status.rs`:
-  - [ ] Define `PollingConfig` struct: `interval: Duration` (default: 10s),
+- [x] Create `src/alpaca_wallet/status.rs`:
+  - [x] Define `PollingConfig` struct: `interval: Duration` (default: 10s),
         `timeout: Duration` (default: 30m), `max_retries: u32` (default: 3)
-  - [ ] Implement `poll_transfer_status()` function that loops until `Complete`
+  - [x] Implement `poll_transfer_status()` function that loops until `Complete`
         or `Failed`
-  - [ ] Sleep between polls using `tokio::time::sleep(interval)`
-  - [ ] Return `Err(TransferTimeout)` if timeout exceeded
-  - [ ] Retry on transient errors up to `max_retries` with exponential backoff
-  - [ ] Log status transitions using `tracing::info!`
-  - [ ] Handle edge cases: status regression, inconsistent status, network
+  - [x] Sleep between polls using `tokio::time::sleep(interval)`
+  - [x] Return `Err(TransferTimeout)` if timeout exceeded
+  - [x] Retry on transient errors up to `max_retries` with exponential backoff
+  - [x] Log status transitions using `tracing::info!`
+  - [x] Handle edge cases: status regression, inconsistent status, network
         failures
-  - [ ] Add tests: successful polling (Processing → Complete), failed transfer,
+  - [x] Add tests: successful polling (Processing → Complete), failed transfer,
         timeout, retry on 5xx errors, invalid status regression
-- [ ] Update `src/alpaca_wallet/client.rs`: add
+- [x] Update `src/alpaca_wallet/client.rs`: add
       `AlpacaWalletError::TransferTimeout` variant
-- [ ] Update `src/alpaca_wallet/mod.rs`: add `mod status;` declaration
-- [ ] Run `cargo test -q`,
+- [x] Update `src/alpaca_wallet/mod.rs`: add `mod status;` declaration
+- [x] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
 ## Task 6. Implement Address Whitelisting
