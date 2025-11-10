@@ -105,14 +105,14 @@ pattern from Task 2. Financial validation prevents errors.
 **Design Reasoning**: Status querying is needed before polling can be
 implemented. Simple addition to existing transfer module.
 
-- [ ] Update `src/alpaca_wallet/transfer.rs`:
-  - [ ] Implement `get_transfer_status()` function calling
+- [x] Update `src/alpaca_wallet/transfer.rs`:
+  - [x] Implement `get_transfer_status()` function calling
         `GET /v1/accounts/{account_id}/wallets/transfers?transfer_id={id}`
-  - [ ] Parse response and map to `TransferStatus` enum, handling different
+  - [x] Parse response and map to `TransferStatus` enum, handling different
         status strings from API
-  - [ ] Add tests: query status for each state (Pending, Processing, Complete,
+  - [x] Add tests: query status for each state (Pending, Processing, Complete,
         Failed), invalid transfer ID, not found, malformed responses
-- [ ] Run `cargo test -q`,
+- [x] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
 
 ## Task 5. Implement Status Polling

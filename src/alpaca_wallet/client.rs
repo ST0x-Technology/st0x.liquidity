@@ -28,6 +28,9 @@ pub enum AlpacaWalletError {
 
     #[error("Empty wallet list for asset '{asset}' on network '{network}'")]
     NoWalletFound { asset: String, network: String },
+
+    #[error("Transfer not found: {transfer_id}")]
+    TransferNotFound { transfer_id: String },
 }
 
 #[derive(Deserialize)]
