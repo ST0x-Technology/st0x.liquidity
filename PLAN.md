@@ -146,23 +146,36 @@ load during retries.
 Addresses must be whitelisted and approved (24-hour wait) before withdrawals.
 Separate module keeps concerns isolated.
 
-- [ ] Create `src/alpaca_wallet/whitelist.rs`:
-  - [ ] Define `WhitelistEntry` struct: id, address, asset, chain, status,
+- [x] Create `src/alpaca_wallet/whitelist.rs`:
+  - [x] Define `WhitelistEntry` struct: id, address, asset, chain, status,
         created_at
-  - [ ] Define `WhitelistStatus` enum: `Pending`, `Approved`, `Rejected`
-  - [ ] Define `APPROVAL_WAIT_TIME` constant (24 hours)
-  - [ ] Implement `whitelist_address()` calling
+  - [x] Define `WhitelistStatus` enum: `Pending`, `Approved`, `Rejected`
+  - [x] Define `APPROVAL_WAIT_TIME` constant (24 hours)
+  - [x] Implement `whitelist_address()` calling
         `POST /v1/accounts/{account_id}/wallets/whitelists`
-  - [ ] Implement `get_whitelisted_addresses()` calling
+  - [x] Implement `get_whitelisted_addresses()` calling
         `GET /v1/accounts/{account_id}/wallets/whitelists`
-  - [ ] Implement `is_address_whitelisted_and_approved()` helper
-  - [ ] Add tests: successful whitelisting, getting list, checking approved
+  - [x] Implement `is_address_whitelisted_and_approved()` helper
+  - [x] Add tests: successful whitelisting, getting list, checking approved
         status, pending/rejected handling, duplicates
-- [ ] Update `src/alpaca_wallet/client.rs`: add
+- [x] Update `src/alpaca_wallet/client.rs`: add
       `AlpacaWalletError::AddressNotWhitelisted` variant
-- [ ] Update `src/alpaca_wallet/mod.rs`: add `mod whitelist;` declaration
-- [ ] Run `cargo test -q`,
+- [x] Update `src/alpaca_wallet/mod.rs`: add `mod whitelist;` declaration
+- [x] Run `cargo test -q`,
       `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
+
+**Implementation Notes**:
+
+- Created Address newtype wrapper around alloy::primitives::Address to handle
+  serialization/deserialization properly
+- Made Token, Network, and Address inner fields pub(super) and added Serialize
+  derive to enable construction in tests and serialization in API responses
+- Added Display implementations for Address, Token, and Network for error
+  formatting
+- Created 8 comprehensive tests covering all whitelist scenarios including
+  success, pending/rejected status, not found, and error cases
+- AddressNotWhitelisted error preserves type information (Address, Token,
+  Network) rather than converting to strings
 
 ## Task 7. Implement AlpacaWalletService Facade
 

@@ -28,7 +28,7 @@ pub(super) struct WhitelistEntry {
 #[cfg(test)]
 mod tests {
     use super::super::client::{AlpacaWalletClient, AlpacaWalletError};
-    use super::super::transfer::{Network, Token};
+    use super::super::transfer::{Network, TokenSymbol};
     use super::*;
     use alloy::primitives::Address;
     use httpmock::prelude::*;
@@ -115,8 +115,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client
             .whitelist_address(&address, &asset, &network)
@@ -225,8 +225,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client
             .is_address_whitelisted_and_approved(&address, &asset, &network)
@@ -275,8 +275,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client
             .is_address_whitelisted_and_approved(&address, &asset, &network)
@@ -325,8 +325,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client
             .is_address_whitelisted_and_approved(&address, &asset, &network)
@@ -376,8 +376,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client
             .is_address_whitelisted_and_approved(&address, &asset, &network)
@@ -417,8 +417,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client.whitelist_address(&address, &asset, &network).await;
 
@@ -459,8 +459,8 @@ mod tests {
         .unwrap();
 
         let address = Address(AlloyAddress::from_str(test_address).unwrap());
-        let asset = Token("USDC".to_string());
-        let network = Network("Ethereum".to_string());
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("Ethereum");
 
         let result = client.whitelist_address(&address, &asset, &network).await;
 
