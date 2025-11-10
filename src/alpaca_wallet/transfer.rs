@@ -25,18 +25,24 @@ where
         .transpose()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(super) struct Token(String);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct TokenSymbol(pub(super) String);
 
-impl From<String> for Token {
+impl From<String> for TokenSymbol {
     fn from(s: String) -> Self {
         Self(s)
     }
 }
 
-impl AsRef<str> for Token {
+impl AsRef<str> for TokenSymbol {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+impl std::fmt::Display for TokenSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -53,6 +59,12 @@ impl TransferId {
 impl From<Uuid> for TransferId {
     fn from(uuid: Uuid) -> Self {
         Self(uuid)
+    }
+}
+
+impl std::fmt::Display for TransferId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -79,7 +91,7 @@ pub(super) struct Transfer {
     pub(super) direction: TransferDirection,
     #[serde(deserialize_with = "deserialize_decimal_from_string")]
     pub(super) amount: Decimal,
-    pub(super) asset: Token,
+    pub(super) asset: TokenSymbol,
     #[serde(rename = "from_address")]
     pub(super) from: Option<Address>,
     #[serde(rename = "to_address")]
@@ -95,8 +107,8 @@ pub(super) struct Transfer {
     pub(super) network_fee: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub(super) struct Network(String);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Network(pub(super) String);
 
 impl From<String> for Network {
     fn from(s: String) -> Self {
@@ -110,10 +122,16 @@ impl AsRef<str> for Network {
     }
 }
 
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DepositAddress {
     pub(super) address: Address,
-    pub(super) asset: Token,
+    pub(super) asset: TokenSymbol,
     pub(super) network: Network,
 }
 
@@ -207,7 +225,7 @@ pub(super) async fn get_transfer_status(
     transfers
         .pop()
         .ok_or_else(|| AlpacaWalletError::TransferNotFound {
-            transfer_id: transfer_id.0.to_string(),
+            transfer_id: *transfer_id,
         })
 }
 
@@ -216,6 +234,7 @@ mod tests {
     use super::*;
     use httpmock::prelude::*;
     use serde_json::json;
+    use std::str::FromStr;
 
     fn create_account_mock<'a>(server: &'a MockServer, account_id: &str) -> httpmock::Mock<'a> {
         server.mock(|when, then| {

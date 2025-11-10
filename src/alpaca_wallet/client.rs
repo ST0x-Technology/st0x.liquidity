@@ -1,9 +1,11 @@
-use alloy::primitives::hex::FromHexError;
+use alloy::primitives::{Address, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use st0x_broker::alpaca::AlpacaAuthEnv;
 use thiserror::Error;
+
+use super::transfer::{Network, TokenSymbol, TransferId, TransferStatus};
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
@@ -30,7 +32,33 @@ pub enum AlpacaWalletError {
     NoWalletFound { asset: String, network: String },
 
     #[error("Transfer not found: {transfer_id}")]
-    TransferNotFound { transfer_id: String },
+    TransferNotFound { transfer_id: TransferId },
+
+    #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
+    TransferTimeout {
+        transfer_id: TransferId,
+        elapsed: std::time::Duration,
+    },
+
+    #[error("Max retries ({retries}) exceeded for transfer {transfer_id}")]
+    MaxRetriesExceeded {
+        transfer_id: TransferId,
+        retries: u32,
+    },
+
+    #[error("Invalid status transition for transfer {transfer_id}: {previous:?} -> {next:?}")]
+    InvalidStatusTransition {
+        transfer_id: TransferId,
+        previous: TransferStatus,
+        next: TransferStatus,
+    },
+
+    #[error("Address {address} is not whitelisted for {asset} on {network}")]
+    AddressNotWhitelisted {
+        address: Address,
+        asset: TokenSymbol,
+        network: Network,
+    },
 }
 
 #[derive(Deserialize)]
