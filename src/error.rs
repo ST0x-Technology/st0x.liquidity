@@ -39,7 +39,7 @@ pub(crate) enum TradeValidationError {
     U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]
     TransactionNotFound(B256),
-    #[error("No AfterClear log found for ClearV2 log")]
+    #[error("No AfterClear log found for ClearV3 log")]
     NoAfterClearLog,
     #[error("Negative shares amount: {0}")]
     NegativeShares(f64),
@@ -75,8 +75,8 @@ pub(crate) enum EventQueueError {
 pub(crate) enum EventProcessingError {
     #[error("Event queue error: {0}")]
     Queue(#[from] EventQueueError),
-    #[error("Failed to enqueue ClearV2 event: {0}")]
-    EnqueueClearV2(#[source] EventQueueError),
+    #[error("Failed to enqueue ClearV3 event: {0}")]
+    EnqueueClearV3(#[source] EventQueueError),
     #[error("Failed to enqueue TakeOrderV3 event: {0}")]
     EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Failed to process trade through accumulator: {0}")]

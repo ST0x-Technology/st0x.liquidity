@@ -7,9 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::num::ParseFloatError;
 use tracing::error;
 
-use crate::bindings::IOrderBookV4::{ClearV2, OrderV3};
-use crate::bindings::IOrderBookV5::{OrderV4, TakeOrderV3};
 use crate::bindings::IERC20::IERC20Instance;
+use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
@@ -25,7 +24,7 @@ use st0x_broker::PersistenceError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
-    ClearV2(Box<ClearV2>),
+    ClearV3(Box<ClearV3>),
     TakeOrderV3(Box<TakeOrderV3>),
 }
 
@@ -185,11 +184,11 @@ impl OnchainTrade {
     }
 
     /// Core parsing logic for converting blockchain events to trades
-    /// Accepts OrderV3 from ClearV2 events (IOrderBookV4)
+    /// Accepts OrderV4 from ClearV3 events (IOrderBookV5)
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
         provider: P,
-        order: OrderV3,
+        order: OrderV4,
         fill: OrderFill,
         log: Log,
         feed_id_cache: &FeedIdCache,
@@ -214,11 +213,11 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let onchain_input_amount = u256_to_f64(fill.input_amount, input.decimals)?;
-        let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
+        let onchain_input_symbol = cache.get_iov2_symbol(&provider, input).await?;
+        let onchain_input_amount = u256_to_f64(fill.input_amount, 18)?; // ERC20 tokens use 18 decimals by default
 
-        let onchain_output_amount = u256_to_f64(fill.output_amount, output.decimals)?;
-        let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
+        let onchain_output_symbol = cache.get_iov2_symbol(&provider, output).await?;
+        let onchain_output_amount = u256_to_f64(fill.output_amount, 18)?; // ERC20 tokens use 18 decimals by default
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
@@ -323,10 +322,14 @@ impl OnchainTrade {
         let output_decimals = fetch_token_decimals(provider.clone(), output.token).await?;
 
         let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
-        let onchain_input_symbol = cache.get_io_symbol_from_token(provider.clone(), input.token).await?;
+        let onchain_input_symbol = cache
+            .get_io_symbol_from_token(provider.clone(), input.token)
+            .await?;
 
         let onchain_output_amount = u256_to_f64(fill.output_amount, output_decimals)?;
-        let onchain_output_symbol = cache.get_io_symbol_from_token(provider.clone(), output.token).await?;
+        let onchain_output_symbol = cache
+            .get_io_symbol_from_token(provider.clone(), output.token)
+            .await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
@@ -418,7 +421,7 @@ impl OnchainTrade {
             .logs()
             .iter()
             .filter(|log| {
-                (log.topic0() == Some(&ClearV2::SIGNATURE_HASH)
+                (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
                     && log.address() == env.orderbook
             })
@@ -469,8 +472,8 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         removed: false,
     };
 
-    if let Ok(clear_event) = log.log_decode::<ClearV2>() {
-        return OnchainTrade::try_from_clear_v2(
+    if let Ok(clear_event) = log.log_decode::<ClearV3>() {
+        return OnchainTrade::try_from_clear_v3(
             env,
             cache,
             &provider,

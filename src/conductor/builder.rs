@@ -9,8 +9,7 @@ use tracing::info;
 
 use st0x_broker::Broker;
 
-use crate::bindings::IOrderBookV4::ClearV2;
-use crate::bindings::IOrderBookV5::TakeOrderV3;
+use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::env::Config;
 use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
@@ -20,7 +19,7 @@ use super::{
     spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
 
-type ClearStream = Box<dyn Stream<Item = Result<(ClearV2, Log), sol_types::Error>> + Unpin + Send>;
+type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
 type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
@@ -89,7 +88,7 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
 {
     pub(crate) fn with_dex_event_streams(
         self,
-        clear_stream: impl Stream<Item = Result<(ClearV2, Log), sol_types::Error>>
+        clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>>
         + Unpin
         + Send
         + 'static,

@@ -504,12 +504,12 @@ fn display_trade_details<W: Write>(
 mod tests {
     use super::*;
     use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange, ClearV2};
+    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmEnv;
     use crate::onchain::trade::OnchainTrade;
-    use crate::test_utils::get_test_order;
+    use crate::test_utils::get_test_order_v4;
     use crate::test_utils::setup_test_db;
     use crate::test_utils::setup_test_tokens;
     use crate::tokenized_symbol;
@@ -1016,20 +1016,20 @@ mod tests {
         alice_output_shares: &str, // e.g., "9000000000000000000" for 9 shares
         bob_output_usdc: u64,      // e.g., 100_000_000 for 100 USDC
     ) -> MockBlockchainData {
-        let order = get_test_order();
+        let order = get_test_order_v4();
         let order_owner = order.owner;
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order,
-            clearConfig: ClearConfig {
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: U256::ZERO,
-                bobBountyVaultId: U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
 
@@ -1049,7 +1049,7 @@ mod tests {
             "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
             "logs": [{
                 "address": orderbook,
-                "topics": [ClearV2::SIGNATURE_HASH],
+                "topics": [ClearV3::SIGNATURE_HASH],
                 "data": format!("0x{}", hex::encode(clear_event.into_log_data().data)),
                 "blockNumber": "0x64",
                 "transactionHash": tx_hash,
@@ -1059,13 +1059,13 @@ mod tests {
             }]
         });
 
-        let after_clear_event = AfterClear {
+        let after_clear_event = AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: ClearStateChange {
-                aliceOutput: U256::from_str(alice_output_shares).unwrap(),
-                bobOutput: U256::from(bob_output_usdc),
-                aliceInput: U256::from(bob_output_usdc),
-                bobInput: U256::from_str(alice_output_shares).unwrap(),
+            clearStateChange: ClearStateChangeV2 {
+                aliceOutput: U256::from_str(alice_output_shares).unwrap().into(),
+                bobOutput: U256::from(bob_output_usdc).into(),
+                aliceInput: U256::from(bob_output_usdc).into(),
+                bobInput: U256::from_str(alice_output_shares).unwrap().into(),
             },
         };
 

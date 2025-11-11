@@ -13,8 +13,7 @@ use tracing::{debug, error, info, trace};
 
 use st0x_broker::{Broker, MarketOrder, SupportedBroker};
 
-use crate::bindings::IOrderBookV4::{ClearV2, IOrderBookV4Instance};
-use crate::bindings::IOrderBookV5::{IOrderBookV5Instance, TakeOrderV3};
+use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
@@ -108,13 +107,15 @@ impl Conductor {
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
         let cache = SymbolCache::default();
 
-        // ClearV2 events come from IOrderBookV4
-        let orderbook_v4 = IOrderBookV4Instance::new(config.evm.orderbook, &provider);
-        // TakeOrderV3 events come from IOrderBookV5
+        // ClearV3 and TakeOrderV3 events come from IOrderBookV5
         let orderbook_v5 = IOrderBookV5Instance::new(config.evm.orderbook, &provider);
 
-        let mut clear_stream = orderbook_v4.ClearV2_filter().watch().await?.into_stream();
-        let mut take_stream = orderbook_v5.TakeOrderV3_filter().watch().await?.into_stream();
+        let mut clear_stream = orderbook_v5.ClearV3_filter().watch().await?.into_stream();
+        let mut take_stream = orderbook_v5
+            .TakeOrderV3_filter()
+            .watch()
+            .await?
+            .into_stream();
 
         let cutoff_block =
             get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
@@ -227,7 +228,7 @@ fn spawn_order_poller<B: Broker + Clone + Send + 'static>(
 
 fn spawn_onchain_event_receiver(
     event_sender: UnboundedSender<(TradeEvent, Log)>,
-    clear_stream: impl Stream<Item = Result<(ClearV2, Log), sol_types::Error>> + Unpin + Send + 'static,
+    clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send + 'static,
     take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
     + Unpin
     + Send
@@ -307,13 +308,13 @@ async fn receive_blockchain_events<S1, S2>(
     mut take_stream: S2,
     event_sender: UnboundedSender<(TradeEvent, Log)>,
 ) where
-    S1: Stream<Item = Result<(ClearV2, Log), sol_types::Error>> + Unpin,
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
     S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
 {
     loop {
         let event_result = tokio::select! {
             Some(result) = clear_stream.next() => {
-                result.map(|(event, log)| (TradeEvent::ClearV2(Box::new(event)), log))
+                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
             }
             Some(result) = take_stream.next() => {
                 result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
@@ -349,7 +350,7 @@ pub(crate) async fn get_cutoff_block<S1, S2, P>(
     pool: &SqlitePool,
 ) -> anyhow::Result<u64>
 where
-    S1: Stream<Item = Result<(ClearV2, Log), sol_types::Error>> + Unpin,
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
     S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
     P: Provider + Clone,
 {
@@ -383,15 +384,15 @@ async fn process_live_event(
     log: Log,
 ) -> Result<(), EventProcessingError> {
     match &event {
-        TradeEvent::ClearV2(clear_event) => {
+        TradeEvent::ClearV3(clear_event) => {
             info!(
-                "Enqueuing ClearV2 event: tx_hash={:?}, log_index={:?}",
+                "Enqueuing ClearV3 event: tx_hash={:?}, log_index={:?}",
                 log.transaction_hash, log.log_index
             );
 
             enqueue(pool, clear_event.as_ref(), &log)
                 .await
-                .map_err(EventProcessingError::EnqueueClearV2)?;
+                .map_err(EventProcessingError::EnqueueClearV3)?;
         }
         TradeEvent::TakeOrderV3(take_event) => {
             info!(
@@ -501,8 +502,8 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, queued_event);
 
     let onchain_trade = match &queued_event.event {
-        TradeEvent::ClearV2(clear_event) => {
-            OnchainTrade::try_from_clear_v2(
+        TradeEvent::ClearV3(clear_event) => {
+            OnchainTrade::try_from_clear_v3(
                 &config.evm,
                 cache,
                 provider,
@@ -537,7 +538,7 @@ async fn handle_filtered_event(
     info!(
         "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
         match &queued_event.event {
-            TradeEvent::ClearV2(_) => "ClearV2",
+            TradeEvent::ClearV3(_) => "ClearV3",
             TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
         },
         queued_event.tx_hash,
@@ -574,7 +575,7 @@ async fn process_valid_trade(
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
         match &queued_event.event {
-            TradeEvent::ClearV2(_) => "ClearV2",
+            TradeEvent::ClearV3(_) => "ClearV3",
             TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
         },
         trade.tx_hash,
@@ -653,7 +654,7 @@ fn reconstruct_log_from_queued_event(
     use alloy::primitives::IntoLogData;
 
     let log_data = match &queued_event.event {
-        TradeEvent::ClearV2(clear_event) => clear_event.as_ref().clone().into_log_data(),
+        TradeEvent::ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
         TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
     };
 
@@ -764,7 +765,7 @@ async fn wait_for_first_event_with_timeout<S1, S2>(
     timeout: std::time::Duration,
 ) -> Option<(Vec<(TradeEvent, Log)>, u64)>
 where
-    S1: Stream<Item = Result<(ClearV2, Log), sol_types::Error>> + Unpin,
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
     S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
 {
     let deadline = tokio::time::sleep(timeout);
@@ -778,10 +779,10 @@ where
                 match result {
                     Ok((event, log)) => {
                         if let Some(block_number) = log.block_number {
-                            events.push((TradeEvent::ClearV2(Box::new(event)), log));
+                            events.push((TradeEvent::ClearV3(Box::new(event)), log));
                             return Some((events, block_number));
                         }
-                        error!("ClearV2 event missing block number");
+                        error!("ClearV3 event missing block number");
                     }
                     Err(e) => {
                         error!("Error in clear event stream during startup: {e}");
@@ -815,14 +816,14 @@ async fn buffer_live_events<S1, S2>(
     event_buffer: &mut Vec<(TradeEvent, Log)>,
     cutoff_block: u64,
 ) where
-    S1: Stream<Item = Result<(ClearV2, Log), sol_types::Error>> + Unpin,
+    S1: Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin,
     S2: Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin,
 {
     loop {
         tokio::select! {
             Some(result) = clear_stream.next() => match result {
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
-                    event_buffer.push((TradeEvent::ClearV2(Box::new(event)), log));
+                    event_buffer.push((TradeEvent::ClearV3(Box::new(event)), log));
                 }
                 Err(e) => error!("Error in clear event stream during backfill: {e}"),
                 _ => {}
@@ -842,7 +843,7 @@ async fn buffer_live_events<S1, S2>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IOrderBookV4::{ClearConfig, ClearV2};
+    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3};
     use crate::env::tests::create_test_config;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
@@ -859,17 +860,17 @@ mod tests {
         let pool = setup_test_db().await;
         let _config = create_test_config();
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let log = crate::test_utils::get_test_log();
@@ -960,17 +961,17 @@ mod tests {
         let pool = setup_test_db().await;
         let config = create_test_config();
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let log = crate::test_utils::get_test_log();
@@ -987,13 +988,13 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        if let TradeEvent::ClearV2(boxed_clear_event) = queued_event.event {
+        if let TradeEvent::ClearV3(boxed_clear_event) = queued_event.event {
             let cache = SymbolCache::default();
             let http_provider =
                 ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
 
             let feed_id_cache = FeedIdCache::default();
-            if let Ok(Some(trade)) = OnchainTrade::try_from_clear_v2(
+            if let Ok(Some(trade)) = OnchainTrade::try_from_clear_v3(
                 &config.evm,
                 &cache,
                 &http_provider,
@@ -1026,17 +1027,17 @@ mod tests {
         let pool = setup_test_db().await;
         let _config = create_test_config();
 
-        let event1 = ClearV2 {
+        let event1 = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let log1 = crate::test_utils::get_test_log();
@@ -1082,17 +1083,17 @@ mod tests {
         let events_and_logs = vec![(100, 5), (99, 3), (100, 1), (101, 2), (99, 8)];
 
         for (block_num, log_idx) in &events_and_logs {
-            let event = ClearV2 {
+            let event = ClearV3 {
                 sender: address!("0x1111111111111111111111111111111111111111"),
-                alice: crate::test_utils::get_test_order(),
-                bob: crate::test_utils::get_test_order(),
-                clearConfig: ClearConfig {
+                alice: crate::test_utils::get_test_order_v4(),
+                bob: crate::test_utils::get_test_order_v4(),
+                clearConfig: ClearConfigV2 {
                     aliceInputIOIndex: alloy::primitives::U256::from(0),
                     aliceOutputIOIndex: alloy::primitives::U256::from(1),
                     bobInputIOIndex: alloy::primitives::U256::from(1),
                     bobOutputIOIndex: alloy::primitives::U256::from(0),
-                    aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                    bobBountyVaultId: alloy::primitives::U256::ZERO,
+                    aliceBountyVaultId: [0u8; 32].into(),
+                    bobBountyVaultId: [0u8; 32].into(),
                 },
             };
             let mut log = crate::test_utils::get_test_log();
@@ -1138,17 +1139,17 @@ mod tests {
 
         let mut events = vec![];
         for i in 0..5 {
-            let event = ClearV2 {
+            let event = ClearV3 {
                 sender: address!("0x1111111111111111111111111111111111111111"),
-                alice: crate::test_utils::get_test_order(),
-                bob: crate::test_utils::get_test_order(),
-                clearConfig: ClearConfig {
+                alice: crate::test_utils::get_test_order_v4(),
+                bob: crate::test_utils::get_test_order_v4(),
+                clearConfig: ClearConfigV2 {
                     aliceInputIOIndex: alloy::primitives::U256::from(0),
                     aliceOutputIOIndex: alloy::primitives::U256::from(1),
                     bobInputIOIndex: alloy::primitives::U256::from(1),
                     bobOutputIOIndex: alloy::primitives::U256::from(0),
-                    aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                    bobBountyVaultId: alloy::primitives::U256::ZERO,
+                    aliceBountyVaultId: [0u8; 32].into(),
+                    bobBountyVaultId: [0u8; 32].into(),
                 },
             };
             let mut log = crate::test_utils::get_test_log();
@@ -1203,17 +1204,17 @@ mod tests {
         let pool = setup_test_db().await;
         let config = create_test_config();
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let log = crate::test_utils::get_test_log();
@@ -1230,7 +1231,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(matches!(queued_event.event, TradeEvent::ClearV2(_)));
+        assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
 
         let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, &queued_event);
         assert_eq!(reconstructed_log.inner.address, config.evm.orderbook);
@@ -1290,17 +1291,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_for_first_event_with_clear_event() {
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let mut log = crate::test_utils::get_test_log();
@@ -1320,22 +1321,22 @@ mod tests {
         let (events, block_number) = result.unwrap();
         assert_eq!(block_number, 1000);
         assert_eq!(events.len(), 1);
-        assert!(matches!(events[0].0, TradeEvent::ClearV2(_)));
+        assert!(matches!(events[0].0, TradeEvent::ClearV3(_)));
     }
 
     #[tokio::test]
     async fn test_wait_for_first_event_missing_block_number() {
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let mut log = crate::test_utils::get_test_log();
@@ -1356,17 +1357,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_live_events_filtering() {
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
 
@@ -1395,23 +1396,23 @@ mod tests {
     async fn test_process_live_event_clear_v2() {
         let pool = setup_test_db().await;
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            alice: crate::test_utils::get_test_order(),
-            bob: crate::test_utils::get_test_order(),
-            clearConfig: ClearConfig {
+            alice: crate::test_utils::get_test_order_v4(),
+            bob: crate::test_utils::get_test_order_v4(),
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let log = crate::test_utils::get_test_log();
 
         let result =
-            process_live_event(&pool, TradeEvent::ClearV2(Box::new(clear_event)), log).await;
+            process_live_event(&pool, TradeEvent::ClearV3(Box::new(clear_event)), log).await;
 
         assert!(result.is_ok());
 
@@ -1428,23 +1429,23 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let mut alice_order = crate::test_utils::get_test_order();
-        let mut bob_order = crate::test_utils::get_test_order();
+        let mut alice_order = crate::test_utils::get_test_order_v4();
+        let mut bob_order = crate::test_utils::get_test_order_v4();
 
         alice_order.owner = address!("0x1111111111111111111111111111111111111111");
         bob_order.owner = address!("0x2222222222222222222222222222222222222222");
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0x3333333333333333333333333333333333333333"),
             alice: alice_order,
             bob: bob_order,
-            clearConfig: ClearConfig {
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: alloy::primitives::U256::from(0),
                 aliceOutputIOIndex: alloy::primitives::U256::from(1),
                 bobInputIOIndex: alloy::primitives::U256::from(1),
                 bobOutputIOIndex: alloy::primitives::U256::from(0),
-                aliceBountyVaultId: alloy::primitives::U256::ZERO,
-                bobBountyVaultId: alloy::primitives::U256::ZERO,
+                aliceBountyVaultId: [0u8; 32].into(),
+                bobBountyVaultId: [0u8; 32].into(),
             },
         };
         let log = crate::test_utils::get_test_log();

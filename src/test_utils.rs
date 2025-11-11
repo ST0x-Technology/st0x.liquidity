@@ -65,21 +65,29 @@ pub(crate) fn get_test_order_v4() -> OrderV4 {
         validInputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                vaultId: fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                ),
             },
             IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                vaultId: fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                ),
             },
         ],
         validOutputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                vaultId: fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                ),
             },
             IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                vaultId: fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000000"
+                ),
             },
         ],
     }
