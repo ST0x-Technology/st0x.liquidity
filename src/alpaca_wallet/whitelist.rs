@@ -47,9 +47,15 @@ mod tests {
         let test_address = "0x1234567890abcdef1234567890abcdef12345678";
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
+            when.method(POST)
+                .path(format!(
+                    "/v1/accounts/{expected_account_id}/wallets/whitelists"
+                ))
+                .json_body(json!({
+                    "address": test_address,
+                    "asset": "USDC",
+                    "chain": "Ethereum"
+                }));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
