@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::num::ParseFloatError;
 use tracing::error;
 
-use crate::bindings::IERC20::IERC20Instance;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
@@ -317,9 +316,9 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        // Fetch decimals for both input and output tokens from blockchain
-        let input_decimals = fetch_token_decimals(provider.clone(), input.token).await?;
-        let output_decimals = fetch_token_decimals(provider.clone(), output.token).await?;
+        // Fetch decimals for both input and output tokens using cache to reduce RPC traffic
+        let input_decimals = cache.get_token_decimals(provider.clone(), input.token).await?;
+        let output_decimals = cache.get_token_decimals(provider.clone(), output.token).await?;
 
         let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
         let onchain_input_symbol = cache
@@ -518,16 +517,6 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
     };
 
     formatted.parse::<f64>()
-}
-
-/// Fetch the decimals for a token from the blockchain
-async fn fetch_token_decimals<P: Provider>(
-    provider: P,
-    token: alloy::primitives::Address,
-) -> Result<u8, OnChainError> {
-    let erc20 = IERC20Instance::new(token, provider);
-    let decimals = erc20.decimals().call().await?;
-    Ok(decimals)
 }
 
 #[cfg(test)]

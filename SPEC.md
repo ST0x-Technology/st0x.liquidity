@@ -1113,7 +1113,7 @@ sequenceDiagram
     participant OP as Order Poller
     participant PC as Position Checker
 
-    BC->>DER: ClearV2/TakeOrderV2 event
+    BC->>DER: ClearV3/TakeOrderV3 event
     DER->>EP: Send via channel
     EP->>Q: Enqueue event
 

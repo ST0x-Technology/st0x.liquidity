@@ -128,7 +128,7 @@ new brokers, see @crates/broker/AGENTS.md
 
 **Main Event Loop ([`launch` function in `src/lib.rs`])**
 
-- Monitors two concurrent WebSocket event streams: `ClearV2` and `TakeOrderV2`
+- Monitors two concurrent WebSocket event streams: `ClearV3` and `TakeOrderV3`
   from the Raindex orderbook
 - Uses `tokio::select!` to handle events from either stream without blocking
 - Converts blockchain events to structured `Trade` objects for processing

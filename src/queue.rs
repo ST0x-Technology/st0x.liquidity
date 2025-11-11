@@ -215,7 +215,7 @@ pub(crate) async fn enqueue_buffer(
 
             if let Err(e) = result {
                 let event_type = match event {
-                    TradeEvent::ClearV3(_) => "ClearV2",
+                    TradeEvent::ClearV3(_) => "ClearV3",
                     TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
                 };
                 error!("Failed to enqueue buffered {event_type} event: {e}");
