@@ -137,24 +137,24 @@ get_next_unprocessed_event()
 Initialize CQRS framework for dual-write operations.
 
 **Subtasks:**
-- [ ] Create `src/dual_write/mod.rs` with module structure
-- [ ] Research cqrs-es SqliteStore setup (examine existing migration code for patterns)
-- [ ] Define `DualWriteContext` struct in `src/dual_write/mod.rs`:
-  - [ ] `pool: SqlitePool` reference
-  - [ ] Add fields for CQRS framework stores (TBD after research)
-- [ ] Add `pub(crate) fn new()` constructor for `DualWriteContext`
-- [ ] Add visibility level: make `DualWriteContext` `pub(crate)`, internals private
-- [ ] Update `src/lib.rs` to expose dual_write module as `pub(crate)`
-- [ ] Add custom `DualWriteError` type in `src/dual_write/error.rs`
+- [x] Create `src/dual_write/mod.rs` with module structure
+- [x] Research cqrs-es SqliteStore setup (examine existing migration code for patterns)
+- [x] Define `DualWriteContext` struct in `src/dual_write/mod.rs`:
+  - [x] `pool: SqlitePool` reference
+  - [x] Add fields for CQRS framework stores (TBD after research)
+- [x] Add `pub(crate) fn new()` constructor for `DualWriteContext`
+- [x] Add visibility level: make `DualWriteContext` `pub(crate)`, internals private
+- [x] Update `src/lib.rs` to expose dual_write module as `pub(crate)`
+- [x] Add custom `DualWriteError` type in `src/dual_write/mod.rs`
 
 **Design Notes:**
 - Use `pub(crate)` for all dual-write types (not part of public API)
 - Follow import organization: external crates, then blank line, then `crate::`
-- Research task may reveal existing CQRS setup patterns to reuse
+- Following migration code pattern: write events directly to `events` table without CqrsFramework
 
 **Completion Criteria:**
-- [ ] `cargo build` succeeds
-- [ ] Module structure created and compiles
+- [x] `cargo build` succeeds
+- [x] Module structure created and compiles
 
 ## Task 2. OnchainTrade Dual-Write
 
