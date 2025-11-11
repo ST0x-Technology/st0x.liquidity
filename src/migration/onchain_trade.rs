@@ -1,0 +1,403 @@
+use alloy::primitives::TxHash;
+use chrono::Utc;
+use cqrs_es::{Aggregate, DomainEvent};
+use rust_decimal::Decimal;
+use sqlx::SqlitePool;
+use st0x_broker::Symbol;
+use tracing::info;
+
+use super::{ExecutionMode, MigrationError};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
+
+#[derive(sqlx::FromRow)]
+struct OnchainTradeRow {
+    tx_hash: String,
+    log_index: i64,
+    symbol: String,
+    amount: f64,
+    direction: String,
+    price_usdc: f64,
+}
+
+pub async fn migrate_onchain_trades(
+    pool: &SqlitePool,
+    execution: ExecutionMode,
+) -> Result<usize, MigrationError> {
+    let rows = sqlx::query_as::<_, OnchainTradeRow>(
+        "SELECT tx_hash, log_index, symbol, amount, direction, price_usdc
+         FROM onchain_trades
+         ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let total = rows.len();
+    info!("Found {total} onchain trades to migrate");
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        let progress = idx + 1;
+        if progress % 100 == 0 {
+            info!("Migrating onchain trades: {progress}/{total}");
+        }
+
+        let tx_hash: TxHash = row.tx_hash.parse()?;
+        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, row.log_index);
+        let symbol = Symbol::new(&row.symbol)?;
+        let amount = Decimal::try_from(row.amount)?;
+        let direction = row.direction.parse()?;
+        let price_usdc = Decimal::try_from(row.price_usdc)?;
+
+        let event = OnChainTradeEvent::Migrated {
+            symbol,
+            amount,
+            direction,
+            price_usdc,
+            block_number: 0,
+            block_timestamp: Utc::now(),
+            gas_used: None,
+            pyth_price: None,
+            migrated_at: Utc::now(),
+        };
+
+        match execution {
+            ExecutionMode::Commit => {
+                persist_event(pool, &aggregate_id, event).await?;
+            }
+            ExecutionMode::DryRun => {}
+        }
+    }
+
+    info!("Migrated {total} onchain trades");
+    Ok(total)
+}
+
+async fn persist_event(
+    pool: &SqlitePool,
+    aggregate_id: &str,
+    event: OnChainTradeEvent,
+) -> Result<(), MigrationError> {
+    let aggregate_type = OnChainTrade::aggregate_type();
+    let event_type = event.event_type();
+    let event_version = event.event_version();
+    let payload = serde_json::to_string(&event)?;
+
+    sqlx::query(
+        "INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES (?, ?, 1, ?, ?, ?, '{}')",
+    )
+    .bind(&aggregate_type)
+    .bind(aggregate_id)
+    .bind(&event_type)
+    .bind(&event_version)
+    .bind(&payload)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{TxHash, b256};
+    use sqlx::SqlitePool;
+
+    use super::{ExecutionMode, migrate_onchain_trades};
+    use crate::onchain_trade::OnChainTrade;
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_test_trade(
+        pool: &SqlitePool,
+        tx_hash: TxHash,
+        log_index: i64,
+        symbol: &str,
+        amount: f64,
+        direction: &str,
+        price_usdc: f64,
+    ) {
+        let tx_hash_str = tx_hash.to_string();
+        sqlx::query!(
+            "
+            INSERT INTO onchain_trades (
+                tx_hash,
+                log_index,
+                symbol,
+                amount,
+                direction,
+                price_usdc
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+            tx_hash_str,
+            log_index,
+            symbol,
+            amount,
+            direction,
+            price_usdc
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_empty_database() {
+        let pool = create_test_pool().await;
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
+
+        assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_single_trade() {
+        let pool = create_test_pool().await;
+
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+        insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
+
+        assert_eq!(result, 1);
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+
+        let aggregate_id = sqlx::query_scalar!(
+            "SELECT aggregate_id FROM events WHERE aggregate_type = 'OnChainTrade'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let expected_id = OnChainTrade::aggregate_id(tx_hash, 0);
+        assert_eq!(aggregate_id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_multiple_trades() {
+        let pool = create_test_pool().await;
+
+        let tx_hash1 = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+        let tx_hash2 = b256!("0xfedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321");
+
+        insert_test_trade(&pool, tx_hash1, 0, "AAPL", 10.0, "BUY", 150.50).await;
+        insert_test_trade(&pool, tx_hash1, 1, "TSLA", 5.0, "SELL", 200.75).await;
+        insert_test_trade(&pool, tx_hash2, 0, "GOOGL", 3.0, "BUY", 2800.00).await;
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
+
+        assert_eq!(result, 3);
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_dry_run() {
+        let pool = create_test_pool().await;
+
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+        insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::DryRun)
+            .await
+            .unwrap();
+
+        assert_eq!(result, 1);
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_invalid_symbol() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE onchain_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_hash TEXT NOT NULL,
+                log_index INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                amount REAL NOT NULL,
+                direction TEXT NOT NULL,
+                price_usdc REAL NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tx_hash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        sqlx::query(
+            "
+            INSERT INTO onchain_trades (
+                tx_hash,
+                log_index,
+                symbol,
+                amount,
+                direction,
+                price_usdc
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(tx_hash)
+        .bind(0_i64)
+        .bind("")
+        .bind(10.0)
+        .bind("BUY")
+        .bind(150.50)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            super::MigrationError::InvalidSymbol(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_invalid_decimal_infinity() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE onchain_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_hash TEXT NOT NULL,
+                log_index INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                amount REAL NOT NULL,
+                direction TEXT NOT NULL,
+                price_usdc REAL NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tx_hash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        sqlx::query(
+            "
+            INSERT INTO onchain_trades (
+                tx_hash,
+                log_index,
+                symbol,
+                amount,
+                direction,
+                price_usdc
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(tx_hash)
+        .bind(0_i64)
+        .bind("AAPL")
+        .bind(10.0)
+        .bind("BUY")
+        .bind(f64::INFINITY)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            super::MigrationError::InvalidDecimal(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_onchain_trades_invalid_direction() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+
+        sqlx::query(
+            "CREATE TABLE onchain_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tx_hash TEXT NOT NULL,
+                log_index INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                amount REAL NOT NULL,
+                direction TEXT NOT NULL,
+                price_usdc REAL NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tx_hash = "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        sqlx::query(
+            "
+            INSERT INTO onchain_trades (
+                tx_hash,
+                log_index,
+                symbol,
+                amount,
+                direction,
+                price_usdc
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(tx_hash)
+        .bind(0_i64)
+        .bind("AAPL")
+        .bind(10.0)
+        .bind("INVALID")
+        .bind(150.50)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            super::MigrationError::InvalidDirection(_)
+        ));
+    }
+}
