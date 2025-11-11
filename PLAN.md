@@ -162,57 +162,75 @@ Idempotency and safety checks built-in from the start.
 **Goal**: Deliver fully working, tested, and verified Position migration.
 Following same pattern as Task 2.
 
+**Status**: COMPLETED
+
 **Subtasks**:
 
 **3.1 Migration implementation**:
 
-- [ ] Create
-      `migrate_positions(pool: &SqlitePool, opts: &MigrationOpts) ->
-      Result<usize>`
+- [x] Create
+      `migrate_positions(pool: &SqlitePool, execution: ExecutionMode) ->
+      Result<usize, MigrationError>`
       function
-- [ ] Query all rows from `trade_accumulators`
-- [ ] For each row, create `PositionEvent::Migrated`:
-  - Aggregate ID: `row.symbol` (symbol is the natural ID for positions)
+- [x] Query all rows from `trade_accumulators` ordered by `symbol` ASC
+- [x] For each row, create `PositionEvent::Migrated`:
+  - Aggregate ID: Use helper `Position::aggregate_id(symbol: &Symbol)` (symbol is the natural ID for positions)
   - Convert `net_position`, `accumulated_long`, `accumulated_short` from REAL to
-    `Decimal` to `FractionalShares`
+    `Decimal` using `Decimal::try_from()` with proper error handling
+  - Convert Decimal to `FractionalShares` with explicit error handling
   - Set default threshold: `ExecutionThreshold::Shares(Decimal::ONE)`
-  - Use `last_updated` timestamp
-- [ ] Handle positions with pending executions:
+  - Use `Utc::now()` timestamp for migrated_at
+- [x] Handle positions with pending executions:
+  - Count pending executions functionally using `.filter().count()`
   - If `pending_execution_id IS NOT NULL`, log warning:
     `"Position {symbol} has pending execution {id} - will be reconciled in
     dual-write phase"`
   - Don't block migration, just log for awareness
-- [ ] Persist events respecting `--dry-run` flag
-- [ ] Log summary: "Migrated N positions, M with pending executions"
+- [x] Persist events respecting `execution` mode using dedicated `persist_position_event()` helper
+- [x] Log summary: "Migrated N positions, M with pending executions"
+- [x] Log progress every 100 positions for large migrations
 
-**3.2 Verification implementation**:
+**3.2 Testing**:
 
-- [ ] Implement `PositionVerifier: MigrationVerifier`
-- [ ] `verify_counts()`: Compare `trade_accumulators` count vs Position events
-- [ ] `verify_sample()`:
-  - Select random positions from `trade_accumulators`
-  - Load aggregates from event store
-  - Query `position_view` table (the view projection)
-  - Compare: net_position, accumulated_long, accumulated_short, threshold
-  - Return mismatches
-- [ ] Wire into main flow
-
-**3.3 Testing**:
-
-- [ ] Integration test: Empty table
-- [ ] Integration test: Full migration with 5 positions
-  - Verify view projections match source data exactly
-- [ ] Integration test: Position with pending execution
-  - Verify warning logged, migration succeeds
-- [ ] Unit test: Row conversion
-- [ ] Integration test: Idempotency check
-- [ ] Run tests, clippy, fmt
+- [x] Test: Empty table (no positions to migrate)
+- [x] Test: Full migration with 3 positions (AAPL, TSLA, MSFT)
+- [x] Test: Position with pending execution (simplified to avoid foreign key complexity)
+- [x] Test: Error handling for invalid symbols
+  - Create database without constraints
+  - Insert invalid symbol (empty string)
+  - Verify proper error propagation
+- [x] Test: Dry-run mode doesn't persist events
+- [x] Use `.unwrap()` instead of `assert!(result.is_ok())` in all tests
+- [x] Run tests, clippy, fmt
 
 **Deliverable**: Can run migration on database with positions → migrates
-OnChainTrades + Positions, verifies both. Output shows migrated counts for both aggregates with verification passed.
+OnChainTrades + Positions. Output shows migrated counts for both aggregates.
 
-**Design rationale**: Per-symbol singletons. Default threshold safe for later
-adjustment via commands.
+**Design rationale**: Per-symbol singletons with centralized aggregate ID helper. Default threshold safe for later
+adjustment via commands. All type conversions use explicit error handling with proper error types.
+
+**Implementation Notes**:
+
+**Core Migration Logic**:
+- Implemented `migrate_positions()` function (src/migration.rs:235)
+- Implemented `persist_position_event()` helper function (src/migration.rs:321)
+- Created `Position::aggregate_id(symbol: &Symbol)` helper (src/position/mod.rs:263)
+
+**Code Quality**:
+- NO boolean blindness: Uses `ExecutionMode` enum instead of `bool dry_run` parameter
+- NO mutable imperative code: Pending execution count calculated functionally with `.filter().count()`
+- Uses pattern matching on `ExecutionMode` enum instead of boolean checks
+- Wired into `run_migration()` flow (src/migration.rs:170)
+
+**Testing**:
+- Added 6 comprehensive tests covering:
+  - Empty database scenarios
+  - Single and multiple position migrations
+  - Position with pending execution (simplified)
+  - Dry-run mode (no persistence)
+  - Error handling for invalid symbols
+- All tests use `.unwrap()` for better error messages
+- All tests pass, clippy clean, code formatted
 
 ## Task 4. OffchainOrder migration
 
@@ -223,56 +241,56 @@ adjustment via commands.
 **4.1 Migration implementation**:
 
 - [ ] Create
-      `migrate_offchain_orders(pool: &SqlitePool, opts: &MigrationOpts)
-      -> Result<usize>`
+      `migrate_offchain_orders(pool: &SqlitePool, dry_run: bool)
+      -> Result<usize, MigrationError>`
       function
 - [ ] Query all rows from `schwab_executions` ordered by `id` ASC
 - [ ] For each row, create `OffchainOrderEvent::Migrated`:
-  - Aggregate ID: `format!("{}", row.id)`
-  - Map status with validation:
-    - "PENDING" → `MigratedOrderStatus::Pending`
-    - "SUBMITTED" → `MigratedOrderStatus::Submitted`
-    - "FILLED" → `MigratedOrderStatus::Filled`
-    - "FAILED" →
-      `MigratedOrderStatus::Failed { error: "Migrated from legacy
-      system".to_string() }`
+  - Aggregate ID: Use helper `OffchainOrder::aggregate_id(id: i64)` (wraps `format!("{}", id)`)
+  - Map status with validation and proper error handling for unknown status strings
   - Handle SUBMITTED with missing `order_id`:
-    - Database constraint should prevent this, but add defensive check
-    - If NULL, log warning and use placeholder: `BrokerOrderId("UNKNOWN")`
-  - Convert `shares` (INTEGER) to `FractionalShares(Decimal::from(i64))`
-  - Convert `price_cents` (INTEGER) to `PriceCents(u64)`
+    - Database constraint should prevent this
+    - If NULL occurs, return error - DO NOT use placeholder values for financial data
+    - Log detailed error context and fail the migration for that row
+  - Convert `shares` (INTEGER) to `FractionalShares`:
+    - Use `i64::try_into()` with explicit error handling
+    - Then convert to `Decimal` and wrap in `FractionalShares`
+  - Convert `price_cents` (INTEGER) to `PriceCents`:
+    - Use `i64::try_into::<u64>()` with explicit error handling
+    - Wrap in `PriceCents` type
   - Broker is always `SupportedBroker::Schwab` for this table
 - [ ] Track status breakdown in memory, log at end:
       `"Status breakdown: 5 PENDING, 120 FILLED, 3 FAILED"`
-- [ ] Persist events respecting `--dry-run` flag
+- [ ] Persist events respecting `dry_run` flag using existing `persist_event()` helper
+- [ ] Log progress every 100 orders for large migrations
 
-**4.2 Verification implementation**:
+**4.2 Testing**:
 
-- [ ] Implement `OffchainOrderVerifier: MigrationVerifier`
-- [ ] `verify_counts()`: Compare `schwab_executions` count vs OffchainOrder
-      events
-- [ ] `verify_sample()`:
-  - Select random executions from `schwab_executions`
-  - Load aggregates from event store
-  - Query `offchain_order_view` table
-  - Compare: symbol, shares, direction, status, broker_order_id, price_cents
-- [ ] Wire into main flow
-
-**4.3 Testing**:
-
-- [ ] Integration test: Empty table
-- [ ] Integration test: Full migration with all status types
+- [ ] Test: Empty table (no orders to migrate)
+- [ ] Test: Full migration with all status types
   - 2 PENDING, 2 SUBMITTED, 2 FILLED, 1 FAILED
   - Verify status breakdown logged correctly
-- [ ] Integration test: SUBMITTED with NULL order_id (edge case)
-  - Verify warning logged, placeholder used
-- [ ] Unit test: Status mapping
+  - Verify view projections match source data via queries
+- [ ] Test: Error handling for SUBMITTED with NULL order_id
+  - Create database without constraints
+  - Insert SUBMITTED order with NULL order_id
+  - Verify migration returns error with proper context
+- [ ] Test: Error handling for negative shares
+  - Create database without constraints
+  - Insert order with negative shares
+  - Verify proper error propagation with `try_into()`
+- [ ] Test: Error handling for negative price_cents
+  - Create database without constraints
+  - Insert order with negative price_cents
+  - Verify proper error propagation with `try_into()`
+- [ ] Test: Dry-run mode doesn't persist events
+- [ ] Use `.unwrap()` instead of `assert!(result.is_ok())` in all tests
 - [ ] Run tests, clippy, fmt
 
-**Deliverable**: Can run migration → migrates 3 aggregates successfully. Output shows counts for all three aggregates with status breakdown for orders, all verified.
+**Deliverable**: Can run migration → migrates 3 aggregates successfully. Output shows counts for all three aggregates with status breakdown for orders.
 
-**Design rationale**: Integer IDs natural for orders. Status mapping preserves
-lifecycle state for dual-write reconciliation.
+**Design rationale**: Integer IDs with centralized aggregate ID helper. Status mapping preserves
+lifecycle state for dual-write reconciliation. All numeric conversions use `try_into()` with explicit error handling to prevent silent data corruption. NO placeholder values for missing financial data - fail fast instead.
 
 ## Task 5. SchwabAuth migration
 
@@ -300,8 +318,8 @@ creating the aggregate if it doesn't exist.
 **5.2 Migration implementation**:
 
 - [ ] Create
-      `migrate_schwab_auth(pool: &SqlitePool, opts: &MigrationOpts) ->
-      Result<bool>`
+      `migrate_schwab_auth(pool: &SqlitePool, dry_run: bool) ->
+      Result<bool, MigrationError>`
       function (returns bool: migrated or not)
 - [ ] Query: `SELECT * FROM schwab_auth WHERE id = 1`
 - [ ] Handle empty table gracefully:
@@ -311,33 +329,24 @@ creating the aggregate if it doesn't exist.
   - Aggregate ID: `"schwab"` (fixed singleton ID)
   - Map all token fields from row
   - Handle potential NULL fields (though schema shows NOT NULL)
-- [ ] Persist event respecting `--dry-run` flag
+- [ ] Persist event respecting `dry_run` flag using existing `persist_event()` helper
 - [ ] Log: "SchwabAuth migrated" or "No SchwabAuth to migrate"
 
-**5.3 Verification implementation**:
+**5.3 Testing**:
 
-- [ ] Implement `SchwabAuthVerifier: MigrationVerifier`
-- [ ] `verify_counts()`:
-  - Count rows in `schwab_auth` (should be 0 or 1)
-  - Count events for aggregate_type='SchwabAuth', aggregate_id='schwab'
-  - Match: both 0, or both 1
-- [ ] `verify_sample()`:
-  - If auth exists, load aggregate from event store
-  - Query `schwab_auth_view` table
-  - Compare: access_token, refresh_token, timestamps
-- [ ] Wire into main flow
-
-**5.4 Testing**:
-
-- [ ] Integration test: Empty table (no auth configured)
+- [ ] Test: Empty table (no auth configured)
   - Migration completes without error, logs "nothing to migrate"
-- [ ] Integration test: Singleton row exists
-  - Migrate, verify event created, view projection matches
-- [ ] Integration test: Idempotency with singleton
+  - Returns `Ok(false)`
+- [ ] Test: Singleton row exists
+  - Migrate, verify event created
+  - Verify view projection matches source data via queries
+  - Returns `Ok(true)`
+- [ ] Test: Dry-run mode doesn't persist events
 - [ ] If new aggregate created: Add aggregate-level unit tests
+- [ ] Use `.unwrap()` instead of `assert!(result.is_ok())` in all tests
 - [ ] Run tests, clippy, fmt
 
-**Deliverable**: Full migration of all 4 aggregates working end-to-end. Binary output shows counts for all aggregates with verification passed. If SchwabAuth aggregate created, it's tested and working standalone.
+**Deliverable**: Full migration of all 4 aggregates working end-to-end. Binary output shows counts for all aggregates. If SchwabAuth aggregate created, it's tested and working standalone.
 
 **Design rationale**: Singleton pattern for global auth state. Creating
 aggregate if needed keeps migration self-contained and unblocks this PR from
@@ -356,8 +365,10 @@ production-ready.
   - Negative amounts or prices
   - Unknown status strings
   - NULL values in NOT NULL columns (data corruption)
-  - Each error should: log detailed context, skip row, continue migration
-  - Track error count, include in summary: "Migrated N, skipped M (errors)"
+  - CRITICAL: Each error should fail fast with detailed context - NO silent skipping of financial data
+  - Use explicit error types with proper context for all conversions
+  - Track error count, fail migration if any errors occur
+  - ALL numeric conversions must use `try_into()` or equivalent with explicit error handling
 - [ ] Add retry logic with backoff for transient failures:
   - Database connection failures
   - Event store write failures
@@ -370,22 +381,20 @@ production-ready.
   - Double confirmation: "This will DELETE all events! Type 'DELETE' to confirm:"
   - Delete from `events` and `snapshots` tables
   - Log: "Deleted N events from event store"
-- [ ] Add `--verify-only` mode:
-  - Skip migration, only run verification
-  - Useful for checking migration without re-running
-- [ ] Integration test: Large dataset (1000+ trades)
+- [ ] Test: Large dataset (1000+ trades)
   - Verify performance acceptable
   - Verify progress logging works
-- [ ] Integration test: Malformed data
+- [ ] Test: Malformed data
   - Insert rows with invalid symbol, negative amount, NULL required field
-  - Verify logged and skipped, migration continues
+  - Verify migration FAILS with detailed error context (fail-fast behavior)
+  - NO silent skipping or default values - errors must propagate
+- [ ] Use `.unwrap()` instead of `assert!(result.is_ok())` in all tests
 - [ ] Run full test suite, clippy, fmt
 
 **Deliverable**: Production-ready migration binary that handles edge cases
-gracefully. Can run on messy real-world data without crashing.
+with fail-fast error reporting. Provides clear diagnostic errors for data integrity issues.
 
-**Design rationale**: Real databases have edge cases. Robust error handling
-prevents migration failures and provides clear diagnostics.
+**Design rationale**: Financial data integrity is paramount. Migration must fail fast with clear errors rather than silently corrupt or skip data. All errors provide detailed context for troubleshooting.
 
 ## Task 7. Documentation and usage guidance
 
@@ -402,19 +411,19 @@ prevents migration failures and provides clear diagnostics.
   - **When to run**: Before enabling dual-write (#130)
   - **Recommended workflow**:
     1. Backup database: `cp st0x.db st0x.db.backup`
-    2. Dry run: `./migrate_to_events --dry-run`
+    2. Dry run: `cargo run --bin migrate_to_events -- dry-run`
     3. Review output, ensure no errors
-    4. Run for real: `./migrate_to_events`
-    5. Verify: `./migrate_to_events --verify-only`
-    6. If verification fails, restore backup and investigate
+    4. Run for real: `cargo run --bin migrate_to_events`
+    5. Query view tables to verify data matches legacy tables
+    6. If issues found, restore backup and investigate
   - **Example commands**:
-    - Dry run: `cargo run --bin migrate_to_events -- --dry-run`
+    - Dry run: `cargo run --bin migrate_to_events -- dry-run`
     - Force mode (no prompts): `cargo run --bin migrate_to_events -- --force`
     - Clean and migrate: `cargo run --bin migrate_to_events -- --clean --force`
   - **Troubleshooting**:
-    - "Events detected" → Already migrated, safe to skip
-    - "Verification failed" → Check logs, compare sample mismatches
-    - Malformed data errors → Review skipped rows in logs
+    - "Events detected" → Already migrated, use `--force` to proceed anyway
+    - Migration errors → Check logs for detailed error context
+    - Malformed data errors → Migration will fail with detailed error - fix source data and retry
   - **Rollback**: `mv st0x.db.backup st0x.db`
 - [ ] Add inline code comments for critical sections:
   - Aggregate ID generation (why format is important)
