@@ -9,7 +9,7 @@ const NONCE_SIZE: usize = 12;
 pub(crate) type EncryptionKey = FixedBytes<32>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct EncryptedToken(#[serde(with = "alloy::hex")] Vec<u8>);
+pub struct EncryptedToken(#[serde(with = "alloy::hex")] Vec<u8>);
 
 impl EncryptedToken {
     pub(crate) fn new(ciphertext: Vec<u8>) -> Self {
