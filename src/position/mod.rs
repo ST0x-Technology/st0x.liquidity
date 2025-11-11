@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::Direction;
+use st0x_broker::{Direction, Symbol};
 
 use crate::offchain_order::ExecutionId;
 
@@ -299,6 +299,10 @@ impl Aggregate for Position {
 }
 
 impl Position {
+    pub(crate) fn aggregate_id(symbol: &Symbol) -> String {
+        symbol.to_string()
+    }
+
     fn create_trigger_reason(&self, threshold: &ExecutionThreshold) -> Option<TriggerReason> {
         match threshold {
             ExecutionThreshold::Shares(threshold_shares) => {
@@ -717,5 +721,13 @@ mod tests {
             .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_aggregate_id_format() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = Position::aggregate_id(&symbol);
+
+        assert_eq!(aggregate_id, "AAPL");
     }
 }
