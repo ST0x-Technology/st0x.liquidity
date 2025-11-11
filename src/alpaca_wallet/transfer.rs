@@ -26,10 +26,10 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct TokenSymbol(pub(super) String);
+pub(crate) struct TokenSymbol(pub(super) String);
 
 impl TokenSymbol {
-    pub(super) fn new(s: impl Into<String>) -> Self {
+    pub(crate) fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 }
@@ -53,7 +53,7 @@ impl std::fmt::Display for TokenSymbol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub(super) struct TransferId(Uuid);
+pub(crate) struct TransferId(Uuid);
 
 impl TransferId {
     #[cfg(test)]
@@ -76,14 +76,14 @@ impl std::fmt::Display for TransferId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub(super) enum TransferDirection {
+pub(crate) enum TransferDirection {
     Incoming,
     Outgoing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub(super) enum TransferStatus {
+pub(crate) enum TransferStatus {
     Pending,
     Processing,
     Complete,
@@ -91,33 +91,33 @@ pub(super) enum TransferStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub(super) struct Transfer {
-    pub(super) id: TransferId,
+pub(crate) struct Transfer {
+    pub(crate) id: TransferId,
     #[serde(rename = "relationship")]
-    pub(super) direction: TransferDirection,
+    pub(crate) direction: TransferDirection,
     #[serde(deserialize_with = "deserialize_decimal_from_string")]
-    pub(super) amount: Decimal,
-    pub(super) asset: TokenSymbol,
+    pub(crate) amount: Decimal,
+    pub(crate) asset: TokenSymbol,
     #[serde(rename = "from_address")]
-    pub(super) from: Option<Address>,
+    pub(crate) from: Option<Address>,
     #[serde(rename = "to_address")]
-    pub(super) to: Address,
-    pub(super) status: TransferStatus,
+    pub(crate) to: Address,
+    pub(crate) status: TransferStatus,
     #[serde(rename = "tx_hash")]
-    pub(super) tx: Option<TxHash>,
-    pub(super) created_at: DateTime<Utc>,
+    pub(crate) tx: Option<TxHash>,
+    pub(crate) created_at: DateTime<Utc>,
     #[serde(
         rename = "network_fee_amount",
         deserialize_with = "deserialize_optional_decimal_from_string"
     )]
-    pub(super) network_fee: Option<Decimal>,
+    pub(crate) network_fee: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Network(pub(super) String);
+pub(crate) struct Network(pub(super) String);
 
 impl Network {
-    pub(super) fn new(s: impl Into<String>) -> Self {
+    pub(crate) fn new(s: impl Into<String>) -> Self {
         Self(s.into().to_lowercase())
     }
 }
@@ -150,7 +150,7 @@ pub(super) struct DepositAddress {
 #[derive(Deserialize)]
 struct FundingWallet {
     address: Address,
-    asset: Token,
+    asset: TokenSymbol,
     network: Network,
 }
 

@@ -10,6 +10,8 @@ pub(super) struct PollingConfig {
     pub(super) interval: Duration,
     pub(super) timeout: Duration,
     pub(super) max_retries: usize,
+    pub(super) min_retry_delay: Duration,
+    pub(super) max_retry_delay: Duration,
 }
 
 impl Default for PollingConfig {
@@ -18,6 +20,8 @@ impl Default for PollingConfig {
             interval: Duration::from_secs(10),
             timeout: Duration::from_secs(30 * 60),
             max_retries: 10,
+            min_retry_delay: Duration::from_secs(1),
+            max_retry_delay: Duration::from_secs(60),
         }
     }
 }
@@ -28,71 +32,55 @@ pub(super) async fn poll_transfer_status(
     config: &PollingConfig,
 ) -> Result<Transfer, AlpacaWalletError> {
     let start = Instant::now();
-    let mut retries = 0;
     let mut last_status = None;
+
+    let retry_strategy = ExponentialBuilder::default()
+        .with_max_times(config.max_retries)
+        .with_min_delay(config.min_retry_delay)
+        .with_max_delay(config.max_retry_delay);
 
     loop {
         if start.elapsed() >= config.timeout {
             return Err(AlpacaWalletError::TransferTimeout {
-                transfer_id: transfer_id.to_string(),
+                transfer_id: *transfer_id,
                 elapsed: start.elapsed(),
             });
         }
 
-        let transfer = match get_transfer_status(client, transfer_id).await {
-            Ok(transfer) => {
-                retries = 0;
-                transfer
-            }
-            Err(AlpacaWalletError::ApiError { status, .. }) if status.is_server_error() => {
-                retries += 1;
-                if retries > config.max_retries {
-                    return Err(AlpacaWalletError::MaxRetriesExceeded {
-                        transfer_id: transfer_id.to_string(),
-                        retries,
-                    });
-                }
-
-                let backoff = Duration::from_secs(2u64.pow(retries - 1));
-                info!(
-                    "Server error polling transfer {}, retry {}/{} after {:?}",
-                    transfer_id, retries, config.max_retries, backoff
-                );
-                sleep(backoff).await;
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
+        let transfer = (|| async { get_transfer_status(client, transfer_id).await })
+            .retry(retry_strategy)
+            .when(|e| matches!(e, AlpacaWalletError::ApiError { status, .. } if status.is_server_error()))
+            .await?;
 
         if let Some(prev_status) = last_status {
             if is_status_regression(prev_status, transfer.status) {
                 return Err(AlpacaWalletError::InvalidStatusTransition {
-                    transfer_id: transfer_id.to_string(),
-                    from: format!("{:?}", prev_status),
-                    to: format!("{:?}", transfer.status),
+                    transfer_id: *transfer_id,
+                    previous: prev_status,
+                    next: transfer.status,
                 });
             }
 
             if prev_status != transfer.status {
                 info!(
-                    "Transfer {} status: {:?} -> {:?}",
-                    transfer_id, prev_status, transfer.status
+                    "Transfer {transfer_id} status: {prev_status:?} -> {:?}",
+                    transfer.status
                 );
             }
         } else {
             info!(
-                "Transfer {} initial status: {:?}",
-                transfer_id, transfer.status
+                "Transfer {transfer_id} initial status: {:?}",
+                transfer.status
             );
         }
 
         match transfer.status {
             TransferStatus::Complete => {
-                info!("Transfer {} completed successfully", transfer_id);
+                info!("Transfer {transfer_id} completed successfully");
                 return Ok(transfer);
             }
             TransferStatus::Failed => {
-                info!("Transfer {} failed", transfer_id);
+                info!("Transfer {transfer_id} failed");
                 return Ok(transfer);
             }
             TransferStatus::Pending | TransferStatus::Processing => {
@@ -103,12 +91,11 @@ pub(super) async fn poll_transfer_status(
     }
 }
 
-fn is_status_regression(from: TransferStatus, to: TransferStatus) -> bool {
+fn is_status_regression(prev: TransferStatus, next: TransferStatus) -> bool {
     matches!(
-        (from, to),
+        (prev, next),
         (TransferStatus::Processing, TransferStatus::Pending)
-            | (TransferStatus::Complete, _)
-            | (TransferStatus::Failed, _)
+            | (TransferStatus::Complete | TransferStatus::Failed, _)
     )
 }
 
@@ -225,6 +212,8 @@ mod tests {
             interval: Duration::from_millis(100),
             timeout: Duration::from_secs(5),
             max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
         };
 
         let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config)
@@ -281,6 +270,8 @@ mod tests {
             interval: Duration::from_millis(100),
             timeout: Duration::from_secs(5),
             max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
         };
 
         let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config)
@@ -336,6 +327,8 @@ mod tests {
             interval: Duration::from_millis(100),
             timeout: Duration::from_millis(500),
             max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
         };
 
         let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
@@ -403,6 +396,8 @@ mod tests {
             interval: Duration::from_millis(100),
             timeout: Duration::from_secs(10),
             max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
         };
 
         let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config)
@@ -482,6 +477,8 @@ mod tests {
             interval: Duration::from_millis(100),
             timeout: Duration::from_secs(5),
             max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
         };
 
         let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
@@ -495,5 +492,69 @@ mod tests {
         account_mock.assert();
         processing_mock.assert();
         pending_mock.assert();
+    }
+
+    #[test]
+    fn test_is_status_regression_processing_to_pending() {
+        assert!(is_status_regression(
+            TransferStatus::Processing,
+            TransferStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn test_is_status_regression_complete_to_any() {
+        assert!(is_status_regression(
+            TransferStatus::Complete,
+            TransferStatus::Pending
+        ));
+        assert!(is_status_regression(
+            TransferStatus::Complete,
+            TransferStatus::Processing
+        ));
+        assert!(is_status_regression(
+            TransferStatus::Complete,
+            TransferStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn test_is_status_regression_failed_to_any() {
+        assert!(is_status_regression(
+            TransferStatus::Failed,
+            TransferStatus::Pending
+        ));
+        assert!(is_status_regression(
+            TransferStatus::Failed,
+            TransferStatus::Processing
+        ));
+        assert!(is_status_regression(
+            TransferStatus::Failed,
+            TransferStatus::Complete
+        ));
+    }
+
+    #[test]
+    fn test_is_status_regression_valid_transitions() {
+        assert!(!is_status_regression(
+            TransferStatus::Pending,
+            TransferStatus::Processing
+        ));
+        assert!(!is_status_regression(
+            TransferStatus::Pending,
+            TransferStatus::Complete
+        ));
+        assert!(!is_status_regression(
+            TransferStatus::Pending,
+            TransferStatus::Failed
+        ));
+        assert!(!is_status_regression(
+            TransferStatus::Processing,
+            TransferStatus::Complete
+        ));
+        assert!(!is_status_regression(
+            TransferStatus::Processing,
+            TransferStatus::Failed
+        ));
     }
 }

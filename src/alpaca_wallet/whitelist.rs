@@ -9,7 +9,7 @@ pub(super) const APPROVAL_WAIT_TIME: Duration = Duration::from_secs(24 * 60 * 60
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub(super) enum WhitelistStatus {
+pub(crate) enum WhitelistStatus {
     Pending,
     Approved,
     Rejected,
@@ -114,7 +114,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -224,7 +224,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -274,7 +274,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -324,7 +324,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -375,7 +375,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -416,7 +416,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -458,7 +458,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address(AlloyAddress::from_str(test_address).unwrap());
+        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 

@@ -1,11 +1,12 @@
 use alloy::primitives::{Address, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use st0x_broker::alpaca::AlpacaAuthEnv;
 use thiserror::Error;
 
 use super::transfer::{Network, TokenSymbol, TransferId, TransferStatus};
+use super::whitelist::{WhitelistEntry, WhitelistStatus};
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
@@ -200,6 +201,60 @@ impl AlpacaWalletClient {
 
     pub(super) fn account_id(&self) -> &str {
         &self.account_id
+    }
+
+    pub(super) async fn whitelist_address(
+        &self,
+        address: &Address,
+        asset: &TokenSymbol,
+        network: &Network,
+    ) -> Result<WhitelistEntry, AlpacaWalletError> {
+        #[derive(Serialize)]
+        struct WhitelistRequest {
+            address: String,
+            asset: String,
+            chain: String,
+        }
+
+        let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
+
+        let request = WhitelistRequest {
+            address: address.to_string(),
+            asset: asset.0.clone(),
+            chain: network.0.clone(),
+        };
+
+        let response = self.post(&path, &request).await?;
+        let entry: WhitelistEntry = response.json().await?;
+
+        Ok(entry)
+    }
+
+    pub(super) async fn get_whitelisted_addresses(
+        &self,
+    ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
+        let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
+
+        let response = self.get(&path).await?;
+        let entries: Vec<WhitelistEntry> = response.json().await?;
+
+        Ok(entries)
+    }
+
+    pub(super) async fn is_address_whitelisted_and_approved(
+        &self,
+        address: &Address,
+        asset: &TokenSymbol,
+        network: &Network,
+    ) -> Result<bool, AlpacaWalletError> {
+        let entries = self.get_whitelisted_addresses().await?;
+
+        Ok(entries.iter().any(|entry| {
+            entry.address == *address
+                && entry.asset == *asset
+                && entry.chain == *network
+                && entry.status == WhitelistStatus::Approved
+        }))
     }
 
     #[cfg(test)]
