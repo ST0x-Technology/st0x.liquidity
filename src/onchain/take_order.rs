@@ -1,19 +1,19 @@
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 
-use crate::bindings::IOrderBookV4::{TakeOrderConfigV3, TakeOrderV2};
+use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
-    /// Creates OnchainTrade directly from TakeOrderV2 blockchain events
+    /// Creates OnchainTrade directly from TakeOrderV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
-    pub async fn try_from_take_order_if_target_owner<P: Provider>(
+    pub async fn try_from_take_order_if_target_owner<P: Provider + Clone>(
         cache: &SymbolCache,
         provider: P,
-        event: TakeOrderV2,
+        event: TakeOrderV3,
         log: Log,
         target_order_owner: alloy::primitives::Address,
         feed_id_cache: &FeedIdCache,
@@ -22,7 +22,7 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let TakeOrderConfigV3 {
+        let TakeOrderConfigV4 {
             order,
             inputIOIndex,
             outputIOIndex,
@@ -34,12 +34,12 @@ impl OnchainTrade {
 
         let fill = OrderFill {
             input_index,
-            input_amount: event.input,
+            input_amount: event.input.into(),
             output_index,
-            output_amount: event.output,
+            output_amount: event.output.into(),
         };
 
-        Self::try_from_order_and_fill_details(cache, &provider, order, fill, log, feed_id_cache)
+        Self::try_from_order_v4_and_fill_details(cache, provider, order, fill, log, feed_id_cache)
             .await
     }
 }
@@ -47,11 +47,11 @@ impl OnchainTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4::{SignedContextV1, TakeOrderConfigV3, TakeOrderV2};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
+    use crate::bindings::IOrderBookV5::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
-    use crate::test_utils::{get_test_log, get_test_order};
+    use crate::test_utils::{get_test_log, get_test_order_v4};
     use crate::tokenized_symbol;
     use alloy::hex;
     use alloy::primitives::{U256, address, fixed_bytes};
@@ -60,11 +60,11 @@ mod tests {
     use std::str::FromStr;
 
     fn create_take_order_event_with_order(
-        order: crate::bindings::IOrderBookV4::OrderV3,
-    ) -> TakeOrderV2 {
-        TakeOrderV2 {
+        order: crate::bindings::IOrderBookV5::OrderV4,
+    ) -> TakeOrderV3 {
+        TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -74,8 +74,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from(100_000_000u64), // 100 USDC (6 decimals)
-            output: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 decimals)
+            input: U256::from(100_000_000u64).into(), // 100 USDC (6 decimals)
+            output: U256::from_str("9000000000000000000").unwrap().into(), // 9 shares (18 decimals)
         }
     }
 
@@ -100,7 +100,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_match() {
         let cache = SymbolCache::default();
-        let order = get_test_order();
+        let order = get_test_order_v4();
         let target_order_owner = order.owner;
 
         let take_event = create_take_order_event_with_order(order);
@@ -111,9 +111,15 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // decimals() call for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        // decimals() call for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        // symbol() call for input token (USDC)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // symbol() call for output token (AAPL0x)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -145,7 +151,7 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_no_match() {
         let cache = SymbolCache::default();
-        let order = get_test_order();
+        let order = get_test_order_v4();
 
         // Create a different target owner that won't match
         let different_target_owner = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
@@ -174,12 +180,12 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_different_input_output_indices() {
         let cache = SymbolCache::default();
-        let order = get_test_order();
+        let order = get_test_order_v4();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(1), // Different indices
                 outputIOIndex: U256::from(0),
@@ -189,8 +195,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from_str("5000000000000000000").unwrap(), // 5 shares (18 decimals)
-            output: U256::from(50_000_000u64),                     // 50 USDC (6 decimals)
+            input: U256::from_str("5000000000000000000").unwrap().into(), // 5 shares (18 decimals)
+            output: U256::from(50_000_000u64).into(),                     // 50 USDC (6 decimals)
         };
 
         let log = get_test_log();
@@ -200,9 +206,15 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // decimals() call for input token (at index 1, AAPL0x with 18 decimals)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        // decimals() call for output token (at index 0, USDC with 6 decimals)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        // symbol() call for input token (AAPL0x)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
+        // symbol() call for output token (USDC)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -229,12 +241,12 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_with_different_amounts() {
         let cache = SymbolCache::default();
-        let order = get_test_order();
+        let order = get_test_order_v4();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -244,8 +256,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from(200_000_000u64), // 200 USDC
-            output: U256::from_str("15000000000000000000").unwrap(), // 15 shares
+            input: U256::from(200_000_000u64).into(), // 200 USDC
+            output: U256::from_str("15000000000000000000").unwrap().into(), // 15 shares
         };
 
         let log = get_test_log();
@@ -255,9 +267,15 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // decimals() call for input token (USDC with 6 decimals)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        // decimals() call for output token (AAPL0x with 18 decimals)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        // symbol() call for input token (USDC)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // symbol() call for output token (AAPL0x)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -286,12 +304,12 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_zero_amounts() {
         let cache = SymbolCache::default();
-        let order = get_test_order();
+        let order = get_test_order_v4();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x3333333333333333333333333333333333333333"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -301,8 +319,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::ZERO,  // Zero input
-            output: U256::ZERO, // Zero output
+            input: U256::ZERO.into(),  // Zero input
+            output: U256::ZERO.into(), // Zero output
         };
 
         let log = get_test_log();
@@ -312,9 +330,15 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // decimals() call for input token (USDC with 6 decimals)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        // decimals() call for output token (AAPL0x with 18 decimals)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        // symbol() call for input token (USDC)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // symbol() call for output token (AAPL0x)
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -339,12 +363,12 @@ mod tests {
     #[tokio::test]
     async fn test_try_from_take_order_if_target_owner_invalid_io_index() {
         let cache = SymbolCache::default();
-        let order = get_test_order();
+        let order = get_test_order_v4();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x4444444444444444444444444444444444444444"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(99), // Invalid index (order only has 2 IOs)
                 outputIOIndex: U256::from(1),
@@ -354,8 +378,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from(100_000_000u64),
-            output: U256::from_str("9000000000000000000").unwrap(),
+            input: U256::from(100_000_000u64).into(),
+            output: U256::from_str("9000000000000000000").unwrap().into(),
         };
 
         let log = get_test_log();

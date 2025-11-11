@@ -7,7 +7,8 @@ use sqlx::SqlitePool;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
-use crate::bindings::IOrderBookV4::{ClearV2, TakeOrderV2};
+use crate::bindings::IOrderBookV4::ClearV2;
+use crate::bindings::IOrderBookV5::TakeOrderV3;
 use crate::error::EventQueueError;
 use crate::onchain::trade::TradeEvent;
 
@@ -22,9 +23,9 @@ impl Enqueueable for ClearV2 {
     }
 }
 
-impl Enqueueable for TakeOrderV2 {
+impl Enqueueable for TakeOrderV3 {
     fn to_trade_event(&self) -> TradeEvent {
-        TradeEvent::TakeOrderV2(Box::new(self.clone()))
+        TradeEvent::TakeOrderV3(Box::new(self.clone()))
     }
 }
 
@@ -208,7 +209,7 @@ pub(crate) async fn enqueue_buffer(
         .map(|(event, log)| async move {
             let result = match &event {
                 TradeEvent::ClearV2(clear_event) => enqueue(pool, clear_event.as_ref(), &log).await,
-                TradeEvent::TakeOrderV2(take_event) => {
+                TradeEvent::TakeOrderV3(take_event) => {
                     enqueue(pool, take_event.as_ref(), &log).await
                 }
             };
@@ -216,7 +217,7 @@ pub(crate) async fn enqueue_buffer(
             if let Err(e) = result {
                 let event_type = match event {
                     TradeEvent::ClearV2(_) => "ClearV2",
-                    TradeEvent::TakeOrderV2(_) => "TakeOrderV2",
+                    TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
                 };
                 error!("Failed to enqueue buffered {event_type} event: {e}");
             }
@@ -258,11 +259,10 @@ pub(crate) async fn get_max_processed_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IOrderBookV4::{
-        ClearConfig, ClearV2, OrderV3, TakeOrderConfigV3, TakeOrderV2,
-    };
+    use crate::bindings::IOrderBookV5::TakeOrderConfigV4;
+    use crate::bindings::IOrderBookV4::{ClearConfig, ClearV2, OrderV3};
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{LogData, Uint, address, b256};
+    use alloy::primitives::{LogData, U256, address, b256};
 
     #[tokio::test]
     async fn test_enqueue_and_process_event() {
@@ -350,11 +350,11 @@ mod tests {
         };
 
         // Create a test event
-        let test_event = TradeEvent::TakeOrderV2(Box::new(TakeOrderV2 {
+        let test_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log.inner.address,
-            config: TakeOrderConfigV3::default(),
-            input: Uint::default(),
-            output: Uint::default(),
+            config: TakeOrderConfigV4 { order: Default::default(), inputIOIndex: U256::ZERO, outputIOIndex: U256::ZERO, signedContext: vec![] },
+            input: U256::ZERO.into(),
+            output: U256::ZERO.into(),
         }));
 
         // Enqueue same event twice
@@ -463,11 +463,11 @@ mod tests {
             clearConfig: ClearConfig::default(),
         }));
 
-        let take_event = TradeEvent::TakeOrderV2(Box::new(TakeOrderV2 {
+        let take_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log2.inner.address,
-            config: TakeOrderConfigV3::default(),
-            input: Uint::default(),
-            output: Uint::default(),
+            config: TakeOrderConfigV4 { order: Default::default(), inputIOIndex: U256::ZERO, outputIOIndex: U256::ZERO, signedContext: vec![] },
+            input: U256::ZERO.into(),
+            output: U256::ZERO.into(),
         }));
 
         let event_buffer = vec![(clear_event, log1), (take_event, log2)];
@@ -487,7 +487,7 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
-        assert!(matches!(second_event.event, TradeEvent::TakeOrderV2(_)));
+        assert!(matches!(second_event.event, TradeEvent::TakeOrderV3(_)));
     }
 
     #[tokio::test]

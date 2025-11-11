@@ -45,6 +45,39 @@ impl SymbolCache {
 
         Ok(symbol)
     }
+
+    /// Fetch symbol for a token address (used for IOV2 tokens that don't have embedded decimals)
+    pub async fn get_io_symbol_from_token<P: Provider>(
+        &self,
+        provider: P,
+        token: Address,
+    ) -> Result<String, OnChainError> {
+        let maybe_symbol = {
+            let read_guard = match self.map.read() {
+                Ok(guard) => guard,
+                Err(poison) => poison.into_inner(),
+            };
+            read_guard.get(&token).cloned()
+        };
+
+        if let Some(symbol) = maybe_symbol {
+            return Ok(symbol);
+        }
+
+        const SYMBOL_FETCH_MAX_RETRIES: usize = 3;
+
+        let erc20 = IERC20Instance::new(token, provider);
+        let symbol = (|| async { erc20.symbol().call().await })
+            .retry(ExponentialBuilder::new().with_max_times(SYMBOL_FETCH_MAX_RETRIES))
+            .await?;
+
+        match self.map.write() {
+            Ok(mut guard) => guard.insert(token, symbol.clone()),
+            Err(poison) => poison.into_inner().insert(token, symbol.clone()),
+        };
+
+        Ok(symbol)
+    }
 }
 
 #[cfg(test)]

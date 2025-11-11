@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use std::num::ParseFloatError;
 use tracing::error;
 
-use crate::bindings::IOrderBookV4::{ClearV2, OrderV3, TakeOrderV2};
+use crate::bindings::IOrderBookV4::{ClearV2, OrderV3};
+use crate::bindings::IOrderBookV5::{OrderV4, TakeOrderV3};
+use crate::bindings::IERC20::IERC20Instance;
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
@@ -24,7 +26,7 @@ use st0x_broker::PersistenceError;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
     ClearV2(Box<ClearV2>),
-    TakeOrderV2(Box<TakeOrderV2>),
+    TakeOrderV3(Box<TakeOrderV3>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -183,6 +185,7 @@ impl OnchainTrade {
     }
 
     /// Core parsing logic for converting blockchain events to trades
+    /// Accepts OrderV3 from ClearV2 events (IOrderBookV4)
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
         provider: P,
@@ -238,12 +241,120 @@ impl OnchainTrade {
         }
 
         // Parse the tokenized equity symbol to ensure it's valid
-        let tokenized_symbol_str = if onchain_input_symbol == "USDC" {
-            onchain_output_symbol
+        let tokenized_symbol_str: &str = if onchain_input_symbol == "USDC" {
+            &onchain_output_symbol
         } else {
-            onchain_input_symbol
+            &onchain_input_symbol
         };
-        let tokenized_symbol = TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
+        let tokenized_symbol = TokenizedEquitySymbol::parse(tokenized_symbol_str)?;
+
+        let pyth_pricing = match PythPricing::try_from_tx_hash(
+            tx_hash,
+            &provider,
+            &tokenized_symbol.base().to_string(),
+            feed_id_cache,
+        )
+        .await
+        {
+            Ok(pricing) => Some(pricing),
+            Err(e) => {
+                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {e}");
+                None
+            }
+        };
+
+        let trade = Self {
+            id: None,
+            tx_hash,
+            log_index,
+            symbol: tokenized_symbol,
+            amount: trade_details.equity_amount().value(),
+            direction: trade_details.direction(),
+            price_usdc: price_per_share_usdc,
+            #[allow(clippy::cast_possible_wrap)]
+            block_timestamp: log
+                .block_timestamp
+                .and_then(|ts| DateTime::from_timestamp(ts as i64, 0)),
+            created_at: None,
+            gas_used,
+            effective_gas_price,
+            pyth_price: pyth_pricing.as_ref().map(|p| p.price),
+            pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
+            pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
+            pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
+        };
+
+        Ok(Some(trade))
+    }
+
+    /// Core parsing logic for converting TakeOrderV3 events with OrderV4 to trades
+    /// Accepts OrderV4 from TakeOrderV3 events (IOrderBookV5)
+    /// OrderV4 uses IOV2 which requires fetching decimals from the blockchain
+    pub(crate) async fn try_from_order_v4_and_fill_details<P: Provider + Clone>(
+        cache: &SymbolCache,
+        provider: P,
+        order: OrderV4,
+        fill: OrderFill,
+        log: Log,
+        feed_id_cache: &FeedIdCache,
+    ) -> Result<Option<Self>, OnChainError> {
+        let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
+        let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
+
+        // Fetch transaction receipt to get gas information
+        let receipt = provider.get_transaction_receipt(tx_hash).await?;
+        let (gas_used, effective_gas_price) = match receipt {
+            Some(receipt) => (Some(receipt.gas_used), Some(receipt.effective_gas_price)),
+            None => (None, None),
+        };
+
+        let input = order
+            .validInputs
+            .get(fill.input_index)
+            .ok_or(TradeValidationError::NoInputAtIndex(fill.input_index))?;
+
+        let output = order
+            .validOutputs
+            .get(fill.output_index)
+            .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
+
+        // Fetch decimals for both input and output tokens from blockchain
+        let input_decimals = fetch_token_decimals(provider.clone(), input.token).await?;
+        let output_decimals = fetch_token_decimals(provider.clone(), output.token).await?;
+
+        let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
+        let onchain_input_symbol = cache.get_io_symbol_from_token(provider.clone(), input.token).await?;
+
+        let onchain_output_amount = u256_to_f64(fill.output_amount, output_decimals)?;
+        let onchain_output_symbol = cache.get_io_symbol_from_token(provider.clone(), output.token).await?;
+
+        // Use centralized TradeDetails::try_from_io to extract all trade data consistently
+        let trade_details = TradeDetails::try_from_io(
+            &onchain_input_symbol,
+            onchain_input_amount,
+            &onchain_output_symbol,
+            onchain_output_amount,
+        )?;
+
+        if trade_details.equity_amount().value() == 0.0 {
+            return Ok(None);
+        }
+
+        // Calculate price per share in USDC (always USDC amount / equity amount)
+        let price_per_share_usdc =
+            trade_details.usdc_amount().value() / trade_details.equity_amount().value();
+
+        if price_per_share_usdc.is_nan() || price_per_share_usdc <= 0.0 {
+            return Ok(None);
+        }
+
+        // Parse the tokenized equity symbol to ensure it's valid
+        let tokenized_symbol_str: &str = if onchain_input_symbol == "USDC" {
+            &onchain_output_symbol
+        } else {
+            &onchain_input_symbol
+        };
+        let tokenized_symbol = TokenizedEquitySymbol::parse(tokenized_symbol_str)?;
 
         let pyth_pricing = match PythPricing::try_from_tx_hash(
             tx_hash,
@@ -308,7 +419,7 @@ impl OnchainTrade {
             .iter()
             .filter(|log| {
                 (log.topic0() == Some(&ClearV2::SIGNATURE_HASH)
-                    || log.topic0() == Some(&TakeOrderV2::SIGNATURE_HASH))
+                    || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
                     && log.address() == env.orderbook
             })
             .collect();
@@ -370,7 +481,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         .await;
     }
 
-    if let Ok(take_order_event) = log.log_decode::<TakeOrderV2>() {
+    if let Ok(take_order_event) = log.log_decode::<TakeOrderV3>() {
         return OnchainTrade::try_from_take_order_if_target_owner(
             cache,
             &provider,
@@ -404,6 +515,16 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
     };
 
     formatted.parse::<f64>()
+}
+
+/// Fetch the decimals for a token from the blockchain
+async fn fetch_token_decimals<P: Provider>(
+    provider: P,
+    token: alloy::primitives::Address,
+) -> Result<u8, OnChainError> {
+    let erc20 = IERC20Instance::new(token, provider);
+    let decimals = erc20.decimals().call().await?;
+    Ok(decimals)
 }
 
 #[cfg(test)]

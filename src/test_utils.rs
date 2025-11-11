@@ -1,4 +1,5 @@
 use crate::bindings::IOrderBookV4::{EvaluableV3, IO, OrderV3};
+use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::TokenizedEquitySymbol;
@@ -10,8 +11,8 @@ use st0x_broker::OrderState;
 use st0x_broker::schwab::{SchwabAuthEnv, SchwabTokens};
 use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
 
-/// Returns a test `OrderV3` instance that is shared across multiple
-/// unit-tests. The exact values are not important – only that the
+/// Returns a test `OrderV3` instance (from IOrderBookV4) that is shared across
+/// ClearV2 unit-tests. The exact values are not important – only that the
 /// structure is valid and deterministic.
 pub(crate) fn get_test_order() -> OrderV3 {
     OrderV3 {
@@ -25,12 +26,12 @@ pub(crate) fn get_test_order() -> OrderV3 {
         validInputs: vec![
             IO {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                decimals: 6, // USDC-like token
+                decimals: 6,
                 vaultId: U256::from(0),
             },
             IO {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                decimals: 18, // Stock share token
+                decimals: 18,
                 vaultId: U256::from(0),
             },
         ],
@@ -44,6 +45,41 @@ pub(crate) fn get_test_order() -> OrderV3 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 decimals: 18,
                 vaultId: U256::from(0),
+            },
+        ],
+    }
+}
+
+/// Returns a test `OrderV4` instance (from IOrderBookV5) for TakeOrderV3
+/// unit-tests. The exact values are not important – only that the structure
+/// is valid and deterministic.
+pub(crate) fn get_test_order_v4() -> OrderV4 {
+    OrderV4 {
+        owner: address!("0xdddddddddddddddddddddddddddddddddddddddd"),
+        evaluable: EvaluableV4 {
+            interpreter: address!("0x2222222222222222222222222222222222222222"),
+            store: address!("0x3333333333333333333333333333333333333333"),
+            bytecode: bytes!("0x00"),
+        },
+        nonce: fixed_bytes!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        validInputs: vec![
+            IOV2 {
+                token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+            },
+            IOV2 {
+                token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+            },
+        ],
+        validOutputs: vec![
+            IOV2 {
+                token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+            },
+            IOV2 {
+                token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                vaultId: fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000000"),
             },
         ],
     }
