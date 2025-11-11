@@ -13,6 +13,7 @@ mod event;
 mod view;
 
 pub(crate) use cmd::OffchainOrderCommand;
+pub use event::InvalidMigratedOrderStatus;
 pub(crate) use event::{MigratedOrderStatus, OffchainOrderEvent};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -125,6 +126,12 @@ pub(crate) enum OffchainOrder {
 impl Default for OffchainOrder {
     fn default() -> Self {
         Self::NotPlaced
+    }
+}
+
+impl OffchainOrder {
+    pub(crate) fn aggregate_id(id: i64) -> String {
+        format!("{id}")
     }
 }
 
@@ -1025,5 +1032,12 @@ mod tests {
             result.unwrap_err(),
             InvalidThresholdError::Negative(negative)
         );
+    }
+
+    #[test]
+    fn test_aggregate_id_format() {
+        let aggregate_id = OffchainOrder::aggregate_id(123);
+
+        assert_eq!(aggregate_id, "123");
     }
 }

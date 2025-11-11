@@ -15,6 +15,26 @@ pub(crate) enum MigratedOrderStatus {
     Failed { error: String },
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid migrated order status: {0}")]
+pub struct InvalidMigratedOrderStatus(pub(crate) String);
+
+impl std::str::FromStr for MigratedOrderStatus {
+    type Err = InvalidMigratedOrderStatus;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "PENDING" => Ok(Self::Pending),
+            "SUBMITTED" => Ok(Self::Submitted),
+            "FILLED" => Ok(Self::Filled),
+            "FAILED" => Ok(Self::Failed {
+                error: "Migrated from legacy system".to_string(),
+            }),
+            _ => Err(InvalidMigratedOrderStatus(s.to_string())),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum OffchainOrderEvent {
     Migrated {
