@@ -1,0 +1,419 @@
+mod offchain_order;
+mod onchain_trade;
+mod position;
+mod schwab_auth;
+
+use clap::{Parser, ValueEnum};
+use sqlx::SqlitePool;
+use std::io;
+use tracing::{info, warn};
+
+use crate::offchain_order::InvalidMigratedOrderStatus;
+use crate::position::NegativePriceCents;
+use offchain_order::migrate_offchain_orders;
+use onchain_trade::migrate_onchain_trades;
+use position::migrate_positions;
+use schwab_auth::migrate_schwab_auth;
+
+#[derive(Debug, Parser)]
+#[command(name = "migrate_to_events")]
+pub struct MigrationEnv {
+    #[clap(long, env = "DATABASE_URL")]
+    pub database_url: String,
+
+    #[clap(long, value_enum, default_value = "interactive")]
+    pub confirmation: ConfirmationMode,
+
+    #[clap(long, value_enum, default_value = "preserve")]
+    pub clean: CleanMode,
+
+    #[clap(long, value_enum, default_value = "commit")]
+    pub execution: ExecutionMode,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MigrationError {
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Invalid symbol: {0}")]
+    InvalidSymbol(#[from] st0x_broker::BrokerError),
+    #[error("Invalid decimal conversion: {0}")]
+    InvalidDecimal(#[from] rust_decimal::Error),
+    #[error("Invalid direction: {0}")]
+    InvalidDirection(#[from] st0x_broker::InvalidDirectionError),
+    #[error("Invalid order status: {0}")]
+    InvalidOrderStatus(#[from] InvalidMigratedOrderStatus),
+    #[error("Negative price in cents: {0}")]
+    NegativePriceCents(#[from] NegativePriceCents),
+    #[error("Negative value in field that must be non-negative: {field} = {value}")]
+    NegativeValue { field: String, value: i64 },
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("User cancelled migration")]
+    UserCancelled,
+    #[error("Hex parsing error: {0}")]
+    FromHex(#[from] alloy::hex::FromHexError),
+}
+
+#[derive(Debug, Default)]
+pub struct MigrationSummary {
+    pub onchain_trades: usize,
+    pub positions: usize,
+    pub offchain_orders: usize,
+    pub schwab_auth: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConfirmationMode {
+    Interactive,
+    Force,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CleanMode {
+    Preserve,
+    Delete,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ExecutionMode {
+    DryRun,
+    Commit,
+}
+
+pub async fn check_existing_events(
+    pool: &SqlitePool,
+    aggregate_type: &str,
+    confirmation: ConfirmationMode,
+) -> Result<(), MigrationError> {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_type = ?")
+        .bind(aggregate_type)
+        .fetch_one(pool)
+        .await?;
+
+    if count > 0 && matches!(confirmation, ConfirmationMode::Interactive) {
+        warn!("Events detected for {aggregate_type} (count: {count}). Continue? [y/N]");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if !input.trim().eq_ignore_ascii_case("y") {
+            return Err(MigrationError::UserCancelled);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn safety_prompt(confirmation: ConfirmationMode) -> Result<(), MigrationError> {
+    if matches!(confirmation, ConfirmationMode::Force) {
+        return Ok(());
+    }
+
+    warn!("⚠️  Create database backup before proceeding! Continue? [y/N]");
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+
+    if !input.trim().eq_ignore_ascii_case("y") {
+        return Err(MigrationError::UserCancelled);
+    }
+
+    Ok(())
+}
+
+pub async fn clean_events(
+    pool: &SqlitePool,
+    confirmation: ConfirmationMode,
+) -> Result<(), MigrationError> {
+    if matches!(confirmation, ConfirmationMode::Interactive) {
+        warn!("⚠️  This will DELETE all events! Type 'DELETE' to confirm:");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+
+        if input.trim() != "DELETE" {
+            return Err(MigrationError::UserCancelled);
+        }
+    }
+
+    let deleted_events = sqlx::query("DELETE FROM events")
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    let deleted_snapshots = sqlx::query("DELETE FROM snapshots")
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+    info!("Deleted {deleted_events} events and {deleted_snapshots} snapshots from event store");
+
+    Ok(())
+}
+
+pub async fn run_migration(
+    pool: &SqlitePool,
+    env: &MigrationEnv,
+) -> Result<MigrationSummary, MigrationError> {
+    match env.execution {
+        ExecutionMode::DryRun => {
+            info!("Starting migration in DRY-RUN mode - no events will be persisted");
+        }
+        ExecutionMode::Commit => {
+            info!("Starting migration...");
+        }
+    }
+
+    check_existing_events(pool, "OnChainTrade", env.confirmation).await?;
+    check_existing_events(pool, "Position", env.confirmation).await?;
+    check_existing_events(pool, "OffchainOrder", env.confirmation).await?;
+    check_existing_events(pool, "SchwabAuth", env.confirmation).await?;
+
+    safety_prompt(env.confirmation)?;
+
+    if matches!(env.clean, CleanMode::Delete) {
+        clean_events(pool, env.confirmation).await?;
+    }
+
+    let onchain_trades = migrate_onchain_trades(pool, env.execution).await?;
+    let positions = migrate_positions(pool, env.execution).await?;
+    let offchain_orders = migrate_offchain_orders(pool, env.execution).await?;
+    let schwab_auth = migrate_schwab_auth(pool, env.execution).await?;
+
+    Ok(MigrationSummary {
+        onchain_trades,
+        positions,
+        offchain_orders,
+        schwab_auth,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::{TxHash, b256};
+    use sqlx::SqlitePool;
+
+    use super::{
+        CleanMode, ConfirmationMode, ExecutionMode, MigrationEnv, check_existing_events,
+        clean_events, run_migration,
+    };
+    use crate::onchain_trade::OnChainTrade;
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+
+    async fn insert_test_trade(
+        pool: &SqlitePool,
+        tx_hash: TxHash,
+        log_index: i64,
+        symbol: &str,
+        amount: f64,
+        direction: &str,
+        price_usdc: f64,
+    ) {
+        let tx_hash_str = tx_hash.to_string();
+        sqlx::query!(
+            "
+            INSERT INTO onchain_trades (
+                tx_hash,
+                log_index,
+                symbol,
+                amount,
+                direction,
+                price_usdc
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ",
+            tx_hash_str,
+            log_index,
+            symbol,
+            amount,
+            direction,
+            price_usdc
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_existing_events_empty_database() {
+        let pool = create_test_pool().await;
+
+        check_existing_events(&pool, "OnChainTrade", ConfirmationMode::Force)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_existing_events_with_force_mode() {
+        let pool = create_test_pool().await;
+
+        sqlx::query!(
+            "INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('OnChainTrade', 'test:0', 1, 'Migrated', '1.0', '{}', '{}')"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        check_existing_events(&pool, "OnChainTrade", ConfirmationMode::Force)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_clean_events_with_force_mode() {
+        let pool = create_test_pool().await;
+
+        sqlx::query!(
+            "INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('OnChainTrade', 'test:0', 1, 'Migrated', '1.0', '{}', '{}')"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        clean_events(&pool, ConfirmationMode::Force).await.unwrap();
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_migration_dry_run() {
+        let pool = create_test_pool().await;
+
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+        insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
+
+        let env = MigrationEnv {
+            database_url: ":memory:".to_string(),
+            confirmation: ConfirmationMode::Force,
+            clean: CleanMode::Preserve,
+            execution: ExecutionMode::DryRun,
+        };
+
+        let result = run_migration(&pool, &env).await.unwrap();
+
+        assert_eq!(result.onchain_trades, 1);
+        assert_eq!(result.positions, 0);
+        assert_eq!(result.offchain_orders, 0);
+        assert!(!result.schwab_auth);
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_run_migration_commit() {
+        let pool = create_test_pool().await;
+
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+        insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
+
+        let env = MigrationEnv {
+            database_url: ":memory:".to_string(),
+            confirmation: ConfirmationMode::Force,
+            clean: CleanMode::Preserve,
+            execution: ExecutionMode::Commit,
+        };
+
+        let result = run_migration(&pool, &env).await.unwrap();
+
+        assert_eq!(result.onchain_trades, 1);
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_run_migration_with_clean() {
+        let pool = create_test_pool().await;
+
+        let old_hash = b256!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let old_id = OnChainTrade::aggregate_id(old_hash, 0);
+
+        sqlx::query!(
+            "INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('OnChainTrade', ?, 1, 'Migrated', '1.0', '{}', '{}')",
+            old_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tx_hash = b256!("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+
+        insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
+
+        let env = MigrationEnv {
+            database_url: ":memory:".to_string(),
+            confirmation: ConfirmationMode::Force,
+            clean: CleanMode::Delete,
+            execution: ExecutionMode::Commit,
+        };
+
+        let result = run_migration(&pool, &env).await.unwrap();
+
+        assert_eq!(result.onchain_trades, 1);
+
+        let count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+
+        let aggregate_id = sqlx::query_scalar!(
+            "SELECT aggregate_id FROM events WHERE aggregate_type = 'OnChainTrade'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let expected_id = OnChainTrade::aggregate_id(tx_hash, 0);
+        assert_eq!(aggregate_id, expected_id);
+    }
+}
