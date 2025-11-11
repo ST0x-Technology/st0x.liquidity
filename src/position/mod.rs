@@ -3,15 +3,17 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::Direction;
+use st0x_broker::{Direction, Symbol};
 
 mod cmd;
 mod event;
 pub(crate) mod view;
 
 pub(crate) use cmd::PositionCommand;
+pub use event::NegativePriceCents;
 pub(crate) use event::{
-    ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, TriggerReason,
+    BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, PriceCents,
+    TriggerReason,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -259,6 +261,10 @@ impl Aggregate for Position {
 }
 
 impl Position {
+    pub(crate) fn aggregate_id(symbol: &Symbol) -> String {
+        symbol.to_string()
+    }
+
     fn create_trigger_reason(&self, threshold: &ExecutionThreshold) -> Option<TriggerReason> {
         match threshold {
             ExecutionThreshold::Shares(threshold_shares) => {
@@ -684,5 +690,13 @@ mod tests {
             .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_aggregate_id_format() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = Position::aggregate_id(&symbol);
+
+        assert_eq!(aggregate_id, "AAPL");
     }
 }

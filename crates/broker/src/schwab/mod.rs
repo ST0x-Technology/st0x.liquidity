@@ -10,8 +10,9 @@ mod order_status;
 mod tokens;
 
 // Re-export only what's needed for broker construction
-pub use auth::SchwabAuthEnv;
+pub use auth::{SchwabAuth, SchwabAuthEnv, SchwabAuthEvent};
 pub use broker::{SchwabBroker, SchwabConfig};
+pub use encryption::EncryptedToken;
 
 // Re-export for auth CLI command (Schwab-specific, not part of generic broker API)
 pub use tokens::SchwabTokens;

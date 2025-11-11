@@ -108,5 +108,9 @@ serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest = "1.6.0"
 
+[[bin]]
+name = "migrate_to_events"
+path = "src/bin/migrate_to_events.rs"
+
 [lints]
 workspace = true
