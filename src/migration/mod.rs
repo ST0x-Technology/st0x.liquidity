@@ -16,18 +16,53 @@ use position::migrate_positions;
 use schwab_auth::migrate_schwab_auth;
 
 #[derive(Debug, Parser)]
-#[command(name = "migrate_to_events")]
+#[command(
+    name = "migrate_to_events",
+    about = "Migrate legacy CRUD data to event-sourced aggregates",
+    long_about = "One-time migration tool that converts existing data from legacy tables \
+                  (onchain_trades, trade_accumulators, offchain_trades, schwab_auth) into \
+                  event-sourced aggregates using cqrs-es framework.\n\n\
+                  ⚠️  IMPORTANT: Create a database backup before running!\n\n\
+                  Example usage:\n  \
+                    # Dry run (preview without persisting)\n  \
+                    migrate_to_events --execution dry-run\n\n  \
+                    # Run migration with interactive confirmation\n  \
+                    migrate_to_events\n\n  \
+                    # Run without prompts (for automation)\n  \
+                    migrate_to_events --confirmation force\n\n  \
+                    # Clean existing events and re-migrate\n  \
+                    migrate_to_events --clean delete --confirmation force"
+)]
 pub struct MigrationEnv {
-    #[clap(long, env = "DATABASE_URL")]
+    #[clap(
+        long,
+        env = "DATABASE_URL",
+        help = "SQLite database path (or set DATABASE_URL env var)"
+    )]
     pub database_url: String,
 
-    #[clap(long, value_enum, default_value = "interactive")]
+    #[clap(
+        long,
+        value_enum,
+        default_value = "interactive",
+        help = "Confirmation mode: interactive (prompt for confirmations) or force (skip prompts)"
+    )]
     pub confirmation: ConfirmationMode,
 
-    #[clap(long, value_enum, default_value = "preserve")]
+    #[clap(
+        long,
+        value_enum,
+        default_value = "preserve",
+        help = "Clean mode: preserve (keep existing events) or delete (remove all events before migrating)"
+    )]
     pub clean: CleanMode,
 
-    #[clap(long, value_enum, default_value = "commit")]
+    #[clap(
+        long,
+        value_enum,
+        default_value = "commit",
+        help = "Execution mode: commit (persist events) or dry-run (preview only)"
+    )]
     pub execution: ExecutionMode,
 }
 
@@ -191,6 +226,7 @@ pub async fn run_migration(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{TxHash, b256};
+    use chrono;
     use sqlx::SqlitePool;
 
     use super::{
@@ -415,5 +451,114 @@ mod tests {
 
         let expected_id = OnChainTrade::aggregate_id(tx_hash, 0);
         assert_eq!(aggregate_id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn test_comprehensive_migration_all_aggregates() {
+        let pool = create_test_pool().await;
+
+        let tx1 = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let tx2 = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let tx3 = b256!("0x3333333333333333333333333333333333333333333333333333333333333333");
+
+        insert_test_trade(&pool, tx1, 0, "AAPL", 10.0, "BUY", 150.50).await;
+        insert_test_trade(&pool, tx2, 0, "TSLA", 5.0, "SELL", 200.75).await;
+        insert_test_trade(&pool, tx3, 0, "GOOGL", 3.0, "BUY", 2800.00).await;
+
+        sqlx::query!(
+            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
+             VALUES (?, ?, ?, ?)",
+            "AAPL",
+            10.0,
+            10.0,
+            0.0
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
+             VALUES (?, ?, ?, ?)",
+            "TSLA",
+            -5.0,
+            0.0,
+            5.0
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let executed_at = chrono::Utc::now();
+        sqlx::query!(
+            "INSERT INTO offchain_trades (symbol, shares, direction, broker_order_id, price_cents, status, executed_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "AAPL",
+            10,
+            "BUY",
+            "ORD123",
+            15050,
+            "FILLED",
+            executed_at
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query!(
+            "INSERT INTO offchain_trades (symbol, shares, direction, status)
+             VALUES (?, ?, ?, ?)",
+            "TSLA",
+            5,
+            "SELL",
+            "PENDING"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let env = MigrationEnv {
+            database_url: ":memory:".to_string(),
+            confirmation: ConfirmationMode::Force,
+            clean: CleanMode::Preserve,
+            execution: ExecutionMode::Commit,
+        };
+
+        let result = run_migration(&pool, &env).await.unwrap();
+
+        assert_eq!(result.onchain_trades, 3);
+        assert_eq!(result.positions, 2);
+        assert_eq!(result.offchain_orders, 2);
+        assert!(!result.schwab_auth);
+
+        let total_events = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(total_events, 7);
+
+        let onchain_trade_events = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OnChainTrade'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(onchain_trade_events, 3);
+
+        let position_events =
+            sqlx::query_scalar!("SELECT COUNT(*) FROM events WHERE aggregate_type = 'Position'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(position_events, 2);
+
+        let offchain_order_events = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(offchain_order_events, 2);
     }
 }
