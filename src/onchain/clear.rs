@@ -143,7 +143,7 @@ async fn fetch_after_clear_event<P: Provider>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
@@ -265,6 +265,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -341,6 +343,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -676,6 +680,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -793,6 +799,8 @@ mod tests {
         asserter.push_success(&json!([after_clear_log_1, after_clear_log_2]));
         let receipt_json = create_test_receipt_json(tx_hash);
         asserter.push_success(&receipt_json);
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -929,6 +937,8 @@ mod tests {
         asserter.push_success(&json!([wrong_tx_log, correct_log]));
         let receipt_json = create_test_receipt_json(target_tx_hash);
         asserter.push_success(&receipt_json);
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));

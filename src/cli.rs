@@ -503,7 +503,7 @@ fn display_trade_details<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
@@ -1101,6 +1101,10 @@ mod tests {
         asserter.push_success(&mock_data.receipt_json);
         asserter.push_success(&json!([mock_data.after_clear_log]));
         asserter.push_success(&mock_data.receipt_json);
+        // Mock decimals calls for input and output tokens
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        // Mock symbol calls for input and output
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &input_symbol.to_string(),
         ));
@@ -1789,6 +1793,8 @@ mod tests {
         asserter1.push_success(&mock_data.receipt_json);
         asserter1.push_success(&json!([mock_data.after_clear_log]));
         asserter1.push_success(&mock_data.receipt_json);
+        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -1829,6 +1835,8 @@ mod tests {
         asserter2.push_success(&mock_data.receipt_json);
         asserter2.push_success(&json!([mock_data.after_clear_log]));
         asserter2.push_success(&mock_data.receipt_json);
+        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
+        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18_u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));

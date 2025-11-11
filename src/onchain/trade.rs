@@ -184,7 +184,7 @@ impl OnchainTrade {
 
     /// Core parsing logic for converting blockchain events to trades
     /// Accepts OrderV4 from ClearV3 events (IOrderBookV5)
-    pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
+    pub(crate) async fn try_from_order_and_fill_details<P: Provider + Clone>(
         cache: &SymbolCache,
         provider: P,
         order: OrderV4,
@@ -212,11 +212,19 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
+        // Fetch decimals for both input and output tokens using cache to reduce RPC traffic
+        let input_decimals = cache
+            .get_token_decimals(provider.clone(), input.token)
+            .await?;
+        let output_decimals = cache
+            .get_token_decimals(provider.clone(), output.token)
+            .await?;
+
         let onchain_input_symbol = cache.get_iov2_symbol(&provider, input).await?;
-        let onchain_input_amount = u256_to_f64(fill.input_amount, 18)?; // ERC20 tokens use 18 decimals by default
+        let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
 
         let onchain_output_symbol = cache.get_iov2_symbol(&provider, output).await?;
-        let onchain_output_amount = u256_to_f64(fill.output_amount, 18)?; // ERC20 tokens use 18 decimals by default
+        let onchain_output_amount = u256_to_f64(fill.output_amount, output_decimals)?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
@@ -317,8 +325,12 @@ impl OnchainTrade {
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
         // Fetch decimals for both input and output tokens using cache to reduce RPC traffic
-        let input_decimals = cache.get_token_decimals(provider.clone(), input.token).await?;
-        let output_decimals = cache.get_token_decimals(provider.clone(), output.token).await?;
+        let input_decimals = cache
+            .get_token_decimals(provider.clone(), input.token)
+            .await?;
+        let output_decimals = cache
+            .get_token_decimals(provider.clone(), output.token)
+            .await?;
 
         let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
         let onchain_input_symbol = cache
