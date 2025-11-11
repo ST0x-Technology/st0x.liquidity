@@ -153,19 +153,23 @@ Add Circle CCTP contracts as dependency and configure build.
 
 **Subtasks**:
 
-- [ ] Add `@circle-fin/cctp-contracts` to package.json dependencies
-- [ ] Update flake.nix `prepSolArtifacts` task:
-  - [ ] Add build step for Circle CCTP contracts (like rain.orderbook and pyth)
-  - [ ] Run `npm install` and build CCTP contracts
-- [ ] Run `nix run .#prepSolArtifacts` to verify build works
-- [ ] Create `src/cctp.rs` module file
-- [ ] Add contract bindings using `sol!` macro:
-  - [ ] `ITokenMessenger` from compiled TokenMessenger.json artifact
-  - [ ] `IMessageTransmitter` from compiled MessageTransmitter.json artifact
-- [ ] Verify bindings compile with `cargo build`
+- [x] Add evm-cctp-contracts as git submodule using `forge install`
+- [x] Update flake.nix `prepSolArtifacts` task:
+  - [x] Add build step for Circle CCTP contracts: `(cd lib/evm-cctp-contracts/ && forge build)`
+- [x] Run `nix run .#prepSolArtifacts` to verify build works
+- [x] Create `src/cctp.rs` module file
+- [x] Add contract bindings using `sol!` macro:
+  - [x] `TokenMessengerV2` from compiled TokenMessengerV2.json artifact
+  - [x] `MessageTransmitterV2` from compiled MessageTransmitterV2.json artifact
+- [x] Add `mod cctp;` to `src/lib.rs`
+- [x] Verify bindings compile with `cargo build`
 
 **Validation**: CCTP contracts build successfully. Contract bindings compile and
 types are accessible.
+
+**Implementation Details**:
+
+Added Circle's official evm-cctp-contracts repository as a git submodule using `forge install circlefin/evm-cctp-contracts`. Updated flake.nix prepSolArtifacts task to build CCTP contracts with Foundry. Created src/cctp.rs with sol! macro bindings for TokenMessengerV2 and MessageTransmitterV2. Both V2 contract artifacts verified at expected paths. CCTP module compiles successfully with no errors.
 
 ### Task 2. Ethereum → Base Bridge Flow
 
