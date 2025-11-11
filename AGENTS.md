@@ -325,13 +325,48 @@ Environment variables (can be set via `.env` file):
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
+- **CRITICAL: Import Organization**: Follow a consistent two-group import
+  pattern throughout the codebase:
+  - **Group 1 - External imports**: All imports from external crates including
+    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines between
+    external imports.
+  - **Empty line separating the groups**
+  - **Group 2 - Internal imports**: All imports from our codebase using
+    `crate::` and `super::`. No empty lines between internal imports.
+  - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
+    within a group
+  - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+  - Module declarations (`mod foo;`) can appear between imports if needed
+  - This pattern applies to ALL modules including test modules
+    (`#[cfg(test)] mod tests`)
+  - Example of correct import organization:
+    ```rust
+    use std::sync::Arc;
+    use alloy::primitives::{Address, B256};
+    use cqrs_es::{CqrsFramework, EventStore};
+    use serde::{Deserialize, Serialize};
+
+    use crate::account::ClientId;
+    use crate::mint::TokenizationRequestId;
+    use super::{Mint, MintCommand};
+    ```
+  - Example of **INCORRECT** import organization:
+    ```rust
+    // ❌ WRONG - Three groups, internal imports mixed with external
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, B256};
+    use crate::account::ClientId;  // Internal import in wrong place
+    use cqrs_es::CqrsFramework;
+
+    use super::Mint;
+    ```
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
-  module is clear (e.g. use `info!` instead of `tracing::info!`). Generally
-  avoid imports inside functions. We don't do function-level imports, instead we
-  do top-of-module imports. Note that I said top-of-module and not top-of-file,
-  e.g. imports required only inside a tests module should be done in the module
-  and not hidden behind #[cfg(test)] at the top of the file
+  module is clear (e.g. use `info!` instead of `tracing::info!`). Note that we
+  use top-of-module imports, not top-of-file. For example, imports required only
+  inside a tests module should be done in that module and not hidden behind
+  #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
   logic changes might leave panics in the codebase
 - **Visibility Levels**: Always keep visibility levels as restrictive as
