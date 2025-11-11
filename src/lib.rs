@@ -4,6 +4,7 @@ use tracing::{error, info, info_span, warn};
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
+mod cctp;
 pub mod cli;
 mod conductor;
 pub mod env;
