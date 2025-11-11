@@ -10,6 +10,7 @@ mod event;
 pub(crate) mod view;
 
 pub(crate) use cmd::PositionCommand;
+pub use event::NegativePriceCents;
 pub(crate) use event::{
     BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, PriceCents,
     TriggerReason,

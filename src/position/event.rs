@@ -26,6 +26,20 @@ pub(crate) struct BrokerOrderId(pub(crate) String);
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PriceCents(pub(crate) u64);
 
+#[derive(Debug, thiserror::Error)]
+#[error("Price in cents cannot be negative: {0}")]
+pub struct NegativePriceCents(pub i64);
+
+impl TryFrom<i64> for PriceCents {
+    type Error = NegativePriceCents;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        u64::try_from(value)
+            .map(Self)
+            .map_err(|_| NegativePriceCents(value))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FractionalShares(pub(crate) Decimal);
 

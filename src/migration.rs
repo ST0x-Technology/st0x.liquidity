@@ -4,12 +4,16 @@ use clap::{Parser, ValueEnum};
 use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_broker::{Direction, Symbol};
+use st0x_broker::{SupportedBroker, Symbol};
 use std::io;
 use tracing::{info, warn};
 
+use crate::offchain_order::{InvalidMigratedOrderStatus, OffchainOrder, OffchainOrderEvent};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
-use crate::position::{ExecutionThreshold, FractionalShares, Position, PositionEvent};
+use crate::position::{
+    BrokerOrderId, ExecutionThreshold, FractionalShares, NegativePriceCents, Position,
+    PositionEvent, PriceCents,
+};
 
 #[derive(Debug, Parser)]
 #[command(name = "migrate_to_events")]
@@ -36,7 +40,13 @@ pub enum MigrationError {
     #[error("Invalid decimal conversion: {0}")]
     InvalidDecimal(#[from] rust_decimal::Error),
     #[error("Invalid direction: {0}")]
-    InvalidDirection(String),
+    InvalidDirection(#[from] st0x_broker::InvalidDirectionError),
+    #[error("Invalid order status: {0}")]
+    InvalidOrderStatus(#[from] InvalidMigratedOrderStatus),
+    #[error("Negative price in cents: {0}")]
+    NegativePriceCents(#[from] NegativePriceCents),
+    #[error("Negative value in field that must be non-negative: {field} = {value}")]
+    NegativeValue { field: String, value: i64 },
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("IO error: {0}")]
@@ -165,23 +175,33 @@ pub async fn run_migration(
         clean_events(pool, env.confirmation).await?;
     }
 
-    let dry_run = matches!(env.execution, ExecutionMode::DryRun);
-    let onchain_trades = migrate_onchain_trades(pool, dry_run).await?;
+    let onchain_trades = migrate_onchain_trades(pool, env.execution).await?;
     let positions = migrate_positions(pool, env.execution).await?;
+    let offchain_orders = migrate_offchain_orders(pool, env.execution).await?;
 
     Ok(MigrationSummary {
         onchain_trades,
         positions,
-        offchain_orders: 0,
+        offchain_orders,
         schwab_auth: false,
     })
 }
 
+#[derive(sqlx::FromRow)]
+struct OnchainTradeRow {
+    tx_hash: String,
+    log_index: i64,
+    symbol: String,
+    amount: f64,
+    direction: String,
+    price_usdc: f64,
+}
+
 pub async fn migrate_onchain_trades(
     pool: &SqlitePool,
-    dry_run: bool,
+    execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
-    let rows: Vec<(String, i64, String, f64, String, f64)> = sqlx::query_as(
+    let rows = sqlx::query_as::<_, OnchainTradeRow>(
         "SELECT tx_hash, log_index, symbol, amount, direction, price_usdc
          FROM onchain_trades
          ORDER BY created_at ASC",
@@ -192,24 +212,18 @@ pub async fn migrate_onchain_trades(
     let total = rows.len();
     info!("Found {total} onchain trades to migrate");
 
-    for (idx, (tx_hash, log_index, symbol, amount, direction, price_usdc)) in
-        rows.into_iter().enumerate()
-    {
+    for (idx, row) in rows.into_iter().enumerate() {
         let progress = idx + 1;
         if progress % 100 == 0 {
             info!("Migrating onchain trades: {progress}/{total}");
         }
 
-        let tx_hash: TxHash = tx_hash.parse()?;
-        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);
-        let symbol = Symbol::new(&symbol)?;
-        let amount = Decimal::try_from(amount)?;
-        let direction = match direction.as_str() {
-            "BUY" => Direction::Buy,
-            "SELL" => Direction::Sell,
-            _ => return Err(MigrationError::InvalidDirection(direction)),
-        };
-        let price_usdc = Decimal::try_from(price_usdc)?;
+        let tx_hash: TxHash = row.tx_hash.parse()?;
+        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, row.log_index);
+        let symbol = Symbol::new(&row.symbol)?;
+        let amount = Decimal::try_from(row.amount)?;
+        let direction = row.direction.parse()?;
+        let price_usdc = Decimal::try_from(row.price_usdc)?;
 
         let event = OnChainTradeEvent::Migrated {
             symbol,
@@ -223,8 +237,11 @@ pub async fn migrate_onchain_trades(
             migrated_at: Utc::now(),
         };
 
-        if !dry_run {
-            persist_event(pool, &aggregate_id, event).await?;
+        match execution {
+            ExecutionMode::Commit => {
+                persist_event(pool, &aggregate_id, event).await?;
+            }
+            ExecutionMode::DryRun => {}
         }
     }
 
@@ -232,11 +249,20 @@ pub async fn migrate_onchain_trades(
     Ok(total)
 }
 
+#[derive(sqlx::FromRow)]
+struct PositionRow {
+    symbol: String,
+    net_position: f64,
+    accumulated_long: f64,
+    accumulated_short: f64,
+    pending_execution_id: Option<i64>,
+}
+
 pub async fn migrate_positions(
     pool: &SqlitePool,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
-    let rows: Vec<(String, f64, f64, f64, Option<i64>)> = sqlx::query_as(
+    let rows = sqlx::query_as::<_, PositionRow>(
         "SELECT symbol, net_position, accumulated_long, accumulated_short, pending_execution_id
          FROM trade_accumulators
          ORDER BY symbol ASC",
@@ -249,29 +275,28 @@ pub async fn migrate_positions(
 
     let pending_count = rows
         .iter()
-        .filter(|(_, _, _, _, pending_id)| pending_id.is_some())
+        .filter(|row| row.pending_execution_id.is_some())
         .count();
 
-    for (idx, (symbol, net_position, accumulated_long, accumulated_short, pending_execution_id)) in
-        rows.into_iter().enumerate()
-    {
+    for (idx, row) in rows.into_iter().enumerate() {
         let processed = idx + 1;
         if processed % 100 == 0 {
             info!("Migrating positions: {processed}/{total}");
         }
 
-        if let Some(exec_id) = pending_execution_id {
+        if let Some(exec_id) = row.pending_execution_id {
             warn!(
-                "Position {symbol} has pending execution {exec_id} - will be reconciled in dual-write phase"
+                "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
+                row.symbol
             );
         }
 
-        let symbol = Symbol::new(&symbol)?;
+        let symbol = Symbol::new(&row.symbol)?;
         let aggregate_id = Position::aggregate_id(&symbol);
 
-        let net_position = Decimal::try_from(net_position)?;
-        let accumulated_long = Decimal::try_from(accumulated_long)?;
-        let accumulated_short = Decimal::try_from(accumulated_short)?;
+        let net_position = Decimal::try_from(row.net_position)?;
+        let accumulated_long = Decimal::try_from(row.accumulated_long)?;
+        let accumulated_short = Decimal::try_from(row.accumulated_short)?;
 
         let event = PositionEvent::Migrated {
             symbol,
@@ -291,6 +316,102 @@ pub async fn migrate_positions(
     }
 
     info!("Migrated {total} positions, {pending_count} with pending executions");
+    Ok(total)
+}
+
+#[derive(sqlx::FromRow)]
+struct OffchainOrderRow {
+    id: i64,
+    symbol: String,
+    shares: i64,
+    direction: String,
+    order_id: Option<String>,
+    price_cents: Option<i64>,
+    status: String,
+}
+
+pub async fn migrate_offchain_orders(
+    pool: &SqlitePool,
+    execution: ExecutionMode,
+) -> Result<usize, MigrationError> {
+    let rows = sqlx::query_as::<_, OffchainOrderRow>(
+        "
+        SELECT
+            id,
+            symbol,
+            shares,
+            direction,
+            broker_order_id as order_id,
+            price_cents,
+            status
+        FROM offchain_trades
+        ORDER BY id ASC
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let total = rows.len();
+    info!("Found {total} offchain orders to migrate");
+
+    let status_counts = rows.iter().fold(
+        (0usize, 0usize, 0usize, 0usize),
+        |(pending, submitted, filled, failed), row| match row.status.as_str() {
+            "PENDING" => (pending + 1, submitted, filled, failed),
+            "SUBMITTED" => (pending, submitted + 1, filled, failed),
+            "FILLED" => (pending, submitted, filled + 1, failed),
+            "FAILED" => (pending, submitted, filled, failed + 1),
+            _ => (pending, submitted, filled, failed),
+        },
+    );
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        let processed = idx + 1;
+        if processed % 100 == 0 {
+            info!("Migrating offchain orders: {processed}/{total}");
+        }
+
+        let aggregate_id = OffchainOrder::aggregate_id(row.id);
+        let symbol = Symbol::new(&row.symbol)?;
+
+        if row.shares < 0 {
+            return Err(MigrationError::NegativeValue {
+                field: "shares".to_string(),
+                value: row.shares,
+            });
+        }
+        let shares = Decimal::from(row.shares);
+
+        let direction = row.direction.parse()?;
+        let migrated_status = row.status.parse()?;
+
+        let broker_order_id = row.order_id.map(BrokerOrderId);
+        let price_cents = row.price_cents.map(PriceCents::try_from).transpose()?;
+
+        let event = OffchainOrderEvent::Migrated {
+            symbol,
+            shares: FractionalShares(shares),
+            direction,
+            broker: SupportedBroker::Schwab,
+            status: migrated_status,
+            broker_order_id,
+            price_cents,
+            executed_at: None,
+            migrated_at: Utc::now(),
+        };
+
+        match execution {
+            ExecutionMode::Commit => {
+                persist_offchain_order_event(pool, &aggregate_id, event).await?;
+            }
+            ExecutionMode::DryRun => {}
+        }
+    }
+
+    let (pending, submitted, filled, failed) = status_counts;
+    info!(
+        "Migrated {total} offchain orders. Status breakdown: {pending} PENDING, {submitted} SUBMITTED, {filled} FILLED, {failed} FAILED"
+    );
     Ok(total)
 }
 
@@ -360,10 +481,44 @@ async fn persist_position_event(
     Ok(())
 }
 
+async fn persist_offchain_order_event(
+    pool: &SqlitePool,
+    aggregate_id: &str,
+    event: OffchainOrderEvent,
+) -> Result<(), MigrationError> {
+    let aggregate_type = OffchainOrder::aggregate_type();
+    let event_type = event.event_type();
+    let event_version = event.event_version();
+    let payload = serde_json::to_string(&event)?;
+
+    sqlx::query(
+        "INSERT INTO events (
+            aggregate_type,
+            aggregate_id,
+            sequence,
+            event_type,
+            event_version,
+            payload,
+            metadata
+        )
+        VALUES (?, ?, 1, ?, ?, ?, '{}')",
+    )
+    .bind(&aggregate_type)
+    .bind(aggregate_id)
+    .bind(&event_type)
+    .bind(&event_version)
+    .bind(&payload)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloy::primitives::b256;
+    use st0x_broker::Direction;
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -472,7 +627,9 @@ mod tests {
     async fn test_migrate_onchain_trades_empty_database() {
         let pool = create_test_pool().await;
 
-        let result = migrate_onchain_trades(&pool, false).await.unwrap();
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
 
         assert_eq!(result, 0);
     }
@@ -485,7 +642,9 @@ mod tests {
 
         insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
 
-        let result = migrate_onchain_trades(&pool, false).await.unwrap();
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
 
         assert_eq!(result, 1);
 
@@ -518,7 +677,9 @@ mod tests {
         insert_test_trade(&pool, tx_hash1, 1, "TSLA", 5.0, "SELL", 200.75).await;
         insert_test_trade(&pool, tx_hash2, 0, "GOOGL", 3.0, "BUY", 2800.00).await;
 
-        let result = migrate_onchain_trades(&pool, false).await.unwrap();
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
 
         assert_eq!(result, 3);
 
@@ -538,7 +699,9 @@ mod tests {
 
         insert_test_trade(&pool, tx_hash, 0, "AAPL", 10.0, "BUY", 150.50).await;
 
-        let result = migrate_onchain_trades(&pool, true).await.unwrap();
+        let result = migrate_onchain_trades(&pool, ExecutionMode::DryRun)
+            .await
+            .unwrap();
 
         assert_eq!(result, 1);
 
@@ -690,7 +853,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = migrate_onchain_trades(&pool, false).await;
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit).await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -743,7 +906,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = migrate_onchain_trades(&pool, false).await;
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit).await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -796,7 +959,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = migrate_onchain_trades(&pool, false).await;
+        let result = migrate_onchain_trades(&pool, ExecutionMode::Commit).await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -1034,5 +1197,181 @@ mod tests {
             result.unwrap_err(),
             MigrationError::InvalidSymbol(_)
         ));
+    }
+
+    async fn insert_test_order(
+        pool: &SqlitePool,
+        symbol: &str,
+        shares: i64,
+        direction: &str,
+        order_id: Option<&str>,
+        price_cents: Option<i64>,
+        status: &str,
+    ) {
+        let executed_at = match status {
+            "FILLED" | "FAILED" => Some(chrono::Utc::now()),
+            _ => None,
+        };
+
+        sqlx::query(
+            "
+            INSERT INTO offchain_trades (
+                symbol,
+                shares,
+                direction,
+                broker_order_id,
+                price_cents,
+                status,
+                executed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ",
+        )
+        .bind(symbol)
+        .bind(shares)
+        .bind(direction)
+        .bind(order_id)
+        .bind(price_cents)
+        .bind(status)
+        .bind(executed_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_migrate_offchain_orders_empty() {
+        let pool = create_test_pool().await;
+
+        let count = migrate_offchain_orders(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_offchain_orders_single_order() {
+        let pool = create_test_pool().await;
+
+        insert_test_order(
+            &pool,
+            "AAPL",
+            10,
+            "BUY",
+            Some("ORDER123"),
+            Some(15050),
+            "FILLED",
+        )
+        .await;
+
+        let count = migrate_offchain_orders(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+
+        let aggregate_id: String = sqlx::query_scalar(
+            "SELECT aggregate_id FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let expected_id = OffchainOrder::aggregate_id(1);
+        assert_eq!(aggregate_id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_offchain_orders_all_status_types() {
+        let pool = create_test_pool().await;
+
+        insert_test_order(&pool, "AAPL", 10, "BUY", None, None, "PENDING").await;
+        insert_test_order(&pool, "TSLA", 5, "SELL", None, None, "PENDING").await;
+        insert_test_order(
+            &pool,
+            "MSFT",
+            20,
+            "BUY",
+            Some("ORDER123"),
+            None,
+            "SUBMITTED",
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            "GOOGL",
+            15,
+            "SELL",
+            Some("ORDER456"),
+            None,
+            "SUBMITTED",
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            "NVDA",
+            8,
+            "BUY",
+            Some("ORDER789"),
+            Some(50025),
+            "FILLED",
+        )
+        .await;
+        insert_test_order(
+            &pool,
+            "AMD",
+            12,
+            "SELL",
+            Some("ORDER999"),
+            Some(14050),
+            "FILLED",
+        )
+        .await;
+        insert_test_order(&pool, "META", 3, "BUY", None, None, "FAILED").await;
+
+        let count = migrate_offchain_orders(&pool, ExecutionMode::Commit)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 7);
+
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(event_count, 7);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_offchain_orders_dry_run() {
+        let pool = create_test_pool().await;
+
+        insert_test_order(
+            &pool,
+            "AAPL",
+            10,
+            "BUY",
+            Some("ORDER123"),
+            Some(15050),
+            "FILLED",
+        )
+        .await;
+
+        let count = migrate_offchain_orders(&pool, ExecutionMode::DryRun)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 1);
+
+        let event_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(event_count, 0);
     }
 }

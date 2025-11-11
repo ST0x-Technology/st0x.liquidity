@@ -11,6 +11,7 @@ use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
 pub(crate) use cmd::OffchainOrderCommand;
+pub use event::InvalidMigratedOrderStatus;
 pub(crate) use event::{MigratedOrderStatus, OffchainOrderEvent};
 
 use crate::position::{BrokerOrderId, PriceCents};
@@ -83,6 +84,12 @@ pub(crate) enum OffchainOrder {
 impl Default for OffchainOrder {
     fn default() -> Self {
         Self::NotPlaced
+    }
+}
+
+impl OffchainOrder {
+    pub(crate) fn aggregate_id(id: i64) -> String {
+        format!("{id}")
     }
 }
 
@@ -881,5 +888,12 @@ mod tests {
         } else {
             panic!("Expected Failed state");
         }
+    }
+
+    #[test]
+    fn test_aggregate_id_format() {
+        let aggregate_id = OffchainOrder::aggregate_id(123);
+
+        assert_eq!(aggregate_id, "123");
     }
 }
