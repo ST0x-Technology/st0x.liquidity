@@ -265,6 +265,22 @@ Environment variables (can be set via `.env` file):
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `SchwabError`) with proper propagation
+- **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
+  cqrs-es framework for event sourcing. **NEVER write directly to the `events`
+  table**. This is strictly forbidden and violates the CQRS architecture:
+  - **FORBIDDEN**: Direct INSERT statements into the `events` table
+  - **FORBIDDEN**: Manual sequence number management for events
+  - **FORBIDDEN**: Bypassing the CqrsFramework to write events
+  - **REQUIRED**: Always use `CqrsFramework::execute()` or
+    `CqrsFramework::execute_with_metadata()` to emit events
+  - **REQUIRED**: Events must be emitted through aggregate commands that
+    generate domain events
+  - The cqrs-es framework handles event persistence, sequence numbers, aggregate
+    loading, and consistency guarantees
+  - Direct table writes break aggregate consistency, event ordering, and the
+    event sourcing pattern
+  - If you see existing code writing directly to `events` table, that code is
+    incorrect and should be refactored to use CqrsFramework
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.

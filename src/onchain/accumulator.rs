@@ -53,7 +53,7 @@ pub async fn process_onchain_trade(
         return Ok(None);
     }
 
-    let trade_id = trade.save_within_transaction(sql_tx).await?;
+    let trade_id = trade.save_within_transaction(sql_tx, None).await?;
     info!(
         trade_id = trade_id,
         symbol = %trade.symbol,

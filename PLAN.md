@@ -134,224 +134,269 @@ get_next_unprocessed_event()
 
 ## Task 1. Setup CQRS Framework Infrastructure
 
-Initialize CQRS framework for dual-write operations.
+Initialize CQRS framework properly with SqliteStore and CqrsFramework instances.
+
+**CRITICAL ARCHITECTURE FIX:** The existing migration code and initial dual-write implementation incorrectly write directly to the `events` table. This violates CQRS architecture. All event emission MUST go through `CqrsFramework::execute()` or `execute_with_metadata()`.
 
 **Subtasks:**
-- [x] Create `src/dual_write/mod.rs` with module structure
-- [x] Research cqrs-es SqliteStore setup (examine existing migration code for patterns)
-- [x] Define `DualWriteContext` struct in `src/dual_write/mod.rs`:
-  - [x] `pool: SqlitePool` reference
-  - [x] Add fields for CQRS framework stores (TBD after research)
-- [x] Add `pub(crate) fn new()` constructor for `DualWriteContext`
-- [x] Add visibility level: make `DualWriteContext` `pub(crate)`, internals private
-- [x] Update `src/lib.rs` to expose dual_write module as `pub(crate)`
-- [x] Add custom `DualWriteError` type in `src/dual_write/mod.rs`
+- [ ] Delete incorrect `src/dual_write/onchain_trade.rs` implementation (writes directly to events table)
+- [ ] Create proper `DualWriteContext` in `src/dual_write/mod.rs`:
+  - [ ] Add `cqrs_es::persist::PersistedEventStore` with `SqliteStore<OnChainTrade>`
+  - [ ] Add `CqrsFramework<OnChainTrade>` field
+  - [ ] Add `CqrsFramework<Position>` field
+  - [ ] Add `CqrsFramework<OffchainOrder>` field
+  - [ ] Constructor initializes all three frameworks with SqliteStore
+- [ ] Update `DualWriteError` to include CQRS-related errors:
+  - [ ] Add variant for `cqrs_es::AggregateError`
+  - [ ] Add variant for aggregate-specific errors (OnChainTradeError, etc.)
+- [ ] Research cqrs-es SqliteStore initialization pattern
+- [ ] Add unit test verifying framework initialization
+- [ ] Revert changes to `OnchainTrade::save_within_transaction()` signature (remove dual_write_context parameter)
+- [ ] Revert all 45+ call sites that were updated
 
 **Design Notes:**
-- Use `pub(crate)` for all dual-write types (not part of public API)
-- Follow import organization: external crates, then blank line, then `crate::`
-- Following migration code pattern: write events directly to `events` table without CqrsFramework
+- Use `pub(crate)` for all dual-write types
+- Follow import organization: external crates, blank line, internal imports
+- Each aggregate gets its own CqrsFramework instance
+- SqliteStore is the event persistence backend
+- CqrsFramework handles transactions, sequence numbers, aggregate loading
 
 **Completion Criteria:**
-- [x] `cargo build` succeeds
-- [x] Module structure created and compiles
+- [ ] `cargo build` succeeds
+- [ ] `DualWriteContext::new()` successfully initializes all three frameworks
+- [ ] Unit test can execute a test command through framework
 
-## Task 2. OnchainTrade Dual-Write
+## Task 2. Fix Migration Script - OnchainTrade
 
-Implement dual-write for OnchainTrade aggregate including CQRS setup, event emission, accumulator integration, queue processor wiring, and testing.
+Fix `src/migration/onchain_trade.rs` to use CqrsFramework instead of direct INSERT.
+
+**Current Problem:**
+- `persist_event()` at line 74-102 writes directly to events table
+- Bypasses CqrsFramework entirely
+- Manual sequence number management
 
 **Subtasks:**
+- [ ] Add `CqrsFramework<OnChainTrade>` parameter to `migrate_onchain_trades()`
+- [ ] Remove `persist_event()` function entirely
+- [ ] Create `OnChainTradeCommand::Migrate` command variant (or reuse existing command)
+- [ ] For each legacy trade row:
+  - [ ] Build appropriate command with trade data
+  - [ ] Execute via `framework.execute(&aggregate_id, command).await`
+  - [ ] Handle errors with proper logging
+- [ ] Update `src/migration/mod.rs::run_migration()` to initialize framework and pass it
+- [ ] Update all migration tests to use framework
+- [ ] Remove test code that inserts directly into events table
 
-### 2.1 Setup OnchainTrade CQRS Framework
-- [ ] Research existing OnchainTrade aggregate implementation
-- [ ] Initialize `CqrsFramework` for OnchainTrade in `DualWriteContext::new()`
-- [ ] Add `onchain_trade_cqrs` field to `DualWriteContext`
-- [ ] Verify OnchainTrade commands exist (or define them)
-- [ ] Add unit test verifying framework initialization
-
-### 2.2 Implement OnchainTrade Event Emission
-- [ ] Create `src/dual_write/onchain_trade.rs` module
-- [ ] Follow import organization: external imports, blank line, internal imports
-- [ ] Implement `pub(crate) async fn emit_trade_filled()`:
-  - [ ] Parameters: `trade: &OnchainTrade`, `context: &DualWriteContext`
-  - [ ] Build aggregate_id as `{tx_hash}:{log_index}`
-  - [ ] Create command (research exact command type from aggregate)
-  - [ ] Execute via CQRS framework
-  - [ ] Wrap in `Result<(), DualWriteError>` with error logging
-  - [ ] Use `tracing::error!` on failures with full context
-  - [ ] Never panic or return Err to caller
-- [ ] Add unit tests with mocked CQRS framework
-- [ ] Add helper function `log_event_error()` for consistent error logging
-
-### 2.3 Integrate OnchainTrade into Accumulator
-- [ ] Modify `src/onchain/trade.rs::OnchainTrade::save_within_transaction()`:
-  - [ ] Add optional parameter: `dual_write_context: Option<&DualWriteContext>`
-  - [ ] After successful INSERT, call `emit_trade_filled()` if context provided
-  - [ ] Use pattern: `if let Some(ctx) = dual_write_context { emit(...).await.ok(); }`
-- [ ] Update call sites in accumulator to pass `None` (preserves existing behavior)
-
-### 2.4 Wire into Queue Processor
-- [ ] Initialize `DualWriteContext` in `src/lib.rs::launch()` function
-- [ ] Pass context to `spawn_queue_processor()` in conductor
-- [ ] Update `process_onchain_trade()` call to pass context
-- [ ] Verify tests still pass with context=None
-
-### 2.5 Integration Testing
-- [ ] Add integration tests in `src/dual_write/onchain_trade.rs` test module:
-  - [ ] Process onchain trade with dual-write enabled
-  - [ ] Verify event written to event store
-  - [ ] Verify legacy table also written
-  - [ ] Verify aggregate can be loaded from event store
-- [ ] Add test with event emission failure (verify legacy succeeds)
+**Design Notes:**
+- May need to add `Migrate` command variant to OnChainTradeCommand enum
+- Or reuse existing `Witness` command if semantics match
+- CqrsFramework will handle sequence numbers automatically
+- Each execute() call is atomic
 
 **Completion Criteria:**
-- [ ] `timeout 60 cargo test -q --lib` passes
-- [ ] `timeout 90 cargo clippy --all-targets -- -D warnings` passes
-- [ ] `cargo fmt --check` passes
-- [ ] Integration test demonstrates working dual-write
-- [ ] Error logging includes full context
+- [ ] `timeout 60 cargo test -q --lib migration` passes
+- [ ] No direct INSERT INTO events statements in onchain_trade.rs
+- [ ] Migrated events have correct sequence numbers
 
-## Task 3. Position Dual-Write
+## Task 3. Fix Migration Script - Position
 
-Implement dual-write for Position aggregate including CQRS setup, event emission for onchain fills and offchain order placement, accumulator integration, and testing.
+Fix `src/migration/position.rs` to use CqrsFramework.
 
 **Subtasks:**
+- [ ] Add `CqrsFramework<Position>` parameter to `migrate_positions()`
+- [ ] Remove direct events table INSERT
+- [ ] Use appropriate Position commands
+- [ ] Update migration runner to pass framework
+- [ ] Update tests
 
-### 3.1 Setup Position CQRS Framework
-- [ ] Initialize `CqrsFramework` for Position in `DualWriteContext::new()`
-- [ ] Add `position_cqrs` field to `DualWriteContext`
-- [ ] Verify Position commands exist (already defined in `src/position/cmd.rs`)
-- [ ] Add unit test verifying framework initialization
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] No direct events table writes
 
-### 3.2 Implement Position Event Emission Functions
-- [ ] Create `src/dual_write/position.rs` module
-- [ ] Follow import organization guidelines
-- [ ] Implement `pub(crate) async fn emit_onchain_fill_acknowledged()`:
-  - [ ] Parameters: `trade: &OnchainTrade`, `symbol: &Symbol`, `context: &DualWriteContext`
-  - [ ] Use symbol as aggregate_id
-  - [ ] Build `PositionCommand::AcknowledgeOnChainFill`
-  - [ ] Execute via CQRS framework
-  - [ ] Error handling with logging
-- [ ] Implement `pub(crate) async fn emit_offchain_order_placed()`:
-  - [ ] Parameters: execution details, `context: &DualWriteContext`
+## Task 4. Fix Migration Script - OffchainOrder
+
+Fix `src/migration/offchain_order.rs` to use CqrsFramework.
+
+**Subtasks:**
+- [ ] Add `CqrsFramework<OffchainOrder>` parameter to `migrate_offchain_orders()`
+- [ ] Remove direct events table INSERT
+- [ ] Use appropriate OffchainOrder commands
+- [ ] Update migration runner to pass framework
+- [ ] Update tests
+
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] No direct events table writes
+
+## Task 5. Fix Migration Script - SchwabAuth
+
+Fix `src/migration/schwab_auth.rs` to use CqrsFramework.
+
+**Subtasks:**
+- [ ] Add CqrsFramework parameter to `migrate_schwab_auth()`
+- [ ] Remove direct events table INSERT
+- [ ] Use appropriate auth commands
+- [ ] Update migration runner to pass framework
+- [ ] Update tests
+
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] No direct events table writes
+
+## Task 6. Verify No Direct Events Table Writes
+
+Audit entire codebase to ensure nothing writes directly to events table.
+
+**Subtasks:**
+- [ ] Run `grep -r "INSERT INTO events" src/` - should return 0 results
+- [ ] Run `grep -r "INSERT.*events.*aggregate_type" src/` - should return 0 results
+- [ ] Search for any sqlx queries writing to events table
+- [ ] Update AGENTS.md if additional guidance needed
+- [ ] Run full test suite: `timeout 180 cargo test -q`
+- [ ] Run clippy: `timeout 90 cargo clippy --all-targets -- -D warnings`
+
+**Completion Criteria:**
+- [ ] Zero direct writes to events table in application code
+- [ ] All tests pass
+- [ ] Clippy passes
+
+## Task 7. Implement OnchainTrade Dual-Write (Correct Implementation)
+
+Now implement dual-write properly using CqrsFramework.
+
+**Subtasks:**
+- [ ] Create NEW `src/dual_write/onchain_trade.rs`
+- [ ] Implement `emit_trade_filled()`:
+  - [ ] Parameters: `trade: &LegacyTrade`, `context: &DualWriteContext`
+  - [ ] Build aggregate_id: `OnChainTrade::aggregate_id(trade.tx_hash, trade.log_index)`
+  - [ ] Create `OnChainTradeCommand::Witness` with trade data
+  - [ ] Execute: `context.onchain_trade_cqrs.execute(&aggregate_id, command).await`
+  - [ ] Map errors to `DualWriteError`
+  - [ ] Return `Result<(), DualWriteError>`
+- [ ] Implement `log_event_error()` helper
+- [ ] Add integration tests:
+  - [ ] Test command execution succeeds
+  - [ ] Test event appears in events table (via framework)
+  - [ ] Test aggregate can be loaded from event store
+  - [ ] Test sequence numbers increment correctly
+- [ ] Modify `OnchainTrade::save_within_transaction()` to accept optional `DualWriteContext`
+- [ ] Update call sites to pass `None` for now
+
+**Design Notes:**
+- CqrsFramework::execute() is async and returns Result
+- Framework handles all event persistence, sequences, view updates
+- We just build commands and call execute()
+- Much simpler than manual event table writes
+
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] Uses CqrsFramework::execute()
+- [ ] No direct events table access
+
+## Task 8. Implement Position Dual-Write
+
+Implement dual-write for Position aggregate using CqrsFramework.
+
+**Subtasks:**
+- [ ] Create `src/dual_write/position.rs`
+- [ ] Implement `emit_onchain_fill_acknowledged()`:
+  - [ ] Parameters: trade data, `context: &DualWriteContext`
+  - [ ] Build `PositionCommand::AcknowledgeOnChainFill` (or appropriate command)
+  - [ ] Execute via `context.position_cqrs.execute(&symbol, command).await`
+- [ ] Implement `emit_offchain_order_placed()`:
   - [ ] Build `PositionCommand::PlaceOffChainOrder`
-  - [ ] Execute via CQRS framework
-- [ ] Add unit tests for both emission functions
-
-### 3.3 Integrate Position into Accumulator
-- [ ] Modify `src/onchain/accumulator.rs::process_onchain_trade()`:
-  - [ ] Add optional parameter: `dual_write_context: Option<&DualWriteContext>`
-  - [ ] After onchain trade saved, call `emit_onchain_fill_acknowledged()`
-  - [ ] When execution created, call `emit_offchain_order_placed()`
-  - [ ] Use non-blocking pattern: `.await.ok()`
-- [ ] Update conductor queue processor to pass context
-- [ ] Verify existing tests pass
-
-### 3.4 Integration Testing
-- [ ] Add test: process onchain trade → position accumulates
-- [ ] Add test: position crosses threshold → offchain order placed
-- [ ] Add test: verify Position aggregate state matches legacy accumulator
-- [ ] Add test: event emission failure doesn't break accumulator
-- [ ] Add test: multiple trades for same symbol (concurrent updates)
+  - [ ] Execute via framework
+- [ ] Implement `emit_offchain_order_filled()`:
+  - [ ] Build appropriate command
+  - [ ] Execute via framework
+- [ ] Implement `emit_offchain_order_failed()`:
+  - [ ] Build appropriate command
+  - [ ] Execute via framework
+- [ ] Add integration tests
+- [ ] Integrate into accumulator (optional context parameter)
 
 **Completion Criteria:**
-- [ ] `timeout 90 cargo test -q --lib` passes
-- [ ] `timeout 90 cargo clippy --all-targets -- -D warnings` passes
-- [ ] Integration tests verify position state consistency
-- [ ] Accumulator still works with context=None (backward compatibility)
+- [ ] Tests pass
+- [ ] Uses CqrsFramework::execute()
+- [ ] No direct events table access
 
-## Task 4. Implement OffchainOrder Aggregate Dual-Write
+## Task 9. Implement OffchainOrder Dual-Write
 
-Emit order lifecycle events.
+Implement dual-write for OffchainOrder aggregate using CqrsFramework.
 
 **Subtasks:**
 - [ ] Create `src/dual_write/offchain_order.rs`
-- [ ] Implement `emit_offchain_order_placed()`:
-  - Called in `accumulator::create_execution_within_transaction()` after INSERT
-  - Command: `OffchainOrderCommand::Place`
-  - Parameters: symbol, shares, direction, broker
-  - Return execution_id to caller
-- [ ] Implement `emit_offchain_order_submitted()`:
-  - Called in order poller when broker confirms submission
-  - Command: `OffchainOrderCommand::ConfirmSubmission`
-  - Parameters: broker_order_id
-- [ ] Implement `emit_offchain_order_filled()`:
-  - Called in order poller when status → FILLED
-  - Command: `OffchainOrderCommand::CompleteFill`
-  - Parameters: price_cents
-- [ ] Implement `emit_offchain_order_failed()`:
-  - Called in order poller or cleanup when order fails
-  - Command: `OffchainOrderCommand::MarkFailed`
-  - Parameters: error message
-- [ ] Add unit tests for each emission function
-- [ ] Add integration test verifying order lifecycle in event store
+- [ ] Implement `emit_order_placed()`:
+  - [ ] Build `OffchainOrderCommand::Place` (or appropriate command)
+  - [ ] Execute via `context.offchain_order_cqrs.execute(&execution_id, command).await`
+- [ ] Implement `emit_order_submitted()`:
+  - [ ] Build appropriate command
+  - [ ] Execute via framework
+- [ ] Implement `emit_order_filled()`:
+  - [ ] Build appropriate command
+  - [ ] Execute via framework
+- [ ] Implement `emit_order_failed()`:
+  - [ ] Build appropriate command
+  - [ ] Execute via framework
+- [ ] Add integration tests
+- [ ] Integrate into order poller and cleanup tasks
 
-**Design Notes:**
-- Use `execution_id` (from offchain_trades.id) as aggregate_id
-- Execution must be INSERTed to get ID before emitting Placed event
-- Consider adding execution_id to context if needed across functions
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] Uses CqrsFramework::execute()
+- [ ] No direct events table access
 
-## Task 5. Integrate Dual-Write into Queue Processor
+## Task 10. Integrate Dual-Write into Queue Processor
 
 Wire dual-write into the main trade processing flow.
 
 **Subtasks:**
-- [ ] Modify `src/conductor/mod.rs::run_queue_processor()`:
-  - Pass `DualWriteContext` to `process_onchain_trade()`
+- [ ] Initialize `DualWriteContext` in `src/lib.rs::launch()`
+- [ ] Pass context to conductor's queue processor task
 - [ ] Modify `src/onchain/accumulator.rs::process_onchain_trade()`:
-  - Accept `dual_write_context: Option<&DualWriteContext>` parameter
-  - After successful legacy transaction commit:
-    - Call `dual_write::onchain_trade::emit_onchain_trade_filled()`
-    - Call `dual_write::position::emit_onchain_fill_acknowledged()`
-    - If execution created: call `dual_write::position::emit_offchain_order_placed()`
-    - If execution created: call `dual_write::offchain_order::emit_offchain_order_placed()`
-  - Wrap each call in error handling
-- [ ] Add integration test for full queue processor flow with events
+  - [ ] Accept optional `DualWriteContext` parameter
+  - [ ] After successful legacy transaction:
+    - [ ] Call `dual_write::emit_trade_filled()`
+    - [ ] Call `dual_write::position::emit_onchain_fill_acknowledged()`
+    - [ ] If execution created: call dual-write for OffchainOrder and Position
+  - [ ] Use pattern: `if let Some(ctx) = context { emit(ctx).await.ok(); }`
+  - [ ] Log errors with full context
+- [ ] Add integration test
 
-**Design Notes:**
-- Make `dual_write_context` Optional for backward compatibility in tests
-- Use pattern: `if let Some(ctx) = dual_write_context { emit_event(ctx).await.ok(); }`
-- Log errors at ERROR level with full context
-- Consider adding distributed tracing span for dual-write operations
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] Context properly passed through call chain
+- [ ] Events emitted after legacy writes
 
-## Task 6. Integrate Dual-Write into Order Poller
+## Task 11. Integrate Dual-Write into Order Poller
 
 Emit events when order status changes.
 
 **Subtasks:**
-- [ ] Locate order poller implementation (likely `src/schwab/order_poller.rs` or `src/conductor/mod.rs`)
 - [ ] Pass `DualWriteContext` to order poller task
-- [ ] Identify status transition points:
-  - PENDING → SUBMITTED: emit `OffchainOrderEvent::Submitted` + `PositionEvent` (none needed)
-  - SUBMITTED → FILLED: emit `OffchainOrderEvent::Filled` + `PositionEvent::OffChainOrderFilled`
-  - SUBMITTED → FAILED: emit `OffchainOrderEvent::Failed` + `PositionEvent::OffChainOrderFailed`
-- [ ] Add dual-write calls after each legacy status UPDATE
-- [ ] Add unit tests for each transition
-- [ ] Add integration test for order lifecycle with events
+- [ ] After each status UPDATE:
+  - [ ] Call appropriate dual-write functions
+  - [ ] Handle errors with logging
+- [ ] Add tests for status transitions
 
-**Design Notes:**
-- Order poller may batch-update multiple orders; ensure events are emitted for each
-- Include broker_order_id in events for correlation
-- Consider using broker timestamps if available
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] Events emitted on status changes
 
-## Task 7. Integrate Dual-Write into Stale Execution Cleanup
+## Task 12. Integrate Dual-Write into Stale Execution Cleanup
 
 Emit failure events when cleaning up stale executions.
 
 **Subtasks:**
-- [ ] Modify `src/onchain/accumulator.rs::clean_up_stale_executions()`:
-  - Accept `dual_write_context: Option<&DualWriteContext>` parameter
-  - After marking execution as FAILED:
-    - Call `dual_write::offchain_order::emit_offchain_order_failed()`
-    - Call `dual_write::position::emit_offchain_order_failed()`
-- [ ] Modify `src/conductor/mod.rs` position_checker task to pass context
-- [ ] Add unit tests
-- [ ] Add integration test
+- [ ] Pass `DualWriteContext` to cleanup task
+- [ ] After marking execution FAILED:
+  - [ ] Call dual-write for OffchainOrder and Position
+  - [ ] Handle errors with logging
+- [ ] Add tests
 
-**Design Notes:**
-- Cleanup happens periodically (every 60s)
-- Stale executions are those older than threshold without broker confirmation
-- Error message should indicate "Stale execution timeout"
+**Completion Criteria:**
+- [ ] Tests pass
+- [ ] Events emitted on cleanup
 
 ## Success Criteria
 

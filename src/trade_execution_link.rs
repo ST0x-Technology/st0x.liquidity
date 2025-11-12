@@ -354,7 +354,10 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+        let trade_id = trade
+            .save_within_transaction(&mut sql_tx, None)
+            .await
+            .unwrap();
         let execution_id = execution
             .save_within_transaction(&mut sql_tx)
             .await
@@ -446,7 +449,10 @@ mod tests {
         let mut sql_tx = pool.begin().await.unwrap();
         let mut trade_ids = Vec::new();
         for trade in trades {
-            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+            let trade_id = trade
+                .save_within_transaction(&mut sql_tx, None)
+                .await
+                .unwrap();
             trade_ids.push(trade_id);
         }
         let execution_id = execution
@@ -513,7 +519,10 @@ mod tests {
                 pyth_exponent: None,
                 pyth_publish_time: None,
             };
-            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+            let trade_id = trade
+                .save_within_transaction(&mut sql_tx, None)
+                .await
+                .unwrap();
             trade_ids.push(trade_id);
         }
 
@@ -583,7 +592,10 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+        let trade_id = trade
+            .save_within_transaction(&mut sql_tx, None)
+            .await
+            .unwrap();
         let execution_id = execution
             .save_within_transaction(&mut sql_tx)
             .await
