@@ -146,15 +146,14 @@ Initialize CQRS framework properly with SqliteEventRepository and CqrsFramework 
   - [x] Three framework fields: `onchain_trade`, `position`, `offchain_order`
   - [x] Constructor uses `sqlite_cqrs()` helper to initialize each framework
   - [x] Accessor methods for each framework
-- [x] Updated `DualWriteError` with aggregate-specific error variants:
-  - [x] `OnChainTradeAggregate(String)`
-  - [x] `PositionAggregate(String)`
-  - [x] `OffchainOrderAggregate(String)`
+- [x] Created minimal `DualWriteError` enum with only basic conversion errors
+  - [x] Database, Serialization, IntConversion, DecimalConversion (all using `#[from]`)
+  - [x] Will discover additional error variants as needed during implementation
 - [x] Reverted changes to `OnchainTrade::save_within_transaction()` signature
 - [x] Reverted all 45+ call sites (removed `None` parameter)
 - [x] Added unit test verifying framework initialization
 - [x] All 386 tests pass
-- [x] Clippy passes (only expected dead_code warnings for unused error variants)
+- [x] Clippy passes (no warnings)
 - [x] Code formatted
 
 **Implementation Notes:**
@@ -162,6 +161,7 @@ Initialize CQRS framework properly with SqliteEventRepository and CqrsFramework 
 - Each aggregate gets its own SqliteCqrs instance backed by SqliteEventRepository
 - Framework accessor methods provide immutable references to frameworks
 - Services parameter is `()` for all three aggregates (Position and OffchainOrder don't require services)
+- Error enum starts minimal - will add variants with `#[from]` as we discover actual errors during implementation
 
 ## Task 2. Fix Migration Script - OnchainTrade
 

@@ -50,7 +50,6 @@ impl OnchainTrade {
     pub async fn save_within_transaction(
         &self,
         sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        dual_write_context: Option<&crate::dual_write::DualWriteContext>,
     ) -> Result<i64, sqlx::Error> {
         let tx_hash_str = self.tx_hash.to_string();
         #[allow(clippy::cast_possible_wrap)]
@@ -98,12 +97,6 @@ impl OnchainTrade {
         )
         .execute(&mut **sql_tx)
         .await?;
-
-        if let Some(ctx) = dual_write_context {
-            if let Err(e) = crate::dual_write::emit_trade_filled(self, ctx).await {
-                crate::dual_write::log_event_error(self, &e);
-            }
-        }
 
         Ok(result.last_insert_rowid())
     }
@@ -447,10 +440,7 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let id = trade
-            .save_within_transaction(&mut sql_tx, None)
-            .await
-            .unwrap();
+        let id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
         sql_tx.commit().await.unwrap();
         assert!(id > 0);
 
@@ -543,15 +533,12 @@ mod tests {
 
         // Insert first trade
         let mut sql_tx1 = pool.begin().await.unwrap();
-        trade
-            .save_within_transaction(&mut sql_tx1, None)
-            .await
-            .unwrap();
+        trade.save_within_transaction(&mut sql_tx1).await.unwrap();
         sql_tx1.commit().await.unwrap();
 
         // Try to insert duplicate trade (same tx_hash and log_index)
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = trade.save_within_transaction(&mut sql_tx2, None).await;
+        let duplicate_result = trade.save_within_transaction(&mut sql_tx2).await;
         assert!(
             duplicate_result.is_err(),
             "Expected duplicate constraint violation"
@@ -588,7 +575,7 @@ mod tests {
         let mut sql_tx = pool.begin().await.unwrap();
 
         // This should fail due to log_index constraint (log_index >= 0)
-        let save_result = trade.save_within_transaction(&mut sql_tx, None).await;
+        let save_result = trade.save_within_transaction(&mut sql_tx).await;
         assert!(save_result.is_err());
         sql_tx.rollback().await.unwrap();
     }
@@ -703,10 +690,7 @@ mod tests {
             };
 
             let mut sql_tx = pool.begin().await.unwrap();
-            trade
-                .save_within_transaction(&mut sql_tx, None)
-                .await
-                .unwrap();
+            trade.save_within_transaction(&mut sql_tx).await.unwrap();
             sql_tx.commit().await.unwrap();
         }
 
