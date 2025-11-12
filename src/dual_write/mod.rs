@@ -1,8 +1,9 @@
-mod onchain_trade;
-
-pub(crate) use onchain_trade::{emit_trade_filled, log_event_error};
-
+use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
+
+use crate::offchain_order::OffchainOrder;
+use crate::onchain_trade::OnChainTrade;
+use crate::position::Position;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DualWriteError {

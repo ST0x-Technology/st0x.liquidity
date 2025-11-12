@@ -1905,13 +1905,13 @@ mod tests {
 
         // Test saving the first trade within a transaction
         let mut sql_tx1 = pool.begin().await.unwrap();
-        let first_result = trade1.save_within_transaction(&mut sql_tx1, None).await;
+        let first_result = trade1.save_within_transaction(&mut sql_tx1).await;
         assert!(first_result.is_ok(), "First save should succeed");
         sql_tx1.commit().await.unwrap();
 
         // Test saving the duplicate trade within a transaction (should fail)
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let second_result = trade2.save_within_transaction(&mut sql_tx2, None).await;
+        let second_result = trade2.save_within_transaction(&mut sql_tx2).await;
         assert!(
             second_result.is_err(),
             "Second save should fail due to duplicate (tx_hash, log_index)"

@@ -895,16 +895,14 @@ mod tests {
             .build();
         let mut sql_tx = pool.begin().await.unwrap();
         existing_trade
-            .save_within_transaction(&mut sql_tx, None)
+            .save_within_transaction(&mut sql_tx)
             .await
             .unwrap();
         sql_tx.commit().await.unwrap();
 
         let duplicate_trade = existing_trade.clone();
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade
-            .save_within_transaction(&mut sql_tx2, None)
-            .await;
+        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
         assert!(duplicate_result.is_err());
         sql_tx2.rollback().await.unwrap();
 
@@ -937,16 +935,14 @@ mod tests {
         };
         let mut sql_tx = pool.begin().await.unwrap();
         existing_trade
-            .save_within_transaction(&mut sql_tx, None)
+            .save_within_transaction(&mut sql_tx)
             .await
             .unwrap();
         sql_tx.commit().await.unwrap();
 
         let duplicate_trade = existing_trade.clone();
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade
-            .save_within_transaction(&mut sql_tx2, None)
-            .await;
+        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
         assert!(duplicate_result.is_err());
         sql_tx2.rollback().await.unwrap();
 

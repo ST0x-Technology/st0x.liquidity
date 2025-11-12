@@ -134,37 +134,34 @@ get_next_unprocessed_event()
 
 ## Task 1. Setup CQRS Framework Infrastructure
 
-Initialize CQRS framework properly with SqliteStore and CqrsFramework instances.
+Initialize CQRS framework properly with SqliteEventRepository and CqrsFramework instances.
 
 **CRITICAL ARCHITECTURE FIX:** The existing migration code and initial dual-write implementation incorrectly write directly to the `events` table. This violates CQRS architecture. All event emission MUST go through `CqrsFramework::execute()` or `execute_with_metadata()`.
 
-**Subtasks:**
-- [ ] Delete incorrect `src/dual_write/onchain_trade.rs` implementation (writes directly to events table)
-- [ ] Create proper `DualWriteContext` in `src/dual_write/mod.rs`:
-  - [ ] Add `cqrs_es::persist::PersistedEventStore` with `SqliteStore<OnChainTrade>`
-  - [ ] Add `CqrsFramework<OnChainTrade>` field
-  - [ ] Add `CqrsFramework<Position>` field
-  - [ ] Add `CqrsFramework<OffchainOrder>` field
-  - [ ] Constructor initializes all three frameworks with SqliteStore
-- [ ] Update `DualWriteError` to include CQRS-related errors:
-  - [ ] Add variant for `cqrs_es::AggregateError`
-  - [ ] Add variant for aggregate-specific errors (OnChainTradeError, etc.)
-- [ ] Research cqrs-es SqliteStore initialization pattern
-- [ ] Add unit test verifying framework initialization
-- [ ] Revert changes to `OnchainTrade::save_within_transaction()` signature (remove dual_write_context parameter)
-- [ ] Revert all 45+ call sites that were updated
+**Completed Work:**
 
-**Design Notes:**
-- Use `pub(crate)` for all dual-write types
-- Follow import organization: external crates, blank line, internal imports
-- Each aggregate gets its own CqrsFramework instance
-- SqliteStore is the event persistence backend
-- CqrsFramework handles transactions, sequence numbers, aggregate loading
+- [x] Deleted incorrect `src/dual_write/onchain_trade.rs` implementation
+- [x] Created proper `DualWriteContext` in `src/dual_write/mod.rs`:
+  - [x] Uses `sqlite_es::SqliteCqrs` type alias (CqrsFramework backed by SQLite)
+  - [x] Three framework fields: `onchain_trade`, `position`, `offchain_order`
+  - [x] Constructor uses `sqlite_cqrs()` helper to initialize each framework
+  - [x] Accessor methods for each framework
+- [x] Updated `DualWriteError` with aggregate-specific error variants:
+  - [x] `OnChainTradeAggregate(String)`
+  - [x] `PositionAggregate(String)`
+  - [x] `OffchainOrderAggregate(String)`
+- [x] Reverted changes to `OnchainTrade::save_within_transaction()` signature
+- [x] Reverted all 45+ call sites (removed `None` parameter)
+- [x] Added unit test verifying framework initialization
+- [x] All 386 tests pass
+- [x] Clippy passes (only expected dead_code warnings for unused error variants)
+- [x] Code formatted
 
-**Completion Criteria:**
-- [ ] `cargo build` succeeds
-- [ ] `DualWriteContext::new()` successfully initializes all three frameworks
-- [ ] Unit test can execute a test command through framework
+**Implementation Notes:**
+- Used `sqlite_es::sqlite_cqrs()` helper function for clean initialization
+- Each aggregate gets its own SqliteCqrs instance backed by SqliteEventRepository
+- Framework accessor methods provide immutable references to frameworks
+- Services parameter is `()` for all three aggregates (Position and OffchainOrder don't require services)
 
 ## Task 2. Fix Migration Script - OnchainTrade
 

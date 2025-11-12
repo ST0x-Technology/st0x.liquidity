@@ -351,6 +351,63 @@ Environment variables (can be set via `.env` file):
   #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
   logic changes might leave panics in the codebase
+- **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
+  String values that throw away type information**. This is strictly forbidden
+  and violates our error handling principles:
+  - **FORBIDDEN**: `SomeError(String)` - throws away all type information
+  - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
+  - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
+    interpolation
+  - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
+    preserve all type information
+  - **REQUIRED**: Each error variant must preserve the complete error chain with
+    `#[source]`
+  - **REQUIRED**: Discover error variants as needed during implementation, not
+    preemptively
+  - **Principle**: Error types must enable debugging and preserve all context -
+    opaque strings make debugging impossible
+  - Example of **FORBIDDEN** pattern:
+    ```rust
+    // ❌ CATASTROPHICALLY BAD - Destroys all type information
+    #[derive(Debug, thiserror::Error)]
+    pub enum MyError {
+        #[error("Aggregate error: {0}")]
+        AggregateError(String),  // WRONG: No way to know what failed
+        #[error("Processing failed: {0}")]
+        ProcessingError(String), // WRONG: Loses error chain
+    }
+
+    // Code that creates these errors (FORBIDDEN):
+    some_operation().map_err(|e| MyError::AggregateError(e.to_string()))?;
+    ```
+  - Example of **CORRECT** pattern:
+    ```rust
+    // ✅ CORRECT - Preserves all type information
+    #[derive(Debug, thiserror::Error)]
+    pub enum MyError {
+        #[error("CQRS aggregate error: {0}")]
+        Aggregate(#[from] cqrs_es::AggregateError<OtherError>),
+        #[error("Database error: {0}")]
+        Database(#[from] sqlx::Error),
+        #[error("Specific business rule violation")]
+        BusinessRuleViolation {
+            field: String,
+            value: Decimal,
+            #[source]
+            cause: ValidationError,
+        },
+    }
+
+    // With #[from], this works automatically:
+    some_operation()?;  // Auto-converts via From trait
+    ```
+  - When adding new error variants:
+    1. Only add variants when you encounter actual errors during implementation
+    2. Use `#[from]` for error types from external crates
+    3. Use `#[source]` for wrapped errors in struct variants
+    4. Never use `.to_string()`, `.map_err(|e| Foo(e.to_string()))`, or similar
+      patterns
+    5. If an error needs context, use a struct variant with fields + `#[source]`
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the
