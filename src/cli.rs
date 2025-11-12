@@ -1062,10 +1062,14 @@ mod tests {
         let after_clear_event = AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: alloy::primitives::B256::new(U256::from_str(alice_output_shares).unwrap().to_le_bytes()),
+                aliceOutput: alloy::primitives::B256::new(
+                    U256::from_str(alice_output_shares).unwrap().to_le_bytes(),
+                ),
                 bobOutput: alloy::primitives::B256::new(U256::from(bob_output_usdc).to_le_bytes()),
                 aliceInput: alloy::primitives::B256::new(U256::from(bob_output_usdc).to_le_bytes()),
-                bobInput: alloy::primitives::B256::new(U256::from_str(alice_output_shares).unwrap().to_le_bytes()),
+                bobInput: alloy::primitives::B256::new(
+                    U256::from_str(alice_output_shares).unwrap().to_le_bytes(),
+                ),
             },
         };
 
@@ -1105,12 +1109,16 @@ mod tests {
         let input_decimals = if input_symbol == "USDC" { 6u8 } else { 18u8 };
         let output_decimals = if output_symbol == "USDC" { 6u8 } else { 18u8 };
         // Mock decimals() then symbol() calls for input token
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&input_decimals));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
+            &input_decimals,
+        ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &input_symbol.to_string(),
         ));
         // Mock decimals() then symbol() calls for output token
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&output_decimals));
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
+            &output_decimals,
+        ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &output_symbol.to_string(),
         ));

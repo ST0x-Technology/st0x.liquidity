@@ -31,9 +31,9 @@ impl OnchainTrade {
 
         let fill = OrderFill {
             input_index: usize::try_from(inputIOIndex)?,
-            input_amount: alloy::primitives::U256::from_le_bytes(event.input.0),
+            input_amount: event.input,
             output_index: usize::try_from(outputIOIndex)?,
-            output_amount: alloy::primitives::U256::from_le_bytes(event.output.0),
+            output_amount: event.output,
         };
 
         Self::try_from_order_and_fill_details(cache, &provider, order, fill, log, feed_id_cache)
@@ -71,8 +71,12 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: fixed_bytes!("0x00e1f50500000000000000000000000000000000000000000000000000000000"), // 100 USDC (LE)
-            output: fixed_bytes!("0x000084e2506ce67c000000000000000000000000000000000000000000000000"), // 9 shares (LE)
+            input: fixed_bytes!(
+                "0x00e1f50500000000000000000000000000000000000000000000000000000000"
+            ), // 100 USDC (LE)
+            output: fixed_bytes!(
+                "0x000084e2506ce67c000000000000000000000000000000000000000000000000"
+            ), // 9 shares (LE)
         }
     }
 
@@ -109,7 +113,7 @@ mod tests {
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -190,8 +194,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::new(U256::from_str("5000000000000000000").unwrap().to_le_bytes()), // 5 shares (18 decimals)
-            output: alloy::primitives::B256::new(U256::from(50_000_000u64).to_le_bytes()),                     // 50 USDC (6 decimals)
+            input: alloy::primitives::B256::new(
+                U256::from_str("5000000000000000000").unwrap().to_le_bytes(),
+            ), // 5 shares (18 decimals)
+            output: alloy::primitives::B256::new(U256::from(50_000_000u64).to_le_bytes()), // 50 USDC (6 decimals)
         };
 
         let log = get_test_log();
@@ -207,7 +213,7 @@ mod tests {
             &"AAPL0x".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -250,7 +256,11 @@ mod tests {
                 }],
             },
             input: alloy::primitives::B256::new(U256::from(200_000_000u64).to_le_bytes()), // 200 USDC
-            output: alloy::primitives::B256::new(U256::from_str("15000000000000000000").unwrap().to_le_bytes()), // 15 shares
+            output: alloy::primitives::B256::new(
+                U256::from_str("15000000000000000000")
+                    .unwrap()
+                    .to_le_bytes(),
+            ), // 15 shares
         };
 
         let log = get_test_log();
@@ -261,7 +271,7 @@ mod tests {
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -322,7 +332,7 @@ mod tests {
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -368,7 +378,9 @@ mod tests {
                 }],
             },
             input: alloy::primitives::B256::new(U256::from(100_000_000u64).to_le_bytes()),
-            output: alloy::primitives::B256::new(U256::from_str("9000000000000000000").unwrap().to_le_bytes()),
+            output: alloy::primitives::B256::new(
+                U256::from_str("9000000000000000000").unwrap().to_le_bytes(),
+            ),
         };
 
         let log = get_test_log();

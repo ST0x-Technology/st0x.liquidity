@@ -128,6 +128,8 @@ pub(crate) enum OnChainError {
     InvalidBroker(#[from] InvalidBrokerError),
     #[error("Numeric conversion error: {0}")]
     Conversion(#[from] ConversionError),
+    #[error("Float/decimal conversion error: {0}")]
+    FloatConversion(String),
 }
 
 impl From<sqlx::Error> for OnChainError {

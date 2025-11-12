@@ -74,17 +74,17 @@ impl OnchainTrade {
         let (order, fill) = if alice_owner_matches {
             let fill = OrderFill {
                 input_index: usize::try_from(aliceInputIOIndex)?,
-                input_amount: alloy::primitives::U256::from_le_bytes(aliceInput.0),
+                input_amount: aliceInput,
                 output_index: usize::try_from(aliceOutputIOIndex)?,
-                output_amount: alloy::primitives::U256::from_le_bytes(aliceOutput.0),
+                output_amount: aliceOutput,
             };
             (alice_order, fill)
         } else {
             let fill = OrderFill {
                 input_index: usize::try_from(bobInputIOIndex)?,
-                input_amount: alloy::primitives::U256::from_le_bytes(bobInput.0),
+                input_amount: bobInput,
                 output_index: usize::try_from(bobOutputIOIndex)?,
-                output_amount: alloy::primitives::U256::from_le_bytes(bobOutput.0),
+                output_amount: bobOutput,
             };
             (bob_order, fill)
         };
@@ -188,10 +188,18 @@ mod tests {
         AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: fixed_bytes!("0x000084e2506ce67c000000000000000000000000000000000000000000000000"), // 9 shares (LE)
-                bobOutput: fixed_bytes!("0x00e1f50500000000000000000000000000000000000000000000000000000000"),   // 100 USDC (LE)
-                aliceInput: fixed_bytes!("0x00e1f50500000000000000000000000000000000000000000000000000000000"),   // 100 USDC (LE)
-                bobInput: fixed_bytes!("0x000084e2506ce67c000000000000000000000000000000000000000000000000"),    // 9 shares (LE)
+                aliceOutput: fixed_bytes!(
+                    "0x000084e2506ce67c000000000000000000000000000000000000000000000000"
+                ), // 9 shares (LE)
+                bobOutput: fixed_bytes!(
+                    "0x00e1f50500000000000000000000000000000000000000000000000000000000"
+                ), // 100 USDC (LE)
+                aliceInput: fixed_bytes!(
+                    "0x00e1f50500000000000000000000000000000000000000000000000000000000"
+                ), // 100 USDC (LE)
+                bobInput: fixed_bytes!(
+                    "0x000084e2506ce67c000000000000000000000000000000000000000000000000"
+                ), // 9 shares (LE)
             },
         }
     }
@@ -265,7 +273,7 @@ mod tests {
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -350,7 +358,7 @@ mod tests {
             &"AAPL0x".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -684,7 +692,7 @@ mod tests {
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -728,10 +736,14 @@ mod tests {
         AfterClearV2 {
             sender: alloy::primitives::Address::repeat_byte(sender_byte),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: u256_to_float(U256::from(alice_shares) * U256::from(10).pow(U256::from(18))),
+                aliceOutput: u256_to_float(
+                    U256::from(alice_shares) * U256::from(10).pow(U256::from(18)),
+                ),
                 bobOutput: u256_to_float(U256::from(bob_usdc) * U256::from(10).pow(U256::from(6))),
                 aliceInput: u256_to_float(U256::from(bob_usdc) * U256::from(10).pow(U256::from(6))),
-                bobInput: u256_to_float(U256::from(alice_shares) * U256::from(10).pow(U256::from(18))),
+                bobInput: u256_to_float(
+                    U256::from(alice_shares) * U256::from(10).pow(U256::from(18)),
+                ),
             },
         }
     }
@@ -795,10 +807,8 @@ mod tests {
 
         let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 5);
 
-        let after_clear_event_1 =
-            create_parameterized_after_clear_event(0xaa, 9, 100);
-        let after_clear_event_2 =
-            create_parameterized_after_clear_event(0xbb, 5, 50);
+        let after_clear_event_1 = create_parameterized_after_clear_event(0xaa, 9, 100);
+        let after_clear_event_2 = create_parameterized_after_clear_event(0xbb, 5, 50);
 
         let after_clear_log_1 =
             create_test_log(orderbook, tx_hash, after_clear_event_1.to_log_data(), 6);
@@ -810,7 +820,7 @@ mod tests {
         let receipt_json = create_test_receipt_json(tx_hash);
         asserter.push_success(&receipt_json);
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -929,8 +939,7 @@ mod tests {
         let clear_log = create_test_log(orderbook, target_tx_hash, clear_event.to_log_data(), 3);
 
         let after_clear_event_correct = create_after_clear_event();
-        let after_clear_event_wrong =
-            create_parameterized_after_clear_event(0xcc, 1, 10);
+        let after_clear_event_wrong = create_parameterized_after_clear_event(0xcc, 1, 10);
 
         let wrong_tx_log = create_test_log(
             orderbook,
@@ -950,7 +959,7 @@ mod tests {
         let receipt_json = create_test_receipt_json(target_tx_hash);
         asserter.push_success(&receipt_json);
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));  // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));

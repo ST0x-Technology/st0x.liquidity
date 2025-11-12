@@ -3,12 +3,6 @@ use alloy::sol;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV4, "lib/rain.orderbook.interface/out/IOrderBookV4.sol/IOrderBookV4.json"
-);
-
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[derive(serde::Serialize, serde::Deserialize)]
     IOrderBookV5, "lib/rain.orderbook.interface/out/IOrderBookV5.sol/IOrderBookV5.json"
 );
 

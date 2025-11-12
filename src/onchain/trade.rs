@@ -4,11 +4,10 @@ use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::num::ParseFloatError;
 use tracing::error;
 
-use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::bindings::IERC20::IERC20Instance;
+use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
@@ -213,11 +212,11 @@ impl OnchainTrade {
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
         let input_decimals = get_token_decimals(&provider, input.token).await?;
-        let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
+        let onchain_input_amount = float_to_f64(fill.input_amount, input_decimals)?;
         let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
 
         let output_decimals = get_token_decimals(&provider, output.token).await?;
-        let onchain_output_amount = u256_to_f64(fill.output_amount, output_decimals)?;
+        let onchain_output_amount = float_to_f64(fill.output_amount, output_decimals)?;
         let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -338,9 +337,9 @@ impl OnchainTrade {
 #[derive(Debug)]
 pub(crate) struct OrderFill {
     pub input_index: usize,
-    pub input_amount: U256,
+    pub input_amount: B256,
     pub output_index: usize,
-    pub output_amount: U256,
+    pub output_amount: B256,
 }
 
 async fn try_convert_log_to_onchain_trade<P: Provider>(
@@ -398,25 +397,36 @@ async fn get_token_decimals<P: Provider>(
     Ok(decimals)
 }
 
-/// Helper that converts a fixed-decimal U256 amount into an f64 using the provided number of decimals.
-fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
+/// Converts a Float (bytes32) amount to f64 using the provided token decimals.
+/// Float in the IOrderBookV5 interface is a bytes32 little-endian encoded value.
+fn float_to_f64(float: B256, decimals: u8) -> Result<f64, OnChainError> {
+    // Convert the little-endian bytes32 to U256
+    let amount = U256::from_le_bytes(float.0);
+
     if amount.is_zero() {
         return Ok(0.);
     }
 
     let u256_str = amount.to_string();
-    let decimals = decimals as usize;
+    let decimals_usize = decimals as usize;
 
-    let formatted = if decimals == 0 {
+    let formatted = if decimals_usize == 0 {
         u256_str
-    } else if u256_str.len() <= decimals {
-        format!("0.{}{}", "0".repeat(decimals - u256_str.len()), u256_str)
+    } else if u256_str.len() <= decimals_usize {
+        format!(
+            "0.{}{}",
+            "0".repeat(decimals_usize - u256_str.len()),
+            u256_str
+        )
     } else {
-        let (int_part, frac_part) = u256_str.split_at(u256_str.len() - decimals);
+        let (int_part, frac_part) =
+            u256_str.split_at(u256_str.len() - decimals_usize);
         format!("{int_part}.{frac_part}")
     };
 
-    formatted.parse::<f64>()
+    formatted
+        .parse::<f64>()
+        .map_err(|e| OnChainError::FloatConversion(e.to_string()))
 }
 
 #[cfg(test)]
@@ -476,15 +486,21 @@ mod tests {
     }
 
     #[test]
-    fn test_u256_to_f64_edge_cases() {
-        assert!((u256_to_f64(U256::ZERO, 18).unwrap() - 0.0).abs() < f64::EPSILON);
+    fn test_float_to_f64_edge_cases() {
+        // Zero value
+        let float_zero = B256::from_slice(&U256::ZERO.to_le_bytes::<32>());
+        assert!((float_to_f64(float_zero, 18).unwrap() - 0.0).abs() < f64::EPSILON);
 
+        // Maximum safe value
         let max_safe = U256::from(9_007_199_254_740_991_u64);
-        let result = u256_to_f64(max_safe, 0).unwrap();
+        let float_max_safe = B256::from_slice(&max_safe.to_le_bytes::<32>());
+        let result = float_to_f64(float_max_safe, 0).unwrap();
         assert!((result - 9_007_199_254_740_991.0).abs() < 1.0);
 
+        // Very large value
         let very_large = U256::MAX;
-        let result = u256_to_f64(very_large, 18);
+        let float_large = B256::from_slice(&very_large.to_le_bytes::<32>());
+        let result = float_to_f64(float_large, 18);
         assert!(result.is_ok());
     }
 
@@ -594,33 +610,38 @@ mod tests {
     }
 
     #[test]
-    fn test_u256_to_f64_precision_loss() {
+    fn test_float_to_f64_precision_loss() {
         // Test precision loss with very large numbers
         let very_large = U256::MAX;
-        let result = u256_to_f64(very_large, 0).unwrap();
+        let float_large = B256::from_slice(&very_large.to_le_bytes::<32>());
+        let result = float_to_f64(float_large, 0).unwrap();
         assert!(result.is_finite());
 
         // Test with maximum decimals
         let small_amount = U256::from(1);
-        let result = u256_to_f64(small_amount, 255).unwrap(); // Max u8 value
+        let float_small = B256::from_slice(&small_amount.to_le_bytes::<32>());
+        let result = float_to_f64(float_small, 255).unwrap(); // Max u8 value
         assert!((result - 0.0).abs() < f64::EPSILON); // Should be rounded to 0 due to extreme precision
     }
 
     #[test]
-    fn test_u256_to_f64_formatting_edge_cases() {
+    fn test_float_to_f64_formatting_edge_cases() {
         // Test with exactly decimal places length
         let amount = U256::from(123_456);
-        let result = u256_to_f64(amount, 6).unwrap();
+        let float_amount = B256::from_slice(&amount.to_le_bytes::<32>());
+        let result = float_to_f64(float_amount, 6).unwrap();
         assert!((result - 0.123_456).abs() < f64::EPSILON);
 
         // Test with more decimals than digits
         let amount = U256::from(5);
-        let result = u256_to_f64(amount, 10).unwrap();
+        let float_amount = B256::from_slice(&amount.to_le_bytes::<32>());
+        let result = float_to_f64(float_amount, 10).unwrap();
         assert!((result - 0.000_000_000_5).abs() < f64::EPSILON);
 
         // Test with zero decimals
         let amount = U256::from(12345);
-        let result = u256_to_f64(amount, 0).unwrap();
+        let float_amount = B256::from_slice(&amount.to_le_bytes::<32>());
+        let result = float_to_f64(float_amount, 0).unwrap();
         assert!((result - 12_345.0).abs() < f64::EPSILON);
     }
 

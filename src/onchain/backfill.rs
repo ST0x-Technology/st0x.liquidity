@@ -983,7 +983,7 @@ mod tests {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: IOrderBookV5::ClearStateChangeV2 {
                 aliceOutput: u256_to_float(U256::from_str("5000000000000000000").unwrap()), // 5 shares
-                bobOutput: u256_to_float(U256::from(50_000_000u64)),                        // 50 USDC cents
+                bobOutput: u256_to_float(U256::from(50_000_000u64)), // 50 USDC cents
                 aliceInput: u256_to_float(U256::from(50_000_000u64)),
                 bobInput: u256_to_float(U256::from_str("5000000000000000000").unwrap()),
             },
