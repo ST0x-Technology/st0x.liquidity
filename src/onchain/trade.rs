@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::num::ParseFloatError;
 use tracing::error;
 
-use crate::bindings::IOrderBookV4::{ClearV2, OrderV3, TakeOrderV2};
+use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
+use crate::bindings::IERC20::IERC20Instance;
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
@@ -23,8 +24,8 @@ use st0x_broker::PersistenceError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
-    ClearV2(Box<ClearV2>),
-    TakeOrderV2(Box<TakeOrderV2>),
+    ClearV3(Box<ClearV3>),
+    TakeOrderV3(Box<TakeOrderV3>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,7 +187,7 @@ impl OnchainTrade {
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
         provider: P,
-        order: OrderV3,
+        order: OrderV4,
         fill: OrderFill,
         log: Log,
         feed_id_cache: &FeedIdCache,
@@ -211,10 +212,12 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let onchain_input_amount = u256_to_f64(fill.input_amount, input.decimals)?;
+        let input_decimals = get_token_decimals(&provider, input.token).await?;
+        let onchain_input_amount = u256_to_f64(fill.input_amount, input_decimals)?;
         let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
 
-        let onchain_output_amount = u256_to_f64(fill.output_amount, output.decimals)?;
+        let output_decimals = get_token_decimals(&provider, output.token).await?;
+        let onchain_output_amount = u256_to_f64(fill.output_amount, output_decimals)?;
         let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -307,8 +310,8 @@ impl OnchainTrade {
             .logs()
             .iter()
             .filter(|log| {
-                (log.topic0() == Some(&ClearV2::SIGNATURE_HASH)
-                    || log.topic0() == Some(&TakeOrderV2::SIGNATURE_HASH))
+                (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
+                    || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
                     && log.address() == env.orderbook
             })
             .collect();
@@ -358,8 +361,8 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         removed: false,
     };
 
-    if let Ok(clear_event) = log.log_decode::<ClearV2>() {
-        return OnchainTrade::try_from_clear_v2(
+    if let Ok(clear_event) = log.log_decode::<ClearV3>() {
+        return OnchainTrade::try_from_clear_v3(
             env,
             cache,
             &provider,
@@ -370,7 +373,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         .await;
     }
 
-    if let Ok(take_order_event) = log.log_decode::<TakeOrderV2>() {
+    if let Ok(take_order_event) = log.log_decode::<TakeOrderV3>() {
         return OnchainTrade::try_from_take_order_if_target_owner(
             cache,
             &provider,
@@ -383,6 +386,16 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     }
 
     Ok(None)
+}
+
+/// Fetches the number of decimals for an ERC20 token.
+async fn get_token_decimals<P: Provider>(
+    provider: P,
+    token: alloy::primitives::Address,
+) -> Result<u8, OnChainError> {
+    let erc20 = IERC20Instance::new(token, provider);
+    let decimals = erc20.decimals().call().await?;
+    Ok(decimals)
 }
 
 /// Helper that converts a fixed-decimal U256 amount into an f64 using the provided number of decimals.

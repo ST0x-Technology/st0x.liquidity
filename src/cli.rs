@@ -503,8 +503,8 @@ fn display_trade_details<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange, ClearV2};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
+    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmEnv;
@@ -1019,17 +1019,17 @@ mod tests {
         let order = get_test_order();
         let order_owner = order.owner;
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order,
-            clearConfig: ClearConfig {
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: U256::ZERO,
-                bobBountyVaultId: U256::ZERO,
+                aliceBountyVaultId: alloy::primitives::B256::ZERO,
+                bobBountyVaultId: alloy::primitives::B256::ZERO,
             },
         };
 
@@ -1049,7 +1049,7 @@ mod tests {
             "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
             "logs": [{
                 "address": orderbook,
-                "topics": [ClearV2::SIGNATURE_HASH],
+                "topics": [ClearV3::SIGNATURE_HASH],
                 "data": format!("0x{}", hex::encode(clear_event.into_log_data().data)),
                 "blockNumber": "0x64",
                 "transactionHash": tx_hash,
@@ -1059,13 +1059,13 @@ mod tests {
             }]
         });
 
-        let after_clear_event = AfterClear {
+        let after_clear_event = AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: ClearStateChange {
-                aliceOutput: U256::from_str(alice_output_shares).unwrap(),
-                bobOutput: U256::from(bob_output_usdc),
-                aliceInput: U256::from(bob_output_usdc),
-                bobInput: U256::from_str(alice_output_shares).unwrap(),
+            clearStateChange: ClearStateChangeV2 {
+                aliceOutput: alloy::primitives::B256::new(U256::from_str(alice_output_shares).unwrap().to_le_bytes()),
+                bobOutput: alloy::primitives::B256::new(U256::from(bob_output_usdc).to_le_bytes()),
+                aliceInput: alloy::primitives::B256::new(U256::from(bob_output_usdc).to_le_bytes()),
+                bobInput: alloy::primitives::B256::new(U256::from_str(alice_output_shares).unwrap().to_le_bytes()),
             },
         };
 
@@ -1101,9 +1101,16 @@ mod tests {
         asserter.push_success(&mock_data.receipt_json);
         asserter.push_success(&json!([mock_data.after_clear_log]));
         asserter.push_success(&mock_data.receipt_json);
+        // Determine decimals based on symbol
+        let input_decimals = if input_symbol == "USDC" { 6u8 } else { 18u8 };
+        let output_decimals = if output_symbol == "USDC" { 6u8 } else { 18u8 };
+        // Mock decimals() then symbol() calls for input token
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&input_decimals));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &input_symbol.to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&output_decimals));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &output_symbol.to_string(),
         ));
@@ -1789,9 +1796,13 @@ mod tests {
         asserter1.push_success(&mock_data.receipt_json);
         asserter1.push_success(&json!([mock_data.after_clear_log]));
         asserter1.push_success(&mock_data.receipt_json);
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (TSLA0x)
+        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"TSLA0x".to_string(),
         ));
@@ -1829,9 +1840,13 @@ mod tests {
         asserter2.push_success(&mock_data.receipt_json);
         asserter2.push_success(&json!([mock_data.after_clear_log]));
         asserter2.push_success(&mock_data.receipt_json);
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (TSLA0x)
+        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"TSLA0x".to_string(),
         ));

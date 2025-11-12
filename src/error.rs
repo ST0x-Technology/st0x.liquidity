@@ -75,10 +75,10 @@ pub(crate) enum EventQueueError {
 pub(crate) enum EventProcessingError {
     #[error("Event queue error: {0}")]
     Queue(#[from] EventQueueError),
-    #[error("Failed to enqueue ClearV2 event: {0}")]
-    EnqueueClearV2(#[source] EventQueueError),
-    #[error("Failed to enqueue TakeOrderV2 event: {0}")]
-    EnqueueTakeOrderV2(#[source] EventQueueError),
+    #[error("Failed to enqueue ClearV3 event: {0}")]
+    EnqueueClearV3(#[source] EventQueueError),
+    #[error("Failed to enqueue TakeOrderV3 event: {0}")]
+    EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Failed to process trade through accumulator: {0}")]
     AccumulatorProcessing(String),
     #[error("Onchain trade processing error: {0}")]
