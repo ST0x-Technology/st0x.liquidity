@@ -407,9 +407,9 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::new(U256::from(100_000_000u64).to_le_bytes()),
+            input: alloy::primitives::B256::new(U256::from(100_000_000u64).to_le_bytes::<32>()),
             output: alloy::primitives::B256::new(
-                U256::from_str("9000000000000000000").unwrap().to_le_bytes(),
+                U256::from_str("9000000000000000000").unwrap().to_le_bytes::<32>(),
             ),
         };
 

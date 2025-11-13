@@ -262,7 +262,7 @@ mod tests {
     }
 
     fn u256_to_float(amount: U256) -> alloy::primitives::B256 {
-        alloy::primitives::B256::new(amount.to_le_bytes())
+        alloy::primitives::B256::new(amount.to_le_bytes::<32>())
     }
 
     #[tokio::test]
