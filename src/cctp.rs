@@ -39,6 +39,7 @@ const ATTESTATION_API_BASE: &str = "https://iris-api.circle.com/attestations";
 /// Minimum finality threshold for CCTP V2 fast transfer (enables ~30 second transfers)
 const FAST_TRANSFER_THRESHOLD: u32 = 1000;
 
+#[derive(Debug)]
 pub(crate) struct BurnReceipt {
     pub(crate) tx: TxHash,
     pub(crate) nonce: FixedBytes<32>,
@@ -251,3 +252,198 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::network::EthereumWallet;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, address, b256};
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
+    use httpmock::prelude::*;
+
+    fn setup_anvil() -> (AnvilInstance, String, B256) {
+        let anvil = Anvil::new().spawn();
+        let endpoint = anvil.endpoint();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        (anvil, endpoint, private_key)
+    }
+
+    async fn create_bridge(
+        ethereum_endpoint: &str,
+        base_endpoint: &str,
+        private_key: &B256,
+    ) -> Result<CctpBridge<impl Provider + Clone, impl Signer + Clone>, Box<dyn std::error::Error>>
+    {
+        let signer = PrivateKeySigner::from_bytes(private_key)?;
+        let wallet = EthereumWallet::from(signer.clone());
+
+        let ethereum_provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ethereum_endpoint)
+            .await?;
+
+        let base_provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(base_endpoint)
+            .await?;
+
+        let ethereum_account = EvmAccount::new(ethereum_provider, signer.clone());
+        let base_account = EvmAccount::new(base_provider, signer);
+
+        Ok(CctpBridge::new(ethereum_account, base_account))
+    }
+
+    #[tokio::test]
+    async fn test_extract_nonce_from_message_sent_event() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(&ethereum_endpoint, &base_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let recipient = address!("0x1234567890123456789012345678901234567890");
+        let amount = U256::from(1_000_000u64);
+
+        let result = bridge.burn_on_ethereum(amount, recipient).await;
+
+        assert!(
+            matches!(result, Err(CctpError::Http(_))),
+            "Expected HTTP error when querying fee API, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_message_sent_event_not_found() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(&ethereum_endpoint, &base_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let recipient = address!("0x1234567890123456789012345678901234567890");
+        let amount = U256::from(1_000_000u64);
+
+        let result = bridge.burn_on_ethereum(amount, recipient).await;
+
+        assert!(
+            result.is_err(),
+            "Expected error due to contract not deployed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attestation_succeeds_with_retry_logic() {
+        let server = MockServer::start();
+        let message_hash =
+            b256!("1234567890123456789012345678901234567890123456789012345678901234");
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!("/{message_hash}"));
+            then.status(200).json_body(serde_json::json!({
+                "attestation": "0x1234567890abcdef"
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge(&ethereum_endpoint, &base_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        let url = format!("{}/{message_hash}", server.base_url());
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_millis(10))
+            .with_max_times(5);
+
+        #[derive(serde::Deserialize)]
+        struct AttestationResponse {
+            attestation: String,
+        }
+
+        let fetch_attestation = || async {
+            let response = bridge.http_client.get(&url).send().await?;
+
+            if !response.status().is_success() {
+                return Err(AttestationError::NotReady);
+            }
+
+            let attestation_response: AttestationResponse = response.json().await?;
+            let attestation_hex = attestation_response
+                .attestation
+                .strip_prefix("0x")
+                .unwrap_or(&attestation_response.attestation);
+            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+
+            Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
+        };
+
+        let result = fetch_attestation.retry(backoff).await;
+
+        assert!(result.is_ok(), "Expected attestation to succeed");
+        assert_eq!(mock.hits(), 1, "Expected exactly 1 API call");
+    }
+
+    #[tokio::test]
+    async fn test_attestation_timeout() {
+        let server = MockServer::start();
+        let message_hash =
+            b256!("abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!("/{message_hash}"));
+            then.status(404);
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let mut bridge = create_bridge(&ethereum_endpoint, &base_endpoint, &private_key)
+            .await
+            .unwrap();
+
+        bridge.http_client = reqwest::Client::new();
+
+        let url = format!("{}/{message_hash}", server.base_url());
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_millis(10))
+            .with_max_times(3);
+
+        #[derive(serde::Deserialize)]
+        struct AttestationResponse {
+            attestation: String,
+        }
+
+        let fetch_attestation = || async {
+            let response = bridge.http_client.get(&url).send().await?;
+
+            if !response.status().is_success() {
+                return Err(AttestationError::NotReady);
+            }
+
+            let attestation_response: AttestationResponse = response.json().await?;
+            let attestation_hex = attestation_response
+                .attestation
+                .strip_prefix("0x")
+                .unwrap_or(&attestation_response.attestation);
+            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+
+            Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
+        };
+
+        let result = fetch_attestation.retry(backoff).await;
+
+        assert!(
+            result.is_err(),
+            "Expected attestation to fail after max retries"
+        );
+        assert!(
+            matches!(result.unwrap_err(), AttestationError::NotReady),
+            "Expected AttestationError::NotReady"
+        );
+        assert!(
+            mock.hits() >= 3,
+            "Expected at least 3 attempts with retries"
+        );
+    }
+}
