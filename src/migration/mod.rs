@@ -10,7 +10,7 @@ use sqlx::SqlitePool;
 use std::io;
 use tracing::{info, warn};
 
-use crate::offchain_order::InvalidMigratedOrderStatus;
+use crate::offchain_order::{InvalidMigratedOrderStatus, OffchainOrderError};
 use crate::onchain_trade::OnChainTradeError;
 use crate::position::{NegativePriceCents, PositionError};
 use offchain_order::migrate_offchain_orders;
@@ -97,6 +97,8 @@ enum MigrationError {
     OnChainTradeAggregate(#[from] AggregateError<OnChainTradeError>),
     #[error("Position aggregate error: {0}")]
     PositionAggregate(#[from] AggregateError<PositionError>),
+    #[error("OffchainOrder aggregate error: {0}")]
+    OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
 }
 
 #[derive(Debug, Default)]
@@ -151,10 +153,12 @@ pub async fn run_migration(
 
     let onchain_trade_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let position_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    let offchain_order_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
     let onchain_trades = migrate_onchain_trades(pool, &onchain_trade_cqrs, env.execution).await?;
     let positions = migrate_positions(pool, &position_cqrs, env.execution).await?;
-    let offchain_orders = migrate_offchain_orders(pool, env.execution).await?;
+    let offchain_orders =
+        migrate_offchain_orders(pool, &offchain_order_cqrs, env.execution).await?;
     let schwab_auth = migrate_schwab_auth(pool, env.execution).await?;
 
     Ok(MigrationSummary {

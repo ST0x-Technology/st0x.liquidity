@@ -1,12 +1,11 @@
-use chrono::Utc;
-use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
+use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use st0x_broker::{SupportedBroker, Symbol};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
-use crate::offchain_order::{OffchainOrder, OffchainOrderEvent};
+use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
 use crate::position::{BrokerOrderId, FractionalShares, PriceCents};
 
 #[derive(sqlx::FromRow)]
@@ -22,6 +21,7 @@ struct OffchainOrderRow {
 
 pub async fn migrate_offchain_orders(
     pool: &SqlitePool,
+    cqrs: &SqliteCqrs<OffchainOrder>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, OffchainOrderRow>(
@@ -78,7 +78,7 @@ pub async fn migrate_offchain_orders(
         let broker_order_id = row.order_id.map(BrokerOrderId);
         let price_cents = row.price_cents.map(PriceCents::try_from).transpose()?;
 
-        let event = OffchainOrderEvent::Migrated {
+        let command = OffchainOrderCommand::Migrate {
             symbol,
             shares: FractionalShares(shares),
             direction,
@@ -87,12 +87,11 @@ pub async fn migrate_offchain_orders(
             broker_order_id,
             price_cents,
             executed_at: None,
-            migrated_at: Utc::now(),
         };
 
         match execution {
             ExecutionMode::Commit => {
-                persist_event(pool, &aggregate_id, event).await?;
+                cqrs.execute(&aggregate_id, command).await?;
             }
             ExecutionMode::DryRun => {}
         }
@@ -105,42 +104,10 @@ pub async fn migrate_offchain_orders(
     Ok(total)
 }
 
-async fn persist_event(
-    pool: &SqlitePool,
-    aggregate_id: &str,
-    event: OffchainOrderEvent,
-) -> Result<(), MigrationError> {
-    let aggregate_type = OffchainOrder::aggregate_type();
-    let event_type = event.event_type();
-    let event_version = event.event_version();
-    let payload = serde_json::to_string(&event)?;
-
-    sqlx::query(
-        "INSERT INTO events (
-            aggregate_type,
-            aggregate_id,
-            sequence,
-            event_type,
-            event_version,
-            payload,
-            metadata
-        )
-        VALUES (?, ?, 1, ?, ?, ?, '{}')",
-    )
-    .bind(&aggregate_type)
-    .bind(aggregate_id)
-    .bind(&event_type)
-    .bind(&event_version)
-    .bind(&payload)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
 
     use super::{ExecutionMode, migrate_offchain_orders};
@@ -195,8 +162,9 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_offchain_orders_empty() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        let count = migrate_offchain_orders(&pool, ExecutionMode::Commit)
+        let count = migrate_offchain_orders(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -206,6 +174,7 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_offchain_orders_single_order() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_order(
             &pool,
@@ -218,7 +187,7 @@ mod tests {
         )
         .await;
 
-        let count = migrate_offchain_orders(&pool, ExecutionMode::Commit)
+        let count = migrate_offchain_orders(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -238,6 +207,7 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_offchain_orders_all_status_types() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_order(&pool, "AAPL", 10, "BUY", None, None, "PENDING").await;
         insert_test_order(&pool, "TSLA", 5, "SELL", None, None, "PENDING").await;
@@ -283,7 +253,7 @@ mod tests {
         .await;
         insert_test_order(&pool, "META", 3, "BUY", None, None, "FAILED").await;
 
-        let count = migrate_offchain_orders(&pool, ExecutionMode::Commit)
+        let count = migrate_offchain_orders(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -302,6 +272,7 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_offchain_orders_dry_run() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_order(
             &pool,
@@ -314,7 +285,7 @@ mod tests {
         )
         .await;
 
-        let count = migrate_offchain_orders(&pool, ExecutionMode::DryRun)
+        let count = migrate_offchain_orders(&pool, &cqrs, ExecutionMode::DryRun)
             .await
             .unwrap();
 

@@ -238,16 +238,34 @@ Fix `src/migration/position.rs` to use CqrsFramework.
 
 Fix `src/migration/offchain_order.rs` to use CqrsFramework.
 
-**Subtasks:**
-- [ ] Add `CqrsFramework<OffchainOrder>` parameter to `migrate_offchain_orders()`
-- [ ] Remove direct events table INSERT
-- [ ] Use appropriate OffchainOrder commands
-- [ ] Update migration runner to pass framework
-- [ ] Update tests
+**Completed Work:**
+
+- [x] Added `OffchainOrderCommand::Migrate` variant to `src/offchain_order/cmd.rs`
+- [x] Implemented handler for `Migrate` command in OffchainOrder aggregate
+- [x] Updated `migrate_offchain_orders()` to accept `SqliteCqrs<OffchainOrder>` parameter
+- [x] Removed `persist_event()` function (direct INSERT into events table)
+- [x] Refactored to use `cqrs.execute(&aggregate_id, command).await`
+- [x] Updated migration runner in `src/migration/mod.rs` to create and pass OffchainOrder framework
+- [x] Updated all 4 offchain order migration tests to use framework
+- [x] Added `OffchainOrderAggregate` error variant to `MigrationError` with `#[from]`
+- [x] Added comprehensive tests for new `Migrate` command (3 new tests):
+  - [x] `test_migrate_command_creates_migrated_event` - Verifies command creates correct event with all fields
+  - [x] `test_migrate_command_all_status_types` - Tests all 4 status types (Pending, Submitted, Filled, Failed)
+  - [x] `test_operations_after_migrate` - Verifies normal operations (ConfirmSubmission) work after migration
+- [x] All 44 offchain order tests pass (41 existing + 3 new migration tests)
+- [x] All 27 migration tests pass
+- [x] Clippy passes (no errors, only expected dead code warnings for dual_write)
+- [x] Code formatted
+
+**Implementation Notes:**
+- OffchainOrder's `Migrate` command follows the same pattern as OnChainTrade and Position
+- The Migrate command handles all 4 status types through the `MigratedOrderStatus` enum
+- CqrsFramework automatically handles event persistence, sequence numbers, and view updates
+- Error conversion through `#[from]` preserves full type information in error chain
 
 **Completion Criteria:**
-- [ ] Tests pass
-- [ ] No direct events table writes
+- [x] Tests pass
+- [x] No direct events table writes
 
 ## Task 5. Fix Migration Script - SchwabAuth
 

@@ -110,6 +110,26 @@ impl Aggregate for OffchainOrder {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
+            OffchainOrderCommand::Migrate {
+                symbol,
+                shares,
+                direction,
+                broker,
+                status,
+                broker_order_id,
+                price_cents,
+                executed_at,
+            } => Ok(vec![OffchainOrderEvent::Migrated {
+                symbol,
+                shares,
+                direction,
+                broker,
+                status,
+                broker_order_id,
+                price_cents,
+                executed_at,
+                migrated_at: Utc::now(),
+            }]),
             OffchainOrderCommand::Place {
                 symbol,
                 shares,
@@ -895,5 +915,201 @@ mod tests {
         let aggregate_id = OffchainOrder::aggregate_id(123);
 
         assert_eq!(aggregate_id, "123");
+    }
+
+    #[test]
+    fn test_migrate_command_creates_migrated_event() {
+        use cqrs_es::test::TestFramework;
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let command = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given_no_previous_events()
+            .when(command)
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            OffchainOrderEvent::Migrated {
+                symbol: evt_symbol,
+                shares,
+                direction,
+                broker,
+                status,
+                broker_order_id,
+                price_cents,
+                executed_at,
+                ..
+            } => {
+                assert_eq!(evt_symbol, &symbol);
+                assert_eq!(shares.0, dec!(100));
+                assert_eq!(direction, &Direction::Buy);
+                assert_eq!(broker, &SupportedBroker::Schwab);
+                assert!(matches!(status, MigratedOrderStatus::Pending));
+                assert!(broker_order_id.is_none());
+                assert!(price_cents.is_none());
+                assert!(executed_at.is_none());
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[test]
+    fn test_migrate_command_all_status_types() {
+        use cqrs_es::test::TestFramework;
+
+        let symbol = Symbol::new("TSLA").unwrap();
+
+        let pending_cmd = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given_no_previous_events()
+            .when(pending_cmd)
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Pending,
+                ..
+            }
+        ));
+
+        let submitted_cmd = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Submitted,
+            broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
+            price_cents: None,
+            executed_at: Some(Utc::now()),
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given_no_previous_events()
+            .when(submitted_cmd)
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Submitted,
+                ..
+            }
+        ));
+
+        let filled_cmd = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Filled,
+            broker_order_id: Some(BrokerOrderId("ORD456".to_string())),
+            price_cents: Some(PriceCents(20000)),
+            executed_at: Some(Utc::now()),
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given_no_previous_events()
+            .when(filled_cmd)
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Filled,
+                ..
+            }
+        ));
+
+        let failed_cmd = OffchainOrderCommand::Migrate {
+            symbol,
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Failed {
+                error: "Insufficient funds".to_string(),
+            },
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: Some(Utc::now()),
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given_no_previous_events()
+            .when(failed_cmd)
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Failed { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_operations_after_migrate() {
+        use cqrs_es::test::TestFramework;
+
+        let symbol = Symbol::new("GOOGL").unwrap();
+
+        let migrated_event = OffchainOrderEvent::Migrated {
+            symbol,
+            shares: FractionalShares(dec!(25)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+            migrated_at: Utc::now(),
+        };
+
+        let confirm_cmd = OffchainOrderCommand::ConfirmSubmission {
+            broker_order_id: BrokerOrderId("ORD789".to_string()),
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given(vec![migrated_event])
+            .when(confirm_cmd)
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], OffchainOrderEvent::Submitted { .. }));
     }
 }
