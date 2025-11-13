@@ -28,6 +28,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
 
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this type
+#[allow(dead_code)]
 impl TokenSymbol {
     pub(crate) fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -113,8 +115,18 @@ pub(crate) struct Transfer {
     pub(crate) network_fee: Option<Decimal>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Network(pub(super) String);
+
+impl<'de> serde::Deserialize<'de> for Network {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self::new(s))
+    }
+}
 
 impl Network {
     pub(crate) fn new(s: impl Into<String>) -> Self {
@@ -141,10 +153,10 @@ impl std::fmt::Display for Network {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct DepositAddress {
-    pub(super) address: Address,
-    pub(super) asset: TokenSymbol,
-    pub(super) network: Network,
+pub(crate) struct DepositAddress {
+    pub(crate) address: Address,
+    pub(crate) asset: TokenSymbol,
+    pub(crate) network: Network,
 }
 
 #[derive(Deserialize)]
@@ -159,10 +171,7 @@ pub(super) async fn get_deposit_address(
     asset: &str,
     network: &str,
 ) -> Result<DepositAddress, AlpacaWalletError> {
-    let path = format!(
-        "/v1/crypto/funding_wallets?asset={}&network={}",
-        asset, network
-    );
+    let path = format!("/v1/crypto/funding_wallets?asset={asset}&network={network}");
 
     let response = client.get(&path).await?;
 
@@ -327,7 +336,7 @@ mod tests {
 
         assert_eq!(deposit_address.address, expected_address);
         assert_eq!(deposit_address.asset.as_ref(), "USDC");
-        assert_eq!(deposit_address.network.as_ref(), "Ethereum");
+        assert_eq!(deposit_address.network.as_ref(), "ethereum");
 
         account_mock.assert();
         wallet_mock.assert();
@@ -513,8 +522,7 @@ mod tests {
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .json_body(json!({
                     "amount": "100.5",
@@ -640,8 +648,7 @@ mod tests {
 
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
-                "/v1/accounts/{}/wallets/transfers",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/transfers"
             ));
             then.status(400)
                 .header("content-type", "application/json")
@@ -684,8 +691,7 @@ mod tests {
 
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
-                "/v1/accounts/{}/wallets/transfers",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/transfers"
             ));
             then.status(400)
                 .header("content-type", "application/json")
@@ -723,8 +729,7 @@ mod tests {
 
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
-                "/v1/accounts/{}/wallets/transfers",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/transfers"
             ));
             then.status(500).body("Internal Server Error");
         });
@@ -765,8 +770,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -814,8 +818,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -863,8 +866,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -911,8 +913,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -959,8 +960,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -998,8 +998,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(500).body("Internal Server Error");
@@ -1035,8 +1034,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)

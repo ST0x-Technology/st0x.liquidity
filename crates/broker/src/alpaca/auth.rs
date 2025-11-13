@@ -1,7 +1,6 @@
 use apca::api::v2::account::{self, GetError};
 use apca::{Client, RequestError};
 use clap::{Parser, ValueEnum};
-use tokio::sync::OnceCell;
 
 /// Trading mode for Alpaca API
 #[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
@@ -63,7 +62,6 @@ impl AlpacaAuthEnv {
 pub struct AlpacaClient {
     client: Client,
     trading_mode: AlpacaTradingMode,
-    account_id: OnceCell<String>,
 }
 
 impl std::fmt::Debug for AlpacaClient {
@@ -86,27 +84,12 @@ impl AlpacaClient {
         Ok(Self {
             client,
             trading_mode: env.alpaca_trading_mode.clone(),
-            account_id: OnceCell::new(),
         })
     }
 
     pub(crate) async fn verify_account(&self) -> Result<(), RequestError<GetError>> {
         let _account = self.client.issue::<account::Get>(&()).await?;
         Ok(())
-    }
-
-    /// Get the account ID, fetching and caching it if not already cached.
-    ///
-    /// This method caches the account ID after the first retrieval to prevent
-    /// repeated API calls. Subsequent calls return the cached value.
-    pub(crate) async fn get_account_id(&self) -> Result<String, RequestError<GetError>> {
-        self.account_id
-            .get_or_try_init(|| async {
-                let account = self.client.issue::<account::Get>(&()).await?;
-                Ok(account.id.to_string())
-            })
-            .await
-            .cloned()
     }
 
     pub(crate) fn is_paper_trading(&self) -> bool {

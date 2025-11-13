@@ -68,12 +68,16 @@ use whitelist::WhitelistEntry;
 pub(crate) use client::AlpacaWalletError;
 pub(crate) use transfer::{Network, TokenSymbol, Transfer, TransferId};
 
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
+#[allow(dead_code)]
 /// Configuration for `AlpacaWalletService`.
 pub(crate) struct AlpacaWalletConfig {
     pub(crate) auth_env: AlpacaAuthEnv,
     pub(crate) polling_config: Option<PollingConfig>,
 }
 
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
+#[allow(dead_code)]
 /// Service facade for Alpaca crypto wallet operations.
 ///
 /// Provides a high-level API for deposits, withdrawals, and transfer polling.
@@ -82,6 +86,8 @@ pub(crate) struct AlpacaWalletService {
     polling_config: PollingConfig,
 }
 
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
+#[allow(dead_code)]
 impl AlpacaWalletService {
     /// Creates a new service instance.
     ///

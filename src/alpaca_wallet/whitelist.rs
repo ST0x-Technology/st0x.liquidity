@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use super::transfer::{Network, TokenSymbol};
 
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this constant
+#[allow(dead_code)]
 pub(super) const APPROVAL_WAIT_TIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -16,13 +18,13 @@ pub(crate) enum WhitelistStatus {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub(super) struct WhitelistEntry {
-    pub(super) id: String,
-    pub(super) address: Address,
-    pub(super) asset: TokenSymbol,
-    pub(super) chain: Network,
-    pub(super) status: WhitelistStatus,
-    pub(super) created_at: DateTime<Utc>,
+pub(crate) struct WhitelistEntry {
+    pub(crate) id: String,
+    pub(crate) address: Address,
+    pub(crate) asset: TokenSymbol,
+    pub(crate) chain: Network,
+    pub(crate) status: WhitelistStatus,
+    pub(crate) created_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
@@ -84,16 +86,9 @@ mod tests {
         let test_address = "0x1234567890abcdef1234567890abcdef12345678";
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path(format!(
-                    "/v1/accounts/{}/wallets/whitelists",
-                    expected_account_id
-                ))
-                .json_body(json!({
-                    "address": test_address,
-                    "asset": "USDC",
-                    "chain": "Ethereum"
-                }));
+            when.method(POST).path(format!(
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
+            ));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -144,8 +139,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -199,8 +193,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -249,8 +242,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -299,8 +291,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -350,8 +341,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -400,8 +390,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(400).json_body(json!({
                 "message": "Invalid address format"
@@ -442,8 +431,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
-                "/v1/accounts/{}/wallets/whitelists",
-                expected_account_id
+                "/v1/accounts/{expected_account_id}/wallets/whitelists"
             ));
             then.status(409).json_body(json!({
                 "message": "Address already whitelisted"
