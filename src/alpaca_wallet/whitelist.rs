@@ -32,10 +32,9 @@ mod tests {
     use super::super::client::{AlpacaWalletClient, AlpacaWalletError};
     use super::super::transfer::{Network, TokenSymbol};
     use super::*;
-    use alloy::primitives::Address;
+    use alloy::primitives::address;
     use httpmock::prelude::*;
     use serde_json::json;
-    use std::str::FromStr;
 
     fn create_account_mock<'a>(server: &'a MockServer, account_id: &str) -> httpmock::Mock<'a> {
         server.mock(|when, then| {
@@ -83,7 +82,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(POST)
@@ -91,15 +90,15 @@ mod tests {
                     "/v1/accounts/{expected_account_id}/wallets/whitelists"
                 ))
                 .json_body(json!({
-                    "address": test_address,
+                    "address": address,
                     "asset": "USDC",
-                    "chain": "Ethereum"
+                    "chain": "ethereum"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "id": "whitelist-123",
-                    "address": test_address,
+                    "address": address,
                     "asset": "USDC",
                     "chain": "Ethereum",
                     "status": "PENDING",
@@ -115,7 +114,6 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -195,7 +193,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
@@ -206,7 +204,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "id": "whitelist-123",
-                        "address": test_address,
+                        "address": address,
                         "asset": "USDC",
                         "chain": "Ethereum",
                         "status": "APPROVED",
@@ -222,8 +220,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let address = Address::from_str(test_address).unwrap();
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -244,7 +240,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
@@ -255,7 +251,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "id": "whitelist-123",
-                        "address": test_address,
+                        "address": address,
                         "asset": "USDC",
                         "chain": "Ethereum",
                         "status": "PENDING",
@@ -272,7 +268,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address::from_str(test_address).unwrap();
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -293,7 +289,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
@@ -304,7 +300,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "id": "whitelist-123",
-                        "address": test_address,
+                        "address": address,
                         "asset": "USDC",
                         "chain": "Ethereum",
                         "status": "REJECTED",
@@ -321,7 +317,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address::from_str(test_address).unwrap();
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -342,7 +338,6 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
         let other_address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
         let whitelist_mock = server.mock(|when, then| {
@@ -371,7 +366,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address::from_str(test_address).unwrap();
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -392,8 +387,6 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
-
         let whitelist_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
                 "/v1/accounts/{expected_account_id}/wallets/whitelists"
@@ -411,7 +404,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address::from_str(test_address).unwrap();
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -433,8 +426,6 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let test_address = "0x1234567890abcdef1234567890abcdef12345678";
-
         let whitelist_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
                 "/v1/accounts/{expected_account_id}/wallets/whitelists"
@@ -452,7 +443,7 @@ mod tests {
         .await
         .unwrap();
 
-        let address = Address::from_str(test_address).unwrap();
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
