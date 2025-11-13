@@ -26,12 +26,10 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TokenSymbol(pub(super) String);
+pub struct TokenSymbol(pub(super) String);
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this type
-#[allow(dead_code)]
 impl TokenSymbol {
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
     }
 }
@@ -133,7 +131,7 @@ pub(crate) struct Transfer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct Network(pub(super) String);
+pub struct Network(pub(super) String);
 
 impl<'de> serde::Deserialize<'de> for Network {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -146,7 +144,7 @@ impl<'de> serde::Deserialize<'de> for Network {
 }
 
 impl Network {
-    pub(crate) fn new(s: impl Into<String>) -> Self {
+    pub fn new(s: impl Into<String>) -> Self {
         Self(s.into().to_lowercase())
     }
 }

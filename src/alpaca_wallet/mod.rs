@@ -60,13 +60,13 @@ use rust_decimal::Decimal;
 use st0x_broker::alpaca::AlpacaAuthEnv;
 use std::sync::Arc;
 
-use client::AlpacaWalletClient;
 use status::PollingConfig;
 use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
-pub(crate) use client::AlpacaWalletError;
-pub(crate) use transfer::{Network, TokenSymbol, Transfer, TransferId};
+pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
+pub use transfer::{Network, TokenSymbol};
+pub(crate) use transfer::{Transfer, TransferId};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -105,6 +105,19 @@ impl AlpacaWalletService {
             client,
             polling_config,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_client(
+        client: AlpacaWalletClient,
+        polling_config: Option<PollingConfig>,
+    ) -> Self {
+        let polling_config = polling_config.unwrap_or_default();
+
+        Self {
+            client: Arc::new(client),
+            polling_config,
+        }
     }
 
     /// Gets the deposit address for an asset and network.

@@ -35,20 +35,40 @@ integration testing with Alpaca's team.
 
 ## Task 2. Implement alpaca-deposit command
 
-- [ ] Add
+- [x] Add
       `AlpacaDeposit { #[arg(long)] asset: TokenSymbol, #[arg(long, default_value = "ethereum")] network: Network }`
       variant to `Commands` enum
-- [ ] Implement handler function `handle_alpaca_deposit()`
-- [ ] Extract `AlpacaAuthEnv` from `BrokerConfig::Alpaca`
-- [ ] Initialize `AlpacaWalletService::new(auth_env, None).await?`
-- [ ] Call `service.get_deposit_address(&asset, &network).await?`
-- [ ] Format output showing deposit address
-- [ ] Wire into `run_command_with_writers()` match statement
-- [ ] Write integration test with mock HTTP server
-- [ ] Run `cargo test -q` and verify passing
+- [x] Implement handler function `handle_alpaca_deposit()`
+- [x] Extract `AlpacaAuthEnv` from `BrokerConfig::Alpaca`
+- [x] Initialize `AlpacaWalletService::new(auth_env, None).await?`
+- [x] Call `service.get_deposit_address(&asset, &network).await?`
+- [x] Format output showing deposit address
+- [x] Wire into `run_command_with_writers()` match statement
+- [x] Write integration test with mock HTTP server
+- [x] Run `cargo test -q` and verify passing
 - [ ] Verify CLI interface works:
-      `cargo run --bin cli -- alpaca-deposit --asset AAPL` (may fail if Alpaca
+      `cargo run --bin cli -- alpaca-deposit --asset tAAPL` (may fail if Alpaca
       backend not ready)
+
+**Implementation notes:**
+
+- Fixed doc comments to use `tAAPL` format instead of `AAPL` for tokenized
+  equity symbols
+- Made `TokenSymbol` and `Network` public (from `pub(crate)`) since they're used
+  in the public `Commands` enum
+- Exported `AlpacaTradingMode` from `st0x_broker::alpaca` for testing support
+- Added handler inline in `run_command_with_writers()` match statement instead
+  of separate function
+- Made `AlpacaWalletClient` struct `pub(crate)` (from `pub`) and re-exported
+  from module
+- Made `AlpacaWalletClient::new_with_base_url()` `pub(crate)` (from
+  `pub(super)`) for testing
+- Added `AlpacaWalletService::new_with_client()` test constructor
+- Created two tests:
+  - `test_alpaca_deposit_wallet_service_with_mock`: Full HTTP integration test
+    with MockServer
+  - `test_alpaca_deposit_command_requires_alpaca_broker`: Broker type checking
+- All 405 tests passing
 
 ## Task 3. Implement alpaca-whitelist-list command
 

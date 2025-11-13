@@ -71,7 +71,7 @@ struct AccountResponse {
     id: String,
 }
 
-pub struct AlpacaWalletClient {
+pub(crate) struct AlpacaWalletClient {
     client: Client,
     account_id: String,
     base_url: String,
@@ -102,7 +102,7 @@ impl AlpacaWalletClient {
     }
 
     #[cfg(test)]
-    pub(super) async fn new_with_base_url(
+    pub(crate) async fn new_with_base_url(
         base_url: String,
         api_key: String,
         api_secret: String,

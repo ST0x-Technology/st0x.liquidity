@@ -4,6 +4,7 @@ use std::io::Write;
 use thiserror::Error;
 use tracing::{error, info};
 
+use crate::alpaca_wallet::{AlpacaWalletService, Network, TokenSymbol};
 use crate::env::{BrokerConfig, Config, Env};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
@@ -66,6 +67,15 @@ pub enum Commands {
     },
     /// Perform Charles Schwab OAuth authentication flow
     Auth,
+    /// Get Alpaca deposit address for tokenized equity
+    AlpacaDeposit {
+        /// Asset symbol (e.g., tAAPL, tTSLA)
+        #[arg(long)]
+        asset: TokenSymbol,
+        /// Network (defaults to ethereum)
+        #[arg(long, default_value = "ethereum")]
+        network: Network,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -195,6 +205,23 @@ async fn run_command_with_writers<W: Write>(
                     return Err(oauth_error.into());
                 }
             }
+        }
+        Commands::AlpacaDeposit { asset, network } => {
+            let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
+                anyhow::bail!("AlpacaDeposit command is only supported for Alpaca broker")
+            };
+
+            info!("Fetching deposit address: asset={asset}, network={network}");
+            writeln!(stdout, "🔄 Fetching Alpaca deposit address...")?;
+
+            let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+            let deposit = service.get_deposit_address(&asset, &network).await?;
+
+            info!("Deposit address retrieved: {}", deposit.address);
+            writeln!(stdout, "✅ Deposit address retrieved!")?;
+            writeln!(stdout, "   Asset: {asset}")?;
+            writeln!(stdout, "   Network: {network}")?;
+            writeln!(stdout, "   Address: {}", deposit.address)?;
         }
     }
 
@@ -503,6 +530,7 @@ fn display_trade_details<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletService};
     use crate::bindings::IERC20::symbolCall;
     use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange, ClearV2};
     use crate::env::LogLevel;
@@ -1874,6 +1902,89 @@ mod tests {
         assert!(help_output.contains("auth"));
         assert!(help_output.contains("OAuth"));
         assert!(help_output.contains("authentication"));
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_deposit_wallet_service_with_mock() {
+        let server = MockServer::start();
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v2/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "account_number": "PA1234567890",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "cash": "100000.00"
+                }));
+        });
+
+        let wallet_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/crypto/funding_wallets")
+                .query_param("asset", "tAAPL")
+                .query_param("network", "ethereum");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "address": "0x1234567890abcdef1234567890abcdef12345678",
+                        "asset": "tAAPL",
+                        "network": "ethereum"
+                    }
+                ]));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let service = AlpacaWalletService::new_with_client(client, None);
+
+        account_mock.assert();
+
+        let deposit_result = service
+            .get_deposit_address(&TokenSymbol::new("tAAPL"), &Network::new("ethereum"))
+            .await;
+
+        assert!(
+            deposit_result.is_ok(),
+            "Should get deposit address: {deposit_result:?}"
+        );
+        let deposit = deposit_result.unwrap();
+        assert_eq!(
+            deposit.address.to_string().to_lowercase(),
+            "0x1234567890abcdef1234567890abcdef12345678"
+        );
+        wallet_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_deposit_command_requires_alpaca_broker() {
+        let server = MockServer::start();
+        let pool = setup_test_db().await;
+
+        let config = create_test_config_for_cli(&server);
+
+        let mut stdout = Vec::new();
+
+        let command = Commands::AlpacaDeposit {
+            asset: TokenSymbol::new("tAAPL"),
+            network: Network::new("ethereum"),
+        };
+
+        let result = run_command_with_writers(config, command, &pool, &mut stdout).await;
+
+        assert!(result.is_err(), "Command should fail with Schwab broker");
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("only supported for Alpaca broker"));
     }
 
     #[tokio::test]
