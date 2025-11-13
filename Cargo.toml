@@ -3,7 +3,7 @@ members = [".", "crates/broker"]
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 license = "MIT"
 homepage = "https://github.com/ST0x-Technology"
@@ -70,7 +70,7 @@ proptest = "1.7.0"
 [package]
 name = "st0x-hedge"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 alloy.workspace = true
