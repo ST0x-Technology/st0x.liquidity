@@ -50,7 +50,6 @@ reqwest = { version = "0.12.4", features = [
   "gzip",
   "blocking",
 ] }
-revm = { version = "25.0.0", default-features = false }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.140"
 serial_test = "3.2.0"
