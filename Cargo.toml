@@ -31,8 +31,9 @@ redundant_pub_crate = "allow"
 [workspace.dependencies]
 alloy = { version = "1.0.38", features = ["full"] }
 async-trait = "0.1.81"
+revm = { version = "=25.0.0", default-features = false }
 # Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
-wasm-bindgen = "=0.2.100"
+wasm-bindgen = "0.2.100"
 sqlx = { version = "0.8.6", features = [
   "sqlite",
   "chrono",
@@ -44,7 +45,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
 flate2 = "1.0"
 httpmock = "0.7.0"
-rain-math-float = { git = "https://github.com/rainlanguage/rain.math.float", rev = "78e15cb91b5c12ccacda8c8772a28eeb21f5b7d3" }
+rain-math-float = { path = "lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
 reqwest = { version = "0.12.4", features = [
   "json",
   "rustls-tls",
