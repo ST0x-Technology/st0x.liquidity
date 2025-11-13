@@ -4,6 +4,7 @@ use alloy::sol_types::SolEvent;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures_util::future;
 use itertools::Itertools;
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
@@ -261,8 +262,9 @@ mod tests {
             .with_max_delay(Duration::from_millis(10))
     }
 
-    fn u256_to_float(amount: U256) -> alloy::primitives::B256 {
-        alloy::primitives::B256::new(amount.to_le_bytes::<32>())
+    fn u256_to_float(value: alloy::primitives::U256, decimals: u8) -> alloy::primitives::B256 {
+        let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
+        float.get_inner()
     }
 
     #[tokio::test]
@@ -432,8 +434,8 @@ mod tests {
                 outputIOIndex: U256::from(1),
                 signedContext: Vec::new(),
             },
-            input: u256_to_float(U256::from(100_000_000)),
-            output: u256_to_float(U256::from_str("9000000000000000000").unwrap()),
+            input: u256_to_float(U256::from(100_000_000), 0),
+            output: u256_to_float(U256::from_str("9000000000000000000").unwrap(), 18),
         };
 
         let tx_hash =
@@ -606,8 +608,8 @@ mod tests {
                 outputIOIndex: U256::from(1),
                 signedContext: Vec::new(),
             },
-            input: u256_to_float(U256::from(input)),
-            output: u256_to_float(U256::from_str(output).unwrap()),
+            input: u256_to_float(U256::from(input), 0),
+            output: u256_to_float(U256::from_str(output).unwrap(), 18),
         }
     }
 
@@ -982,10 +984,10 @@ mod tests {
         let after_clear_event = IOrderBookV5::AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: IOrderBookV5::ClearStateChangeV2 {
-                aliceOutput: u256_to_float(U256::from_str("5000000000000000000").unwrap()), // 5 shares
-                bobOutput: u256_to_float(U256::from(50_000_000u64)), // 50 USDC cents
-                aliceInput: u256_to_float(U256::from(50_000_000u64)),
-                bobInput: u256_to_float(U256::from_str("5000000000000000000").unwrap()),
+                aliceOutput: u256_to_float(U256::from_str("5000000000000000000").unwrap(), 18), // 5 shares
+                bobOutput: u256_to_float(U256::from(50_000_000u64), 0), // 50 USDC cents
+                aliceInput: u256_to_float(U256::from(50_000_000u64), 0),
+                bobInput: u256_to_float(U256::from_str("5000000000000000000").unwrap(), 18),
             },
         };
 
