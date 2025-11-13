@@ -31,7 +31,7 @@ redundant_pub_crate = "allow"
 [workspace.dependencies]
 alloy = { version = "1.0.38", features = ["full"] }
 async-trait = "0.1.81"
-wasm-bindgen = "=0.2.100"
+wasm-bindgen = "0.2.100"
 sqlx = { version = "0.8.6", features = [
   "sqlite",
   "chrono",
