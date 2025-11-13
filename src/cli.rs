@@ -157,6 +157,212 @@ pub async fn run_command(config: Config, command: Commands) -> anyhow::Result<()
     run_command_with_writers(config, command, &pool, &mut std::io::stdout()).await
 }
 
+async fn handle_auth<W: Write>(
+    broker: &BrokerConfig,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Schwab(schwab_auth) = broker else {
+        anyhow::bail!("Auth command is only supported for Schwab broker")
+    };
+
+    info!("Starting OAuth authentication flow");
+    writeln!(
+        stdout,
+        "🔄 Starting Charles Schwab OAuth authentication process..."
+    )?;
+    writeln!(
+        stdout,
+        "   You will be guided through the authentication process."
+    )?;
+
+    match run_oauth_flow(pool, schwab_auth).await {
+        Ok(()) => {
+            info!("OAuth authentication completed successfully");
+            writeln!(stdout, "✅ Authentication successful!")?;
+            writeln!(
+                stdout,
+                "   Your tokens have been saved and are ready to use."
+            )?;
+        }
+        Err(oauth_error) => {
+            error!("OAuth authentication failed: {oauth_error:?}");
+            writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
+            writeln!(
+                stdout,
+                "   Please ensure you have a valid Charles Schwab account and try again."
+            )?;
+            return Err(oauth_error.into());
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_alpaca_deposit<W: Write>(
+    broker: &BrokerConfig,
+    asset: &TokenSymbol,
+    network: &Network,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Alpaca(alpaca_auth) = broker else {
+        anyhow::bail!("AlpacaDeposit command is only supported for Alpaca broker")
+    };
+
+    info!("Fetching deposit address: asset={asset}, network={network}");
+    writeln!(stdout, "🔄 Fetching Alpaca deposit address...")?;
+
+    let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+    let deposit = service.get_deposit_address(asset, network).await?;
+
+    info!("Deposit address retrieved: {}", deposit.address);
+    writeln!(stdout, "✅ Deposit address retrieved!")?;
+    writeln!(stdout, "   Asset: {asset}")?;
+    writeln!(stdout, "   Network: {network}")?;
+    writeln!(stdout, "   Address: {}", deposit.address)?;
+
+    Ok(())
+}
+
+async fn handle_alpaca_whitelist_list<W: Write>(
+    broker: &BrokerConfig,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Alpaca(alpaca_auth) = broker else {
+        anyhow::bail!("AlpacaWhitelistList command is only supported for Alpaca broker")
+    };
+
+    info!("Fetching whitelisted addresses");
+    writeln!(stdout, "🔄 Fetching whitelisted addresses...")?;
+
+    let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+    let addresses = service.get_whitelisted_addresses().await?;
+
+    info!("Found {} whitelisted addresses", addresses.len());
+    writeln!(stdout, "✅ Whitelisted addresses:")?;
+
+    if addresses.is_empty() {
+        writeln!(stdout, "   (No whitelisted addresses found)")?;
+    } else {
+        writeln!(stdout)?;
+        writeln!(
+            stdout,
+            "   {:<44}  {:<8}  {:<10}  {:<10}",
+            "Address", "Asset", "Network", "Status"
+        )?;
+        writeln!(stdout, "   {}", "-".repeat(80))?;
+
+        for entry in addresses {
+            writeln!(
+                stdout,
+                "   {:<44}  {:<8}  {:<10}  {:<10?}",
+                entry.address, entry.asset, entry.chain, entry.status
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_alpaca_whitelist<W: Write>(
+    broker: &BrokerConfig,
+    address: &Address,
+    asset: &TokenSymbol,
+    network: &Network,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Alpaca(alpaca_auth) = broker else {
+        anyhow::bail!("AlpacaWhitelist command is only supported for Alpaca broker")
+    };
+
+    info!("Whitelisting address: address={address}, asset={asset}, network={network}");
+    writeln!(stdout, "🔄 Whitelisting address...")?;
+
+    let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+    let entry = service.whitelist_address(address, asset, network).await?;
+
+    info!("Address whitelisted: id={}", entry.id);
+    writeln!(stdout, "✅ Address whitelisted successfully!")?;
+    writeln!(stdout, "   Address: {address}")?;
+    writeln!(stdout, "   Asset: {asset}")?;
+    writeln!(stdout, "   Network: {network}")?;
+    writeln!(stdout, "   Status: {:?}", entry.status)?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "⏱  Note: There is a 24-hour approval period before this address can be used for withdrawals."
+    )?;
+
+    Ok(())
+}
+
+async fn handle_alpaca_transfer_status<W: Write>(
+    broker: &BrokerConfig,
+    transfer_id: &TransferId,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Alpaca(alpaca_auth) = broker else {
+        anyhow::bail!("AlpacaTransferStatus command is only supported for Alpaca broker")
+    };
+
+    let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+    let transfer = service.get_transfer_status(transfer_id).await?;
+
+    writeln!(stdout, "Transfer Status:")?;
+    writeln!(stdout, "   ID: {}", transfer.id)?;
+    writeln!(stdout, "   Status: {:?}", transfer.status)?;
+    writeln!(stdout, "   Direction: {:?}", transfer.direction)?;
+    writeln!(stdout, "   Asset: {}", transfer.asset)?;
+    writeln!(stdout, "   Amount: {}", transfer.amount)?;
+    writeln!(stdout, "   To Address: {}", transfer.to)?;
+
+    if let Some(from) = transfer.from {
+        writeln!(stdout, "   From Address: {from}")?;
+    }
+
+    if let Some(tx_hash) = transfer.tx {
+        writeln!(stdout, "   Transaction Hash: {tx_hash}")?;
+    }
+
+    if let Some(network_fee) = transfer.network_fee {
+        writeln!(stdout, "   Network Fee: {network_fee}")?;
+    }
+
+    writeln!(stdout, "   Created At: {}", transfer.created_at)?;
+
+    Ok(())
+}
+
+async fn handle_alpaca_withdraw<W: Write>(
+    broker: &BrokerConfig,
+    amount: Decimal,
+    address: &Address,
+    asset: &TokenSymbol,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Alpaca(alpaca_auth) = broker else {
+        anyhow::bail!("AlpacaWithdraw command is only supported for Alpaca broker")
+    };
+
+    let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+    let transfer = service.initiate_withdrawal(amount, asset, address).await?;
+
+    writeln!(stdout, "✅ Withdrawal initiated successfully!")?;
+    writeln!(stdout, "   Transfer ID: {}", transfer.id)?;
+    writeln!(stdout, "   Status: {:?}", transfer.status)?;
+    writeln!(stdout, "   Asset: {}", transfer.asset)?;
+    writeln!(stdout, "   Amount: {}", transfer.amount)?;
+    writeln!(stdout, "   To Address: {}", transfer.to)?;
+    writeln!(stdout)?;
+    writeln!(
+        stdout,
+        "💡 Use 'alpaca-transfer-status --transfer-id {}' to check the withdrawal status.",
+        transfer.id
+    )?;
+
+    Ok(())
+}
+
 async fn run_command_with_writers<W: Write>(
     config: Config,
     command: Commands,
@@ -206,171 +412,30 @@ async fn run_command_with_writers<W: Write>(
             process_tx_with_provider(tx_hash, &config, pool, stdout, &provider, &cache).await?;
         }
         Commands::Auth => {
-            let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
-                anyhow::bail!("Auth command is only supported for Schwab broker")
-            };
-
-            info!("Starting OAuth authentication flow");
-            writeln!(
-                stdout,
-                "🔄 Starting Charles Schwab OAuth authentication process..."
-            )?;
-            writeln!(
-                stdout,
-                "   You will be guided through the authentication process."
-            )?;
-
-            match run_oauth_flow(pool, schwab_auth).await {
-                Ok(()) => {
-                    info!("OAuth authentication completed successfully");
-                    writeln!(stdout, "✅ Authentication successful!")?;
-                    writeln!(
-                        stdout,
-                        "   Your tokens have been saved and are ready to use."
-                    )?;
-                }
-                Err(oauth_error) => {
-                    error!("OAuth authentication failed: {oauth_error:?}");
-                    writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
-                    writeln!(
-                        stdout,
-                        "   Please ensure you have a valid Charles Schwab account and try again."
-                    )?;
-                    return Err(oauth_error.into());
-                }
-            }
+            handle_auth(&config.broker, pool, stdout).await?;
         }
         Commands::AlpacaDeposit { asset, network } => {
-            let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-                anyhow::bail!("AlpacaDeposit command is only supported for Alpaca broker")
-            };
-
-            info!("Fetching deposit address: asset={asset}, network={network}");
-            writeln!(stdout, "🔄 Fetching Alpaca deposit address...")?;
-
-            let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
-            let deposit = service.get_deposit_address(&asset, &network).await?;
-
-            info!("Deposit address retrieved: {}", deposit.address);
-            writeln!(stdout, "✅ Deposit address retrieved!")?;
-            writeln!(stdout, "   Asset: {asset}")?;
-            writeln!(stdout, "   Network: {network}")?;
-            writeln!(stdout, "   Address: {}", deposit.address)?;
+            handle_alpaca_deposit(&config.broker, &asset, &network, stdout).await?;
         }
         Commands::AlpacaWhitelistList => {
-            let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-                anyhow::bail!("AlpacaWhitelistList command is only supported for Alpaca broker")
-            };
-
-            info!("Fetching whitelisted addresses");
-            writeln!(stdout, "🔄 Fetching whitelisted addresses...")?;
-
-            let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
-            let addresses = service.get_whitelisted_addresses().await?;
-
-            info!("Retrieved {} whitelisted addresses", addresses.len());
-            writeln!(stdout, "✅ Whitelisted addresses:")?;
-            writeln!(stdout)?;
-            writeln!(
-                stdout,
-                "{:<44} {:<10} {:<12} {:<10}",
-                "Address", "Asset", "Network", "Status"
-            )?;
-            writeln!(stdout, "{}", "-".repeat(80))?;
-
-            for entry in addresses {
-                writeln!(
-                    stdout,
-                    "{:<44} {:<10} {:<12} {:<10?}",
-                    entry.address, entry.asset, entry.chain, entry.status
-                )?;
-            }
+            handle_alpaca_whitelist_list(&config.broker, stdout).await?;
         }
         Commands::AlpacaWhitelist {
             address,
             asset,
             network,
         } => {
-            let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-                anyhow::bail!("AlpacaWhitelist command is only supported for Alpaca broker")
-            };
-
-            info!("Whitelisting address: {address}, asset={asset}, network={network}");
-            writeln!(stdout, "🔄 Whitelisting address for withdrawals...")?;
-
-            let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
-            let entry = service
-                .whitelist_address(&address, &asset, &network)
-                .await?;
-
-            info!("Address whitelisted: id={}", entry.id);
-            writeln!(stdout, "✅ Address whitelisted successfully!")?;
-            writeln!(stdout, "   Address: {address}")?;
-            writeln!(stdout, "   Asset: {asset}")?;
-            writeln!(stdout, "   Network: {network}")?;
-            writeln!(stdout, "   Status: {:?}", entry.status)?;
-            writeln!(stdout)?;
-            writeln!(
-                stdout,
-                "⏱  Note: There is a 24-hour approval period before this address can be used for withdrawals."
-            )?;
+            handle_alpaca_whitelist(&config.broker, &address, &asset, &network, stdout).await?;
         }
         Commands::AlpacaTransferStatus { transfer_id } => {
-            let BrokerConfig::Alpaca(auth_env) = config.broker else {
-                anyhow::bail!("AlpacaTransferStatus command is only supported for Alpaca broker")
-            };
-
-            let service = AlpacaWalletService::new(auth_env, None).await?;
-            let transfer = service.get_transfer_status(&transfer_id).await?;
-
-            writeln!(stdout, "Transfer Status:")?;
-            writeln!(stdout, "   ID: {}", transfer.id)?;
-            writeln!(stdout, "   Status: {:?}", transfer.status)?;
-            writeln!(stdout, "   Direction: {:?}", transfer.direction)?;
-            writeln!(stdout, "   Asset: {}", transfer.asset)?;
-            writeln!(stdout, "   Amount: {}", transfer.amount)?;
-            writeln!(stdout, "   To Address: {}", transfer.to)?;
-
-            if let Some(from) = transfer.from {
-                writeln!(stdout, "   From Address: {from}")?;
-            }
-
-            if let Some(tx_hash) = transfer.tx {
-                writeln!(stdout, "   Transaction Hash: {tx_hash}")?;
-            }
-
-            if let Some(network_fee) = transfer.network_fee {
-                writeln!(stdout, "   Network Fee: {network_fee}")?;
-            }
-
-            writeln!(stdout, "   Created At: {}", transfer.created_at)?;
+            handle_alpaca_transfer_status(&config.broker, &transfer_id, stdout).await?;
         }
         Commands::AlpacaWithdraw {
             amount,
             address,
             asset,
         } => {
-            let BrokerConfig::Alpaca(auth_env) = config.broker else {
-                anyhow::bail!("AlpacaWithdraw command is only supported for Alpaca broker")
-            };
-
-            let service = AlpacaWalletService::new(auth_env, None).await?;
-            let transfer = service
-                .initiate_withdrawal(amount, &asset, &address)
-                .await?;
-
-            writeln!(stdout, "✅ Withdrawal initiated successfully!")?;
-            writeln!(stdout, "   Transfer ID: {}", transfer.id)?;
-            writeln!(stdout, "   Status: {:?}", transfer.status)?;
-            writeln!(stdout, "   Asset: {}", transfer.asset)?;
-            writeln!(stdout, "   Amount: {}", transfer.amount)?;
-            writeln!(stdout, "   To Address: {}", transfer.to)?;
-            writeln!(stdout)?;
-            writeln!(
-                stdout,
-                "💡 Use 'alpaca-transfer-status --transfer-id {}' to check the withdrawal status.",
-                transfer.id
-            )?;
+            handle_alpaca_withdraw(&config.broker, amount, &address, &asset, stdout).await?;
         }
     }
 
@@ -2306,9 +2371,7 @@ mod tests {
 
         let status_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
-                .path(format!(
-                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers"
-                ))
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers")
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
