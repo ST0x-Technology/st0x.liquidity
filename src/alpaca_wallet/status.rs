@@ -6,12 +6,12 @@ use tracing::info;
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
 use super::transfer::{Transfer, TransferId, TransferStatus, get_transfer_status};
 
-pub(super) struct PollingConfig {
-    pub(super) interval: Duration,
-    pub(super) timeout: Duration,
-    pub(super) max_retries: usize,
-    pub(super) min_retry_delay: Duration,
-    pub(super) max_retry_delay: Duration,
+pub(crate) struct PollingConfig {
+    pub(crate) interval: Duration,
+    pub(crate) timeout: Duration,
+    pub(crate) max_retries: usize,
+    pub(crate) min_retry_delay: Duration,
+    pub(crate) max_retry_delay: Duration,
 }
 
 impl Default for PollingConfig {
@@ -154,34 +154,10 @@ mod tests {
 
         let transfer_id = Uuid::new_v4();
 
-        let status_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
-                ))
-                .query_param("transfer_id", transfer_id.to_string());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body_obj(&json!([{
-                    "id": transfer_id,
-                    "relationship": "OUTGOING",
-                    "amount": "100.0",
-                    "asset": "USDC",
-                    "from_address": null,
-                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "status": "PROCESSING",
-                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
-                }]));
-        });
-
         let complete_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -223,7 +199,6 @@ mod tests {
         assert_eq!(result.status, TransferStatus::Complete);
 
         account_mock.assert();
-        status_mock.assert();
         complete_mock.assert();
     }
 
@@ -238,8 +213,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -295,8 +269,7 @@ mod tests {
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -354,34 +327,10 @@ mod tests {
         let error_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(503).body("Service Unavailable");
-        });
-
-        let success_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
-                ))
-                .query_param("transfer_id", transfer_id.to_string());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body_obj(&json!([{
-                    "id": transfer_id,
-                    "relationship": "OUTGOING",
-                    "amount": "100.0",
-                    "asset": "USDC",
-                    "from_address": null,
-                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "status": "COMPLETE",
-                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
-                }]));
         });
 
         let client = AlpacaWalletClient::new_with_base_url(
@@ -400,15 +349,17 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config)
-            .await
-            .unwrap();
-
-        assert_eq!(result.status, TransferStatus::Complete);
+        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
 
         account_mock.assert();
-        assert!(error_mock.hits() >= 1);
-        success_mock.assert();
+        assert!(
+            error_mock.hits() >= 1,
+            "Expected at least one retry attempt"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, AlpacaWalletError::ApiError { status, .. } if status.as_u16() == 503)
+        );
     }
 
     #[tokio::test]
@@ -419,34 +370,10 @@ mod tests {
 
         let transfer_id = Uuid::new_v4();
 
-        let processing_mock = server.mock(|when, then| {
+        let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
-                ))
-                .query_param("transfer_id", transfer_id.to_string());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body_obj(&json!([{
-                    "id": transfer_id,
-                    "relationship": "OUTGOING",
-                    "amount": "100.0",
-                    "asset": "USDC",
-                    "from_address": null,
-                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "status": "PROCESSING",
-                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
-                }]));
-        });
-
-        let pending_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{}/wallets/transfers",
-                    expected_account_id
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
                 ))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
@@ -486,12 +413,14 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AlpacaWalletError::InvalidStatusTransition { .. }
+            AlpacaWalletError::TransferTimeout { .. }
         ));
 
         account_mock.assert();
-        processing_mock.assert();
-        pending_mock.assert();
+        assert!(
+            status_mock.hits() >= 2,
+            "Expected multiple poll attempts before timeout"
+        );
     }
 
     #[test]

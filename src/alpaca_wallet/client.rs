@@ -16,6 +16,8 @@ pub enum AlpacaWalletError {
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
 
+    // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this error variant
+    #[allow(dead_code)]
     #[error("Invalid decimal value '{value}': {source}")]
     InvalidDecimal {
         value: String,
@@ -41,6 +43,8 @@ pub enum AlpacaWalletError {
         elapsed: std::time::Duration,
     },
 
+    // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this error variant
+    #[allow(dead_code)]
     #[error("Max retries ({retries}) exceeded for transfer {transfer_id}")]
     MaxRetriesExceeded {
         transfer_id: TransferId,
@@ -122,7 +126,7 @@ impl AlpacaWalletClient {
         api_key: &str,
         api_secret: &str,
     ) -> Result<String, AlpacaWalletError> {
-        let url = format!("{}/v2/account", base_url);
+        let url = format!("{base_url}/v2/account");
 
         let response = client
             .get(&url)
@@ -170,7 +174,7 @@ impl AlpacaWalletClient {
         Ok(response)
     }
 
-    pub(super) async fn post<T: serde::Serialize>(
+    pub(super) async fn post<T: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &T,
@@ -210,8 +214,8 @@ impl AlpacaWalletClient {
         network: &Network,
     ) -> Result<WhitelistEntry, AlpacaWalletError> {
         #[derive(Serialize)]
-        struct WhitelistRequest {
-            address: String,
+        struct WhitelistRequest<'a> {
+            address: &'a Address,
             asset: String,
             chain: String,
         }
@@ -219,7 +223,7 @@ impl AlpacaWalletClient {
         let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
 
         let request = WhitelistRequest {
-            address: address.to_string(),
+            address,
             asset: asset.0.clone(),
             chain: network.0.clone(),
         };
@@ -255,16 +259,6 @@ impl AlpacaWalletClient {
                 && entry.chain == *network
                 && entry.status == WhitelistStatus::Approved
         }))
-    }
-
-    #[cfg(test)]
-    fn api_key(&self) -> &str {
-        &self.api_key
-    }
-
-    #[cfg(test)]
-    fn api_secret(&self) -> &str {
-        &self.api_secret
     }
 }
 
