@@ -51,16 +51,15 @@ mod tests {
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{U256, address, fixed_bytes};
+    use alloy::primitives::{I256, U256, address, fixed_bytes};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
+    use rain_math_float::Float;
     use std::str::FromStr;
 
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,
     ) -> TakeOrderV3 {
-        use alloy::primitives::I256;
-
         // Helper to create Float from coefficient and exponent
         fn create_float(coefficient: i128, exponent: i32) -> alloy::primitives::B256 {
             let mut bytes = [0u8; 32];
@@ -196,9 +195,6 @@ mod tests {
 
         // Helper to create Float for testing
         fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            use alloy::primitives::U256;
-            use rain_math_float::Float;
-
             let u256_value = U256::from(value.unsigned_abs());
             let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
@@ -267,9 +263,6 @@ mod tests {
 
         // Helper to create Float for testing
         fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            use alloy::primitives::U256;
-            use rain_math_float::Float;
-
             let u256_value = U256::from(value.unsigned_abs());
             let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
