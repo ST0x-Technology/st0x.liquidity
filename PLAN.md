@@ -72,14 +72,22 @@ integration testing with Alpaca's team.
 
 ## Task 3. Implement alpaca-whitelist-list command
 
-- [ ] Add `AlpacaWhitelistList` variant to `Commands` enum
-- [ ] Implement handler function `handle_alpaca_whitelist_list()`
-- [ ] Initialize `AlpacaWalletService` from `BrokerConfig::Alpaca`
-- [ ] Call `service.get_whitelisted_addresses().await?`
-- [ ] Format output as table: address, asset, network, status
-- [ ] Wire into `run_command_with_writers()`
-- [ ] Write integration test with mock HTTP server
-- [ ] Run `cargo test -q` and verify passing
+- [x] Add `AlpacaWhitelistList` variant to `Commands` enum
+- [x] Implement handler function `handle_alpaca_whitelist_list()`
+- [x] Initialize `AlpacaWalletService` from `BrokerConfig::Alpaca`
+- [x] Call `service.get_whitelisted_addresses().await?`
+- [x] Format output as table: address, asset, network, status
+- [x] Wire into `run_command_with_writers()`
+- [x] Write integration test with mock HTTP server
+- [x] Run `cargo test -q` and verify passing
+
+**Implementation notes:**
+
+- Added handler inline in `run_command_with_writers()` match statement
+- Formatted output as table with columns: Address, Asset, Network, Status
+- Used `{:<10?}` formatting for WhitelistStatus enum (Debug formatting)
+- Created test `test_alpaca_whitelist_list_with_mock` with MockServer
+- All 406 tests passing
 
 ## Task 4. Implement alpaca-whitelist command
 
