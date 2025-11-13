@@ -76,20 +76,18 @@ impl std::fmt::Debug for AlpacaClient {
 impl AlpacaClient {
     pub(crate) fn new(env: &AlpacaAuthEnv) -> Result<Self, crate::BrokerError> {
         let base_url = env.base_url();
-        let api_info = apca::ApiInfo::from_parts(
-            &base_url,
-            &env.alpaca_api_key,
-            &env.alpaca_api_secret,
-        )?;
+        let api_info =
+            apca::ApiInfo::from_parts(&base_url, &env.alpaca_api_key, &env.alpaca_api_secret)?;
 
         let client = Client::new(api_info);
 
-        Ok(Self { client, trading_mode: env.alpaca_trading_mode.clone() })
+        Ok(Self {
+            client,
+            trading_mode: env.alpaca_trading_mode.clone(),
+        })
     }
 
-    pub(crate) async fn verify_account(
-        &self,
-    ) -> Result<(), RequestError<GetError>> {
+    pub(crate) async fn verify_account(&self) -> Result<(), RequestError<GetError>> {
         let _account = self.client.issue::<account::Get>(&()).await?;
         Ok(())
     }

@@ -15,9 +15,18 @@ pub(crate) struct OrderStateDbFields {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderState {
     Pending,
-    Submitted { order_id: String },
-    Filled { executed_at: DateTime<Utc>, order_id: String, price_cents: u64 },
-    Failed { failed_at: DateTime<Utc>, error_reason: Option<String> },
+    Submitted {
+        order_id: String,
+    },
+    Filled {
+        executed_at: DateTime<Utc>,
+        order_id: String,
+        price_cents: u64,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+        error_reason: Option<String>,
+    },
 }
 
 impl OrderState {
@@ -41,25 +50,21 @@ impl OrderState {
         match status {
             OrderStatus::Pending => Ok(Self::Pending),
             OrderStatus::Submitted => {
-                let order_id =
-                    order_id.ok_or_else(|| BrokerError::InvalidOrder {
-                        reason: "SUBMITTED requires order_id".to_string(),
-                    })?;
+                let order_id = order_id.ok_or_else(|| BrokerError::InvalidOrder {
+                    reason: "SUBMITTED requires order_id".to_string(),
+                })?;
                 Ok(Self::Submitted { order_id })
             }
             OrderStatus::Filled => {
-                let order_id =
-                    order_id.ok_or_else(|| BrokerError::InvalidOrder {
-                        reason: "FILLED requires order_id".to_string(),
-                    })?;
-                let price_cents =
-                    price_cents.ok_or_else(|| BrokerError::InvalidOrder {
-                        reason: "FILLED requires price_cents".to_string(),
-                    })?;
-                let executed_at =
-                    executed_at.ok_or_else(|| BrokerError::InvalidOrder {
-                        reason: "FILLED requires executed_at".to_string(),
-                    })?;
+                let order_id = order_id.ok_or_else(|| BrokerError::InvalidOrder {
+                    reason: "FILLED requires order_id".to_string(),
+                })?;
+                let price_cents = price_cents.ok_or_else(|| BrokerError::InvalidOrder {
+                    reason: "FILLED requires price_cents".to_string(),
+                })?;
+                let executed_at = executed_at.ok_or_else(|| BrokerError::InvalidOrder {
+                    reason: "FILLED requires executed_at".to_string(),
+                })?;
                 Ok(Self::Filled {
                     executed_at: Utc.from_utc_datetime(&executed_at),
                     order_id,
@@ -67,11 +72,9 @@ impl OrderState {
                 })
             }
             OrderStatus::Failed => {
-                let failed_at =
-                    executed_at.ok_or_else(|| BrokerError::InvalidOrder {
-                        reason: "FAILED requires executed_at timestamp"
-                            .to_string(),
-                    })?;
+                let failed_at = executed_at.ok_or_else(|| BrokerError::InvalidOrder {
+                    reason: "FAILED requires executed_at timestamp".to_string(),
+                })?;
                 Ok(Self::Failed {
                     failed_at: Utc.from_utc_datetime(&failed_at),
                     error_reason: None, // We don't store error_reason in database yet
@@ -151,9 +154,7 @@ impl OrderState {
         Ok(result.last_insert_rowid())
     }
 
-    pub(crate) fn to_db_fields(
-        &self,
-    ) -> Result<OrderStateDbFields, BrokerError> {
+    pub(crate) fn to_db_fields(&self) -> Result<OrderStateDbFields, BrokerError> {
         match self {
             Self::Pending => Ok(OrderStateDbFields {
                 order_id: None,
@@ -165,20 +166,23 @@ impl OrderState {
                 price_cents: None,
                 executed_at: None,
             }),
-            Self::Filled { executed_at, order_id, price_cents } => {
-                Ok(OrderStateDbFields {
-                    order_id: Some(order_id.clone()),
-                    price_cents: Some((*price_cents).try_into()?),
-                    executed_at: Some(executed_at.naive_utc()),
-                })
-            }
-            Self::Failed { failed_at, error_reason: _ } => {
-                Ok(OrderStateDbFields {
-                    order_id: None,
-                    price_cents: None,
-                    executed_at: Some(failed_at.naive_utc()),
-                })
-            }
+            Self::Filled {
+                executed_at,
+                order_id,
+                price_cents,
+            } => Ok(OrderStateDbFields {
+                order_id: Some(order_id.clone()),
+                price_cents: Some((*price_cents).try_into()?),
+                executed_at: Some(executed_at.naive_utc()),
+            }),
+            Self::Failed {
+                failed_at,
+                error_reason: _,
+            } => Ok(OrderStateDbFields {
+                order_id: None,
+                price_cents: None,
+                executed_at: Some(failed_at.naive_utc()),
+            }),
         }
     }
 }
@@ -190,9 +194,7 @@ mod tests {
 
     #[test]
     fn test_from_db_row_pending() {
-        let result =
-            OrderState::from_db_row(OrderStatus::Pending, None, None, None)
-                .unwrap();
+        let result = OrderState::from_db_row(OrderStatus::Pending, None, None, None).unwrap();
         assert_eq!(result, OrderState::Pending);
     }
 
@@ -207,7 +209,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             result,
-            OrderState::Submitted { order_id: "ORDER123".to_string() }
+            OrderState::Submitted {
+                order_id: "ORDER123".to_string()
+            }
         );
     }
 
@@ -223,7 +227,11 @@ mod tests {
         .unwrap();
 
         match result {
-            OrderState::Filled { executed_at, order_id, price_cents } => {
+            OrderState::Filled {
+                executed_at,
+                order_id,
+                price_cents,
+            } => {
                 assert_eq!(order_id, "ORDER123");
                 assert_eq!(price_cents, 15000);
                 assert_eq!(executed_at.naive_utc(), timestamp);
@@ -235,16 +243,14 @@ mod tests {
     #[test]
     fn test_from_db_row_failed() {
         let timestamp = Utc::now().naive_utc();
-        let result = OrderState::from_db_row(
-            OrderStatus::Failed,
-            None,
-            None,
-            Some(timestamp),
-        )
-        .unwrap();
+        let result =
+            OrderState::from_db_row(OrderStatus::Failed, None, None, Some(timestamp)).unwrap();
 
         match result {
-            OrderState::Failed { failed_at, error_reason } => {
+            OrderState::Failed {
+                failed_at,
+                error_reason,
+            } => {
                 assert_eq!(failed_at.naive_utc(), timestamp);
                 assert_eq!(error_reason, None);
             }
@@ -254,20 +260,15 @@ mod tests {
 
     #[test]
     fn test_from_db_row_submitted_missing_order_id() {
-        let result =
-            OrderState::from_db_row(OrderStatus::Submitted, None, None, None);
+        let result = OrderState::from_db_row(OrderStatus::Submitted, None, None, None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_from_db_row_filled_missing_order_id() {
         let timestamp = Utc::now().naive_utc();
-        let result = OrderState::from_db_row(
-            OrderStatus::Filled,
-            None,
-            Some(15000),
-            Some(timestamp),
-        );
+        let result =
+            OrderState::from_db_row(OrderStatus::Filled, None, Some(15000), Some(timestamp));
         assert!(result.is_err());
     }
 
@@ -296,8 +297,7 @@ mod tests {
 
     #[test]
     fn test_from_db_row_failed_missing_executed_at() {
-        let result =
-            OrderState::from_db_row(OrderStatus::Failed, None, None, None);
+        let result = OrderState::from_db_row(OrderStatus::Failed, None, None, None);
         assert!(result.is_err());
     }
 
@@ -312,7 +312,9 @@ mod tests {
 
     #[test]
     fn test_to_db_fields_submitted() {
-        let state = OrderState::Submitted { order_id: "ORDER123".to_string() };
+        let state = OrderState::Submitted {
+            order_id: "ORDER123".to_string(),
+        };
         let db_fields = state.to_db_fields().unwrap();
         assert_eq!(db_fields.order_id, Some("ORDER123".to_string()));
         assert_eq!(db_fields.price_cents, None);
@@ -350,7 +352,10 @@ mod tests {
     fn test_status_extraction() {
         assert_eq!(OrderState::Pending.status(), OrderStatus::Pending);
         assert_eq!(
-            OrderState::Submitted { order_id: "ORDER123".to_string() }.status(),
+            OrderState::Submitted {
+                order_id: "ORDER123".to_string()
+            }
+            .status(),
             OrderStatus::Submitted
         );
         assert_eq!(
@@ -363,8 +368,11 @@ mod tests {
             OrderStatus::Filled
         );
         assert_eq!(
-            OrderState::Failed { failed_at: Utc::now(), error_reason: None }
-                .status(),
+            OrderState::Failed {
+                failed_at: Utc::now(),
+                error_reason: None
+            }
+            .status(),
             OrderStatus::Failed
         );
     }

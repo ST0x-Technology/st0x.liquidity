@@ -26,11 +26,7 @@ pub struct TradeExecutionLink {
 }
 
 impl TradeExecutionLink {
-    pub const fn new(
-        trade_id: i64,
-        execution_id: i64,
-        contributed_shares: f64,
-    ) -> Self {
+    pub const fn new(trade_id: i64, execution_id: i64, contributed_shares: f64) -> Self {
         Self {
             id: None,
             trade_id,
@@ -92,21 +88,15 @@ impl TradeExecutionLink {
 
         rows.into_iter()
             .map(|row| {
-                let execution_direction =
-                    row.direction.parse::<Direction>().map_err(|e| {
-                        OnChainError::Persistence(
-                            st0x_broker::PersistenceError::InvalidDirection(e),
-                        )
-                    })?;
+                let execution_direction = row.direction.parse::<Direction>().map_err(|e| {
+                    OnChainError::Persistence(st0x_broker::PersistenceError::InvalidDirection(e))
+                })?;
 
-                let execution_status_enum =
-                    row.status.parse::<OrderStatus>().map_err(|e| {
-                        OnChainError::Persistence(
-                            st0x_broker::PersistenceError::InvalidTradeStatus(
-                                e.to_string(),
-                            ),
-                        )
-                    })?;
+                let execution_status_enum = row.status.parse::<OrderStatus>().map_err(|e| {
+                    OnChainError::Persistence(st0x_broker::PersistenceError::InvalidTradeStatus(
+                        e.to_string(),
+                    ))
+                })?;
 
                 let execution_status = OrderState::from_db_row(
                     execution_status_enum,
@@ -120,21 +110,14 @@ impl TradeExecutionLink {
                     execution_id: row.execution_id,
                     contributed_shares: row.contributed_shares,
                     execution_symbol: row.symbol,
-                    execution_total_shares: row.shares.try_into().map_err(
-                        |_| {
-                            OnChainError::Persistence(
-                                PersistenceError::InvalidShareQuantity(
-                                    row.shares,
-                                ),
-                            )
-                        },
-                    )?,
+                    execution_total_shares: row.shares.try_into().map_err(|_| {
+                        OnChainError::Persistence(PersistenceError::InvalidShareQuantity(
+                            row.shares,
+                        ))
+                    })?,
                     execution_direction,
                     execution_status,
-                    created_at: Some(DateTime::from_naive_utc_and_offset(
-                        row.created_at,
-                        Utc,
-                    )),
+                    created_at: Some(DateTime::from_naive_utc_and_offset(row.created_at, Utc)),
                 })
             })
             .collect()
@@ -182,10 +165,7 @@ impl TradeExecutionLink {
                     trade_total_amount: row.amount,
                     trade_direction: row.direction,
                     trade_price_usdc: row.price_usdc,
-                    created_at: Some(DateTime::from_naive_utc_and_offset(
-                        row.created_at,
-                        Utc,
-                    )),
+                    created_at: Some(DateTime::from_naive_utc_and_offset(row.created_at, Utc)),
                 })
             })
             .collect()
@@ -247,25 +227,21 @@ impl TradeExecutionLink {
                     trade_amount: row.trade_amount,
                     trade_direction: row.trade_direction,
                     trade_price_usdc: row.price_usdc,
-                    trade_created_at: row.trade_created_at.map(|naive_dt| {
-                        DateTime::from_naive_utc_and_offset(naive_dt, Utc)
-                    }),
+                    trade_created_at: row
+                        .trade_created_at
+                        .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
                     execution_id: row.execution_id,
-                    execution_shares: row.execution_shares.try_into().map_err(
-                        |_| {
-                            OnChainError::Persistence(
-                                PersistenceError::InvalidShareQuantity(
-                                    row.execution_shares,
-                                ),
-                            )
-                        },
-                    )?,
+                    execution_shares: row.execution_shares.try_into().map_err(|_| {
+                        OnChainError::Persistence(PersistenceError::InvalidShareQuantity(
+                            row.execution_shares,
+                        ))
+                    })?,
                     execution_direction: row.execution_direction,
                     execution_status: row.status,
                     execution_order_id: row.order_id,
-                    execution_executed_at: row.executed_at.map(|naive_dt| {
-                        DateTime::from_naive_utc_and_offset(naive_dt, Utc)
-                    }),
+                    execution_executed_at: row
+                        .executed_at
+                        .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
                 })
             })
             .collect()
@@ -273,10 +249,9 @@ impl TradeExecutionLink {
 
     #[cfg(test)]
     pub async fn db_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
-        let row =
-            sqlx::query!("SELECT COUNT(*) as count FROM trade_execution_links")
-                .fetch_one(pool)
-                .await?;
+        let row = sqlx::query!("SELECT COUNT(*) as count FROM trade_execution_links")
+            .fetch_one(pool)
+            .await?;
         Ok(row.count)
     }
 }
@@ -382,10 +357,11 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let trade_id =
-            trade.save_within_transaction(&mut sql_tx).await.unwrap();
-        let execution_id =
-            execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
 
         // Create and save the link
         let link = TradeExecutionLink::new(trade_id, execution_id, 1.0);
@@ -395,19 +371,17 @@ mod tests {
         assert!(link_id > 0);
 
         // Test finding executions for trade
-        let executions =
-            TradeExecutionLink::find_executions_for_trade(&pool, trade_id)
-                .await
-                .unwrap();
+        let executions = TradeExecutionLink::find_executions_for_trade(&pool, trade_id)
+            .await
+            .unwrap();
         assert_eq!(executions.len(), 1);
         assert_eq!(executions[0].execution_id, execution_id);
         assert!((executions[0].contributed_shares - 1.0).abs() < f64::EPSILON);
 
         // Test finding trades for execution
-        let trades =
-            TradeExecutionLink::find_trades_for_execution(&pool, execution_id)
-                .await
-                .unwrap();
+        let trades = TradeExecutionLink::find_trades_for_execution(&pool, execution_id)
+            .await
+            .unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].trade_id, trade_id);
         assert!((trades[0].contributed_shares - 1.0).abs() < f64::EPSILON);
@@ -475,12 +449,13 @@ mod tests {
         let mut sql_tx = pool.begin().await.unwrap();
         let mut trade_ids = Vec::new();
         for trade in trades {
-            let trade_id =
-                trade.save_within_transaction(&mut sql_tx).await.unwrap();
+            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
             trade_ids.push(trade_id);
         }
-        let execution_id =
-            execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
 
         // Create links
         let link1 = TradeExecutionLink::new(trade_ids[0], execution_id, 0.5);
@@ -492,17 +467,13 @@ mod tests {
 
         // Test audit trail
         let tokenized_symbol = tokenized_symbol!("MSFT0x");
-        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(
-            &pool,
-            &tokenized_symbol,
-        )
-        .await
-        .unwrap();
+        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(&pool, &tokenized_symbol)
+            .await
+            .unwrap();
         assert_eq!(audit_trail.len(), 2);
 
         // Verify total contributed shares add up correctly
-        let total_contributed: f64 =
-            audit_trail.iter().map(|e| e.contributed_shares).sum();
+        let total_contributed: f64 = audit_trail.iter().map(|e| e.contributed_shares).sum();
         assert!((total_contributed - 1.0).abs() < f64::EPSILON);
     }
 
@@ -545,13 +516,14 @@ mod tests {
                 pyth_exponent: None,
                 pyth_publish_time: None,
             };
-            let trade_id =
-                trade.save_within_transaction(&mut sql_tx).await.unwrap();
+            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
             trade_ids.push(trade_id);
         }
 
-        let execution_id =
-            execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
 
         // Create links showing how each trade contributed
         let links = vec![
@@ -573,8 +545,10 @@ mod tests {
         assert_eq!(contributing_trades.len(), 3);
 
         // Verify total contributions equal exactly 1 share
-        let total_contributions: f64 =
-            contributing_trades.iter().map(|t| t.contributed_shares).sum();
+        let total_contributions: f64 = contributing_trades
+            .iter()
+            .map(|t| t.contributed_shares)
+            .sum();
         assert!((total_contributions - 1.0).abs() < f64::EPSILON);
     }
 
@@ -612,10 +586,11 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let trade_id =
-            trade.save_within_transaction(&mut sql_tx).await.unwrap();
-        let execution_id =
-            execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
 
         // Create first link
         let link1 = TradeExecutionLink::new(trade_id, execution_id, 0.5);

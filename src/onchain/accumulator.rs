@@ -4,14 +4,9 @@ use tracing::info;
 
 use super::OnchainTrade;
 use crate::error::{OnChainError, TradeValidationError};
-use crate::lock::{
-    clear_execution_lease, set_pending_execution_id,
-    try_acquire_execution_lease,
-};
+use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_execution_lease};
 use crate::offchain::execution::OffchainExecution;
-use crate::onchain::position_calculator::{
-    AccumulationBucket, PositionCalculator,
-};
+use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
 use crate::trade_execution_link::TradeExecutionLink;
 use st0x_broker::{Direction, OrderState, Shares, SupportedBroker, Symbol};
 
@@ -35,9 +30,8 @@ pub async fn process_onchain_trade(
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     // Check if trade already exists to handle duplicates gracefully
     let tx_hash_str = trade.tx_hash.to_string();
-    let log_index_i64 = i64::try_from(trade.log_index).map_err(|_| {
-        OnChainError::Validation(crate::error::TradeValidationError::NoLogIndex)
-    })?;
+    let log_index_i64 = i64::try_from(trade.log_index)
+        .map_err(|_| OnChainError::Validation(crate::error::TradeValidationError::NoLogIndex))?;
 
     let existing_trade = sqlx::query!(
         "
@@ -72,15 +66,14 @@ pub async fn process_onchain_trade(
 
     let base_symbol = trade.symbol.base();
 
-    let mut calculator =
-        get_or_create_within_transaction(sql_tx, base_symbol).await?;
+    let mut calculator = get_or_create_within_transaction(sql_tx, base_symbol).await?;
 
     // Map onchain direction to exposure state
     // Onchain SELL (gave away stock for USDC) -> we're now short the stock
     // Onchain BUY (gave away USDC for stock) -> we're now long the stock
     let exposure_bucket = match trade.direction {
         Direction::Sell => AccumulationBucket::ShortExposure, // Sold stock -> short exposure
-        Direction::Buy => AccumulationBucket::LongExposure, // Bought stock -> long exposure
+        Direction::Buy => AccumulationBucket::LongExposure,   // Bought stock -> long exposure
     };
     calculator.add_trade(trade.amount, exposure_bucket);
 
@@ -98,21 +91,16 @@ pub async fn process_onchain_trade(
     clean_up_stale_executions(sql_tx, base_symbol).await?;
 
     let execution = if try_acquire_execution_lease(sql_tx, base_symbol).await? {
-        let result = try_create_execution_if_ready(
-            sql_tx,
-            base_symbol,
-            &mut calculator,
-            broker_type,
-        )
-        .await?;
+        let result =
+            try_create_execution_if_ready(sql_tx, base_symbol, &mut calculator, broker_type)
+                .await?;
 
         match &result {
             Some(execution) => {
                 let execution_id = execution
                     .id
                     .ok_or(st0x_broker::PersistenceError::MissingExecutionId)?;
-                set_pending_execution_id(sql_tx, base_symbol, execution_id)
-                    .await?;
+                set_pending_execution_id(sql_tx, base_symbol, execution_id).await?;
             }
             None => {
                 clear_execution_lease(sql_tx, base_symbol).await?;
@@ -129,13 +117,7 @@ pub async fn process_onchain_trade(
     };
 
     let pending_execution_id = execution.as_ref().and_then(|e| e.id);
-    save_within_transaction(
-        &mut *sql_tx,
-        base_symbol,
-        &calculator,
-        pending_execution_id,
-    )
-    .await?;
+    save_within_transaction(&mut *sql_tx, base_symbol, &calculator, pending_execution_id).await?;
 
     Ok(execution)
 }
@@ -145,18 +127,13 @@ pub async fn find_by_symbol(
     pool: &SqlitePool,
     symbol: &str,
 ) -> Result<Option<(PositionCalculator, Option<i64>)>, OnChainError> {
-    let row = sqlx::query!(
-        "SELECT * FROM trade_accumulators WHERE symbol = ?1",
-        symbol
-    )
-    .fetch_optional(pool)
-    .await?;
+    let row = sqlx::query!("SELECT * FROM trade_accumulators WHERE symbol = ?1", symbol)
+        .fetch_optional(pool)
+        .await?;
 
     Ok(row.map(|row| {
-        let calculator = PositionCalculator::with_positions(
-            row.accumulated_long,
-            row.accumulated_short,
-        );
+        let calculator =
+            PositionCalculator::with_positions(row.accumulated_long, row.accumulated_short);
         (calculator, row.pending_execution_id)
     }))
 }
@@ -257,28 +234,17 @@ async fn execute_position(
         AccumulationBucket::ShortExposure => Direction::Buy, // Short exposure -> Schwab BUY to offset
     };
 
-    let execution = create_execution_within_transaction(
-        sql_tx,
-        base_symbol,
-        shares,
-        instruction,
-        broker_type,
-    )
-    .await?;
+    let execution =
+        create_execution_within_transaction(sql_tx, base_symbol, shares, instruction, broker_type)
+            .await?;
 
     let execution_id = execution
         .id
         .ok_or(st0x_broker::PersistenceError::MissingExecutionId)?;
 
     // Find all trades that contributed to this execution and create linkages
-    create_trade_execution_linkages(
-        sql_tx,
-        base_symbol,
-        execution_id,
-        execution_type,
-        shares,
-    )
-    .await?;
+    create_trade_execution_linkages(sql_tx, base_symbol, execution_id, execution_type, shares)
+        .await?;
 
     calculator.reduce_accumulation(execution_type, shares)?;
 
@@ -310,7 +276,7 @@ async fn create_trade_execution_linkages(
     // AccumulationBucket::LongExposure comes from onchain BUY trades (bought stock, now long)
     let trade_direction = match execution_type {
         AccumulationBucket::ShortExposure => Direction::Sell, // Short exposure from selling onchain
-        AccumulationBucket::LongExposure => Direction::Buy, // Long exposure from buying onchain
+        AccumulationBucket::LongExposure => Direction::Buy,   // Long exposure from buying onchain
     };
 
     // Get all trades for this base symbol/direction, regardless of tokenized marker
@@ -369,8 +335,7 @@ async fn create_trade_execution_linkages(
         let contribution = available_amount.min(remaining_execution_shares);
 
         // Create the linkage
-        let link =
-            TradeExecutionLink::new(row.trade_id, execution_id, contribution);
+        let link = TradeExecutionLink::new(row.trade_id, execution_id, contribution);
         link.save_within_transaction(sql_tx).await?;
 
         remaining_execution_shares -= contribution;
@@ -553,12 +518,10 @@ pub async fn check_all_accumulated_positions(
         // Try to acquire execution lease for this symbol
         if try_acquire_execution_lease(&mut sql_tx, &symbol).await? {
             // Re-fetch calculator to get current state
-            let mut calculator =
-                get_or_create_within_transaction(&mut sql_tx, &symbol).await?;
+            let mut calculator = get_or_create_within_transaction(&mut sql_tx, &symbol).await?;
 
             // Check if still ready after potentially concurrent processing
-            if let Some(execution_type) = calculator.determine_execution_type()
-            {
+            if let Some(execution_type) = calculator.determine_execution_type() {
                 // The linkage system will handle allocating the oldest available trades
                 let result = execute_position(
                     &mut sql_tx,
@@ -570,15 +533,10 @@ pub async fn check_all_accumulated_positions(
                 .await?;
 
                 if let Some(execution) = &result {
-                    let execution_id = execution.id.ok_or(
-                        st0x_broker::PersistenceError::MissingExecutionId,
-                    )?;
-                    set_pending_execution_id(
-                        &mut sql_tx,
-                        &symbol,
-                        execution_id,
-                    )
-                    .await?;
+                    let execution_id = execution
+                        .id
+                        .ok_or(st0x_broker::PersistenceError::MissingExecutionId)?;
+                    set_pending_execution_id(&mut sql_tx, &symbol, execution_id).await?;
 
                     info!(
                         symbol = %symbol,
@@ -599,13 +557,8 @@ pub async fn check_all_accumulated_positions(
 
                 // Save updated calculator state
                 let pending_execution_id = result.as_ref().and_then(|e| e.id);
-                save_within_transaction(
-                    &mut sql_tx,
-                    &symbol,
-                    &calculator,
-                    pending_execution_id,
-                )
-                .await?;
+                save_within_transaction(&mut sql_tx, &symbol, &calculator, pending_execution_id)
+                    .await?;
             } else {
                 clear_execution_lease(&mut sql_tx, &symbol).await?;
                 info!(
@@ -652,12 +605,8 @@ mod tests {
         trade: OnchainTrade,
     ) -> Result<Option<OffchainExecution>, OnChainError> {
         let mut sql_tx = pool.begin().await?;
-        let result = process_onchain_trade(
-            &mut sql_tx,
-            trade,
-            st0x_broker::SupportedBroker::Schwab,
-        )
-        .await?;
+        let result =
+            process_onchain_trade(&mut sql_tx, trade, st0x_broker::SupportedBroker::Schwab).await?;
         sql_tx.commit().await?;
         Ok(result)
     }
@@ -689,8 +638,7 @@ mod tests {
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
         assert!(result.is_none());
 
-        let (calculator, _) =
-            find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        let (calculator, _) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
         assert!((calculator.accumulated_short - 0.5).abs() < f64::EPSILON); // SELL creates short exposure
         assert!((calculator.net_position() - (-0.5)).abs() < f64::EPSILON); // Short position = negative net
         assert!((calculator.accumulated_long - 0.0).abs() < f64::EPSILON); // No long exposure
@@ -720,15 +668,13 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution =
-            process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
 
         assert_eq!(execution.symbol, Symbol::new("MSFT").unwrap());
         assert_eq!(execution.shares, Shares::new(1).unwrap());
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
 
-        let (calculator, _) =
-            find_by_symbol(&pool, "MSFT").await.unwrap().unwrap();
+        let (calculator, _) = find_by_symbol(&pool, "MSFT").await.unwrap().unwrap();
         assert!((calculator.accumulated_short - 0.5).abs() < f64::EPSILON); // SELL creates short exposure
         assert!((calculator.net_position() - (-0.5)).abs() < f64::EPSILON); // Short position = negative net
     }
@@ -810,8 +756,7 @@ mod tests {
         assert_eq!(execution.shares, Shares::new(1).unwrap());
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
 
-        let (calculator, _) =
-            find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        let (calculator, _) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
         assert!((calculator.accumulated_short - 0.1).abs() < f64::EPSILON); // Remaining short exposure
         assert!((calculator.net_position() - (-0.1)).abs() < f64::EPSILON); // Net short position
     }
@@ -869,8 +814,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution =
-            process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
 
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
         assert_eq!(execution.symbol, Symbol::new("AAPL").unwrap());
@@ -901,8 +845,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution =
-            process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
 
         assert_eq!(execution.direction, Direction::Sell); // Schwab SELL to offset onchain BUY (long exposure)
         assert_eq!(execution.symbol, Symbol::new("MSFT").unwrap());
@@ -923,7 +866,10 @@ mod tests {
             state: OrderState::Pending,
         };
         let mut sql_tx = pool.begin().await.unwrap();
-        blocking_execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        blocking_execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
         sql_tx.commit().await.unwrap();
 
         // Create a trade that would trigger execution for the same symbol
@@ -1034,8 +980,7 @@ mod tests {
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL
 
         // Verify accumulator shows correct remaining fractional amount
-        let (calculator, _) =
-            find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        let (calculator, _) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
         assert!((calculator.accumulated_short - 0.1).abs() < f64::EPSILON); // SELL creates short exposure
         assert!((calculator.net_position() - (-0.1)).abs() < f64::EPSILON); // Short position = negative net
 
@@ -1044,12 +989,11 @@ mod tests {
         assert_eq!(trade_count, 2);
 
         // Verify exactly one execution was created
-        let execution_count =
-            sqlx::query!("SELECT COUNT(*) as count FROM offchain_trades")
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-                .count;
+        let execution_count = sqlx::query!("SELECT COUNT(*) as count FROM offchain_trades")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .count;
         assert_eq!(execution_count, 1);
     }
 
@@ -1060,22 +1004,16 @@ mod tests {
         for attempt in 0..3 {
             match process_trade_with_tx(pool, trade.clone()).await {
                 Ok(result) => return Ok(result),
-                Err(OnChainError::Persistence(
-                    st0x_broker::PersistenceError::Database(
-                        sqlx::Error::Database(db_err),
-                    ),
-                )) if db_err.message().contains("database is deadlocked") => {
+                Err(OnChainError::Persistence(st0x_broker::PersistenceError::Database(
+                    sqlx::Error::Database(db_err),
+                ))) if db_err.message().contains("database is deadlocked") => {
                     if attempt < 2 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            10 * (1 << attempt),
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(10 * (1 << attempt)))
+                            .await;
                         continue;
                     }
                     return Err(OnChainError::Persistence(
-                        st0x_broker::PersistenceError::Database(
-                            sqlx::Error::Database(db_err),
-                        ),
+                        st0x_broker::PersistenceError::Database(sqlx::Error::Database(db_err)),
                     ));
                 }
                 Err(e) => return Err(e),
@@ -1084,11 +1022,7 @@ mod tests {
         unreachable!()
     }
 
-    fn create_test_trade(
-        tx_hash_byte: u8,
-        symbol: &str,
-        amount: f64,
-    ) -> OnchainTrade {
+    fn create_test_trade(tx_hash_byte: u8, symbol: &str, amount: f64) -> OnchainTrade {
         OnchainTrade {
             id: None,
             tx_hash: alloy::primitives::B256::repeat_byte(tx_hash_byte),
@@ -1108,19 +1042,15 @@ mod tests {
         }
     }
 
-    async fn verify_concurrent_execution_state(
-        pool: &SqlitePool,
-        expected_short: f64,
-    ) {
+    async fn verify_concurrent_execution_state(pool: &SqlitePool, expected_short: f64) {
         let trade_count = super::OnchainTrade::db_count(pool).await.unwrap();
         assert_eq!(trade_count, 2, "Expected 2 trades to be saved");
 
-        let execution_count =
-            sqlx::query!("SELECT COUNT(*) as count FROM offchain_trades")
-                .fetch_one(pool)
-                .await
-                .unwrap()
-                .count;
+        let execution_count = sqlx::query!("SELECT COUNT(*) as count FROM offchain_trades")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .count;
         assert_eq!(
             execution_count, 1,
             "Expected exactly 1 execution to prevent duplicate orders"
@@ -1132,8 +1062,7 @@ mod tests {
             .expect("Accumulator should exist for AAPL");
 
         assert!(
-            (calculator.accumulated_short - expected_short).abs()
-                < f64::EPSILON,
+            (calculator.accumulated_short - expected_short).abs() < f64::EPSILON,
             "Expected {expected_short} accumulated_short remaining, got {}",
             calculator.accumulated_short
         );
@@ -1192,8 +1121,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution =
-            process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
         let execution_id = execution.id.unwrap();
 
         // Verify trade-execution link was created
@@ -1209,10 +1137,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(trades_for_execution.len(), 1);
-        assert!(
-            (trades_for_execution[0].contributed_shares - 1.0).abs()
-                < f64::EPSILON
-        );
+        assert!((trades_for_execution[0].contributed_shares - 1.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1280,17 +1205,20 @@ mod tests {
         ];
 
         // Add first two trades - should not trigger execution
-        let result1 =
-            process_trade_with_tx(&pool, trades[0].clone()).await.unwrap();
+        let result1 = process_trade_with_tx(&pool, trades[0].clone())
+            .await
+            .unwrap();
         assert!(result1.is_none());
 
-        let result2 =
-            process_trade_with_tx(&pool, trades[1].clone()).await.unwrap();
+        let result2 = process_trade_with_tx(&pool, trades[1].clone())
+            .await
+            .unwrap();
         assert!(result2.is_none());
 
         // Third trade should trigger execution
-        let result3 =
-            process_trade_with_tx(&pool, trades[2].clone()).await.unwrap();
+        let result3 = process_trade_with_tx(&pool, trades[2].clone())
+            .await
+            .unwrap();
         let execution = result3.unwrap();
         let execution_id = execution.id.unwrap();
 
@@ -1302,23 +1230,19 @@ mod tests {
         assert_eq!(contributing_trades.len(), 3);
 
         // Verify total contribution equals execution shares
-        let total_contribution: f64 =
-            contributing_trades.iter().map(|t| t.contributed_shares).sum();
+        let total_contribution: f64 = contributing_trades
+            .iter()
+            .map(|t| t.contributed_shares)
+            .sum();
         assert!((total_contribution - 1.0).abs() < f64::EPSILON);
 
         // Verify individual contributions match chronological allocation
         let mut contributions = contributing_trades;
         contributions.sort_by(|a, b| a.trade_id.cmp(&b.trade_id));
 
-        assert!(
-            (contributions[0].contributed_shares - 0.3).abs() < f64::EPSILON
-        );
-        assert!(
-            (contributions[1].contributed_shares - 0.4).abs() < f64::EPSILON
-        );
-        assert!(
-            (contributions[2].contributed_shares - 0.3).abs() < f64::EPSILON
-        );
+        assert!((contributions[0].contributed_shares - 0.3).abs() < f64::EPSILON);
+        assert!((contributions[1].contributed_shares - 0.4).abs() < f64::EPSILON);
+        assert!((contributions[2].contributed_shares - 0.3).abs() < f64::EPSILON);
         // Only 0.3 of 0.5 needed
     }
 
@@ -1369,23 +1293,22 @@ mod tests {
         ];
 
         // Add first trade - no execution
-        let result1 =
-            process_trade_with_tx(&pool, trades[0].clone()).await.unwrap();
+        let result1 = process_trade_with_tx(&pool, trades[0].clone())
+            .await
+            .unwrap();
         assert!(result1.is_none());
 
         // Add second trade - triggers execution
-        let result2 =
-            process_trade_with_tx(&pool, trades[1].clone()).await.unwrap();
+        let result2 = process_trade_with_tx(&pool, trades[1].clone())
+            .await
+            .unwrap();
         let execution = result2.unwrap();
 
         // Test audit trail completeness
         let tokenized_symbol = tokenized_symbol!("AAPL0x");
-        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(
-            &pool,
-            &tokenized_symbol,
-        )
-        .await
-        .unwrap();
+        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(&pool, &tokenized_symbol)
+            .await
+            .unwrap();
 
         assert_eq!(audit_trail.len(), 2); // Both trades should appear
 
@@ -1399,16 +1322,14 @@ mod tests {
         }
 
         // Verify total contributions in audit trail
-        let total_audit_contribution: f64 =
-            audit_trail.iter().map(|e| e.contributed_shares).sum();
+        let total_audit_contribution: f64 = audit_trail.iter().map(|e| e.contributed_shares).sum();
         assert!((total_audit_contribution - 1.0).abs() < f64::EPSILON);
 
         // Test reverse lookups work
         let execution_id = execution.id.unwrap();
-        let executions_for_first_trade =
-            TradeExecutionLink::find_executions_for_trade(&pool, 1) // Assuming first trade has ID 1
-                .await
-                .unwrap();
+        let executions_for_first_trade = TradeExecutionLink::find_executions_for_trade(&pool, 1) // Assuming first trade has ID 1
+            .await
+            .unwrap();
         assert_eq!(executions_for_first_trade.len(), 1);
         assert_eq!(executions_for_first_trade[0].execution_id, execution_id);
     }
@@ -1439,8 +1360,7 @@ mod tests {
         };
 
         // Add trade and trigger execution
-        let execution =
-            process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
 
         // Verify only 1 share executed, not 1.2
         assert_eq!(execution.shares, Shares::new(1).unwrap());
@@ -1453,14 +1373,10 @@ mod tests {
                 .unwrap();
 
         assert_eq!(trades_for_execution.len(), 1);
-        assert!(
-            (trades_for_execution[0].contributed_shares - 1.0).abs()
-                < f64::EPSILON
-        );
+        assert!((trades_for_execution[0].contributed_shares - 1.0).abs() < f64::EPSILON);
 
         // Verify the remaining 0.2 is still available for future executions
-        let (calculator, _) =
-            find_by_symbol(&pool, "TSLA").await.unwrap().unwrap();
+        let (calculator, _) = find_by_symbol(&pool, "TSLA").await.unwrap().unwrap();
         assert!((calculator.accumulated_long - 0.2).abs() < f64::EPSILON); // BUY creates long exposure
     }
 
@@ -1511,27 +1427,20 @@ mod tests {
 
         // Execute both trades
         let buy_result = process_trade_with_tx(&pool, buy_trade).await.unwrap();
-        let sell_result =
-            process_trade_with_tx(&pool, sell_trade).await.unwrap();
+        let sell_result = process_trade_with_tx(&pool, sell_trade).await.unwrap();
 
         let buy_execution = buy_result.unwrap();
         let sell_execution = sell_result.unwrap();
 
         // Verify each execution is only linked to trades of matching direction
         let buy_execution_trades =
-            TradeExecutionLink::find_trades_for_execution(
-                &pool,
-                buy_execution.id.unwrap(),
-            )
-            .await
-            .unwrap();
+            TradeExecutionLink::find_trades_for_execution(&pool, buy_execution.id.unwrap())
+                .await
+                .unwrap();
         let sell_execution_trades =
-            TradeExecutionLink::find_trades_for_execution(
-                &pool,
-                sell_execution.id.unwrap(),
-            )
-            .await
-            .unwrap();
+            TradeExecutionLink::find_trades_for_execution(&pool, sell_execution.id.unwrap())
+                .await
+                .unwrap();
 
         assert_eq!(buy_execution_trades.len(), 1);
         assert_eq!(sell_execution_trades.len(), 1);
@@ -1556,12 +1465,16 @@ mod tests {
             shares: Shares::new(1).unwrap(),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
-            state: OrderState::Submitted { order_id: "123456".to_string() },
+            state: OrderState::Submitted {
+                order_id: "123456".to_string(),
+            },
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let execution_id =
-            stale_execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        let execution_id = stale_execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
 
         // Set up accumulator with pending execution
         let calculator = PositionCalculator::new();
@@ -1746,7 +1659,9 @@ mod tests {
             shares: Shares::new(1).unwrap(),
             direction: Direction::Buy,
             broker: st0x_broker::SupportedBroker::Schwab,
-            state: OrderState::Submitted { order_id: "recent123".to_string() },
+            state: OrderState::Submitted {
+                order_id: "recent123".to_string(),
+            },
         };
 
         let stale_execution = OffchainExecution {
@@ -1755,7 +1670,9 @@ mod tests {
             shares: Shares::new(1).unwrap(),
             direction: Direction::Sell,
             broker: st0x_broker::SupportedBroker::Schwab,
-            state: OrderState::Submitted { order_id: "stale456".to_string() },
+            state: OrderState::Submitted {
+                order_id: "stale456".to_string(),
+            },
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -1764,27 +1681,19 @@ mod tests {
             .save_within_transaction(&mut sql_tx)
             .await
             .unwrap();
-        let stale_id =
-            stale_execution.save_within_transaction(&mut sql_tx).await.unwrap();
+        let stale_id = stale_execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
 
         // Set up accumulators
         let calculator = PositionCalculator::new();
-        save_within_transaction(
-            &mut sql_tx,
-            &symbol!("MSFT"),
-            &calculator,
-            Some(recent_id),
-        )
-        .await
-        .unwrap();
-        save_within_transaction(
-            &mut sql_tx,
-            &symbol!("TSLA"),
-            &calculator,
-            Some(stale_id),
-        )
-        .await
-        .unwrap();
+        save_within_transaction(&mut sql_tx, &symbol!("MSFT"), &calculator, Some(recent_id))
+            .await
+            .unwrap();
+        save_within_transaction(&mut sql_tx, &symbol!("TSLA"), &calculator, Some(stale_id))
+            .await
+            .unwrap();
 
         // Make TSLA accumulator stale (15 minutes ago) but leave MSFT recent
         sqlx::query!(
@@ -1829,13 +1738,11 @@ mod tests {
         assert_eq!(tsla_failed[0].id.unwrap(), stale_id);
 
         // Verify TSLA accumulator pending_execution_id was cleared
-        let (_, pending_id) =
-            find_by_symbol(&pool, "TSLA").await.unwrap().unwrap();
+        let (_, pending_id) = find_by_symbol(&pool, "TSLA").await.unwrap().unwrap();
         assert!(pending_id.is_none());
 
         // Verify MSFT accumulator pending_execution_id is still set
-        let (_, msft_pending_id) =
-            find_by_symbol(&pool, "MSFT").await.unwrap().unwrap();
+        let (_, msft_pending_id) = find_by_symbol(&pool, "MSFT").await.unwrap().unwrap();
         assert_eq!(msft_pending_id, Some(recent_id));
     }
 
@@ -1850,7 +1757,9 @@ mod tests {
             shares: Shares::new(2).unwrap(),
             direction: Direction::Buy,
             broker: st0x_broker::SupportedBroker::Schwab,
-            state: OrderState::Submitted { order_id: "recent789".to_string() },
+            state: OrderState::Submitted {
+                order_id: "recent789".to_string(),
+            },
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -1890,8 +1799,7 @@ mod tests {
         assert_eq!(submitted_executions[0].id.unwrap(), execution_id);
 
         // Verify accumulator pending_execution_id is still set
-        let (_, pending_id) =
-            find_by_symbol(&pool, "NVDA").await.unwrap().unwrap();
+        let (_, pending_id) = find_by_symbol(&pool, "NVDA").await.unwrap().unwrap();
         assert_eq!(pending_id, Some(execution_id));
     }
 
@@ -1924,23 +1832,19 @@ mod tests {
         assert!(result.is_none()); // Should not execute yet (below 1.0)
 
         // Verify AAPL has accumulated position but no pending execution
-        let (aapl_calc, aapl_pending) =
-            find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        let (aapl_calc, aapl_pending) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
         assert!((aapl_calc.accumulated_short - 0.8).abs() < f64::EPSILON); // SELL creates short exposure
         assert!(aapl_pending.is_none());
 
         // Run the function - should not create any executions since 0.8 < 1.0
-        let executions = check_all_accumulated_positions(
-            &pool,
-            st0x_broker::SupportedBroker::Schwab,
-        )
-        .await
-        .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, st0x_broker::SupportedBroker::Schwab)
+                .await
+                .unwrap();
         assert_eq!(executions.len(), 0);
 
         // Verify AAPL state unchanged
-        let (aapl_calc, aapl_pending) =
-            find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        let (aapl_calc, aapl_pending) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
         assert!((aapl_calc.accumulated_short - 0.8).abs() < f64::EPSILON); // SELL creates short exposure
         assert!(aapl_pending.is_none());
     }
@@ -1950,12 +1854,10 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Run the function on empty database
-        let executions = check_all_accumulated_positions(
-            &pool,
-            st0x_broker::SupportedBroker::Schwab,
-        )
-        .await
-        .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, st0x_broker::SupportedBroker::Schwab)
+                .await
+                .unwrap();
 
         // Should create no executions
         assert_eq!(executions.len(), 0);
@@ -1995,19 +1897,16 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         // Run the function
-        let executions = check_all_accumulated_positions(
-            &pool,
-            st0x_broker::SupportedBroker::Schwab,
-        )
-        .await
-        .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, st0x_broker::SupportedBroker::Schwab)
+                .await
+                .unwrap();
 
         // Should create no executions since AAPL has pending execution
         assert_eq!(executions.len(), 0);
 
         // Verify AAPL was unchanged (still has pending execution)
-        let (aapl_calc, aapl_pending) =
-            find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        let (aapl_calc, aapl_pending) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
         assert!((aapl_calc.accumulated_long - 1.5).abs() < f64::EPSILON); // Unchanged
         assert_eq!(aapl_pending, Some(execution_id)); // Still has same pending execution
     }
@@ -2082,8 +1981,7 @@ mod tests {
         assert!(result1.is_none());
 
         // Verify accumulation for GME base symbol
-        let (calculator, pending) =
-            find_by_symbol(&pool, "GME").await.unwrap().unwrap();
+        let (calculator, pending) = find_by_symbol(&pool, "GME").await.unwrap().unwrap();
         assert!((calculator.accumulated_short - 0.6).abs() < f64::EPSILON);
         assert!((calculator.accumulated_long - 0.0).abs() < f64::EPSILON);
         assert_eq!(pending, None);
@@ -2093,8 +1991,7 @@ mod tests {
         assert!(result2.is_none());
 
         // Verify accumulation increased
-        let (calculator2, pending2) =
-            find_by_symbol(&pool, "GME").await.unwrap().unwrap();
+        let (calculator2, pending2) = find_by_symbol(&pool, "GME").await.unwrap().unwrap();
         assert!((calculator2.accumulated_short - 0.9).abs() < f64::EPSILON);
         assert!((calculator2.accumulated_long - 0.0).abs() < f64::EPSILON);
         assert_eq!(pending2, None);
@@ -2109,34 +2006,26 @@ mod tests {
         assert_eq!(execution.direction, Direction::Buy); // Buy to offset short exposure
 
         // Verify all three trades contributed to the same execution
-        let links = TradeExecutionLink::find_trades_for_execution(
-            &pool,
-            execution.id.unwrap(),
-        )
-        .await
-        .unwrap();
+        let links = TradeExecutionLink::find_trades_for_execution(&pool, execution.id.unwrap())
+            .await
+            .unwrap();
         assert_eq!(links.len(), 3);
 
         // Verify the allocation amounts
-        let total_contributed: f64 =
-            links.iter().map(|l| l.contributed_shares).sum();
+        let total_contributed: f64 = links.iter().map(|l| l.contributed_shares).sum();
         assert!((total_contributed - 1.0).abs() < f64::EPSILON);
 
         // Verify remaining accumulation
-        let (final_calc, final_pending) =
-            find_by_symbol(&pool, "GME").await.unwrap().unwrap();
+        let (final_calc, final_pending) = find_by_symbol(&pool, "GME").await.unwrap().unwrap();
         assert!((final_calc.accumulated_short - 0.1).abs() < f64::EPSILON); // 0.6 + 0.3 + 0.2 - 1.0 = 0.1 remaining
         assert!((final_calc.accumulated_long - 0.0).abs() < f64::EPSILON);
         assert_eq!(final_pending, execution.id); // Has pending execution
 
         // Verify audit trail shows all three marker types
         let tokenized_gme_0x = tokenized_symbol!("GME0x");
-        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(
-            &pool,
-            &tokenized_gme_0x,
-        )
-        .await
-        .unwrap();
+        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(&pool, &tokenized_gme_0x)
+            .await
+            .unwrap();
 
         // Should include all three trades in the audit trail
         assert_eq!(audit_trail.len(), 3);

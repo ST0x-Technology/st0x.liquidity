@@ -123,9 +123,9 @@ impl TokenizedEquitySymbol {
         }
 
         // No valid marker found
-        Err(OnChainError::Validation(TradeValidationError::NotTokenizedEquity(
-            symbol.to_string(),
-        )))
+        Err(OnChainError::Validation(
+            TradeValidationError::NotTokenizedEquity(symbol.to_string()),
+        ))
     }
 
     /// Gets the base equity symbol
@@ -195,8 +195,7 @@ impl TradeDetails {
         output_amount: f64,
     ) -> Result<Self, OnChainError> {
         // Determine direction and ticker using existing logic
-        let (ticker, direction) =
-            determine_schwab_trade_details(input_symbol, output_symbol)?;
+        let (ticker, direction) = determine_schwab_trade_details(input_symbol, output_symbol)?;
 
         // Extract equity and USDC amounts based on which symbol is the tokenized equity
         let (equity_amount_raw, usdc_amount_raw) = if input_symbol == "USDC"
@@ -204,9 +203,7 @@ impl TradeDetails {
         {
             // USDC → tokenized equity: output is equity, input is USDC
             (output_amount, input_amount)
-        } else if output_symbol == "USDC"
-            && TokenizedEquitySymbol::parse(input_symbol).is_ok()
-        {
+        } else if output_symbol == "USDC" && TokenizedEquitySymbol::parse(input_symbol).is_ok() {
             // tokenized equity → USDC: input is equity, output is USDC
             (input_amount, output_amount)
         } else {
@@ -222,7 +219,12 @@ impl TradeDetails {
         let equity_amount = Shares::new(equity_amount_raw)?;
         let usdc_amount = Usdc::new(usdc_amount_raw)?;
 
-        Ok(Self { ticker, equity_amount, usdc_amount, direction })
+        Ok(Self {
+            ticker,
+            equity_amount,
+            usdc_amount,
+            direction,
+        })
     }
 }
 
@@ -237,18 +239,14 @@ fn determine_schwab_trade_details(
 ) -> Result<(Symbol, Direction), OnChainError> {
     // USDC input + tokenized stock output = sold tokenized stock onchain
     if onchain_input_symbol == "USDC" {
-        if let Ok(tokenized) =
-            TokenizedEquitySymbol::parse(onchain_output_symbol)
-        {
+        if let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_output_symbol) {
             return Ok((tokenized.base().clone(), Direction::Sell));
         }
     }
 
     // tokenized stock input + USDC output = bought tokenized stock onchain
     if onchain_output_symbol == "USDC" {
-        if let Ok(tokenized) =
-            TokenizedEquitySymbol::parse(onchain_input_symbol)
-        {
+        if let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_input_symbol) {
             return Ok((tokenized.base().clone(), Direction::Buy));
         }
     }
@@ -476,40 +474,31 @@ mod tests {
         let result = determine_schwab_trade_details("BTC", "ETH");
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                TradeValidationError::InvalidSymbolConfiguration(_, _)
-            )
+            OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
         let result = determine_schwab_trade_details("USDC", "USDC");
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                TradeValidationError::InvalidSymbolConfiguration(_, _)
-            )
+            OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
         let result = determine_schwab_trade_details("AAPL0x", "TSLA0x");
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                TradeValidationError::InvalidSymbolConfiguration(_, _)
-            )
+            OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
         let result = determine_schwab_trade_details("", "");
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                TradeValidationError::InvalidSymbolConfiguration(_, _)
-            )
+            OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
     }
 
     #[test]
     fn test_trade_details_try_from_io_usdc_to_0x_equity() {
-        let details =
-            TradeDetails::try_from_io("USDC", 100.0, "AAPL0x", 0.5).unwrap();
+        let details = TradeDetails::try_from_io("USDC", 100.0, "AAPL0x", 0.5).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
         assert!((details.equity_amount().value() - 0.5).abs() < f64::EPSILON);
@@ -520,8 +509,7 @@ mod tests {
     #[test]
     fn test_trade_details_try_from_io_usdc_to_s1_equity_fixes_bug() {
         // This is the key test - s1 suffix should work correctly now
-        let details =
-            TradeDetails::try_from_io("USDC", 64.17, "NVDAs1", 0.374).unwrap();
+        let details = TradeDetails::try_from_io("USDC", 64.17, "NVDAs1", 0.374).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert!((details.equity_amount().value() - 0.374).abs() < f64::EPSILON); // Should be 0.374, not 64.17!
@@ -531,8 +519,7 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_0x_equity_to_usdc() {
-        let details =
-            TradeDetails::try_from_io("AAPL0x", 0.5, "USDC", 100.0).unwrap();
+        let details = TradeDetails::try_from_io("AAPL0x", 0.5, "USDC", 100.0).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
         assert!((details.equity_amount().value() - 0.5).abs() < f64::EPSILON);
@@ -542,8 +529,7 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_s1_equity_to_usdc() {
-        let details =
-            TradeDetails::try_from_io("NVDAs1", 0.374, "USDC", 64.17).unwrap();
+        let details = TradeDetails::try_from_io("NVDAs1", 0.374, "USDC", 64.17).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert!((details.equity_amount().value() - 0.374).abs() < f64::EPSILON);
@@ -553,8 +539,7 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_usdc_to_t_equity() {
-        let details =
-            TradeDetails::try_from_io("USDC", 100.0, "tGME", 0.5).unwrap();
+        let details = TradeDetails::try_from_io("USDC", 100.0, "tGME", 0.5).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("GME"));
         assert!((details.equity_amount().value() - 0.5).abs() < f64::EPSILON);
@@ -564,8 +549,7 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_t_equity_to_usdc() {
-        let details =
-            TradeDetails::try_from_io("tAAPL", 0.25, "USDC", 50.0).unwrap();
+        let details = TradeDetails::try_from_io("tAAPL", 0.25, "USDC", 50.0).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
         assert!((details.equity_amount().value() - 0.25).abs() < f64::EPSILON);
@@ -578,17 +562,13 @@ mod tests {
         let result = TradeDetails::try_from_io("USDC", 100.0, "USDC", 100.0);
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                TradeValidationError::InvalidSymbolConfiguration(_, _)
-            )
+            OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
         let result = TradeDetails::try_from_io("BTC", 1.0, "ETH", 3000.0);
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                TradeValidationError::InvalidSymbolConfiguration(_, _)
-            )
+            OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
     }
 
@@ -638,8 +618,7 @@ mod tests {
         assert_eq!(nvda_symbol.to_string(), "NVDA");
 
         // Test that compile-time validation works (these should compile)
-        let _valid_symbols =
-            [symbol!("MSFT"), symbol!("GOOG"), symbol!("TSLA")];
+        let _valid_symbols = [symbol!("MSFT"), symbol!("GOOG"), symbol!("TSLA")];
     }
 
     // Integration tests with real transaction data that caused the 175x overexecution bug
@@ -648,9 +627,7 @@ mod tests {
     fn test_real_transaction_0x844_nvda_s1_bug_fix() {
         // Real transaction 0x844...a42d4: 0.374 NVDAs1 sold for 64.169234 USDC
         // The bug was using 64.169234 as share amount instead of 0.374
-        let details =
-            TradeDetails::try_from_io("USDC", 64.169_234, "NVDAs1", 0.374)
-                .unwrap();
+        let details = TradeDetails::try_from_io("USDC", 64.169_234, "NVDAs1", 0.374).unwrap();
 
         // Verify we extract the correct amounts
         assert_eq!(details.ticker(), &symbol!("NVDA"));
@@ -667,9 +644,7 @@ mod tests {
     fn test_real_transaction_0x700_nvda_s1_bug_fix() {
         // Real transaction 0x700...bfb85: 0.2 NVDAs1 sold for 34.645024 USDC
         // The bug was using 34.645024 as share amount instead of 0.2
-        let details =
-            TradeDetails::try_from_io("USDC", 34.645_024, "NVDAs1", 0.2)
-                .unwrap();
+        let details = TradeDetails::try_from_io("USDC", 34.645_024, "NVDAs1", 0.2).unwrap();
 
         // Verify we extract the correct amounts
         assert_eq!(details.ticker(), &symbol!("NVDA"));
@@ -685,12 +660,9 @@ mod tests {
     #[test]
     fn test_gme_trades_with_different_markers_extract_same_ticker() {
         // Test that GME0x, GMEs1, and tGME all map to base symbol "GME"
-        let gme_0x_details =
-            TradeDetails::try_from_io("USDC", 5.2, "GME0x", 0.2).unwrap();
-        let gme_s1_details =
-            TradeDetails::try_from_io("USDC", 5.1, "GMEs1", 0.2).unwrap();
-        let gme_t_details =
-            TradeDetails::try_from_io("USDC", 5.3, "tGME", 0.2).unwrap();
+        let gme_0x_details = TradeDetails::try_from_io("USDC", 5.2, "GME0x", 0.2).unwrap();
+        let gme_s1_details = TradeDetails::try_from_io("USDC", 5.1, "GMEs1", 0.2).unwrap();
+        let gme_t_details = TradeDetails::try_from_io("USDC", 5.3, "tGME", 0.2).unwrap();
 
         // All should map to the same base ticker
         assert_eq!(gme_0x_details.ticker(), &symbol!("GME"));
@@ -700,49 +672,30 @@ mod tests {
         assert_eq!(gme_0x_details.ticker(), gme_t_details.ticker());
 
         // Verify amounts are extracted correctly
-        assert!(
-            (gme_0x_details.equity_amount().value() - 0.2).abs() < f64::EPSILON
-        );
-        assert!(
-            (gme_s1_details.equity_amount().value() - 0.2).abs() < f64::EPSILON
-        );
-        assert!(
-            (gme_t_details.equity_amount().value() - 0.2).abs() < f64::EPSILON
-        );
-        assert!(
-            (gme_0x_details.usdc_amount().value() - 5.2).abs() < f64::EPSILON
-        );
-        assert!(
-            (gme_s1_details.usdc_amount().value() - 5.1).abs() < f64::EPSILON
-        );
-        assert!(
-            (gme_t_details.usdc_amount().value() - 5.3).abs() < f64::EPSILON
-        );
+        assert!((gme_0x_details.equity_amount().value() - 0.2).abs() < f64::EPSILON);
+        assert!((gme_s1_details.equity_amount().value() - 0.2).abs() < f64::EPSILON);
+        assert!((gme_t_details.equity_amount().value() - 0.2).abs() < f64::EPSILON);
+        assert!((gme_0x_details.usdc_amount().value() - 5.2).abs() < f64::EPSILON);
+        assert!((gme_s1_details.usdc_amount().value() - 5.1).abs() < f64::EPSILON);
+        assert!((gme_t_details.usdc_amount().value() - 5.3).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_edge_case_validation_very_small_amounts() {
         // Test very small but valid amounts
-        let details =
-            TradeDetails::try_from_io("USDC", 0.01, "AAPLs1", 0.0001).unwrap();
+        let details = TradeDetails::try_from_io("USDC", 0.01, "AAPLs1", 0.0001).unwrap();
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert!(
-            (details.equity_amount().value() - 0.0001).abs() < f64::EPSILON
-        );
+        assert!((details.equity_amount().value() - 0.0001).abs() < f64::EPSILON);
         assert!((details.usdc_amount().value() - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_edge_case_validation_very_large_amounts() {
         // Test large but realistic amounts
-        let details =
-            TradeDetails::try_from_io("USDC", 1_000_000.0, "BRKs1", 100.0)
-                .unwrap();
+        let details = TradeDetails::try_from_io("USDC", 1_000_000.0, "BRKs1", 100.0).unwrap();
         assert_eq!(details.ticker(), &symbol!("BRK"));
         assert!((details.equity_amount().value() - 100.0).abs() < f64::EPSILON);
-        assert!(
-            (details.usdc_amount().value() - 1_000_000.0).abs() < f64::EPSILON
-        );
+        assert!((details.usdc_amount().value() - 1_000_000.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -763,8 +716,7 @@ mod tests {
     #[test]
     fn test_invalid_marker_combinations() {
         let gme_symbol = Symbol::new("GME0x").unwrap();
-        let t_symbol =
-            TokenizedEquitySymbol::new(gme_symbol, TokenizedEquityMarker::T);
+        let t_symbol = TokenizedEquitySymbol::new(gme_symbol, TokenizedEquityMarker::T);
 
         assert_eq!(t_symbol.to_string(), "tGME0x");
         assert_eq!(t_symbol.extract_base(), "GME0x");

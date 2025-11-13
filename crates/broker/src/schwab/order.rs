@@ -4,9 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{
-    SchwabAuthEnv, SchwabError, SchwabTokens, order_status::OrderStatusResponse,
-};
+use super::{SchwabAuthEnv, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -28,14 +26,17 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn new(
-        symbol: String,
-        instruction: Instruction,
-        quantity: u64,
-    ) -> Self {
-        let instrument = Instrument { symbol, asset_type: AssetType::Equity };
+    pub fn new(symbol: String, instruction: Instruction, quantity: u64) -> Self {
+        let instrument = Instrument {
+            symbol,
+            asset_type: AssetType::Equity,
+        };
 
-        let order_leg = OrderLeg { instruction, quantity, instrument };
+        let order_leg = OrderLeg {
+            instruction,
+            quantity,
+            instrument,
+        };
 
         Self {
             order_type: OrderType::Market,
@@ -51,8 +52,7 @@ impl Order {
         env: &SchwabAuthEnv,
         pool: &SqlitePool,
     ) -> Result<OrderPlacementResponse, SchwabError> {
-        let access_token =
-            SchwabTokens::get_valid_access_token(pool, env).await?;
+        let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
         let account_hash = env.get_account_hash(pool).await?;
 
         let headers = [
@@ -61,7 +61,10 @@ impl Order {
                 HeaderValue::from_str(&format!("Bearer {access_token}"))?,
             ),
             (header::ACCEPT, HeaderValue::from_str("*/*")?),
-            (header::CONTENT_TYPE, HeaderValue::from_str("application/json")?),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_str("application/json")?,
+            ),
         ]
         .into_iter()
         .collect::<HeaderMap>();
@@ -106,8 +109,7 @@ impl Order {
         env: &SchwabAuthEnv,
         pool: &SqlitePool,
     ) -> Result<OrderStatusResponse, SchwabError> {
-        let access_token =
-            SchwabTokens::get_valid_access_token(pool, env).await?;
+        let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
         let account_hash = env.get_account_hash(pool).await?;
 
         let headers = [
@@ -189,8 +191,7 @@ fn extract_order_id_from_location_header(
         .ok_or_else(|| SchwabError::RequestFailed {
             action: "extract order ID".to_string(),
             status: response.status(),
-            body: "Missing Location header in order placement response"
-                .to_string(),
+            body: "Missing Location header in order placement response".to_string(),
         })?
         .to_str()
         .map_err(|_| SchwabError::RequestFailed {
@@ -201,9 +202,7 @@ fn extract_order_id_from_location_header(
 
     // Extract order ID from URL path: "/trader/v1/accounts/{accountHash}/orders/{orderId}"
     // Must contain the expected path structure
-    if !location.contains("/trader/v1/accounts/")
-        || !location.contains("/orders/")
-    {
+    if !location.contains("/trader/v1/accounts/") || !location.contains("/orders/") {
         return Err(SchwabError::RequestFailed {
             action: "extract order ID".to_string(),
             status: response.status(),
@@ -219,9 +218,7 @@ fn extract_order_id_from_location_header(
         .ok_or_else(|| SchwabError::RequestFailed {
             action: "extract order ID".to_string(),
             status: response.status(),
-            body: format!(
-                "Cannot extract order ID from Location header: {location}"
-            ),
+            body: format!("Cannot extract order ID from Location header: {location}"),
         })?
         .to_string();
 
@@ -229,9 +226,7 @@ fn extract_order_id_from_location_header(
         return Err(SchwabError::RequestFailed {
             action: "extract order ID".to_string(),
             status: response.status(),
-            body: format!(
-                "Empty order ID extracted from Location header: {location}"
-            ),
+            body: format!("Empty order ID extracted from Location header: {location}"),
         });
     }
 
@@ -317,9 +312,7 @@ pub(crate) struct Instrument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{
-        TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens,
-    };
+    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
     use serde_json::json;
 
     #[test]
@@ -441,10 +434,7 @@ mod tests {
         assert_eq!(json["orderStrategyType"], "SINGLE");
         assert_eq!(json["orderLegCollection"][0]["instruction"], "BUY");
         assert_eq!(json["orderLegCollection"][0]["quantity"], 15);
-        assert_eq!(
-            json["orderLegCollection"][0]["instrument"]["symbol"],
-            "XYZ"
-        );
+        assert_eq!(json["orderLegCollection"][0]["instrument"]["symbol"], "XYZ");
         assert_eq!(
             json["orderLegCollection"][0]["instrument"]["assetType"],
             "EQUITY"
@@ -475,10 +465,8 @@ mod tests {
                 .header("authorization", "Bearer test_access_token")
                 .header("accept", "*/*")
                 .header("content-type", "application/json");
-            then.status(201).header(
-                "location",
-                "/trader/v1/accounts/ABC123DEF456/orders/12345",
-            );
+            then.status(201)
+                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
@@ -511,7 +499,8 @@ mod tests {
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(400).json_body(json!({"error": "Invalid order"}));
+            then.status(400)
+                .json_body(json!({"error": "Invalid order"}));
         });
 
         let order = Order::new("INVALID".to_string(), Instruction::Buy, 100);
@@ -525,9 +514,7 @@ mod tests {
         );
     }
 
-    fn create_test_env_with_mock_server(
-        mock_server: &httpmock::MockServer,
-    ) -> SchwabAuthEnv {
+    fn create_test_env_with_mock_server(mock_server: &httpmock::MockServer) -> SchwabAuthEnv {
         SchwabAuthEnv {
             schwab_app_key: "test_app_key".to_string(),
             schwab_app_secret: "test_app_secret".to_string(),
@@ -559,10 +546,8 @@ mod tests {
         let order_mock = server.mock(|when, then| {
             when.method(httpmock::Method::POST)
                 .path("/trader/v1/accounts/ABC123DEF456/orders");
-            then.status(201).header(
-                "location",
-                "/trader/v1/accounts/ABC123DEF456/orders/67890",
-            );
+            then.status(201)
+                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/67890");
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
@@ -878,20 +863,15 @@ mod tests {
                 }));
         });
 
-        let result =
-            Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
         let order_status = result.unwrap();
         assert_eq!(order_status.order_id, Some("1004055538123".to_string()));
         assert!(order_status.is_filled());
-        assert!(
-            (order_status.filled_quantity.unwrap() - 100.0).abs()
-                < f64::EPSILON
-        );
-        let avg_price =
-            order_status.calculate_weighted_average_price().unwrap();
+        assert!((order_status.filled_quantity.unwrap() - 100.0).abs() < f64::EPSILON);
+        let avg_price = order_status.calculate_weighted_average_price().unwrap();
         assert!((avg_price - 150.25).abs() < f64::EPSILON);
         assert_eq!(order_status.price_in_cents().unwrap(), Some(15025));
     }
@@ -932,8 +912,7 @@ mod tests {
                 }));
         });
 
-        let result =
-            Order::get_order_status("1004055538456", &env, &pool).await;
+        let result = Order::get_order_status("1004055538456", &env, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -941,9 +920,7 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538456".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert!(
-            order_status.filled_quantity.unwrap_or(0.0).abs() < f64::EPSILON
-        );
+        assert!(order_status.filled_quantity.unwrap_or(0.0).abs() < f64::EPSILON);
         assert_eq!(order_status.calculate_weighted_average_price(), None);
     }
 
@@ -999,8 +976,7 @@ mod tests {
                 }));
         });
 
-        let result =
-            Order::get_order_status("1004055538789", &env, &pool).await;
+        let result = Order::get_order_status("1004055538789", &env, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1008,13 +984,10 @@ mod tests {
         assert_eq!(order_status.order_id, Some("1004055538789".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
-        assert!(
-            (order_status.filled_quantity.unwrap() - 75.0).abs() < f64::EPSILON
-        );
+        assert!((order_status.filled_quantity.unwrap() - 75.0).abs() < f64::EPSILON);
         // Weighted average: (50 * 100.00 + 25 * 101.00) / 75 = (5000 + 2525) / 75 = 100.33333
         assert!(
-            (order_status.calculate_weighted_average_price().unwrap()
-                - 100.333_333_333_333_33)
+            (order_status.calculate_weighted_average_price().unwrap() - 100.333_333_333_333_33)
                 .abs()
                 < 0.000_001
         );
@@ -1086,8 +1059,7 @@ mod tests {
                 .json_body(json!({"error": "Unauthorized"}));
         });
 
-        let result =
-            Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1125,8 +1097,7 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result =
-            Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1164,8 +1135,7 @@ mod tests {
                 .body("invalid json response");
         });
 
-        let result =
-            Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1200,8 +1170,7 @@ mod tests {
                 .json_body(json!({"error": "Bad Gateway"}));
         });
 
-        let result =
-            Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &pool).await;
 
         account_mock.assert();
         // Should have made at least one request (retry logic is handled by backon)

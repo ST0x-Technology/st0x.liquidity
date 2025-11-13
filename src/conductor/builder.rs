@@ -15,19 +15,13 @@ use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
 
 use super::{
-    Conductor, spawn_event_processor, spawn_onchain_event_receiver,
-    spawn_order_poller, spawn_periodic_accumulated_position_check,
-    spawn_queue_processor,
+    Conductor, spawn_event_processor, spawn_onchain_event_receiver, spawn_order_poller,
+    spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
 
-type ClearStream = Box<
-    dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send,
->;
-type TakeStream = Box<
-    dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
-        + Unpin
-        + Send,
->;
+type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
+type TakeStream =
+    Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
 struct CommonFields<P, B> {
     config: Config,
@@ -67,7 +61,13 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         broker: B,
     ) -> Self {
         Self {
-            common: CommonFields { config, pool, cache, provider, broker },
+            common: CommonFields {
+                config,
+                pool,
+                cache,
+                provider,
+                broker,
+            },
             state: Initial,
         }
     }
@@ -92,9 +92,8 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         + Unpin
         + Send
         + 'static,
-        take_stream: impl Stream<
-            Item = Result<(TakeOrderV3, Log), sol_types::Error>,
-        > + Unpin
+        take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
+        + Unpin
         + Send
         + 'static,
     ) -> ConductorBuilder<P, B, WithDexStreams> {
@@ -138,10 +137,8 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
             self.state.clear_stream,
             self.state.take_stream,
         );
-        let event_processor = spawn_event_processor(
-            self.common.pool.clone(),
-            self.state.event_receiver,
-        );
+        let event_processor =
+            spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.broker.clone(),
             self.common.pool.clone(),

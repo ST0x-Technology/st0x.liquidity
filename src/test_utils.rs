@@ -21,9 +21,7 @@ pub(crate) fn get_test_order() -> OrderV4 {
             store: address!("0x3333333333333333333333333333333333333333"),
             bytecode: bytes!("0x00"),
         },
-        nonce: fixed_bytes!(
-            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        ),
+        nonce: fixed_bytes!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
         validInputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -150,10 +148,7 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_tx_hash(
-        mut self,
-        hash: alloy::primitives::B256,
-    ) -> Self {
+    pub(crate) fn with_tx_hash(mut self, hash: alloy::primitives::B256) -> Self {
         self.trade.tx_hash = hash;
         self
     }

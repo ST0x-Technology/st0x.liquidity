@@ -35,9 +35,7 @@ pub(crate) trait HasSqlite {
     async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
 }
 
-pub(crate) async fn configure_sqlite_pool(
-    database_url: &str,
-) -> Result<SqlitePool, sqlx::Error> {
+pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let pool = SqlitePool::connect(database_url).await?;
 
     // SQLite Concurrency Configuration:
@@ -46,7 +44,9 @@ pub(crate) async fn configure_sqlite_pool(
     // all processes. When both main bot and reporter try to write simultaneously,
     // one will block until the other completes. This is a fundamental SQLite
     // limitation.
-    sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
 
     // Busy Timeout: 10 seconds - when a write is blocked by another process,
     // SQLite will wait up to 10 seconds before failing with "database is locked".
@@ -57,7 +57,9 @@ pub(crate) async fn configure_sqlite_pool(
     //
     // Future: This limitation will be eliminated when migrating to Kafka +
     // Elasticsearch with CQRS pattern for separate read/write paths.
-    sqlx::query("PRAGMA busy_timeout = 10000").execute(&pool).await?;
+    sqlx::query("PRAGMA busy_timeout = 10000")
+        .execute(&pool)
+        .await?;
 
     Ok(pool)
 }
@@ -138,13 +140,11 @@ impl Env {
     pub fn into_config(self) -> Result<Config, clap::Error> {
         let broker = match self.broker {
             SupportedBroker::Schwab => {
-                let schwab_auth =
-                    SchwabAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                let schwab_auth = SchwabAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
                 BrokerConfig::Schwab(schwab_auth)
             }
             SupportedBroker::Alpaca => {
-                let alpaca_auth =
-                    AlpacaAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                let alpaca_auth = AlpacaAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
                 BrokerConfig::Alpaca(alpaca_auth)
             }
             SupportedBroker::DryRun => BrokerConfig::DryRun,
@@ -177,12 +177,8 @@ impl Config {
 
     pub const fn get_order_poller_config(&self) -> OrderPollerConfig {
         OrderPollerConfig {
-            polling_interval: std::time::Duration::from_secs(
-                self.order_polling_interval,
-            ),
-            max_jitter: std::time::Duration::from_secs(
-                self.order_polling_max_jitter,
-            ),
+            polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
+            max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
         }
     }
 }
@@ -209,18 +205,14 @@ pub mod tests {
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    pub fn create_test_config_with_order_owner(
-        order_owner: alloy::primitives::Address,
-    ) -> Config {
+    pub fn create_test_config_with_order_owner(order_owner: alloy::primitives::Address) -> Config {
         Config {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
-                orderbook: address!(
-                    "0x1111111111111111111111111111111111111111"
-                ),
+                orderbook: address!("0x1111111111111111111111111111111111111111"),
                 order_owner,
                 deployment_block: 1,
             },
@@ -239,9 +231,7 @@ pub mod tests {
     }
 
     pub fn create_test_config() -> Config {
-        create_test_config_with_order_owner(address!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        ))
+        create_test_config_with_order_owner(address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
     }
 
     #[test]
@@ -283,8 +273,10 @@ pub mod tests {
         let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
             panic!("Expected Schwab broker config");
         };
-        let schwab_config =
-            SchwabConfig { auth: schwab_auth.clone(), pool: pool.clone() };
+        let schwab_config = SchwabConfig {
+            auth: schwab_auth.clone(),
+            pool: pool.clone(),
+        };
         let schwab_result = schwab_config.try_into_broker().await;
         assert!(schwab_result.is_err());
 

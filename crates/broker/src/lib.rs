@@ -14,9 +14,7 @@ pub mod test_utils;
 pub use alpaca::AlpacaBroker;
 pub use error::PersistenceError;
 pub use mock::{MockBroker, MockBrokerConfig};
-pub use order::{
-    MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate,
-};
+pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::SchwabBroker;
 
 use alpaca::{AlpacaAuthEnv, MarketHoursError};
@@ -35,9 +33,7 @@ pub trait Broker: Send + Sync + 'static {
 
     /// Wait until market opens (blocks if market closed), then return time until market close
     /// Implementations without market hours should return a very long duration
-    async fn wait_until_market_open(
-        &self,
-    ) -> Result<std::time::Duration, Self::Error>;
+    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error>;
 
     /// Place a market order for the specified symbol and quantity
     /// Returns order placement details including broker-assigned order ID
@@ -48,16 +44,11 @@ pub trait Broker: Send + Sync + 'static {
 
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed
-    async fn get_order_status(
-        &self,
-        order_id: &Self::OrderId,
-    ) -> Result<OrderState, Self::Error>;
+    async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
 
     /// Poll all pending orders for status updates
     /// More efficient than individual get_order_status calls for multiple orders
-    async fn poll_pending_orders(
-        &self,
-    ) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
+    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
     /// Return the enum variant representing this broker type
     /// Used for database storage and conditional logic
@@ -65,10 +56,7 @@ pub trait Broker: Send + Sync + 'static {
 
     /// Convert a string representation to the broker's OrderId type
     /// This is needed for converting database-stored order IDs back to broker types
-    fn parse_order_id(
-        &self,
-        order_id_str: &str,
-    ) -> Result<Self::OrderId, Self::Error>;
+    fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error>;
 
     /// Run broker-specific maintenance tasks (token refresh, connection health, etc.)
     /// Returns None if no maintenance needed, Some(handle) if maintenance task spawned
@@ -124,9 +112,11 @@ impl Shares {
                 reason: "Shares must be greater than 0".to_string(),
             });
         }
-        u32::try_from(shares).map(Self).map_err(|_| BrokerError::InvalidOrder {
-            reason: "Shares exceeds maximum allowed value".to_string(),
-        })
+        u32::try_from(shares)
+            .map(Self)
+            .map_err(|_| BrokerError::InvalidOrder {
+                reason: "Shares exceeds maximum allowed value".to_string(),
+            })
     }
 
     pub fn value(&self) -> u32 {
@@ -277,18 +267,14 @@ impl From<apca::Error> for BrokerError {
 pub trait TryIntoBroker {
     type Broker: Broker;
 
-    async fn try_into_broker(
-        self,
-    ) -> Result<Self::Broker, <Self::Broker as Broker>::Error>;
+    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error>;
 }
 
 #[async_trait]
 impl TryIntoBroker for schwab::SchwabConfig {
     type Broker = SchwabBroker;
 
-    async fn try_into_broker(
-        self,
-    ) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
+    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
         SchwabBroker::try_from_config(self).await
     }
 }
@@ -297,9 +283,7 @@ impl TryIntoBroker for schwab::SchwabConfig {
 impl TryIntoBroker for AlpacaAuthEnv {
     type Broker = AlpacaBroker;
 
-    async fn try_into_broker(
-        self,
-    ) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
+    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
         AlpacaBroker::try_from_config(self).await
     }
 }
@@ -308,9 +292,7 @@ impl TryIntoBroker for AlpacaAuthEnv {
 impl TryIntoBroker for MockBrokerConfig {
     type Broker = MockBroker;
 
-    async fn try_into_broker(
-        self,
-    ) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
+    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
         MockBroker::try_from_config(self).await
     }
 }

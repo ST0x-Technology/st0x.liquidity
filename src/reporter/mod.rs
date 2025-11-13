@@ -68,16 +68,12 @@ impl Trade {
         price_usdc: f64,
         created_at: Option<chrono::NaiveDateTime>,
     ) -> anyhow::Result<Self> {
-        let quantity = Decimal::from_f64_retain(amount).ok_or_else(|| {
-            anyhow::anyhow!("Failed to convert amount f64 to Decimal: {amount}")
-        })?;
+        let quantity = Decimal::from_f64_retain(amount)
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert amount f64 to Decimal: {amount}"))?;
 
-        let price_per_share =
-            Decimal::from_f64_retain(price_usdc).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to convert price_usdc f64 to Decimal: {price_usdc}"
-                )
-            })?;
+        let price_per_share = Decimal::from_f64_retain(price_usdc).ok_or_else(|| {
+            anyhow::anyhow!("Failed to convert price_usdc f64 to Decimal: {price_usdc}")
+        })?;
 
         let direction = direction
             .parse()
@@ -106,13 +102,11 @@ impl Trade {
         price_cents: Option<i64>,
         executed_at: Option<chrono::NaiveDateTime>,
     ) -> anyhow::Result<Self> {
-        let executed_at = executed_at.ok_or_else(|| {
-            anyhow::anyhow!("FILLED execution missing executed_at")
-        })?;
+        let executed_at =
+            executed_at.ok_or_else(|| anyhow::anyhow!("FILLED execution missing executed_at"))?;
 
-        let price_cents = price_cents.ok_or_else(|| {
-            anyhow::anyhow!("FILLED execution missing price_cents")
-        })?;
+        let price_cents =
+            price_cents.ok_or_else(|| anyhow::anyhow!("FILLED execution missing price_cents"))?;
 
         let quantity = Decimal::from(shares);
 
@@ -143,33 +137,33 @@ impl Trade {
 
         let direction_str = self.direction.as_str();
 
-        let quantity_f64 = self.quantity.to_f64().ok_or_else(|| {
-            anyhow::anyhow!("Failed to convert quantity to f64")
-        })?;
+        let quantity_f64 = self
+            .quantity
+            .to_f64()
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert quantity to f64"))?;
 
-        let price_per_share_f64 =
-            self.price_per_share.to_f64().ok_or_else(|| {
-                anyhow::anyhow!("Failed to convert price_per_share to f64")
-            })?;
+        let price_per_share_f64 = self
+            .price_per_share
+            .to_f64()
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert price_per_share to f64"))?;
 
         let realized_pnl_f64 = result
             .realized_pnl
             .map(|p| {
-                p.to_f64().ok_or_else(|| {
-                    anyhow::anyhow!("Failed to convert realized_pnl to f64")
-                })
+                p.to_f64()
+                    .ok_or_else(|| anyhow::anyhow!("Failed to convert realized_pnl to f64"))
             })
             .transpose()?;
 
-        let cumulative_pnl_f64 =
-            result.cumulative_pnl.to_f64().ok_or_else(|| {
-                anyhow::anyhow!("Failed to convert cumulative_pnl to f64")
-            })?;
+        let cumulative_pnl_f64 = result
+            .cumulative_pnl
+            .to_f64()
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert cumulative_pnl to f64"))?;
 
-        let net_position_after_f64 =
-            result.net_position_after.to_f64().ok_or_else(|| {
-                anyhow::anyhow!("Failed to convert net_position_after to f64")
-            })?;
+        let net_position_after_f64 = result
+            .net_position_after
+            .to_f64()
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert net_position_after to f64"))?;
 
         Ok(DbMetricsRow {
             symbol: self.symbol.as_str().to_string(),
@@ -206,9 +200,7 @@ struct Checkpoint {
     trade_id: i64,
 }
 
-async fn load_checkpoint(
-    pool: &SqlitePool,
-) -> anyhow::Result<Option<Checkpoint>> {
+async fn load_checkpoint(pool: &SqlitePool) -> anyhow::Result<Option<Checkpoint>> {
     let result = sqlx::query!(
         "SELECT timestamp, trade_type, trade_id
          FROM metrics_pnl
@@ -220,10 +212,10 @@ async fn load_checkpoint(
 
     result
         .map(|row| {
-            let trade_type: TradeType =
-                row.trade_type.parse().map_err(|e: String| {
-                    anyhow::anyhow!("Failed to parse trade_type: {e}")
-                })?;
+            let trade_type: TradeType = row
+                .trade_type
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!("Failed to parse trade_type: {e}"))?;
 
             Ok(Checkpoint {
                 timestamp: row.timestamp.and_utc(),
@@ -316,21 +308,14 @@ fn rebuild_fifo_state(
                 .or_insert_with(FifoInventory::new);
 
             inventory
-                .process_trade(
-                    trade.quantity,
-                    trade.price_per_share,
-                    trade.direction,
-                )
+                .process_trade(trade.quantity, trade.price_per_share, trade.direction)
                 .map_err(|e| anyhow::anyhow!("FIFO processing error: {e}"))?;
 
             Ok(inventories)
         })
 }
 
-async fn persist_metrics_row(
-    pool: &SqlitePool,
-    row: &DbMetricsRow,
-) -> anyhow::Result<()> {
+async fn persist_metrics_row(pool: &SqlitePool, row: &DbMetricsRow) -> anyhow::Result<()> {
     sqlx::query!(
         "INSERT INTO metrics_pnl (
             symbol,
@@ -379,9 +364,7 @@ async fn process_and_persist_trade(
     persist_metrics_row(pool, &row).await
 }
 
-pub(crate) async fn process_iteration(
-    pool: &SqlitePool,
-) -> anyhow::Result<usize> {
+pub(crate) async fn process_iteration(pool: &SqlitePool) -> anyhow::Result<usize> {
     let checkpoint = load_checkpoint(pool).await?;
 
     if checkpoint.is_none() {
@@ -469,15 +452,9 @@ mod tests {
     async fn test_trade_from_onchain_row() {
         let naive_dt = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
 
-        let trade = Trade::from_onchain_row(
-            1,
-            "AAPL".to_string(),
-            10.0,
-            "BUY",
-            100.0,
-            Some(naive_dt),
-        )
-        .unwrap();
+        let trade =
+            Trade::from_onchain_row(1, "AAPL".to_string(), 10.0, "BUY", 100.0, Some(naive_dt))
+                .unwrap();
 
         assert_eq!(trade.id, 1);
         assert_eq!(trade.symbol.as_str(), "AAPL");
@@ -541,8 +518,7 @@ mod tests {
         timestamp: DateTime<Utc>,
     ) {
         let tx_hash = format!("0x{:064x}", rand::random::<u64>());
-        let log_index = i64::try_from(rand::random::<u64>() % 1000)
-            .expect("log_index overflow");
+        let log_index = i64::try_from(rand::random::<u64>() % 1000).expect("log_index overflow");
         let naive_timestamp = timestamp.naive_utc();
 
         sqlx::query!(
@@ -610,10 +586,7 @@ mod tests {
         trade_type: String,
     }
 
-    async fn query_all_pnl_metrics(
-        pool: &SqlitePool,
-        symbol: &str,
-    ) -> Vec<PnlMetric> {
+    async fn query_all_pnl_metrics(pool: &SqlitePool, symbol: &str) -> Vec<PnlMetric> {
         let rows = sqlx::query!(
             "SELECT
                 trade_type,
@@ -677,7 +650,9 @@ mod tests {
         insert_onchain_trade(&pool, "AAPL", 50.0, 12.0, "BUY", t2).await;
         insert_onchain_trade(&pool, "AAPL", 80.0, 11.0, "SELL", t3).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
 
         let metrics = query_all_pnl_metrics(&pool, "AAPL").await;
         assert_eq!(metrics.len(), 3);
@@ -697,7 +672,9 @@ mod tests {
         insert_onchain_trade(&pool, "AAPL", 100.0, 10.0, "BUY", t1).await;
         insert_onchain_trade(&pool, "AAPL", 150.0, 11.0, "SELL", t2).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
 
         let metrics = query_all_pnl_metrics(&pool, "AAPL").await;
         assert_eq!(metrics.len(), 2);
@@ -747,7 +724,9 @@ mod tests {
         insert_offchain_trade(&pool, "AAPL", 50, "SELL", 1100, t2).await;
         insert_onchain_trade(&pool, "AAPL", 30.0, 12.0, "SELL", t3).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
 
         let metrics = query_all_pnl_metrics(&pool, "AAPL").await;
         assert_eq!(metrics.len(), 3);
@@ -772,7 +751,9 @@ mod tests {
         insert_onchain_trade(&pool, "AAPL", 100.0, 12.0, "SELL", t2).await;
         insert_onchain_trade(&pool, "MSFT", 50.0, 210.0, "SELL", t2).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
 
         let aapl_metrics = query_all_pnl_metrics(&pool, "AAPL").await;
         assert_eq!(aapl_metrics.len(), 2);
@@ -791,7 +772,9 @@ mod tests {
 
         insert_onchain_trade(&pool, "AAPL", 100.0, 10.0, "BUY", t1).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
         let count = process_iteration(&pool)
             .await
             .expect("Failed to process iteration");
@@ -807,28 +790,20 @@ mod tests {
         let pool = create_test_pool().await;
 
         let timestamps: Vec<_> = (1..=7)
-            .map(|i| {
-                DateTime::from_timestamp(i * 1000, 0)
-                    .expect("Invalid timestamp")
-            })
+            .map(|i| DateTime::from_timestamp(i * 1000, 0).expect("Invalid timestamp"))
             .collect();
 
-        insert_onchain_trade(&pool, "AAPL", 100.0, 10.0, "BUY", timestamps[0])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 50.0, 12.0, "BUY", timestamps[1])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 80.0, 11.0, "SELL", timestamps[2])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 60.0, 9.5, "SELL", timestamps[3])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 30.0, 12.2, "BUY", timestamps[4])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 70.0, 12.0, "SELL", timestamps[5])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 20.0, 11.5, "BUY", timestamps[6])
-            .await;
+        insert_onchain_trade(&pool, "AAPL", 100.0, 10.0, "BUY", timestamps[0]).await;
+        insert_onchain_trade(&pool, "AAPL", 50.0, 12.0, "BUY", timestamps[1]).await;
+        insert_onchain_trade(&pool, "AAPL", 80.0, 11.0, "SELL", timestamps[2]).await;
+        insert_onchain_trade(&pool, "AAPL", 60.0, 9.5, "SELL", timestamps[3]).await;
+        insert_onchain_trade(&pool, "AAPL", 30.0, 12.2, "BUY", timestamps[4]).await;
+        insert_onchain_trade(&pool, "AAPL", 70.0, 12.0, "SELL", timestamps[5]).await;
+        insert_onchain_trade(&pool, "AAPL", 20.0, 11.5, "BUY", timestamps[6]).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
 
         let metrics = query_all_pnl_metrics(&pool, "AAPL").await;
         assert_eq!(metrics.len(), 7);
@@ -867,22 +842,17 @@ mod tests {
         let pool = create_test_pool().await;
 
         let timestamps: Vec<_> = (1..=4)
-            .map(|i| {
-                DateTime::from_timestamp(i * 1000, 0)
-                    .expect("Invalid timestamp")
-            })
+            .map(|i| DateTime::from_timestamp(i * 1000, 0).expect("Invalid timestamp"))
             .collect();
 
-        insert_onchain_trade(&pool, "AAPL", 0.3, 150.0, "SELL", timestamps[0])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 0.4, 151.0, "SELL", timestamps[1])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 0.5, 149.0, "SELL", timestamps[2])
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 0.6, 148.0, "BUY", timestamps[3])
-            .await;
+        insert_onchain_trade(&pool, "AAPL", 0.3, 150.0, "SELL", timestamps[0]).await;
+        insert_onchain_trade(&pool, "AAPL", 0.4, 151.0, "SELL", timestamps[1]).await;
+        insert_onchain_trade(&pool, "AAPL", 0.5, 149.0, "SELL", timestamps[2]).await;
+        insert_onchain_trade(&pool, "AAPL", 0.6, 148.0, "BUY", timestamps[3]).await;
 
-        process_iteration(&pool).await.expect("Failed to process iteration");
+        process_iteration(&pool)
+            .await
+            .expect("Failed to process iteration");
 
         let metrics = query_all_pnl_metrics(&pool, "AAPL").await;
         assert_eq!(metrics.len(), 4);
@@ -910,13 +880,10 @@ mod tests {
     async fn test_same_timestamp_trades_not_skipped() {
         let pool = create_test_pool().await;
 
-        let same_timestamp =
-            DateTime::from_timestamp(1000, 0).expect("Invalid timestamp");
+        let same_timestamp = DateTime::from_timestamp(1000, 0).expect("Invalid timestamp");
 
-        insert_onchain_trade(&pool, "AAPL", 100.0, 10.0, "BUY", same_timestamp)
-            .await;
-        insert_onchain_trade(&pool, "AAPL", 50.0, 11.0, "BUY", same_timestamp)
-            .await;
+        insert_onchain_trade(&pool, "AAPL", 100.0, 10.0, "BUY", same_timestamp).await;
+        insert_onchain_trade(&pool, "AAPL", 50.0, 11.0, "BUY", same_timestamp).await;
 
         let count = process_iteration(&pool)
             .await
@@ -930,8 +897,7 @@ mod tests {
             "Should have 2 metrics after first iteration"
         );
 
-        insert_onchain_trade(&pool, "AAPL", 30.0, 12.0, "BUY", same_timestamp)
-            .await;
+        insert_onchain_trade(&pool, "AAPL", 30.0, 12.0, "BUY", same_timestamp).await;
 
         let count = process_iteration(&pool)
             .await

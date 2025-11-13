@@ -38,21 +38,11 @@ pub(crate) async fn backfill_events<P: Provider + Clone>(
     end_block: u64,
 ) -> Result<(), OnChainError> {
     let retry_strat = get_backfill_retry_strat();
-    backfill_events_with_retry_strat(
-        pool,
-        provider,
-        evm_env,
-        end_block,
-        retry_strat,
-    )
-    .await
+    backfill_events_with_retry_strat(pool, provider, evm_env, end_block, retry_strat).await
 }
 
 #[tracing::instrument(skip(pool, provider, evm_env, retry_strategy), fields(end_block), level = tracing::Level::INFO)]
-async fn backfill_events_with_retry_strat<
-    P: Provider + Clone,
-    B: BackoffBuilder + Clone,
->(
+async fn backfill_events_with_retry_strat<P: Provider + Clone, B: BackoffBuilder + Clone>(
     pool: &SqlitePool,
     provider: &P,
     evm_env: &EvmEnv,
@@ -60,8 +50,9 @@ async fn backfill_events_with_retry_strat<
     retry_strategy: B,
 ) -> Result<(), OnChainError> {
     // Query the last processed block from event_queue to determine start point
-    let start_block =
-        crate::queue::get_max_processed_block(pool).await?.map_or_else(
+    let start_block = crate::queue::get_max_processed_block(pool)
+        .await?
+        .map_or_else(
             || {
                 info!(
                     "Starting initial backfill from deployment block {}",
@@ -81,7 +72,10 @@ async fn backfill_events_with_retry_strat<
 
     // Skip if we're already caught up
     if start_block > end_block {
-        info!("Already caught up to block {}, skipping backfill", end_block);
+        info!(
+            "Already caught up to block {}, skipping backfill",
+            end_block
+        );
         return Ok(());
     }
 
@@ -122,10 +116,7 @@ async fn backfill_events_with_retry_strat<
 }
 
 #[tracing::instrument(skip(pool, provider, evm_env, retry_strategy), fields(batch_start, batch_end), level = tracing::Level::DEBUG)]
-async fn enqueue_batch_events<
-    P: Provider + Clone,
-    B: BackoffBuilder + Clone,
->(
+async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     pool: &SqlitePool,
     provider: &P,
     evm_env: &EvmEnv,
@@ -185,8 +176,10 @@ async fn enqueue_batch_events<
         batch_end
     );
 
-    let all_logs =
-        clear_logs.into_iter().chain(take_logs.into_iter()).collect::<Vec<_>>();
+    let all_logs = clear_logs
+        .into_iter()
+        .chain(take_logs.into_iter())
+        .collect::<Vec<_>>();
 
     let enqueue_tasks = all_logs
         .into_iter()
@@ -237,8 +230,7 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
     (start_block..=end_block)
         .step_by(BACKFILL_BATCH_SIZE)
         .map(|batch_start| {
-            let batch_end = (batch_start
-                + u64::try_from(BACKFILL_BATCH_SIZE).unwrap_or(u64::MAX)
+            let batch_end = (batch_start + u64::try_from(BACKFILL_BATCH_SIZE).unwrap_or(u64::MAX)
                 - 1)
             .min(end_block);
             (batch_start, batch_end)
@@ -249,12 +241,8 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use crate::onchain::trade::TradeEvent;
-    use crate::queue::{
-        count_unprocessed, get_next_unprocessed_event, mark_event_processed,
-    };
-    use alloy::primitives::{
-        FixedBytes, IntoLogData, U256, address, fixed_bytes,
-    };
+    use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
+    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
@@ -274,12 +262,8 @@ mod tests {
             .with_max_delay(Duration::from_millis(10))
     }
 
-    fn u256_to_float(
-        value: alloy::primitives::U256,
-        decimals: u8,
-    ) -> alloy::primitives::B256 {
-        let float = Float::from_fixed_decimal_lossy(value, decimals)
-            .expect("valid Float");
+    fn u256_to_float(value: alloy::primitives::U256, decimals: u8) -> alloy::primitives::B256 {
+        let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
         float.get_inner()
     }
 
@@ -299,7 +283,9 @@ mod tests {
             deployment_block: 1,
         };
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
@@ -375,9 +361,8 @@ mod tests {
             deployment_block: 1,
         };
 
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_config = IOrderBookV5::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
@@ -416,14 +401,15 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
 
         // Verify the enqueued event details
-        let queued_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, tx_hash);
         assert_eq!(queued_event.log_index, 1);
         assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
@@ -449,15 +435,11 @@ mod tests {
                 signedContext: Vec::new(),
             },
             input: u256_to_float(U256::from(100_000_000), 0),
-            output: u256_to_float(
-                U256::from_str("9000000000000000000").unwrap(),
-                18,
-            ),
+            output: u256_to_float(U256::from_str("9000000000000000000").unwrap(), 18),
         };
 
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         let take_log = Log {
             inner: alloy::primitives::Log {
                 address: evm_env.orderbook,
@@ -485,15 +467,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         // Check that one event was enqueued
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
 
         // Verify the enqueued event details
-        let queued_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, tx_hash);
         assert_eq!(queued_event.log_index, 1);
         assert!(matches!(queued_event.event, TradeEvent::TakeOrderV3(_)));
@@ -547,7 +530,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         // Should enqueue the event (filtering happens during queue processing, not backfill)
         let count = count_unprocessed(&pool).await.unwrap();
@@ -602,7 +587,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
@@ -658,22 +645,16 @@ mod tests {
             deployment_block: 1,
         };
 
-        let tx_hash1 = fixed_bytes!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        );
-        let tx_hash2 = fixed_bytes!(
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-        );
+        let tx_hash1 =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let tx_hash2 =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let take_event1 =
-            create_test_take_event(&order, 100_000_000, "1000000000000000000");
-        let take_event2 =
-            create_test_take_event(&order, 200_000_000, "2000000000000000000");
+        let take_event1 = create_test_take_event(&order, 100_000_000, "1000000000000000000");
+        let take_event2 = create_test_take_event(&order, 200_000_000, "2000000000000000000");
 
-        let take_log1 =
-            create_test_log(evm_env.orderbook, &take_event1, 50, tx_hash1);
-        let take_log2 =
-            create_test_log(evm_env.orderbook, &take_event2, 100, tx_hash2);
+        let take_log1 = create_test_log(evm_env.orderbook, &take_event1, 50, tx_hash1);
+        let take_log2 = create_test_log(evm_env.orderbook, &take_event2, 100, tx_hash2);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(200u64));
@@ -696,15 +677,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         // Check that two events were enqueued
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 2);
 
         // Verify the first event (earlier block number)
-        let first_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(first_event.tx_hash, tx_hash1);
         assert_eq!(first_event.block_number, 50);
 
@@ -715,8 +697,7 @@ mod tests {
             .unwrap();
         sql_tx.commit().await.unwrap();
 
-        let second_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(second_event.tx_hash, tx_hash2);
         assert_eq!(second_event.block_number, 100);
     }
@@ -743,7 +724,9 @@ mod tests {
         asserter.push_success(&serde_json::json!([]));
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        backfill_events(&pool, &provider, &evm_env, 2500).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 2500)
+            .await
+            .unwrap();
 
         // Verifies that batching correctly handles the expected number of RPC calls
         let count = count_unprocessed(&pool).await.unwrap();
@@ -799,13 +782,10 @@ mod tests {
             deployment_block: 1,
         };
 
-        let tx_hash = fixed_bytes!(
-            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd"
-        );
-        let take_event =
-            create_test_take_event(&order, 500_000_000, "5000000000000000000");
-        let take_log =
-            create_test_log(evm_env.orderbook, &take_event, 150, tx_hash);
+        let tx_hash =
+            fixed_bytes!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+        let take_event = create_test_take_event(&order, 500_000_000, "5000000000000000000");
+        let take_log = create_test_log(evm_env.orderbook, &take_event, 150, tx_hash);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::json!([]));
@@ -813,22 +793,15 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let enqueued_count = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await
-        .unwrap();
+        let enqueued_count =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy())
+                .await
+                .unwrap();
 
         assert_eq!(enqueued_count, 1);
 
         // Verify the enqueued event
-        let queued_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, tx_hash);
         assert_eq!(queued_event.block_number, 150);
     }
@@ -850,7 +823,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
@@ -905,15 +880,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events_with_retry_strat(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            test_retry_strategy(),
-        )
-        .await
-        .unwrap();
+        backfill_events_with_retry_strat(&pool, &provider, &evm_env, 100, test_retry_strategy())
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
@@ -930,38 +899,22 @@ mod tests {
             deployment_block: 1,
         };
 
-        let valid_take_event =
-            create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let valid_take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
 
         // Create different order with different hash to make it invalid
         let mut different_order = get_test_order();
-        different_order.nonce = fixed_bytes!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        ); // Change nonce to make hash different
-        let invalid_take_event = create_test_take_event(
-            &different_order,
-            50_000_000,
-            "5000000000000000000",
-        );
+        different_order.nonce =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"); // Change nonce to make hash different
+        let invalid_take_event =
+            create_test_take_event(&different_order, 50_000_000, "5000000000000000000");
 
-        let valid_tx_hash = fixed_bytes!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        );
-        let invalid_tx_hash = fixed_bytes!(
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-        );
-        let valid_log = create_test_log(
-            evm_env.orderbook,
-            &valid_take_event,
-            50,
-            valid_tx_hash,
-        );
-        let invalid_log = create_test_log(
-            evm_env.orderbook,
-            &invalid_take_event,
-            51,
-            invalid_tx_hash,
-        );
+        let valid_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let invalid_tx_hash =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let valid_log = create_test_log(evm_env.orderbook, &valid_take_event, 50, valid_tx_hash);
+        let invalid_log =
+            create_test_log(evm_env.orderbook, &invalid_take_event, 51, invalid_tx_hash);
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64));
@@ -970,7 +923,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         // Both events should be enqueued (filtering happens during processing, not backfill)
         let count = count_unprocessed(&pool).await.unwrap();
@@ -988,17 +943,13 @@ mod tests {
             deployment_block: 1,
         };
 
-        let tx_hash1 = fixed_bytes!(
-            "0x1111111111111111111111111111111111111111111111111111111111111111"
-        );
-        let tx_hash2 = fixed_bytes!(
-            "0x2222222222222222222222222222222222222222222222222222222222222222"
-        );
+        let tx_hash1 =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let tx_hash2 =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let take_event =
-            create_test_take_event(&order, 100_000_000, "9000000000000000000");
-        let take_log =
-            create_test_log(evm_env.orderbook, &take_event, 50, tx_hash1);
+        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_log = create_test_log(evm_env.orderbook, &take_event, 50, tx_hash1);
 
         let clear_config = IOrderBookV5::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
@@ -1033,16 +984,10 @@ mod tests {
         let after_clear_event = IOrderBookV5::AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: IOrderBookV5::ClearStateChangeV2 {
-                aliceOutput: u256_to_float(
-                    U256::from_str("5000000000000000000").unwrap(),
-                    18,
-                ), // 5 shares
+                aliceOutput: u256_to_float(U256::from_str("5000000000000000000").unwrap(), 18), // 5 shares
                 bobOutput: u256_to_float(U256::from(50_000_000u64), 0), // 50 USDC cents
                 aliceInput: u256_to_float(U256::from(50_000_000u64), 0),
-                bobInput: u256_to_float(
-                    U256::from_str("5000000000000000000").unwrap(),
-                    18,
-                ),
+                bobInput: u256_to_float(U256::from_str("5000000000000000000").unwrap(), 18),
             },
         };
 
@@ -1088,15 +1033,16 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         // Check that two events were enqueued
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 2);
 
         // Verify the first event (earlier block number)
-        let first_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(first_event.tx_hash, tx_hash1);
         assert_eq!(first_event.block_number, 50);
 
@@ -1107,8 +1053,7 @@ mod tests {
             .unwrap();
         sql_tx.commit().await.unwrap();
 
-        let second_event =
-            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(second_event.tx_hash, tx_hash2);
         assert_eq!(second_event.block_number, 100);
     }
@@ -1132,15 +1077,8 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
 
         assert!(result.is_ok());
         let enqueued_count = result.unwrap();
@@ -1169,15 +1107,8 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), OnChainError::Alloy(_)));
@@ -1261,7 +1192,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         // Corrupted logs are silently ignored during backfill
         let count = count_unprocessed(&pool).await.unwrap();
@@ -1285,7 +1218,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 0);
@@ -1302,15 +1237,12 @@ mod tests {
         };
 
         let order = get_test_order();
-        let take_event =
-            create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
             50,
-            fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"),
         );
 
         let asserter = Asserter::new();
@@ -1322,15 +1254,8 @@ mod tests {
         // Close the database to simulate connection failure
         pool.close().await;
 
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
 
         // Should succeed at RPC level but fail at database level
         // The function handles enqueue failures gracefully by continuing
@@ -1355,15 +1280,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         // Test with specific block range
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            150,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 150, test_retry_strategy()).await;
         assert_eq!(result.unwrap(), 0);
     }
 
@@ -1380,26 +1298,20 @@ mod tests {
         let order = get_test_order();
 
         // Create multiple events
-        let take_event1 =
-            create_test_take_event(&order, 100_000_000, "9000000000000000000");
-        let take_event2 =
-            create_test_take_event(&order, 200_000_000, "18000000000000000000");
+        let take_event1 = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event2 = create_test_take_event(&order, 200_000_000, "18000000000000000000");
 
         let take_log1 = create_test_log(
             evm_env.orderbook,
             &take_event1,
             50,
-            fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"),
         );
         let take_log2 = create_test_log(
             evm_env.orderbook,
             &take_event2,
             51,
-            fixed_bytes!(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            ),
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222"),
         );
 
         let asserter = Asserter::new();
@@ -1408,15 +1320,8 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
 
         // Should succeed with 2 events enqueued
         assert!(result.is_ok());
@@ -1434,15 +1339,12 @@ mod tests {
         };
 
         let order = get_test_order();
-        let take_event =
-            create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
             50,
-            fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"),
         );
 
         let asserter = Asserter::new();
@@ -1463,7 +1365,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 3000).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 3000)
+            .await
+            .unwrap();
 
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -1490,15 +1394,8 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let start_time = std::time::Instant::now();
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
         let elapsed = start_time.elapsed();
 
         // Should succeed after retries
@@ -1574,15 +1471,12 @@ mod tests {
         };
 
         // Create a TakeOrderV3 event
-        let take_event =
-            create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
             51,
-            fixed_bytes!(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            ),
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222"),
         );
 
         let asserter = Asserter::new();
@@ -1591,15 +1485,8 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        let result = enqueue_batch_events(
-            &pool,
-            &provider,
-            &evm_env,
-            100,
-            200,
-            test_retry_strategy(),
-        )
-        .await;
+        let result =
+            enqueue_batch_events(&pool, &provider, &evm_env, 100, 200, test_retry_strategy()).await;
 
         // Should process both event types
         assert!(result.is_ok());
@@ -1640,7 +1527,9 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         // Should start from block 101 (last processed + 1), not deployment_block
-        backfill_events(&pool, &provider, &evm_env, 200).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 200)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1661,7 +1550,9 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 100).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 100)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1691,7 +1582,9 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         // Last processed: 150, end_block: 150, so start would be 151 > 150
-        backfill_events(&pool, &provider, &evm_env, 150).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 150)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1727,6 +1620,8 @@ mod tests {
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
-        backfill_events(&pool, &provider, &evm_env, 200).await.unwrap();
+        backfill_events(&pool, &provider, &evm_env, 200)
+            .await
+            .unwrap();
     }
 }

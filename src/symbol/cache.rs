@@ -35,10 +35,7 @@ impl SymbolCache {
 
         let erc20 = IERC20Instance::new(io.token, provider);
         let symbol = (|| async { erc20.symbol().call().await })
-            .retry(
-                ExponentialBuilder::new()
-                    .with_max_times(SYMBOL_FETCH_MAX_RETRIES),
-            )
+            .retry(ExponentialBuilder::new().with_max_times(SYMBOL_FETCH_MAX_RETRIES))
             .await?;
 
         match self.map.write() {
@@ -67,8 +64,10 @@ mod tests {
             .expect("Test cache lock poisoned")
             .insert(address, "TEST".to_string());
 
-        let io =
-            IOV2 { token: address, vaultId: alloy::primitives::B256::ZERO };
+        let io = IOV2 {
+            token: address,
+            vaultId: alloy::primitives::B256::ZERO,
+        };
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -81,8 +80,10 @@ mod tests {
         let cache = SymbolCache::default();
         let address = address!("0x1234567890123456789012345678901234567890");
 
-        let io =
-            IOV2 { token: address, vaultId: alloy::primitives::B256::ZERO };
+        let io = IOV2 {
+            token: address,
+            vaultId: alloy::primitives::B256::ZERO,
+        };
 
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure");

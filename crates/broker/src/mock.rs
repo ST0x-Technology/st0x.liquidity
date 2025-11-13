@@ -7,8 +7,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::{
-    Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate,
-    SupportedBroker,
+    Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate, SupportedBroker,
 };
 
 /// Configuration for MockBroker
@@ -58,16 +57,12 @@ impl Broker for MockBroker {
     type OrderId = String;
     type Config = MockBrokerConfig;
 
-    async fn try_from_config(
-        _config: Self::Config,
-    ) -> Result<Self, Self::Error> {
+    async fn try_from_config(_config: Self::Config) -> Result<Self, Self::Error> {
         warn!("[MOCK] Initializing mock broker - always ready in dry-run mode");
         Ok(Self::new())
     }
 
-    async fn wait_until_market_open(
-        &self,
-    ) -> Result<std::time::Duration, Self::Error> {
+    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
         info!("[TEST] Market hours check - market is always open in test mode");
         // Test broker should never block on market hours, so return Duration::MAX
         // to signal no time limit
@@ -80,9 +75,7 @@ impl Broker for MockBroker {
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         if self.should_fail {
-            return Err(BrokerError::OrderPlacement(
-                self.failure_message.clone(),
-            ));
+            return Err(BrokerError::OrderPlacement(self.failure_message.clone()));
         }
 
         let order_id = self.generate_order_id();
@@ -101,10 +94,7 @@ impl Broker for MockBroker {
         })
     }
 
-    async fn get_order_status(
-        &self,
-        order_id: &Self::OrderId,
-    ) -> Result<OrderState, Self::Error> {
+    async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error> {
         if self.should_fail {
             return Err(BrokerError::OrderNotFound {
                 order_id: order_id.clone(),
@@ -122,9 +112,7 @@ impl Broker for MockBroker {
         })
     }
 
-    async fn poll_pending_orders(
-        &self,
-    ) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
+    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
         if self.should_fail {
             return Err(BrokerError::Network(self.failure_message.clone()));
         }
@@ -139,10 +127,7 @@ impl Broker for MockBroker {
         SupportedBroker::DryRun
     }
 
-    fn parse_order_id(
-        &self,
-        order_id_str: &str,
-    ) -> Result<Self::OrderId, Self::Error> {
+    fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
         // For MockBroker, OrderId is String, so just clone the input
         Ok(order_id_str.to_string())
     }

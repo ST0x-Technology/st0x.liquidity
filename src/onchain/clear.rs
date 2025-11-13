@@ -3,9 +3,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::{debug, info};
 
-use crate::bindings::IOrderBookV5::{
-    AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3,
-};
+use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::{
     EvmEnv,
@@ -66,8 +64,12 @@ impl OnchainTrade {
 
         let after_clear = fetch_after_clear_event(&provider, env, &log).await?;
 
-        let ClearStateChangeV2 { aliceOutput, bobOutput, aliceInput, bobInput } =
-            after_clear.clearStateChange;
+        let ClearStateChangeV2 {
+            aliceOutput,
+            bobOutput,
+            aliceInput,
+            bobInput,
+        } = after_clear.clearStateChange;
 
         let (order, fill) = if alice_owner_matches {
             let fill = OrderFill {
@@ -117,8 +119,9 @@ async fn fetch_after_clear_event<P: Provider>(
     env: &EvmEnv,
     log: &Log,
 ) -> Result<AfterClearV2, OnChainError> {
-    let block_number =
-        log.block_number.ok_or(TradeValidationError::NoBlockNumber)?;
+    let block_number = log
+        .block_number
+        .ok_or(TradeValidationError::NoBlockNumber)?;
 
     let filter = Filter::new()
         .select(block_number)
@@ -141,9 +144,7 @@ async fn fetch_after_clear_event<P: Provider>(
 mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV5::{
-        AfterClearV2, ClearConfigV2, ClearStateChangeV2,
-    };
+    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
@@ -190,8 +191,7 @@ mod tests {
             use rain_math_float::Float;
 
             let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
-                .expect("valid Float");
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 
@@ -210,9 +210,7 @@ mod tests {
         }
     }
 
-    fn mocked_receipt_hex(
-        tx_hash: alloy::primitives::FixedBytes<32>,
-    ) -> serde_json::Value {
+    fn mocked_receipt_hex(tx_hash: alloy::primitives::FixedBytes<32>) -> serde_json::Value {
         json!({
             "transactionHash": hex::encode_prefixed(tx_hash),
             "transactionIndex": "0x1",
@@ -238,17 +236,15 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(order.clone(), different_order);
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
@@ -283,15 +279,12 @@ mod tests {
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -324,16 +317,14 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.owner =
-                address!("0xffffffffffffffffffffffffffffffffffffffff");
+            order.owner = address!("0xffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(different_order, order.clone());
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
@@ -368,15 +359,12 @@ mod tests {
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -408,19 +396,16 @@ mod tests {
 
         let different_order1 = {
             let mut order = get_test_order();
-            order.owner =
-                address!("0xffffffffffffffffffffffffffffffffffffffff");
+            order.owner = address!("0xffffffffffffffffffffffffffffffffffffffff");
             order
         };
         let different_order2 = {
             let mut order = get_test_order();
-            order.owner =
-                address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+            order.owner = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
             order
         };
 
-        let clear_event =
-            create_clear_event(different_order1, different_order2);
+        let clear_event = create_clear_event(different_order1, different_order2);
         let clear_log = get_test_log();
 
         let asserter = Asserter::new();
@@ -449,9 +434,8 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
@@ -475,9 +459,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                crate::error::TradeValidationError::NoBlockNumber
-            )
+            OnChainError::Validation(crate::error::TradeValidationError::NoBlockNumber)
         ));
     }
 
@@ -489,9 +471,8 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
@@ -529,9 +510,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                crate::error::TradeValidationError::NoAfterClearLog
-            )
+            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -543,17 +522,15 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(order.clone(), different_order);
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
@@ -603,9 +580,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                crate::error::TradeValidationError::NoAfterClearLog
-            )
+            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -617,17 +592,15 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(order.clone(), different_order);
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
@@ -675,9 +648,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                crate::error::TradeValidationError::NoAfterClearLog
-            )
+            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -691,9 +662,8 @@ mod tests {
         // Both Alice and Bob have the target order hash
         let clear_event = create_clear_event(order.clone(), order.clone());
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
@@ -728,15 +698,12 @@ mod tests {
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -773,8 +740,7 @@ mod tests {
             use rain_math_float::Float;
 
             let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
-                .expect("valid Float");
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 
@@ -812,9 +778,7 @@ mod tests {
         }
     }
 
-    fn create_test_receipt_json(
-        tx_hash: alloy::primitives::B256,
-    ) -> serde_json::Value {
+    fn create_test_receipt_json(tx_hash: alloy::primitives::B256) -> serde_json::Value {
         json!({
             "transactionHash": tx_hash,
             "transactionIndex": "0x1",
@@ -840,53 +804,37 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(order.clone(), different_order);
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
-        let clear_log =
-            create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 5);
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 5);
 
-        let after_clear_event_1 =
-            create_parameterized_after_clear_event(0xaa, 9, 100);
-        let after_clear_event_2 =
-            create_parameterized_after_clear_event(0xbb, 5, 50);
+        let after_clear_event_1 = create_parameterized_after_clear_event(0xaa, 9, 100);
+        let after_clear_event_2 = create_parameterized_after_clear_event(0xbb, 5, 50);
 
-        let after_clear_log_1 = create_test_log(
-            orderbook,
-            tx_hash,
-            after_clear_event_1.to_log_data(),
-            6,
-        );
-        let after_clear_log_2 = create_test_log(
-            orderbook,
-            tx_hash,
-            after_clear_event_2.to_log_data(),
-            7,
-        );
+        let after_clear_log_1 =
+            create_test_log(orderbook, tx_hash, after_clear_event_1.to_log_data(), 6);
+        let after_clear_log_2 =
+            create_test_log(orderbook, tx_hash, after_clear_event_2.to_log_data(), 7);
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log_1, after_clear_log_2]));
         let receipt_json = create_test_receipt_json(tx_hash);
         asserter.push_success(&receipt_json);
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -917,17 +865,15 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(order.clone(), different_order);
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let clear_log = Log {
             inner: alloy::primitives::Log {
@@ -975,9 +921,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(
-                crate::error::TradeValidationError::NoAfterClearLog
-            )
+            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -989,31 +933,22 @@ mod tests {
         let order = get_test_order();
         let different_order = {
             let mut order = get_test_order();
-            order.nonce = fixed_bytes!(
-                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-            );
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
             order
         };
 
         let clear_event = create_clear_event(order.clone(), different_order);
         let orderbook = address!("0x1111111111111111111111111111111111111111");
-        let target_tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
-        let other_tx_hash = fixed_bytes!(
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        );
+        let target_tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let other_tx_hash =
+            fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
 
-        let clear_log = create_test_log(
-            orderbook,
-            target_tx_hash,
-            clear_event.to_log_data(),
-            3,
-        );
+        let clear_log = create_test_log(orderbook, target_tx_hash, clear_event.to_log_data(), 3);
 
         let after_clear_event_correct = create_after_clear_event();
-        let after_clear_event_wrong =
-            create_parameterized_after_clear_event(0xcc, 1, 10);
+        let after_clear_event_wrong = create_parameterized_after_clear_event(0xcc, 1, 10);
 
         let wrong_tx_log = create_test_log(
             orderbook,
@@ -1033,15 +968,12 @@ mod tests {
         let receipt_json = create_test_receipt_json(target_tx_hash);
         asserter.push_success(&receipt_json);
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));

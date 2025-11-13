@@ -101,10 +101,7 @@ async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
                             "Refresh token expired, retrying in {} seconds",
                             RERUN_DELAY_SECS
                         );
-                        tokio::time::sleep(std::time::Duration::from_secs(
-                            RERUN_DELAY_SECS,
-                        ))
-                        .await;
+                        tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
                         continue;
                     }
                 }
@@ -117,30 +114,26 @@ async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run_bot_session(
-    config: &Config,
-    pool: &SqlitePool,
-) -> anyhow::Result<()> {
+async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<()> {
     match &config.broker {
         BrokerConfig::DryRun => {
             info!("Initializing test broker for dry-run mode");
             let broker = MockBrokerConfig.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker))
-                .await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
         }
         BrokerConfig::Schwab(schwab_auth) => {
             info!("Initializing Schwab broker");
-            let schwab_config =
-                SchwabConfig { auth: schwab_auth.clone(), pool: pool.clone() };
+            let schwab_config = SchwabConfig {
+                auth: schwab_auth.clone(),
+                pool: pool.clone(),
+            };
             let broker = schwab_config.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker))
-                .await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
         }
         BrokerConfig::Alpaca(alpaca_auth) => {
             info!("Initializing Alpaca broker");
             let broker = alpaca_auth.clone().try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker))
-                .await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
         }
     }
 }
@@ -152,8 +145,7 @@ async fn run_with_broker<B: Broker + Clone + Send + 'static>(
 ) -> anyhow::Result<()> {
     let broker_maintenance = broker.run_broker_maintenance().await;
 
-    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance)
-        .await
+    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance).await
 }
 
 #[cfg(test)]
@@ -171,8 +163,7 @@ mod tests {
     async fn test_run_function_websocket_connection_error() {
         let mut config = create_test_config();
         let pool = create_test_pool().await;
-        config.evm.ws_rpc_url =
-            "ws://invalid.nonexistent.url:8545".parse().unwrap();
+        config.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
         Box::pin(run(config, pool)).await.unwrap_err();
     }
 
@@ -188,8 +179,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_function_error_propagation() {
         let mut config = create_test_config();
-        config.evm.ws_rpc_url =
-            "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
+        config.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
         Box::pin(run(config, pool)).await.unwrap_err();
     }

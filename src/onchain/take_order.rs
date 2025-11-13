@@ -36,15 +36,8 @@ impl OnchainTrade {
             output_amount: event.output,
         };
 
-        Self::try_from_order_and_fill_details(
-            cache,
-            &provider,
-            order,
-            fill,
-            log,
-            feed_id_cache,
-        )
-        .await
+        Self::try_from_order_and_fill_details(cache, &provider, order, fill, log, feed_id_cache)
+            .await
     }
 }
 
@@ -52,9 +45,7 @@ impl OnchainTrade {
 mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
-    use crate::bindings::IOrderBookV5::{
-        SignedContextV1, TakeOrderConfigV4, TakeOrderV3,
-    };
+    use crate::bindings::IOrderBookV5::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
@@ -71,8 +62,7 @@ mod tests {
         // Helper to create Float for testing using from_fixed_decimal_lossy
         fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
             let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
-                .expect("valid Float");
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 
@@ -83,9 +73,7 @@ mod tests {
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
                 signedContext: vec![SignedContextV1 {
-                    signer: address!(
-                        "0x0000000000000000000000000000000000000000"
-                    ),
+                    signer: address!("0x0000000000000000000000000000000000000000"),
                     signature: vec![].into(),
                     context: vec![],
                 }],
@@ -97,9 +85,7 @@ mod tests {
         }
     }
 
-    fn mocked_receipt_hex(
-        tx_hash: alloy::primitives::FixedBytes<32>,
-    ) -> serde_json::Value {
+    fn mocked_receipt_hex(tx_hash: alloy::primitives::FixedBytes<32>) -> serde_json::Value {
         serde_json::json!({
             "transactionHash": hex::encode_prefixed(tx_hash),
             "transactionIndex": "0x1",
@@ -128,20 +114,16 @@ mod tests {
 
         let asserter = Asserter::new();
 
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -165,9 +147,7 @@ mod tests {
         assert!((trade.amount - 9.0).abs() < f64::EPSILON);
         assert_eq!(
             trade.tx_hash,
-            fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            )
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
         );
         assert_eq!(trade.log_index, 293);
     }
@@ -178,8 +158,7 @@ mod tests {
         let order = get_test_order();
 
         // Create a different target owner that won't match
-        let different_target_owner =
-            address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let different_target_owner = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
         let take_event = create_take_order_event_with_order(order);
         let log = get_test_log();
@@ -203,8 +182,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_take_order_if_target_owner_different_input_output_indices()
-     {
+    async fn test_try_from_take_order_if_target_owner_different_input_output_indices() {
         let cache = SymbolCache::default();
         let order = get_test_order();
         let target_order_owner = order.owner;
@@ -212,8 +190,7 @@ mod tests {
         // Helper to create Float for testing
         fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
             let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
-                .expect("valid Float");
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 
@@ -224,9 +201,7 @@ mod tests {
                 inputIOIndex: U256::from(1), // Different indices
                 outputIOIndex: U256::from(0),
                 signedContext: vec![SignedContextV1 {
-                    signer: address!(
-                        "0x0000000000000000000000000000000000000000"
-                    ),
+                    signer: address!("0x0000000000000000000000000000000000000000"),
                     signature: vec![].into(),
                     context: vec![],
                 }],
@@ -241,20 +216,16 @@ mod tests {
 
         let asserter = Asserter::new();
 
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -287,8 +258,7 @@ mod tests {
         // Helper to create Float for testing
         fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
             let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
-                .expect("valid Float");
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 
@@ -299,9 +269,7 @@ mod tests {
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
                 signedContext: vec![SignedContextV1 {
-                    signer: address!(
-                        "0x0000000000000000000000000000000000000000"
-                    ),
+                    signer: address!("0x0000000000000000000000000000000000000000"),
                     signature: vec![].into(),
                     context: vec![],
                 }],
@@ -316,20 +284,16 @@ mod tests {
 
         let asserter = Asserter::new();
 
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -368,14 +332,12 @@ mod tests {
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
                 signedContext: vec![SignedContextV1 {
-                    signer: address!(
-                        "0x0000000000000000000000000000000000000000"
-                    ),
+                    signer: address!("0x0000000000000000000000000000000000000000"),
                     signature: vec![].into(),
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::ZERO, // Zero input
+            input: alloy::primitives::B256::ZERO,  // Zero input
             output: alloy::primitives::B256::ZERO, // Zero output
         };
 
@@ -383,20 +345,16 @@ mod tests {
 
         let asserter = Asserter::new();
 
-        let tx_hash = fixed_bytes!(
-            "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        );
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter
-            .push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
-            &18u8,
-        )); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -427,8 +385,7 @@ mod tests {
         // Helper to create Float for testing using from_fixed_decimal_lossy
         fn create_float(value: u64, decimals: u8) -> alloy::primitives::B256 {
             let u256_value = U256::from(value);
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
-                .expect("valid Float");
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
             float.get_inner()
         }
 
@@ -439,9 +396,7 @@ mod tests {
                 inputIOIndex: U256::from(99), // Invalid index (order only has 2 IOs)
                 outputIOIndex: U256::from(1),
                 signedContext: vec![SignedContextV1 {
-                    signer: address!(
-                        "0x0000000000000000000000000000000000000000"
-                    ),
+                    signer: address!("0x0000000000000000000000000000000000000000"),
                     signature: vec![].into(),
                     context: vec![],
                 }],

@@ -13,9 +13,7 @@ pub(crate) enum ConversionError {
     #[error("Failed to convert u64 {value} to f64: precision loss would occur")]
     U64ToF64PrecisionLoss { value: u64 },
 
-    #[error(
-        "Failed to convert f64 {value} to u64: value out of range or invalid"
-    )]
+    #[error("Failed to convert f64 {value} to u64: value out of range or invalid")]
     F64ToU64OutOfRange { value: f64 },
 }
 
@@ -35,23 +33,24 @@ impl Default for PositionCalculator {
 
 impl PositionCalculator {
     pub(crate) const fn new() -> Self {
-        Self { accumulated_long: 0.0, accumulated_short: 0.0 }
+        Self {
+            accumulated_long: 0.0,
+            accumulated_short: 0.0,
+        }
     }
 
-    pub(crate) const fn with_positions(
-        accumulated_long: f64,
-        accumulated_short: f64,
-    ) -> Self {
-        Self { accumulated_long, accumulated_short }
+    pub(crate) const fn with_positions(accumulated_long: f64, accumulated_short: f64) -> Self {
+        Self {
+            accumulated_long,
+            accumulated_short,
+        }
     }
 
     pub(crate) fn net_position(&self) -> f64 {
         self.accumulated_long - self.accumulated_short
     }
 
-    pub(crate) fn determine_execution_type(
-        &self,
-    ) -> Option<AccumulationBucket> {
+    pub(crate) fn determine_execution_type(&self) -> Option<AccumulationBucket> {
         let net = self.net_position();
         if net.abs() >= SCHWAB_MINIMUM_WHOLE_SHARES {
             if net > 0.0 {
@@ -64,11 +63,7 @@ impl PositionCalculator {
         }
     }
 
-    pub(crate) fn add_trade(
-        &mut self,
-        amount: f64,
-        direction: AccumulationBucket,
-    ) {
+    pub(crate) fn add_trade(&mut self, amount: f64, direction: AccumulationBucket) {
         match direction {
             AccumulationBucket::LongExposure => {
                 // Long exposure from onchain BUY -> accumulate for Schwab SELL to offset
@@ -102,11 +97,10 @@ impl PositionCalculator {
         Ok(())
     }
 
-    pub(crate) fn calculate_executable_shares(
-        &self,
-    ) -> Result<u64, ConversionError> {
+    pub(crate) fn calculate_executable_shares(&self) -> Result<u64, ConversionError> {
         let net = self.net_position().abs().floor();
-        net.to_u64().ok_or(ConversionError::F64ToU64OutOfRange { value: net })
+        net.to_u64()
+            .ok_or(ConversionError::F64ToU64OutOfRange { value: net })
     }
 }
 
@@ -248,11 +242,13 @@ mod tests {
     #[test]
     fn test_reduce_accumulation() {
         let mut calc = PositionCalculator::with_positions(2.5, 3.0);
-        calc.reduce_accumulation(AccumulationBucket::LongExposure, 2).unwrap();
+        calc.reduce_accumulation(AccumulationBucket::LongExposure, 2)
+            .unwrap();
         assert!((calc.accumulated_long - 0.5).abs() < f64::EPSILON);
         assert!((calc.net_position() - (-2.5)).abs() < f64::EPSILON); // 0.5 - 3.0 = -2.5
 
-        calc.reduce_accumulation(AccumulationBucket::ShortExposure, 1).unwrap();
+        calc.reduce_accumulation(AccumulationBucket::ShortExposure, 1)
+            .unwrap();
         assert!((calc.accumulated_short - 2.0).abs() < f64::EPSILON);
         assert!((calc.net_position() - (-1.5)).abs() < f64::EPSILON); // 0.5 - 2.0 = -1.5
     }
