@@ -59,6 +59,20 @@ mod tests {
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,
     ) -> TakeOrderV3 {
+        use alloy::primitives::I256;
+
+        // Helper to create Float from coefficient and exponent
+        fn create_float(coefficient: i128, exponent: i32) -> alloy::primitives::B256 {
+            let mut bytes = [0u8; 32];
+            bytes[0..4].copy_from_slice(&exponent.to_be_bytes());
+
+            let coeff_i256 = I256::try_from(coefficient).expect("coefficient fits");
+            let coeff_bytes = coeff_i256.to_be_bytes::<32>();
+            bytes[4..32].copy_from_slice(&coeff_bytes[4..32]);
+
+            alloy::primitives::B256::from(bytes)
+        }
+
         TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -71,12 +85,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: fixed_bytes!(
-                "0x00e1f50500000000000000000000000000000000000000000000000000000000"
-            ), // 100 USDC (LE)
-            output: fixed_bytes!(
-                "0x000084e2506ce67c000000000000000000000000000000000000000000000000"
-            ), // 9 shares (LE)
+            // 100 USDC: coefficient=100, exponent=0
+            input: create_float(100, 0),
+            // 9 shares: coefficient=9, exponent=0
+            output: create_float(9, 0),
         }
     }
 
@@ -182,6 +194,16 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
+        // Helper to create Float for testing
+        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
+            use alloy::primitives::U256;
+            use rain_math_float::Float;
+
+            let u256_value = U256::from(value.unsigned_abs());
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
         let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -194,10 +216,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::new(
-                U256::from_str("5000000000000000000").unwrap().to_le_bytes(),
-            ), // 5 shares (18 decimals)
-            output: alloy::primitives::B256::new(U256::from(50_000_000u64).to_le_bytes()), // 50 USDC (6 decimals)
+            // 5 shares: coefficient=5, exponent=0
+            input: create_float(5, 0),
+            // 50 USDC: coefficient=50, exponent=0
+            output: create_float(50, 0),
         };
 
         let log = get_test_log();
@@ -243,6 +265,16 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
+        // Helper to create Float for testing
+        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
+            use alloy::primitives::U256;
+            use rain_math_float::Float;
+
+            let u256_value = U256::from(value.unsigned_abs());
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
         let take_event = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),
             config: TakeOrderConfigV4 {
@@ -255,12 +287,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::new(U256::from(200_000_000u64).to_le_bytes()), // 200 USDC
-            output: alloy::primitives::B256::new(
-                U256::from_str("15000000000000000000")
-                    .unwrap()
-                    .to_le_bytes(),
-            ), // 15 shares
+            // 200 USDC: coefficient=200, exponent=0
+            input: create_float(200, 0),
+            // 15 shares: coefficient=15, exponent=0
+            output: create_float(15, 0),
         };
 
         let log = get_test_log();

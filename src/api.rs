@@ -417,7 +417,7 @@ mod tests {
         }
     }
 
-    fn setup_schwab_api_mocks(server: &MockServer) -> Vec<Mock> {
+    fn setup_schwab_api_mocks(server: &MockServer) -> Vec<Mock<'_>> {
         vec![
             server.mock(|when, then| {
                 when.method(httpmock::Method::GET)

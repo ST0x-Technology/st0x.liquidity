@@ -1144,7 +1144,7 @@ mod tests {
     async fn test_trade_execution_linkage_multiple_trades() {
         let pool = setup_test_db().await;
 
-        let trades = vec![
+        let trades = [
             OnchainTrade {
                 id: None,
                 tx_hash: fixed_bytes!(
@@ -1250,7 +1250,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Create trades that will accumulate before triggering execution
-        let trades = vec![
+        let trades = [
             OnchainTrade {
                 id: None,
                 tx_hash: fixed_bytes!(

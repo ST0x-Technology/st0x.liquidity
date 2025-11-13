@@ -433,11 +433,10 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
             .await
         {
             Ok(Some(execution)) => {
-                if let Some(exec_id) = execution.id {
-                    if let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await
-                    {
-                        error!("Failed to execute offchain order {exec_id}: {e}");
-                    }
+                if let Some(exec_id) = execution.id
+                    && let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await
+                {
+                    error!("Failed to execute offchain order {exec_id}: {e}");
                 }
             }
             Ok(None) => {

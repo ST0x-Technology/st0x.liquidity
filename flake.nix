@@ -4,11 +4,19 @@
   inputs = {
     rainix.url = "github:rainprotocol/rainix";
     flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay.url = "github:oxalica/rust-overlay";
+    nixpkgs.follows = "rainix/nixpkgs";
   };
 
-  outputs = { flake-utils, rainix, ... }:
+  outputs = { flake-utils, rainix, rust-overlay, nixpkgs, ... }:
     flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = rainix.pkgs.${system};
+      let
+        overlays = [ (import rust-overlay) ];
+        pkgs = import nixpkgs {
+          inherit system overlays;
+        };
+        # Use rust 1.88 or later
+        rust = pkgs.rust-bin.stable.latest.default;
       in rec {
         packages = let rainixPkgs = rainix.packages.${system};
         in rainixPkgs // {
@@ -45,7 +53,7 @@
 
         devShell = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
-          inherit (rainix.devShells.${system}.default) nativeBuildInputs;
+          nativeBuildInputs = [ rust ] ++ rainix.devShells.${system}.default.nativeBuildInputs;
           buildInputs = with pkgs;
             [
               bacon

@@ -457,7 +457,7 @@ async fn process_found_trade<W: Write>(
         let placement = execute_broker_order(config, pool, market_order, stdout).await?;
 
         let submitted_state = OrderState::Submitted {
-            order_id: placement.order_id.to_string(),
+            order_id: placement.order_id.clone(),
         };
 
         let mut sql_tx = pool.begin().await?;
@@ -1059,17 +1059,33 @@ mod tests {
             }]
         });
 
+        // Helper to create Float from U256 value with decimals
+        fn create_float_from_u256(value: U256, decimals: u8) -> alloy::primitives::B256 {
+            use rain_math_float::Float;
+
+            let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
+        // Parse alice_output_shares as fixed-point value with 18 decimals
+        // e.g., "9000000000000000000" with 18 decimals = 9.0
+        let alice_shares_u256 = U256::from_str(alice_output_shares).unwrap();
+
+        // Convert bob_output_usdc to U256 (it's in 6-decimal format)
+        // e.g., 100_000_000 with 6 decimals = 100.0
+        let bob_usdc_u256 = U256::from(bob_output_usdc);
+
         let after_clear_event = AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: alloy::primitives::B256::new(
-                    U256::from_str(alice_output_shares).unwrap().to_le_bytes(),
-                ),
-                bobOutput: alloy::primitives::B256::new(U256::from(bob_output_usdc).to_le_bytes()),
-                aliceInput: alloy::primitives::B256::new(U256::from(bob_output_usdc).to_le_bytes()),
-                bobInput: alloy::primitives::B256::new(
-                    U256::from_str(alice_output_shares).unwrap().to_le_bytes(),
-                ),
+                // Alice output: shares (18 decimals)
+                aliceOutput: create_float_from_u256(alice_shares_u256, 18),
+                // Bob output: USDC (6 decimals)
+                bobOutput: create_float_from_u256(bob_usdc_u256, 6),
+                // Alice input: USDC (6 decimals)
+                aliceInput: create_float_from_u256(bob_usdc_u256, 6),
+                // Bob input: shares (18 decimals)
+                bobInput: create_float_from_u256(alice_shares_u256, 18),
             },
         };
 
@@ -1126,7 +1142,7 @@ mod tests {
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
-    fn setup_schwab_api_mocks(server: &MockServer) -> (httpmock::Mock, httpmock::Mock) {
+    fn setup_schwab_api_mocks(server: &MockServer) -> (httpmock::Mock<'_>, httpmock::Mock<'_>) {
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/trader/v1/accounts/accountNumbers");

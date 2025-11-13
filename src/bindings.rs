@@ -18,3 +18,8 @@ sol!(
     #[derive(serde::Serialize, serde::Deserialize)]
     IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
 );
+
+sol!(
+    #![sol(all_derives = true)]
+    LibDecimalFloat, "lib/rain.orderbook.interface/out/LibDecimalFloat.sol/LibDecimalFloat.json"
+);

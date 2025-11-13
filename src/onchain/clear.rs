@@ -185,21 +185,27 @@ mod tests {
     }
 
     fn create_after_clear_event() -> AfterClearV2 {
+        // Helper to create Float for testing
+        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
+            use alloy::primitives::U256;
+            use rain_math_float::Float;
+
+            let u256_value = U256::from(value.unsigned_abs());
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
         AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: fixed_bytes!(
-                    "0x000084e2506ce67c000000000000000000000000000000000000000000000000"
-                ), // 9 shares (LE)
-                bobOutput: fixed_bytes!(
-                    "0x00e1f50500000000000000000000000000000000000000000000000000000000"
-                ), // 100 USDC (LE)
-                aliceInput: fixed_bytes!(
-                    "0x00e1f50500000000000000000000000000000000000000000000000000000000"
-                ), // 100 USDC (LE)
-                bobInput: fixed_bytes!(
-                    "0x000084e2506ce67c000000000000000000000000000000000000000000000000"
-                ), // 9 shares (LE)
+                // 9 shares: coefficient=9, exponent=0
+                aliceOutput: create_float(9, 0),
+                // 100 USDC: coefficient=100, exponent=0
+                bobOutput: create_float(100, 0),
+                // 100 USDC: coefficient=100, exponent=0
+                aliceInput: create_float(100, 0),
+                // 9 shares: coefficient=9, exponent=0
+                bobInput: create_float(9, 0),
             },
         }
     }
@@ -723,27 +729,30 @@ mod tests {
         assert_eq!(trade.log_index, 1);
     }
 
-    fn u256_to_float(amount: U256) -> alloy::primitives::B256 {
-        alloy::primitives::B256::new(amount.to_le_bytes())
-    }
-
     fn create_parameterized_after_clear_event(
         sender_byte: u8,
         alice_shares: u64,
         bob_usdc: u64,
     ) -> AfterClearV2 {
-        // alice_shares in 18 decimals, bob_usdc in 6 decimals
+        // Helper to create Float for testing
+        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
+            use alloy::primitives::U256;
+            use rain_math_float::Float;
+
+            let u256_value = U256::from(value.unsigned_abs());
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
         AfterClearV2 {
             sender: alloy::primitives::Address::repeat_byte(sender_byte),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: u256_to_float(
-                    U256::from(alice_shares) * U256::from(10).pow(U256::from(18)),
-                ),
-                bobOutput: u256_to_float(U256::from(bob_usdc) * U256::from(10).pow(U256::from(6))),
-                aliceInput: u256_to_float(U256::from(bob_usdc) * U256::from(10).pow(U256::from(6))),
-                bobInput: u256_to_float(
-                    U256::from(alice_shares) * U256::from(10).pow(U256::from(18)),
-                ),
+                // alice_shares: coefficient=alice_shares, exponent=0
+                aliceOutput: create_float(i128::from(alice_shares), 0),
+                // bob_usdc: coefficient=bob_usdc, exponent=0
+                bobOutput: create_float(i128::from(bob_usdc), 0),
+                aliceInput: create_float(i128::from(bob_usdc), 0),
+                bobInput: create_float(i128::from(alice_shares), 0),
             },
         }
     }
