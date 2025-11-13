@@ -154,18 +154,38 @@ integration testing with Alpaca's team.
 
 ## Task 6. Implement alpaca-withdraw command
 
-- [ ] Add
+- [x] Add
       `AlpacaWithdraw { #[arg(long)] amount: Decimal, #[arg(long)] address: Address, #[arg(long)] asset: TokenSymbol }`
       variant to `Commands` enum
-- [ ] Implement handler function `handle_alpaca_withdraw()`
-- [ ] Initialize `AlpacaWalletService` from `BrokerConfig::Alpaca`
-- [ ] Call `service.initiate_withdrawal(amount, &asset, &address).await?`
-- [ ] Display transfer ID and initial status
-- [ ] Wire into `run_command_with_writers()`
-- [ ] Write test for invalid amount (zero, negative)
-- [ ] Write test for address not whitelisted error
-- [ ] Write integration test with mock HTTP server
-- [ ] Run `cargo test -q` and verify passing
+- [x] Implement handler function `handle_alpaca_withdraw()`
+- [x] Initialize `AlpacaWalletService` from `BrokerConfig::Alpaca`
+- [x] Call `service.initiate_withdrawal(amount, &asset, &address).await?`
+- [x] Display transfer ID and initial status
+- [x] Wire into `run_command_with_writers()`
+- [x] Write test for invalid amount (zero, negative)
+- [x] Write test for address not whitelisted error
+- [x] Write integration test with mock HTTP server
+- [x] Run `cargo test -q` and verify passing
+
+**Implementation notes:**
+
+- Added `rust_decimal::Decimal` import to `src/cli.rs`
+- Added handler inline in `run_command_with_writers()` match statement
+- Displayed transfer ID, status, asset, amount, to address with helpful tip to
+  use alpaca-transfer-status command
+- Used `anyhow::bail!()` for broker type checking (consistent with other Alpaca
+  commands)
+- Created two tests:
+  - `test_alpaca_withdraw_successful_with_mock`: Full HTTP integration test with
+    whitelist check and withdrawal
+  - `test_alpaca_withdraw_address_not_whitelisted`: Tests error when address is
+    not whitelisted
+- Invalid amount tests (zero/negative) already exist in
+  `src/alpaca_wallet/transfer.rs` tests, so didn't duplicate them in CLI tests
+- Used `address!()` macro for test addresses and `.to_string()` in json! body
+  matcher
+- Added `AlpacaWalletError` import to test module
+- All 411 tests passing
 
 ## Task 7. Final validation
 

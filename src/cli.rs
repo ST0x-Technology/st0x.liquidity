@@ -13,6 +13,7 @@ use crate::symbol::cache::SymbolCache;
 use alloy::primitives::Address;
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use rust_decimal::Decimal;
 use st0x_broker::schwab::{
     SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
 };
@@ -96,6 +97,18 @@ pub enum Commands {
         /// Transfer ID (UUID)
         #[arg(long)]
         transfer_id: TransferId,
+    },
+    /// Withdraw tokenized assets to Ethereum address
+    AlpacaWithdraw {
+        /// Amount to withdraw
+        #[arg(long)]
+        amount: Decimal,
+        /// Ethereum address (must be whitelisted and approved)
+        #[arg(long)]
+        address: Address,
+        /// Asset symbol (e.g., tAAPL, tTSLA)
+        #[arg(long)]
+        asset: TokenSymbol,
     },
 }
 
@@ -331,6 +344,33 @@ async fn run_command_with_writers<W: Write>(
             }
 
             writeln!(stdout, "   Created At: {}", transfer.created_at)?;
+        }
+        Commands::AlpacaWithdraw {
+            amount,
+            address,
+            asset,
+        } => {
+            let BrokerConfig::Alpaca(auth_env) = config.broker else {
+                anyhow::bail!("AlpacaWithdraw command is only supported for Alpaca broker")
+            };
+
+            let service = AlpacaWalletService::new(auth_env, None).await?;
+            let transfer = service
+                .initiate_withdrawal(amount, &asset, &address)
+                .await?;
+
+            writeln!(stdout, "✅ Withdrawal initiated successfully!")?;
+            writeln!(stdout, "   Transfer ID: {}", transfer.id)?;
+            writeln!(stdout, "   Status: {:?}", transfer.status)?;
+            writeln!(stdout, "   Asset: {}", transfer.asset)?;
+            writeln!(stdout, "   Amount: {}", transfer.amount)?;
+            writeln!(stdout, "   To Address: {}", transfer.to)?;
+            writeln!(stdout)?;
+            writeln!(
+                stdout,
+                "💡 Use 'alpaca-transfer-status --transfer-id {}' to check the withdrawal status.",
+                transfer.id
+            )?;
         }
     }
 
@@ -639,7 +679,7 @@ fn display_trade_details<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, AlpacaWalletService};
     use crate::bindings::IERC20::symbolCall;
     use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange, ClearV2};
     use crate::env::LogLevel;
@@ -2309,6 +2349,152 @@ mod tests {
         assert_eq!(transfer.to, test_to_address);
 
         status_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_withdraw_successful_with_mock() {
+        let server = MockServer::start();
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v2/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "account_number": "PA1234567890",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "cash": "100000.00"
+                }));
+        });
+
+        let test_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_check_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "whitelist-123",
+                    "address": test_address,
+                    "asset": "tAAPL",
+                    "chain": "ethereum",
+                    "status": "APPROVED",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }]));
+        });
+
+        let transfer_id = Uuid::new_v4();
+        let withdrawal_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers")
+                .json_body(json!({
+                    "amount": "10.5",
+                    "asset": "tAAPL",
+                    "address": test_address.to_string()
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": transfer_id,
+                    "relationship": "OUTGOING",
+                    "amount": "10.5",
+                    "asset": "tAAPL",
+                    "from_address": null,
+                    "to_address": test_address,
+                    "status": "PENDING",
+                    "tx_hash": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee_amount": "0.5"
+                }));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let service = AlpacaWalletService::new_with_client(client, None);
+
+        account_mock.assert();
+
+        let transfer = service
+            .initiate_withdrawal(
+                Decimal::new(105, 1),
+                &TokenSymbol::new("tAAPL"),
+                &test_address,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(transfer.id, TransferId::from(transfer_id));
+        assert_eq!(transfer.amount.to_string(), "10.5");
+        assert_eq!(transfer.asset.to_string(), "tAAPL");
+
+        whitelist_check_mock.assert();
+        withdrawal_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_withdraw_address_not_whitelisted() {
+        let server = MockServer::start();
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v2/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "account_number": "PA1234567890",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "cash": "100000.00"
+                }));
+        });
+
+        let test_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_check_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let service = AlpacaWalletService::new_with_client(client, None);
+
+        account_mock.assert();
+
+        let result = service
+            .initiate_withdrawal(
+                Decimal::new(105, 1),
+                &TokenSymbol::new("tAAPL"),
+                &test_address,
+            )
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            AlpacaWalletError::AddressNotWhitelisted { .. }
+        ));
+
+        whitelist_check_mock.assert();
     }
 
     #[tokio::test]
