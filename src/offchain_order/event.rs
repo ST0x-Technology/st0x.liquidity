@@ -4,7 +4,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
-use crate::position::{BrokerOrderId, FractionalShares, PriceCents};
+use crate::position::FractionalShares;
+
+use super::{BrokerOrderId, PriceCents};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum MigratedOrderStatus {
