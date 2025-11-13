@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, Symbol};
 use tracing::error;
 
-use super::event::{ExecutionId, FractionalShares};
-use super::{Position, PositionEvent};
+use crate::offchain_order::ExecutionId;
+
+use super::{FractionalShares, Position, PositionEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum PositionView {
@@ -227,7 +228,6 @@ impl PositionView {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::primitives::TxHash;
     use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
@@ -236,7 +236,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::super::ExecutionThreshold;
-    use super::super::event::{BrokerOrderId, ExecutionId, PriceCents, TradeId, TriggerReason};
+    use super::super::event::{TradeId, TriggerReason};
+    use super::*;
+    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 
     #[test]
     fn test_view_update_from_initialized_event() {

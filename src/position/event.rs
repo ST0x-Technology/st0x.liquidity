@@ -5,6 +5,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
+use super::FractionalShares;
+use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TradeId {
     pub(crate) tx_hash: TxHash,
@@ -14,54 +17,6 @@ pub(crate) struct TradeId {
 impl std::fmt::Display for TradeId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.tx_hash, self.log_index)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ExecutionId(pub(crate) i64);
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct BrokerOrderId(pub(crate) String);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PriceCents(pub(crate) u64);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FractionalShares(pub(crate) Decimal);
-
-impl FractionalShares {
-    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
-
-    pub(crate) fn abs(self) -> Self {
-        Self(self.0.abs())
-    }
-}
-
-impl std::ops::Add for FractionalShares {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0 + rhs.0)
-    }
-}
-
-impl std::ops::Sub for FractionalShares {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self(self.0 - rhs.0)
-    }
-}
-
-impl std::ops::AddAssign for FractionalShares {
-    fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
-    }
-}
-
-impl std::ops::SubAssign for FractionalShares {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
     }
 }
 

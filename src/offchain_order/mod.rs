@@ -1,7 +1,3 @@
-mod cmd;
-mod event;
-pub(crate) mod view;
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -10,10 +6,21 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
+mod cmd;
+mod event;
+mod view;
+
 pub(crate) use cmd::OffchainOrderCommand;
 pub(crate) use event::{MigratedOrderStatus, OffchainOrderEvent};
 
-use crate::position::{BrokerOrderId, PriceCents};
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExecutionId(pub(crate) i64);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BrokerOrderId(pub(crate) String);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PriceCents(pub(crate) u64);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OffchainOrderError {

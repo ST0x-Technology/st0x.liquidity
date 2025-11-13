@@ -5,14 +5,53 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::Direction;
 
+use crate::offchain_order::ExecutionId;
+
 mod cmd;
 mod event;
-pub(crate) mod view;
+mod view;
 
 pub(crate) use cmd::PositionCommand;
-pub(crate) use event::{
-    ExecutionId, ExecutionThreshold, FractionalShares, PositionEvent, TriggerReason,
-};
+pub(crate) use event::{ExecutionThreshold, PositionEvent, TriggerReason};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FractionalShares(pub(crate) Decimal);
+
+impl FractionalShares {
+    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
+
+    pub(crate) fn abs(self) -> Self {
+        Self(self.0.abs())
+    }
+}
+
+impl std::ops::Add for FractionalShares {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0 + rhs.0)
+    }
+}
+
+impl std::ops::Sub for FractionalShares {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0 - rhs.0)
+    }
+}
+
+impl std::ops::AddAssign for FractionalShares {
+    fn add_assign(&mut self, rhs: Self) {
+        self.0 += rhs.0;
+    }
+}
+
+impl std::ops::SubAssign for FractionalShares {
+    fn sub_assign(&mut self, rhs: Self) {
+        self.0 -= rhs.0;
+    }
+}
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub(crate) enum PositionError {
@@ -280,8 +319,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use st0x_broker::{Direction, SupportedBroker};
 
+    use super::event::TradeId;
     use super::*;
-    use crate::position::event::{BrokerOrderId, PriceCents, TradeId};
+    use crate::offchain_order::{BrokerOrderId, PriceCents};
 
     #[test]
     fn test_initialize_sets_threshold() {
