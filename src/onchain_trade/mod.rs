@@ -78,6 +78,35 @@ impl Aggregate for OnChainTrade {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
+            OnChainTradeCommand::Migrate {
+                symbol,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                block_timestamp,
+                gas_used,
+                pyth_price,
+            } => match self {
+                Self::Unfilled => {
+                    let now = Utc::now();
+
+                    Ok(vec![OnChainTradeEvent::Migrated {
+                        symbol,
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_number,
+                        block_timestamp,
+                        gas_used,
+                        pyth_price,
+                        migrated_at: now,
+                    }])
+                }
+                Self::Filled { .. } | Self::Enriched { .. } => {
+                    Err(OnChainTradeError::AlreadyFilled)
+                }
+            },
             OnChainTradeCommand::Witness {
                 symbol,
                 amount,
@@ -124,6 +153,42 @@ impl Aggregate for OnChainTrade {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
+            OnChainTradeEvent::Migrated {
+                symbol,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                block_timestamp,
+                gas_used,
+                pyth_price,
+                migrated_at: _,
+            } => {
+                if let (Some(gas), Some(pyth)) = (gas_used, pyth_price) {
+                    *self = Self::Enriched {
+                        symbol,
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_number,
+                        block_timestamp,
+                        filled_at: block_timestamp,
+                        gas_used: gas,
+                        pyth_price: pyth,
+                        enriched_at: block_timestamp,
+                    };
+                } else {
+                    *self = Self::Filled {
+                        symbol,
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_number,
+                        block_timestamp,
+                        filled_at: block_timestamp,
+                    };
+                }
+            }
             OnChainTradeEvent::Filled {
                 symbol,
                 amount,
@@ -169,42 +234,6 @@ impl Aggregate for OnChainTrade {
                         gas_used,
                         pyth_price,
                         enriched_at,
-                    };
-                }
-            }
-            OnChainTradeEvent::Migrated {
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_number,
-                block_timestamp,
-                gas_used,
-                pyth_price,
-                migrated_at: _,
-            } => {
-                if let (Some(gas), Some(pyth)) = (gas_used, pyth_price) {
-                    *self = Self::Enriched {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
-                        gas_used: gas,
-                        pyth_price: pyth,
-                        enriched_at: block_timestamp,
-                    };
-                } else {
-                    *self = Self::Filled {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
                     };
                 }
             }

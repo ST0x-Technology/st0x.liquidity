@@ -7,6 +7,16 @@ use super::event::PythPrice;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OnChainTradeCommand {
+    Migrate {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+    },
     Witness {
         symbol: Symbol,
         amount: Decimal,

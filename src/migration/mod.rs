@@ -4,11 +4,14 @@ mod position;
 mod schwab_auth;
 
 use clap::{Parser, ValueEnum};
+use cqrs_es::AggregateError;
+use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
 use std::io;
 use tracing::{info, warn};
 
 use crate::offchain_order::InvalidMigratedOrderStatus;
+use crate::onchain_trade::OnChainTradeError;
 use crate::position::NegativePriceCents;
 use offchain_order::migrate_offchain_orders;
 use onchain_trade::migrate_onchain_trades;
@@ -67,7 +70,7 @@ pub struct MigrationEnv {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum MigrationError {
+enum MigrationError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Invalid symbol: {0}")]
@@ -90,6 +93,8 @@ pub enum MigrationError {
     UserCancelled,
     #[error("Hex parsing error: {0}")]
     FromHex(#[from] alloy::hex::FromHexError),
+    #[error("OnChainTrade aggregate error: {0}")]
+    OnChainTradeAggregate(#[from] AggregateError<OnChainTradeError>),
 }
 
 #[derive(Debug, Default)]
@@ -118,7 +123,46 @@ pub enum ExecutionMode {
     Commit,
 }
 
-pub async fn check_existing_events(
+pub async fn run_migration(
+    pool: &SqlitePool,
+    env: &MigrationEnv,
+) -> anyhow::Result<MigrationSummary> {
+    match env.execution {
+        ExecutionMode::DryRun => {
+            info!("Starting migration in DRY-RUN mode - no events will be persisted");
+        }
+        ExecutionMode::Commit => {
+            info!("Starting migration...");
+        }
+    }
+
+    check_existing_events(pool, "OnChainTrade", env.confirmation).await?;
+    check_existing_events(pool, "Position", env.confirmation).await?;
+    check_existing_events(pool, "OffchainOrder", env.confirmation).await?;
+    check_existing_events(pool, "SchwabAuth", env.confirmation).await?;
+
+    safety_prompt(env.confirmation)?;
+
+    if matches!(env.clean, CleanMode::Delete) {
+        clean_events(pool, env.confirmation).await?;
+    }
+
+    let onchain_trade_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+
+    let onchain_trades = migrate_onchain_trades(pool, &onchain_trade_cqrs, env.execution).await?;
+    let positions = migrate_positions(pool, env.execution).await?;
+    let offchain_orders = migrate_offchain_orders(pool, env.execution).await?;
+    let schwab_auth = migrate_schwab_auth(pool, env.execution).await?;
+
+    Ok(MigrationSummary {
+        onchain_trades,
+        positions,
+        offchain_orders,
+        schwab_auth,
+    })
+}
+
+async fn check_existing_events(
     pool: &SqlitePool,
     aggregate_type: &str,
     confirmation: ConfirmationMode,
@@ -141,7 +185,7 @@ pub async fn check_existing_events(
     Ok(())
 }
 
-pub fn safety_prompt(confirmation: ConfirmationMode) -> Result<(), MigrationError> {
+fn safety_prompt(confirmation: ConfirmationMode) -> Result<(), MigrationError> {
     if matches!(confirmation, ConfirmationMode::Force) {
         return Ok(());
     }
@@ -157,7 +201,7 @@ pub fn safety_prompt(confirmation: ConfirmationMode) -> Result<(), MigrationErro
     Ok(())
 }
 
-pub async fn clean_events(
+async fn clean_events(
     pool: &SqlitePool,
     confirmation: ConfirmationMode,
 ) -> Result<(), MigrationError> {
@@ -184,43 +228,6 @@ pub async fn clean_events(
     info!("Deleted {deleted_events} events and {deleted_snapshots} snapshots from event store");
 
     Ok(())
-}
-
-pub async fn run_migration(
-    pool: &SqlitePool,
-    env: &MigrationEnv,
-) -> Result<MigrationSummary, MigrationError> {
-    match env.execution {
-        ExecutionMode::DryRun => {
-            info!("Starting migration in DRY-RUN mode - no events will be persisted");
-        }
-        ExecutionMode::Commit => {
-            info!("Starting migration...");
-        }
-    }
-
-    check_existing_events(pool, "OnChainTrade", env.confirmation).await?;
-    check_existing_events(pool, "Position", env.confirmation).await?;
-    check_existing_events(pool, "OffchainOrder", env.confirmation).await?;
-    check_existing_events(pool, "SchwabAuth", env.confirmation).await?;
-
-    safety_prompt(env.confirmation)?;
-
-    if matches!(env.clean, CleanMode::Delete) {
-        clean_events(pool, env.confirmation).await?;
-    }
-
-    let onchain_trades = migrate_onchain_trades(pool, env.execution).await?;
-    let positions = migrate_positions(pool, env.execution).await?;
-    let offchain_orders = migrate_offchain_orders(pool, env.execution).await?;
-    let schwab_auth = migrate_schwab_auth(pool, env.execution).await?;
-
-    Ok(MigrationSummary {
-        onchain_trades,
-        positions,
-        offchain_orders,
-        schwab_auth,
-    })
 }
 
 #[cfg(test)]
