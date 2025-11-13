@@ -1,12 +1,11 @@
-use chrono::Utc;
-use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
+use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use st0x_broker::Symbol;
 use tracing::{info, warn};
 
 use super::{ExecutionMode, MigrationError};
-use crate::position::{ExecutionThreshold, FractionalShares, Position, PositionEvent};
+use crate::position::{ExecutionThreshold, FractionalShares, Position, PositionCommand};
 
 #[derive(sqlx::FromRow)]
 struct PositionRow {
@@ -19,6 +18,7 @@ struct PositionRow {
 
 pub async fn migrate_positions(
     pool: &SqlitePool,
+    cqrs: &SqliteCqrs<Position>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, PositionRow>(
@@ -57,18 +57,17 @@ pub async fn migrate_positions(
         let accumulated_long = Decimal::try_from(row.accumulated_long)?;
         let accumulated_short = Decimal::try_from(row.accumulated_short)?;
 
-        let event = PositionEvent::Migrated {
+        let command = PositionCommand::Migrate {
             symbol,
             net_position: FractionalShares(net_position),
             accumulated_long: FractionalShares(accumulated_long),
             accumulated_short: FractionalShares(accumulated_short),
             threshold: ExecutionThreshold::Shares(Decimal::ONE),
-            migrated_at: Utc::now(),
         };
 
         match execution {
             ExecutionMode::Commit => {
-                persist_event(pool, &aggregate_id, event).await?;
+                cqrs.execute(&aggregate_id, command).await?;
             }
             ExecutionMode::DryRun => {}
         }
@@ -78,41 +77,9 @@ pub async fn migrate_positions(
     Ok(total)
 }
 
-async fn persist_event(
-    pool: &SqlitePool,
-    aggregate_id: &str,
-    event: PositionEvent,
-) -> Result<(), MigrationError> {
-    let aggregate_type = Position::aggregate_type();
-    let event_type = event.event_type();
-    let event_version = event.event_version();
-    let payload = serde_json::to_string(&event)?;
-
-    sqlx::query(
-        "INSERT INTO events (
-            aggregate_type,
-            aggregate_id,
-            sequence,
-            event_type,
-            event_version,
-            payload,
-            metadata
-        )
-        VALUES (?, ?, 1, ?, ?, ?, '{}')",
-    )
-    .bind(&aggregate_type)
-    .bind(aggregate_id)
-    .bind(&event_type)
-    .bind(&event_version)
-    .bind(&payload)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
     use st0x_broker::Symbol;
 
@@ -158,8 +125,9 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_positions_empty() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        let count = migrate_positions(&pool, ExecutionMode::Commit)
+        let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -169,10 +137,11 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_positions_single_position() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
 
-        let count = migrate_positions(&pool, ExecutionMode::Commit)
+        let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -193,12 +162,13 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_positions_multiple_positions() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
         insert_test_position(&pool, "TSLA", -2.0, 3.0, 5.0, None).await;
         insert_test_position(&pool, "MSFT", 0.0, 0.0, 0.0, None).await;
 
-        let count = migrate_positions(&pool, ExecutionMode::Commit)
+        let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -216,10 +186,11 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_positions_with_pending_execution() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
 
-        let count = migrate_positions(&pool, ExecutionMode::Commit)
+        let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -240,10 +211,11 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_positions_dry_run() {
         let pool = create_test_pool().await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
 
-        let count = migrate_positions(&pool, ExecutionMode::DryRun)
+        let count = migrate_positions(&pool, &cqrs, ExecutionMode::DryRun)
             .await
             .unwrap();
 
@@ -294,7 +266,8 @@ mod tests {
         .await
         .unwrap();
 
-        let result = migrate_positions(&pool, ExecutionMode::Commit).await;
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+        let result = migrate_positions(&pool, &cqrs, ExecutionMode::Commit).await;
 
         assert!(matches!(
             result.unwrap_err(),

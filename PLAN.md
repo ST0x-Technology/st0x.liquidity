@@ -199,16 +199,40 @@ Fix `src/migration/onchain_trade.rs` to use CqrsFramework instead of direct INSE
 
 Fix `src/migration/position.rs` to use CqrsFramework.
 
-**Subtasks:**
-- [ ] Add `CqrsFramework<Position>` parameter to `migrate_positions()`
-- [ ] Remove direct events table INSERT
-- [ ] Use appropriate Position commands
-- [ ] Update migration runner to pass framework
-- [ ] Update tests
+**Completed Work:**
+
+- [x] Added `PositionCommand::Migrate` variant to `src/position/cmd.rs`
+- [x] Implemented handler for `Migrate` command in Position aggregate
+- [x] Updated `migrate_positions()` to accept `SqliteCqrs<Position>` parameter
+- [x] Removed `persist_event()` function (direct INSERT into events table)
+- [x] Refactored to use `cqrs.execute(&aggregate_id, command).await`
+- [x] Updated migration runner in `src/migration/mod.rs` to create and pass Position framework
+- [x] Updated all 6 position migration tests to use framework
+- [x] Added `PositionAggregate` error variant to `MigrationError` with `#[from]`
+- [x] Refactored Position aggregate's `handle()` function to meet clippy line limits:
+  - [x] Extracted `handle_place_offchain_order()` helper method
+  - [x] Extracted `handle_complete_offchain_order()` helper method
+  - [x] Extracted `handle_fail_offchain_order()` helper method
+- [x] Added comprehensive tests for new `Migrate` command (5 new tests):
+  - [x] `test_migrate_command_creates_migrated_event` - Verifies command creates correct event with all fields
+  - [x] `test_migrated_event_sets_position_state` - Verifies all event fields match command inputs
+  - [x] `test_migrate_with_zero_position` - Tests migration of empty positions
+  - [x] `test_migrate_preserves_negative_position` - Tests short positions are preserved correctly
+  - [x] `test_operations_after_migrate` - Verifies normal operations work after migration
+- [x] All 59 position tests pass (17 existing + 5 new migration tests + 37 other tests)
+- [x] All 27 migration tests pass
+- [x] Clippy passes (no errors)
+- [x] Code formatted
+
+**Implementation Notes:**
+- Position's `Migrate` command follows the same pattern as OnChainTrade's `Migrate` command
+- CqrsFramework automatically handles event persistence, sequence numbers, and view updates
+- Helper methods extracted from `handle()` keep each function under 100 lines (clippy requirement)
+- Error conversion through `#[from]` preserves full type information in error chain
 
 **Completion Criteria:**
-- [ ] Tests pass
-- [ ] No direct events table writes
+- [x] Tests pass
+- [x] No direct events table writes
 
 ## Task 4. Fix Migration Script - OffchainOrder
 
