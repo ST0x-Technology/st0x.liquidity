@@ -10,6 +10,7 @@ use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
+use alloy::primitives::Address;
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use st0x_broker::schwab::{
@@ -78,6 +79,18 @@ pub enum Commands {
     },
     /// List whitelisted Ethereum addresses for withdrawals
     AlpacaWhitelistList,
+    /// Whitelist Ethereum address for withdrawals
+    AlpacaWhitelist {
+        /// Ethereum address to whitelist
+        #[arg(long)]
+        address: Address,
+        /// Asset symbol (e.g., tAAPL, tTSLA)
+        #[arg(long)]
+        asset: TokenSymbol,
+        /// Network (defaults to ethereum)
+        #[arg(long, default_value = "ethereum")]
+        network: Network,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -253,6 +266,35 @@ async fn run_command_with_writers<W: Write>(
                     entry.address, entry.asset, entry.chain, entry.status
                 )?;
             }
+        }
+        Commands::AlpacaWhitelist {
+            address,
+            asset,
+            network,
+        } => {
+            let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
+                anyhow::bail!("AlpacaWhitelist command is only supported for Alpaca broker")
+            };
+
+            info!("Whitelisting address: {address}, asset={asset}, network={network}");
+            writeln!(stdout, "🔄 Whitelisting address for withdrawals...")?;
+
+            let service = AlpacaWalletService::new(alpaca_auth.clone(), None).await?;
+            let entry = service
+                .whitelist_address(&address, &asset, &network)
+                .await?;
+
+            info!("Address whitelisted: id={}", entry.id);
+            writeln!(stdout, "✅ Address whitelisted successfully!")?;
+            writeln!(stdout, "   Address: {address}")?;
+            writeln!(stdout, "   Asset: {asset}")?;
+            writeln!(stdout, "   Network: {network}")?;
+            writeln!(stdout, "   Status: {:?}", entry.status)?;
+            writeln!(stdout)?;
+            writeln!(
+                stdout,
+                "⏱  Note: There is a 24-hour approval period before this address can be used for withdrawals."
+            )?;
         }
     }
 
@@ -1939,6 +1981,8 @@ mod tests {
     async fn test_alpaca_deposit_wallet_service_with_mock() {
         let server = MockServer::start();
 
+        let test_address = address!("1234567890abcdef1234567890abcdef12345678");
+
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v2/account");
             then.status(200)
@@ -1962,7 +2006,7 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!([
                     {
-                        "address": "0x1234567890abcdef1234567890abcdef12345678",
+                        "address": test_address,
                         "asset": "tAAPL",
                         "network": "ethereum"
                     }
@@ -1986,16 +2030,16 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            deposit.address.to_string().to_lowercase(),
-            "0x1234567890abcdef1234567890abcdef12345678"
-        );
+        assert_eq!(deposit.address, test_address);
         wallet_mock.assert();
     }
 
     #[tokio::test]
     async fn test_alpaca_whitelist_list_with_mock() {
         let server = MockServer::start();
+
+        let test_address1 = address!("1234567890abcdef1234567890abcdef12345678");
+        let test_address2 = address!("abcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET).path("/v2/account");
@@ -2019,7 +2063,7 @@ mod tests {
                 .json_body(json!([
                     {
                         "id": "whitelist-123",
-                        "address": "0x1234567890abcdef1234567890abcdef12345678",
+                        "address": test_address1,
                         "asset": "tAAPL",
                         "chain": "ethereum",
                         "status": "APPROVED",
@@ -2027,7 +2071,7 @@ mod tests {
                     },
                     {
                         "id": "whitelist-456",
-                        "address": "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
+                        "address": test_address2,
                         "asset": "tTSLA",
                         "chain": "ethereum",
                         "status": "PENDING",
@@ -2057,25 +2101,112 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_alpaca_whitelist_list_command_requires_alpaca_broker() {
+    async fn test_alpaca_whitelist_list_empty_list() {
         let server = MockServer::start();
-        let pool = setup_test_db().await;
 
-        let config = create_test_config_for_cli(&server);
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v2/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "account_number": "PA1234567890",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "cash": "100000.00"
+                }));
+        });
 
-        let mut stdout = Vec::new();
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
 
-        let command = Commands::AlpacaWhitelistList;
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
 
-        let result = run_command_with_writers(config, command, &pool, &mut stdout).await;
+        let service = AlpacaWalletService::new_with_client(client, None);
 
-        assert!(result.is_err(), "Command should fail with Schwab broker");
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("only supported for Alpaca broker"));
+        account_mock.assert();
+
+        let addresses = service.get_whitelisted_addresses().await.unwrap();
+
+        assert_eq!(addresses.len(), 0);
+        whitelist_mock.assert();
     }
 
     #[tokio::test]
-    async fn test_alpaca_deposit_command_requires_alpaca_broker() {
+    async fn test_alpaca_whitelist_with_mock() {
+        let server = MockServer::start();
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v2/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "account_number": "PA1234567890",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "cash": "100000.00"
+                }));
+        });
+
+        let test_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "whitelist-123",
+                    "address": test_address,
+                    "asset": "tAAPL",
+                    "chain": "ethereum",
+                    "status": "PENDING",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let service = AlpacaWalletService::new_with_client(client, None);
+
+        account_mock.assert();
+
+        let entry = service
+            .whitelist_address(
+                &test_address,
+                &TokenSymbol::new("tAAPL"),
+                &Network::new("ethereum"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(entry.id, "whitelist-123");
+        assert_eq!(entry.address, test_address);
+        whitelist_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_commands_require_alpaca_broker() {
         let server = MockServer::start();
         let pool = setup_test_db().await;
 

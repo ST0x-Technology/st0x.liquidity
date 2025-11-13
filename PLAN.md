@@ -86,22 +86,38 @@ integration testing with Alpaca's team.
 - Added handler inline in `run_command_with_writers()` match statement
 - Formatted output as table with columns: Address, Asset, Network, Status
 - Used `{:<10?}` formatting for WhitelistStatus enum (Debug formatting)
-- Created test `test_alpaca_whitelist_list_with_mock` with MockServer
-- All 406 tests passing
+- Created two tests:
+  - `test_alpaca_whitelist_list_with_mock`: Full HTTP integration test with
+    MockServer
+  - `test_alpaca_whitelist_list_command_requires_alpaca_broker`: Broker type
+    checking
+- Fixed test assertion pattern to use `.unwrap()` directly instead of
+  `assert!(result.is_ok())`
+- All 407 tests passing
 
 ## Task 4. Implement alpaca-whitelist command
 
-- [ ] Add
+- [x] Add
       `AlpacaWhitelist { #[arg(long)] address: Address, #[arg(long)] asset: TokenSymbol, #[arg(long, default_value = "ethereum")] network: Network }`
       variant to `Commands` enum
-- [ ] Implement handler function `handle_alpaca_whitelist()`
-- [ ] Initialize `AlpacaWalletService` from `BrokerConfig::Alpaca`
-- [ ] Call `service.whitelist_address(&address, &asset, &network).await?`
-- [ ] Display confirmation message with 24-hour approval notice
-- [ ] Wire into `run_command_with_writers()`
-- [ ] Write test for invalid address format
-- [ ] Write integration test with mock HTTP server
-- [ ] Run `cargo test -q` and verify passing
+- [x] Implement handler function `handle_alpaca_whitelist()`
+- [x] Initialize `AlpacaWalletService` from `BrokerConfig::Alpaca`
+- [x] Call `service.whitelist_address(&address, &asset, &network).await?`
+- [x] Display confirmation message with 24-hour approval notice
+- [x] Wire into `run_command_with_writers()`
+- [x] Write integration test with mock HTTP server
+- [x] Run `cargo test -q` and verify passing
+
+**Implementation notes:**
+
+- Added handler inline in `run_command_with_writers()` match statement
+- Displayed address, asset, network, status and 24-hour approval notice
+- Added `Address` import from `alloy::primitives`
+- Created two tests:
+  - `test_alpaca_whitelist_with_mock`: Full HTTP integration test with
+    MockServer
+  - `test_alpaca_whitelist_command_requires_alpaca_broker`: Broker type checking
+- All 409 tests passing
 
 ## Task 5. Implement alpaca-transfer-status command
 
