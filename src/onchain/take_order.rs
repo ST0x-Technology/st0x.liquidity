@@ -51,11 +51,10 @@ mod tests {
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{address, fixed_bytes, I256, U256};
+    use alloy::primitives::{address, fixed_bytes, U256};
     use alloy::providers::{mock::Asserter, ProviderBuilder};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
-    use std::str::FromStr;
 
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,

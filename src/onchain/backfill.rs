@@ -4,7 +4,6 @@ use alloy::sol_types::SolEvent;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use futures_util::future;
 use itertools::Itertools;
-use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
@@ -247,6 +246,7 @@ mod tests {
     use alloy::providers::{mock::Asserter, ProviderBuilder};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
+    use rain_math_float::Float;
     use std::str::FromStr;
 
     use super::*;
