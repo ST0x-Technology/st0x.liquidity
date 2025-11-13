@@ -1,49 +1,45 @@
-use crate::bindings::IOrderBookV4::{EvaluableV3, IO, OrderV3};
+use crate::bindings::IOrderBookV5::{EvaluableV4, OrderV4, IOV2};
 use crate::offchain::execution::OffchainExecution;
-use crate::onchain::OnchainTrade;
 use crate::onchain::io::TokenizedEquitySymbol;
-use alloy::primitives::{LogData, U256, address, bytes, fixed_bytes};
+use crate::onchain::OnchainTrade;
+use alloy::primitives::{address, bytes, fixed_bytes, LogData};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use st0x_broker::OrderState;
 use st0x_broker::schwab::{SchwabAuthEnv, SchwabTokens};
+use st0x_broker::OrderState;
 use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
 
-/// Returns a test `OrderV3` instance that is shared across multiple
+/// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important – only that the
 /// structure is valid and deterministic.
-pub(crate) fn get_test_order() -> OrderV3 {
-    OrderV3 {
+pub(crate) fn get_test_order() -> OrderV4 {
+    OrderV4 {
         owner: address!("0xdddddddddddddddddddddddddddddddddddddddd"),
-        evaluable: EvaluableV3 {
+        evaluable: EvaluableV4 {
             interpreter: address!("0x2222222222222222222222222222222222222222"),
             store: address!("0x3333333333333333333333333333333333333333"),
             bytecode: bytes!("0x00"),
         },
         nonce: fixed_bytes!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
         validInputs: vec![
-            IO {
+            IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                decimals: 6, // USDC-like token
-                vaultId: U256::from(0),
+                vaultId: alloy::primitives::B256::ZERO,
             },
-            IO {
+            IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                decimals: 18, // Stock share token
-                vaultId: U256::from(0),
+                vaultId: alloy::primitives::B256::ZERO,
             },
         ],
         validOutputs: vec![
-            IO {
+            IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                decimals: 6,
-                vaultId: U256::from(0),
+                vaultId: alloy::primitives::B256::ZERO,
             },
-            IO {
+            IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                decimals: 18,
-                vaultId: U256::from(0),
+                vaultId: alloy::primitives::B256::ZERO,
             },
         ],
     }

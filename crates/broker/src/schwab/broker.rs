@@ -4,8 +4,8 @@ use tokio::task::JoinHandle;
 use tracing::{error, info};
 
 use crate::schwab::auth::SchwabAuthEnv;
-use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
-use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
+use crate::schwab::market_hours::{fetch_market_hours, MarketStatus};
+use crate::schwab::tokens::{spawn_automatic_token_refresh, SchwabTokens};
 use crate::{
     Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate, Shares, Symbol,
 };
@@ -278,10 +278,10 @@ impl Broker for SchwabBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schwab::SchwabError;
     use crate::schwab::auth::SchwabAuthEnv;
     use crate::schwab::tokens::SchwabTokens;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
+    use crate::schwab::SchwabError;
+    use crate::test_utils::{setup_test_db, TEST_ENCRYPTION_KEY};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;

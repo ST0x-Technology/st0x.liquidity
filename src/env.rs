@@ -5,9 +5,9 @@ use tracing::Level;
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
 use crate::telemetry::HyperDxConfig;
-use st0x_broker::SupportedBroker;
 use st0x_broker::alpaca::AlpacaAuthEnv;
 use st0x_broker::schwab::SchwabAuthEnv;
+use st0x_broker::SupportedBroker;
 
 // Dummy program name required by clap when parsing from environment variables.
 // clap's try_parse_from expects argv[0] to be the program name, but we only
@@ -199,7 +199,7 @@ pub fn setup_tracing(log_level: &LogLevel) {
 pub mod tests {
     use super::*;
     use crate::onchain::EvmEnv;
-    use alloy::primitives::{FixedBytes, address};
+    use alloy::primitives::{address, FixedBytes};
     use st0x_broker::schwab::{SchwabAuthEnv, SchwabConfig};
     use st0x_broker::{MockBrokerConfig, TryIntoBroker};
 

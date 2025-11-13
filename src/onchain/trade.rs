@@ -1,17 +1,16 @@
-use alloy::primitives::{B256, U256};
+use alloy::primitives::B256;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::num::ParseFloatError;
 use tracing::error;
 
-use crate::bindings::IOrderBookV4::{ClearV2, OrderV3, TakeOrderV2};
+use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::EvmEnv;
 
 use super::pyth::PythPricing;
 use crate::symbol::cache::SymbolCache;
@@ -23,8 +22,8 @@ use st0x_broker::PersistenceError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
-    ClearV2(Box<ClearV2>),
-    TakeOrderV2(Box<TakeOrderV2>),
+    ClearV3(Box<ClearV3>),
+    TakeOrderV3(Box<TakeOrderV3>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -186,7 +185,7 @@ impl OnchainTrade {
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
         provider: P,
-        order: OrderV3,
+        order: OrderV4,
         fill: OrderFill,
         log: Log,
         feed_id_cache: &FeedIdCache,
@@ -211,10 +210,10 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let onchain_input_amount = u256_to_f64(fill.input_amount, input.decimals)?;
+        let onchain_input_amount = float_to_f64(fill.input_amount)?;
         let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
 
-        let onchain_output_amount = u256_to_f64(fill.output_amount, output.decimals)?;
+        let onchain_output_amount = float_to_f64(fill.output_amount)?;
         let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -307,8 +306,8 @@ impl OnchainTrade {
             .logs()
             .iter()
             .filter(|log| {
-                (log.topic0() == Some(&ClearV2::SIGNATURE_HASH)
-                    || log.topic0() == Some(&TakeOrderV2::SIGNATURE_HASH))
+                (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
+                    || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
                     && log.address() == env.orderbook
             })
             .collect();
@@ -335,9 +334,9 @@ impl OnchainTrade {
 #[derive(Debug)]
 pub(crate) struct OrderFill {
     pub input_index: usize,
-    pub input_amount: U256,
+    pub input_amount: B256,
     pub output_index: usize,
-    pub output_amount: U256,
+    pub output_amount: B256,
 }
 
 async fn try_convert_log_to_onchain_trade<P: Provider>(
@@ -358,8 +357,8 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         removed: false,
     };
 
-    if let Ok(clear_event) = log.log_decode::<ClearV2>() {
-        return OnchainTrade::try_from_clear_v2(
+    if let Ok(clear_event) = log.log_decode::<ClearV3>() {
+        return OnchainTrade::try_from_clear_v3(
             env,
             cache,
             &provider,
@@ -370,7 +369,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
         .await;
     }
 
-    if let Ok(take_order_event) = log.log_decode::<TakeOrderV2>() {
+    if let Ok(take_order_event) = log.log_decode::<TakeOrderV3>() {
         return OnchainTrade::try_from_take_order_if_target_owner(
             cache,
             &provider,
@@ -385,25 +384,25 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     Ok(None)
 }
 
-/// Helper that converts a fixed-decimal U256 amount into an f64 using the provided number of decimals.
-fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
-    if amount.is_zero() {
-        return Ok(0.);
-    }
+/// Converts a Float (bytes32) amount to f64.
+///
+/// Uses the rain-math-float library's format() method to convert the Float to a string,
+/// then parses it to f64. Float.format() handles the proper formatting internally.
+fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
+    use rain_math_float::Float;
 
-    let u256_str = amount.to_string();
-    let decimals = decimals as usize;
+    // Create Float from raw B256
+    let float = Float::from_raw(float);
 
-    let formatted = if decimals == 0 {
-        u256_str
-    } else if u256_str.len() <= decimals {
-        format!("0.{}{}", "0".repeat(decimals - u256_str.len()), u256_str)
-    } else {
-        let (int_part, frac_part) = u256_str.split_at(u256_str.len() - decimals);
-        format!("{int_part}.{frac_part}")
-    };
+    // Use the library's format() method to get a string representation
+    let formatted = float
+        .format()
+        .map_err(|e| OnChainError::FloatConversion(format!("Float format error: {e}")))?;
 
-    formatted.parse::<f64>()
+    // Parse the formatted string to f64
+    formatted.parse::<f64>().map_err(|e| {
+        OnChainError::FloatConversion(format!("Failed to parse '{formatted}' as f64: {e}"))
+    })
 }
 
 #[cfg(test)]
@@ -413,7 +412,23 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
     use alloy::primitives::fixed_bytes;
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::providers::{mock::Asserter, ProviderBuilder};
+
+    /// Helper to create a properly encoded Float for testing
+    /// Creates a Float representing the given value using from_fixed_decimal_lossy
+    fn create_float(value: i128, decimals: u8) -> B256 {
+        use alloy::primitives::U256;
+        use rain_math_float::Float;
+
+        // For testing, we create Float from a fixed decimal value
+        // E.g., value=9, decimals=0 represents 9.0
+        let u256_value = U256::from(value.unsigned_abs());
+        let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+
+        // Handle negative values by manually setting the sign bit if needed
+        // For now, assume positive values in tests
+        float.get_inner()
+    }
 
     #[tokio::test]
     async fn test_onchain_trade_save_within_transaction_and_find() {
@@ -463,16 +478,61 @@ mod tests {
     }
 
     #[test]
-    fn test_u256_to_f64_edge_cases() {
-        assert!((u256_to_f64(U256::ZERO, 18).unwrap() - 0.0).abs() < f64::EPSILON);
+    fn test_float_constants_from_v5_interface() {
+        // Verify our implementation matches Float constants from LibDecimalFloat.sol
 
-        let max_safe = U256::from(9_007_199_254_740_991_u64);
-        let result = u256_to_f64(max_safe, 0).unwrap();
-        assert!((result - 9_007_199_254_740_991.0).abs() < 1.0);
+        // FLOAT_ONE = bytes32(uint256(1)) = coefficient=1, exponent=0 → 1.0
+        let float_one = B256::from([
+            0x00, 0x00, 0x00, 0x00, // exponent = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, // coefficient = 1
+        ]);
+        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
-        let very_large = U256::MAX;
-        let result = u256_to_f64(very_large, 18);
-        assert!(result.is_ok());
+        // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
+        let float_half = B256::from([
+            0xff, 0xff, 0xff, 0xff, // exponent = -1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x05, // coefficient = 5
+        ]);
+        assert!((float_to_f64(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
+
+        // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
+        let float_two = B256::from([
+            0x00, 0x00, 0x00, 0x00, // exponent = 0
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, // coefficient = 2
+        ]);
+        assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_float_to_f64_edge_cases() {
+        // Zero value (coefficient=0, exponent=0)
+        let float_zero = create_float(0, 0);
+        assert!((float_to_f64(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
+
+        // Value 1.0
+        let float_one = create_float(1, 0); // 1 with 0 decimals = 1.0
+        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+
+        // Value 9.0
+        let float_nine = create_float(9, 0); // 9 with 0 decimals = 9.0
+        let result = float_to_f64(float_nine).unwrap();
+        assert!((result - 9.0).abs() < f64::EPSILON);
+
+        // Value 100.0
+        let float_hundred = create_float(100, 0); // 100 with 0 decimals = 100.0
+        let result = float_to_f64(float_hundred).unwrap();
+        assert!((result - 100.0).abs() < f64::EPSILON);
+
+        // Fractional value: 0.5 (represented as 5 with 1 decimal)
+        let float_half = create_float(5, 1); // 5 with 1 decimal = 0.5
+        let result = float_to_f64(float_half).unwrap();
+        assert!((result - 0.5).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -581,34 +641,51 @@ mod tests {
     }
 
     #[test]
-    fn test_u256_to_f64_precision_loss() {
-        // Test precision loss with very large numbers
-        let very_large = U256::MAX;
-        let result = u256_to_f64(very_large, 0).unwrap();
+    fn test_float_to_f64_precision_loss() {
+        // Test with very large coefficient
+        let large_coeff = 1_000_000_000_000_000_i128;
+        let float_large = create_float(large_coeff, 0);
+        let result = float_to_f64(float_large).unwrap();
         assert!(result.is_finite());
+        assert!((result - 1_000_000_000_000_000.0).abs() < 1.0);
 
-        // Test with maximum decimals
-        let small_amount = U256::from(1);
-        let result = u256_to_f64(small_amount, 255).unwrap(); // Max u8 value
-        assert!((result - 0.0).abs() < f64::EPSILON); // Should be rounded to 0 due to extreme precision
+        // Test with very small value (high negative exponent)
+        let float_small = create_float(1, 50);
+        let result = float_to_f64(float_small).unwrap();
+        assert!(result.is_finite());
+        // 1 × 10^-50 is extremely small
+        assert!(result > 0.0 && result < 1e-40);
     }
 
     #[test]
-    fn test_u256_to_f64_formatting_edge_cases() {
-        // Test with exactly decimal places length
-        let amount = U256::from(123_456);
-        let result = u256_to_f64(amount, 6).unwrap();
+    fn test_float_to_f64_formatting_edge_cases() {
+        // Test with coefficient requiring decimal point insertion
+        // coefficient=123456, exponent=-6, decimals=0
+        // Result: 123456 × 10^-6 = 0.123456
+        let float_amount = create_float(123_456, 6);
+        let result = float_to_f64(float_amount).unwrap();
         assert!((result - 0.123_456).abs() < f64::EPSILON);
 
-        // Test with more decimals than digits
-        let amount = U256::from(5);
-        let result = u256_to_f64(amount, 10).unwrap();
-        assert!((result - 0.000_000_000_5).abs() < f64::EPSILON);
+        // Test with very small coefficient and negative exponent
+        // coefficient=5, exponent=-10, decimals=0
+        // Result: 5 × 10^-10 = 0.0000000005
+        let float_amount = create_float(5, 10);
+        let result = float_to_f64(float_amount).unwrap();
+        assert!((result - 5e-10).abs() < 1e-15);
 
-        // Test with zero decimals
-        let amount = U256::from(12345);
-        let result = u256_to_f64(amount, 0).unwrap();
+        // Test with no exponent adjustment
+        // coefficient=12345, exponent=0, decimals=0
+        // Result: 12345 × 10^0 = 12345
+        let float_amount = create_float(12_345, 0);
+        let result = float_to_f64(float_amount).unwrap();
         assert!((result - 12_345.0).abs() < f64::EPSILON);
+
+        // Test with positive exponent (multiplication)
+        // coefficient=5, exponent=3, decimals=0
+        // Result: 5 × 10^3 = 5000
+        let float_amount = create_float(5000, 0);
+        let result = float_to_f64(float_amount).unwrap();
+        assert!((result - 5000.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

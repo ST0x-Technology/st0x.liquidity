@@ -1,13 +1,13 @@
-use alloy::primitives::{Address, B256, Bytes, U256, address};
-use alloy::providers::Provider;
+use alloy::primitives::{address, Address, Bytes, B256, U256};
 use alloy::providers::ext::DebugApi;
+use alloy::providers::Provider;
 use alloy::rpc::types::trace::geth::{
     CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, GethTrace,
 };
 use alloy::sol_types::{SolCall, SolType};
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::Decimal;
 use tracing::{debug, error, info, warn};
 
 use crate::bindings::IPyth::{
@@ -304,8 +304,8 @@ where
 mod tests {
     use super::*;
     use alloy::primitives::{Address, U256};
-    use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::providers::ProviderBuilder;
     use alloy::rpc::types::trace::geth::FourByteFrame;
 
     fn create_test_call_frame(

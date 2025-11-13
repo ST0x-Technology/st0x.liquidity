@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use std::str::FromStr;
 use tracing::{error, info, warn};
 
-use crate::bindings::IOrderBookV4::{ClearV2, TakeOrderV2};
+use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::error::EventQueueError;
 use crate::onchain::trade::TradeEvent;
 
@@ -16,15 +16,15 @@ pub trait Enqueueable {
     fn to_trade_event(&self) -> TradeEvent;
 }
 
-impl Enqueueable for ClearV2 {
+impl Enqueueable for ClearV3 {
     fn to_trade_event(&self) -> TradeEvent {
-        TradeEvent::ClearV2(Box::new(self.clone()))
+        TradeEvent::ClearV3(Box::new(self.clone()))
     }
 }
 
-impl Enqueueable for TakeOrderV2 {
+impl Enqueueable for TakeOrderV3 {
     fn to_trade_event(&self) -> TradeEvent {
-        TradeEvent::TakeOrderV2(Box::new(self.clone()))
+        TradeEvent::TakeOrderV3(Box::new(self.clone()))
     }
 }
 
@@ -207,16 +207,16 @@ pub(crate) async fn enqueue_buffer(
     stream::iter(event_buffer)
         .map(|(event, log)| async move {
             let result = match &event {
-                TradeEvent::ClearV2(clear_event) => enqueue(pool, clear_event.as_ref(), &log).await,
-                TradeEvent::TakeOrderV2(take_event) => {
+                TradeEvent::ClearV3(clear_event) => enqueue(pool, clear_event.as_ref(), &log).await,
+                TradeEvent::TakeOrderV3(take_event) => {
                     enqueue(pool, take_event.as_ref(), &log).await
                 }
             };
 
             if let Err(e) = result {
                 let event_type = match event {
-                    TradeEvent::ClearV2(_) => "ClearV2",
-                    TradeEvent::TakeOrderV2(_) => "TakeOrderV2",
+                    TradeEvent::ClearV3(_) => "ClearV3",
+                    TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
                 };
                 error!("Failed to enqueue buffered {event_type} event: {e}");
             }
@@ -258,11 +258,11 @@ pub(crate) async fn get_max_processed_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IOrderBookV4::{
-        ClearConfig, ClearV2, OrderV3, TakeOrderConfigV3, TakeOrderV2,
+    use crate::bindings::IOrderBookV5::{
+        ClearConfigV2, ClearV3, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{LogData, Uint, address, b256};
+    use alloy::primitives::{address, b256, LogData};
 
     #[tokio::test]
     async fn test_enqueue_and_process_event() {
@@ -287,11 +287,11 @@ mod tests {
         };
 
         // Create a test event
-        let test_event = TradeEvent::ClearV2(Box::new(ClearV2 {
+        let test_event = TradeEvent::ClearV3(Box::new(ClearV3 {
             sender: log.inner.address,
-            alice: OrderV3::default(),
-            bob: OrderV3::default(),
-            clearConfig: ClearConfig::default(),
+            alice: OrderV4::default(),
+            bob: OrderV4::default(),
+            clearConfig: ClearConfigV2::default(),
         }));
 
         // Enqueue event
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(queued_event.tx_hash, log.transaction_hash.unwrap());
         assert_eq!(queued_event.log_index, 5);
         assert_eq!(queued_event.block_number, 100);
-        assert!(matches!(queued_event.event, TradeEvent::ClearV2(_)));
+        assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
         assert!(!queued_event.processed);
 
         // Mark as processed
@@ -350,11 +350,11 @@ mod tests {
         };
 
         // Create a test event
-        let test_event = TradeEvent::TakeOrderV2(Box::new(TakeOrderV2 {
+        let test_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log.inner.address,
-            config: TakeOrderConfigV3::default(),
-            input: Uint::default(),
-            output: Uint::default(),
+            config: TakeOrderConfigV4::default(),
+            input: alloy::primitives::B256::ZERO,
+            output: alloy::primitives::B256::ZERO,
         }));
 
         // Enqueue same event twice
@@ -392,11 +392,11 @@ mod tests {
                 removed: false,
             };
 
-            let test_event = TradeEvent::ClearV2(Box::new(ClearV2 {
+            let test_event = TradeEvent::ClearV3(Box::new(ClearV3 {
                 sender: log.inner.address,
-                alice: OrderV3::default(),
-                bob: OrderV3::default(),
-                clearConfig: ClearConfig::default(),
+                alice: OrderV4::default(),
+                bob: OrderV4::default(),
+                clearConfig: ClearConfigV2::default(),
             }));
             enqueue_event(&pool, &log, test_event).await.unwrap();
         }
@@ -456,18 +456,18 @@ mod tests {
             removed: false,
         };
 
-        let clear_event = TradeEvent::ClearV2(Box::new(ClearV2 {
+        let clear_event = TradeEvent::ClearV3(Box::new(ClearV3 {
             sender: log1.inner.address,
-            alice: OrderV3::default(),
-            bob: OrderV3::default(),
-            clearConfig: ClearConfig::default(),
+            alice: OrderV4::default(),
+            bob: OrderV4::default(),
+            clearConfig: ClearConfigV2::default(),
         }));
 
-        let take_event = TradeEvent::TakeOrderV2(Box::new(TakeOrderV2 {
+        let take_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log2.inner.address,
-            config: TakeOrderConfigV3::default(),
-            input: Uint::default(),
-            output: Uint::default(),
+            config: TakeOrderConfigV4::default(),
+            input: alloy::primitives::B256::ZERO,
+            output: alloy::primitives::B256::ZERO,
         }));
 
         let event_buffer = vec![(clear_event, log1), (take_event, log2)];
@@ -478,7 +478,7 @@ mod tests {
         assert_eq!(count, 2);
 
         let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
-        assert!(matches!(first_event.event, TradeEvent::ClearV2(_)));
+        assert!(matches!(first_event.event, TradeEvent::ClearV3(_)));
 
         let mut sql_tx = pool.begin().await.unwrap();
         mark_event_processed(&mut sql_tx, first_event.id.unwrap())
@@ -487,7 +487,7 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
-        assert!(matches!(second_event.event, TradeEvent::TakeOrderV2(_)));
+        assert!(matches!(second_event.event, TradeEvent::TakeOrderV3(_)));
     }
 
     #[tokio::test]

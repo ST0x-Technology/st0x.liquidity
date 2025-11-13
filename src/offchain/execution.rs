@@ -255,7 +255,7 @@ impl OffchainExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{OffchainExecutionBuilder, setup_test_db};
+    use crate::test_utils::{setup_test_db, OffchainExecutionBuilder};
     use chrono::Utc;
     use st0x_broker::OrderState;
 

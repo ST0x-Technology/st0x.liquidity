@@ -7,12 +7,12 @@ use tracing::{error, info};
 use crate::env::{BrokerConfig, Config, Env};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::{OnchainTrade, accumulator};
+use crate::onchain::{accumulator, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use st0x_broker::schwab::{
-    SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
+    extract_code_from_url, SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens,
 };
 use st0x_broker::{
     Broker, Direction, MarketOrder, MockBrokerConfig, OrderPlacement, OrderState, Shares, Symbol,
@@ -457,7 +457,7 @@ async fn process_found_trade<W: Write>(
         let placement = execute_broker_order(config, pool, market_order, stdout).await?;
 
         let submitted_state = OrderState::Submitted {
-            order_id: placement.order_id.to_string(),
+            order_id: placement.order_id.clone(),
         };
 
         let mut sql_tx = pool.begin().await?;
@@ -503,27 +503,27 @@ fn display_trade_details<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange, ClearV2};
+    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
-    use crate::onchain::EvmEnv;
     use crate::onchain::trade::OnchainTrade;
+    use crate::onchain::EvmEnv;
     use crate::test_utils::get_test_order;
     use crate::test_utils::setup_test_db;
     use crate::test_utils::setup_test_tokens;
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{address, fixed_bytes, FixedBytes, IntoLogData, U256};
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
     use chrono::{Duration, Utc};
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
+    use st0x_broker::schwab::SchwabAuthEnv;
     use st0x_broker::Direction;
     use st0x_broker::OrderStatus;
-    use st0x_broker::schwab::SchwabAuthEnv;
     use std::str::FromStr;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -954,10 +954,8 @@ mod tests {
         .unwrap();
 
         let stdout_output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(
-            stdout_output
-                .contains("🔄 Your refresh token has expired. Starting authentication process...")
-        );
+        assert!(stdout_output
+            .contains("🔄 Your refresh token has expired. Starting authentication process..."));
         assert!(
             stdout_output.contains("You will be guided through the Charles Schwab OAuth process.")
         );
@@ -1019,17 +1017,17 @@ mod tests {
         let order = get_test_order();
         let order_owner = order.owner;
 
-        let clear_event = ClearV2 {
+        let clear_event = ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order,
-            clearConfig: ClearConfig {
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: U256::ZERO,
-                bobBountyVaultId: U256::ZERO,
+                aliceBountyVaultId: alloy::primitives::B256::ZERO,
+                bobBountyVaultId: alloy::primitives::B256::ZERO,
             },
         };
 
@@ -1049,7 +1047,7 @@ mod tests {
             "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
             "logs": [{
                 "address": orderbook,
-                "topics": [ClearV2::SIGNATURE_HASH],
+                "topics": [ClearV3::SIGNATURE_HASH],
                 "data": format!("0x{}", hex::encode(clear_event.into_log_data().data)),
                 "blockNumber": "0x64",
                 "transactionHash": tx_hash,
@@ -1059,13 +1057,33 @@ mod tests {
             }]
         });
 
-        let after_clear_event = AfterClear {
+        // Helper to create Float from U256 value with decimals
+        fn create_float_from_u256(value: U256, decimals: u8) -> alloy::primitives::B256 {
+            use rain_math_float::Float;
+
+            let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
+        // Parse alice_output_shares as fixed-point value with 18 decimals
+        // e.g., "9000000000000000000" with 18 decimals = 9.0
+        let alice_shares_u256 = U256::from_str(alice_output_shares).unwrap();
+
+        // Convert bob_output_usdc to U256 (it's in 6-decimal format)
+        // e.g., 100_000_000 with 6 decimals = 100.0
+        let bob_usdc_u256 = U256::from(bob_output_usdc);
+
+        let after_clear_event = AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: ClearStateChange {
-                aliceOutput: U256::from_str(alice_output_shares).unwrap(),
-                bobOutput: U256::from(bob_output_usdc),
-                aliceInput: U256::from(bob_output_usdc),
-                bobInput: U256::from_str(alice_output_shares).unwrap(),
+            clearStateChange: ClearStateChangeV2 {
+                // Alice output: shares (18 decimals)
+                aliceOutput: create_float_from_u256(alice_shares_u256, 18),
+                // Bob output: USDC (6 decimals)
+                bobOutput: create_float_from_u256(bob_usdc_u256, 6),
+                // Alice input: USDC (6 decimals)
+                aliceInput: create_float_from_u256(bob_usdc_u256, 6),
+                // Bob input: shares (18 decimals)
+                bobInput: create_float_from_u256(alice_shares_u256, 18),
             },
         };
 
@@ -1101,8 +1119,19 @@ mod tests {
         asserter.push_success(&mock_data.receipt_json);
         asserter.push_success(&json!([mock_data.after_clear_log]));
         asserter.push_success(&mock_data.receipt_json);
+        // Determine decimals based on symbol
+        let input_decimals = if input_symbol == "USDC" { 6u8 } else { 18u8 };
+        let output_decimals = if output_symbol == "USDC" { 6u8 } else { 18u8 };
+        // Mock decimals() then symbol() calls for input token
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
+            &input_decimals,
+        ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &input_symbol.to_string(),
+        ));
+        // Mock decimals() then symbol() calls for output token
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(
+            &output_decimals,
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &output_symbol.to_string(),
@@ -1111,7 +1140,7 @@ mod tests {
         ProviderBuilder::new().connect_mocked_client(asserter)
     }
 
-    fn setup_schwab_api_mocks(server: &MockServer) -> (httpmock::Mock, httpmock::Mock) {
+    fn setup_schwab_api_mocks(server: &MockServer) -> (httpmock::Mock<'_>, httpmock::Mock<'_>) {
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/trader/v1/accounts/accountNumbers");
@@ -1789,9 +1818,13 @@ mod tests {
         asserter1.push_success(&mock_data.receipt_json);
         asserter1.push_success(&json!([mock_data.after_clear_log]));
         asserter1.push_success(&mock_data.receipt_json);
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (TSLA0x)
+        asserter1.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter1.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"TSLA0x".to_string(),
         ));
@@ -1829,9 +1862,13 @@ mod tests {
         asserter2.push_success(&mock_data.receipt_json);
         asserter2.push_success(&json!([mock_data.after_clear_log]));
         asserter2.push_success(&mock_data.receipt_json);
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (TSLA0x)
+        asserter2.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter2.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"TSLA0x".to_string(),
         ));
