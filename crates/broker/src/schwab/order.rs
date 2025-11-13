@@ -802,8 +802,7 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/trader/v1/accounts/ABC123DEF456/orders");
             then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/");
-            // Empty order ID
+                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/"); // Empty order ID
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Sell, 50);
