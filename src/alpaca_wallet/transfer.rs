@@ -54,6 +54,14 @@ impl std::fmt::Display for TokenSymbol {
     }
 }
 
+impl std::str::FromStr for TokenSymbol {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(s))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub(crate) struct TransferId(Uuid);
 
@@ -73,6 +81,15 @@ impl From<Uuid> for TransferId {
 impl std::fmt::Display for TransferId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for TransferId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let uuid = Uuid::parse_str(s)?;
+        Ok(Self(uuid))
     }
 }
 
@@ -149,6 +166,14 @@ impl AsRef<str> for Network {
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for Network {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(s))
     }
 }
 
@@ -1069,5 +1094,51 @@ mod tests {
     fn test_network_from_string_normalizes() {
         let network = Network::from("EtHeReuM".to_string());
         assert_eq!(network.as_ref(), "ethereum");
+    }
+
+    #[test]
+    fn test_token_symbol_from_str() {
+        let symbol = TokenSymbol::from_str("AAPL").unwrap();
+        assert_eq!(symbol.as_ref(), "AAPL");
+
+        let symbol = TokenSymbol::from_str("USDC").unwrap();
+        assert_eq!(symbol.as_ref(), "USDC");
+
+        let symbol = TokenSymbol::from_str("").unwrap();
+        assert_eq!(symbol.as_ref(), "");
+    }
+
+    #[test]
+    fn test_network_from_str() {
+        let network = Network::from_str("ethereum").unwrap();
+        assert_eq!(network.as_ref(), "ethereum");
+
+        let network = Network::from_str("Ethereum").unwrap();
+        assert_eq!(network.as_ref(), "ethereum");
+
+        let network = Network::from_str("ETHEREUM").unwrap();
+        assert_eq!(network.as_ref(), "ethereum");
+
+        let network = Network::from_str("PoLyGoN").unwrap();
+        assert_eq!(network.as_ref(), "polygon");
+    }
+
+    #[test]
+    fn test_transfer_id_from_str_valid() {
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+        let transfer_id = TransferId::from_str(uuid_str).unwrap();
+        assert_eq!(transfer_id.to_string(), uuid_str);
+    }
+
+    #[test]
+    fn test_transfer_id_from_str_invalid() {
+        let result = TransferId::from_str("not-a-uuid");
+        assert!(result.is_err());
+
+        let result = TransferId::from_str("");
+        assert!(result.is_err());
+
+        let result = TransferId::from_str("550e8400-e29b-41d4-a716");
+        assert!(result.is_err());
     }
 }

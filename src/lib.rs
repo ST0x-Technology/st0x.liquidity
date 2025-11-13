@@ -1,7 +1,7 @@
 use sqlx::SqlitePool;
 use tracing::{error, info, info_span, warn};
 
-mod alpaca_wallet;
+pub(crate) mod alpaca_wallet;
 pub mod api;
 mod bindings;
 pub mod cli;

@@ -22,16 +22,16 @@ integration testing with Alpaca's team.
 
 ## Task 1. Add FromStr implementations for alpaca_wallet types
 
-- [ ] Change `mod alpaca_wallet;` to `pub(crate) mod alpaca_wallet;` in
+- [x] Change `mod alpaca_wallet;` to `pub(crate) mod alpaca_wallet;` in
       `src/lib.rs`
-- [ ] Add `impl FromStr for TokenSymbol` in `src/alpaca_wallet/transfer.rs`
-- [ ] Write tests for `TokenSymbol::from_str()` (valid symbols, empty strings)
-- [ ] Add `impl FromStr for Network` in `src/alpaca_wallet/transfer.rs`
-- [ ] Write tests for `Network::from_str()` (valid networks, case normalization)
-- [ ] Add `impl FromStr for TransferId` in `src/alpaca_wallet/transfer.rs`
-- [ ] Write tests for `TransferId::from_str()` (valid UUIDs, invalid formats)
-- [ ] Run `cargo test -q` and verify passing
-- [ ] Run `cargo check` to verify compilation
+- [x] Add `impl FromStr for TokenSymbol` in `src/alpaca_wallet/transfer.rs`
+- [x] Write tests for `TokenSymbol::from_str()` (valid symbols, empty strings)
+- [x] Add `impl FromStr for Network` in `src/alpaca_wallet/transfer.rs`
+- [x] Write tests for `Network::from_str()` (valid networks, case normalization)
+- [x] Add `impl FromStr for TransferId` in `src/alpaca_wallet/transfer.rs`
+- [x] Write tests for `TransferId::from_str()` (valid UUIDs, invalid formats)
+- [x] Run `cargo test -q` and verify passing
+- [x] Run `cargo check` to verify compilation
 
 ## Task 2. Implement alpaca-deposit command
 
