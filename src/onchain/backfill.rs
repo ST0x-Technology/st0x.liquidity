@@ -957,6 +957,81 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    fn create_clear_log(orderbook: Address, order: &IOrderBookV5::OrderV4, tx_hash: B256) -> Log {
+        let clear_config = IOrderBookV5::ClearConfigV2 {
+            aliceInputIOIndex: U256::from(0),
+            aliceOutputIOIndex: U256::from(1),
+            bobInputIOIndex: U256::from(1),
+            bobOutputIOIndex: U256::from(0),
+            aliceBountyVaultId: B256::ZERO,
+            bobBountyVaultId: B256::ZERO,
+        };
+
+        let clear_event = IOrderBookV5::ClearV3 {
+            sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            alice: order.clone(),
+            bob: order.clone(),
+            clearConfig: clear_config,
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: clear_event.to_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(1),
+            removed: false,
+        }
+    }
+
+    fn create_after_clear_log(orderbook: Address, tx_hash: B256) -> Log {
+        let after_clear_event = IOrderBookV5::AfterClearV2 {
+            sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            clearStateChange: IOrderBookV5::ClearStateChangeV2 {
+                aliceOutput: Float::from_fixed_decimal_lossy(
+                    uint!(5_000_000_000_000_000_000_U256),
+                    18,
+                )
+                .unwrap()
+                .get_inner(),
+
+                bobOutput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                aliceInput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobInput: Float::from_fixed_decimal_lossy(
+                    uint!(5_000_000_000_000_000_000_U256),
+                    18,
+                )
+                .unwrap()
+                .get_inner(),
+            },
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: after_clear_event.to_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(2),
+            removed: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_backfill_events_mixed_clear_and_take_events() {
         let pool = setup_test_db().await;
@@ -979,101 +1054,24 @@ mod tests {
             uint!(9_000_000_000_000_000_000_U256),
         );
         let take_log = create_test_log(evm_env.orderbook, &take_event, 50, tx_hash1);
-
-        let clear_config = IOrderBookV5::ClearConfigV2 {
-            aliceInputIOIndex: U256::from(0),
-            aliceOutputIOIndex: U256::from(1),
-            bobInputIOIndex: U256::from(1),
-            bobOutputIOIndex: U256::from(0),
-            aliceBountyVaultId: B256::ZERO,
-            bobBountyVaultId: B256::ZERO,
-        };
-
-        let clear_event = IOrderBookV5::ClearV3 {
-            sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
-            alice: order.clone(),
-            bob: order.clone(),
-            clearConfig: clear_config,
-        };
-
-        let clear_log = Log {
-            inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
-                data: clear_event.to_log_data(),
-            },
-            block_hash: None,
-            block_number: Some(100),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash2),
-            transaction_index: None,
-            log_index: Some(1),
-            removed: false,
-        };
-
-        let after_clear_event = IOrderBookV5::AfterClearV2 {
-            sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: IOrderBookV5::ClearStateChangeV2 {
-                aliceOutput: Float::from_fixed_decimal_lossy(
-                    uint!(5_000_000_000_000_000_000_U256),
-                    18,
-                )
-                .unwrap()
-                .get_inner(), // 5 shares
-
-                bobOutput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
-                    .unwrap()
-                    .get_inner(), // 50 USDC cents
-
-                aliceInput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
-                    .unwrap()
-                    .get_inner(),
-
-                bobInput: Float::from_fixed_decimal_lossy(
-                    uint!(5_000_000_000_000_000_000_U256),
-                    18,
-                )
-                .unwrap()
-                .get_inner(),
-            },
-        };
-
-        let after_clear_log = Log {
-            inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
-                data: after_clear_event.to_log_data(),
-            },
-            block_hash: None,
-            block_number: Some(100),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash2),
-            transaction_index: None,
-            log_index: Some(2),
-            removed: false,
-        };
+        let clear_log = create_clear_log(evm_env.orderbook, &order, tx_hash2);
+        let after_clear_log = create_after_clear_log(evm_env.orderbook, tx_hash2);
 
         let asserter = Asserter::new();
-        asserter.push_success(&serde_json::Value::from(150u64)); // 1. get_block_number
-        asserter.push_success(&serde_json::json!([clear_log])); // 2. get_logs clear
-        asserter.push_success(&serde_json::json!([take_log])); // 3. get_logs take
-
-        // Take event processing (processed first due to earlier block)
+        asserter.push_success(&serde_json::Value::from(150u64));
+        asserter.push_success(&serde_json::json!([clear_log]));
+        asserter.push_success(&serde_json::json!([take_log]));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 4. symbol input
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 5. symbol output
             &"AAPL0x".to_string(),
         ));
-
-        // Clear event processing (processed second due to later block)
-        asserter.push_success(&serde_json::json!([after_clear_log])); // 6. get_logs AfterClear
+        asserter.push_success(&serde_json::json!([after_clear_log]));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 7. symbol input
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 8. symbol output
             &"AAPL0x".to_string(),
         ));
 
@@ -1083,16 +1081,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Check that two events were enqueued
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 2);
 
-        // Verify the first event (earlier block number)
         let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(first_event.tx_hash, tx_hash1);
         assert_eq!(first_event.block_number, 50);
 
-        // Mark as processed and get the second event
         let mut sql_tx = pool.begin().await.unwrap();
         mark_event_processed(&mut sql_tx, first_event.id.unwrap())
             .await

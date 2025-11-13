@@ -193,19 +193,16 @@ mod tests {
         AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                aliceOutput: Float::from_fixed_decimal(uint!(9_U256), 0)
                     .unwrap()
                     .get_inner(),
-
-                bobOutput: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                bobOutput: Float::from_fixed_decimal(uint!(100_U256), 0)
                     .unwrap()
                     .get_inner(),
-
-                aliceInput: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                aliceInput: Float::from_fixed_decimal(uint!(100_U256), 0)
                     .unwrap()
                     .get_inner(),
-
-                bobInput: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                bobInput: Float::from_fixed_decimal(uint!(9_U256), 0)
                     .unwrap()
                     .get_inner(),
             },
@@ -739,19 +736,16 @@ mod tests {
         AfterClearV2 {
             sender: Address::repeat_byte(sender_byte),
             clearStateChange: ClearStateChangeV2 {
-                aliceOutput: Float::from_fixed_decimal_lossy(U256::from(alice_shares), 0)
+                aliceOutput: Float::from_fixed_decimal(U256::from(alice_shares), 0)
                     .unwrap()
                     .get_inner(),
-
-                bobOutput: Float::from_fixed_decimal_lossy(U256::from(bob_usdc), 0)
+                bobOutput: Float::from_fixed_decimal(U256::from(bob_usdc), 0)
                     .unwrap()
                     .get_inner(),
-
-                aliceInput: Float::from_fixed_decimal_lossy(U256::from(bob_usdc), 0)
+                aliceInput: Float::from_fixed_decimal(U256::from(bob_usdc), 0)
                     .unwrap()
                     .get_inner(),
-
-                bobInput: Float::from_fixed_decimal_lossy(U256::from(alice_shares), 0)
+                bobInput: Float::from_fixed_decimal(U256::from(alice_shares), 0)
                     .unwrap()
                     .get_inner(),
             },

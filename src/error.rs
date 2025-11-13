@@ -3,9 +3,10 @@
 
 use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
+use rain_math_float::FloatError;
 use st0x_broker::order::status::ParseOrderStatusError;
 use st0x_broker::{InvalidBrokerError, PersistenceError};
-use std::num::ParseFloatError;
+use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::onchain::position_calculator::ConversionError;
 
@@ -128,8 +129,10 @@ pub(crate) enum OnChainError {
     InvalidBroker(#[from] InvalidBrokerError),
     #[error("Numeric conversion error: {0}")]
     Conversion(#[from] ConversionError),
-    #[error("Float/decimal conversion error: {0}")]
-    FloatConversion(String),
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] TryFromIntError),
 }
 
 impl From<sqlx::Error> for OnChainError {

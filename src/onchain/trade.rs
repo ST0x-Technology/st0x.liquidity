@@ -3,22 +3,18 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
+use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
+use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
 use crate::onchain::pyth::FeedIdCache;
-
-use super::pyth::PythPricing;
 use crate::symbol::cache::SymbolCache;
-#[cfg(test)]
-use sqlx::SqlitePool;
 use st0x_broker::Direction;
-#[cfg(test)]
-use st0x_broker::PersistenceError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
@@ -28,31 +24,30 @@ pub enum TradeEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnchainTrade {
-    pub id: Option<i64>,
-    pub tx_hash: B256,
-    pub log_index: u64,
-    pub symbol: TokenizedEquitySymbol,
-    pub amount: f64,
-    pub direction: Direction,
-    pub price_usdc: f64,
-    pub block_timestamp: Option<DateTime<Utc>>,
-    pub created_at: Option<DateTime<Utc>>,
-    pub gas_used: Option<u64>,
-    pub effective_gas_price: Option<u128>,
-    pub pyth_price: Option<f64>,
-    pub pyth_confidence: Option<f64>,
-    pub pyth_exponent: Option<i32>,
-    pub pyth_publish_time: Option<DateTime<Utc>>,
+    pub(crate) id: Option<i64>,
+    pub(crate) tx_hash: B256,
+    pub(crate) log_index: u64,
+    pub(crate) symbol: TokenizedEquitySymbol,
+    pub(crate) amount: f64,
+    pub(crate) direction: Direction,
+    pub(crate) price_usdc: f64,
+    pub(crate) block_timestamp: Option<DateTime<Utc>>,
+    pub(crate) created_at: Option<DateTime<Utc>>,
+    pub(crate) gas_used: Option<u64>,
+    pub(crate) effective_gas_price: Option<u128>,
+    pub(crate) pyth_price: Option<f64>,
+    pub(crate) pyth_confidence: Option<f64>,
+    pub(crate) pyth_exponent: Option<i32>,
+    pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
 }
 
 impl OnchainTrade {
     pub async fn save_within_transaction(
         &self,
         sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ) -> Result<i64, sqlx::Error> {
+    ) -> Result<i64, OnChainError> {
         let tx_hash_str = self.tx_hash.to_string();
-        #[allow(clippy::cast_possible_wrap)]
-        let log_index_i64 = self.log_index as i64;
+        let log_index_i64 = i64::try_from(self.log_index)?;
 
         let direction_str = self.direction.as_str();
         let symbol_str = self.symbol.to_string();
@@ -102,15 +97,16 @@ impl OnchainTrade {
 
     #[cfg(test)]
     pub async fn find_by_tx_hash_and_log_index(
-        pool: &SqlitePool,
+        pool: &sqlx::SqlitePool,
         tx_hash: B256,
         log_index: u64,
     ) -> Result<Self, OnChainError> {
         let tx_hash_str = tx_hash.to_string();
-        #[allow(clippy::cast_possible_wrap)]
-        let log_index_i64 = log_index as i64;
+        let log_index_i64 = i64::try_from(log_index).expect("test log_index should fit in i64");
+
         let row = sqlx::query!(
-            "SELECT
+            "
+            SELECT
                 id,
                 tx_hash,
                 log_index,
@@ -127,30 +123,26 @@ impl OnchainTrade {
                 pyth_exponent,
                 pyth_publish_time
             FROM onchain_trades
-            WHERE tx_hash = ?1 AND log_index = ?2",
+            WHERE tx_hash = ?1 AND log_index = ?2
+            ",
             tx_hash_str,
             log_index_i64
         )
         .fetch_one(pool)
         .await?;
 
-        let tx_hash = row.tx_hash.parse().map_err(|_| {
-            OnChainError::Persistence(PersistenceError::InvalidTradeStatus(format!(
-                "Invalid tx_hash format: {}",
-                row.tx_hash
-            )))
-        })?;
-
-        let direction = row
-            .direction
+        let tx_hash = row
+            .tx_hash
             .parse()
-            .map_err(|e| OnChainError::Persistence(PersistenceError::InvalidDirection(e)))?;
+            .expect("test db should have valid tx_hash");
+
+        let direction = row.direction.parse()?;
 
         Ok(Self {
             id: Some(row.id),
             tx_hash,
-            #[allow(clippy::cast_sign_loss)]
-            log_index: row.log_index as u64,
+            log_index: u64::try_from(row.log_index)
+                .expect("test db log_index should be non-negative"),
             symbol: row.symbol.parse::<TokenizedEquitySymbol>().unwrap(),
             amount: row.amount,
             direction,
@@ -165,8 +157,7 @@ impl OnchainTrade {
             effective_gas_price: row.effective_gas_price.and_then(|p| u128::try_from(p).ok()),
             pyth_price: row.pyth_price,
             pyth_confidence: row.pyth_confidence,
-            #[allow(clippy::cast_possible_truncation)]
-            pyth_exponent: row.pyth_exponent.map(|exp| exp as i32),
+            pyth_exponent: row.pyth_exponent.and_then(|exp| i32::try_from(exp).ok()),
             pyth_publish_time: row
                 .pyth_publish_time
                 .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
@@ -174,7 +165,7 @@ impl OnchainTrade {
     }
 
     #[cfg(test)]
-    pub async fn db_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    pub async fn db_count(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
         let row = sqlx::query!("SELECT COUNT(*) as count FROM onchain_trades")
             .fetch_one(pool)
             .await?;
@@ -389,20 +380,9 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 /// Uses the rain-math-float library's format() method to convert the Float to a string,
 /// then parses it to f64. Float.format() handles the proper formatting internally.
 fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
-    use rain_math_float::Float;
-
-    // Create Float from raw B256
     let float = Float::from_raw(float);
-
-    // Use the library's format() method to get a string representation
-    let formatted = float
-        .format()
-        .map_err(|e| OnChainError::FloatConversion(format!("Float format error: {e}")))?;
-
-    // Parse the formatted string to f64
-    formatted.parse::<f64>().map_err(|e| {
-        OnChainError::FloatConversion(format!("Failed to parse '{formatted}' as f64: {e}"))
-    })
+    let formatted = float.format()?;
+    Ok(formatted.parse::<f64>()?)
 }
 
 #[cfg(test)]
@@ -411,8 +391,9 @@ mod tests {
     use crate::onchain::EvmEnv;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{U256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use rain_math_float::Float;
 
     #[tokio::test]
     async fn test_onchain_trade_save_within_transaction_and_find() {
@@ -495,26 +476,31 @@ mod tests {
 
     #[test]
     fn test_float_to_f64_edge_cases() {
-        // Zero value (coefficient=0, exponent=0)
-        let float_zero = create_float(0, 0);
+        let float_zero = Float::from_fixed_decimal(uint!(0_U256), 0)
+            .unwrap()
+            .get_inner();
         assert!((float_to_f64(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
 
-        // Value 1.0
-        let float_one = create_float(1, 0); // 1 with 0 decimals = 1.0
+        let float_one = Float::from_fixed_decimal(uint!(1_U256), 0)
+            .unwrap()
+            .get_inner();
         assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
-        // Value 9.0
-        let float_nine = create_float(9, 0); // 9 with 0 decimals = 9.0
+        let float_nine = Float::from_fixed_decimal(uint!(9_U256), 0)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_nine).unwrap();
         assert!((result - 9.0).abs() < f64::EPSILON);
 
-        // Value 100.0
-        let float_hundred = create_float(100, 0); // 100 with 0 decimals = 100.0
+        let float_hundred = Float::from_fixed_decimal(uint!(100_U256), 0)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_hundred).unwrap();
         assert!((result - 100.0).abs() < f64::EPSILON);
 
-        // Fractional value: 0.5 (represented as 5 with 1 decimal)
-        let float_half = create_float(5, 1); // 5 with 1 decimal = 0.5
+        let float_half = Float::from_fixed_decimal(uint!(5_U256), 1)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_half).unwrap();
         assert!((result - 0.5).abs() < f64::EPSILON);
     }
@@ -628,13 +614,17 @@ mod tests {
     fn test_float_to_f64_precision_loss() {
         // Test with very large coefficient
         let large_coeff = 1_000_000_000_000_000_i128;
-        let float_large = create_float(large_coeff, 0);
+        let float_large = Float::from_fixed_decimal_lossy(U256::from(large_coeff), 0)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_large).unwrap();
         assert!(result.is_finite());
         assert!((result - 1_000_000_000_000_000.0).abs() < 1.0);
 
         // Test with very small value (high negative exponent)
-        let float_small = create_float(1, 50);
+        let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_small).unwrap();
         assert!(result.is_finite());
         // 1 × 10^-50 is extremely small
@@ -643,31 +633,27 @@ mod tests {
 
     #[test]
     fn test_float_to_f64_formatting_edge_cases() {
-        // Test with coefficient requiring decimal point insertion
-        // coefficient=123456, exponent=-6, decimals=0
-        // Result: 123456 × 10^-6 = 0.123456
-        let float_amount = create_float(123_456, 6);
+        let float_amount = Float::from_fixed_decimal(uint!(123_456_U256), 6)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_amount).unwrap();
         assert!((result - 0.123_456).abs() < f64::EPSILON);
 
-        // Test with very small coefficient and negative exponent
-        // coefficient=5, exponent=-10, decimals=0
-        // Result: 5 × 10^-10 = 0.0000000005
-        let float_amount = create_float(5, 10);
+        let float_amount = Float::from_fixed_decimal(uint!(5_U256), 10)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_amount).unwrap();
         assert!((result - 5e-10).abs() < 1e-15);
 
-        // Test with no exponent adjustment
-        // coefficient=12345, exponent=0, decimals=0
-        // Result: 12345 × 10^0 = 12345
-        let float_amount = create_float(12_345, 0);
+        let float_amount = Float::from_fixed_decimal(uint!(12_345_U256), 0)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_amount).unwrap();
         assert!((result - 12_345.0).abs() < f64::EPSILON);
 
-        // Test with positive exponent (multiplication)
-        // coefficient=5, exponent=3, decimals=0
-        // Result: 5 × 10^3 = 5000
-        let float_amount = create_float(5000, 0);
+        let float_amount = Float::from_fixed_decimal(uint!(5000_U256), 0)
+            .unwrap()
+            .get_inner();
         let result = float_to_f64(float_amount).unwrap();
         assert!((result - 5000.0).abs() < f64::EPSILON);
     }

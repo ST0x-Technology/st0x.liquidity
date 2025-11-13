@@ -50,8 +50,7 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
-    use alloy::hex;
-    use alloy::primitives::{U256, address, fixed_bytes, uint};
+    use alloy::primitives::{B256, U256, address, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
@@ -195,10 +194,12 @@ mod tests {
                     context: vec![],
                 }],
             },
-            // 5 shares: coefficient=5, exponent=0
-            input: create_float(5, 0),
-            // 50 USDC: coefficient=50, exponent=0
-            output: create_float(50, 0),
+            input: Float::from_fixed_decimal_lossy(uint!(5_U256), 0)
+                .unwrap()
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(50_U256), 0)
+                .unwrap()
+                .get_inner(),
         };
 
         let log = get_test_log();
@@ -256,10 +257,12 @@ mod tests {
                     context: vec![],
                 }],
             },
-            // 200 USDC: coefficient=200, exponent=0
-            input: create_float(200, 0),
-            // 15 shares: coefficient=15, exponent=0
-            output: create_float(15, 0),
+            input: Float::from_fixed_decimal_lossy(uint!(200_U256), 0)
+                .unwrap()
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(15_U256), 0)
+                .unwrap()
+                .get_inner(),
         };
 
         let log = get_test_log();
