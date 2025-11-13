@@ -444,9 +444,21 @@ mod tests {
             .await
             .unwrap();
 
-        // Mock market hours API to return open market
-        // Use today's date with market hours that encompass current time
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // Get current time in Eastern timezone to ensure date alignment
+        use chrono_tz::America::New_York as Eastern;
+        let now_eastern = Utc::now().with_timezone(&Eastern);
+        let today = now_eastern.format("%Y-%m-%d").to_string();
+
+        // Set market hours to be 2 hours before and 2 hours after current time
+        // This ensures the market appears "open" regardless of when the test runs
+        // Use %:z for RFC3339 compliant timezone (e.g., "-05:00" not "-0500")
+        let start_time = (now_eastern - chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string();
+        let end_time = (now_eastern + chrono::Duration::hours(2))
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string();
+
         let market_hours_mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/marketdata/v1/markets/equity")
@@ -464,16 +476,10 @@ mod tests {
                             "productName": "equity",
                             "isOpen": true,
                             "sessionHours": {
-                                "preMarket": [
-                                    {
-                                        "start": format!("{}T04:00:00-05:00", today),
-                                        "end": format!("{}T09:30:00-05:00", today)
-                                    }
-                                ],
                                 "regularMarket": [
                                     {
-                                        "start": format!("{}T00:00:00-05:00", today),
-                                        "end": format!("{}T23:59:59-05:00", today)
+                                        "start": start_time,
+                                        "end": end_time
                                     }
                                 ]
                             }
@@ -487,8 +493,9 @@ mod tests {
 
         assert!(result.is_ok());
         let duration = result.unwrap();
-        // Market is open, returns time until close
+        // Market is open, returns time until close (should be ~2 hours)
         assert!(duration.as_secs() > 0);
+        assert!(duration.as_secs() < 7300); // Less than ~2 hours + buffer
         market_hours_mock.assert();
     }
 

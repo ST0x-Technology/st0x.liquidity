@@ -3,9 +3,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker};
 
-use super::event::{
-    BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PriceCents, TradeId,
-};
+use super::FractionalShares;
+use super::event::{ExecutionThreshold, TradeId};
+use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PositionCommand {
