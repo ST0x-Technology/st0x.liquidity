@@ -51,7 +51,7 @@ mod tests {
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{U256, address, fixed_bytes};
+    use alloy::primitives::{U256, address, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
@@ -59,13 +59,6 @@ mod tests {
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,
     ) -> TakeOrderV3 {
-        // Helper to create Float for testing using from_fixed_decimal_lossy
-        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
-            float.get_inner()
-        }
-
         TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -78,16 +71,19 @@ mod tests {
                     context: vec![],
                 }],
             },
-            // 100 USDC: 100 with 0 decimals
-            input: create_float(100, 0),
-            // 9 shares: 9 with 0 decimals
-            output: create_float(9, 0),
+            input: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                .unwrap()
+                .get_inner(),
+
+            output: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                .unwrap()
+                .get_inner(),
         }
     }
 
-    fn mocked_receipt_hex(tx_hash: alloy::primitives::FixedBytes<32>) -> serde_json::Value {
+    fn mocked_receipt_hex(tx_hash: B256) -> serde_json::Value {
         serde_json::json!({
-            "transactionHash": hex::encode_prefixed(tx_hash),
+            "transactionHash": tx_hash,
             "transactionIndex": "0x1",
             "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
             "blockNumber": "0x1",
@@ -187,18 +183,11 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
-        // Helper to create Float for testing
-        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
-            float.get_inner()
-        }
-
         let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
                 order,
-                inputIOIndex: U256::from(1), // Different indices
+                inputIOIndex: U256::from(1),
                 outputIOIndex: U256::from(0),
                 signedContext: vec![SignedContextV1 {
                     signer: address!("0x0000000000000000000000000000000000000000"),
@@ -254,13 +243,6 @@ mod tests {
         let cache = SymbolCache::default();
         let order = get_test_order();
         let target_order_owner = order.owner;
-
-        // Helper to create Float for testing
-        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
-            float.get_inner()
-        }
 
         let take_event = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),

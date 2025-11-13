@@ -142,19 +142,24 @@ async fn fetch_after_clear_event<P: Provider>(
 
 #[cfg(test)]
 mod tests {
+    use alloy::hex;
+    use alloy::primitives::{
+        Address, B256, IntoLogData, LogData, U256, address, fixed_bytes, uint,
+    };
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::rpc::types::Log;
+    use alloy::sol_types::SolCall;
+    use rain_math_float::Float;
+    use serde_json::json;
+
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
+    use crate::bindings::IOrderBookV5;
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
-    use alloy::hex;
-    use alloy::primitives::{IntoLogData, U256, address, fixed_bytes};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
-    use alloy::rpc::types::Log;
-    use alloy::sol_types::SolCall;
-    use serde_json::json;
 
     fn create_test_env() -> EvmEnv {
         EvmEnv {
@@ -166,8 +171,8 @@ mod tests {
     }
 
     fn create_clear_event(
-        alice_order: crate::bindings::IOrderBookV5::OrderV4,
-        bob_order: crate::bindings::IOrderBookV5::OrderV4,
+        alice_order: IOrderBookV5::OrderV4,
+        bob_order: IOrderBookV5::OrderV4,
     ) -> ClearV3 {
         ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
@@ -178,34 +183,31 @@ mod tests {
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: alloy::primitives::B256::ZERO,
-                bobBountyVaultId: alloy::primitives::B256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         }
     }
 
     fn create_after_clear_event() -> AfterClearV2 {
-        // Helper to create Float for testing
-        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            use alloy::primitives::U256;
-            use rain_math_float::Float;
-
-            let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
-            float.get_inner()
-        }
-
         AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: ClearStateChangeV2 {
-                // 9 shares: coefficient=9, exponent=0
-                aliceOutput: create_float(9, 0),
-                // 100 USDC: coefficient=100, exponent=0
-                bobOutput: create_float(100, 0),
-                // 100 USDC: coefficient=100, exponent=0
-                aliceInput: create_float(100, 0),
-                // 9 shares: coefficient=9, exponent=0
-                bobInput: create_float(9, 0),
+                aliceOutput: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobOutput: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                aliceInput: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobInput: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                    .unwrap()
+                    .get_inner(),
             },
         }
     }
@@ -510,7 +512,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -580,7 +582,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -648,7 +650,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
         ));
     }
 
@@ -734,33 +736,32 @@ mod tests {
         alice_shares: u64,
         bob_usdc: u64,
     ) -> AfterClearV2 {
-        // Helper to create Float for testing
-        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
-            use alloy::primitives::U256;
-            use rain_math_float::Float;
-
-            let u256_value = U256::from(value.unsigned_abs());
-            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
-            float.get_inner()
-        }
-
         AfterClearV2 {
-            sender: alloy::primitives::Address::repeat_byte(sender_byte),
+            sender: Address::repeat_byte(sender_byte),
             clearStateChange: ClearStateChangeV2 {
-                // alice_shares: coefficient=alice_shares, exponent=0
-                aliceOutput: create_float(i128::from(alice_shares), 0),
-                // bob_usdc: coefficient=bob_usdc, exponent=0
-                bobOutput: create_float(i128::from(bob_usdc), 0),
-                aliceInput: create_float(i128::from(bob_usdc), 0),
-                bobInput: create_float(i128::from(alice_shares), 0),
+                aliceOutput: Float::from_fixed_decimal_lossy(U256::from(alice_shares), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobOutput: Float::from_fixed_decimal_lossy(U256::from(bob_usdc), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                aliceInput: Float::from_fixed_decimal_lossy(U256::from(bob_usdc), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobInput: Float::from_fixed_decimal_lossy(U256::from(alice_shares), 0)
+                    .unwrap()
+                    .get_inner(),
             },
         }
     }
 
     fn create_test_log(
-        orderbook: alloy::primitives::Address,
-        tx_hash: alloy::primitives::B256,
-        log_data: alloy::primitives::LogData,
+        orderbook: Address,
+        tx_hash: B256,
+        log_data: LogData,
         log_index: u64,
     ) -> Log {
         Log {
@@ -778,7 +779,7 @@ mod tests {
         }
     }
 
-    fn create_test_receipt_json(tx_hash: alloy::primitives::B256) -> serde_json::Value {
+    fn create_test_receipt_json(tx_hash: B256) -> serde_json::Value {
         json!({
             "transactionHash": tx_hash,
             "transactionIndex": "0x1",

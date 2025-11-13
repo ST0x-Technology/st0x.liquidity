@@ -240,19 +240,20 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use crate::onchain::trade::TradeEvent;
-    use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{
+        Address, B256, FixedBytes, IntoLogData, U256, address, fixed_bytes, uint,
+    };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
-    use std::str::FromStr;
 
     use super::*;
     use crate::bindings::IERC20::symbolCall;
     use crate::bindings::IOrderBookV5;
     use crate::onchain::EvmEnv;
+    use crate::onchain::trade::TradeEvent;
+    use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
     use crate::test_utils::{get_test_order, setup_test_db};
 
     fn test_retry_strategy() -> ExponentialBuilder {
@@ -260,11 +261,6 @@ mod tests {
             .with_max_times(2) // Only 2 retries for tests (3 attempts total)
             .with_min_delay(Duration::from_millis(1))
             .with_max_delay(Duration::from_millis(10))
-    }
-
-    fn u256_to_float(value: alloy::primitives::U256, decimals: u8) -> alloy::primitives::B256 {
-        let float = Float::from_fixed_decimal_lossy(value, decimals).expect("valid Float");
-        float.get_inner()
     }
 
     #[tokio::test]
@@ -369,8 +365,8 @@ mod tests {
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
             bobOutputIOIndex: U256::from(0),
-            aliceBountyVaultId: alloy::primitives::B256::ZERO,
-            bobBountyVaultId: alloy::primitives::B256::ZERO,
+            aliceBountyVaultId: B256::ZERO,
+            bobBountyVaultId: B256::ZERO,
         };
 
         let clear_event = IOrderBookV5::ClearV3 {
@@ -434,8 +430,12 @@ mod tests {
                 outputIOIndex: U256::from(1),
                 signedContext: Vec::new(),
             },
-            input: u256_to_float(U256::from(100_000_000), 0),
-            output: u256_to_float(U256::from_str("9000000000000000000").unwrap(), 18),
+            input: Float::from_fixed_decimal_lossy(uint!(100_000_000_U256), 0)
+                .unwrap()
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(9_000_000_000_000_000_000_U256), 18)
+                .unwrap()
+                .get_inner(),
         };
 
         let tx_hash =
@@ -502,8 +502,8 @@ mod tests {
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: alloy::primitives::B256::ZERO,
-                bobBountyVaultId: alloy::primitives::B256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         };
 
@@ -596,9 +596,9 @@ mod tests {
     }
 
     fn create_test_take_event(
-        order: &crate::bindings::IOrderBookV5::OrderV4,
-        input: u64,
-        output: &str,
+        order: &IOrderBookV5::OrderV4,
+        input: U256,
+        output: U256,
     ) -> IOrderBookV5::TakeOrderV3 {
         IOrderBookV5::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -608,13 +608,19 @@ mod tests {
                 outputIOIndex: U256::from(1),
                 signedContext: Vec::new(),
             },
-            input: u256_to_float(U256::from(input), 0),
-            output: u256_to_float(U256::from_str(output).unwrap(), 18),
+
+            input: Float::from_fixed_decimal_lossy(input, 0)
+                .unwrap()
+                .get_inner(),
+
+            output: Float::from_fixed_decimal_lossy(output, 18)
+                .unwrap()
+                .get_inner(),
         }
     }
 
     fn create_test_log(
-        orderbook: alloy::primitives::Address,
+        orderbook: Address,
         event: &IOrderBookV5::TakeOrderV3,
         block_number: u64,
         tx_hash: FixedBytes<32>,
@@ -650,8 +656,16 @@ mod tests {
         let tx_hash2 =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let take_event1 = create_test_take_event(&order, 100_000_000, "1000000000000000000");
-        let take_event2 = create_test_take_event(&order, 200_000_000, "2000000000000000000");
+        let take_event1 = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(1_000_000_000_000_000_000_U256),
+        );
+        let take_event2 = create_test_take_event(
+            &order,
+            uint!(200_000_000_U256),
+            uint!(2_000_000_000_000_000_000_U256),
+        );
 
         let take_log1 = create_test_log(evm_env.orderbook, &take_event1, 50, tx_hash1);
         let take_log2 = create_test_log(evm_env.orderbook, &take_event2, 100, tx_hash2);
@@ -784,7 +798,11 @@ mod tests {
 
         let tx_hash =
             fixed_bytes!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-        let take_event = create_test_take_event(&order, 500_000_000, "5000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(500_000_000_U256),
+            uint!(5_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(evm_env.orderbook, &take_event, 150, tx_hash);
 
         let asserter = Asserter::new();
@@ -899,14 +917,21 @@ mod tests {
             deployment_block: 1,
         };
 
-        let valid_take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let valid_take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
 
         // Create different order with different hash to make it invalid
         let mut different_order = get_test_order();
         different_order.nonce =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"); // Change nonce to make hash different
-        let invalid_take_event =
-            create_test_take_event(&different_order, 50_000_000, "5000000000000000000");
+        let invalid_take_event = create_test_take_event(
+            &different_order,
+            uint!(50_000_000_U256),
+            uint!(5_000_000_000_000_000_000_U256),
+        );
 
         let valid_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
@@ -948,7 +973,11 @@ mod tests {
         let tx_hash2 =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(evm_env.orderbook, &take_event, 50, tx_hash1);
 
         let clear_config = IOrderBookV5::ClearConfigV2 {
@@ -956,8 +985,8 @@ mod tests {
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
             bobOutputIOIndex: U256::from(0),
-            aliceBountyVaultId: alloy::primitives::B256::ZERO,
-            bobBountyVaultId: alloy::primitives::B256::ZERO,
+            aliceBountyVaultId: B256::ZERO,
+            bobBountyVaultId: B256::ZERO,
         };
 
         let clear_event = IOrderBookV5::ClearV3 {
@@ -984,10 +1013,27 @@ mod tests {
         let after_clear_event = IOrderBookV5::AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             clearStateChange: IOrderBookV5::ClearStateChangeV2 {
-                aliceOutput: u256_to_float(U256::from_str("5000000000000000000").unwrap(), 18), // 5 shares
-                bobOutput: u256_to_float(U256::from(50_000_000u64), 0), // 50 USDC cents
-                aliceInput: u256_to_float(U256::from(50_000_000u64), 0),
-                bobInput: u256_to_float(U256::from_str("5000000000000000000").unwrap(), 18),
+                aliceOutput: Float::from_fixed_decimal_lossy(
+                    uint!(5_000_000_000_000_000_000_U256),
+                    18,
+                )
+                .unwrap()
+                .get_inner(), // 5 shares
+
+                bobOutput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
+                    .unwrap()
+                    .get_inner(), // 50 USDC cents
+
+                aliceInput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobInput: Float::from_fixed_decimal_lossy(
+                    uint!(5_000_000_000_000_000_000_U256),
+                    18,
+                )
+                .unwrap()
+                .get_inner(),
             },
         };
 
@@ -1237,7 +1283,11 @@ mod tests {
         };
 
         let order = get_test_order();
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
@@ -1298,8 +1348,16 @@ mod tests {
         let order = get_test_order();
 
         // Create multiple events
-        let take_event1 = create_test_take_event(&order, 100_000_000, "9000000000000000000");
-        let take_event2 = create_test_take_event(&order, 200_000_000, "18000000000000000000");
+        let take_event1 = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
+        let take_event2 = create_test_take_event(
+            &order,
+            uint!(200_000_000_U256),
+            uint!(18_000_000_000_000_000_000_U256),
+        );
 
         let take_log1 = create_test_log(
             evm_env.orderbook,
@@ -1339,7 +1397,11 @@ mod tests {
         };
 
         let order = get_test_order();
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
@@ -1449,8 +1511,8 @@ mod tests {
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: alloy::primitives::B256::ZERO,
-                bobBountyVaultId: alloy::primitives::B256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         };
 
@@ -1471,7 +1533,11 @@ mod tests {
         };
 
         // Create a TakeOrderV3 event
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,

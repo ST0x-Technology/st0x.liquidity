@@ -414,22 +414,6 @@ mod tests {
     use alloy::primitives::fixed_bytes;
     use alloy::providers::{ProviderBuilder, mock::Asserter};
 
-    /// Helper to create a properly encoded Float for testing
-    /// Creates a Float representing the given value using from_fixed_decimal_lossy
-    fn create_float(value: i128, decimals: u8) -> B256 {
-        use alloy::primitives::U256;
-        use rain_math_float::Float;
-
-        // For testing, we create Float from a fixed decimal value
-        // E.g., value=9, decimals=0 represents 9.0
-        let u256_value = U256::from(value.unsigned_abs());
-        let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
-
-        // Handle negative values by manually setting the sign bit if needed
-        // For now, assume positive values in tests
-        float.get_inner()
-    }
-
     #[tokio::test]
     async fn test_onchain_trade_save_within_transaction_and_find() {
         let pool = setup_test_db().await;
