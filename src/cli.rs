@@ -7,12 +7,12 @@ use tracing::{error, info};
 use crate::env::{BrokerConfig, Config, Env};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::{OnchainTrade, accumulator};
+use crate::onchain::{accumulator, OnchainTrade};
 use crate::symbol::cache::SymbolCache;
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use st0x_broker::schwab::{
-    SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
+    extract_code_from_url, SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens,
 };
 use st0x_broker::{
     Broker, Direction, MarketOrder, MockBrokerConfig, OrderPlacement, OrderState, Shares, Symbol,
@@ -503,27 +503,27 @@ fn display_trade_details<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
-    use crate::onchain::EvmEnv;
     use crate::onchain::trade::OnchainTrade;
+    use crate::onchain::EvmEnv;
     use crate::test_utils::get_test_order;
     use crate::test_utils::setup_test_db;
     use crate::test_utils::setup_test_tokens;
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{address, fixed_bytes, FixedBytes, IntoLogData, U256};
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
     use chrono::{Duration, Utc};
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
+    use st0x_broker::schwab::SchwabAuthEnv;
     use st0x_broker::Direction;
     use st0x_broker::OrderStatus;
-    use st0x_broker::schwab::SchwabAuthEnv;
     use std::str::FromStr;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -954,10 +954,8 @@ mod tests {
         .unwrap();
 
         let stdout_output = String::from_utf8(stdout_buffer).unwrap();
-        assert!(
-            stdout_output
-                .contains("🔄 Your refresh token has expired. Starting authentication process...")
-        );
+        assert!(stdout_output
+            .contains("🔄 Your refresh token has expired. Starting authentication process..."));
         assert!(
             stdout_output.contains("You will be guided through the Charles Schwab OAuth process.")
         );

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::{debug, info};
 
-use super::{SchwabError, tokens::SchwabTokens};
+use super::{tokens::SchwabTokens, SchwabError};
 
 #[derive(Parser, Debug, Clone)]
 pub struct SchwabAuthEnv {
@@ -240,7 +240,7 @@ impl SchwabAuthEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
+    use crate::test_utils::{setup_test_db, TEST_ENCRYPTION_KEY};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
@@ -555,11 +555,9 @@ mod tests {
     fn test_schwab_auth_error_display() {
         let invalid_header_err =
             SchwabError::InvalidHeader(HeaderValue::from_str("test\x00").unwrap_err());
-        assert!(
-            invalid_header_err
-                .to_string()
-                .contains("Failed to create header value")
-        );
+        assert!(invalid_header_err
+            .to_string()
+            .contains("Failed to create header value"));
     }
 
     #[test]

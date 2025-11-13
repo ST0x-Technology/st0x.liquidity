@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::bindings::{IERC20::IERC20Instance, IOrderBookV5::IOV2};
+use crate::bindings::{IOrderBookV5::IOV2, IERC20::IERC20Instance};
 use crate::error::OnChainError;
 
 #[derive(Debug, Default, Clone)]
@@ -51,7 +51,7 @@ impl SymbolCache {
 mod tests {
     use super::*;
     use alloy::primitives::address;
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::providers::{mock::Asserter, ProviderBuilder};
 
     #[tokio::test]
     async fn test_symbol_cache_hit() {

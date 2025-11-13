@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
-use rocket::{Route, State, get, post, routes};
+use rocket::{get, post, routes, Route, State};
 use sqlx::SqlitePool;
 
 use crate::env::{BrokerConfig, Config};
@@ -85,7 +85,7 @@ pub(crate) fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{FixedBytes, address};
+    use alloy::primitives::{address, FixedBytes};
     use backon::{ExponentialBuilder, Retryable};
     use httpmock::{Mock, MockServer};
     use reqwest::Client as ReqwestClient;
@@ -519,12 +519,10 @@ mod tests {
             .expect("Auth response should be valid JSON");
 
         assert_eq!(auth_data["success"], "true");
-        assert!(
-            auth_data["message"]
-                .as_str()
-                .unwrap()
-                .contains("Authentication successful")
-        );
+        assert!(auth_data["message"]
+            .as_str()
+            .unwrap()
+            .contains("Authentication successful"));
 
         oauth_mock.assert();
 

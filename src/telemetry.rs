@@ -58,17 +58,17 @@
 //! This prevents external crate spam (e.g., from `alloy`, `rocket`) from cluttering
 //! traces while still allowing those logs in console if needed.
 
-use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider;
+use opentelemetry::KeyValue;
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
+use opentelemetry_sdk::Resource;
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
-use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::Registry;
 
 #[derive(Debug, Clone)]
 pub struct HyperDxConfig {

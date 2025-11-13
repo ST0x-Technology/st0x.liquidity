@@ -243,15 +243,15 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 mod tests {
     use crate::onchain::trade::TradeEvent;
     use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::primitives::{address, fixed_bytes, FixedBytes, IntoLogData, U256};
+    use alloy::providers::{mock::Asserter, ProviderBuilder};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
     use std::str::FromStr;
 
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
     use crate::bindings::IOrderBookV5;
+    use crate::bindings::IERC20::symbolCall;
     use crate::onchain::EvmEnv;
     use crate::test_utils::{get_test_order, setup_test_db};
 
@@ -551,7 +551,7 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&serde_json::Value::from(100u64)); // get_block_number call
-        // Need 2 failures: one for clear_logs retry, one for take_logs retry (they run in parallel)
+                                                                 // Need 2 failures: one for clear_logs retry, one for take_logs retry (they run in parallel)
         asserter.push_failure_msg("RPC error"); // clear_logs failure
         asserter.push_failure_msg("RPC error"); // take_logs failure
 
@@ -1387,7 +1387,7 @@ mod tests {
         // First attempt fails for both parallel calls
         asserter.push_failure_msg("Temporary network failure"); // clear_logs first attempt
         asserter.push_failure_msg("Rate limit exceeded"); // take_logs first attempt
-        // Second attempt succeeds for both
+                                                          // Second attempt succeeds for both
         asserter.push_success(&serde_json::json!([])); // clear events (retry)
         asserter.push_success(&serde_json::json!([])); // take events (retry)
 

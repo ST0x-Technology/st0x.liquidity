@@ -15,8 +15,8 @@ use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
 
 use super::{
-    Conductor, spawn_event_processor, spawn_onchain_event_receiver, spawn_order_poller,
-    spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    spawn_event_processor, spawn_onchain_event_receiver, spawn_order_poller,
+    spawn_periodic_accumulated_position_check, spawn_queue_processor, Conductor,
 };
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
@@ -89,13 +89,13 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
     pub(crate) fn with_dex_event_streams(
         self,
         clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>>
-        + Unpin
-        + Send
-        + 'static,
+            + Unpin
+            + Send
+            + 'static,
         take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
-        + Unpin
-        + Send
-        + 'static,
+            + Unpin
+            + Send
+            + 'static,
     ) -> ConductorBuilder<P, B, WithDexStreams> {
         let (event_sender, event_receiver) =
             tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();

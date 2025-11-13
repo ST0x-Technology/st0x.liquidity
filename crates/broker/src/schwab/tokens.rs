@@ -2,14 +2,14 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration as TokioDuration, interval};
+use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{error, info, warn};
 
 use alloy::primitives::FixedBytes;
 
-use super::SchwabError;
 use super::auth::SchwabAuthEnv;
-use super::encryption::{EncryptionError, decrypt_token, encrypt_token};
+use super::encryption::{decrypt_token, encrypt_token, EncryptionError};
+use super::SchwabError;
 
 const ACCESS_TOKEN_DURATION_MINUTES: i64 = 30;
 const REFRESH_TOKEN_DURATION_DAYS: i64 = 7;
@@ -251,12 +251,12 @@ async fn handle_token_refresh(pool: &SqlitePool, env: &SchwabAuthEnv) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
+    use crate::test_utils::{setup_test_db, TEST_ENCRYPTION_KEY};
     use chrono::Utc;
     use httpmock::prelude::*;
     use serde_json::json;
     use std::thread;
-    use tokio::time::{Duration as TokioDuration, sleep};
+    use tokio::time::{sleep, Duration as TokioDuration};
 
     fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
         SchwabAuthEnv {

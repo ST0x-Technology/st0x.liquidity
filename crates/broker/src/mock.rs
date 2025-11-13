@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, Ordering},
+    Arc,
 };
 use tokio::task::JoinHandle;
 use tracing::{info, warn};

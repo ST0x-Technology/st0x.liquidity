@@ -16,14 +16,14 @@ use st0x_broker::{Broker, MarketOrder, SupportedBroker};
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::env::Config;
 use crate::error::EventProcessingError;
-use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
+use crate::offchain::execution::{find_execution_by_id, OffchainExecution};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::onchain::accumulator::check_all_accumulated_positions;
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
-use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
-use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::onchain::{accumulator, EvmEnv, OnchainTrade};
+use crate::queue::{enqueue, get_next_unprocessed_event, mark_event_processed, QueuedEvent};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 
@@ -224,9 +224,9 @@ fn spawn_onchain_event_receiver(
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send + 'static,
     take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
-    + Unpin
-    + Send
-    + 'static,
+        + Unpin
+        + Send
+        + 'static,
 ) -> JoinHandle<()> {
     info!("Starting blockchain event receiver");
     tokio::spawn(receive_blockchain_events(
@@ -245,7 +245,8 @@ fn spawn_event_processor(
         while let Some((event, log)) = event_receiver.recv().await {
             trace!(
                 "Processing live event: tx_hash={:?}, log_index={:?}",
-                log.transaction_hash, log.log_index
+                log.transaction_hash,
+                log.log_index
             );
             if let Err(e) = process_live_event(&pool, event, log).await {
                 error!("Failed to process live event: {e}");
@@ -323,7 +324,9 @@ async fn receive_blockchain_events<S1, S2>(
             Ok((event, log)) => {
                 trace!(
                     "Received blockchain event: tx_hash={:?}, log_index={:?}, block_number={:?}",
-                    log.transaction_hash, log.log_index, log.block_number
+                    log.transaction_hash,
+                    log.log_index,
+                    log.block_number
                 );
                 if event_sender.send((event, log)).is_err() {
                     error!("Event receiver dropped, shutting down");
@@ -433,10 +436,11 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
             .await
         {
             Ok(Some(execution)) => {
-                if let Some(exec_id) = execution.id
-                    && let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await
-                {
-                    error!("Failed to execute offchain order {exec_id}: {e}");
+                if let Some(exec_id) = execution.id {
+                    if let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await
+                    {
+                        error!("Failed to execute offchain order {exec_id}: {e}");
+                    }
                 }
             }
             Ok(None) => {
@@ -839,11 +843,11 @@ mod tests {
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3};
     use crate::env::tests::create_test_config;
     use crate::onchain::trade::OnchainTrade;
-    use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
+    use crate::test_utils::{setup_test_db, OnchainTradeBuilder};
     use crate::tokenized_symbol;
-    use alloy::primitives::{IntoLogData, address, fixed_bytes};
-    use alloy::providers::ProviderBuilder;
+    use alloy::primitives::{address, fixed_bytes, IntoLogData};
     use alloy::providers::mock::Asserter;
+    use alloy::providers::ProviderBuilder;
     use alloy::sol_types;
     use futures_util::stream;
     use st0x_broker::{Direction, MockBrokerConfig, TryIntoBroker};
@@ -1115,12 +1119,10 @@ mod tests {
             sql_tx.commit().await.unwrap();
         }
 
-        assert!(
-            crate::queue::get_next_unprocessed_event(&pool)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(crate::queue::get_next_unprocessed_event(&pool)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

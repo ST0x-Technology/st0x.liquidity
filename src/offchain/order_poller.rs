@@ -2,11 +2,11 @@ use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
 use std::time::Duration;
-use tokio::time::{Interval, interval};
+use tokio::time::{interval, Interval};
 use tracing::{debug, error, info};
 
 use super::execution::{
-    OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
+    find_execution_by_id, find_executions_by_symbol_status_and_broker, OffchainExecution,
 };
 use crate::error::{OnChainError, OrderPollingError};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id};

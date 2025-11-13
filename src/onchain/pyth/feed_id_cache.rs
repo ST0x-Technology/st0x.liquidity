@@ -1,4 +1,4 @@
-use alloy::primitives::{B256, fixed_bytes};
+use alloy::primitives::{fixed_bytes, B256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;

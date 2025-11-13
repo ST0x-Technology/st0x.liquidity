@@ -262,7 +262,7 @@ mod tests {
         ClearConfigV2, ClearV3, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{LogData, address, b256};
+    use alloy::primitives::{address, b256, LogData};
 
     #[tokio::test]
     async fn test_enqueue_and_process_event() {

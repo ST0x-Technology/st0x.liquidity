@@ -1,13 +1,13 @@
-use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
+use crate::bindings::IOrderBookV5::{EvaluableV4, OrderV4, IOV2};
 use crate::offchain::execution::OffchainExecution;
-use crate::onchain::OnchainTrade;
 use crate::onchain::io::TokenizedEquitySymbol;
-use alloy::primitives::{LogData, address, bytes, fixed_bytes};
+use crate::onchain::OnchainTrade;
+use alloy::primitives::{address, bytes, fixed_bytes, LogData};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use st0x_broker::OrderState;
 use st0x_broker::schwab::{SchwabAuthEnv, SchwabTokens};
+use st0x_broker::OrderState;
 use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple

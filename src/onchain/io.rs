@@ -238,17 +238,17 @@ fn determine_schwab_trade_details(
     onchain_output_symbol: &str,
 ) -> Result<(Symbol, Direction), OnChainError> {
     // USDC input + tokenized stock output = sold tokenized stock onchain
-    if onchain_input_symbol == "USDC"
-        && let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_output_symbol)
-    {
-        return Ok((tokenized.base().clone(), Direction::Sell));
+    if onchain_input_symbol == "USDC" {
+        if let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_output_symbol) {
+            return Ok((tokenized.base().clone(), Direction::Sell));
+        }
     }
 
     // tokenized stock input + USDC output = bought tokenized stock onchain
-    if onchain_output_symbol == "USDC"
-        && let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_input_symbol)
-    {
-        return Ok((tokenized.base().clone(), Direction::Buy));
+    if onchain_output_symbol == "USDC" {
+        if let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_input_symbol) {
+            return Ok((tokenized.base().clone(), Direction::Buy));
+        }
     }
 
     Err(TradeValidationError::InvalidSymbolConfiguration(

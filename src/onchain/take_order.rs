@@ -44,15 +44,15 @@ impl OnchainTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{I256, U256, address, fixed_bytes};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::primitives::{address, fixed_bytes, I256, U256};
+    use alloy::providers::{mock::Asserter, ProviderBuilder};
     use alloy::sol_types::SolCall;
     use rain_math_float::Float;
     use std::str::FromStr;
@@ -60,16 +60,11 @@ mod tests {
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,
     ) -> TakeOrderV3 {
-        // Helper to create Float from coefficient and exponent
-        fn create_float(coefficient: i128, exponent: i32) -> alloy::primitives::B256 {
-            let mut bytes = [0u8; 32];
-            bytes[0..4].copy_from_slice(&exponent.to_be_bytes());
-
-            let coeff_i256 = I256::try_from(coefficient).expect("coefficient fits");
-            let coeff_bytes = coeff_i256.to_be_bytes::<32>();
-            bytes[4..32].copy_from_slice(&coeff_bytes[4..32]);
-
-            alloy::primitives::B256::from(bytes)
+        // Helper to create Float for testing using from_fixed_decimal_lossy
+        fn create_float(value: i128, decimals: u8) -> alloy::primitives::B256 {
+            let u256_value = U256::from(value.unsigned_abs());
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
         }
 
         TakeOrderV3 {
@@ -84,9 +79,9 @@ mod tests {
                     context: vec![],
                 }],
             },
-            // 100 USDC: coefficient=100, exponent=0
+            // 100 USDC: 100 with 0 decimals
             input: create_float(100, 0),
-            // 9 shares: coefficient=9, exponent=0
+            // 9 shares: 9 with 0 decimals
             output: create_float(9, 0),
         }
     }
@@ -388,6 +383,13 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
+        // Helper to create Float for testing using from_fixed_decimal_lossy
+        fn create_float(value: u64, decimals: u8) -> alloy::primitives::B256 {
+            let u256_value = U256::from(value);
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
         let take_event = TakeOrderV3 {
             sender: address!("0x4444444444444444444444444444444444444444"),
             config: TakeOrderConfigV4 {
@@ -400,10 +402,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::new(U256::from(100_000_000u64).to_le_bytes::<32>()),
-            output: alloy::primitives::B256::new(
-                U256::from_str("9000000000000000000").unwrap().to_le_bytes::<32>(),
-            ),
+            input: create_float(100_000_000, 0),
+            output: create_float(9_000_000_000_000_000_000, 18),
         };
 
         let log = get_test_log();

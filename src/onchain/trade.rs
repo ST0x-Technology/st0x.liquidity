@@ -6,12 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use crate::bindings::IERC20::IERC20Instance;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::EvmEnv;
 
 use super::pyth::PythPricing;
 use crate::symbol::cache::SymbolCache;
@@ -211,12 +210,10 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let input_decimals = get_token_decimals(&provider, input.token).await?;
-        let onchain_input_amount = float_to_f64(fill.input_amount, input_decimals)?;
+        let onchain_input_amount = float_to_f64(fill.input_amount)?;
         let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
 
-        let output_decimals = get_token_decimals(&provider, output.token).await?;
-        let onchain_output_amount = float_to_f64(fill.output_amount, output_decimals)?;
+        let onchain_output_amount = float_to_f64(fill.output_amount)?;
         let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -387,22 +384,11 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     Ok(None)
 }
 
-/// Fetches the number of decimals for an ERC20 token.
-async fn get_token_decimals<P: Provider>(
-    provider: P,
-    token: alloy::primitives::Address,
-) -> Result<u8, OnChainError> {
-    let erc20 = IERC20Instance::new(token, provider);
-    let decimals = erc20.decimals().call().await?;
-    Ok(decimals)
-}
-
 /// Converts a Float (bytes32) amount to f64.
 ///
 /// Uses the rain-math-float library's format() method to convert the Float to a string,
-/// then parses it to f64. The decimals parameter is not used since Float.format() handles
-/// the proper formatting internally.
-fn float_to_f64(float: B256, _decimals: u8) -> Result<f64, OnChainError> {
+/// then parses it to f64. Float.format() handles the proper formatting internally.
+fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
     use rain_math_float::Float;
 
     // Create Float from raw B256
@@ -426,7 +412,7 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
     use alloy::primitives::fixed_bytes;
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::providers::{mock::Asserter, ProviderBuilder};
 
     /// Helper to create a properly encoded Float for testing
     /// Creates a Float representing the given value using from_fixed_decimal_lossy
@@ -502,7 +488,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x01, // coefficient = 1
         ]);
-        assert!((float_to_f64(float_one, 0).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
         // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
         let float_half = B256::from([
@@ -511,7 +497,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x05, // coefficient = 5
         ]);
-        assert!((float_to_f64(float_half, 0).unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((float_to_f64(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
 
         // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
         let float_two = B256::from([
@@ -520,32 +506,32 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x02, // coefficient = 2
         ]);
-        assert!((float_to_f64(float_two, 0).unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn test_float_to_f64_edge_cases() {
         // Zero value (coefficient=0, exponent=0)
         let float_zero = create_float(0, 0);
-        assert!((float_to_f64(float_zero, 18).unwrap() - 0.0).abs() < f64::EPSILON);
+        assert!((float_to_f64(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
 
         // Value 1.0
         let float_one = create_float(1, 0); // 1 with 0 decimals = 1.0
-        assert!((float_to_f64(float_one, 0).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
         // Value 9.0
         let float_nine = create_float(9, 0); // 9 with 0 decimals = 9.0
-        let result = float_to_f64(float_nine, 18).unwrap();
+        let result = float_to_f64(float_nine).unwrap();
         assert!((result - 9.0).abs() < f64::EPSILON);
 
         // Value 100.0
         let float_hundred = create_float(100, 0); // 100 with 0 decimals = 100.0
-        let result = float_to_f64(float_hundred, 6).unwrap();
+        let result = float_to_f64(float_hundred).unwrap();
         assert!((result - 100.0).abs() < f64::EPSILON);
 
         // Fractional value: 0.5 (represented as 5 with 1 decimal)
         let float_half = create_float(5, 1); // 5 with 1 decimal = 0.5
-        let result = float_to_f64(float_half, 0).unwrap();
+        let result = float_to_f64(float_half).unwrap();
         assert!((result - 0.5).abs() < f64::EPSILON);
     }
 
@@ -659,13 +645,13 @@ mod tests {
         // Test with very large coefficient
         let large_coeff = 1_000_000_000_000_000_i128;
         let float_large = create_float(large_coeff, 0);
-        let result = float_to_f64(float_large, 0).unwrap();
+        let result = float_to_f64(float_large).unwrap();
         assert!(result.is_finite());
         assert!((result - 1_000_000_000_000_000.0).abs() < 1.0);
 
         // Test with very small value (high negative exponent)
         let float_small = create_float(1, 50);
-        let result = float_to_f64(float_small, 0).unwrap();
+        let result = float_to_f64(float_small).unwrap();
         assert!(result.is_finite());
         // 1 × 10^-50 is extremely small
         assert!(result > 0.0 && result < 1e-40);
@@ -677,28 +663,28 @@ mod tests {
         // coefficient=123456, exponent=-6, decimals=0
         // Result: 123456 × 10^-6 = 0.123456
         let float_amount = create_float(123_456, 6);
-        let result = float_to_f64(float_amount, 0).unwrap();
+        let result = float_to_f64(float_amount).unwrap();
         assert!((result - 0.123_456).abs() < f64::EPSILON);
 
         // Test with very small coefficient and negative exponent
         // coefficient=5, exponent=-10, decimals=0
         // Result: 5 × 10^-10 = 0.0000000005
         let float_amount = create_float(5, 10);
-        let result = float_to_f64(float_amount, 0).unwrap();
+        let result = float_to_f64(float_amount).unwrap();
         assert!((result - 5e-10).abs() < 1e-15);
 
         // Test with no exponent adjustment
         // coefficient=12345, exponent=0, decimals=0
         // Result: 12345 × 10^0 = 12345
         let float_amount = create_float(12_345, 0);
-        let result = float_to_f64(float_amount, 0).unwrap();
+        let result = float_to_f64(float_amount).unwrap();
         assert!((result - 12_345.0).abs() < f64::EPSILON);
 
         // Test with positive exponent (multiplication)
         // coefficient=5, exponent=3, decimals=0
         // Result: 5 × 10^3 = 5000
         let float_amount = create_float(5000, 0);
-        let result = float_to_f64(float_amount, 0).unwrap();
+        let result = float_to_f64(float_amount).unwrap();
         assert!((result - 5000.0).abs() < f64::EPSILON);
     }
 

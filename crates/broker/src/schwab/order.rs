@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{SchwabAuthEnv, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
+use super::{order_status::OrderStatusResponse, SchwabAuthEnv, SchwabError, SchwabTokens};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -312,7 +312,7 @@ pub(crate) struct Instrument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
+    use crate::test_utils::{setup_test_db, setup_test_tokens, TEST_ENCRYPTION_KEY};
     use serde_json::json;
 
     #[test]
@@ -802,7 +802,8 @@ mod tests {
             when.method(httpmock::Method::POST)
                 .path("/trader/v1/accounts/ABC123DEF456/orders");
             then.status(201)
-                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/"); // Empty order ID
+                .header("location", "/trader/v1/accounts/ABC123DEF456/orders/");
+            // Empty order ID
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Sell, 50);

@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::time::Duration;

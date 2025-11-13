@@ -1242,7 +1242,8 @@ mod tests {
 
         assert!((contributions[0].contributed_shares - 0.3).abs() < f64::EPSILON);
         assert!((contributions[1].contributed_shares - 0.4).abs() < f64::EPSILON);
-        assert!((contributions[2].contributed_shares - 0.3).abs() < f64::EPSILON); // Only 0.3 of 0.5 needed
+        assert!((contributions[2].contributed_shares - 0.3).abs() < f64::EPSILON);
+        // Only 0.3 of 0.5 needed
     }
 
     #[tokio::test]
