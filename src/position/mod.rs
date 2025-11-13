@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, Symbol};
+use st0x_broker::{Direction, SupportedBroker, Symbol};
 
 use crate::offchain_order::ExecutionId;
 
@@ -114,6 +114,20 @@ impl Aggregate for Position {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
+            PositionCommand::Migrate {
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold,
+            } => Ok(vec![PositionEvent::Migrated {
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold,
+                migrated_at: Utc::now(),
+            }]),
             PositionCommand::Initialize { threshold } => Ok(vec![PositionEvent::Initialized {
                 threshold,
                 initialized_at: Utc::now(),
@@ -137,30 +151,7 @@ impl Aggregate for Position {
                 shares,
                 direction,
                 broker,
-            } => {
-                if let Some(pending) = self.pending_execution_id {
-                    return Err(PositionError::PendingExecution {
-                        execution_id: pending,
-                    });
-                }
-
-                let trigger_reason =
-                    self.create_trigger_reason(&self.threshold).ok_or_else(|| {
-                        PositionError::ThresholdNotMet {
-                            net_position: self.net,
-                            threshold: self.threshold,
-                        }
-                    })?;
-
-                Ok(vec![PositionEvent::OffChainOrderPlaced {
-                    execution_id,
-                    shares,
-                    direction,
-                    broker,
-                    trigger_reason,
-                    placed_at: Utc::now(),
-                }])
-            }
+            } => self.handle_place_offchain_order(execution_id, shares, direction, broker),
             PositionCommand::CompleteOffChainOrder {
                 execution_id,
                 shares_filled,
@@ -168,48 +159,18 @@ impl Aggregate for Position {
                 broker_order_id,
                 price_cents,
                 broker_timestamp,
-            } => {
-                let Some(pending_id) = self.pending_execution_id else {
-                    return Err(PositionError::NoPendingExecution);
-                };
-
-                if pending_id != execution_id {
-                    return Err(PositionError::ExecutionIdMismatch {
-                        expected: pending_id,
-                        actual: execution_id,
-                    });
-                }
-
-                Ok(vec![PositionEvent::OffChainOrderFilled {
-                    execution_id,
-                    shares_filled,
-                    direction,
-                    broker_order_id,
-                    price_cents,
-                    broker_timestamp,
-                }])
-            }
+            } => self.handle_complete_offchain_order(
+                execution_id,
+                shares_filled,
+                direction,
+                broker_order_id,
+                price_cents,
+                broker_timestamp,
+            ),
             PositionCommand::FailOffChainOrder {
                 execution_id,
                 error,
-            } => {
-                let Some(pending_id) = self.pending_execution_id else {
-                    return Err(PositionError::NoPendingExecution);
-                };
-
-                if pending_id != execution_id {
-                    return Err(PositionError::ExecutionIdMismatch {
-                        expected: pending_id,
-                        actual: execution_id,
-                    });
-                }
-
-                Ok(vec![PositionEvent::OffChainOrderFailed {
-                    execution_id,
-                    error,
-                    failed_at: Utc::now(),
-                }])
-            }
+            } => self.handle_fail_offchain_order(execution_id, error),
             PositionCommand::UpdateThreshold { threshold } => {
                 Ok(vec![PositionEvent::ThresholdUpdated {
                     old_threshold: self.threshold,
@@ -314,6 +275,89 @@ impl Position {
             }
             ExecutionThreshold::DollarValue(_threshold_dollars) => None,
         }
+    }
+
+    fn handle_place_offchain_order(
+        &self,
+        execution_id: ExecutionId,
+        shares: FractionalShares,
+        direction: Direction,
+        broker: SupportedBroker,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if let Some(pending) = self.pending_execution_id {
+            return Err(PositionError::PendingExecution {
+                execution_id: pending,
+            });
+        }
+
+        let trigger_reason = self.create_trigger_reason(&self.threshold).ok_or_else(|| {
+            PositionError::ThresholdNotMet {
+                net_position: self.net,
+                threshold: self.threshold.clone(),
+            }
+        })?;
+
+        Ok(vec![PositionEvent::OffChainOrderPlaced {
+            execution_id,
+            shares,
+            direction,
+            broker,
+            trigger_reason,
+            placed_at: Utc::now(),
+        }])
+    }
+
+    fn handle_complete_offchain_order(
+        &self,
+        execution_id: ExecutionId,
+        shares_filled: FractionalShares,
+        direction: Direction,
+        broker_order_id: BrokerOrderId,
+        price_cents: PriceCents,
+        broker_timestamp: DateTime<Utc>,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        let Some(pending_id) = self.pending_execution_id else {
+            return Err(PositionError::NoPendingExecution);
+        };
+
+        if pending_id != execution_id {
+            return Err(PositionError::ExecutionIdMismatch {
+                expected: pending_id,
+                actual: execution_id,
+            });
+        }
+
+        Ok(vec![PositionEvent::OffChainOrderFilled {
+            execution_id,
+            shares_filled,
+            direction,
+            broker_order_id,
+            price_cents,
+            broker_timestamp,
+        }])
+    }
+
+    fn handle_fail_offchain_order(
+        &self,
+        execution_id: ExecutionId,
+        error: String,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        let Some(pending_id) = self.pending_execution_id else {
+            return Err(PositionError::NoPendingExecution);
+        };
+
+        if pending_id != execution_id {
+            return Err(PositionError::ExecutionIdMismatch {
+                expected: pending_id,
+                actual: execution_id,
+            });
+        }
+
+        Ok(vec![PositionEvent::OffChainOrderFailed {
+            execution_id,
+            error,
+            failed_at: Utc::now(),
+        }])
     }
 }
 
@@ -729,5 +773,201 @@ mod tests {
         let aggregate_id = Position::aggregate_id(&symbol);
 
         assert_eq!(aggregate_id, "AAPL");
+    }
+
+    #[test]
+    fn test_migrate_command_creates_migrated_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let net_position = FractionalShares(dec!(5.5));
+        let accumulated_long = FractionalShares(dec!(10.0));
+        let accumulated_short = FractionalShares(dec!(4.5));
+        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+
+        let result = TestFramework::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::Migrate {
+                symbol: symbol.clone(),
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold: threshold.clone(),
+            })
+            .inspect_result();
+
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            PositionEvent::Migrated {
+                symbol: event_symbol,
+                net_position: event_net,
+                accumulated_long: event_long,
+                accumulated_short: event_short,
+                threshold: event_threshold,
+                ..
+            } => {
+                assert_eq!(event_symbol, &symbol);
+                assert_eq!(event_net, &net_position);
+                assert_eq!(event_long, &accumulated_long);
+                assert_eq!(event_short, &accumulated_short);
+                assert_eq!(event_threshold, &threshold);
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[test]
+    fn test_migrated_event_sets_position_state() {
+        let symbol = Symbol::new("TSLA").unwrap();
+        let net_position = FractionalShares(dec!(-2.0));
+        let accumulated_long = FractionalShares(dec!(3.0));
+        let accumulated_short = FractionalShares(dec!(5.0));
+        let threshold = ExecutionThreshold::Shares(dec!(2.0));
+
+        let result = TestFramework::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::Migrate {
+                symbol: symbol.clone(),
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold: threshold.clone(),
+            })
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            PositionEvent::Migrated {
+                symbol: event_symbol,
+                net_position: event_net,
+                accumulated_long: event_long,
+                accumulated_short: event_short,
+                threshold: event_threshold,
+                ..
+            } => {
+                assert_eq!(event_symbol, &symbol);
+                assert_eq!(event_net, &net_position);
+                assert_eq!(event_long, &accumulated_long);
+                assert_eq!(event_short, &accumulated_short);
+                assert_eq!(event_threshold, &threshold);
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[test]
+    fn test_migrate_with_zero_position() {
+        let symbol = Symbol::new("MSFT").unwrap();
+        let net_position = FractionalShares::ZERO;
+        let accumulated_long = FractionalShares::ZERO;
+        let accumulated_short = FractionalShares::ZERO;
+        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+
+        let result = TestFramework::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::Migrate {
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold,
+            })
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            PositionEvent::Migrated {
+                net_position: event_net,
+                accumulated_long: event_long,
+                accumulated_short: event_short,
+                ..
+            } => {
+                assert_eq!(event_net, &FractionalShares::ZERO);
+                assert_eq!(event_long, &FractionalShares::ZERO);
+                assert_eq!(event_short, &FractionalShares::ZERO);
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[test]
+    fn test_migrate_preserves_negative_position() {
+        let symbol = Symbol::new("GOOGL").unwrap();
+        let net_position = FractionalShares(dec!(-10.5));
+        let accumulated_long = FractionalShares(dec!(5.0));
+        let accumulated_short = FractionalShares(dec!(15.5));
+        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+
+        let result = TestFramework::<Position>::with(())
+            .given_no_previous_events()
+            .when(PositionCommand::Migrate {
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold,
+            })
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            PositionEvent::Migrated {
+                net_position: event_net,
+                ..
+            } => {
+                assert_eq!(event_net.0, dec!(-10.5));
+                assert!(event_net.0 < Decimal::ZERO);
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[test]
+    fn test_operations_after_migrate() {
+        let symbol = Symbol::new("NVDA").unwrap();
+        let net_position = FractionalShares(dec!(1.5));
+        let accumulated_long = FractionalShares(dec!(1.5));
+        let accumulated_short = FractionalShares::ZERO;
+        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+
+        let trade_id = TradeId {
+            tx_hash: TxHash::random(),
+            log_index: 1,
+        };
+
+        let result = TestFramework::<Position>::with(())
+            .given(vec![PositionEvent::Migrated {
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold,
+                migrated_at: Utc::now(),
+            }])
+            .when(PositionCommand::AcknowledgeOnChainFill {
+                trade_id,
+                amount: FractionalShares(dec!(0.5)),
+                direction: Direction::Buy,
+                price_usdc: dec!(500.0),
+                block_timestamp: Utc::now(),
+            })
+            .inspect_result();
+
+        assert!(result.is_ok());
+        let events = result.unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            PositionEvent::OnChainOrderFilled { .. }
+        ));
     }
 }
