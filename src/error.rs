@@ -1,7 +1,7 @@
 //! Domain-specific error types following clean error handling architecture.
 //! Separates concerns instead of mixing database, business logic, and external API errors.
 
-use alloy::primitives::{ruint::FromUintError, B256};
+use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
 use st0x_broker::order::status::ParseOrderStatusError;
 use st0x_broker::{InvalidBrokerError, PersistenceError};
@@ -31,10 +31,7 @@ pub(crate) enum TradeValidationError {
     #[error(
         "Could not fully allocate execution shares for symbol {symbol}. Remaining: {remaining_shares}"
     )]
-    InsufficientTradeAllocation {
-        symbol: String,
-        remaining_shares: f64,
-    },
+    InsufficientTradeAllocation { symbol: String, remaining_shares: f64 },
     #[error("Failed to convert U256 to f64: {0}")]
     U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]

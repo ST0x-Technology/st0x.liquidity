@@ -2,11 +2,12 @@ use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
 use std::time::Duration;
-use tokio::time::{interval, Interval};
+use tokio::time::{Interval, interval};
 use tracing::{debug, error, info};
 
 use super::execution::{
-    find_execution_by_id, find_executions_by_symbol_status_and_broker, OffchainExecution,
+    OffchainExecution, find_execution_by_id,
+    find_executions_by_symbol_status_and_broker,
 };
 use crate::error::{OnChainError, OrderPollingError};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id};
@@ -38,12 +39,7 @@ impl<B: Broker> OrderStatusPoller<B> {
     pub fn new(config: OrderPollerConfig, pool: SqlitePool, broker: B) -> Self {
         let interval = interval(config.polling_interval);
 
-        Self {
-            config,
-            pool,
-            interval,
-            broker,
-        }
+        Self { config, pool, interval, broker }
     }
 
     pub async fn run(mut self) -> Result<(), OrderPollingError> {
@@ -108,14 +104,17 @@ impl<B: Broker> OrderStatusPoller<B> {
 
         let order_id = match &execution.state {
             OrderState::Pending => {
-                debug!("Execution {execution_id} is PENDING but no order_id yet");
+                debug!(
+                    "Execution {execution_id} is PENDING but no order_id yet"
+                );
                 return Ok(());
             }
-            OrderState::Submitted { order_id } | OrderState::Filled { order_id, .. } => {
-                order_id.clone()
-            }
+            OrderState::Submitted { order_id }
+            | OrderState::Filled { order_id, .. } => order_id.clone(),
             OrderState::Failed { .. } => {
-                debug!("Execution {execution_id} already failed, skipping poll");
+                debug!(
+                    "Execution {execution_id} already failed, skipping poll"
+                );
                 return Ok(());
             }
         };
@@ -158,10 +157,14 @@ impl<B: Broker> OrderStatusPoller<B> {
 
         let mut tx = self.pool.begin().await?;
 
-        let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
+        let Some(execution) =
+            find_execution_by_id(&self.pool, execution_id).await?
+        else {
             error!("Execution {execution_id} not found in database");
             return Err(OrderPollingError::OnChain(OnChainError::Persistence(
-                PersistenceError::InvalidTradeStatus("Execution not found".to_string()),
+                PersistenceError::InvalidTradeStatus(
+                    "Execution not found".to_string(),
+                ),
             )));
         };
 
@@ -197,10 +200,14 @@ impl<B: Broker> OrderStatusPoller<B> {
 
         let mut tx = self.pool.begin().await?;
 
-        let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
+        let Some(execution) =
+            find_execution_by_id(&self.pool, execution_id).await?
+        else {
             error!("Execution {execution_id} not found in database");
             return Err(OrderPollingError::OnChain(OnChainError::Persistence(
-                PersistenceError::InvalidTradeStatus("Execution not found".to_string()),
+                PersistenceError::InvalidTradeStatus(
+                    "Execution not found".to_string(),
+                ),
             )));
         };
 
@@ -222,9 +229,12 @@ impl<B: Broker> OrderStatusPoller<B> {
 
     async fn add_jittered_delay(&self) {
         if self.config.max_jitter > Duration::ZERO {
-            let max_jitter_u128 = self.config.max_jitter.as_millis().min(u128::from(u64::MAX));
-            let max_jitter_millis = max_jitter_u128.to_u64().unwrap_or(u64::MAX);
-            let jitter_millis = rand::thread_rng().gen_range(0..max_jitter_millis);
+            let max_jitter_u128 =
+                self.config.max_jitter.as_millis().min(u128::from(u64::MAX));
+            let max_jitter_millis =
+                max_jitter_u128.to_u64().unwrap_or(u64::MAX);
+            let jitter_millis =
+                rand::thread_rng().gen_range(0..max_jitter_millis);
             let jitter = Duration::from_millis(jitter_millis);
             tokio::time::sleep(jitter).await;
         }

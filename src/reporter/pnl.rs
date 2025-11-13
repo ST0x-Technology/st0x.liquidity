@@ -68,10 +68,7 @@ pub(super) struct PnlResult {
 
 impl FifoInventory {
     pub(super) fn new() -> Self {
-        Self {
-            lots: VecDeque::new(),
-            cumulative_pnl: Decimal::ZERO,
-        }
+        Self { lots: VecDeque::new(), cumulative_pnl: Decimal::ZERO }
     }
 
     /// Processes a trade and updates FIFO inventory, returning P&L metrics.
@@ -112,7 +109,8 @@ impl FifoInventory {
                 })
             }
             Some(_) => {
-                let pnl = self.consume_lots(quantity, price_per_share, direction)?;
+                let pnl =
+                    self.consume_lots(quantity, price_per_share, direction)?;
                 self.cumulative_pnl = self
                     .cumulative_pnl
                     .checked_add(pnl)
@@ -153,10 +151,12 @@ impl FifoInventory {
                 let consumed = qty_remaining.min(lot.quantity_remaining);
 
                 let pnl = match lot.direction {
-                    Direction::Buy => (execution_price - lot.cost_basis_per_share)
+                    Direction::Buy => (execution_price
+                        - lot.cost_basis_per_share)
                         .checked_mul(consumed)
                         .ok_or(PnlError::ArithmeticOverflow)?,
-                    Direction::Sell => (lot.cost_basis_per_share - execution_price)
+                    Direction::Sell => (lot.cost_basis_per_share
+                        - execution_price)
                         .checked_mul(consumed)
                         .ok_or(PnlError::ArithmeticOverflow)?,
                 };
@@ -178,8 +178,7 @@ impl FifoInventory {
             },
         )?;
 
-        self.lots
-            .retain(|lot| lot.quantity_remaining > Decimal::ZERO);
+        self.lots.retain(|lot| lot.quantity_remaining > Decimal::ZERO);
 
         if remaining > Decimal::ZERO {
             self.add_lot(remaining, execution_price, direction);
@@ -188,7 +187,12 @@ impl FifoInventory {
         Ok(total_pnl)
     }
 
-    fn add_lot(&mut self, quantity: Decimal, price: Decimal, direction: Direction) {
+    fn add_lot(
+        &mut self,
+        quantity: Decimal,
+        price: Decimal,
+        direction: Direction,
+    ) {
         self.lots.push_back(InventoryLot {
             quantity_remaining: quantity,
             cost_basis_per_share: price,
@@ -197,12 +201,10 @@ impl FifoInventory {
     }
 
     fn net_position(&self) -> Decimal {
-        self.lots
-            .iter()
-            .fold(Decimal::ZERO, |acc, lot| match lot.direction {
-                Direction::Buy => acc + lot.quantity_remaining,
-                Direction::Sell => acc - lot.quantity_remaining,
-            })
+        self.lots.iter().fold(Decimal::ZERO, |acc, lot| match lot.direction {
+            Direction::Buy => acc + lot.quantity_remaining,
+            Direction::Sell => acc - lot.quantity_remaining,
+        })
     }
 
     fn current_direction(&self) -> Option<Direction> {
@@ -224,9 +226,8 @@ mod tests {
     fn test_simple_buy_sell() {
         let mut fifo = FifoInventory::new();
 
-        let result = fifo
-            .process_trade(dec!(100), dec!(10.00), Direction::Buy)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy).unwrap();
         assert_eq!(result.realized_pnl, None);
         assert_eq!(result.net_position_after, dec!(100));
 
@@ -242,14 +243,11 @@ mod tests {
     fn test_multiple_lots_fifo() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy)
-            .unwrap();
-        fifo.process_trade(dec!(50), dec!(12.00), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy).unwrap();
+        fifo.process_trade(dec!(50), dec!(12.00), Direction::Buy).unwrap();
 
-        let result = fifo
-            .process_trade(dec!(80), dec!(11.00), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(80), dec!(11.00), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(80.00)));
         assert_eq!(result.net_position_after, dec!(70));
     }
@@ -258,8 +256,7 @@ mod tests {
     fn test_position_reversal_long_to_short() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy).unwrap();
 
         let result = fifo
             .process_trade(dec!(150), dec!(11.00), Direction::Sell)
@@ -272,12 +269,10 @@ mod tests {
     fn test_position_reversal_short_to_long() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(100), dec!(10.00), Direction::Sell)
-            .unwrap();
+        fifo.process_trade(dec!(100), dec!(10.00), Direction::Sell).unwrap();
 
-        let result = fifo
-            .process_trade(dec!(150), dec!(11.00), Direction::Buy)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(150), dec!(11.00), Direction::Buy).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(-100.00)));
         assert_eq!(result.net_position_after, dec!(50));
     }
@@ -292,9 +287,8 @@ mod tests {
         assert_eq!(result.realized_pnl, None);
         assert_eq!(result.net_position_after, dec!(-100));
 
-        let result = fifo
-            .process_trade(dec!(100), dec!(9.00), Direction::Buy)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(100), dec!(9.00), Direction::Buy).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(100.00)));
         assert_eq!(result.cumulative_pnl, dec!(100.00));
         assert_eq!(result.net_position_after, dec!(0));
@@ -304,35 +298,28 @@ mod tests {
     fn test_requirements_doc_example() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy)
-            .unwrap();
-        fifo.process_trade(dec!(50), dec!(12.00), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy).unwrap();
+        fifo.process_trade(dec!(50), dec!(12.00), Direction::Buy).unwrap();
 
-        let result = fifo
-            .process_trade(dec!(80), dec!(11.00), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(80), dec!(11.00), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(80.00)));
         assert_eq!(result.cumulative_pnl, dec!(80.00));
 
-        let result = fifo
-            .process_trade(dec!(60), dec!(9.50), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(60), dec!(9.50), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(-110.00)));
         assert_eq!(result.cumulative_pnl, dec!(-30.00));
 
-        fifo.process_trade(dec!(30), dec!(12.20), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(30), dec!(12.20), Direction::Buy).unwrap();
 
-        let result = fifo
-            .process_trade(dec!(70), dec!(12.00), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(70), dec!(12.00), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(-6.00)));
         assert_eq!(result.cumulative_pnl, dec!(-36.00));
 
-        let result = fifo
-            .process_trade(dec!(20), dec!(11.50), Direction::Buy)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(20), dec!(11.50), Direction::Buy).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(10.00)));
         assert_eq!(result.cumulative_pnl, dec!(-26.00));
         assert_eq!(result.net_position_after, dec!(-10));
@@ -342,8 +329,7 @@ mod tests {
     fn test_fractional_share_handling() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(10.5), dec!(100.00), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(10.5), dec!(100.00), Direction::Buy).unwrap();
 
         let result = fifo
             .process_trade(dec!(5.25), dec!(110.00), Direction::Sell)
@@ -356,14 +342,11 @@ mod tests {
     fn test_precision_with_rust_decimal() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(0.1), dec!(0.3), Direction::Buy)
-            .unwrap();
-        fifo.process_trade(dec!(0.2), dec!(0.3), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(0.1), dec!(0.3), Direction::Buy).unwrap();
+        fifo.process_trade(dec!(0.2), dec!(0.3), Direction::Buy).unwrap();
 
-        let result = fifo
-            .process_trade(dec!(0.3), dec!(0.6), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(0.3), dec!(0.6), Direction::Sell).unwrap();
 
         assert_eq!(result.realized_pnl, Some(dec!(0.09)));
         assert_eq!(result.net_position_after, dec!(0));
@@ -395,23 +378,20 @@ mod tests {
     fn test_multiple_reversals() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy).unwrap();
 
         let result = fifo
             .process_trade(dec!(150), dec!(11.00), Direction::Sell)
             .unwrap();
         assert_eq!(result.net_position_after, dec!(-50));
 
-        let result = fifo
-            .process_trade(dec!(100), dec!(10.50), Direction::Buy)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(100), dec!(10.50), Direction::Buy).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(25.00)));
         assert_eq!(result.net_position_after, dec!(50));
 
-        let result = fifo
-            .process_trade(dec!(75), dec!(11.00), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(75), dec!(11.00), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(25.00)));
         assert_eq!(result.net_position_after, dec!(-25));
     }
@@ -420,18 +400,15 @@ mod tests {
     fn test_partial_lot_consumption() {
         let mut fifo = FifoInventory::new();
 
-        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy)
-            .unwrap();
+        fifo.process_trade(dec!(100), dec!(10.00), Direction::Buy).unwrap();
 
-        let result = fifo
-            .process_trade(dec!(30), dec!(11.00), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(30), dec!(11.00), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(30.00)));
         assert_eq!(result.net_position_after, dec!(70));
 
-        let result = fifo
-            .process_trade(dec!(40), dec!(12.00), Direction::Sell)
-            .unwrap();
+        let result =
+            fifo.process_trade(dec!(40), dec!(12.00), Direction::Sell).unwrap();
         assert_eq!(result.realized_pnl, Some(dec!(80.00)));
         assert_eq!(result.cumulative_pnl, dec!(110.00));
         assert_eq!(result.net_position_after, dec!(30));

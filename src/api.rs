@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};
-use rocket::{get, post, routes, Route, State};
+use rocket::{Route, State, get, post, routes};
 use sqlx::SqlitePool;
 
 use crate::env::{BrokerConfig, Config};
@@ -43,7 +43,8 @@ async fn auth_refresh(
 ) -> Json<AuthRefreshResponse> {
     let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
         return Json(AuthRefreshResponse::Error {
-            error: "Auth refresh is only supported for Schwab broker".to_string(),
+            error: "Auth refresh is only supported for Schwab broker"
+                .to_string(),
         });
     };
 
@@ -65,9 +66,8 @@ async fn auth_refresh(
         }
     };
 
-    if let Err(e) = tokens
-        .store(pool.inner(), &schwab_auth.encryption_key)
-        .await
+    if let Err(e) =
+        tokens.store(pool.inner(), &schwab_auth.encryption_key).await
     {
         return Json(AuthRefreshResponse::Error {
             error: format!("Failed to store tokens: {e}"),
@@ -85,7 +85,7 @@ pub(crate) fn routes() -> Vec<Route> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{address, FixedBytes};
+    use alloy::primitives::{FixedBytes, address};
     use backon::{ExponentialBuilder, Retryable};
     use httpmock::{Mock, MockServer};
     use reqwest::Client as ReqwestClient;
@@ -112,8 +112,12 @@ mod tests {
             server_port: 8080,
             evm: EvmEnv {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
-                orderbook: address!("0x1111111111111111111111111111111111111111"),
-                order_owner: address!("0x2222222222222222222222222222222222222222"),
+                orderbook: address!(
+                    "0x1111111111111111111111111111111111111111"
+                ),
+                order_owner: address!(
+                    "0x2222222222222222222222222222222222222222"
+                ),
                 deployment_block: 0,
             },
             order_polling_interval: 15,
@@ -139,9 +143,8 @@ mod tests {
     #[tokio::test]
     async fn test_health_endpoint() {
         let rocket = rocket::build().mount("/", routes![health]);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let response = client.get("/health").dispatch().await;
         assert_eq!(response.status(), Status::Ok);
@@ -176,9 +179,8 @@ mod tests {
             .mount("/", routes![auth_refresh])
             .manage(pool)
             .manage(config);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let request_body = json!({
             "redirect_url": "https://127.0.0.1/?code=test_auth_code&state=xyz"
@@ -219,9 +221,8 @@ mod tests {
             .mount("/", routes![auth_refresh])
             .manage(pool)
             .manage(config);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let request_body = json!({
             "redirect_url": "invalid_url"
@@ -244,7 +245,9 @@ mod tests {
             AuthRefreshResponse::Error { error } => {
                 assert!(error.contains("Failed to extract authorization code"));
             }
-            AuthRefreshResponse::Success { .. } => panic!("Expected error response"),
+            AuthRefreshResponse::Success { .. } => {
+                panic!("Expected error response")
+            }
         }
     }
 
@@ -258,9 +261,8 @@ mod tests {
             .mount("/", routes![auth_refresh])
             .manage(pool)
             .manage(config);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let request_body = json!({
             "redirect_url": "https://127.0.0.1/?state=xyz&other=param"
@@ -284,7 +286,9 @@ mod tests {
                 assert!(error.contains("Failed to extract authorization code"));
                 assert!(error.contains("Missing authorization code parameter"));
             }
-            AuthRefreshResponse::Success { .. } => panic!("Expected error response"),
+            AuthRefreshResponse::Success { .. } => {
+                panic!("Expected error response")
+            }
         }
     }
 
@@ -305,9 +309,8 @@ mod tests {
             .mount("/", routes![auth_refresh])
             .manage(pool)
             .manage(config);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let request_body = json!({
             "redirect_url": "https://127.0.0.1/?code=invalid_code&state=xyz"
@@ -330,7 +333,9 @@ mod tests {
             AuthRefreshResponse::Error { error } => {
                 assert!(error.contains("Authentication failed"));
             }
-            AuthRefreshResponse::Success { .. } => panic!("Expected error response"),
+            AuthRefreshResponse::Success { .. } => {
+                panic!("Expected error response")
+            }
         }
 
         mock.assert();
@@ -346,9 +351,8 @@ mod tests {
             .mount("/", routes![auth_refresh])
             .manage(pool)
             .manage(config);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let response = client
             .post("/auth/refresh")
@@ -371,9 +375,8 @@ mod tests {
             .mount("/", routes![auth_refresh])
             .manage(pool)
             .manage(config);
-        let client = Client::tracked(rocket)
-            .await
-            .expect("valid rocket instance");
+        let client =
+            Client::tracked(rocket).await.expect("valid rocket instance");
 
         let request_body = json!({
             "wrong_field": "https://127.0.0.1/?code=test_code"
@@ -390,7 +393,10 @@ mod tests {
         assert_eq!(response.status(), Status::UnprocessableEntity);
     }
 
-    fn create_test_config_for_server(server: &MockServer, server_port: u16) -> Config {
+    fn create_test_config_for_server(
+        server: &MockServer,
+        server_port: u16,
+    ) -> Config {
         let base_url = server.base_url();
 
         Config {
@@ -399,8 +405,12 @@ mod tests {
             server_port,
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://127.0.0.1:8545").unwrap(),
-                orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: address!("0xD2843D9E7738d46D90CB6Dff8D6C83db58B9c165"),
+                orderbook: address!(
+                    "0x1234567890123456789012345678901234567890"
+                ),
+                order_owner: address!(
+                    "0xD2843D9E7738d46D90CB6Dff8D6C83db58B9c165"
+                ),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -479,7 +489,9 @@ mod tests {
             .with_max_delay(Duration::from_secs(1))
             .with_max_times(20);
 
-        let health_check = || async { client.get(&health_url).send().await?.error_for_status() };
+        let health_check = || async {
+            client.get(&health_url).send().await?.error_for_status()
+        };
 
         health_check
             .retry(&retry_strategy)
@@ -519,10 +531,12 @@ mod tests {
             .expect("Auth response should be valid JSON");
 
         assert_eq!(auth_data["success"], "true");
-        assert!(auth_data["message"]
-            .as_str()
-            .unwrap()
-            .contains("Authentication successful"));
+        assert!(
+            auth_data["message"]
+                .as_str()
+                .unwrap()
+                .contains("Authentication successful")
+        );
 
         oauth_mock.assert();
 

@@ -8,7 +8,9 @@ use crate::BrokerError;
 /// NOTE: Schwab API spec defines orderId as int64, but our database schema stores it as TEXT.
 /// This conversion bridges the API format to our storage format. We may want to change the
 /// database schema to INTEGER before production deployment.
-fn deserialize_order_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_order_id<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -134,7 +136,11 @@ impl OrderStatusResponse {
     pub(crate) const fn is_terminal_failure(&self) -> bool {
         matches!(
             self.status,
-            Some(OrderStatus::Canceled | OrderStatus::Rejected | OrderStatus::Expired)
+            Some(
+                OrderStatus::Canceled
+                    | OrderStatus::Rejected
+                    | OrderStatus::Expired
+            )
         )
     }
 }
@@ -174,11 +180,14 @@ mod tests {
             }]
         }"#;
 
-        let response: OrderStatusResponse = serde_json::from_str(json_response).unwrap();
+        let response: OrderStatusResponse =
+            serde_json::from_str(json_response).unwrap();
 
         assert_eq!(response.order_id, Some("1004055538123".to_string()));
         assert_eq!(response.status, Some(OrderStatus::Filled));
-        assert!((response.filled_quantity.unwrap() - 100.0).abs() < f64::EPSILON);
+        assert!(
+            (response.filled_quantity.unwrap() - 100.0).abs() < f64::EPSILON
+        );
         assert!(response.remaining_quantity.unwrap().abs() < f64::EPSILON);
         assert_eq!(
             response.order_activity_collection.as_ref().unwrap().len(),
@@ -219,14 +228,8 @@ mod tests {
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![
-                    ExecutionLeg {
-                        quantity: 100.0,
-                        price: 150.00,
-                    },
-                    ExecutionLeg {
-                        quantity: 100.0,
-                        price: 151.00,
-                    },
+                    ExecutionLeg { quantity: 100.0, price: 150.00 },
+                    ExecutionLeg { quantity: 100.0, price: 151.00 },
                 ]),
             }]),
         };
@@ -246,14 +249,8 @@ mod tests {
             order_activity_collection: Some(vec![OrderActivity {
                 activity_type: Some("EXECUTION".to_string()),
                 execution_legs: Some(vec![
-                    ExecutionLeg {
-                        quantity: 200.0,
-                        price: 150.00,
-                    },
-                    ExecutionLeg {
-                        quantity: 100.0,
-                        price: 153.00,
-                    },
+                    ExecutionLeg { quantity: 200.0, price: 150.00 },
+                    ExecutionLeg { quantity: 100.0, price: 153.00 },
                 ]),
             }]),
         };
@@ -378,7 +375,10 @@ mod tests {
                 close_time: None,
                 order_activity_collection: Some(vec![]),
             };
-            assert!(response.is_pending(), "Status {status:?} should be pending");
+            assert!(
+                response.is_pending(),
+                "Status {status:?} should be pending"
+            );
         }
 
         let non_pending_states = [
@@ -484,11 +484,14 @@ mod tests {
         }
         "#;
 
-        let response: OrderStatusResponse = serde_json::from_str(json_response).unwrap();
+        let response: OrderStatusResponse =
+            serde_json::from_str(json_response).unwrap();
 
         assert_eq!(response.order_id, Some("1004055538999".to_string()));
         assert_eq!(response.status, Some(OrderStatus::Filled));
-        assert!((response.filled_quantity.unwrap() - 200.0).abs() < f64::EPSILON);
+        assert!(
+            (response.filled_quantity.unwrap() - 200.0).abs() < f64::EPSILON
+        );
         assert!(response.remaining_quantity.unwrap().abs() < f64::EPSILON);
         assert_eq!(
             response.order_activity_collection.as_ref().unwrap().len(),
@@ -576,8 +579,8 @@ mod tests {
         }"#;
 
         // This should parse successfully now
-        let parsed: OrderStatusResponse =
-            serde_json::from_str(actual_response).expect("Should parse actual Schwab API response");
+        let parsed: OrderStatusResponse = serde_json::from_str(actual_response)
+            .expect("Should parse actual Schwab API response");
 
         // Verify the parsed values
         assert_eq!(parsed.order_id, Some("1004055538153".to_string()));
@@ -613,8 +616,8 @@ mod tests {
             "remainingQuantity": 0.0
         }"#;
 
-        let parsed: OrderStatusResponse =
-            serde_json::from_str(response_json).expect("Should parse orderId as number");
+        let parsed: OrderStatusResponse = serde_json::from_str(response_json)
+            .expect("Should parse orderId as number");
 
         assert_eq!(parsed.order_id, Some("1004055538153".to_string()));
         assert_eq!(parsed.status, Some(OrderStatus::Filled));
@@ -643,8 +646,8 @@ mod tests {
             "remainingQuantity": 100.0
         }"#;
 
-        let parsed: OrderStatusResponse =
-            serde_json::from_str(response_json).expect("Should parse response without orderId");
+        let parsed: OrderStatusResponse = serde_json::from_str(response_json)
+            .expect("Should parse response without orderId");
 
         assert_eq!(parsed.order_id, None);
         assert_eq!(parsed.status, Some(OrderStatus::Queued));
@@ -657,7 +660,8 @@ mod tests {
         }"#;
 
         let parsed: OrderStatusResponse =
-            serde_json::from_str(minimal_response).expect("Should parse minimal response");
+            serde_json::from_str(minimal_response)
+                .expect("Should parse minimal response");
 
         assert_eq!(parsed.order_id, None);
         assert_eq!(parsed.status, Some(OrderStatus::Queued));
@@ -677,7 +681,8 @@ mod tests {
         }"#;
 
         let parsed: OrderStatusResponse =
-            serde_json::from_str(no_status_response).expect("Should parse response without status");
+            serde_json::from_str(no_status_response)
+                .expect("Should parse response without status");
 
         assert_eq!(parsed.order_id, Some("1004055538123".to_string()));
         assert_eq!(parsed.status, None);

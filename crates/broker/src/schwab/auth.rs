@@ -8,7 +8,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::{debug, info};
 
-use super::{tokens::SchwabTokens, SchwabError};
+use super::{SchwabError, tokens::SchwabTokens};
 
 #[derive(Parser, Debug, Clone)]
 pub struct SchwabAuthEnv {
@@ -44,8 +44,12 @@ pub(crate) struct AccountNumbers {
 }
 
 impl SchwabAuthEnv {
-    pub async fn get_account_hash(&self, pool: &SqlitePool) -> Result<String, SchwabError> {
-        let access_token = SchwabTokens::get_valid_access_token(pool, self).await?;
+    pub async fn get_account_hash(
+        &self,
+        pool: &SqlitePool,
+    ) -> Result<String, SchwabError> {
+        let access_token =
+            SchwabTokens::get_valid_access_token(pool, self).await?;
 
         let headers = [
             (
@@ -94,9 +98,7 @@ impl SchwabAuthEnv {
             });
         }
 
-        Ok(account_numbers[self.schwab_account_index]
-            .hash_value
-            .clone())
+        Ok(account_numbers[self.schwab_account_index].hash_value.clone())
     }
 
     pub fn get_auth_url(&self) -> String {
@@ -108,9 +110,13 @@ impl SchwabAuthEnv {
         )
     }
 
-    pub async fn get_tokens_from_code(&self, code: &str) -> Result<SchwabTokens, SchwabError> {
+    pub async fn get_tokens_from_code(
+        &self,
+        code: &str,
+    ) -> Result<SchwabTokens, SchwabError> {
         info!("Getting tokens for code: {code}");
-        let credentials = format!("{}:{}", self.schwab_app_key, self.schwab_app_secret);
+        let credentials =
+            format!("{}:{}", self.schwab_app_key, self.schwab_app_secret);
         let credentials = BASE64_STANDARD.encode(credentials);
 
         let payload = format!(
@@ -132,7 +138,9 @@ impl SchwabAuthEnv {
         .into_iter()
         .collect::<HeaderMap>();
 
-        debug!("Sending request to Schwab API with headers: {headers:?}\nAnd payload: {payload}");
+        debug!(
+            "Sending request to Schwab API with headers: {headers:?}\nAnd payload: {payload}"
+        );
         let client = reqwest::Client::new();
         let response = client
             .post(format!("{}/v1/oauth/token", self.schwab_base_url))
@@ -160,10 +168,9 @@ impl SchwabAuthEnv {
                     Err(_) => "Failed to decode gzipped response".to_string(),
                 }
             } else {
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Failed to read response body".to_string())
+                response.text().await.unwrap_or_else(|_| {
+                    "Failed to read response body".to_string()
+                })
             };
             return Err(SchwabError::RequestFailed {
                 action: "get tokens".to_string(),
@@ -182,8 +189,12 @@ impl SchwabAuthEnv {
         })
     }
 
-    pub async fn refresh_tokens(&self, refresh_token: &str) -> Result<SchwabTokens, SchwabError> {
-        let credentials = format!("{}:{}", self.schwab_app_key, self.schwab_app_secret);
+    pub async fn refresh_tokens(
+        &self,
+        refresh_token: &str,
+    ) -> Result<SchwabTokens, SchwabError> {
+        let credentials =
+            format!("{}:{}", self.schwab_app_key, self.schwab_app_secret);
         let credentials = BASE64_STANDARD.encode(credentials);
 
         let payload = format!(
@@ -240,7 +251,7 @@ impl SchwabAuthEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{setup_test_db, TEST_ENCRYPTION_KEY};
+    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
@@ -256,7 +267,9 @@ mod tests {
         }
     }
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
+    fn create_test_env_with_mock_server(
+        mock_server: &MockServer,
+    ) -> SchwabAuthEnv {
         SchwabAuthEnv {
             schwab_app_key: "test_app_key".to_string(),
             schwab_app_secret: "test_app_secret".to_string(),
@@ -293,7 +306,9 @@ mod tests {
         let env = SchwabAuthEnv {
             schwab_app_key: "test key with spaces & symbols!".to_string(),
             schwab_app_secret: "test_secret".to_string(),
-            schwab_redirect_uri: "https://example.com/callback?param=value&other=test".to_string(),
+            schwab_redirect_uri:
+                "https://example.com/callback?param=value&other=test"
+                    .to_string(),
             schwab_base_url: "https://api.schwabapi.com".to_string(),
             schwab_account_index: 0,
             encryption_key: TEST_ENCRYPTION_KEY,
@@ -337,8 +352,14 @@ mod tests {
         assert_eq!(tokens.refresh_token, "test_refresh_token");
 
         let now = Utc::now();
-        assert!(now.signed_duration_since(tokens.access_token_fetched_at) < Duration::seconds(5));
-        assert!(now.signed_duration_since(tokens.refresh_token_fetched_at) < Duration::seconds(5));
+        assert!(
+            now.signed_duration_since(tokens.access_token_fetched_at)
+                < Duration::seconds(5)
+        );
+        assert!(
+            now.signed_duration_since(tokens.refresh_token_fetched_at)
+                < Duration::seconds(5)
+        );
     }
 
     #[tokio::test]
@@ -470,8 +491,14 @@ mod tests {
         assert_eq!(tokens.refresh_token, "new_refresh_token");
 
         let now = Utc::now();
-        assert!(now.signed_duration_since(tokens.access_token_fetched_at) < Duration::seconds(5));
-        assert!(now.signed_duration_since(tokens.refresh_token_fetched_at) < Duration::seconds(5));
+        assert!(
+            now.signed_duration_since(tokens.access_token_fetched_at)
+                < Duration::seconds(5)
+        );
+        assert!(
+            now.signed_duration_since(tokens.refresh_token_fetched_at)
+                < Duration::seconds(5)
+        );
     }
 
     #[tokio::test]
@@ -538,7 +565,8 @@ mod tests {
     #[test]
     fn test_schwab_auth_response_deserialization() {
         let json_str = r#"{"access_token": "test_access", "refresh_token": "test_refresh"}"#;
-        let response: SchwabAuthResponse = serde_json::from_str(json_str).unwrap();
+        let response: SchwabAuthResponse =
+            serde_json::from_str(json_str).unwrap();
 
         assert_eq!(response.access_token, "test_access");
         assert_eq!(response.refresh_token, "test_refresh");
@@ -547,17 +575,21 @@ mod tests {
     #[test]
     fn test_schwab_auth_response_deserialization_missing_field() {
         let json_str = r#"{"access_token": "test_access"}"#;
-        let result: Result<SchwabAuthResponse, _> = serde_json::from_str(json_str);
+        let result: Result<SchwabAuthResponse, _> =
+            serde_json::from_str(json_str);
         assert!(matches!(result.unwrap_err(), serde_json::Error { .. }));
     }
 
     #[test]
     fn test_schwab_auth_error_display() {
-        let invalid_header_err =
-            SchwabError::InvalidHeader(HeaderValue::from_str("test\x00").unwrap_err());
-        assert!(invalid_header_err
-            .to_string()
-            .contains("Failed to create header value"));
+        let invalid_header_err = SchwabError::InvalidHeader(
+            HeaderValue::from_str("test\x00").unwrap_err(),
+        );
+        assert!(
+            invalid_header_err
+                .to_string()
+                .contains("Failed to create header value")
+        );
     }
 
     #[test]

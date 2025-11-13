@@ -8,9 +8,9 @@ use tracing::error;
 
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
+use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::EvmEnv;
 
 use super::pyth::PythPricing;
 use crate::symbol::cache::SymbolCache;
@@ -56,10 +56,12 @@ impl OnchainTrade {
 
         let direction_str = self.direction.as_str();
         let symbol_str = self.symbol.to_string();
-        let block_timestamp_naive = self.block_timestamp.map(|dt| dt.naive_utc());
+        let block_timestamp_naive =
+            self.block_timestamp.map(|dt| dt.naive_utc());
 
         let gas_used_i64 = self.gas_used.and_then(|g| i64::try_from(g).ok());
-        let effective_gas_price_i64 = self.effective_gas_price.and_then(|p| i64::try_from(p).ok());
+        let effective_gas_price_i64 =
+            self.effective_gas_price.and_then(|p| i64::try_from(p).ok());
 
         let result = sqlx::query!(
             r#"
@@ -135,16 +137,14 @@ impl OnchainTrade {
         .await?;
 
         let tx_hash = row.tx_hash.parse().map_err(|_| {
-            OnChainError::Persistence(PersistenceError::InvalidTradeStatus(format!(
-                "Invalid tx_hash format: {}",
-                row.tx_hash
-            )))
+            OnChainError::Persistence(PersistenceError::InvalidTradeStatus(
+                format!("Invalid tx_hash format: {}", row.tx_hash),
+            ))
         })?;
 
-        let direction = row
-            .direction
-            .parse()
-            .map_err(|e| OnChainError::Persistence(PersistenceError::InvalidDirection(e)))?;
+        let direction = row.direction.parse().map_err(|e| {
+            OnChainError::Persistence(PersistenceError::InvalidDirection(e))
+        })?;
 
         Ok(Self {
             id: Some(row.id),
@@ -155,21 +155,23 @@ impl OnchainTrade {
             amount: row.amount,
             direction,
             price_usdc: row.price_usdc,
-            block_timestamp: row
-                .block_timestamp
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            created_at: row
-                .created_at
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
+            block_timestamp: row.block_timestamp.map(|naive_dt| {
+                DateTime::from_naive_utc_and_offset(naive_dt, Utc)
+            }),
+            created_at: row.created_at.map(|naive_dt| {
+                DateTime::from_naive_utc_and_offset(naive_dt, Utc)
+            }),
             gas_used: row.gas_used.and_then(|g| u64::try_from(g).ok()),
-            effective_gas_price: row.effective_gas_price.and_then(|p| u128::try_from(p).ok()),
+            effective_gas_price: row
+                .effective_gas_price
+                .and_then(|p| u128::try_from(p).ok()),
             pyth_price: row.pyth_price,
             pyth_confidence: row.pyth_confidence,
             #[allow(clippy::cast_possible_truncation)]
             pyth_exponent: row.pyth_exponent.map(|exp| exp as i32),
-            pyth_publish_time: row
-                .pyth_publish_time
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
+            pyth_publish_time: row.pyth_publish_time.map(|naive_dt| {
+                DateTime::from_naive_utc_and_offset(naive_dt, Utc)
+            }),
         })
     }
 
@@ -190,13 +192,17 @@ impl OnchainTrade {
         log: Log,
         feed_id_cache: &FeedIdCache,
     ) -> Result<Option<Self>, OnChainError> {
-        let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
-        let log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
+        let tx_hash =
+            log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
+        let log_index =
+            log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
 
         // Fetch transaction receipt to get gas information
         let receipt = provider.get_transaction_receipt(tx_hash).await?;
         let (gas_used, effective_gas_price) = match receipt {
-            Some(receipt) => (Some(receipt.gas_used), Some(receipt.effective_gas_price)),
+            Some(receipt) => {
+                (Some(receipt.gas_used), Some(receipt.effective_gas_price))
+            }
             None => (None, None),
         };
 
@@ -211,10 +217,12 @@ impl OnchainTrade {
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
         let onchain_input_amount = float_to_f64(fill.input_amount)?;
-        let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
+        let onchain_input_symbol =
+            cache.get_io_symbol(&provider, input).await?;
 
         let onchain_output_amount = float_to_f64(fill.output_amount)?;
-        let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
+        let onchain_output_symbol =
+            cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
         let trade_details = TradeDetails::try_from_io(
@@ -229,8 +237,8 @@ impl OnchainTrade {
         }
 
         // Calculate price per share in USDC (always USDC amount / equity amount)
-        let price_per_share_usdc =
-            trade_details.usdc_amount().value() / trade_details.equity_amount().value();
+        let price_per_share_usdc = trade_details.usdc_amount().value()
+            / trade_details.equity_amount().value();
 
         if price_per_share_usdc.is_nan() || price_per_share_usdc <= 0.0 {
             return Ok(None);
@@ -242,7 +250,8 @@ impl OnchainTrade {
         } else {
             onchain_input_symbol
         };
-        let tokenized_symbol = TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
+        let tokenized_symbol =
+            TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
 
         let pyth_pricing = match PythPricing::try_from_tx_hash(
             tx_hash,
@@ -254,7 +263,9 @@ impl OnchainTrade {
         {
             Ok(pricing) => Some(pricing),
             Err(e) => {
-                error!("Failed to get Pyth pricing for tx_hash={tx_hash:?}: {e}");
+                error!(
+                    "Failed to get Pyth pricing for tx_hash={tx_hash:?}: {e}"
+                );
                 None
             }
         };
@@ -296,9 +307,11 @@ impl OnchainTrade {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
-                OnChainError::Validation(crate::error::TradeValidationError::TransactionNotFound(
-                    tx_hash,
-                ))
+                OnChainError::Validation(
+                    crate::error::TradeValidationError::TransactionNotFound(
+                        tx_hash,
+                    ),
+                )
             })?;
 
         let trades: Vec<_> = receipt
@@ -320,8 +333,14 @@ impl OnchainTrade {
         }
 
         for log in trades {
-            if let Some(trade) =
-                try_convert_log_to_onchain_trade(log, &provider, cache, env, feed_id_cache).await?
+            if let Some(trade) = try_convert_log_to_onchain_trade(
+                log,
+                &provider,
+                cache,
+                env,
+                feed_id_cache,
+            )
+            .await?
             {
                 return Ok(Some(trade));
             }
@@ -395,13 +414,15 @@ fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
     let float = Float::from_raw(float);
 
     // Use the library's format() method to get a string representation
-    let formatted = float
-        .format()
-        .map_err(|e| OnChainError::FloatConversion(format!("Float format error: {e}")))?;
+    let formatted = float.format().map_err(|e| {
+        OnChainError::FloatConversion(format!("Float format error: {e}"))
+    })?;
 
     // Parse the formatted string to f64
     formatted.parse::<f64>().map_err(|e| {
-        OnChainError::FloatConversion(format!("Failed to parse '{formatted}' as f64: {e}"))
+        OnChainError::FloatConversion(format!(
+            "Failed to parse '{formatted}' as f64: {e}"
+        ))
     })
 }
 
@@ -412,7 +433,7 @@ mod tests {
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
     use alloy::primitives::fixed_bytes;
-    use alloy::providers::{mock::Asserter, ProviderBuilder};
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
 
     /// Helper to create a properly encoded Float for testing
     /// Creates a Float representing the given value using from_fixed_decimal_lossy
@@ -423,7 +444,8 @@ mod tests {
         // For testing, we create Float from a fixed decimal value
         // E.g., value=9, decimals=0 represents 9.0
         let u256_value = U256::from(value.unsigned_abs());
-        let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+        let float = Float::from_fixed_decimal_lossy(u256_value, decimals)
+            .expect("valid Float");
 
         // Handle negative values by manually setting the sign bit if needed
         // For now, assume positive values in tests
@@ -459,10 +481,13 @@ mod tests {
         sql_tx.commit().await.unwrap();
         assert!(id > 0);
 
-        let found =
-            OnchainTrade::find_by_tx_hash_and_log_index(&pool, trade.tx_hash, trade.log_index)
-                .await
-                .unwrap();
+        let found = OnchainTrade::find_by_tx_hash_and_log_index(
+            &pool,
+            trade.tx_hash,
+            trade.log_index,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(found.tx_hash, trade.tx_hash);
         assert_eq!(found.log_index, trade.log_index);
@@ -484,27 +509,27 @@ mod tests {
         // FLOAT_ONE = bytes32(uint256(1)) = coefficient=1, exponent=0 → 1.0
         let float_one = B256::from([
             0x00, 0x00, 0x00, 0x00, // exponent = 0
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x01, // coefficient = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // coefficient = 1
         ]);
         assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
         // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
         let float_half = B256::from([
             0xff, 0xff, 0xff, 0xff, // exponent = -1
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x05, // coefficient = 5
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // coefficient = 5
         ]);
         assert!((float_to_f64(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
 
         // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
         let float_two = B256::from([
             0x00, 0x00, 0x00, 0x00, // exponent = 0
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x02, // coefficient = 2
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // coefficient = 2
         ]);
         assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
     }
@@ -598,7 +623,8 @@ mod tests {
 
         // Try to insert duplicate trade (same tx_hash and log_index)
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = trade.save_within_transaction(&mut sql_tx2).await;
+        let duplicate_result =
+            trade.save_within_transaction(&mut sql_tx2).await;
         assert!(
             duplicate_result.is_err(),
             "Expected duplicate constraint violation"
@@ -703,16 +729,25 @@ mod tests {
             deployment_block: 0,
         };
 
-        let tx_hash =
-            fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
+        let tx_hash = fixed_bytes!(
+            "0x4444444444444444444444444444444444444444444444444444444444444444"
+        );
 
         // Mock returns empty response by default, simulating transaction not found
-        let result =
-            OnchainTrade::try_from_tx_hash(tx_hash, provider, &cache, &env, &feed_id_cache).await;
+        let result = OnchainTrade::try_from_tx_hash(
+            tx_hash,
+            provider,
+            &cache,
+            &env,
+            &feed_id_cache,
+        )
+        .await;
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(TradeValidationError::TransactionNotFound(_))
+            OnChainError::Validation(
+                TradeValidationError::TransactionNotFound(_)
+            )
         ));
     }
 
@@ -741,9 +776,10 @@ mod tests {
         for i in 0..5 {
             let mut tx_hash_bytes = [0u8; 32];
             tx_hash_bytes[0..31].copy_from_slice(&[
-                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
-                0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56,
-                0x78, 0x90, 0x12,
+                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
+                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
+                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
+                0x12,
             ]);
             tx_hash_bytes[31] = i;
 
@@ -751,8 +787,10 @@ mod tests {
                 id: None,
                 tx_hash: alloy::primitives::B256::from(tx_hash_bytes),
                 log_index: u64::from(i),
-                symbol: crate::onchain::io::TokenizedEquitySymbol::parse(&format!("TEST{i}0x"))
-                    .unwrap(),
+                symbol: crate::onchain::io::TokenizedEquitySymbol::parse(
+                    &format!("TEST{i}0x"),
+                )
+                .unwrap(),
                 amount: 10.0,
                 direction: Direction::Buy,
                 price_usdc: 150.0,

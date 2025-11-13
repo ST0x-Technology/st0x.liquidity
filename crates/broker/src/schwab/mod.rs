@@ -68,11 +68,7 @@ pub enum SchwabError {
     /// `status`: HTTP status code returned.
     /// `body`: Response body text.
     #[error("{action} failed with status: {status}, body: {body}")]
-    RequestFailed {
-        action: String,
-        status: reqwest::StatusCode,
-        body: String,
-    },
+    RequestFailed { action: String, status: reqwest::StatusCode, body: String },
 
     /// Broker configuration validation failed during initialization.
     #[error("Invalid configuration: {0}")]
@@ -107,9 +103,7 @@ pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {
         .query_pairs()
         .find(|(key, _)| key == "code")
         .map(|(_, value)| value.into_owned())
-        .ok_or_else(|| SchwabError::MissingAuthCode {
-            url: url.to_string(),
-        })
+        .ok_or_else(|| SchwabError::MissingAuthCode { url: url.to_string() })
 }
 
 #[cfg(test)]
@@ -119,7 +113,9 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
+    fn create_test_env_with_mock_server(
+        mock_server: &MockServer,
+    ) -> SchwabAuthEnv {
         SchwabAuthEnv {
             schwab_app_key: "test_app_key".to_string(),
             schwab_app_secret: "test_app_secret".to_string(),

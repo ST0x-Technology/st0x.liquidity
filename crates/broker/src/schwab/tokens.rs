@@ -2,14 +2,14 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
-use tokio::time::{interval, Duration as TokioDuration};
+use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{error, info, warn};
 
 use alloy::primitives::FixedBytes;
 
-use super::auth::SchwabAuthEnv;
-use super::encryption::{decrypt_token, encrypt_token, EncryptionError};
 use super::SchwabError;
+use super::auth::SchwabAuthEnv;
+use super::encryption::{EncryptionError, decrypt_token, encrypt_token};
 
 const ACCESS_TOKEN_DURATION_MINUTES: i64 = 30;
 const REFRESH_TOKEN_DURATION_DAYS: i64 = 7;
@@ -54,8 +54,10 @@ impl SchwabTokens {
         pool: &SqlitePool,
         encryption_key: &FixedBytes<32>,
     ) -> Result<(), SchwabError> {
-        let encrypted_access = encrypt_token(encryption_key, &self.access_token)?;
-        let encrypted_refresh = encrypt_token(encryption_key, &self.refresh_token)?;
+        let encrypted_access =
+            encrypt_token(encryption_key, &self.access_token)?;
+        let encrypted_refresh =
+            encrypt_token(encryption_key, &self.refresh_token)?;
 
         let encrypted_access_hex = alloy::hex::encode(&encrypted_access);
         let encrypted_refresh_hex = alloy::hex::encode(&encrypted_refresh);
@@ -110,12 +112,16 @@ impl SchwabTokens {
         .await?;
 
         let encrypted_access_bytes: Vec<u8> =
-            alloy::hex::decode(&row.access_token).map_err(EncryptionError::Hex)?;
+            alloy::hex::decode(&row.access_token)
+                .map_err(EncryptionError::Hex)?;
         let encrypted_refresh_bytes: Vec<u8> =
-            alloy::hex::decode(&row.refresh_token).map_err(EncryptionError::Hex)?;
+            alloy::hex::decode(&row.refresh_token)
+                .map_err(EncryptionError::Hex)?;
 
-        let access_token = decrypt_token(encryption_key, &encrypted_access_bytes)?;
-        let refresh_token = decrypt_token(encryption_key, &encrypted_refresh_bytes)?;
+        let access_token =
+            decrypt_token(encryption_key, &encrypted_access_bytes)?;
+        let refresh_token =
+            decrypt_token(encryption_key, &encrypted_refresh_bytes)?;
 
         Ok(Self {
             access_token,
@@ -133,22 +139,22 @@ impl SchwabTokens {
 
     pub fn is_access_token_expired(&self) -> bool {
         let now = Utc::now();
-        let expires_at =
-            self.access_token_fetched_at + Duration::minutes(ACCESS_TOKEN_DURATION_MINUTES);
+        let expires_at = self.access_token_fetched_at
+            + Duration::minutes(ACCESS_TOKEN_DURATION_MINUTES);
         now >= expires_at
     }
 
     pub fn is_refresh_token_expired(&self) -> bool {
         let now = Utc::now();
-        let expires_at =
-            self.refresh_token_fetched_at + Duration::days(REFRESH_TOKEN_DURATION_DAYS);
+        let expires_at = self.refresh_token_fetched_at
+            + Duration::days(REFRESH_TOKEN_DURATION_DAYS);
         now >= expires_at
     }
 
     pub fn access_token_expires_in(&self) -> Duration {
         let now = Utc::now();
-        let expires_at =
-            self.access_token_fetched_at + Duration::minutes(ACCESS_TOKEN_DURATION_MINUTES);
+        let expires_at = self.access_token_fetched_at
+            + Duration::minutes(ACCESS_TOKEN_DURATION_MINUTES);
         expires_at - now
     }
 
@@ -172,7 +178,9 @@ impl SchwabTokens {
     }
 
     #[cfg(test)]
-    pub(crate) async fn db_count(pool: &SqlitePool) -> Result<i64, SchwabError> {
+    pub(crate) async fn db_count(
+        pool: &SqlitePool,
+    ) -> Result<i64, SchwabError> {
         let count = sqlx::query_scalar!("SELECT COUNT(*) FROM schwab_auth")
             .fetch_one(pool)
             .await?;
@@ -219,10 +227,14 @@ async fn start_automatic_token_refresh_loop(
     env: SchwabAuthEnv,
 ) -> Result<(), SchwabError> {
     let refresh_interval_secs = (ACCESS_TOKEN_DURATION_MINUTES - 1) * 60;
-    let refresh_interval_u64 = refresh_interval_secs.try_into().map_err(|_| {
-        SchwabError::InvalidConfiguration("Refresh interval out of range".to_string())
-    })?;
-    let mut interval_timer = interval(TokioDuration::from_secs(refresh_interval_u64));
+    let refresh_interval_u64 =
+        refresh_interval_secs.try_into().map_err(|_| {
+            SchwabError::InvalidConfiguration(
+                "Refresh interval out of range".to_string(),
+            )
+        })?;
+    let mut interval_timer =
+        interval(TokioDuration::from_secs(refresh_interval_u64));
 
     loop {
         interval_timer.tick().await;
@@ -230,7 +242,10 @@ async fn start_automatic_token_refresh_loop(
     }
 }
 
-async fn handle_token_refresh(pool: &SqlitePool, env: &SchwabAuthEnv) -> Result<(), SchwabError> {
+async fn handle_token_refresh(
+    pool: &SqlitePool,
+    env: &SchwabAuthEnv,
+) -> Result<(), SchwabError> {
     match SchwabTokens::refresh_if_needed(pool, env).await {
         Ok(refreshed) if refreshed => {
             info!("Access token refreshed successfully");
@@ -251,14 +266,16 @@ async fn handle_token_refresh(pool: &SqlitePool, env: &SchwabAuthEnv) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{setup_test_db, TEST_ENCRYPTION_KEY};
+    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
     use chrono::Utc;
     use httpmock::prelude::*;
     use serde_json::json;
     use std::thread;
-    use tokio::time::{sleep, Duration as TokioDuration};
+    use tokio::time::{Duration as TokioDuration, sleep};
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
+    fn create_test_env_with_mock_server(
+        mock_server: &MockServer,
+    ) -> SchwabAuthEnv {
         SchwabAuthEnv {
             schwab_app_key: "test_app_key".to_string(),
             schwab_app_secret: "test_app_secret".to_string(),
@@ -295,9 +312,8 @@ mod tests {
 
         tokens.store(&pool, &env.encryption_key).await.unwrap();
 
-        let stored_token = SchwabTokens::load(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        let stored_token =
+            SchwabTokens::load(&pool, &env.encryption_key).await.unwrap();
         assert_eq!(stored_token.access_token, "test_access_token");
         assert_eq!(stored_token.refresh_token, "test_refresh_token");
         assert_eq!(stored_token.access_token_fetched_at, now);
@@ -326,17 +342,13 @@ mod tests {
             refresh_token_fetched_at: now,
         };
 
-        updated_tokens
-            .store(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        updated_tokens.store(&pool, &env.encryption_key).await.unwrap();
 
         let count = SchwabTokens::db_count(&pool).await.unwrap();
         assert_eq!(count, 1);
 
-        let stored_tokens = SchwabTokens::load(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        let stored_tokens =
+            SchwabTokens::load(&pool, &env.encryption_key).await.unwrap();
         assert_eq!(stored_tokens.access_token, "updated_access_token");
         assert_eq!(stored_tokens.refresh_token, "updated_refresh_token");
     }
@@ -464,9 +476,7 @@ mod tests {
         tokens.store(&pool, &env.encryption_key).await.unwrap();
 
         assert_eq!(
-            SchwabTokens::get_valid_access_token(&pool, &env)
-                .await
-                .unwrap(),
+            SchwabTokens::get_valid_access_token(&pool, &env).await.unwrap(),
             "valid_access_token"
         );
     }
@@ -530,9 +540,8 @@ mod tests {
         mock.assert();
         assert_eq!(result.unwrap(), "refreshed_access_token");
 
-        let stored_tokens = SchwabTokens::load(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        let stored_tokens =
+            SchwabTokens::load(&pool, &env.encryption_key).await.unwrap();
         assert_eq!(stored_tokens.access_token, "refreshed_access_token");
         assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
     }
@@ -620,9 +629,8 @@ mod tests {
         mock.assert();
         assert!(result.unwrap());
 
-        let stored_tokens = SchwabTokens::load(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        let stored_tokens =
+            SchwabTokens::load(&pool, &env.encryption_key).await.unwrap();
         assert_eq!(stored_tokens.access_token, "refreshed_access_token");
         assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
     }
@@ -671,9 +679,8 @@ mod tests {
 
         assert!(!result.unwrap());
 
-        let stored_tokens = SchwabTokens::load(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        let stored_tokens =
+            SchwabTokens::load(&pool, &env.encryption_key).await.unwrap();
         assert_eq!(stored_tokens.access_token, "valid_access_token");
     }
 
@@ -718,15 +725,15 @@ mod tests {
         mock.assert();
         assert!(result.unwrap());
 
-        let stored_tokens = SchwabTokens::load(&pool, &env.encryption_key)
-            .await
-            .unwrap();
+        let stored_tokens =
+            SchwabTokens::load(&pool, &env.encryption_key).await.unwrap();
         assert_eq!(stored_tokens.access_token, "refreshed_access_token");
         assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
     }
 
     #[tokio::test]
-    async fn test_automatic_token_refresh_before_expiration() -> Result<(), SchwabError> {
+    async fn test_automatic_token_refresh_before_expiration()
+    -> Result<(), SchwabError> {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
         let pool = setup_test_db().await;
@@ -781,7 +788,8 @@ mod tests {
 
         mock.assert();
 
-        let stored_tokens = SchwabTokens::load(&pool, &env.encryption_key).await?;
+        let stored_tokens =
+            SchwabTokens::load(&pool, &env.encryption_key).await?;
         assert_eq!(stored_tokens.access_token, "refreshed_access_token");
         assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
 

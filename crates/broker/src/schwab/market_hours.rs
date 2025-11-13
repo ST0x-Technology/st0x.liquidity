@@ -144,23 +144,27 @@ pub async fn fetch_market_hours(
     .into_iter()
     .collect::<HeaderMap>();
 
-    let mut url = format!("{}/marketdata/v1/markets/equity", env.schwab_base_url);
+    let mut url =
+        format!("{}/marketdata/v1/markets/equity", env.schwab_base_url);
 
     if let Some(date_param) = date {
         use std::fmt::Write;
-        write!(url, "?date={date_param}").map_err(|e| SchwabError::RequestFailed {
-            action: "format URL".to_string(),
-            status: reqwest::StatusCode::OK,
-            body: format!("Failed to format date parameter: {e}"),
+        write!(url, "?date={date_param}").map_err(|e| {
+            SchwabError::RequestFailed {
+                action: "format URL".to_string(),
+                status: reqwest::StatusCode::OK,
+                body: format!("Failed to format date parameter: {e}"),
+            }
         })?;
     }
 
     debug!("Fetching market hours from: {url}");
 
     let client = reqwest::Client::new();
-    let response = (|| async { client.get(&url).headers(headers.clone()).send().await })
-        .retry(ExponentialBuilder::default())
-        .await?;
+    let response =
+        (|| async { client.get(&url).headers(headers.clone()).send().await })
+            .retry(ExponentialBuilder::default())
+            .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -200,11 +204,12 @@ fn parse_market_hours_response(
         });
     };
 
-    let date = parse_date(&eq.date).map_err(|e| SchwabError::RequestFailed {
-        action: "parse market hours date".to_string(),
-        status: reqwest::StatusCode::OK,
-        body: format!("Invalid date format '{}': {e}", eq.date),
-    })?;
+    let date =
+        parse_date(&eq.date).map_err(|e| SchwabError::RequestFailed {
+            action: "parse market hours date".to_string(),
+            status: reqwest::StatusCode::OK,
+            body: format!("Invalid date format '{}': {e}", eq.date),
+        })?;
 
     // If market is closed (weekends/holidays), return closed market hours
     if !eq.is_open {
@@ -264,16 +269,23 @@ fn parse_date(date_str: &str) -> Result<NaiveDate, chrono::ParseError> {
     NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
 }
 
-fn parse_datetime(datetime_str: &str, date: NaiveDate) -> Result<DateTime<Utc>, SchwabError> {
+fn parse_datetime(
+    datetime_str: &str,
+    date: NaiveDate,
+) -> Result<DateTime<Utc>, SchwabError> {
     // Schwab API returns datetime strings like "2025-01-03T09:30:00-05:00"
     if let Ok(dt) = DateTime::parse_from_rfc3339(datetime_str) {
         return Ok(dt.with_timezone(&Utc));
     }
 
     // Fallback: try parsing just time and combine with date
-    if let Ok(time) = chrono::NaiveTime::parse_from_str(datetime_str, "%H:%M:%S") {
+    if let Ok(time) =
+        chrono::NaiveTime::parse_from_str(datetime_str, "%H:%M:%S")
+    {
         let naive_dt = date.and_time(time);
-        if let Some(eastern_dt) = Eastern.from_local_datetime(&naive_dt).single() {
+        if let Some(eastern_dt) =
+            Eastern.from_local_datetime(&naive_dt).single()
+        {
             return Ok(eastern_dt.with_timezone(&Utc));
         }
     }
@@ -289,11 +301,15 @@ fn parse_datetime(datetime_str: &str, date: NaiveDate) -> Result<DateTime<Utc>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{setup_test_db, setup_test_tokens, TEST_ENCRYPTION_KEY};
+    use crate::test_utils::{
+        TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens,
+    };
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
+    fn create_test_env_with_mock_server(
+        mock_server: &MockServer,
+    ) -> SchwabAuthEnv {
         SchwabAuthEnv {
             schwab_app_key: "test_app_key".to_string(),
             schwab_app_secret: "test_app_secret".to_string(),

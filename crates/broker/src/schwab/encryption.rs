@@ -21,11 +21,7 @@ pub(crate) fn encrypt_token(
         .encrypt(nonce, plaintext.as_bytes())
         .map_err(|_| EncryptionError::EncryptionFailed)?;
 
-    Ok(nonce_bytes
-        .iter()
-        .chain(ciphertext.iter())
-        .copied()
-        .collect())
+    Ok(nonce_bytes.iter().chain(ciphertext.iter()).copied().collect())
 }
 
 pub(crate) fn decrypt_token(
@@ -49,7 +45,8 @@ pub(crate) fn decrypt_token(
         .decrypt(nonce, encrypted_data)
         .map_err(|_| EncryptionError::DecryptionFailed)?;
 
-    String::from_utf8(plaintext_bytes).map_err(|e| EncryptionError::Utf8Error(e.to_string()))
+    String::from_utf8(plaintext_bytes)
+        .map_err(|e| EncryptionError::Utf8Error(e.to_string()))
 }
 
 #[derive(Debug, thiserror::Error)]

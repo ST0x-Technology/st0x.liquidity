@@ -30,10 +30,11 @@ pub(crate) async fn try_acquire_execution_lease(
     }
 
     // Try to acquire lock by inserting into symbol_locks table
-    let result = sqlx::query("INSERT OR IGNORE INTO symbol_locks (symbol) VALUES (?1)")
-        .bind(symbol.to_string())
-        .execute(sql_tx.as_mut())
-        .await?;
+    let result =
+        sqlx::query("INSERT OR IGNORE INTO symbol_locks (symbol) VALUES (?1)")
+            .bind(symbol.to_string())
+            .execute(sql_tx.as_mut())
+            .await?;
 
     let lease_acquired = result.rows_affected() > 0;
     if lease_acquired {
@@ -119,9 +120,8 @@ mod tests {
         let mut sql_tx = pool.begin().await.unwrap();
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx, &symbol)
-            .await
-            .unwrap();
+        let result =
+            try_acquire_execution_lease(&mut sql_tx, &symbol).await.unwrap();
         assert!(result);
 
         sql_tx.commit().await.unwrap();
@@ -134,17 +134,15 @@ mod tests {
         // First transaction acquires the lease
         let mut sql_tx1 = pool.begin().await.unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let result1 = try_acquire_execution_lease(&mut sql_tx1, &symbol)
-            .await
-            .unwrap();
+        let result1 =
+            try_acquire_execution_lease(&mut sql_tx1, &symbol).await.unwrap();
         assert!(result1);
         sql_tx1.commit().await.unwrap();
 
         // Second transaction tries to acquire the same lease and should fail
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let result2 = try_acquire_execution_lease(&mut sql_tx2, &symbol)
-            .await
-            .unwrap();
+        let result2 =
+            try_acquire_execution_lease(&mut sql_tx2, &symbol).await.unwrap();
         assert!(!result2);
         sql_tx2.rollback().await.unwrap();
     }
@@ -156,18 +154,16 @@ mod tests {
         // Acquire lease for first symbol
         let mut sql_tx1 = pool.begin().await.unwrap();
         let symbol1 = Symbol::new("AAPL").unwrap();
-        let result1 = try_acquire_execution_lease(&mut sql_tx1, &symbol1)
-            .await
-            .unwrap();
+        let result1 =
+            try_acquire_execution_lease(&mut sql_tx1, &symbol1).await.unwrap();
         assert!(result1);
         sql_tx1.commit().await.unwrap();
 
         // Acquire lease for different symbol (should succeed)
         let mut sql_tx2 = pool.begin().await.unwrap();
         let symbol2 = Symbol::new("MSFT").unwrap();
-        let result2 = try_acquire_execution_lease(&mut sql_tx2, &symbol2)
-            .await
-            .unwrap();
+        let result2 =
+            try_acquire_execution_lease(&mut sql_tx2, &symbol2).await.unwrap();
         assert!(result2);
         sql_tx2.commit().await.unwrap();
     }
@@ -178,9 +174,8 @@ mod tests {
 
         let mut sql_tx1 = pool.begin().await.unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx1, &symbol)
-            .await
-            .unwrap();
+        let result =
+            try_acquire_execution_lease(&mut sql_tx1, &symbol).await.unwrap();
         assert!(result);
         sql_tx1.commit().await.unwrap();
 
@@ -189,9 +184,8 @@ mod tests {
         sql_tx2.commit().await.unwrap();
 
         let mut sql_tx3 = pool.begin().await.unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx3, &symbol)
-            .await
-            .unwrap();
+        let result =
+            try_acquire_execution_lease(&mut sql_tx3, &symbol).await.unwrap();
         assert!(result);
         sql_tx3.commit().await.unwrap();
     }
@@ -211,19 +205,20 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let execution_id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
+        let execution_id =
+            execution.save_within_transaction(&mut sql_tx).await.unwrap();
 
         let calculator = PositionCalculator::new();
-        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id))
-            .await
-            .unwrap();
+        save_within_transaction(
+            &mut sql_tx,
+            &symbol,
+            &calculator,
+            Some(execution_id),
+        )
+        .await
+        .unwrap();
 
-        try_acquire_execution_lease(&mut sql_tx, &symbol)
-            .await
-            .unwrap();
+        try_acquire_execution_lease(&mut sql_tx, &symbol).await.unwrap();
         sql_tx.commit().await.unwrap();
 
         // Note: clear_pending_execution_within_transaction function was removed
@@ -235,15 +230,19 @@ mod tests {
         let pool = setup_test_db().await;
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx, &Symbol::new("TEST").unwrap())
-            .await
-            .unwrap();
+        let result = try_acquire_execution_lease(
+            &mut sql_tx,
+            &Symbol::new("TEST").unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(result);
 
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM symbol_locks")
-            .fetch_one(sql_tx.as_mut())
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM symbol_locks")
+                .fetch_one(sql_tx.as_mut())
+                .await
+                .unwrap();
         assert_eq!(count, 1);
 
         sql_tx.commit().await.unwrap();
@@ -256,9 +255,8 @@ mod tests {
         // First, acquire a lease
         let mut sql_tx = pool.begin().await.unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx, &symbol)
-            .await
-            .unwrap();
+        let result =
+            try_acquire_execution_lease(&mut sql_tx, &symbol).await.unwrap();
         assert!(result);
         sql_tx.commit().await.unwrap();
 
@@ -275,9 +273,8 @@ mod tests {
 
         // Now try to acquire the same lease - should succeed due to TTL cleanup
         let mut sql_tx = pool.begin().await.unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx, &symbol)
-            .await
-            .unwrap();
+        let result =
+            try_acquire_execution_lease(&mut sql_tx, &symbol).await.unwrap();
         assert!(result); // Should succeed because old lock was cleaned up
         sql_tx.rollback().await.unwrap();
     }
@@ -300,28 +297,29 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         // Verify all locks exist
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM symbol_locks")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM symbol_locks")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 3);
 
         // Acquire lease for one of the stale symbols - should cleanup only that symbol's stale lock
         let mut sql_tx = pool.begin().await.unwrap();
         let symbol = Symbol::new("AAPL").unwrap();
-        let result = try_acquire_execution_lease(&mut sql_tx, &symbol)
-            .await
-            .unwrap();
+        let result =
+            try_acquire_execution_lease(&mut sql_tx, &symbol).await.unwrap();
         assert!(result);
         sql_tx.commit().await.unwrap();
 
         // Verify only the AAPL stale lock was cleaned up and a new AAPL lock was created
         // The other stale locks (MSFT, TSLA) remain because we only clean up the specific symbol
-        let remaining_locks: Vec<String> =
-            sqlx::query_scalar("SELECT symbol FROM symbol_locks ORDER BY symbol")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let remaining_locks: Vec<String> = sqlx::query_scalar(
+            "SELECT symbol FROM symbol_locks ORDER BY symbol",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(remaining_locks, vec!["AAPL", "MSFT", "TSLA"]);
     }
 
@@ -340,15 +338,18 @@ mod tests {
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let execution_id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
+        let execution_id =
+            execution.save_within_transaction(&mut sql_tx).await.unwrap();
 
         let calculator = PositionCalculator::new();
-        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id))
-            .await
-            .unwrap();
+        save_within_transaction(
+            &mut sql_tx,
+            &symbol,
+            &calculator,
+            Some(execution_id),
+        )
+        .await
+        .unwrap();
 
         sql_tx.commit().await.unwrap();
 
@@ -365,9 +366,7 @@ mod tests {
 
         // Clear pending execution ID
         let mut sql_tx = pool.begin().await.unwrap();
-        clear_pending_execution_id(&mut sql_tx, &symbol)
-            .await
-            .unwrap();
+        clear_pending_execution_id(&mut sql_tx, &symbol).await.unwrap();
         sql_tx.commit().await.unwrap();
 
         // Verify pending_execution_id is now NULL

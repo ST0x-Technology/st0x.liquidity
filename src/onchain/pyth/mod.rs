@@ -1,17 +1,19 @@
-use alloy::primitives::{address, Address, Bytes, B256, U256};
-use alloy::providers::ext::DebugApi;
+use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy::providers::Provider;
+use alloy::providers::ext::DebugApi;
 use alloy::rpc::types::trace::geth::{
-    CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, GethTrace,
+    CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
+    GethDebugTracingOptions, GethTrace,
 };
 use alloy::sol_types::{SolCall, SolType};
 use chrono::{DateTime, Utc};
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use tracing::{debug, error, info, warn};
 
 use crate::bindings::IPyth::{
-    getEmaPriceNoOlderThanCall, getEmaPriceUnsafeCall, getPriceNoOlderThanCall, getPriceUnsafeCall,
+    getEmaPriceNoOlderThanCall, getEmaPriceUnsafeCall, getPriceNoOlderThanCall,
+    getPriceUnsafeCall,
 };
 use crate::bindings::PythStructs::Price;
 
@@ -64,14 +66,17 @@ impl PythPricing {
         symbol: &str,
         feed_id_cache: &FeedIdCache,
     ) -> Result<Self, PythError> {
-        let pyth_price = extract_pyth_price(tx_hash, &provider, symbol, feed_id_cache).await?;
+        let pyth_price =
+            extract_pyth_price(tx_hash, &provider, symbol, feed_id_cache)
+                .await?;
 
         let price_decimal = pyth_price.to_decimal()?;
-        let price_f64 = price_decimal
-            .to_f64()
-            .ok_or_else(|| PythError::ConversionFailed("Price to f64 conversion failed".into()))?;
+        let price_f64 = price_decimal.to_f64().ok_or_else(|| {
+            PythError::ConversionFailed("Price to f64 conversion failed".into())
+        })?;
 
-        let confidence_f64 = scale_with_exponent(pyth_price.conf, pyth_price.expo)?;
+        let confidence_f64 =
+            scale_with_exponent(pyth_price.conf, pyth_price.expo)?;
 
         let publish_time_i64 = i64::try_from(pyth_price.publishTime)
             .map_err(|_| PythError::InvalidTimestamp(pyth_price.publishTime))?;
@@ -92,37 +97,40 @@ fn scale_with_exponent(value: u64, exponent: i32) -> Result<f64, PythError> {
     let decimal_value = Decimal::from(value);
 
     let scaled = if exponent >= 0 {
-        let multiplier = (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
-            acc.checked_mul(Decimal::from(10_i64))
-                .ok_or(PythError::ArithmeticOverflow)
-        })?;
+        let multiplier =
+            (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
+                acc.checked_mul(Decimal::from(10_i64))
+                    .ok_or(PythError::ArithmeticOverflow)
+            })?;
 
         decimal_value
             .checked_mul(multiplier)
             .ok_or(PythError::ArithmeticOverflow)?
     } else {
-        let abs_exponent = exponent
-            .checked_abs()
-            .ok_or(PythError::ArithmeticOverflow)?;
+        let abs_exponent =
+            exponent.checked_abs().ok_or(PythError::ArithmeticOverflow)?;
 
-        let divisor = (0..abs_exponent).try_fold(Decimal::from(1_i64), |acc, _| {
-            acc.checked_mul(Decimal::from(10_i64))
-                .ok_or(PythError::ArithmeticOverflow)
-        })?;
+        let divisor =
+            (0..abs_exponent).try_fold(Decimal::from(1_i64), |acc, _| {
+                acc.checked_mul(Decimal::from(10_i64))
+                    .ok_or(PythError::ArithmeticOverflow)
+            })?;
 
         decimal_value
             .checked_div(divisor)
             .ok_or(PythError::ArithmeticOverflow)?
     };
 
-    scaled
-        .to_f64()
-        .ok_or_else(|| PythError::ConversionFailed("Decimal to f64 conversion failed".into()))
+    scaled.to_f64().ok_or_else(|| {
+        PythError::ConversionFailed("Decimal to f64 conversion failed".into())
+    })
 }
 
 pub fn find_pyth_calls(trace: &GethTrace) -> Result<Vec<PythCall>, PythError> {
     match trace {
-        GethTrace::CallTracer(call_frame) => Ok(traverse_call_frame(call_frame, 0)),
+        GethTrace::CallTracer(call_frame) => {
+            Ok(traverse_call_frame(call_frame, 0))
+        }
         _ => Err(PythError::InvalidTraceVariant),
     }
 }
@@ -172,8 +180,9 @@ fn extract_price_feed_id(input: &Bytes) -> Option<B256> {
 }
 
 pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
-    let price = Price::abi_decode(output)
-        .map_err(|e| PythError::DecodeError(format!("ABI decode failed: {e}")))?;
+    let price = Price::abi_decode(output).map_err(|e| {
+        PythError::DecodeError(format!("ABI decode failed: {e}"))
+    })?;
 
     Ok(price)
 }
@@ -183,13 +192,18 @@ impl Price {
         let exponent = self.expo;
 
         let result = if exponent >= 0 {
-            let price_value = Decimal::from_i64(self.price)
-                .ok_or_else(|| PythError::InvalidResponse("price value too large".to_string()))?;
+            let price_value =
+                Decimal::from_i64(self.price).ok_or_else(|| {
+                    PythError::InvalidResponse(
+                        "price value too large".to_string(),
+                    )
+                })?;
 
-            let multiplier = (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
-                acc.checked_mul(Decimal::from(10_i64))
-                    .ok_or(PythError::ArithmeticOverflow)
-            })?;
+            let multiplier =
+                (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
+                    acc.checked_mul(Decimal::from(10_i64))
+                        .ok_or(PythError::ArithmeticOverflow)
+                })?;
 
             price_value
                 .checked_mul(multiplier)
@@ -199,10 +213,15 @@ impl Price {
                 .checked_abs()
                 .ok_or(PythError::ArithmeticOverflow)?
                 .try_into()
-                .map_err(|_| PythError::InvalidResponse("exponent too large".to_string()))?;
+                .map_err(|_| {
+                    PythError::InvalidResponse("exponent too large".to_string())
+                })?;
 
-            Decimal::try_new(self.price, decimals)
-                .map_err(|e| PythError::InvalidResponse(format!("failed to create decimal: {e}")))
+            Decimal::try_new(self.price, decimals).map_err(|e| {
+                PythError::InvalidResponse(format!(
+                    "failed to create decimal: {e}"
+                ))
+            })
         }?;
 
         Ok(result.normalize())
@@ -248,12 +267,12 @@ where
                 PythError::NoMatchingFeedId(feed_id)
             })?
     } else {
-        debug!("No cached feed ID for {symbol}, using first Pyth call and caching");
+        debug!(
+            "No cached feed ID for {symbol}, using first Pyth call and caching"
+        );
 
         let first_call = &pyth_calls[0];
-        cache
-            .insert(symbol.to_string(), first_call.price_feed_id)
-            .await;
+        cache.insert(symbol.to_string(), first_call.price_feed_id).await;
 
         info!(
             "Cached new feed ID mapping: {symbol} -> {}",
@@ -281,7 +300,10 @@ where
     Ok(price)
 }
 
-async fn fetch_transaction_trace<P>(tx_hash: B256, provider: &P) -> Result<GethTrace, PythError>
+async fn fetch_transaction_trace<P>(
+    tx_hash: B256,
+    provider: &P,
+) -> Result<GethTrace, PythError>
 where
     P: Provider,
 {
@@ -304,8 +326,8 @@ where
 mod tests {
     use super::*;
     use alloy::primitives::{Address, U256};
-    use alloy::providers::mock::Asserter;
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use alloy::rpc::types::trace::geth::FourByteFrame;
 
     fn create_test_call_frame(
@@ -332,7 +354,8 @@ mod tests {
 
     #[test]
     fn test_find_pyth_calls_single_call_at_root() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector =
+            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
         let mut input = pyth_selector.to_vec();
         let feed_id = B256::repeat_byte(0xaa);
         input.extend_from_slice(feed_id.as_slice());
@@ -357,7 +380,8 @@ mod tests {
 
     #[test]
     fn test_find_pyth_calls_nested() {
-        let pyth_selector = crate::bindings::IPyth::getPriceUnsafeCall::SELECTOR;
+        let pyth_selector =
+            crate::bindings::IPyth::getPriceUnsafeCall::SELECTOR;
         let mut input = pyth_selector.to_vec();
         let feed_id = B256::repeat_byte(0xbb);
         input.extend_from_slice(feed_id.as_slice());
@@ -389,8 +413,10 @@ mod tests {
 
     #[test]
     fn test_find_pyth_calls_multiple() {
-        let pyth_selector1 = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
-        let pyth_selector2 = crate::bindings::IPyth::getEmaPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector1 =
+            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector2 =
+            crate::bindings::IPyth::getEmaPriceNoOlderThanCall::SELECTOR;
 
         let mut input1 = pyth_selector1.to_vec();
         let feed_id1 = B256::repeat_byte(0xcc);
@@ -456,8 +482,12 @@ mod tests {
         let mut input = wrong_selector;
         input.extend_from_slice(&[0u8; 32]);
 
-        let call_frame =
-            create_test_call_frame(BASE_PYTH_CONTRACT_ADDRESS, input, Some(vec![0x01]), vec![]);
+        let call_frame = create_test_call_frame(
+            BASE_PYTH_CONTRACT_ADDRESS,
+            input,
+            Some(vec![0x01]),
+            vec![],
+        );
 
         let trace = GethTrace::CallTracer(call_frame);
         let result = find_pyth_calls(&trace).unwrap();
@@ -467,11 +497,17 @@ mod tests {
 
     #[test]
     fn test_find_pyth_calls_no_output() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector =
+            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
         let mut input = pyth_selector.to_vec();
         input.extend_from_slice(&[0u8; 32]);
 
-        let call_frame = create_test_call_frame(BASE_PYTH_CONTRACT_ADDRESS, input, None, vec![]);
+        let call_frame = create_test_call_frame(
+            BASE_PYTH_CONTRACT_ADDRESS,
+            input,
+            None,
+            vec![],
+        );
 
         let trace = GethTrace::CallTracer(call_frame);
         let result = find_pyth_calls(&trace).unwrap();
@@ -481,7 +517,8 @@ mod tests {
 
     #[test]
     fn test_find_pyth_calls_deeply_nested() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector =
+            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
         let mut input = pyth_selector.to_vec();
         let feed_id = B256::repeat_byte(0xee);
         input.extend_from_slice(feed_id.as_slice());
@@ -729,7 +766,8 @@ mod tests {
 
     #[test]
     fn test_extract_price_feed_id_valid() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector =
+            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
         let mut input = pyth_selector.to_vec();
         let expected_feed_id = B256::repeat_byte(0xaa);
         input.extend_from_slice(expected_feed_id.as_slice());
@@ -777,7 +815,8 @@ mod tests {
 
         assert!((price_f64 - pricing.price).abs() < 0.01);
 
-        let confidence_f64 = scale_with_exponent(price.conf, price.expo).unwrap();
+        let confidence_f64 =
+            scale_with_exponent(price.conf, price.expo).unwrap();
         assert!((confidence_f64 - pricing.confidence).abs() < 0.01);
     }
 
@@ -798,14 +837,16 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xff);
         let cache = FeedIdCache::new();
 
-        let result = extract_pyth_price(tx_hash, &provider, "TEST", &cache).await;
+        let result =
+            extract_pyth_price(tx_hash, &provider, "TEST", &cache).await;
 
         assert!(matches!(result, Err(PythError::NoPythCall)));
     }
 
     #[tokio::test]
     async fn test_pyth_pricing_try_from_tx_hash_timestamp_overflow() {
-        let pyth_selector = crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
+        let pyth_selector =
+            crate::bindings::IPyth::getPriceNoOlderThanCall::SELECTOR;
         let mut input = pyth_selector.to_vec();
         let feed_id = B256::repeat_byte(0xaa);
         input.extend_from_slice(feed_id.as_slice());
@@ -835,7 +876,9 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xff);
         let cache = FeedIdCache::new();
 
-        let result = PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache).await;
+        let result =
+            PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache)
+                .await;
 
         assert!(matches!(result, Err(PythError::InvalidTimestamp(_))));
     }

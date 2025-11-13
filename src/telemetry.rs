@@ -58,17 +58,19 @@
 //! This prevents external crate spam (e.g., from `alloy`, `rocket`) from cluttering
 //! traces while still allowing those logs in console if needed.
 
-use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
+use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider};
 use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::trace::{
+    BatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
-use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::Registry;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 #[derive(Debug, Clone)]
 pub struct HyperDxConfig {
@@ -79,7 +81,10 @@ pub struct HyperDxConfig {
 
 impl HyperDxConfig {
     pub fn setup_telemetry(&self) -> Result<TelemetryGuard, TelemetryError> {
-        let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
+        let headers = HashMap::from([(
+            "authorization".to_string(),
+            self.api_key.clone(),
+        )]);
 
         let http_client = std::thread::spawn(|| {
             reqwest::blocking::Client::builder()
@@ -114,14 +119,18 @@ impl HyperDxConfig {
             .with_resource(
                 Resource::builder()
                     .with_service_name(self.service_name.clone())
-                    .with_attributes(vec![KeyValue::new("deployment.environment", "production")])
+                    .with_attributes(vec![KeyValue::new(
+                        "deployment.environment",
+                        "production",
+                    )])
                     .build(),
             )
             .build();
 
         let tracer = tracer_provider.tracer(TRACER_NAME);
 
-        let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let telemetry_layer =
+            tracing_opentelemetry::layer().with_tracer(tracer);
 
         let default_filter = format!(
             "st0x_hedge={},st0x_broker={}",
@@ -131,13 +140,16 @@ impl HyperDxConfig {
         let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| default_filter.clone().into());
 
-        let telemetry_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| default_filter.into());
+        let telemetry_filter =
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into());
 
-        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(fmt_filter);
+        let fmt_layer =
+            tracing_subscriber::fmt::layer().with_filter(fmt_filter);
         let telemetry_layer = telemetry_layer.with_filter(telemetry_filter);
 
-        let subscriber = Registry::default().with(fmt_layer).with(telemetry_layer);
+        let subscriber =
+            Registry::default().with(fmt_layer).with(telemetry_layer);
 
         tracing::subscriber::set_global_default(subscriber)?;
 

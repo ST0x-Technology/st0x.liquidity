@@ -6,7 +6,8 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
-    BrokerError, Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Shares, Symbol,
+    BrokerError, Direction, MarketOrder, OrderPlacement, OrderStatus,
+    OrderUpdate, Shares, Symbol,
 };
 
 pub(super) async fn place_market_order(
@@ -42,13 +43,17 @@ pub(super) async fn place_market_order(
         .await
         .map_err(|e| match e {
             RequestError::Endpoint(endpoint_error) => {
-                BrokerError::AlpacaRequest(format!("Order placement failed: {endpoint_error}"))
+                BrokerError::AlpacaRequest(format!(
+                    "Order placement failed: {endpoint_error}"
+                ))
             }
             RequestError::Hyper(hyper_error) => {
                 BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
             }
             RequestError::HyperUtil(hyper_util_error) => {
-                BrokerError::AlpacaRequest(format!("HTTP util error: {hyper_util_error}"))
+                BrokerError::AlpacaRequest(format!(
+                    "HTTP util error: {hyper_util_error}"
+                ))
             }
             RequestError::Io(io_error) => {
                 BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
@@ -72,32 +77,37 @@ pub(super) async fn get_order_status(
 ) -> Result<OrderUpdate<String>, BrokerError> {
     debug!("Querying Alpaca order status for order ID: {}", order_id);
 
-    let order_uuid = Uuid::parse_str(order_id)
-        .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid order ID format: {e}")))?;
+    let order_uuid = Uuid::parse_str(order_id).map_err(|e| {
+        BrokerError::AlpacaRequest(format!("Invalid order ID format: {e}"))
+    })?;
 
     let alpaca_order_id = order::Id(order_uuid);
 
-    let order_response =
-        client
-            .issue::<order::Get>(&alpaca_order_id)
-            .await
-            .map_err(|e| match e {
-                RequestError::Endpoint(endpoint_error) => BrokerError::AlpacaRequest(format!(
+    let order_response = client
+        .issue::<order::Get>(&alpaca_order_id)
+        .await
+        .map_err(|e| match e {
+            RequestError::Endpoint(endpoint_error) => {
+                BrokerError::AlpacaRequest(format!(
                     "Order status query failed: {endpoint_error}"
-                )),
-                RequestError::Hyper(hyper_error) => {
-                    BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
-                }
-                RequestError::HyperUtil(hyper_util_error) => {
-                    BrokerError::AlpacaRequest(format!("HTTP util error: {hyper_util_error}"))
-                }
-                RequestError::Io(io_error) => {
-                    BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
-                }
-            })?;
+                ))
+            }
+            RequestError::Hyper(hyper_error) => {
+                BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
+            }
+            RequestError::HyperUtil(hyper_util_error) => {
+                BrokerError::AlpacaRequest(format!(
+                    "HTTP util error: {hyper_util_error}"
+                ))
+            }
+            RequestError::Io(io_error) => {
+                BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
+            }
+        })?;
 
-    let symbol = Symbol::new(order_response.symbol.clone())
-        .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid symbol: {e}")))?;
+    let symbol = Symbol::new(order_response.symbol.clone()).map_err(|e| {
+        BrokerError::AlpacaRequest(format!("Invalid symbol: {e}"))
+    })?;
 
     let shares = extract_shares_from_amount(&order_response.amount)?;
 
@@ -132,18 +142,20 @@ pub(super) async fn poll_pending_orders(
         ..Default::default()
     };
 
-    let alpaca_orders = client
-        .issue::<orders::List>(&request)
-        .await
-        .map_err(|e| match e {
+    let alpaca_orders =
+        client.issue::<orders::List>(&request).await.map_err(|e| match e {
             RequestError::Endpoint(endpoint_error) => {
-                BrokerError::AlpacaRequest(format!("Order listing failed: {endpoint_error}"))
+                BrokerError::AlpacaRequest(format!(
+                    "Order listing failed: {endpoint_error}"
+                ))
             }
             RequestError::Hyper(hyper_error) => {
                 BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
             }
             RequestError::HyperUtil(hyper_util_error) => {
-                BrokerError::AlpacaRequest(format!("HTTP util error: {hyper_util_error}"))
+                BrokerError::AlpacaRequest(format!(
+                    "HTTP util error: {hyper_util_error}"
+                ))
             }
             RequestError::Io(io_error) => {
                 BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
@@ -153,8 +165,10 @@ pub(super) async fn poll_pending_orders(
     let order_updates = alpaca_orders
         .into_iter()
         .map(|alpaca_order| {
-            let symbol = Symbol::new(alpaca_order.symbol.clone())
-                .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid symbol: {e}")))?;
+            let symbol =
+                Symbol::new(alpaca_order.symbol.clone()).map_err(|e| {
+                    BrokerError::AlpacaRequest(format!("Invalid symbol: {e}"))
+                })?;
 
             let shares = extract_shares_from_amount(&alpaca_order.amount)?;
 
@@ -219,24 +233,30 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
         // we encounter an unknown status, prompting us to update this mapping.
         #[allow(unreachable_patterns)]
         unknown => {
-            debug!("Unknown Alpaca order status encountered: {unknown:?}, treating as Failed");
+            debug!(
+                "Unknown Alpaca order status encountered: {unknown:?}, treating as Failed"
+            );
             OrderStatus::Failed
         }
     }
 }
 
 /// Extracts price in cents from Alpaca order
-fn extract_price_cents_from_order(order: &order::Order) -> Result<Option<u64>, BrokerError> {
+fn extract_price_cents_from_order(
+    order: &order::Order,
+) -> Result<Option<u64>, BrokerError> {
     if let Some(avg_fill_price) = &order.average_fill_price {
         let price_str = format!("{avg_fill_price}");
-        let price_f64 = price_str
-            .parse::<f64>()
-            .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid fill price: {e}")))?;
+        let price_f64 = price_str.parse::<f64>().map_err(|e| {
+            BrokerError::AlpacaRequest(format!("Invalid fill price: {e}"))
+        })?;
 
         let price_cents_float = (price_f64 * 100.0).round();
 
         let price_cents = price_cents_float.to_u64().ok_or_else(|| {
-            BrokerError::AlpacaRequest(format!("Invalid price value: {price_f64}"))
+            BrokerError::AlpacaRequest(format!(
+                "Invalid price value: {price_f64}"
+            ))
         })?;
 
         Ok(Some(price_cents))
@@ -246,7 +266,9 @@ fn extract_price_cents_from_order(order: &order::Order) -> Result<Option<u64>, B
 }
 
 /// Extracts shares from Alpaca Amount enum
-fn extract_shares_from_amount(amount: &order::Amount) -> Result<Shares, BrokerError> {
+fn extract_shares_from_amount(
+    amount: &order::Amount,
+) -> Result<Shares, BrokerError> {
     match amount {
         order::Amount::Quantity { quantity } => {
             let qty_u64 = quantity
@@ -271,8 +293,12 @@ mod tests {
     use serde_json::json;
 
     fn create_test_client(mock_server: &MockServer) -> Client {
-        let api_info =
-            apca::ApiInfo::from_parts(mock_server.base_url(), "test_key", "test_secret").unwrap();
+        let api_info = apca::ApiInfo::from_parts(
+            mock_server.base_url(),
+            "test_key",
+            "test_secret",
+        )
+        .unwrap();
         Client::new(api_info)
     }
 
@@ -707,9 +733,7 @@ mod tests {
 
     #[test]
     fn test_extract_shares_from_notional_amount_returns_error() {
-        let quantity_amount = Amount::Quantity {
-            quantity: 100.into(),
-        };
+        let quantity_amount = Amount::Quantity { quantity: 100.into() };
 
         let result = extract_shares_from_amount(&quantity_amount);
         assert!(result.is_ok());

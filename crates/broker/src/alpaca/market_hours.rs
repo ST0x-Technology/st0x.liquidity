@@ -85,8 +85,12 @@ mod tests {
     use serde_json::json;
 
     fn create_test_client(mock_server: &MockServer) -> Client {
-        let api_info =
-            apca::ApiInfo::from_parts(mock_server.base_url(), "test_key", "test_secret").unwrap();
+        let api_info = apca::ApiInfo::from_parts(
+            mock_server.base_url(),
+            "test_key",
+            "test_secret",
+        )
+        .unwrap();
         Client::new(api_info)
     }
 

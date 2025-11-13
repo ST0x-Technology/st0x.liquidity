@@ -2,7 +2,8 @@ use sqlx::SqlitePool;
 
 use crate::error::OnChainError;
 use st0x_broker::{
-    Direction, OrderState, OrderStatus, PersistenceError, Shares, SupportedBroker, Symbol,
+    Direction, OrderState, OrderStatus, PersistenceError, Shares,
+    SupportedBroker, Symbol,
 };
 
 #[derive(sqlx::FromRow)]
@@ -36,14 +37,23 @@ fn row_to_execution(
     let parsed_direction = direction.parse()?;
     let parsed_broker = broker.parse()?;
     let status_enum = status.parse()?;
-    let parsed_state = OrderState::from_db_row(status_enum, order_id, price_cents, executed_at)
-        .map_err(|e| {
-            OnChainError::Persistence(PersistenceError::InvalidTradeStatus(e.to_string()))
-        })?;
+    let parsed_state = OrderState::from_db_row(
+        status_enum,
+        order_id,
+        price_cents,
+        executed_at,
+    )
+    .map_err(|e| {
+        OnChainError::Persistence(PersistenceError::InvalidTradeStatus(
+            e.to_string(),
+        ))
+    })?;
 
-    let shares_u64 = shares
-        .try_into()
-        .map_err(|_| OnChainError::Persistence(PersistenceError::InvalidShareQuantity(shares)))?;
+    let shares_u64 = shares.try_into().map_err(|_| {
+        OnChainError::Persistence(PersistenceError::InvalidShareQuantity(
+            shares,
+        ))
+    })?;
 
     Ok(OffchainExecution {
         id: Some(id),
@@ -76,10 +86,12 @@ pub(crate) async fn find_executions_by_symbol_status_and_broker(
     let rows = match (symbol, broker) {
         (None, None) => query_by_status(pool, status_str).await?,
         (None, Some(broker)) => {
-            query_by_status_and_broker(pool, status_str, &broker.to_string()).await?
+            query_by_status_and_broker(pool, status_str, &broker.to_string())
+                .await?
         }
         (Some(symbol), None) => {
-            query_by_symbol_and_status(pool, &symbol.to_string(), status_str).await?
+            query_by_symbol_and_status(pool, &symbol.to_string(), status_str)
+                .await?
         }
         (Some(symbol), Some(broker)) => {
             query_by_symbol_status_and_broker(
@@ -92,18 +104,19 @@ pub(crate) async fn find_executions_by_symbol_status_and_broker(
         }
     };
 
-    rows.into_iter()
-        .map(row_to_execution)
-        .collect::<Result<Vec<_>, _>>()
+    rows.into_iter().map(row_to_execution).collect::<Result<Vec<_>, _>>()
 }
 
 pub(crate) async fn find_execution_by_id(
     pool: &SqlitePool,
     execution_id: i64,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
-    let row = sqlx::query!("SELECT * FROM offchain_trades WHERE id = ?1", execution_id)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query!(
+        "SELECT * FROM offchain_trades WHERE id = ?1",
+        execution_id
+    )
+    .fetch_optional(pool)
+    .await?;
 
     if let Some(row) = row {
         row_to_execution(ExecutionRow {
@@ -255,7 +268,7 @@ impl OffchainExecution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{setup_test_db, OffchainExecutionBuilder};
+    use crate::test_utils::{OffchainExecutionBuilder, setup_test_db};
     use chrono::Utc;
     use st0x_broker::OrderState;
 
@@ -266,18 +279,16 @@ mod tests {
         let execution = OffchainExecutionBuilder::new().build();
 
         let mut sql_tx = pool.begin().await.unwrap();
-        let id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
+        let id = execution.save_within_transaction(&mut sql_tx).await.unwrap();
         sql_tx.commit().await.unwrap();
         assert!(id > 0);
 
-        let count = sqlx::query!("SELECT COUNT(*) as count FROM offchain_trades")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            .count;
+        let count =
+            sqlx::query!("SELECT COUNT(*) as count FROM offchain_trades")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .count;
         assert_eq!(count, 1);
     }
 
@@ -317,24 +328,15 @@ mod tests {
         };
 
         let mut sql_tx1 = pool.begin().await.unwrap();
-        execution1
-            .save_within_transaction(&mut sql_tx1)
-            .await
-            .unwrap();
+        execution1.save_within_transaction(&mut sql_tx1).await.unwrap();
         sql_tx1.commit().await.unwrap();
 
         let mut sql_tx2 = pool.begin().await.unwrap();
-        execution2
-            .save_within_transaction(&mut sql_tx2)
-            .await
-            .unwrap();
+        execution2.save_within_transaction(&mut sql_tx2).await.unwrap();
         sql_tx2.commit().await.unwrap();
 
         let mut sql_tx3 = pool.begin().await.unwrap();
-        execution3
-            .save_within_transaction(&mut sql_tx3)
-            .await
-            .unwrap();
+        execution3.save_within_transaction(&mut sql_tx3).await.unwrap();
         sql_tx3.commit().await.unwrap();
 
         let pending_aapl = find_executions_by_symbol_status_and_broker(
@@ -421,34 +423,32 @@ mod tests {
             .unwrap();
         sql_tx3.commit().await.unwrap();
 
-        let schwab_retrieved = find_execution_by_id(&pool, schwab_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let schwab_retrieved =
+            find_execution_by_id(&pool, schwab_id).await.unwrap().unwrap();
         assert_eq!(schwab_retrieved.broker, SupportedBroker::Schwab);
         assert_eq!(schwab_retrieved.symbol, Symbol::new("AAPL").unwrap());
         assert_eq!(schwab_retrieved.shares, Shares::new(100).unwrap());
 
-        let alpaca_retrieved = find_execution_by_id(&pool, alpaca_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let alpaca_retrieved =
+            find_execution_by_id(&pool, alpaca_id).await.unwrap().unwrap();
         assert_eq!(alpaca_retrieved.broker, SupportedBroker::Alpaca);
         assert_eq!(alpaca_retrieved.symbol, Symbol::new("TSLA").unwrap());
         assert_eq!(alpaca_retrieved.shares, Shares::new(50).unwrap());
 
-        let dry_run_retrieved = find_execution_by_id(&pool, dry_run_id)
-            .await
-            .unwrap()
-            .unwrap();
+        let dry_run_retrieved =
+            find_execution_by_id(&pool, dry_run_id).await.unwrap().unwrap();
         assert_eq!(dry_run_retrieved.broker, SupportedBroker::DryRun);
         assert_eq!(dry_run_retrieved.symbol, Symbol::new("MSFT").unwrap());
         assert_eq!(dry_run_retrieved.shares, Shares::new(25).unwrap());
 
-        let all_pending =
-            find_executions_by_symbol_status_and_broker(&pool, None, OrderStatus::Pending, None)
-                .await
-                .unwrap();
+        let all_pending = find_executions_by_symbol_status_and_broker(
+            &pool,
+            None,
+            OrderStatus::Pending,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(all_pending.len(), 3);
 
         let schwab_only = find_executions_by_symbol_status_and_broker(

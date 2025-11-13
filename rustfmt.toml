@@ -1,0 +1,6 @@
+# See more keys and their definitions at https://rust-lang.github.io/rustfmt
+use_small_heuristics = "Max"
+use_field_init_shorthand = true
+reorder_imports = true
+edition = "2024"
+max_width = 80

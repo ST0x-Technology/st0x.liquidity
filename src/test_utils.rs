@@ -1,13 +1,13 @@
-use crate::bindings::IOrderBookV5::{EvaluableV4, OrderV4, IOV2};
+use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::offchain::execution::OffchainExecution;
-use crate::onchain::io::TokenizedEquitySymbol;
 use crate::onchain::OnchainTrade;
-use alloy::primitives::{address, bytes, fixed_bytes, LogData};
+use crate::onchain::io::TokenizedEquitySymbol;
+use alloy::primitives::{LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use st0x_broker::schwab::{SchwabAuthEnv, SchwabTokens};
 use st0x_broker::OrderState;
+use st0x_broker::schwab::{SchwabAuthEnv, SchwabTokens};
 use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
@@ -21,7 +21,9 @@ pub(crate) fn get_test_order() -> OrderV4 {
             store: address!("0x3333333333333333333333333333333333333333"),
             bytecode: bytes!("0x00"),
         },
-        nonce: fixed_bytes!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+        nonce: fixed_bytes!(
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        ),
         validInputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
@@ -148,7 +150,10 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_tx_hash(mut self, hash: alloy::primitives::B256) -> Self {
+    pub(crate) fn with_tx_hash(
+        mut self,
+        hash: alloy::primitives::B256,
+    ) -> Self {
         self.trade.tx_hash = hash;
         self
     }

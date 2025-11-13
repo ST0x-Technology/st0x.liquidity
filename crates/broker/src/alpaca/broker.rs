@@ -5,7 +5,9 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::auth::{AlpacaAuthEnv, AlpacaClient};
-use crate::{Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate};
+use crate::{
+    Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate,
+};
 
 /// Alpaca broker implementation
 #[derive(Debug, Clone)]
@@ -19,11 +21,15 @@ impl Broker for AlpacaBroker {
     type OrderId = String;
     type Config = AlpacaAuthEnv;
 
-    async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
+    async fn try_from_config(
+        config: Self::Config,
+    ) -> Result<Self, Self::Error> {
         let client = AlpacaClient::new(&config)?;
 
         client.verify_account().await.map_err(|e| {
-            BrokerError::Authentication(format!("Alpaca account verification failed: {e}"))
+            BrokerError::Authentication(format!(
+                "Alpaca account verification failed: {e}"
+            ))
         })?;
 
         info!(
@@ -35,13 +41,14 @@ impl Broker for AlpacaBroker {
             }
         );
 
-        Ok(Self {
-            client: Arc::new(client),
-        })
+        Ok(Self { client: Arc::new(client) })
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        Ok(super::market_hours::wait_until_market_open(self.client.client()).await?)
+    async fn wait_until_market_open(
+        &self,
+    ) -> Result<std::time::Duration, Self::Error> {
+        Ok(super::market_hours::wait_until_market_open(self.client.client())
+            .await?)
     }
 
     async fn place_market_order(
@@ -51,14 +58,17 @@ impl Broker for AlpacaBroker {
         super::order::place_market_order(self.client.client(), order).await
     }
 
-    async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error> {
-        let order_update = super::order::get_order_status(self.client.client(), order_id).await?;
+    async fn get_order_status(
+        &self,
+        order_id: &Self::OrderId,
+    ) -> Result<OrderState, Self::Error> {
+        let order_update =
+            super::order::get_order_status(self.client.client(), order_id)
+                .await?;
 
         match order_update.status {
             crate::OrderStatus::Pending | crate::OrderStatus::Submitted => {
-                Ok(OrderState::Submitted {
-                    order_id: order_id.clone(),
-                })
+                Ok(OrderState::Submitted { order_id: order_id.clone() })
             }
             crate::OrderStatus::Filled => Ok(OrderState::Filled {
                 executed_at: order_update.updated_at,
@@ -67,12 +77,17 @@ impl Broker for AlpacaBroker {
             }),
             crate::OrderStatus::Failed => Ok(OrderState::Failed {
                 failed_at: order_update.updated_at,
-                error_reason: Some(format!("Order status: {:?}", order_update.status)),
+                error_reason: Some(format!(
+                    "Order status: {:?}",
+                    order_update.status
+                )),
             }),
         }
     }
 
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
+    async fn poll_pending_orders(
+        &self,
+    ) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
         super::order::poll_pending_orders(self.client.client()).await
     }
 
@@ -80,16 +95,25 @@ impl Broker for AlpacaBroker {
         crate::SupportedBroker::Alpaca
     }
 
-    fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
+    fn parse_order_id(
+        &self,
+        order_id_str: &str,
+    ) -> Result<Self::OrderId, Self::Error> {
         // Validate that it's a valid UUID format (Alpaca uses UUIDs for order IDs)
-        Uuid::parse_str(order_id_str).map_err(|e| BrokerError::InvalidOrder {
-            reason: format!("Invalid Alpaca order ID format (expected UUID): {e}"),
+        Uuid::parse_str(order_id_str).map_err(|e| {
+            BrokerError::InvalidOrder {
+                reason: format!(
+                    "Invalid Alpaca order ID format (expected UUID): {e}"
+                ),
+            }
         })?;
 
         Ok(order_id_str.to_string())
     }
 
-    async fn run_broker_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
+    async fn run_broker_maintenance(
+        &self,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         // Alpaca uses API keys, no token refresh needed
         None
     }
@@ -183,10 +207,7 @@ mod tests {
 
         account_mock.assert();
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BrokerError::Authentication(_)
-        ));
+        assert!(matches!(result.unwrap_err(), BrokerError::Authentication(_)));
     }
 
     #[tokio::test]
@@ -310,7 +331,10 @@ mod tests {
 
         account_mock.assert();
 
-        assert_eq!(broker.to_supported_broker(), crate::SupportedBroker::Alpaca);
+        assert_eq!(
+            broker.to_supported_broker(),
+            crate::SupportedBroker::Alpaca
+        );
     }
 
     #[tokio::test]

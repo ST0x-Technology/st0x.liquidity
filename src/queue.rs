@@ -46,27 +46,30 @@ async fn enqueue_event(
     log: &Log,
     event: TradeEvent,
 ) -> Result<(), EventQueueError> {
-    let tx_hash = log
-        .transaction_hash
-        .ok_or_else(|| EventQueueError::Processing("Log missing transaction hash".to_string()))?;
+    let tx_hash = log.transaction_hash.ok_or_else(|| {
+        EventQueueError::Processing("Log missing transaction hash".to_string())
+    })?;
 
-    let log_index = log
-        .log_index
-        .ok_or_else(|| EventQueueError::Processing("Log missing log index".to_string()))?;
+    let log_index = log.log_index.ok_or_else(|| {
+        EventQueueError::Processing("Log missing log index".to_string())
+    })?;
 
-    let log_index_i64 = i64::try_from(log_index)
-        .map_err(|_| EventQueueError::Processing("Log index too large".to_string()))?;
+    let log_index_i64 = i64::try_from(log_index).map_err(|_| {
+        EventQueueError::Processing("Log index too large".to_string())
+    })?;
 
-    let block_number = log
-        .block_number
-        .ok_or_else(|| EventQueueError::Processing("Log missing block number".to_string()))?;
+    let block_number = log.block_number.ok_or_else(|| {
+        EventQueueError::Processing("Log missing block number".to_string())
+    })?;
 
-    let block_number_i64 = i64::try_from(block_number)
-        .map_err(|_| EventQueueError::Processing("Block number too large".to_string()))?;
+    let block_number_i64 = i64::try_from(block_number).map_err(|_| {
+        EventQueueError::Processing("Block number too large".to_string())
+    })?;
 
     let tx_hash_str = format!("{tx_hash:#x}");
-    let event_json = serde_json::to_string(&event)
-        .map_err(|e| EventQueueError::Processing(format!("Failed to serialize event: {e}")))?;
+    let event_json = serde_json::to_string(&event).map_err(|e| {
+        EventQueueError::Processing(format!("Failed to serialize event: {e}"))
+    })?;
 
     let block_timestamp_naive = log.block_timestamp.and_then(|ts| {
         let Ok(ts_i64) = i64::try_from(ts) else {
@@ -135,21 +138,29 @@ pub(crate) async fn get_next_unprocessed_event(
         return Ok(None);
     };
 
-    let tx_hash = B256::from_str(&row.tx_hash)
-        .map_err(|e| EventQueueError::Processing(format!("Invalid tx_hash format: {e}")))?;
+    let tx_hash = B256::from_str(&row.tx_hash).map_err(|e| {
+        EventQueueError::Processing(format!("Invalid tx_hash format: {e}"))
+    })?;
 
-    let event: TradeEvent = serde_json::from_str(&row.event_data)
-        .map_err(|e| EventQueueError::Processing(format!("Failed to deserialize event: {e}")))?;
+    let event: TradeEvent =
+        serde_json::from_str(&row.event_data).map_err(|e| {
+            EventQueueError::Processing(format!(
+                "Failed to deserialize event: {e}"
+            ))
+        })?;
 
     Ok(Some(QueuedEvent {
         id: Some(row.id),
         tx_hash,
-        log_index: row
-            .log_index
-            .try_into()
-            .map_err(|_| EventQueueError::Processing("Log index conversion failed".to_string()))?,
+        log_index: row.log_index.try_into().map_err(|_| {
+            EventQueueError::Processing(
+                "Log index conversion failed".to_string(),
+            )
+        })?,
         block_number: row.block_number.try_into().map_err(|_| {
-            EventQueueError::Processing("Block number conversion failed".to_string())
+            EventQueueError::Processing(
+                "Block number conversion failed".to_string(),
+            )
         })?,
         event,
         processed: row.processed,
@@ -207,7 +218,9 @@ pub(crate) async fn enqueue_buffer(
     stream::iter(event_buffer)
         .map(|(event, log)| async move {
             let result = match &event {
-                TradeEvent::ClearV3(clear_event) => enqueue(pool, clear_event.as_ref(), &log).await,
+                TradeEvent::ClearV3(clear_event) => {
+                    enqueue(pool, clear_event.as_ref(), &log).await
+                }
                 TradeEvent::TakeOrderV3(take_event) => {
                     enqueue(pool, take_event.as_ref(), &log).await
                 }
@@ -227,10 +240,14 @@ pub(crate) async fn enqueue_buffer(
 }
 
 /// Gets count of unprocessed events in the queue - test utility function
-pub(crate) async fn count_unprocessed(pool: &SqlitePool) -> Result<i64, EventQueueError> {
-    let row = sqlx::query!("SELECT COUNT(*) as count FROM event_queue WHERE processed = 0")
-        .fetch_one(pool)
-        .await?;
+pub(crate) async fn count_unprocessed(
+    pool: &SqlitePool,
+) -> Result<i64, EventQueueError> {
+    let row = sqlx::query!(
+        "SELECT COUNT(*) as count FROM event_queue WHERE processed = 0"
+    )
+    .fetch_one(pool)
+    .await?;
 
     Ok(row.count)
 }
@@ -249,7 +266,9 @@ pub(crate) async fn get_max_processed_block(
     };
 
     let block_u64 = u64::try_from(block).map_err(|_| {
-        EventQueueError::Processing(format!("Block number {block} conversion failed"))
+        EventQueueError::Processing(format!(
+            "Block number {block} conversion failed"
+        ))
     })?;
 
     Ok(Some(block_u64))
@@ -262,7 +281,7 @@ mod tests {
         ClearConfigV2, ClearV3, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{address, b256, LogData};
+    use alloy::primitives::{LogData, address, b256};
 
     #[tokio::test]
     async fn test_enqueue_and_process_event() {
@@ -295,16 +314,15 @@ mod tests {
         }));
 
         // Enqueue event
-        enqueue_event(&pool, &log, test_event.clone())
-            .await
-            .unwrap();
+        enqueue_event(&pool, &log, test_event.clone()).await.unwrap();
 
         // Check unprocessed count
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
 
         // Get next unprocessed event
-        let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let queued_event =
+            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, log.transaction_hash.unwrap());
         assert_eq!(queued_event.log_index, 5);
         assert_eq!(queued_event.block_number, 100);
@@ -358,12 +376,8 @@ mod tests {
         }));
 
         // Enqueue same event twice
-        enqueue_event(&pool, &log, test_event.clone())
-            .await
-            .unwrap();
-        enqueue_event(&pool, &log, test_event.clone())
-            .await
-            .unwrap();
+        enqueue_event(&pool, &log, test_event.clone()).await.unwrap();
+        enqueue_event(&pool, &log, test_event.clone()).await.unwrap();
 
         // Should only have one event due to unique constraint
         let count = count_unprocessed(&pool).await.unwrap();
@@ -378,7 +392,9 @@ mod tests {
         for i in 0..3 {
             let log = Log {
                 inner: alloy::primitives::Log {
-                    address: address!("1234567890123456789012345678901234567890"),
+                    address: address!(
+                        "1234567890123456789012345678901234567890"
+                    ),
                     data: LogData::default(),
                 },
                 block_hash: Some(b256!(
@@ -386,7 +402,9 @@ mod tests {
                 )),
                 block_number: Some(100 + i),
                 block_timestamp: None,
-                transaction_hash: Some(B256::from([u8::try_from(i).unwrap_or(0); 32])),
+                transaction_hash: Some(B256::from(
+                    [u8::try_from(i).unwrap_or(0); 32],
+                )),
                 transaction_index: Some(1),
                 log_index: Some(i),
                 removed: false,
@@ -403,12 +421,11 @@ mod tests {
 
         // Events should be returned in creation order
         for i in 0..3 {
-            let event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+            let event =
+                get_next_unprocessed_event(&pool).await.unwrap().unwrap();
             assert_eq!(event.log_index, i);
             let mut sql_tx = pool.begin().await.unwrap();
-            mark_event_processed(&mut sql_tx, event.id.unwrap())
-                .await
-                .unwrap();
+            mark_event_processed(&mut sql_tx, event.id.unwrap()).await.unwrap();
             sql_tx.commit().await.unwrap();
         }
 
@@ -477,7 +494,8 @@ mod tests {
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 2);
 
-        let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let first_event =
+            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert!(matches!(first_event.event, TradeEvent::ClearV3(_)));
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -486,7 +504,8 @@ mod tests {
             .unwrap();
         sql_tx.commit().await.unwrap();
 
-        let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
+        let second_event =
+            get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert!(matches!(second_event.event, TradeEvent::TakeOrderV3(_)));
     }
 

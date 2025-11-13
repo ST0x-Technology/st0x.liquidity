@@ -13,17 +13,21 @@ use tracing::{debug, error, info, trace};
 
 use st0x_broker::{Broker, MarketOrder, SupportedBroker};
 
-use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
+use crate::bindings::IOrderBookV5::{
+    ClearV3, IOrderBookV5Instance, TakeOrderV3,
+};
 use crate::env::Config;
 use crate::error::EventProcessingError;
-use crate::offchain::execution::{find_execution_by_id, OffchainExecution};
+use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::onchain::accumulator::check_all_accumulated_positions;
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
-use crate::onchain::{accumulator, EvmEnv, OnchainTrade};
-use crate::queue::{enqueue, get_next_unprocessed_event, mark_event_processed, QueuedEvent};
+use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
+use crate::queue::{
+    QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
+};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 
@@ -38,7 +42,9 @@ pub(crate) struct Conductor {
     pub(crate) queue_processor: JoinHandle<()>,
 }
 
-pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
+pub(crate) async fn run_market_hours_loop<
+    B: Broker + Clone + Send + 'static,
+>(
     broker: B,
     config: Config,
     pool: SqlitePool,
@@ -53,13 +59,20 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
 
     let timeout_minutes = timeout.as_secs() / 60;
     if timeout_minutes < 60 * 24 {
-        info!("Market is open, starting conductor (will timeout in {timeout_minutes} minutes)");
+        info!(
+            "Market is open, starting conductor (will timeout in {timeout_minutes} minutes)"
+        );
     } else {
         info!("Starting conductor (no market hours restrictions)");
     }
 
-    let mut conductor = match Conductor::start(&config, &pool, broker.clone(), broker_maintenance)
-        .await
+    let mut conductor = match Conductor::start(
+        &config,
+        &pool,
+        broker.clone(),
+        broker_maintenance,
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -68,11 +81,20 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
                 RERUN_DELAY_SECS
             );
 
-            tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                RERUN_DELAY_SECS,
+            ))
+            .await;
 
             let new_maintenance = broker.run_broker_maintenance().await;
 
-            return Box::pin(run_market_hours_loop(broker, config, pool, new_maintenance)).await;
+            return Box::pin(run_market_hours_loop(
+                broker,
+                config,
+                pool,
+                new_maintenance,
+            ))
+            .await;
         }
     };
 
@@ -106,31 +128,49 @@ impl Conductor {
         let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
         let cache = SymbolCache::default();
-        let orderbook = IOrderBookV5Instance::new(config.evm.orderbook, &provider);
+        let orderbook =
+            IOrderBookV5Instance::new(config.evm.orderbook, &provider);
 
-        let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-        let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+        let mut clear_stream =
+            orderbook.ClearV3_filter().watch().await?.into_stream();
+        let mut take_stream =
+            orderbook.TakeOrderV3_filter().watch().await?.into_stream();
 
-        let cutoff_block =
-            get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
+        let cutoff_block = get_cutoff_block(
+            &mut clear_stream,
+            &mut take_stream,
+            &provider,
+            pool,
+        )
+        .await?;
 
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
 
-        Ok(
-            ConductorBuilder::new(config.clone(), pool.clone(), cache, provider, broker)
-                .with_broker_maintenance(broker_maintenance)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn(),
+        Ok(ConductorBuilder::new(
+            config.clone(),
+            pool.clone(),
+            cache,
+            provider,
+            broker,
         )
+        .with_broker_maintenance(broker_maintenance)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn())
     }
 
-    pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
+    pub(crate) async fn wait_for_completion(
+        &mut self,
+    ) -> Result<(), anyhow::Error> {
         let maintenance_task = async {
             if let Some(handle) = &mut self.broker_maintenance {
                 match handle.await {
-                    Ok(()) => info!("Broker maintenance completed successfully"),
+                    Ok(()) => {
+                        info!("Broker maintenance completed successfully")
+                    }
                     Err(e) if e.is_cancelled() => {
-                        info!("Broker maintenance cancelled (expected during shutdown)");
+                        info!(
+                            "Broker maintenance cancelled (expected during shutdown)"
+                        );
                     }
                     Err(e) => error!("Broker maintenance task panicked: {e}"),
                 }
@@ -173,14 +213,18 @@ impl Conductor {
     }
 
     pub(crate) fn abort_trading_tasks(&self) {
-        info!("Aborting trading tasks (keeping broker maintenance and DEX event receiver alive)");
+        info!(
+            "Aborting trading tasks (keeping broker maintenance and DEX event receiver alive)"
+        );
 
         self.order_poller.abort();
         self.event_processor.abort();
         self.position_checker.abort();
         self.queue_processor.abort();
 
-        info!("Trading tasks aborted successfully (DEX events will continue buffering)");
+        info!(
+            "Trading tasks aborted successfully (DEX events will continue buffering)"
+        );
     }
 
     pub(crate) fn abort_all(self) {
@@ -222,11 +266,14 @@ fn spawn_order_poller<B: Broker + Clone + Send + 'static>(
 
 fn spawn_onchain_event_receiver(
     event_sender: UnboundedSender<(TradeEvent, Log)>,
-    clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send + 'static,
+    clear_stream: impl Stream<Item = Result<(ClearV3, Log), sol_types::Error>>
+    + Unpin
+    + Send
+    + 'static,
     take_stream: impl Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>>
-        + Unpin
-        + Send
-        + 'static,
+    + Unpin
+    + Send
+    + 'static,
 ) -> JoinHandle<()> {
     info!("Starting blockchain event receiver");
     tokio::spawn(receive_blockchain_events(
@@ -245,8 +292,7 @@ fn spawn_event_processor(
         while let Some((event, log)) = event_receiver.recv().await {
             trace!(
                 "Processing live event: tx_hash={:?}, log_index={:?}",
-                log.transaction_hash,
-                log.log_index
+                log.transaction_hash, log.log_index
             );
             if let Err(e) = process_live_event(&pool, event, log).await {
                 error!("Failed to process live event: {e}");
@@ -272,26 +318,39 @@ fn spawn_queue_processor<
     let cache_clone = cache.clone();
 
     tokio::spawn(async move {
-        run_queue_processor(&broker, &config_clone, &pool_clone, &cache_clone, provider).await;
+        run_queue_processor(
+            &broker,
+            &config_clone,
+            &pool_clone,
+            &cache_clone,
+            provider,
+        )
+        .await;
     })
 }
 
-fn spawn_periodic_accumulated_position_check<B: Broker + Clone + Send + 'static>(
+fn spawn_periodic_accumulated_position_check<
+    B: Broker + Clone + Send + 'static,
+>(
     broker: B,
     pool: SqlitePool,
 ) -> JoinHandle<()> {
     info!("Starting periodic accumulated position checker");
 
     tokio::spawn(async move {
-        const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+        const CHECK_INTERVAL: std::time::Duration =
+            std::time::Duration::from_secs(60);
 
         let mut interval = tokio::time::interval(CHECK_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval
+            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) = check_and_execute_accumulated_positions(&broker, &pool).await {
+            if let Err(e) =
+                check_and_execute_accumulated_positions(&broker, &pool).await
+            {
                 error!("Periodic accumulated position check failed: {e}");
             }
         }
@@ -324,9 +383,7 @@ async fn receive_blockchain_events<S1, S2>(
             Ok((event, log)) => {
                 trace!(
                     "Received blockchain event: tx_hash={:?}, log_index={:?}, block_number={:?}",
-                    log.transaction_hash,
-                    log.log_index,
-                    log.block_number
+                    log.transaction_hash, log.log_index, log.block_number
                 );
                 if event_sender.send((event, log)).is_err() {
                     error!("Event receiver dropped, shutting down");
@@ -368,7 +425,13 @@ where
         return Ok(current_block);
     };
 
-    buffer_live_events(clear_stream, take_stream, &mut event_buffer, block_number).await;
+    buffer_live_events(
+        clear_stream,
+        take_stream,
+        &mut event_buffer,
+        block_number,
+    )
+    .await;
 
     crate::queue::enqueue_buffer(pool, event_buffer).await;
 
@@ -419,7 +482,9 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
 
     match crate::queue::count_unprocessed(pool).await {
         Ok(count) if count > 0 => {
-            info!("Found {count} unprocessed events from previous sessions to process");
+            info!(
+                "Found {count} unprocessed events from previous sessions to process"
+            );
         }
         Ok(_) => {
             info!("No unprocessed events found, starting fresh");
@@ -432,14 +497,26 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
     let broker_type = broker.to_supported_broker();
 
     loop {
-        match process_next_queued_event(broker_type, config, pool, cache, &provider, &feed_id_cache)
-            .await
+        match process_next_queued_event(
+            broker_type,
+            config,
+            pool,
+            cache,
+            &provider,
+            &feed_id_cache,
+        )
+        .await
         {
             Ok(Some(execution)) => {
                 if let Some(exec_id) = execution.id {
-                    if let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await
+                    if let Err(e) = execute_pending_offchain_execution(
+                        broker, pool, exec_id,
+                    )
+                    .await
                     {
-                        error!("Failed to execute offchain order {exec_id}: {e}");
+                        error!(
+                            "Failed to execute offchain order {exec_id}: {e}"
+                        );
                     }
                 }
             }
@@ -470,8 +547,14 @@ async fn process_next_queued_event<P: Provider + Clone>(
 
     let event_id = extract_event_id(&queued_event)?;
 
-    let onchain_trade =
-        convert_event_to_trade(config, cache, provider, &queued_event, feed_id_cache).await?;
+    let onchain_trade = convert_event_to_trade(
+        config,
+        cache,
+        provider,
+        &queued_event,
+        feed_id_cache,
+    )
+    .await?;
 
     let Some(trade) = onchain_trade else {
         return handle_filtered_event(pool, &queued_event, event_id).await;
@@ -480,7 +563,9 @@ async fn process_next_queued_event<P: Provider + Clone>(
     process_valid_trade(broker_type, pool, &queued_event, event_id, trade).await
 }
 
-fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
+fn extract_event_id(
+    queued_event: &QueuedEvent,
+) -> Result<i64, EventProcessingError> {
     queued_event.id.ok_or_else(|| {
         EventProcessingError::Queue(crate::error::EventQueueError::Processing(
             "Queued event missing ID".to_string(),
@@ -496,7 +581,8 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     queued_event: &QueuedEvent,
     feed_id_cache: &FeedIdCache,
 ) -> Result<Option<OnchainTrade>, EventProcessingError> {
-    let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, queued_event);
+    let reconstructed_log =
+        reconstruct_log_from_queued_event(&config.evm, queued_event);
 
     let onchain_trade = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => {
@@ -544,18 +630,18 @@ async fn handle_filtered_event(
 
     let mut sql_tx = pool.begin().await.map_err(|e| {
         error!("Failed to begin transaction for filtered event: {e}");
-        EventProcessingError::Queue(crate::error::EventQueueError::Processing(format!(
-            "Failed to begin transaction: {e}"
-        )))
+        EventProcessingError::Queue(crate::error::EventQueueError::Processing(
+            format!("Failed to begin transaction: {e}"),
+        ))
     })?;
 
     mark_event_processed(&mut sql_tx, event_id).await?;
 
     sql_tx.commit().await.map_err(|e| {
         error!("Failed to commit transaction for filtered event: {e}");
-        EventProcessingError::Queue(crate::error::EventQueueError::Processing(format!(
-            "Failed to commit transaction: {e}"
-        )))
+        EventProcessingError::Queue(crate::error::EventQueueError::Processing(
+            format!("Failed to commit transaction: {e}"),
+        ))
     })?;
 
     Ok(None)
@@ -586,10 +672,21 @@ async fn process_valid_trade(
 
     info!(
         "Processing queued trade: symbol={}, amount={}, direction={:?}, tx_hash={:?}, log_index={}",
-        trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
+        trade.symbol,
+        trade.amount,
+        trade.direction,
+        trade.tx_hash,
+        trade.log_index
     );
 
-    process_trade_within_transaction(broker_type, pool, queued_event, event_id, trade).await
+    process_trade_within_transaction(
+        broker_type,
+        pool,
+        queued_event,
+        event_id,
+        trade,
+    )
+    .await
 }
 
 async fn process_trade_within_transaction(
@@ -601,7 +698,9 @@ async fn process_trade_within_transaction(
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let mut sql_tx = pool.begin().await.map_err(|e| {
         error!("Failed to begin transaction for event processing: {e}");
-        EventProcessingError::AccumulatorProcessing(format!("Failed to begin transaction: {e}"))
+        EventProcessingError::AccumulatorProcessing(format!(
+            "Failed to begin transaction: {e}"
+        ))
     })?;
 
     info!(
@@ -621,12 +720,10 @@ async fn process_trade_within_transaction(
             ))
         })?;
 
-    mark_event_processed(&mut sql_tx, event_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to mark event {event_id} as processed: {e}");
-            EventProcessingError::Queue(e)
-        })?;
+    mark_event_processed(&mut sql_tx, event_id).await.map_err(|e| {
+        error!("Failed to mark event {event_id} as processed: {e}");
+        EventProcessingError::Queue(e)
+    })?;
 
     sql_tx.commit().await.map_err(|e| {
         error!(
@@ -651,8 +748,12 @@ fn reconstruct_log_from_queued_event(
     use alloy::primitives::IntoLogData;
 
     let log_data = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => clear_event.as_ref().clone().into_log_data(),
-        TradeEvent::TakeOrderV3(take_event) => take_event.as_ref().clone().into_log_data(),
+        TradeEvent::ClearV3(clear_event) => {
+            clear_event.as_ref().clone().into_log_data()
+        }
+        TradeEvent::TakeOrderV3(take_event) => {
+            take_event.as_ref().clone().into_log_data()
+        }
     };
 
     let block_timestamp = queued_event
@@ -675,7 +776,9 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'static>(
+async fn check_and_execute_accumulated_positions<
+    B: Broker + Clone + Send + 'static,
+>(
     broker: &B,
     pool: &SqlitePool,
 ) -> Result<(), EventProcessingError> {
@@ -694,20 +797,29 @@ async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'sta
 
     for execution in executions {
         let Some(execution_id) = execution.id else {
-            error!("Execution returned from check_all_accumulated_positions has None ID");
+            error!(
+                "Execution returned from check_all_accumulated_positions has None ID"
+            );
             continue;
         };
 
         info!(
             "Executing accumulated position for symbol={}, shares={}, direction={:?}, execution_id={}",
-            execution.symbol, execution.shares, execution.direction, execution_id
+            execution.symbol,
+            execution.shares,
+            execution.direction,
+            execution_id
         );
 
         let pool_clone = pool.clone();
         let broker_clone = broker.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                execute_pending_offchain_execution(&broker_clone, &pool_clone, execution_id).await
+            if let Err(e) = execute_pending_offchain_execution(
+                &broker_clone,
+                &pool_clone,
+                execution_id,
+            )
+            .await
             {
                 error!(
                     "Failed to execute accumulated position for execution_id {}: {e}",
@@ -726,14 +838,15 @@ async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'sta
 }
 
 #[tracing::instrument(skip(broker, pool), level = tracing::Level::INFO)]
-async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
+async fn execute_pending_offchain_execution<
+    B: Broker + Clone + Send + 'static,
+>(
     broker: &B,
     pool: &SqlitePool,
     execution_id: i64,
 ) -> Result<(), EventProcessingError> {
-    let execution = find_execution_by_id(pool, execution_id)
-        .await?
-        .ok_or_else(|| {
+    let execution =
+        find_execution_by_id(pool, execution_id).await?.ok_or_else(|| {
             EventProcessingError::AccumulatorProcessing(format!(
                 "Execution with ID {execution_id} not found"
             ))
@@ -747,9 +860,12 @@ async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
         direction: execution.direction,
     };
 
-    let placement = broker.place_market_order(market_order).await.map_err(|e| {
-        EventProcessingError::AccumulatorProcessing(format!("Order placement failed: {e}"))
-    })?;
+    let placement =
+        broker.place_market_order(market_order).await.map_err(|e| {
+            EventProcessingError::AccumulatorProcessing(format!(
+                "Order placement failed: {e}"
+            ))
+        })?;
 
     info!("Order placed with ID: {}", placement.order_id);
 
@@ -843,11 +959,11 @@ mod tests {
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3};
     use crate::env::tests::create_test_config;
     use crate::onchain::trade::OnchainTrade;
-    use crate::test_utils::{setup_test_db, OnchainTradeBuilder};
+    use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::tokenized_symbol;
-    use alloy::primitives::{address, fixed_bytes, IntoLogData};
-    use alloy::providers::mock::Asserter;
+    use alloy::primitives::{IntoLogData, address, fixed_bytes};
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
     use alloy::sol_types;
     use futures_util::stream;
     use st0x_broker::{Direction, MockBrokerConfig, TryIntoBroker};
@@ -872,9 +988,7 @@ mod tests {
         };
         let log = crate::test_utils::get_test_log();
 
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
+        crate::queue::enqueue(&pool, &clear_event, &log).await.unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -897,15 +1011,13 @@ mod tests {
             .with_price(20000.0)
             .build();
         let mut sql_tx = pool.begin().await.unwrap();
-        existing_trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
+        existing_trade.save_within_transaction(&mut sql_tx).await.unwrap();
         sql_tx.commit().await.unwrap();
 
         let duplicate_trade = existing_trade.clone();
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
+        let duplicate_result =
+            duplicate_trade.save_within_transaction(&mut sql_tx2).await;
         assert!(duplicate_result.is_err());
         sql_tx2.rollback().await.unwrap();
 
@@ -937,15 +1049,13 @@ mod tests {
             pyth_publish_time: None,
         };
         let mut sql_tx = pool.begin().await.unwrap();
-        existing_trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
+        existing_trade.save_within_transaction(&mut sql_tx).await.unwrap();
         sql_tx.commit().await.unwrap();
 
         let duplicate_trade = existing_trade.clone();
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
+        let duplicate_result =
+            duplicate_trade.save_within_transaction(&mut sql_tx2).await;
         assert!(duplicate_result.is_err());
         sql_tx2.rollback().await.unwrap();
 
@@ -973,9 +1083,7 @@ mod tests {
         };
         let log = crate::test_utils::get_test_log();
 
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
+        crate::queue::enqueue(&pool, &clear_event, &log).await.unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -987,8 +1095,8 @@ mod tests {
 
         if let TradeEvent::ClearV3(boxed_clear_event) = queued_event.event {
             let cache = SymbolCache::default();
-            let http_provider =
-                ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+            let http_provider = ProviderBuilder::new()
+                .connect_http("http://localhost:8545".parse().unwrap());
 
             let feed_id_cache = FeedIdCache::default();
             if let Ok(Some(trade)) = OnchainTrade::try_from_clear_v3(
@@ -1002,20 +1110,28 @@ mod tests {
             .await
             {
                 let mut sql_tx = pool.begin().await.unwrap();
-                accumulator::process_onchain_trade(&mut sql_tx, trade, SupportedBroker::DryRun)
-                    .await
-                    .unwrap();
+                accumulator::process_onchain_trade(
+                    &mut sql_tx,
+                    trade,
+                    SupportedBroker::DryRun,
+                )
+                .await
+                .unwrap();
                 sql_tx.commit().await.unwrap();
             }
         }
 
         let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
-            .await
-            .unwrap();
+        crate::queue::mark_event_processed(
+            &mut sql_tx,
+            queued_event.id.unwrap(),
+        )
+        .await
+        .unwrap();
         sql_tx.commit().await.unwrap();
 
-        let remaining_count = crate::queue::count_unprocessed(&pool).await.unwrap();
+        let remaining_count =
+            crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(remaining_count, 0);
     }
 
@@ -1047,9 +1163,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
-            .await
-            .unwrap();
+        crate::queue::mark_event_processed(
+            &mut sql_tx,
+            queued_event.id.unwrap(),
+        )
+        .await
+        .unwrap();
         sql_tx.commit().await.unwrap();
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
 
@@ -1077,7 +1196,8 @@ mod tests {
     async fn test_deterministic_processing_order() {
         let pool = setup_test_db().await;
 
-        let events_and_logs = vec![(100, 5), (99, 3), (100, 1), (101, 2), (99, 8)];
+        let events_and_logs =
+            vec![(100, 5), (99, 3), (100, 1), (101, 2), (99, 8)];
 
         for (block_num, log_idx) in &events_and_logs {
             let event = ClearV3 {
@@ -1103,7 +1223,8 @@ mod tests {
             crate::queue::enqueue(&pool, &event, &log).await.unwrap();
         }
 
-        let expected_order = vec![(99, 3), (99, 8), (100, 1), (100, 5), (101, 2)];
+        let expected_order =
+            vec![(99, 3), (99, 8), (100, 1), (100, 5), (101, 2)];
 
         for (expected_block, expected_log_idx) in expected_order {
             let event = crate::queue::get_next_unprocessed_event(&pool)
@@ -1119,10 +1240,12 @@ mod tests {
             sql_tx.commit().await.unwrap();
         }
 
-        assert!(crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::queue::get_next_unprocessed_event(&pool)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -1151,7 +1274,8 @@ mod tests {
             log.log_index = Some(i);
             let mut hash_bytes = [0u8; 32];
             hash_bytes[31] = u8::try_from(i).unwrap_or(0);
-            log.transaction_hash = Some(alloy::primitives::B256::from(hash_bytes));
+            log.transaction_hash =
+                Some(alloy::primitives::B256::from(hash_bytes));
 
             crate::queue::enqueue(&pool, &event, &log).await.unwrap();
             events.push((event, log));
@@ -1172,9 +1296,8 @@ mod tests {
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 3);
 
         let mut processed_count = 0;
-        while let Some(event) = crate::queue::get_next_unprocessed_event(&pool)
-            .await
-            .unwrap()
+        while let Some(event) =
+            crate::queue::get_next_unprocessed_event(&pool).await.unwrap()
         {
             let mut sql_tx = pool.begin().await.unwrap();
             crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
@@ -1214,9 +1337,7 @@ mod tests {
         };
         let log = crate::test_utils::get_test_log();
 
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
+        crate::queue::enqueue(&pool, &clear_event, &log).await.unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -1228,13 +1349,17 @@ mod tests {
 
         assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
 
-        let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, &queued_event);
+        let reconstructed_log =
+            reconstruct_log_from_queued_event(&config.evm, &queued_event);
         assert_eq!(reconstructed_log.inner.address, config.evm.orderbook);
         assert_eq!(
             reconstructed_log.transaction_hash.unwrap(),
             queued_event.tx_hash
         );
-        assert_eq!(reconstructed_log.log_index.unwrap(), queued_event.log_index);
+        assert_eq!(
+            reconstructed_log.log_index.unwrap(),
+            queued_event.log_index
+        );
         assert_eq!(
             reconstructed_log.block_number.unwrap(),
             queued_event.block_number
@@ -1244,9 +1369,12 @@ mod tests {
         assert_eq!(reconstructed_log.inner.data, original_log_data);
 
         let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
-            .await
-            .unwrap();
+        crate::queue::mark_event_processed(
+            &mut sql_tx,
+            queued_event.id.unwrap(),
+        )
+        .await
+        .unwrap();
         sql_tx.commit().await.unwrap();
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
     }
@@ -1257,14 +1385,20 @@ mod tests {
         let asserter = Asserter::new();
 
         asserter.push_success(&serde_json::Value::from(12345u64));
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter);
 
         let mut clear_stream = futures_util::stream::empty();
         let mut take_stream = futures_util::stream::empty();
 
-        let cutoff_block = get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, &pool)
-            .await
-            .unwrap();
+        let cutoff_block = get_cutoff_block(
+            &mut clear_stream,
+            &mut take_stream,
+            &provider,
+            &pool,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(cutoff_block, 12345);
     }
@@ -1302,8 +1436,10 @@ mod tests {
         let mut log = crate::test_utils::get_test_log();
         log.block_number = Some(1000);
 
-        let mut clear_stream = stream::iter(vec![Ok((clear_event, log.clone()))]);
-        let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+        let mut clear_stream =
+            stream::iter(vec![Ok((clear_event, log.clone()))]);
+        let mut take_stream =
+            stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
         let result = wait_for_first_event_with_timeout(
             &mut clear_stream,
@@ -1338,7 +1474,8 @@ mod tests {
         log.block_number = None;
 
         let mut clear_stream = stream::iter(vec![Ok((clear_event, log))]);
-        let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+        let mut take_stream =
+            stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
         let result = wait_for_first_event_with_timeout(
             &mut clear_stream,
@@ -1378,10 +1515,17 @@ mod tests {
         ];
 
         let mut clear_stream = stream::iter(events);
-        let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+        let mut take_stream =
+            stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
         let mut event_buffer = Vec::new();
 
-        buffer_live_events(&mut clear_stream, &mut take_stream, &mut event_buffer, 100).await;
+        buffer_live_events(
+            &mut clear_stream,
+            &mut take_stream,
+            &mut event_buffer,
+            100,
+        )
+        .await;
 
         assert_eq!(event_buffer.len(), 1);
         assert_eq!(event_buffer[0].1.block_number.unwrap(), 101);
@@ -1406,8 +1550,12 @@ mod tests {
         };
         let log = crate::test_utils::get_test_log();
 
-        let result =
-            process_live_event(&pool, TradeEvent::ClearV3(Box::new(clear_event)), log).await;
+        let result = process_live_event(
+            &pool,
+            TradeEvent::ClearV3(Box::new(clear_event)),
+            log,
+        )
+        .await;
 
         assert!(result.is_ok());
 
@@ -1427,8 +1575,10 @@ mod tests {
         let mut alice_order = crate::test_utils::get_test_order();
         let mut bob_order = crate::test_utils::get_test_order();
 
-        alice_order.owner = address!("0x1111111111111111111111111111111111111111");
-        bob_order.owner = address!("0x2222222222222222222222222222222222222222");
+        alice_order.owner =
+            address!("0x1111111111111111111111111111111111111111");
+        bob_order.owner =
+            address!("0x2222222222222222222222222222222222222222");
 
         let clear_event = ClearV3 {
             sender: address!("0x3333333333333333333333333333333333333333"),
@@ -1445,9 +1595,7 @@ mod tests {
         };
         let log = crate::test_utils::get_test_log();
 
-        crate::queue::enqueue(&pool, &clear_event, &log)
-            .await
-            .unwrap();
+        crate::queue::enqueue(&pool, &clear_event, &log).await.unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -1465,7 +1613,8 @@ mod tests {
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
 
-        let remaining_count = crate::queue::count_unprocessed(&pool).await.unwrap();
+        let remaining_count =
+            crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(remaining_count, 0);
     }
 
@@ -1474,7 +1623,8 @@ mod tests {
         let pool = setup_test_db().await;
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
 
-        let result = execute_pending_offchain_execution(&broker, &pool, 99999).await;
+        let result =
+            execute_pending_offchain_execution(&broker, &pool, 99999).await;
         assert!(matches!(
             result.unwrap_err(),
             EventProcessingError::AccumulatorProcessing(_)
@@ -1487,17 +1637,19 @@ mod tests {
         let config = create_test_config();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter);
 
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
-            .with_broker_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor =
+            ConductorBuilder::new(config, pool, cache, provider, broker)
+                .with_broker_maintenance(None)
+                .with_dex_event_streams(clear_stream, take_stream)
+                .spawn();
 
         assert!(!conductor.order_poller.is_finished());
         assert!(!conductor.event_processor.is_finished());
@@ -1515,17 +1667,19 @@ mod tests {
         let config = create_test_config();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter);
 
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
-            .with_broker_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor =
+            ConductorBuilder::new(config, pool, cache, provider, broker)
+                .with_broker_maintenance(None)
+                .with_dex_event_streams(clear_stream, take_stream)
+                .spawn();
 
         let order_handle = conductor.order_poller;
         let event_handle = conductor.event_processor;
@@ -1556,7 +1710,8 @@ mod tests {
         let config = create_test_config();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = alloy::providers::ProviderBuilder::new()
+            .connect_mocked_client(asserter);
 
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
@@ -1565,10 +1720,11 @@ mod tests {
 
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
-            .with_broker_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor =
+            ConductorBuilder::new(config, pool, cache, provider, broker)
+                .with_broker_maintenance(None)
+                .with_dex_event_streams(clear_stream, take_stream)
+                .spawn();
 
         let elapsed = start_time.elapsed();
 
