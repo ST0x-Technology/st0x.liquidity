@@ -61,7 +61,7 @@ impl std::str::FromStr for TokenSymbol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub(crate) struct TransferId(Uuid);
+pub struct TransferId(Uuid);
 
 impl TransferId {
     #[cfg(test)]

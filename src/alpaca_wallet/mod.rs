@@ -65,8 +65,8 @@ use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
-pub use transfer::{Network, TokenSymbol};
-pub(crate) use transfer::{Transfer, TransferId};
+pub(crate) use transfer::Transfer;
+pub use transfer::{Network, TokenSymbol, TransferId};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]

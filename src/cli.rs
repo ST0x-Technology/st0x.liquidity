@@ -4,7 +4,7 @@ use std::io::Write;
 use thiserror::Error;
 use tracing::{error, info};
 
-use crate::alpaca_wallet::{AlpacaWalletService, Network, TokenSymbol};
+use crate::alpaca_wallet::{AlpacaWalletService, Network, TokenSymbol, TransferId};
 use crate::env::{BrokerConfig, Config, Env};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
@@ -90,6 +90,12 @@ pub enum Commands {
         /// Network (defaults to ethereum)
         #[arg(long, default_value = "ethereum")]
         network: Network,
+    },
+    /// Check transfer status
+    AlpacaTransferStatus {
+        /// Transfer ID (UUID)
+        #[arg(long)]
+        transfer_id: TransferId,
     },
 }
 
@@ -295,6 +301,36 @@ async fn run_command_with_writers<W: Write>(
                 stdout,
                 "⏱  Note: There is a 24-hour approval period before this address can be used for withdrawals."
             )?;
+        }
+        Commands::AlpacaTransferStatus { transfer_id } => {
+            let BrokerConfig::Alpaca(auth_env) = config.broker else {
+                anyhow::bail!("AlpacaTransferStatus command is only supported for Alpaca broker")
+            };
+
+            let service = AlpacaWalletService::new(auth_env, None).await?;
+            let transfer = service.get_transfer_status(&transfer_id).await?;
+
+            writeln!(stdout, "Transfer Status:")?;
+            writeln!(stdout, "   ID: {}", transfer.id)?;
+            writeln!(stdout, "   Status: {:?}", transfer.status)?;
+            writeln!(stdout, "   Direction: {:?}", transfer.direction)?;
+            writeln!(stdout, "   Asset: {}", transfer.asset)?;
+            writeln!(stdout, "   Amount: {}", transfer.amount)?;
+            writeln!(stdout, "   To Address: {}", transfer.to)?;
+
+            if let Some(from) = transfer.from {
+                writeln!(stdout, "   From Address: {from}")?;
+            }
+
+            if let Some(tx_hash) = transfer.tx {
+                writeln!(stdout, "   Transaction Hash: {tx_hash}")?;
+            }
+
+            if let Some(network_fee) = transfer.network_fee {
+                writeln!(stdout, "   Network Fee: {network_fee}")?;
+            }
+
+            writeln!(stdout, "   Created At: {}", transfer.created_at)?;
         }
     }
 
@@ -626,6 +662,7 @@ mod tests {
     use st0x_broker::OrderStatus;
     use st0x_broker::schwab::SchwabAuthEnv;
     use std::str::FromStr;
+    use uuid::Uuid;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -2203,6 +2240,75 @@ mod tests {
         assert_eq!(entry.id, "whitelist-123");
         assert_eq!(entry.address, test_address);
         whitelist_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_transfer_status_complete_with_mock() {
+        let server = MockServer::start();
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/v2/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "account_number": "PA1234567890",
+                    "status": "ACTIVE",
+                    "currency": "USD",
+                    "buying_power": "100000.00",
+                    "cash": "100000.00"
+                }));
+        });
+
+        let transfer_id = Uuid::new_v4();
+        let test_to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let test_tx_hash = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
+
+        let status_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!(
+                    "/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers"
+                ))
+                .query_param("transfer_id", transfer_id.to_string());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": transfer_id,
+                    "relationship": "OUTGOING",
+                    "amount": "100.0",
+                    "asset": "tAAPL",
+                    "from_address": null,
+                    "to_address": test_to_address,
+                    "status": "COMPLETE",
+                    "tx_hash": test_tx_hash,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee_amount": "0.5"
+                }]));
+        });
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let service = AlpacaWalletService::new_with_client(client, None);
+
+        account_mock.assert();
+
+        let transfer = service
+            .get_transfer_status(&TransferId::from(transfer_id))
+            .await
+            .unwrap();
+
+        assert_eq!(transfer.id, TransferId::from(transfer_id));
+        assert_eq!(transfer.amount.to_string(), "100.0");
+        assert_eq!(transfer.asset.to_string(), "tAAPL");
+        assert_eq!(transfer.to, test_to_address);
+
+        status_mock.assert();
     }
 
     #[tokio::test]
