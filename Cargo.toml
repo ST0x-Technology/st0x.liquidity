@@ -29,7 +29,7 @@ must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-alloy = { version = "1.0.38", features = ["full", "rand"] }
+alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
 async-trait = "0.1.81"
 cqrs-es = "0.4"
 sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }
