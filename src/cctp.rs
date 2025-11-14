@@ -1,3 +1,51 @@
+//! Circle CCTP bridge service for cross-chain USDC transfers.
+//!
+//! This module provides a service layer for bridging USDC between Ethereum mainnet
+//! and Base using Circle's Cross-Chain Transfer Protocol (CCTP) V2 with fast transfers.
+//!
+//! ## Overview
+//!
+//! Circle CCTP enables native USDC transfers between blockchains by burning on the
+//! source chain and minting on the destination chain. This implementation uses
+//! **CCTP V2 Fast Transfer** which reduces transfer time from 13-19 minutes per chain
+//! to approximately **30 seconds total** (20s on Ethereum + 8s on Base) for a cost of
+//! 1 basis point (0.01%) per transfer.
+//!
+//! ## Supported Chains
+//!
+//! - **Ethereum mainnet** (domain 0)
+//! - **Base** (domain 6)
+//!
+//! ## Architecture
+//!
+//! The CCTP bridge flow consists of three steps:
+//!
+//! 1. **Burn**: Lock and burn USDC on source chain via `TokenMessengerV2.depositForBurn()`
+//! 2. **Attest**: Poll Circle's attestation API for signed message (fast transfer: ~20-30s)
+//! 3. **Mint**: Mint native USDC on destination chain via `MessageTransmitterV2.receiveMessage()`
+//!
+//! ## Usage
+//!
+//! ```rust,ignore
+//! // Create bridge instance
+//! let ethereum = EvmAccount::new(ethereum_provider, ethereum_signer);
+//! let base = EvmAccount::new(base_provider, base_signer);
+//! let bridge = CctpBridge::new(ethereum, base);
+//!
+//! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
+//! let amount = U256::from(1_000_000); // 1 USDC
+//! let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
+//! ```
+//!
+//! ## CCTP V2 Fast Transfer
+//!
+//! Fast transfers are enabled by setting `minFinalityThreshold` to 1000 in the
+//! `depositForBurn()` call. The fee is dynamically queried from Circle's API
+//! (`/v2/burn/USDC/fees`) before each burn operation.
+//!
+//! **Timing**: ~30 seconds total (20s Ethereum finality + 8s Base finality)
+//! **Cost**: 1 basis point (0.01%) of transfer amount
+
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
@@ -39,44 +87,83 @@ const ATTESTATION_API_BASE: &str = "https://iris-api.circle.com/attestations";
 /// Minimum finality threshold for CCTP V2 fast transfer (enables ~30 second transfers)
 const FAST_TRANSFER_THRESHOLD: u32 = 1000;
 
+/// Receipt from burning USDC on the source chain.
+///
+/// Contains all information needed to poll for attestation and mint on the destination chain.
 #[derive(Debug)]
 pub(crate) struct BurnReceipt {
+    /// Transaction hash of the burn transaction
     pub(crate) tx: TxHash,
+    /// CCTP message nonce (extracted from message bytes at index 12-44)
     pub(crate) nonce: FixedBytes<32>,
+    /// Keccak256 hash of the CCTP message (used for attestation polling)
     pub(crate) hash: FixedBytes<32>,
+    /// Full CCTP message bytes (passed to `receiveMessage()` on destination)
     pub(crate) message: Bytes,
+    /// Amount of USDC burned (in smallest unit, 6 decimals for USDC)
     pub(crate) amount: U256,
 }
 
+/// EVM account wrapper combining provider and signer.
+///
+/// Generic container for blockchain provider and transaction signer,
+/// used to configure Ethereum and Base connections for the CCTP bridge.
 pub(crate) struct EvmAccount<P, S>
 where
     P: Provider + Clone,
-    S: Signer + Clone,
+    S: Signer + Clone + Sync,
 {
+    /// Blockchain provider for reading chain state and sending transactions
     provider: P,
+    /// Transaction signer for authorizing transactions
     signer: S,
 }
 
 impl<P, S> EvmAccount<P, S>
 where
     P: Provider + Clone,
-    S: Signer + Clone,
+    S: Signer + Clone + Sync,
 {
+    /// Creates a new EVM account with the given provider and signer.
     pub(crate) fn new(provider: P, signer: S) -> Self {
         Self { provider, signer }
     }
 }
 
+/// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
+///
+/// Provides both low-level methods (burn, poll, mint) and high-level convenience
+/// methods (bridge_ethereum_to_base, bridge_base_to_ethereum) for cross-chain transfers.
+///
+/// # Type Parameters
+///
+/// * `P` - Provider type implementing [`Provider`] + [`Clone`]
+/// * `S` - Signer type implementing [`Signer`] + [`Clone`] + [`Sync`]
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let ethereum = EvmAccount::new(ethereum_provider, ethereum_signer);
+/// let base = EvmAccount::new(base_provider, base_signer);
+/// let bridge = CctpBridge::new(ethereum, base);
+///
+/// let amount = U256::from(1_000_000); // 1 USDC
+/// let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
+/// ```
 pub(crate) struct CctpBridge<P, S>
 where
     P: Provider + Clone,
-    S: Signer + Clone,
+    S: Signer + Clone + Sync,
 {
+    /// Ethereum mainnet provider and signer
     ethereum: EvmAccount<P, S>,
+    /// Base provider and signer
     base: EvmAccount<P, S>,
+    /// HTTP client for Circle attestation API requests
     http_client: reqwest::Client,
 }
 
+/// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CctpError {
     #[error("Transaction error: {0}")]
@@ -100,6 +187,7 @@ pub(crate) enum CctpError {
     FeeValueParse(#[from] std::num::ParseIntError),
 }
 
+/// Errors specific to attestation polling from Circle's API.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AttestationError {
     #[error("HTTP error: {0}")]
@@ -119,7 +207,7 @@ struct FeeResponse {
 impl<P, S> CctpBridge<P, S>
 where
     P: Provider + Clone,
-    S: Signer + Clone,
+    S: Signer + Clone + Sync,
 {
     pub(crate) fn new(ethereum: EvmAccount<P, S>, base: EvmAccount<P, S>) -> Self {
         Self {
