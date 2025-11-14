@@ -9,7 +9,7 @@ use alloy::primitives::FixedBytes;
 
 use super::SchwabError;
 use super::auth::SchwabAuthEnv;
-use super::encryption::{EncryptionError, decrypt_token, encrypt_token};
+use super::encryption::{EncryptedToken, EncryptionError, decrypt_token, encrypt_token};
 
 const ACCESS_TOKEN_DURATION_MINUTES: i64 = 30;
 const REFRESH_TOKEN_DURATION_DAYS: i64 = 7;
@@ -114,8 +114,11 @@ impl SchwabTokens {
         let encrypted_refresh_bytes: Vec<u8> =
             alloy::hex::decode(&row.refresh_token).map_err(EncryptionError::Hex)?;
 
-        let access_token = decrypt_token(encryption_key, &encrypted_access_bytes)?;
-        let refresh_token = decrypt_token(encryption_key, &encrypted_refresh_bytes)?;
+        let encrypted_access = EncryptedToken::from(encrypted_access_bytes);
+        let encrypted_refresh = EncryptedToken::from(encrypted_refresh_bytes);
+
+        let access_token = decrypt_token(encryption_key, &encrypted_access)?;
+        let refresh_token = decrypt_token(encryption_key, &encrypted_refresh)?;
 
         Ok(Self {
             access_token,

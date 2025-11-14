@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::schwab::auth::SchwabAuthEnv;
+use crate::schwab::SchwabAuthEnv;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
@@ -278,9 +278,8 @@ impl Broker for SchwabBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schwab::SchwabError;
-    use crate::schwab::auth::SchwabAuthEnv;
     use crate::schwab::tokens::SchwabTokens;
+    use crate::schwab::{SchwabAuthEnv, SchwabError};
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
@@ -313,7 +312,7 @@ mod tests {
     async fn test_try_from_config_with_no_tokens() {
         let pool = setup_test_db().await;
         let auth = create_test_auth_env();
-        let config = (auth, pool);
+        let config = SchwabConfig { auth, pool };
 
         let result = SchwabBroker::try_from_config(config).await;
 
@@ -339,7 +338,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = (auth, pool);
+        let config = SchwabConfig { auth, pool };
         let result = SchwabBroker::try_from_config(config).await;
 
         assert!(result.is_ok());
@@ -382,7 +381,10 @@ mod tests {
                 }));
         });
 
-        let config = (auth, pool.clone());
+        let config = SchwabConfig {
+            auth,
+            pool: pool.clone(),
+        };
         let result = SchwabBroker::try_from_config(config).await;
 
         assert!(result.is_ok());
@@ -414,7 +416,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = (auth, pool);
+        let config = SchwabConfig { auth, pool };
         let result = SchwabBroker::try_from_config(config).await;
 
         assert!(result.is_err());
