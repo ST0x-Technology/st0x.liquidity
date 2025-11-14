@@ -1582,31 +1582,45 @@ enum UsdcRebalanceEvent {
 - **Circle Attestation API**: Poll for attestation using CCTP nonce
 - **Rain OrderBook**: deposit2()/withdraw2() for vault operations
 
-**CCTP Flow**:
+**CCTP Flow (using V2 Fast Transfer)**:
 
 Alpaca to Base:
 
 1. Initiate USDC withdrawal from Alpaca (get transfer_id)
 2. Poll Alpaca API until withdrawal status is COMPLETE
-3. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
-4. Wait for burn tx confirmation and extract CCTP nonce from event logs
-5. Poll Circle attestation service for signature using CCTP nonce
-6. Submit receiveMessage() tx on Base MessageTransmitter with attestation
-7. Wait for mint tx confirmation
-8. Submit deposit tx to Rain orderbook vault on Base
-9. Wait for deposit tx confirmation
+3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
+4. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
+   with minFinalityThreshold=1000 and calculated maxFee for fast transfer
+5. Wait for burn tx confirmation and extract CCTP nonce from event logs
+6. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
+   for fast transfer)
+7. Submit receiveMessage() tx on Base MessageTransmitter with attestation
+8. Wait for mint tx confirmation (~8 seconds on Base)
+9. Submit deposit tx to Rain orderbook vault on Base
+10. Wait for deposit tx confirmation
 
 Base to Alpaca:
 
 1. Submit withdraw tx from Rain orderbook vault on Base
 2. Wait for withdraw tx confirmation
-3. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0)
-4. Wait for burn tx confirmation and extract CCTP nonce from event logs
-5. Poll Circle attestation service for signature using CCTP nonce
-6. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
-7. Wait for mint tx confirmation
-8. Initiate USDC deposit to Alpaca (get transfer_id)
-9. Poll Alpaca API until deposit status is COMPLETE
+3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
+4. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0) with
+   minFinalityThreshold=1000 and calculated maxFee for fast transfer
+5. Wait for burn tx confirmation and extract CCTP nonce from event logs
+6. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
+   for fast transfer)
+7. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
+8. Wait for mint tx confirmation (~20 seconds on Ethereum)
+9. Initiate USDC deposit to Alpaca (get transfer_id)
+10. Poll Alpaca API until deposit status is COMPLETE
+
+**Fast Transfer Benefits**:
+
+- **Timing**: ~20-30 seconds for CCTP bridge portion vs 13-19 minutes standard
+  transfer (50-80x faster)
+- **Cost**: 1 basis point (0.01%) fee per transfer
+- **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
+  rather than bridge time
 
 #### **Rebalancing Triggers**
 

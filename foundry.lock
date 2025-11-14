@@ -1,0 +1,8 @@
+{
+  "lib/forge-std": {
+    "rev": "77041d2ce690e692d6e03cc812b57d1ddaa4d505"
+  },
+  "lib/rain.orderbook.interface": {
+    "rev": "ecb42a2262d08ba184c05baef62f4d8c0a57537f"
+  }
+}

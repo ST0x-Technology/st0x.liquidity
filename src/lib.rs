@@ -4,6 +4,9 @@ use tracing::{error, info, info_span, warn};
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
+// TODO(#136): Remove dead_code allow when UsdcRebalance aggregate is implemented
+#[allow(dead_code)]
+mod cctp;
 pub mod cli;
 mod conductor;
 pub mod env;
