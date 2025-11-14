@@ -76,6 +76,8 @@ fi
 
 # Generate docker-compose.yaml from template
 echo "==> Generating docker-compose.yaml"
+
+# shellcheck disable=SC2016  # Single quotes intentional - pass literal var names to envsubst
 envsubst '$DOCKER_IMAGE $DATA_VOLUME_PATH $PULL_POLICY $GRAFANA_ADMIN_PASSWORD $SCHWAB_BROKER $ALPACA_BROKER' < docker-compose.template.yaml > docker-compose.yaml
 
 echo "==> docker-compose.yaml generated successfully"

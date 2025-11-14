@@ -30,8 +30,7 @@ pub async fn process_onchain_trade(
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     // Check if trade already exists to handle duplicates gracefully
     let tx_hash_str = trade.tx_hash.to_string();
-    let log_index_i64 = i64::try_from(trade.log_index)
-        .map_err(|_| OnChainError::Validation(crate::error::TradeValidationError::NoLogIndex))?;
+    let log_index_i64 = i64::try_from(trade.log_index)?;
 
     let existing_trade = sqlx::query!(
         "

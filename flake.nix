@@ -2,7 +2,8 @@
   description = "Flake for development workflows.";
 
   inputs = {
-    rainix.url = "github:rainprotocol/rainix";
+    rainix.url =
+      "github:rainprotocol/rainix?rev=560ee6ec35b72a2e6c669745b4af33997b2979fb";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -20,6 +21,7 @@
               set -euxo pipefail
               npm install
               (cd lib/rain.orderbook.interface/ && forge build)
+              (cd lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd node_modules/@pythnetwork/pyth-sdk-solidity/ && forge build)
             '';

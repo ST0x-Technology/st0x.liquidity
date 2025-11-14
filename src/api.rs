@@ -244,7 +244,9 @@ mod tests {
             AuthRefreshResponse::Error { error } => {
                 assert!(error.contains("Failed to extract authorization code"));
             }
-            AuthRefreshResponse::Success { .. } => panic!("Expected error response"),
+            AuthRefreshResponse::Success { .. } => {
+                panic!("Expected error response")
+            }
         }
     }
 
@@ -284,7 +286,9 @@ mod tests {
                 assert!(error.contains("Failed to extract authorization code"));
                 assert!(error.contains("Missing authorization code parameter"));
             }
-            AuthRefreshResponse::Success { .. } => panic!("Expected error response"),
+            AuthRefreshResponse::Success { .. } => {
+                panic!("Expected error response")
+            }
         }
     }
 
@@ -330,7 +334,9 @@ mod tests {
             AuthRefreshResponse::Error { error } => {
                 assert!(error.contains("Authentication failed"));
             }
-            AuthRefreshResponse::Success { .. } => panic!("Expected error response"),
+            AuthRefreshResponse::Success { .. } => {
+                panic!("Expected error response")
+            }
         }
 
         mock.assert();
@@ -417,7 +423,7 @@ mod tests {
         }
     }
 
-    fn setup_schwab_api_mocks(server: &MockServer) -> Vec<Mock> {
+    fn setup_schwab_api_mocks(server: &MockServer) -> Vec<Mock<'_>> {
         vec![
             server.mock(|when, then| {
                 when.method(httpmock::Method::GET)

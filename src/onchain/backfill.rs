@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 use super::EvmEnv;
-use crate::bindings::IOrderBookV4::{ClearV2, TakeOrderV2};
+use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::error::OnChainError;
 use crate::queue::enqueue;
 
@@ -27,8 +27,8 @@ fn get_backfill_retry_strat() -> ExponentialBuilder {
 
 #[derive(Debug)]
 enum EventData {
-    ClearV2(Box<ClearV2>),
-    TakeOrderV2(Box<TakeOrderV2>),
+    ClearV3(Box<ClearV3>),
+    TakeOrderV3(Box<TakeOrderV3>),
 }
 
 pub(crate) async fn backfill_events<P: Provider + Clone>(
@@ -128,13 +128,13 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .address(evm_env.orderbook)
         .from_block(batch_start)
         .to_block(batch_end)
-        .event_signature(ClearV2::SIGNATURE_HASH);
+        .event_signature(ClearV3::SIGNATURE_HASH);
 
     let take_filter = Filter::new()
         .address(evm_env.orderbook)
         .from_block(batch_start)
         .to_block(batch_end)
-        .event_signature(TakeOrderV2::SIGNATURE_HASH);
+        .event_signature(TakeOrderV3::SIGNATURE_HASH);
 
     // Use the provided retry strategy
 
@@ -169,7 +169,7 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
     .await?;
 
     debug!(
-        "Found {} ClearV2 events and {} TakeOrderV2 events in batch {}-{}",
+        "Found {} ClearV3 events and {} TakeOrderV3 events in batch {}-{}",
         clear_logs.len(),
         take_logs.len(),
         batch_start,
@@ -185,13 +185,13 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         .into_iter()
         .sorted_by_key(|log| (log.block_number, log.log_index))
         .filter_map(|log| {
-            // Try ClearV2 first
-            if let Ok(clear_event) = log.log_decode::<ClearV2>() {
-                let event_data = EventData::ClearV2(Box::new(clear_event.data().clone()));
+            // Try ClearV3 first
+            if let Ok(clear_event) = log.log_decode::<ClearV3>() {
+                let event_data = EventData::ClearV3(Box::new(clear_event.data().clone()));
                 Some((event_data, log))
-            // Then try TakeOrderV2
-            } else if let Ok(take_event) = log.log_decode::<TakeOrderV2>() {
-                let event_data = EventData::TakeOrderV2(Box::new(take_event.data().clone()));
+            // Then try TakeOrderV3
+            } else if let Ok(take_event) = log.log_decode::<TakeOrderV3>() {
+                let event_data = EventData::TakeOrderV3(Box::new(take_event.data().clone()));
                 Some((event_data, log))
             } else {
                 None
@@ -199,17 +199,17 @@ async fn enqueue_batch_events<P: Provider + Clone, B: BackoffBuilder + Clone>(
         })
         .map(|(event_data, log)| async move {
             match event_data {
-                EventData::ClearV2(event) => match enqueue(pool, &*event, &log).await {
+                EventData::ClearV3(event) => match enqueue(pool, &*event, &log).await {
                     Ok(()) => Some(()),
                     Err(e) => {
-                        warn!("Failed to enqueue ClearV2 event during backfill: {e}");
+                        warn!("Failed to enqueue ClearV3 event during backfill: {e}");
                         None
                     }
                 },
-                EventData::TakeOrderV2(event) => match enqueue(pool, &*event, &log).await {
+                EventData::TakeOrderV3(event) => match enqueue(pool, &*event, &log).await {
                     Ok(()) => Some(()),
                     Err(e) => {
-                        warn!("Failed to enqueue TakeOrderV2 event during backfill: {e}");
+                        warn!("Failed to enqueue TakeOrderV3 event during backfill: {e}");
                         None
                     }
                 },
@@ -240,18 +240,20 @@ fn generate_batch_ranges(start_block: u64, end_block: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use crate::onchain::trade::TradeEvent;
-    use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{
+        Address, B256, FixedBytes, IntoLogData, U256, address, fixed_bytes, uint,
+    };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
-    use std::str::FromStr;
+    use rain_math_float::Float;
 
     use super::*;
     use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4;
+    use crate::bindings::IOrderBookV5;
     use crate::onchain::EvmEnv;
+    use crate::onchain::trade::TradeEvent;
+    use crate::queue::{count_unprocessed, get_next_unprocessed_event, mark_event_processed};
     use crate::test_utils::{get_test_order, setup_test_db};
 
     fn test_retry_strategy() -> ExponentialBuilder {
@@ -358,16 +360,16 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
 
-        let clear_config = IOrderBookV4::ClearConfig {
+        let clear_config = IOrderBookV5::ClearConfigV2 {
             aliceInputIOIndex: U256::from(0),
             aliceOutputIOIndex: U256::from(1),
             bobInputIOIndex: U256::from(1),
             bobOutputIOIndex: U256::from(0),
-            aliceBountyVaultId: U256::ZERO,
-            bobBountyVaultId: U256::ZERO,
+            aliceBountyVaultId: B256::ZERO,
+            bobBountyVaultId: B256::ZERO,
         };
 
-        let clear_event = IOrderBookV4::ClearV2 {
+        let clear_event = IOrderBookV5::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
@@ -406,7 +408,7 @@ mod tests {
         let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, tx_hash);
         assert_eq!(queued_event.log_index, 1);
-        assert!(matches!(queued_event.event, TradeEvent::ClearV2(_)));
+        assert!(matches!(queued_event.event, TradeEvent::ClearV3(_)));
     }
 
     #[tokio::test]
@@ -420,16 +422,20 @@ mod tests {
             deployment_block: 1,
         };
 
-        let take_event = IOrderBookV4::TakeOrderV2 {
+        let take_event = IOrderBookV5::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV4::TakeOrderConfigV3 {
+            config: IOrderBookV5::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
                 signedContext: Vec::new(),
             },
-            input: U256::from(100_000_000),
-            output: U256::from_str("9000000000000000000").unwrap(),
+            input: Float::from_fixed_decimal_lossy(uint!(100_000_000_U256), 0)
+                .unwrap()
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(9_000_000_000_000_000_000_U256), 18)
+                .unwrap()
+                .get_inner(),
         };
 
         let tx_hash =
@@ -473,7 +479,7 @@ mod tests {
         let queued_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(queued_event.tx_hash, tx_hash);
         assert_eq!(queued_event.log_index, 1);
-        assert!(matches!(queued_event.event, TradeEvent::TakeOrderV2(_)));
+        assert!(matches!(queued_event.event, TradeEvent::TakeOrderV3(_)));
     }
 
     #[tokio::test]
@@ -487,17 +493,17 @@ mod tests {
         };
 
         let different_order = get_test_order();
-        let clear_event = IOrderBookV4::ClearV2 {
+        let clear_event = IOrderBookV5::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: different_order.clone(),
             bob: different_order.clone(),
-            clearConfig: IOrderBookV4::ClearConfig {
+            clearConfig: IOrderBookV5::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: U256::ZERO,
-                bobBountyVaultId: U256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         };
 
@@ -590,26 +596,32 @@ mod tests {
     }
 
     fn create_test_take_event(
-        order: &crate::bindings::IOrderBookV4::OrderV3,
-        input: u64,
-        output: &str,
-    ) -> IOrderBookV4::TakeOrderV2 {
-        IOrderBookV4::TakeOrderV2 {
+        order: &IOrderBookV5::OrderV4,
+        input: U256,
+        output: U256,
+    ) -> IOrderBookV5::TakeOrderV3 {
+        IOrderBookV5::TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: IOrderBookV4::TakeOrderConfigV3 {
+            config: IOrderBookV5::TakeOrderConfigV4 {
                 order: order.clone(),
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
                 signedContext: Vec::new(),
             },
-            input: U256::from(input),
-            output: U256::from_str(output).unwrap(),
+
+            input: Float::from_fixed_decimal_lossy(input, 0)
+                .unwrap()
+                .get_inner(),
+
+            output: Float::from_fixed_decimal_lossy(output, 18)
+                .unwrap()
+                .get_inner(),
         }
     }
 
     fn create_test_log(
-        orderbook: alloy::primitives::Address,
-        event: &IOrderBookV4::TakeOrderV2,
+        orderbook: Address,
+        event: &IOrderBookV5::TakeOrderV3,
         block_number: u64,
         tx_hash: FixedBytes<32>,
     ) -> Log {
@@ -644,8 +656,16 @@ mod tests {
         let tx_hash2 =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let take_event1 = create_test_take_event(&order, 100_000_000, "1000000000000000000");
-        let take_event2 = create_test_take_event(&order, 200_000_000, "2000000000000000000");
+        let take_event1 = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(1_000_000_000_000_000_000_U256),
+        );
+        let take_event2 = create_test_take_event(
+            &order,
+            uint!(200_000_000_U256),
+            uint!(2_000_000_000_000_000_000_U256),
+        );
 
         let take_log1 = create_test_log(evm_env.orderbook, &take_event1, 50, tx_hash1);
         let take_log2 = create_test_log(evm_env.orderbook, &take_event2, 100, tx_hash2);
@@ -778,7 +798,11 @@ mod tests {
 
         let tx_hash =
             fixed_bytes!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
-        let take_event = create_test_take_event(&order, 500_000_000, "5000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(500_000_000_U256),
+            uint!(5_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(evm_env.orderbook, &take_event, 150, tx_hash);
 
         let asserter = Asserter::new();
@@ -893,14 +917,21 @@ mod tests {
             deployment_block: 1,
         };
 
-        let valid_take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let valid_take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
 
         // Create different order with different hash to make it invalid
         let mut different_order = get_test_order();
         different_order.nonce =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111"); // Change nonce to make hash different
-        let invalid_take_event =
-            create_test_take_event(&different_order, 50_000_000, "5000000000000000000");
+        let invalid_take_event = create_test_take_event(
+            &different_order,
+            uint!(50_000_000_U256),
+            uint!(5_000_000_000_000_000_000_U256),
+        );
 
         let valid_tx_hash =
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
@@ -926,6 +957,81 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    fn create_clear_log(orderbook: Address, order: &IOrderBookV5::OrderV4, tx_hash: B256) -> Log {
+        let clear_config = IOrderBookV5::ClearConfigV2 {
+            aliceInputIOIndex: U256::from(0),
+            aliceOutputIOIndex: U256::from(1),
+            bobInputIOIndex: U256::from(1),
+            bobOutputIOIndex: U256::from(0),
+            aliceBountyVaultId: B256::ZERO,
+            bobBountyVaultId: B256::ZERO,
+        };
+
+        let clear_event = IOrderBookV5::ClearV3 {
+            sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            alice: order.clone(),
+            bob: order.clone(),
+            clearConfig: clear_config,
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: clear_event.to_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(1),
+            removed: false,
+        }
+    }
+
+    fn create_after_clear_log(orderbook: Address, tx_hash: B256) -> Log {
+        let after_clear_event = IOrderBookV5::AfterClearV2 {
+            sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            clearStateChange: IOrderBookV5::ClearStateChangeV2 {
+                aliceOutput: Float::from_fixed_decimal_lossy(
+                    uint!(5_000_000_000_000_000_000_U256),
+                    18,
+                )
+                .unwrap()
+                .get_inner(),
+
+                bobOutput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                aliceInput: Float::from_fixed_decimal_lossy(uint!(50_000_000_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+
+                bobInput: Float::from_fixed_decimal_lossy(
+                    uint!(5_000_000_000_000_000_000_U256),
+                    18,
+                )
+                .unwrap()
+                .get_inner(),
+            },
+        };
+
+        Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: after_clear_event.to_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(100),
+            block_timestamp: None,
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(2),
+            removed: false,
+        }
+    }
+
     #[tokio::test]
     async fn test_backfill_events_mixed_clear_and_take_events() {
         let pool = setup_test_db().await;
@@ -942,86 +1048,30 @@ mod tests {
         let tx_hash2 =
             fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(evm_env.orderbook, &take_event, 50, tx_hash1);
-
-        let clear_config = IOrderBookV4::ClearConfig {
-            aliceInputIOIndex: U256::from(0),
-            aliceOutputIOIndex: U256::from(1),
-            bobInputIOIndex: U256::from(1),
-            bobOutputIOIndex: U256::from(0),
-            aliceBountyVaultId: U256::ZERO,
-            bobBountyVaultId: U256::ZERO,
-        };
-
-        let clear_event = IOrderBookV4::ClearV2 {
-            sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
-            alice: order.clone(),
-            bob: order.clone(),
-            clearConfig: clear_config,
-        };
-
-        let clear_log = Log {
-            inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
-                data: clear_event.to_log_data(),
-            },
-            block_hash: None,
-            block_number: Some(100),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash2),
-            transaction_index: None,
-            log_index: Some(1),
-            removed: false,
-        };
-
-        let after_clear_event = IOrderBookV4::AfterClear {
-            sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: IOrderBookV4::ClearStateChange {
-                aliceOutput: U256::from_str("5000000000000000000").unwrap(), // 5 shares
-                bobOutput: U256::from(50_000_000u64),                        // 50 USDC cents
-                aliceInput: U256::from(50_000_000u64),
-                bobInput: U256::from_str("5000000000000000000").unwrap(),
-            },
-        };
-
-        let after_clear_log = Log {
-            inner: alloy::primitives::Log {
-                address: evm_env.orderbook,
-                data: after_clear_event.to_log_data(),
-            },
-            block_hash: None,
-            block_number: Some(100),
-            block_timestamp: None,
-            transaction_hash: Some(tx_hash2),
-            transaction_index: None,
-            log_index: Some(2),
-            removed: false,
-        };
+        let clear_log = create_clear_log(evm_env.orderbook, &order, tx_hash2);
+        let after_clear_log = create_after_clear_log(evm_env.orderbook, tx_hash2);
 
         let asserter = Asserter::new();
-        asserter.push_success(&serde_json::Value::from(150u64)); // 1. get_block_number
-        asserter.push_success(&serde_json::json!([clear_log])); // 2. get_logs clear
-        asserter.push_success(&serde_json::json!([take_log])); // 3. get_logs take
-
-        // Take event processing (processed first due to earlier block)
+        asserter.push_success(&serde_json::Value::from(150u64));
+        asserter.push_success(&serde_json::json!([clear_log]));
+        asserter.push_success(&serde_json::json!([take_log]));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 4. symbol input
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 5. symbol output
             &"AAPL0x".to_string(),
         ));
-
-        // Clear event processing (processed second due to later block)
-        asserter.push_success(&serde_json::json!([after_clear_log])); // 6. get_logs AfterClear
+        asserter.push_success(&serde_json::json!([after_clear_log]));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 7. symbol input
             &"USDC".to_string(),
         ));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
-            // 8. symbol output
             &"AAPL0x".to_string(),
         ));
 
@@ -1031,16 +1081,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Check that two events were enqueued
         let count = count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 2);
 
-        // Verify the first event (earlier block number)
         let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(first_event.tx_hash, tx_hash1);
         assert_eq!(first_event.block_number, 50);
 
-        // Mark as processed and get the second event
         let mut sql_tx = pool.begin().await.unwrap();
         mark_event_processed(&mut sql_tx, first_event.id.unwrap())
             .await
@@ -1231,7 +1278,11 @@ mod tests {
         };
 
         let order = get_test_order();
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
@@ -1292,8 +1343,16 @@ mod tests {
         let order = get_test_order();
 
         // Create multiple events
-        let take_event1 = create_test_take_event(&order, 100_000_000, "9000000000000000000");
-        let take_event2 = create_test_take_event(&order, 200_000_000, "18000000000000000000");
+        let take_event1 = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
+        let take_event2 = create_test_take_event(
+            &order,
+            uint!(200_000_000_U256),
+            uint!(18_000_000_000_000_000_000_U256),
+        );
 
         let take_log1 = create_test_log(
             evm_env.orderbook,
@@ -1333,7 +1392,11 @@ mod tests {
         };
 
         let order = get_test_order();
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
@@ -1433,18 +1496,18 @@ mod tests {
 
         let order = get_test_order();
 
-        // Create a ClearV2 event
-        let clear_event = IOrderBookV4::ClearV2 {
+        // Create a ClearV3 event
+        let clear_event = IOrderBookV5::ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: order.clone(),
             bob: order.clone(),
-            clearConfig: IOrderBookV4::ClearConfig {
+            clearConfig: IOrderBookV5::ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: U256::ZERO,
-                bobBountyVaultId: U256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         };
 
@@ -1464,8 +1527,12 @@ mod tests {
             removed: false,
         };
 
-        // Create a TakeOrderV2 event
-        let take_event = create_test_take_event(&order, 100_000_000, "9000000000000000000");
+        // Create a TakeOrderV3 event
+        let take_event = create_test_take_event(
+            &order,
+            uint!(100_000_000_U256),
+            uint!(9_000_000_000_000_000_000_U256),
+        );
         let take_log = create_test_log(
             evm_env.orderbook,
             &take_event,
