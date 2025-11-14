@@ -27,21 +27,35 @@ contract interaction tests.
 
 ## Task 1. Create vault service module with types and core structure
 
-- [ ] Create `src/onchain/vault.rs` module file
-- [ ] Define `VaultId` newtype wrapping `U256`
-- [ ] Define `VaultError` enum with variants:
+- [x] Create `src/onchain/vault.rs` module file
+- [x] Define `VaultId` newtype wrapping `U256`
+- [x] Define `VaultError` enum with variants:
   - `Transaction(alloy::providers::PendingTransactionError)`
   - `Contract(alloy::contract::Error)`
   - `InsufficientBalance { requested: U256, available: U256 }`
   - `ZeroAmount`
-- [ ] Implement error traits using `thiserror`
-- [ ] Define `VaultService<P, S>` struct with:
+- [x] Implement error traits using `thiserror`
+- [x] Define `VaultService<P, S>` struct with:
   - `account: EvmAccount<P, S>`
   - `orderbook: Address`
-- [ ] Implement
+- [x] Implement
       `VaultService::new(account: EvmAccount<P, S>, orderbook: Address) -> Self`
-- [ ] Export module in `src/onchain/mod.rs`
-- [ ] Run `cargo build` and `cargo clippy` to verify clean compilation
+- [x] Export module in `src/onchain/mod.rs`
+- [x] Run `cargo build` and `cargo clippy` to verify clean compilation
+
+### Completed Changes
+
+Created `src/onchain/vault.rs` with:
+
+- `VaultId` newtype for type-safe vault identifiers
+- `VaultError` enum with comprehensive error variants using `thiserror`
+- `VaultService<P, S>` generic struct using `EvmAccount` pattern from cctp
+  module
+- Constructor method for initializing service with account and orderbook address
+- Module exported in `src/onchain/mod.rs`
+
+Build and clippy checks pass with only expected dead_code warnings for unused
+types.
 
 ## Task 2. Implement and test deposit functionality
 
