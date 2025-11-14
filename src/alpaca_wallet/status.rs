@@ -297,28 +297,6 @@ mod tests {
             then.status(503).body("Service Unavailable");
         });
 
-        let success_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
-                .query_param("transfer_id", transfer_id.to_string());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body_obj(&json!([{
-                    "id": transfer_id,
-                    "relationship": "OUTGOING",
-                    "amount": "100.0",
-                    "asset": "USDC",
-                    "from_address": null,
-                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "status": "COMPLETE",
-                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
-                }]));
-        });
-
         let client = AlpacaWalletClient::new_with_base_url(
             server.base_url(),
             "test_key_id".to_string(),
@@ -430,7 +408,7 @@ mod tests {
                 }]));
         });
 
-        let pending_mock = server.mock(|when, then| {
+        server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
                     "/v1/accounts/{expected_account_id}/wallets/transfers"
