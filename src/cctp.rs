@@ -114,9 +114,9 @@ where
     S: Signer + Clone + Sync,
 {
     /// Blockchain provider for reading chain state and sending transactions
-    provider: P,
+    pub(crate) provider: P,
     /// Transaction signer for authorizing transactions
-    signer: S,
+    pub(crate) signer: S,
 }
 
 impl<P, S> EvmAccount<P, S>
