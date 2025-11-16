@@ -313,7 +313,7 @@ mod tests {
     async fn test_try_from_config_with_no_tokens() {
         let pool = setup_test_db().await;
         let auth = create_test_auth_env();
-        let config = (auth, pool);
+        let config = SchwabConfig { auth, pool };
 
         let result = SchwabBroker::try_from_config(config).await;
 
@@ -339,7 +339,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = (auth, pool);
+        let config = SchwabConfig { auth, pool };
         let result = SchwabBroker::try_from_config(config).await;
 
         assert!(result.is_ok());
@@ -382,7 +382,10 @@ mod tests {
                 }));
         });
 
-        let config = (auth, pool.clone());
+        let config = SchwabConfig {
+            auth,
+            pool: pool.clone(),
+        };
         let result = SchwabBroker::try_from_config(config).await;
 
         assert!(result.is_ok());
@@ -414,7 +417,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = (auth, pool);
+        let config = SchwabConfig { auth, pool };
         let result = SchwabBroker::try_from_config(config).await;
 
         assert!(result.is_err());

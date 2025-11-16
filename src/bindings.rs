@@ -3,7 +3,7 @@ use alloy::sol;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV4, "lib/rain.orderbook.interface/out/IOrderBookV4.sol/IOrderBookV4.json"
+    IOrderBookV5, "lib/rain.orderbook.interface/out/IOrderBookV5.sol/IOrderBookV5.json"
 );
 
 sol!(
@@ -17,4 +17,9 @@ sol!(
     #[allow(clippy::too_many_arguments)]
     #[derive(serde::Serialize, serde::Deserialize)]
     IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
+);
+
+sol!(
+    #![sol(all_derives = true)]
+    LibDecimalFloat, "lib/rain.orderbook.interface/out/LibDecimalFloat.sol/LibDecimalFloat.json"
 );

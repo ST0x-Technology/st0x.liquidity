@@ -1,19 +1,19 @@
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 
-use crate::bindings::IOrderBookV4::{TakeOrderConfigV3, TakeOrderV2};
+use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
-    /// Creates OnchainTrade directly from TakeOrderV2 blockchain events
+    /// Creates OnchainTrade directly from TakeOrderV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
     pub async fn try_from_take_order_if_target_owner<P: Provider>(
         cache: &SymbolCache,
         provider: P,
-        event: TakeOrderV2,
+        event: TakeOrderV3,
         log: Log,
         target_order_owner: alloy::primitives::Address,
         feed_id_cache: &FeedIdCache,
@@ -22,20 +22,17 @@ impl OnchainTrade {
             return Ok(None);
         }
 
-        let TakeOrderConfigV3 {
+        let TakeOrderConfigV4 {
             order,
             inputIOIndex,
             outputIOIndex,
             signedContext: _,
         } = event.config;
 
-        let input_index = usize::try_from(inputIOIndex)?;
-        let output_index = usize::try_from(outputIOIndex)?;
-
         let fill = OrderFill {
-            input_index,
+            input_index: usize::try_from(inputIOIndex)?,
             input_amount: event.input,
-            output_index,
+            output_index: usize::try_from(outputIOIndex)?,
             output_amount: event.output,
         };
 
@@ -47,24 +44,23 @@ impl OnchainTrade {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4::{SignedContextV1, TakeOrderConfigV3, TakeOrderV2};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
+    use crate::bindings::IOrderBookV5::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
-    use alloy::hex;
-    use alloy::primitives::{U256, address, fixed_bytes};
+    use alloy::primitives::{B256, U256, address, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::sol_types::SolCall;
-    use std::str::FromStr;
+    use rain_math_float::Float;
 
     fn create_take_order_event_with_order(
-        order: crate::bindings::IOrderBookV4::OrderV3,
-    ) -> TakeOrderV2 {
-        TakeOrderV2 {
+        order: crate::bindings::IOrderBookV5::OrderV4,
+    ) -> TakeOrderV3 {
+        TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -74,14 +70,19 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from(100_000_000u64), // 100 USDC (6 decimals)
-            output: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 decimals)
+            input: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+                .unwrap()
+                .get_inner(),
+
+            output: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+                .unwrap()
+                .get_inner(),
         }
     }
 
-    fn mocked_receipt_hex(tx_hash: alloy::primitives::FixedBytes<32>) -> serde_json::Value {
+    fn mocked_receipt_hex(tx_hash: B256) -> serde_json::Value {
         serde_json::json!({
-            "transactionHash": hex::encode_prefixed(tx_hash),
+            "transactionHash": tx_hash,
             "transactionIndex": "0x1",
             "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
             "blockNumber": "0x1",
@@ -111,9 +112,13 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -177,11 +182,11 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
-                inputIOIndex: U256::from(1), // Different indices
+                inputIOIndex: U256::from(1),
                 outputIOIndex: U256::from(0),
                 signedContext: vec![SignedContextV1 {
                     signer: address!("0x0000000000000000000000000000000000000000"),
@@ -189,8 +194,12 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from_str("5000000000000000000").unwrap(), // 5 shares (18 decimals)
-            output: U256::from(50_000_000u64),                     // 50 USDC (6 decimals)
+            input: Float::from_fixed_decimal_lossy(uint!(5_U256), 0)
+                .unwrap()
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(50_U256), 0)
+                .unwrap()
+                .get_inner(),
         };
 
         let log = get_test_log();
@@ -200,9 +209,13 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -232,9 +245,9 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -244,8 +257,12 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from(200_000_000u64), // 200 USDC
-            output: U256::from_str("15000000000000000000").unwrap(), // 15 shares
+            input: Float::from_fixed_decimal_lossy(uint!(200_U256), 0)
+                .unwrap()
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(15_U256), 0)
+                .unwrap()
+                .get_inner(),
         };
 
         let log = get_test_log();
@@ -255,9 +272,13 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -289,9 +310,9 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        let take_event = TakeOrderV3 {
             sender: address!("0x3333333333333333333333333333333333333333"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(0),
                 outputIOIndex: U256::from(1),
@@ -301,8 +322,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::ZERO,  // Zero input
-            output: U256::ZERO, // Zero output
+            input: alloy::primitives::B256::ZERO,  // Zero input
+            output: alloy::primitives::B256::ZERO, // Zero output
         };
 
         let log = get_test_log();
@@ -312,9 +333,13 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -342,9 +367,16 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
-        let take_event = TakeOrderV2 {
+        // Helper to create Float for testing using from_fixed_decimal_lossy
+        fn create_float(value: u64, decimals: u8) -> alloy::primitives::B256 {
+            let u256_value = U256::from(value);
+            let float = Float::from_fixed_decimal_lossy(u256_value, decimals).expect("valid Float");
+            float.get_inner()
+        }
+
+        let take_event = TakeOrderV3 {
             sender: address!("0x4444444444444444444444444444444444444444"),
-            config: TakeOrderConfigV3 {
+            config: TakeOrderConfigV4 {
                 order,
                 inputIOIndex: U256::from(99), // Invalid index (order only has 2 IOs)
                 outputIOIndex: U256::from(1),
@@ -354,8 +386,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: U256::from(100_000_000u64),
-            output: U256::from_str("9000000000000000000").unwrap(),
+            input: create_float(100_000_000, 0),
+            output: create_float(9_000_000_000_000_000_000, 18),
         };
 
         let log = get_test_log();
