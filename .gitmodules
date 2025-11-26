@@ -1,6 +1,3 @@
-[submodule "lib/rain.orderbook.interface"]
-	path = lib/rain.orderbook.interface
-	url = https://github.com/rainlanguage/rain.orderbook.interface
 [submodule "lib/forge-std"]
 	path = lib/forge-std
 	url = https://github.com/foundry-rs/forge-std
