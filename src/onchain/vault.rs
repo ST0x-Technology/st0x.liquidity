@@ -1,10 +1,21 @@
-use alloy::primitives::{Address, TxHash, U256};
+//! Rain OrderBook V4 vault operations on Base.
+//!
+//! This module provides a service layer for depositing and withdrawing tokens to/from
+//! Rain OrderBook vaults using the `deposit2` and `withdraw2` contract functions.
+//!
+//! The primary use case is USDC vault management for inventory rebalancing in the
+//! market making system.
+
+use alloy::primitives::{Address, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 
 use crate::bindings::IOrderBookV4;
 use crate::cctp::EvmAccount;
 
+const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+
+/// Vault identifier for Rain OrderBook vaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VaultId(pub(crate) U256);
 
@@ -20,6 +31,22 @@ pub(crate) enum VaultError {
     ZeroAmount,
 }
 
+/// Service for managing Rain OrderBook vault operations.
+///
+/// # Example
+///
+/// ```ignore
+/// let account = EvmAccount::new(provider, signer);
+/// let service = VaultService::new(account, orderbook_address);
+///
+/// // Deposit USDC to vault
+/// let vault_id = VaultId(U256::from(1));
+/// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
+/// service.deposit_usdc(vault_id, amount).await?;
+///
+/// // Withdraw USDC from vault
+/// service.withdraw_usdc(vault_id, amount).await?;
+/// ```
 pub(crate) struct VaultService<P, S>
 where
     P: Provider + Clone,
@@ -38,6 +65,18 @@ where
         Self { account, orderbook }
     }
 
+    /// Deposits tokens to a Rain OrderBook vault.
+    ///
+    /// # Parameters
+    ///
+    /// * `token` - ERC20 token address to deposit
+    /// * `vault_id` - Target vault identifier
+    /// * `amount` - Amount of tokens to deposit (in token's base units)
+    ///
+    /// # Errors
+    ///
+    /// Returns `VaultError::ZeroAmount` if amount is zero.
+    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
     pub(crate) async fn deposit(
         &self,
         token: Address,
@@ -62,6 +101,18 @@ where
         Ok(receipt.transaction_hash)
     }
 
+    /// Withdraws tokens from a Rain OrderBook vault.
+    ///
+    /// # Parameters
+    ///
+    /// * `token` - ERC20 token address to withdraw
+    /// * `vault_id` - Source vault identifier
+    /// * `target_amount` - Target amount of tokens to withdraw (in token's base units)
+    ///
+    /// # Errors
+    ///
+    /// Returns `VaultError::ZeroAmount` if target_amount is zero.
+    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
     pub(crate) async fn withdraw(
         &self,
         token: Address,
@@ -84,6 +135,38 @@ where
             .await?;
 
         Ok(receipt.transaction_hash)
+    }
+
+    /// Deposits USDC to a Rain OrderBook vault on Base.
+    ///
+    /// Convenience method that calls `deposit` with the Base USDC address.
+    ///
+    /// # Parameters
+    ///
+    /// * `vault_id` - Target vault identifier
+    /// * `amount` - Amount of USDC to deposit (in USDC's base units, 6 decimals)
+    pub(crate) async fn deposit_usdc(
+        &self,
+        vault_id: VaultId,
+        amount: U256,
+    ) -> Result<TxHash, VaultError> {
+        self.deposit(USDC_BASE, vault_id, amount).await
+    }
+
+    /// Withdraws USDC from a Rain OrderBook vault on Base.
+    ///
+    /// Convenience method that calls `withdraw` with the Base USDC address.
+    ///
+    /// # Parameters
+    ///
+    /// * `vault_id` - Source vault identifier
+    /// * `target_amount` - Target amount of USDC to withdraw (in USDC's base units, 6 decimals)
+    pub(crate) async fn withdraw_usdc(
+        &self,
+        vault_id: VaultId,
+        target_amount: U256,
+    ) -> Result<TxHash, VaultError> {
+        self.withdraw(USDC_BASE, vault_id, target_amount).await
     }
 }
 
@@ -219,5 +302,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(vault_balance_after, deposit_amount - withdraw_amount);
+    }
+
+    #[test]
+    fn usdc_base_address_is_correct() {
+        assert_eq!(
+            USDC_BASE,
+            address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+        );
     }
 }
