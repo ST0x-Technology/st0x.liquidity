@@ -151,7 +151,7 @@ Wrote comprehensive tests for deposit functionality:
 
 ## Task 5. Implement and test withdraw functionality
 
-- [ ] Implement `withdraw` method:
+- [x] Implement `withdraw` method:
   ```rust
   pub async fn withdraw(
       &self,
@@ -163,15 +163,33 @@ Wrote comprehensive tests for deposit functionality:
   - Validate target_amount is non-zero
   - Call `IOrderBookV4::withdraw2` with empty tasks array
   - Get transaction receipt before returning
-- [ ] Write integration test: `test_withdraw_succeeds_with_deployed_contract`
+- [x] Write integration test: `test_withdraw_succeeds_with_deployed_contract`
   - Use LocalEvm to set up test environment
   - Deposit tokens first to create vault balance
   - Call withdraw via VaultService
   - Verify transaction succeeds
   - Query vault balance and verify it decreased correctly
-- [ ] Write unit test: `withdraw_rejects_zero_amount`
+- [x] Write unit test: `withdraw_rejects_zero_amount`
   - Assert `VaultError::ZeroAmount` without contract call
-- [ ] Run `cargo test -q` and `cargo clippy`
+- [x] Run `cargo test -q` and `cargo clippy`
+
+### Completed Changes
+
+Implemented withdraw functionality with comprehensive tests:
+
+- Implemented `withdraw` method in `VaultService`:
+  - Validates target_amount is non-zero
+  - Calls `IOrderBookV4::withdraw2` with empty tasks array
+  - Returns transaction hash after getting receipt
+- Wrote `withdraw_rejects_zero_amount` test:
+  - Verifies `VaultError::ZeroAmount` is returned for zero amount
+- Wrote `test_withdraw_succeeds_with_deployed_contract` integration test:
+  - Deposits 1000 tokens to vault first
+  - Withdraws 500 tokens via VaultService
+  - Verifies vault balance decreased from 1000 to 500 tokens
+  - Verifies transaction hash is non-zero
+- All 4 vault tests pass (2 deposit + 2 withdraw)
+- Clippy passes with no errors
 
 ## Task 6. Add and test USDC convenience methods
 
