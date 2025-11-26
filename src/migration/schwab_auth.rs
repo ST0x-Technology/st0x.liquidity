@@ -1,7 +1,7 @@
 use chrono::Utc;
-use cqrs_es::{Aggregate, DomainEvent};
+use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::schwab::{EncryptedToken, SchwabAuth, SchwabAuthEvent};
+use st0x_broker::schwab::{EncryptedToken, SchwabAuth, SchwabAuthCommand};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
@@ -16,6 +16,7 @@ struct SchwabAuthRow {
 
 pub async fn migrate_schwab_auth(
     pool: &SqlitePool,
+    cqrs: &SqliteCqrs<SchwabAuth>,
     execution: ExecutionMode,
 ) -> Result<bool, MigrationError> {
     let row = sqlx::query_as::<_, SchwabAuthRow>(
@@ -37,7 +38,7 @@ pub async fn migrate_schwab_auth(
     let refresh_token: EncryptedToken =
         serde_json::from_str(&format!("\"{}\"", row.refresh_token))?;
 
-    let event = SchwabAuthEvent::TokensStored {
+    let command = SchwabAuthCommand::Migrate {
         access_token,
         access_token_fetched_at: row.access_token_fetched_at,
         refresh_token,
@@ -48,7 +49,7 @@ pub async fn migrate_schwab_auth(
 
     match execution {
         ExecutionMode::Commit => {
-            persist_event(pool, aggregate_id, event).await?;
+            cqrs.execute(aggregate_id, command).await?;
         }
         ExecutionMode::DryRun => {}
     }
@@ -57,43 +58,14 @@ pub async fn migrate_schwab_auth(
     Ok(true)
 }
 
-async fn persist_event(
-    pool: &SqlitePool,
-    aggregate_id: &str,
-    event: SchwabAuthEvent,
-) -> Result<(), MigrationError> {
-    let aggregate_type = SchwabAuth::aggregate_type();
-    let event_type = event.event_type();
-    let event_version = event.event_version();
-    let payload = serde_json::to_string(&event)?;
-
-    sqlx::query(
-        "INSERT INTO events (
-            aggregate_type,
-            aggregate_id,
-            sequence,
-            event_type,
-            event_version,
-            payload,
-            metadata
-        )
-        VALUES (?, ?, 1, ?, ?, ?, '{}')",
-    )
-    .bind(&aggregate_type)
-    .bind(aggregate_id)
-    .bind(&event_type)
-    .bind(&event_version)
-    .bind(&payload)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::b256;
     use chrono::Utc;
+    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
+
+    use st0x_broker::schwab::EncryptionKey;
 
     use super::{ExecutionMode, migrate_schwab_auth};
 
@@ -101,6 +73,10 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool
+    }
+
+    fn create_test_key() -> EncryptionKey {
+        b256!("0x0000000000000000000000000000000000000000000000000000000000000000")
     }
 
     async fn insert_test_schwab_auth(pool: &SqlitePool, access_token: &str, refresh_token: &str) {
@@ -131,8 +107,10 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_schwab_auth_empty() {
         let pool = create_test_pool().await;
+        let encryption_key = create_test_key();
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
 
-        let migrated = migrate_schwab_auth(&pool, ExecutionMode::Commit)
+        let migrated = migrate_schwab_auth(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -149,13 +127,15 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_schwab_auth_with_tokens() {
         let pool = create_test_pool().await;
+        let encryption_key = create_test_key();
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
 
         let access_hex = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
         let refresh_hex = "0x2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
 
         insert_test_schwab_auth(&pool, access_hex, refresh_hex).await;
 
-        let migrated = migrate_schwab_auth(&pool, ExecutionMode::Commit)
+        let migrated = migrate_schwab_auth(&pool, &cqrs, ExecutionMode::Commit)
             .await
             .unwrap();
 
@@ -191,13 +171,15 @@ mod tests {
     #[tokio::test]
     async fn test_migrate_schwab_auth_dry_run() {
         let pool = create_test_pool().await;
+        let encryption_key = create_test_key();
+        let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
 
         let access_hex = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
         let refresh_hex = "0x2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40";
 
         insert_test_schwab_auth(&pool, access_hex, refresh_hex).await;
 
-        let migrated = migrate_schwab_auth(&pool, ExecutionMode::DryRun)
+        let migrated = migrate_schwab_auth(&pool, &cqrs, ExecutionMode::DryRun)
             .await
             .unwrap();
 
