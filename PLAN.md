@@ -57,7 +57,59 @@ Created `src/onchain/vault.rs` with:
 Build and clippy checks pass with only expected dead_code warnings for unused
 types.
 
-## Task 2. Implement and test deposit functionality
+## Task 2. Update bindings to use rain.orderbook submodule
+
+- [x] Update `src/bindings.rs` to reference OrderBook from
+      `lib/rain.orderbook/out/OrderBook.sol/OrderBook.json`
+- [x] Verify `nix run .#prepSolArtifacts` builds artifacts correctly
+- [x] Run `cargo build` to ensure bindings compile
+- [x] Run `cargo clippy`
+
+### Completed Changes
+
+Updated bindings to reference the full OrderBook contract from rain.orderbook
+submodule:
+
+- Modified `flake.nix` line 23 to build rain.orderbook instead of
+  rain.orderbook.interface
+- Updated `src/bindings.rs` to reference
+  `lib/rain.orderbook/out/OrderBook.sol/OrderBook.json`
+- Ran `nix run .#prepSolArtifacts` to build artifacts (compilation succeeded in
+  138.52s, linting error from rain.interpreter dependency is ignorable)
+- Verified bindings compile successfully with cargo build and clippy
+
+## Task 3. Create LocalEvm test infrastructure
+
+- [x] Create `src/onchain/vault/test_utils.rs` module
+- [x] Implement `LocalEvm` struct:
+  - Spawn Anvil instance
+  - Deploy OrderBook contract from artifacts
+  - Deploy mock ERC20 token
+  - Store provider, signer, contract instances
+  - Implement helper methods for minting and approving tokens
+- [x] Export test_utils module behind `#[cfg(test)]`
+- [x] Run `cargo test -q` to verify setup compiles
+
+### Completed Changes
+
+Created comprehensive LocalEvm test infrastructure:
+
+- Used existing Token contract artifact from
+  lib/rain.orderbook/out/ArbTest.sol/Token.json for test ERC20
+- Added TestERC20 binding in bindings.rs pointing to Token.json artifact
+- Created src/onchain/vault/test_utils.rs with:
+  - LocalEvm struct with Anvil instance, provider, signer, and deployed contract
+    addresses
+  - new() method that spawns Anvil, deploys OrderBook and TestERC20 contracts
+  - Helper methods: mint_tokens, approve_tokens, get_balance, get_vault_balance
+  - LocalEvmError with proper error propagation using #[from] and #[source]
+  - Concrete type alias LocalEvmProvider for the complex Fill Provider type
+    chain
+- All errors properly propagated using `?` operator without string formatting
+- All 404 tests pass
+- Clippy passes
+
+## Task 4. Implement and test deposit functionality
 
 - [x] Implement `deposit` method:
   ```rust
@@ -71,27 +123,33 @@ types.
   - Validate amount is non-zero
   - Call `IOrderBookV4::deposit2` with empty tasks array
   - Get transaction receipt before returning
-- [x] Create `#[cfg(test)] mod tests` module
-- [x] Write test: `deposit_rejects_zero_amount`
-  - Assert `VaultError::ZeroAmount` returned
-  - Verify no contract call made
+- [x] Write integration test: `test_deposit_succeeds_with_deployed_contract`
+  - Use LocalEvm to set up test environment
+  - Mint tokens to test account
+  - Approve orderbook to spend tokens
+  - Call deposit via VaultService
+  - Verify transaction succeeds
+  - Query vault balance and verify it increased correctly
+- [x] Write unit test: `deposit_rejects_zero_amount`
+  - Assert `VaultError::ZeroAmount` without contract call
 - [x] Run `cargo test -q` and `cargo clippy`
 
 ### Completed Changes
 
-Implemented deposit method with:
+Wrote comprehensive tests for deposit functionality:
 
-- Zero amount validation that returns early with `VaultError::ZeroAmount`
-- Contract call to `IOrderBookV4::deposit2` with empty tasks array
-- Transaction receipt retrieval before returning hash
-- Test for zero amount rejection
+- Updated `deposit_rejects_zero_amount` test to use LocalEvm instead of mocks
+- Wrote `test_deposit_succeeds_with_deployed_contract` integration test that:
+  - Deploys real OrderBook and ERC20 contracts via LocalEvm
+  - Approves orderbook to spend tokens
+  - Calls deposit via VaultService
+  - Verifies vault balance before deposit is zero
+  - Verifies vault balance after deposit equals deposited amount
+  - Verifies transaction hash is non-zero
+- Both tests pass (2/2 passed in 1.66s)
+- Clippy passes with no errors
 
-Note: Full contract call mocking tests omitted due to complexity of mocking
-alloy's contract send/receipt flow. Zero amount validation test verifies the
-critical business logic, and the implementation follows the proven pattern from
-cctp.rs.
-
-## Task 3. Implement and test withdraw functionality
+## Task 5. Implement and test withdraw functionality
 
 - [ ] Implement `withdraw` method:
   ```rust
@@ -105,16 +163,17 @@ cctp.rs.
   - Validate target_amount is non-zero
   - Call `IOrderBookV4::withdraw2` with empty tasks array
   - Get transaction receipt before returning
-- [ ] Write test: `withdraw_succeeds_with_valid_parameters`
-  - Mock successful withdrawal transaction
-  - Verify correct contract parameters
-- [ ] Write test: `withdraw_rejects_zero_amount`
-  - Assert `VaultError::ZeroAmount` returned
-- [ ] Write test: `withdraw_propagates_transaction_error`
-  - Mock transaction failure, verify wrapped correctly
+- [ ] Write integration test: `test_withdraw_succeeds_with_deployed_contract`
+  - Use LocalEvm to set up test environment
+  - Deposit tokens first to create vault balance
+  - Call withdraw via VaultService
+  - Verify transaction succeeds
+  - Query vault balance and verify it decreased correctly
+- [ ] Write unit test: `withdraw_rejects_zero_amount`
+  - Assert `VaultError::ZeroAmount` without contract call
 - [ ] Run `cargo test -q` and `cargo clippy`
 
-## Task 4. Add and test USDC convenience methods
+## Task 6. Add and test USDC convenience methods
 
 - [ ] Define constant:
       `USDC_BASE: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")`

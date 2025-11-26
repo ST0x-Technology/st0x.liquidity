@@ -64,30 +64,71 @@ where
 }
 
 #[cfg(test)]
+mod test_utils;
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
-    use alloy::providers::ProviderBuilder;
-    use alloy::providers::mock::Asserter;
-    use alloy::signers::local::PrivateKeySigner;
+    use test_utils::LocalEvm;
 
-    const TEST_ORDERBOOK: Address = address!("1234567890123456789012345678901234567890");
-    const TEST_TOKEN: Address = address!("0000000000000000000000000000000000000001");
     const TEST_VAULT_ID: u64 = 1;
 
     #[tokio::test]
     async fn deposit_rejects_zero_amount() {
-        let asserter = Asserter::new();
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let signer = PrivateKeySigner::random();
+        let local_evm = LocalEvm::new().await.unwrap();
 
-        let account = EvmAccount::new(provider, signer);
-        let service = VaultService::new(account, TEST_ORDERBOOK);
+        let account = EvmAccount::new(local_evm.provider.clone(), local_evm.signer.clone());
+        let service = VaultService::new(account, local_evm.orderbook_address);
 
         let result = service
-            .deposit(TEST_TOKEN, VaultId(U256::from(TEST_VAULT_ID)), U256::ZERO)
+            .deposit(
+                local_evm.token_address,
+                VaultId(U256::from(TEST_VAULT_ID)),
+                U256::ZERO,
+            )
             .await;
 
         assert!(matches!(result.unwrap_err(), VaultError::ZeroAmount));
+    }
+
+    #[tokio::test]
+    async fn test_deposit_succeeds_with_deployed_contract() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let vault_id = VaultId(U256::from(TEST_VAULT_ID));
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+
+        let account = EvmAccount::new(local_evm.provider.clone(), local_evm.signer.clone());
+        let service = VaultService::new(account, local_evm.orderbook_address);
+
+        let vault_balance_before = local_evm
+            .get_vault_balance(local_evm.token_address, vault_id.0)
+            .await
+            .unwrap();
+
+        assert_eq!(vault_balance_before, U256::ZERO);
+
+        let tx_hash = service
+            .deposit(local_evm.token_address, vault_id, deposit_amount)
+            .await
+            .unwrap();
+
+        assert!(!tx_hash.is_zero());
+
+        let vault_balance_after = local_evm
+            .get_vault_balance(local_evm.token_address, vault_id.0)
+            .await
+            .unwrap();
+
+        assert_eq!(vault_balance_after, deposit_amount);
     }
 }
