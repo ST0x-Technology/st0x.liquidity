@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 const NONCE_SIZE: usize = 12;
 
-pub(crate) type EncryptionKey = FixedBytes<32>;
+pub type EncryptionKey = FixedBytes<32>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedToken(#[serde(with = "alloy::hex")] Vec<u8>);
@@ -33,7 +33,7 @@ impl From<Vec<u8>> for EncryptedToken {
     }
 }
 
-pub(crate) fn encrypt_token(
+pub fn encrypt_token(
     key: &EncryptionKey,
     plaintext: &str,
 ) -> Result<EncryptedToken, EncryptionError> {
@@ -56,7 +56,7 @@ pub(crate) fn encrypt_token(
     Ok(EncryptedToken::new(combined))
 }
 
-pub(crate) fn decrypt_token(
+pub fn decrypt_token(
     key: &EncryptionKey,
     token: &EncryptedToken,
 ) -> Result<String, EncryptionError> {

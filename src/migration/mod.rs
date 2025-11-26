@@ -3,6 +3,7 @@ mod onchain_trade;
 mod position;
 mod schwab_auth;
 
+use alloy::primitives::FixedBytes;
 use clap::{Parser, ValueEnum};
 use cqrs_es::AggregateError;
 use sqlite_es::sqlite_cqrs;
@@ -17,6 +18,7 @@ use offchain_order::migrate_offchain_orders;
 use onchain_trade::migrate_onchain_trades;
 use position::migrate_positions;
 use schwab_auth::migrate_schwab_auth;
+use st0x_broker::schwab::{EncryptionError, SchwabAuthError};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -43,6 +45,13 @@ pub struct MigrationEnv {
         help = "SQLite database path (or set DATABASE_URL env var)"
     )]
     pub database_url: String,
+
+    #[clap(
+        long,
+        env = "ENCRYPTION_KEY",
+        help = "Encryption key for Schwab auth tokens (or set ENCRYPTION_KEY env var)"
+    )]
+    pub encryption_key: FixedBytes<32>,
 
     #[clap(
         long,
@@ -99,6 +108,10 @@ enum MigrationError {
     PositionAggregate(#[from] AggregateError<PositionError>),
     #[error("OffchainOrder aggregate error: {0}")]
     OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
+    #[error("SchwabAuth aggregate error: {0}")]
+    SchwabAuthAggregate(#[from] AggregateError<SchwabAuthError>),
+    #[error("Encryption error: {0}")]
+    Encryption(#[from] EncryptionError),
 }
 
 #[derive(Debug, Default)]
@@ -154,12 +167,13 @@ pub async fn run_migration(
     let onchain_trade_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let position_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let offchain_order_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    let schwab_auth_cqrs = sqlite_cqrs(pool.clone(), vec![], env.encryption_key);
 
     let onchain_trades = migrate_onchain_trades(pool, &onchain_trade_cqrs, env.execution).await?;
     let positions = migrate_positions(pool, &position_cqrs, env.execution).await?;
     let offchain_orders =
         migrate_offchain_orders(pool, &offchain_order_cqrs, env.execution).await?;
-    let schwab_auth = migrate_schwab_auth(pool, env.execution).await?;
+    let schwab_auth = migrate_schwab_auth(pool, &schwab_auth_cqrs, env.execution).await?;
 
     Ok(MigrationSummary {
         onchain_trades,
@@ -239,7 +253,7 @@ async fn clean_events(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{TxHash, b256};
+    use alloy::primitives::{FixedBytes, TxHash, b256};
     use chrono;
     use sqlx::SqlitePool;
 
@@ -247,6 +261,10 @@ mod tests {
         CleanMode, ConfirmationMode, ExecutionMode, MigrationEnv, check_existing_events,
         clean_events, run_migration,
     };
+
+    fn create_test_encryption_key() -> FixedBytes<32> {
+        b256!("0x0000000000000000000000000000000000000000000000000000000000000000")
+    }
     use crate::onchain_trade::OnChainTrade;
 
     async fn create_test_pool() -> SqlitePool {
@@ -363,6 +381,7 @@ mod tests {
 
         let env = MigrationEnv {
             database_url: ":memory:".to_string(),
+            encryption_key: create_test_encryption_key(),
             confirmation: ConfirmationMode::Force,
             clean: CleanMode::Preserve,
             execution: ExecutionMode::DryRun,
@@ -393,6 +412,7 @@ mod tests {
 
         let env = MigrationEnv {
             database_url: ":memory:".to_string(),
+            encryption_key: create_test_encryption_key(),
             confirmation: ConfirmationMode::Force,
             clean: CleanMode::Preserve,
             execution: ExecutionMode::Commit,
@@ -440,6 +460,7 @@ mod tests {
 
         let env = MigrationEnv {
             database_url: ":memory:".to_string(),
+            encryption_key: create_test_encryption_key(),
             confirmation: ConfirmationMode::Force,
             clean: CleanMode::Delete,
             execution: ExecutionMode::Commit,
@@ -533,6 +554,7 @@ mod tests {
 
         let env = MigrationEnv {
             database_url: ":memory:".to_string(),
+            encryption_key: create_test_encryption_key(),
             confirmation: ConfirmationMode::Force,
             clean: CleanMode::Preserve,
             execution: ExecutionMode::Commit,

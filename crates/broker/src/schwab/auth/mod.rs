@@ -10,7 +10,7 @@ mod event;
 mod oauth;
 pub(crate) mod view;
 
-pub use cmd::SchwabAuthCommand;
+pub use cmd::{AccessToken, RefreshToken, SchwabAuthCommand};
 pub use event::SchwabAuthEvent;
 pub use oauth::SchwabAuthEnv;
 
@@ -51,14 +51,25 @@ impl Aggregate for SchwabAuth {
         encryption_key: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match command {
+            SchwabAuthCommand::Migrate {
+                access_token,
+                access_token_fetched_at,
+                refresh_token,
+                refresh_token_fetched_at,
+            } => Ok(vec![SchwabAuthEvent::TokensStored {
+                access_token,
+                access_token_fetched_at,
+                refresh_token,
+                refresh_token_fetched_at,
+            }]),
             SchwabAuthCommand::StoreTokens {
                 access_token,
                 refresh_token,
             } => {
                 let now = Utc::now();
 
-                let encrypted_access = encrypt_token(encryption_key, &access_token)?;
-                let encrypted_refresh = encrypt_token(encryption_key, &refresh_token)?;
+                let encrypted_access = encrypt_token(encryption_key, access_token.as_str())?;
+                let encrypted_refresh = encrypt_token(encryption_key, refresh_token.as_str())?;
 
                 Ok(vec![SchwabAuthEvent::TokensStored {
                     access_token: encrypted_access,
@@ -74,7 +85,7 @@ impl Aggregate for SchwabAuth {
 
                 let now = Utc::now();
 
-                let encrypted_access = encrypt_token(encryption_key, &new_access_token)?;
+                let encrypted_access = encrypt_token(encryption_key, new_access_token.as_str())?;
 
                 Ok(vec![SchwabAuthEvent::AccessTokenRefreshed {
                     access_token: encrypted_access,
@@ -135,8 +146,8 @@ mod tests {
         let aggregate = SchwabAuth::NotAuthenticated;
         let encryption_key = create_test_key();
         let command = SchwabAuthCommand::StoreTokens {
-            access_token: "test_access_token".to_string(),
-            refresh_token: "test_refresh_token".to_string(),
+            access_token: cmd::AccessToken::new("test_access_token".to_string()),
+            refresh_token: cmd::RefreshToken::new("test_refresh_token".to_string()),
         };
 
         let events = aggregate.handle(command, &encryption_key).await.unwrap();
@@ -217,7 +228,7 @@ mod tests {
         };
 
         let command = SchwabAuthCommand::RefreshAccessToken {
-            new_access_token: "new_access".to_string(),
+            new_access_token: cmd::AccessToken::new("new_access".to_string()),
         };
 
         let events = aggregate.handle(command, &encryption_key).await.unwrap();
@@ -245,7 +256,7 @@ mod tests {
         let aggregate = SchwabAuth::NotAuthenticated;
         let encryption_key = create_test_key();
         let command = SchwabAuthCommand::RefreshAccessToken {
-            new_access_token: "new_access".to_string(),
+            new_access_token: cmd::AccessToken::new("new_access".to_string()),
         };
 
         let result = aggregate.handle(command, &encryption_key).await;
