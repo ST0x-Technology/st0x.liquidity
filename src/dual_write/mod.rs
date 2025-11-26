@@ -1,9 +1,15 @@
+use alloy::primitives::TxHash;
+use cqrs_es::AggregateError;
 use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
 
-use crate::offchain_order::OffchainOrder;
-use crate::onchain_trade::OnChainTrade;
-use crate::position::Position;
+use crate::offchain_order::{OffchainOrder, OffchainOrderError};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
+use crate::position::{Position, PositionError};
+
+mod onchain_trade;
+
+pub(crate) use onchain_trade::emit_trade_filled;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DualWriteError {
@@ -15,6 +21,14 @@ pub(crate) enum DualWriteError {
     IntConversion(#[from] std::num::TryFromIntError),
     #[error("Decimal conversion error: {0}")]
     DecimalConversion(#[from] rust_decimal::Error),
+    #[error("OnChainTrade aggregate error: {0}")]
+    OnChainTradeAggregate(#[from] AggregateError<OnChainTradeError>),
+    #[error("Position aggregate error: {0}")]
+    PositionAggregate(#[from] AggregateError<PositionError>),
+    #[error("OffchainOrder aggregate error: {0}")]
+    OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
+    #[error("Missing block timestamp for trade: tx_hash={tx_hash:?}, log_index={log_index}")]
+    MissingBlockTimestamp { tx_hash: TxHash, log_index: u64 },
 }
 
 pub(crate) struct DualWriteContext {
