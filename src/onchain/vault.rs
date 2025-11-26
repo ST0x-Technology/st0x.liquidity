@@ -61,6 +61,30 @@ where
 
         Ok(receipt.transaction_hash)
     }
+
+    pub(crate) async fn withdraw(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        target_amount: U256,
+    ) -> Result<TxHash, VaultError> {
+        if target_amount.is_zero() {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        let contract = IOrderBookV4::new(self.orderbook, &self.account.provider);
+
+        let tasks = Vec::new();
+
+        let receipt = contract
+            .withdraw2(token, vault_id.0, target_amount, tasks)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(receipt.transaction_hash)
+    }
 }
 
 #[cfg(test)]
@@ -130,5 +154,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(vault_balance_after, deposit_amount);
+    }
+
+    #[tokio::test]
+    async fn withdraw_rejects_zero_amount() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        let account = EvmAccount::new(local_evm.provider.clone(), local_evm.signer.clone());
+        let service = VaultService::new(account, local_evm.orderbook_address);
+
+        let result = service
+            .withdraw(
+                local_evm.token_address,
+                VaultId(U256::from(TEST_VAULT_ID)),
+                U256::ZERO,
+            )
+            .await;
+
+        assert!(matches!(result.unwrap_err(), VaultError::ZeroAmount));
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_succeeds_with_deployed_contract() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let withdraw_amount = U256::from(500) * U256::from(10).pow(U256::from(18));
+        let vault_id = VaultId(U256::from(TEST_VAULT_ID));
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+
+        let account = EvmAccount::new(local_evm.provider.clone(), local_evm.signer.clone());
+        let service = VaultService::new(account, local_evm.orderbook_address);
+
+        service
+            .deposit(local_evm.token_address, vault_id, deposit_amount)
+            .await
+            .unwrap();
+
+        let vault_balance_before = local_evm
+            .get_vault_balance(local_evm.token_address, vault_id.0)
+            .await
+            .unwrap();
+
+        assert_eq!(vault_balance_before, deposit_amount);
+
+        let tx_hash = service
+            .withdraw(local_evm.token_address, vault_id, withdraw_amount)
+            .await
+            .unwrap();
+
+        assert!(!tx_hash.is_zero());
+
+        let vault_balance_after = local_evm
+            .get_vault_balance(local_evm.token_address, vault_id.0)
+            .await
+            .unwrap();
+
+        assert_eq!(vault_balance_after, deposit_amount - withdraw_amount);
     }
 }
