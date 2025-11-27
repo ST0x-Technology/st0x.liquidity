@@ -135,18 +135,19 @@ Implement the `Aggregate` trait with business logic and comprehensive tests.
 
 **Subtasks:**
 
-- [ ] In `src/tokenized_equity_mint/mod.rs`, implement `Aggregate` trait:
+- [x] In `src/tokenized_equity_mint/mod.rs`, implement `Aggregate` trait:
   - `aggregate_type()` returns "TokenizedEquityMint"
   - `handle()` validates commands and produces events
   - `apply()` transitions state based on events
-- [ ] Implement business rules in `handle()`:
+- [x] Implement business rules in `handle()`:
   - `RequestMint`: Only from `NotStarted` → emit `MintRequested`
   - `AcknowledgeAcceptance`: Only from `MintRequested` → emit `MintAccepted`
   - `ReceiveTokens`: Only from `MintAccepted` → emit `TokensReceived`
   - `Finalize`: Only from `TokensReceived` → emit `MintCompleted`
   - `Fail`: From any non-terminal state → emit `MintFailed`
-- [ ] Implement state transitions in `apply()` for each event
-- [ ] Write tests in `#[cfg(test)] mod tests`:
+- [x] Implement state transitions in `apply()` for each event (refactored into
+      helper methods)
+- [x] Write tests in `#[cfg(test)] mod tests`:
   - `test_request_mint_from_not_started` - Verify initial request works
   - `test_acknowledge_acceptance_after_request` - Verify acceptance transition
   - `test_receive_tokens_after_acceptance` - Verify token receipt
@@ -160,8 +161,9 @@ Implement the `Aggregate` trait with business logic and comprehensive tests.
   - `test_fail_from_accepted_state` - Verify failure from accepted
   - `test_cannot_fail_when_completed` - Expect `AlreadyCompleted` error
   - `test_cannot_fail_when_already_failed` - Expect `AlreadyFailed` error
-- [ ] Run `cargo test -q` - all TokenizedEquityMint tests must pass
-- [ ] Run `cargo clippy`
+- [x] Run `cargo test -q` - all TokenizedEquityMint tests must pass (12/12 tests
+      passing)
+- [x] Run `cargo clippy` - no warnings for TokenizedEquityMint code
 
 **State Transition Rules:**
 
