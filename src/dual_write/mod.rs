@@ -7,9 +7,11 @@ use crate::offchain_order::{OffchainOrder, OffchainOrderError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
 use crate::position::{NegativePriceCents, Position, PositionError};
 
+mod offchain_order;
 mod onchain_trade;
 mod position;
 
+pub(crate) use offchain_order::{confirm_submission, mark_failed, place_order, record_fill};
 pub(crate) use onchain_trade::witness_trade;
 pub(crate) use position::{
     acknowledge_onchain_fill, complete_offchain_order, fail_offchain_order, place_offchain_order,
