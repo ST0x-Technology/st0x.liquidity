@@ -211,7 +211,8 @@ fn spawn_order_poller<B: Broker + Clone + Send + 'static>(
         poller_config.polling_interval, poller_config.max_jitter
     );
 
-    let poller = OrderStatusPoller::new(poller_config, pool.clone(), broker);
+    let dual_write_context = DualWriteContext::new(pool.clone());
+    let poller = OrderStatusPoller::new(poller_config, pool.clone(), broker, dual_write_context);
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
             error!("Order poller failed: {e}");
