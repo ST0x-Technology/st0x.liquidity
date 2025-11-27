@@ -30,6 +30,9 @@ mod telemetry;
 // TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
 #[allow(dead_code)]
 mod tokenized_equity_mint;
+// TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
+#[allow(dead_code)]
+mod equity_redemption;
 mod trade_execution_link;
 
 pub use telemetry::{TelemetryError, TelemetryGuard};

@@ -206,25 +206,29 @@ events, and aggregate implementation.
 
 **Subtasks:**
 
-- [ ] Create `src/equity_redemption/` directory
-- [ ] Create `src/equity_redemption/mod.rs`:
+- [x] Create `src/equity_redemption/` directory
+- [x] Create `src/equity_redemption/mod.rs`:
   - Import `TokenizationRequestId` from tokenized_equity_mint module
   - Define `EquityRedemption` enum with states: `NotStarted`, `TokensSent`,
     `Pending`, `Completed`, `Failed`
   - Define `EquityRedemptionError` enum with error variants
   - Implement `Default` returning `NotStarted`
+  - Implement `Aggregate` trait with `handle()` and `apply()` methods
+  - Implement helper methods for apply: `apply_tokens_sent`, `apply_detected`,
+    `apply_completed`, `apply_failed`
   - Export types
-- [ ] Create `src/equity_redemption/cmd.rs`:
+- [x] Create `src/equity_redemption/cmd.rs`:
   - Define `EquityRedemptionCommand` enum with variants: `SendTokens`, `Detect`,
     `Complete`, `Fail`
   - Add derives: `Debug`, `Clone`
-- [ ] Create `src/equity_redemption/event.rs`:
+- [x] Create `src/equity_redemption/event.rs`:
   - Define `EquityRedemptionEvent` enum with variants: `TokensSent`, `Detected`,
     `Completed`, `Failed`
   - Add derives: `Debug`, `Clone`, `Serialize`, `Deserialize`, `PartialEq`
-- [ ] Export module in `src/lib.rs`
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy`
+  - Implement `DomainEvent` trait
+- [x] Export module in `src/lib.rs` with TODO(#135) comment
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy` - no errors
 
 **State Definitions:**
 
