@@ -44,8 +44,8 @@ commands, events, and aggregate implementation.
 
 **Subtasks:**
 
-- [ ] Create `src/tokenized_equity_mint/` directory
-- [ ] Create `src/tokenized_equity_mint/mod.rs`:
+- [x] Create `src/tokenized_equity_mint/` directory
+- [x] Create `src/tokenized_equity_mint/mod.rs`:
   - Define `IssuerRequestId(String)`, `TokenizationRequestId(String)`,
     `ReceiptId(U256)` newtypes
   - Define `TokenizedEquityMint` enum with states: `NotStarted`,
@@ -53,17 +53,18 @@ commands, events, and aggregate implementation.
   - Define `TokenizedEquityMintError` enum with error variants
   - Implement `Default` returning `NotStarted`
   - Export types
-- [ ] Create `src/tokenized_equity_mint/cmd.rs`:
+- [x] Create `src/tokenized_equity_mint/cmd.rs`:
   - Define `TokenizedEquityMintCommand` enum with variants: `RequestMint`,
     `AcknowledgeAcceptance`, `ReceiveTokens`, `Finalize`, `Fail`
   - Add derives: `Debug`, `Clone`
-- [ ] Create `src/tokenized_equity_mint/event.rs`:
+- [x] Create `src/tokenized_equity_mint/event.rs`:
   - Define `TokenizedEquityMintEvent` enum with variants: `MintRequested`,
     `MintAccepted`, `TokensReceived`, `MintCompleted`, `MintFailed`
   - Add derives: `Debug`, `Clone`, `Serialize`, `Deserialize`, `PartialEq`
-- [ ] Export module in `src/lib.rs`
-- [ ] Run `cargo build` to verify compilation
-- [ ] Run `cargo clippy`
+  - Implement `DomainEvent` trait
+- [x] Export module in `src/lib.rs`
+- [x] Run `cargo build` to verify compilation
+- [x] Run `cargo clippy`
 
 **State Definitions:**
 
