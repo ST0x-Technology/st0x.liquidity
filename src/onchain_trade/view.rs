@@ -3,7 +3,7 @@ use cqrs_es::{EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, Symbol};
-use tracing::error;
+use tracing::{error, warn};
 
 use super::{OnChainTrade, OnChainTradeEvent, PythPrice};
 
@@ -52,6 +52,7 @@ impl OnChainTradeView {
             filled_at,
         } = event
         else {
+            warn!("handle_filled called with non-Filled event: {event:?}");
             return;
         };
 

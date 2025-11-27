@@ -179,31 +179,25 @@ Create view projection to query aggregate state.
 
 **Subtasks:**
 
-- [ ] Create `src/tokenized_equity_mint/view.rs`
-- [ ] Define `MintStatus` enum: `NotStarted`, `Requested`, `Accepted`,
-      `TokensReceived`, `Completed`, `Failed`
-- [ ] Define `TokenizedEquityMintView` struct with fields:
-  - `mint_id: String`
-  - `symbol: Option<Symbol>`
-  - `quantity: Option<Decimal>`
-  - `wallet: Option<Address>`
-  - `status: MintStatus`
-  - `issuer_request_id: Option<IssuerRequestId>`
-  - `tokenization_request_id: Option<TokenizationRequestId>`
-  - `tx_hash: Option<TxHash>`
-  - `shares_minted: Option<U256>`
-  - `requested_at: Option<DateTime<Utc>>`
-  - `completed_at: Option<DateTime<Utc>>`
-  - `failed_at: Option<DateTime<Utc>>`
-  - `failure_reason: Option<String>`
-- [ ] Implement `View<TokenizedEquityMint>` trait with `update()` method
-- [ ] Update view fields based on each event type
-- [ ] Write tests:
+- [x] Create `src/tokenized_equity_mint/view.rs`
+- [x] Define `TokenizedEquityMintView` enum with state variants:
+  - `NotStarted { mint_id }`
+  - `Requested { mint_id, symbol, quantity, wallet, requested_at }`
+  - `Accepted { ..., issuer_request_id, tokenization_request_id, accepted_at }`
+  - `TokensReceived { ..., tx_hash, receipt_id, shares_minted, received_at }`
+  - `Completed { ..., completed_at }`
+  - `Failed { mint_id, symbol, quantity, wallet, failure_reason, requested_at, failed_at }`
+- [x] Implement `View<TokenizedEquityMint>` trait with `update()` method
+- [x] Use helper methods for state transitions: `handle_mint_requested`,
+      `handle_mint_accepted`, `handle_tokens_received`, `handle_mint_completed`,
+      `handle_mint_failed`
+- [x] Write tests:
   - `test_view_tracks_complete_flow` - Verify view updates through all states
   - `test_view_captures_failure_state` - Verify failure tracking
-- [ ] Export view in module
-- [ ] Run `cargo test -q` - all tests must pass
-- [ ] Run `cargo clippy`
+- [x] Export view in module
+- [x] Run `cargo test -q` - all tests must pass (14/14 tests passing: 12
+      aggregate + 2 view)
+- [x] Run `cargo clippy` - no errors
 
 ## Task 4. Implement EquityRedemption aggregate core types and structure
 

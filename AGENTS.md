@@ -317,6 +317,10 @@ Environment variables (can be set via `.env` file):
   and not hidden behind #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
   logic changes might leave panics in the codebase
+- **Silent Early Returns**: Never silently return in error/mismatch cases.
+  Always log a warning or error with context before early returns in `let-else`
+  or similar patterns. Silent failures hide bugs and make debugging nearly
+  impossible
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the

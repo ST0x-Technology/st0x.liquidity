@@ -8,9 +8,11 @@ use st0x_broker::Symbol;
 
 mod cmd;
 mod event;
+mod view;
 
 pub(crate) use cmd::TokenizedEquityMintCommand;
 pub(crate) use event::TokenizedEquityMintEvent;
+pub(crate) use view::TokenizedEquityMintView;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IssuerRequestId(pub(crate) String);
@@ -473,7 +475,7 @@ mod tests {
                 TokenizedEquityMintCommand::ReceiveTokens {
                     tx_hash,
                     receipt_id: ReceiptId(U256::from(789)),
-                    shares_minted: U256::from(100500000000000000000u128),
+                    shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
                 &(),
             )
@@ -512,7 +514,7 @@ mod tests {
         let received_event = TokenizedEquityMintEvent::TokensReceived {
             tx_hash,
             receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100500000000000000000u128),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
             received_at: Utc::now(),
         };
         aggregate.apply(received_event);
@@ -573,7 +575,7 @@ mod tests {
                 TokenizedEquityMintCommand::ReceiveTokens {
                     tx_hash,
                     receipt_id: ReceiptId(U256::from(789)),
-                    shares_minted: U256::from(100500000000000000000u128),
+                    shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
                 &(),
             )
@@ -635,7 +637,7 @@ mod tests {
                 TokenizedEquityMintCommand::ReceiveTokens {
                     tx_hash: TxHash::random(),
                     receipt_id: ReceiptId(U256::from(789)),
-                    shares_minted: U256::from(100500000000000000000u128),
+                    shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
                 &(),
             )
@@ -769,7 +771,7 @@ mod tests {
         let received_event = TokenizedEquityMintEvent::TokensReceived {
             tx_hash,
             receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100500000000000000000u128),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
             received_at: Utc::now(),
         };
         aggregate.apply(received_event);
