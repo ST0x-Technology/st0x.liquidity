@@ -5,11 +5,15 @@ use sqlx::SqlitePool;
 
 use crate::offchain_order::{OffchainOrder, OffchainOrderError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
-use crate::position::{Position, PositionError};
+use crate::position::{NegativePriceCents, Position, PositionError};
 
 mod onchain_trade;
+mod position;
 
-pub(crate) use onchain_trade::emit_trade_filled;
+pub(crate) use onchain_trade::witness_trade;
+pub(crate) use position::{
+    acknowledge_onchain_fill, complete_offchain_order, fail_offchain_order, place_offchain_order,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DualWriteError {
@@ -29,6 +33,14 @@ pub(crate) enum DualWriteError {
     OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
     #[error("Missing block timestamp for trade: tx_hash={tx_hash:?}, log_index={log_index}")]
     MissingBlockTimestamp { tx_hash: TxHash, log_index: u64 },
+    #[error("Missing execution ID")]
+    MissingExecutionId,
+    #[error(
+        "Invalid order state for execution {execution_id}: expected {expected}, got different state"
+    )]
+    InvalidOrderState { execution_id: i64, expected: String },
+    #[error("Negative price in cents: {0}")]
+    NegativePriceCents(#[from] NegativePriceCents),
 }
 
 pub(crate) struct DualWriteContext {

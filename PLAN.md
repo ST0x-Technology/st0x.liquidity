@@ -425,7 +425,7 @@ Now implement dual-write properly using CqrsFramework.
 **Completed Work:**
 
 - [x] Created `src/dual_write/onchain_trade.rs`
-- [x] Implemented `emit_trade_filled()`:
+- [x] Implemented `witness_trade()` (executes `Witness` command):
   - [x] Parameters: `context: &DualWriteContext`, `trade: &OnchainTrade`,
         `block_number: u64`
   - [x] Converts legacy OnchainTrade fields to command types:
@@ -442,26 +442,27 @@ Now implement dual-write properly using CqrsFramework.
         `context.onchain_trade_framework().execute(&aggregate_id,
         command).await`
   - [x] Returns `Result<(), DualWriteError>`
-- [x] Implemented `log_event_error()` helper for error logging
 - [x] Added `MissingBlockTimestamp` error variant to `DualWriteError`
 - [x] Added aggregate error variants to `DualWriteError`:
   - [x] `OnChainTradeAggregate(#[from] AggregateError<OnChainTradeError>)`
   - [x] `PositionAggregate(#[from] AggregateError<PositionError>)`
   - [x] `OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>)`
 - [x] Added comprehensive integration tests:
-  - [x] `test_emit_trade_filled_success` - Verifies command execution succeeds
-        and event appears in events table
-  - [x] `test_emit_trade_filled_sequence_increments` - Verifies sequence numbers
-        are correct
-  - [x] `test_emit_trade_filled_missing_block_timestamp` - Verifies proper error
+  - [x] `test_witness_trade_success` - Verifies command execution succeeds and
+        event appears in events table
+  - [x] `test_witness_trade_sequence_increments` - Verifies sequence numbers are
+        correct
+  - [x] `test_witness_trade_missing_block_timestamp` - Verifies proper error
         handling for missing block timestamp
-- [x] All 397 tests pass (3 new dual_write tests)
+- [x] All 404 tests pass (3 new dual_write tests for OnchainTrade)
 - [x] Clippy passes (only expected dead_code warnings for functions not yet
       integrated)
 - [x] Code formatted
 
 **Implementation Notes:**
 
+- Function name `witness_trade()` reflects DDD command semantics (executing
+  `Witness` command, not emitting events)
 - Used `block_number` parameter from `QueuedEvent` since legacy `OnchainTrade`
   doesn't have this field
 - `OnchainTrade::Witness` command properly used (not `Migrate`)
@@ -483,30 +484,90 @@ Now implement dual-write properly using CqrsFramework.
 
 Implement dual-write for Position aggregate using CqrsFramework.
 
-**Subtasks:**
+**Status:** COMPLETE ✓
 
-- [ ] Create `src/dual_write/position.rs`
-- [ ] Implement `emit_onchain_fill_acknowledged()`:
-  - [ ] Parameters: trade data, `context: &DualWriteContext`
-  - [ ] Build `PositionCommand::AcknowledgeOnChainFill` (or appropriate command)
-  - [ ] Execute via `context.position_cqrs.execute(&symbol, command).await`
-- [ ] Implement `emit_offchain_order_placed()`:
-  - [ ] Build `PositionCommand::PlaceOffChainOrder`
-  - [ ] Execute via framework
-- [ ] Implement `emit_offchain_order_filled()`:
-  - [ ] Build appropriate command
-  - [ ] Execute via framework
-- [ ] Implement `emit_offchain_order_failed()`:
-  - [ ] Build appropriate command
-  - [ ] Execute via framework
-- [ ] Add integration tests
-- [ ] Integrate into accumulator (optional context parameter)
+**Completed Work:**
+
+- [x] Created `src/dual_write/position.rs`
+- [x] Implemented `acknowledge_onchain_fill()` (executes
+      `AcknowledgeOnChainFill` command):
+  - [x] Parameters: `context: &DualWriteContext`, `trade: &OnchainTrade`
+  - [x] Converts legacy types to command types (f64 → Decimal)
+  - [x] Builds aggregate_id: `Position::aggregate_id(&symbol)`
+  - [x] Creates `PositionCommand::AcknowledgeOnChainFill` with TradeId, amount,
+        direction, price, timestamp
+  - [x] Executes via
+        `context.position_framework().execute(&aggregate_id,
+        command).await`
+- [x] Implemented `place_offchain_order()` (executes `PlaceOffChainOrder`
+      command):
+  - [x] Parameters: `context: &DualWriteContext`,
+        `execution:
+        &OffchainExecution`, `symbol: &Symbol`
+  - [x] Builds `PositionCommand::PlaceOffChainOrder` with ExecutionId, shares,
+        direction, broker
+  - [x] Executes via framework
+- [x] Implemented `complete_offchain_order()` (executes `CompleteOffChainOrder`
+      command):
+  - [x] Parameters: `context: &DualWriteContext`,
+        `execution:
+        &OffchainExecution`, `symbol: &Symbol`
+  - [x] Extracts filled state data (order_id, price_cents, executed_at)
+  - [x] Builds `PositionCommand::CompleteOffChainOrder` with all required fields
+  - [x] Validates execution state (must be OrderState::Filled)
+  - [x] Executes via framework
+- [x] Implemented `fail_offchain_order()` (executes `FailOffChainOrder`
+      command):
+  - [x] Parameters: `context: &DualWriteContext`, `execution_id: i64`,
+        `symbol:
+        &Symbol`, `error: String`
+  - [x] Builds `PositionCommand::FailOffChainOrder` with ExecutionId and error
+        message
+  - [x] Executes via framework
+- [x] Added error variants to `DualWriteError`:
+  - [x] `MissingExecutionId` - When OffchainExecution has no id
+  - [x] `InvalidOrderState` - When execution not in expected state
+  - [x] `NegativePriceCents` - For price conversion errors
+- [x] Exported `TradeId` from `src/position/mod.rs` (was private in event
+      module)
+- [x] Added comprehensive integration tests (7 new tests):
+  - [x] `test_acknowledge_onchain_fill_success` - Verifies event persisted with
+        correct aggregate_id and type
+  - [x] `test_acknowledge_onchain_fill_missing_block_timestamp` - Error handling
+        test
+  - [x] `test_place_offchain_order_success` - Verifies PlaceOffChainOrder event
+        persisted
+  - [x] `test_complete_offchain_order_success` - Verifies CompleteOffChainOrder
+        event persisted
+  - [x] `test_fail_offchain_order_success` - Verifies FailOffChainOrder event
+        persisted
+  - [x] `test_complete_offchain_order_invalid_state` - Error when execution not
+        in Filled state
+  - [x] `test_place_offchain_order_missing_execution_id` - Error when execution
+        id is None
+- [x] All 404 tests pass (11 dual_write tests total: 3 OnchainTrade + 7
+      Position + 1 context initialization)
+- [x] Clippy passes (only expected dead_code warnings for functions not yet
+      integrated)
+- [x] Code formatted
+
+**Implementation Notes:**
+
+- Function names reflect DDD command semantics (e.g., `acknowledge_onchain_fill`
+  executes `AcknowledgeOnChainFill` command, not "emitting" events)
+- Position aggregate_id is the symbol string (e.g., "AAPL")
+- All four Position lifecycle commands properly implemented
+- Type conversions handle legacy broker types (Shares, OrderState) to CQRS types
+  (FractionalShares, etc.)
+- Framework automatically handles event persistence, sequence numbers, and view
+  updates
+- Tests verify correct event types appear with proper aggregate_id
 
 **Completion Criteria:**
 
-- [ ] Tests pass
-- [ ] Uses CqrsFramework::execute()
-- [ ] No direct events table access
+- [x] Tests pass
+- [x] Uses CqrsFramework::execute()
+- [x] No direct events table access
 
 ## Task 9. Implement OffchainOrder Dual-Write
 
@@ -515,18 +576,19 @@ Implement dual-write for OffchainOrder aggregate using CqrsFramework.
 **Subtasks:**
 
 - [ ] Create `src/dual_write/offchain_order.rs`
-- [ ] Implement `emit_order_placed()`:
-  - [ ] Build `OffchainOrderCommand::Place` (or appropriate command)
+- [ ] Implement `place_order()` (executes `Place` command):
+  - [ ] Build `OffchainOrderCommand::Place`
   - [ ] Execute via
-        `context.offchain_order_cqrs.execute(&execution_id, command).await`
-- [ ] Implement `emit_order_submitted()`:
-  - [ ] Build appropriate command
+        `context.offchain_order_framework().execute(&execution_id,
+        command).await`
+- [ ] Implement `confirm_submission()` (executes `ConfirmSubmission` command):
+  - [ ] Build `OffchainOrderCommand::ConfirmSubmission`
   - [ ] Execute via framework
-- [ ] Implement `emit_order_filled()`:
-  - [ ] Build appropriate command
+- [ ] Implement `record_fill()` (executes `RecordFill` command):
+  - [ ] Build `OffchainOrderCommand::RecordFill`
   - [ ] Execute via framework
-- [ ] Implement `emit_order_failed()`:
-  - [ ] Build appropriate command
+- [ ] Implement `mark_failed()` (executes `MarkFailed` command):
+  - [ ] Build `OffchainOrderCommand::MarkFailed`
   - [ ] Execute via framework
 - [ ] Add integration tests
 - [ ] Integrate into order poller and cleanup tasks
@@ -548,10 +610,13 @@ Wire dual-write into the main trade processing flow.
 - [ ] Modify `src/onchain/accumulator.rs::process_onchain_trade()`:
   - [ ] Accept optional `DualWriteContext` parameter
   - [ ] After successful legacy transaction:
-    - [ ] Call `dual_write::emit_trade_filled()`
-    - [ ] Call `dual_write::position::emit_onchain_fill_acknowledged()`
-    - [ ] If execution created: call dual-write for OffchainOrder and Position
-  - [ ] Use pattern: `if let Some(ctx) = context { emit(ctx).await.ok(); }`
+    - [ ] Call `dual_write::witness_trade()` (executes OnChainTrade::Witness
+          command)
+    - [ ] Call `dual_write::acknowledge_onchain_fill()` (executes
+          Position::AcknowledgeOnChainFill command)
+    - [ ] If execution created: call `dual_write::place_offchain_order()` and
+          `dual_write::place_order()`
+  - [ ] Use pattern: `if let Some(ctx) = context { command(ctx).await.ok(); }`
   - [ ] Log errors with full context
 - [ ] Add integration test
 
@@ -559,52 +624,58 @@ Wire dual-write into the main trade processing flow.
 
 - [ ] Tests pass
 - [ ] Context properly passed through call chain
-- [ ] Events emitted after legacy writes
+- [ ] Commands executed after legacy writes
 
 ## Task 11. Integrate Dual-Write into Order Poller
 
-Emit events when order status changes.
+Execute commands when order status changes.
 
 **Subtasks:**
 
 - [ ] Pass `DualWriteContext` to order poller task
 - [ ] After each status UPDATE:
-  - [ ] Call appropriate dual-write functions
+  - [ ] Call appropriate command functions (`confirm_submission`,
+        `complete_offchain_order`, `record_fill`, etc.)
   - [ ] Handle errors with logging
 - [ ] Add tests for status transitions
 
 **Completion Criteria:**
 
 - [ ] Tests pass
-- [ ] Events emitted on status changes
+- [ ] Commands executed on status changes
 
 ## Task 12. Integrate Dual-Write into Stale Execution Cleanup
 
-Emit failure events when cleaning up stale executions.
+Execute failure commands when cleaning up stale executions.
 
 **Subtasks:**
 
 - [ ] Pass `DualWriteContext` to cleanup task
 - [ ] After marking execution FAILED:
-  - [ ] Call dual-write for OffchainOrder and Position
+  - [ ] Call `fail_offchain_order()` (executes Position::FailOffChainOrder
+        command)
+  - [ ] Call `mark_failed()` (executes OffchainOrder::MarkFailed command)
   - [ ] Handle errors with logging
 - [ ] Add tests
 
 **Completion Criteria:**
 
 - [ ] Tests pass
-- [ ] Events emitted on cleanup
+- [ ] Commands executed on cleanup
 
 ## Success Criteria
 
 **Must Have:**
 
-- [ ] All onchain trades generate `OnChainTradeEvent::Filled` events
-- [ ] All position changes generate corresponding `PositionEvent` events
-- [ ] All offchain orders generate lifecycle `OffchainOrderEvent` events
+- [ ] All onchain trades execute `Witness` command generating
+      `OnChainTradeEvent::Filled` events
+- [ ] All position changes execute appropriate commands generating
+      `PositionEvent` events
+- [ ] All offchain orders execute lifecycle commands generating
+      `OffchainOrderEvent` events
 - [ ] Legacy tables remain source of truth for reads (no code changes to read
       path)
-- [ ] Event emission failures logged but don't block trade processing
+- [ ] Command execution failures logged but don't block trade processing
 - [ ] Integration tests pass for full trade lifecycle
 
 **Nice to Have:**

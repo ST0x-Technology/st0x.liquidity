@@ -5,7 +5,7 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand};
 
 use super::{DualWriteContext, DualWriteError};
 
-pub(crate) async fn emit_trade_filled(
+pub(crate) async fn witness_trade(
     context: &DualWriteContext,
     trade: &OnchainTrade,
     block_number: u64,
@@ -53,7 +53,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_emit_trade_filled_success() {
+    async fn test_witness_trade_success() {
         let pool = setup_test_db().await;
         let context = DualWriteContext::new(pool.clone());
 
@@ -77,7 +77,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = emit_trade_filled(&context, &trade, 12345).await;
+        let result = witness_trade(&context, &trade, 12345).await;
         assert!(result.is_ok());
 
         let event_count = sqlx::query_scalar!(
@@ -110,7 +110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_emit_trade_filled_sequence_increments() {
+    async fn test_witness_trade_sequence_increments() {
         let pool = setup_test_db().await;
         let context = DualWriteContext::new(pool.clone());
 
@@ -135,7 +135,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        emit_trade_filled(&context, &trade1, 12345).await.unwrap();
+        witness_trade(&context, &trade1, 12345).await.unwrap();
 
         let event_count = sqlx::query_scalar!("SELECT COUNT(*) FROM events")
             .fetch_one(&pool)
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_emit_trade_filled_missing_block_timestamp() {
+    async fn test_witness_trade_missing_block_timestamp() {
         let pool = setup_test_db().await;
         let context = DualWriteContext::new(pool.clone());
 
@@ -179,7 +179,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = emit_trade_filled(&context, &trade, 12345).await;
+        let result = witness_trade(&context, &trade, 12345).await;
 
         assert!(result.is_err());
         assert!(matches!(
