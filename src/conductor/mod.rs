@@ -14,6 +14,7 @@ use tracing::{debug, error, info, trace};
 use st0x_broker::{Broker, MarketOrder, SupportedBroker};
 
 use crate::bindings::IOrderBookV4::{ClearV2, IOrderBookV4Instance, TakeOrderV2};
+use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
@@ -269,9 +270,18 @@ fn spawn_queue_processor<
     let config_clone = config.clone();
     let pool_clone = pool.clone();
     let cache_clone = cache.clone();
+    let dual_write_context = DualWriteContext::new(pool.clone());
 
     tokio::spawn(async move {
-        run_queue_processor(&broker, &config_clone, &pool_clone, &cache_clone, provider).await;
+        run_queue_processor(
+            &broker,
+            &config_clone,
+            &pool_clone,
+            &cache_clone,
+            provider,
+            &dual_write_context,
+        )
+        .await;
     })
 }
 
@@ -409,6 +419,7 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
+    dual_write_context: &DualWriteContext,
 ) {
     info!("Starting queue processor service");
 
@@ -429,8 +440,16 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
     let broker_type = broker.to_supported_broker();
 
     loop {
-        match process_next_queued_event(broker_type, config, pool, cache, &provider, &feed_id_cache)
-            .await
+        match process_next_queued_event(
+            broker_type,
+            config,
+            pool,
+            cache,
+            &provider,
+            &feed_id_cache,
+            dual_write_context,
+        )
+        .await
         {
             Ok(Some(execution)) => {
                 if let Some(exec_id) = execution.id {
@@ -459,6 +478,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     cache: &SymbolCache,
     provider: &P,
     feed_id_cache: &FeedIdCache,
+    dual_write_context: &DualWriteContext,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -474,7 +494,15 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return handle_filtered_event(pool, &queued_event, event_id).await;
     };
 
-    process_valid_trade(broker_type, pool, &queued_event, event_id, trade).await
+    process_valid_trade(
+        broker_type,
+        pool,
+        &queued_event,
+        event_id,
+        trade,
+        dual_write_context,
+    )
+    .await
 }
 
 fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
@@ -558,13 +586,18 @@ async fn handle_filtered_event(
     Ok(None)
 }
 
-#[tracing::instrument(skip(pool, queued_event, trade), fields(event_id, symbol = %trade.symbol), level = tracing::Level::INFO)]
+#[tracing::instrument(
+    skip(pool, queued_event, trade, dual_write_context),
+    fields(event_id, symbol = %trade.symbol),
+    level = tracing::Level::INFO
+)]
 async fn process_valid_trade(
     broker_type: SupportedBroker,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
+    dual_write_context: &DualWriteContext,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -586,7 +619,15 @@ async fn process_valid_trade(
         trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
     );
 
-    process_trade_within_transaction(broker_type, pool, queued_event, event_id, trade).await
+    process_trade_within_transaction(
+        broker_type,
+        pool,
+        queued_event,
+        event_id,
+        trade,
+        dual_write_context,
+    )
+    .await
 }
 
 async fn process_trade_within_transaction(
@@ -595,6 +636,7 @@ async fn process_trade_within_transaction(
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
+    dual_write_context: &DualWriteContext,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let mut sql_tx = pool.begin().await.map_err(|e| {
         error!("Failed to begin transaction for event processing: {e}");
@@ -606,7 +648,7 @@ async fn process_trade_within_transaction(
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    let execution = accumulator::process_onchain_trade(&mut sql_tx, trade, broker_type)
+    let execution = accumulator::process_onchain_trade(&mut sql_tx, trade.clone(), broker_type)
         .await
         .map_err(|e| {
             error!(
@@ -637,6 +679,63 @@ async fn process_trade_within_transaction(
         "Successfully committed atomic event processing: event_id={}, tx_hash={:?}, log_index={}",
         event_id, queued_event.tx_hash, queued_event.log_index
     );
+
+    if let Err(e) =
+        crate::dual_write::witness_trade(dual_write_context, &trade, queued_event.block_number)
+            .await
+    {
+        error!(
+            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        );
+    } else {
+        info!(
+            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        );
+    }
+
+    if let Err(e) = crate::dual_write::acknowledge_onchain_fill(dual_write_context, &trade).await {
+        error!(
+            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        );
+    } else {
+        info!(
+            "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        );
+    }
+
+    if let Some(ref exec) = execution {
+        let base_symbol = trade.symbol.base();
+
+        if let Err(e) =
+            crate::dual_write::place_offchain_order(dual_write_context, exec, base_symbol).await
+        {
+            error!(
+                "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
+                exec.id, base_symbol
+            );
+        } else {
+            info!(
+                "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
+                exec.id, base_symbol
+            );
+        }
+
+        if let Err(e) = crate::dual_write::place_order(dual_write_context, exec).await {
+            error!(
+                "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
+                exec.id, exec.symbol
+            );
+        } else {
+            info!(
+                "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
+                exec.id, exec.symbol
+            );
+        }
+    }
 
     Ok(execution)
 }
@@ -1451,6 +1550,8 @@ mod tests {
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
 
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
         let result = process_next_queued_event(
             SupportedBroker::DryRun,
             &config,
@@ -1458,6 +1559,7 @@ mod tests {
             &cache,
             &provider,
             &feed_id_cache,
+            &dual_write_context,
         )
         .await;
 
