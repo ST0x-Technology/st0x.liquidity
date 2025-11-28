@@ -1414,6 +1414,14 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
+    WithdrawalFailed {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        withdrawal_ref: TransferRef,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
     BridgingInitiated {
         direction: RebalancingDirection,
         amount: Decimal,
@@ -1439,6 +1447,15 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
     },
+    BridgingFailed {
+        direction: RebalancingDirection,
+        amount: Decimal,
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
     DepositInitiated {
         direction: RebalancingDirection,
         amount: Decimal,
@@ -1456,17 +1473,12 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         deposit_confirmed_at: DateTime<Utc>,
     },
-    Completed {
+    DepositFailed {
         direction: RebalancingDirection,
         amount: Decimal,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
-        initiated_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-    },
-    Failed {
-        direction: RebalancingDirection,
-        amount: Decimal,
+        deposit_ref: Option<TransferRef>,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -1478,11 +1490,9 @@ enum UsdcRebalance {
 
 ```rust
 enum UsdcRebalanceCommand {
-    InitiateRebalancing {
+    Initiate {
         direction: RebalancingDirection,
         amount: Decimal,
-    },
-    InitiateWithdrawal {
         withdrawal: TransferRef,
     },
     ConfirmWithdrawal,
@@ -1500,8 +1510,13 @@ enum UsdcRebalanceCommand {
         deposit: TransferRef,
     },
     ConfirmDeposit,
-    Finalize,
-    Fail {
+    FailWithdrawal {
+        reason: String,
+    },
+    FailBridging {
+        reason: String,
+    },
+    FailDeposit {
         reason: String,
     },
 }
@@ -1511,17 +1526,18 @@ enum UsdcRebalanceCommand {
 
 ```rust
 enum UsdcRebalanceEvent {
-    RebalancingInitiated {
+    Initiated {
         direction: RebalancingDirection,
         amount: Decimal,
-        initiated_at: DateTime<Utc>,
-    },
-    WithdrawalInitiated {
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalConfirmed {
         confirmed_at: DateTime<Utc>,
+    },
+    WithdrawalFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
     BridgingInitiated {
         burn_tx_hash: TxHash,
@@ -1536,6 +1552,12 @@ enum UsdcRebalanceEvent {
         mint_tx_hash: TxHash,
         minted_at: DateTime<Utc>,
     },
+    BridgingFailed {
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
     DepositInitiated {
         deposit_ref: TransferRef,
         deposit_initiated_at: DateTime<Utc>,
@@ -1543,10 +1565,8 @@ enum UsdcRebalanceEvent {
     DepositConfirmed {
         deposit_confirmed_at: DateTime<Utc>,
     },
-    RebalancingCompleted {
-        completed_at: DateTime<Utc>,
-    },
-    RebalancingFailed {
+    DepositFailed {
+        deposit_ref: Option<TransferRef>,
         reason: String,
         failed_at: DateTime<Utc>,
     },
