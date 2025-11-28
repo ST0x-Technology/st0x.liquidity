@@ -4,7 +4,7 @@ use tokio::time::{Instant, sleep};
 use tracing::info;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
-use super::transfer::{Transfer, TransferId, TransferStatus, get_transfer_status};
+use super::transfer::{AlpacaTransferId, Transfer, TransferStatus, get_transfer_status};
 
 pub(crate) struct PollingConfig {
     pub(crate) interval: Duration,
@@ -28,7 +28,7 @@ impl Default for PollingConfig {
 
 pub(super) async fn poll_transfer_status(
     client: &AlpacaWalletClient,
-    transfer_id: &TransferId,
+    transfer_id: &AlpacaTransferId,
     config: &PollingConfig,
 ) -> Result<Transfer, AlpacaWalletError> {
     let start = Instant::now();
@@ -192,7 +192,7 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config)
+        let result = poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config)
             .await
             .unwrap();
 
@@ -248,7 +248,7 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config)
+        let result = poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config)
             .await
             .unwrap();
 
@@ -304,9 +304,9 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
+        let result =
+            poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::TransferTimeout { .. }
@@ -349,7 +349,8 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
+        let result =
+            poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config).await;
 
         account_mock.assert();
         assert!(
@@ -430,9 +431,9 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
+        let result =
+            poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::TransferTimeout { .. }

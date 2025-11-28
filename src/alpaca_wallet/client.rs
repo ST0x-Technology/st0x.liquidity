@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::alpaca::AlpacaAuthEnv;
 use thiserror::Error;
 
-use super::transfer::{Network, TokenSymbol, TransferId, TransferStatus};
+use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{WhitelistEntry, WhitelistStatus};
 
 #[derive(Debug, Error)]
@@ -35,11 +35,11 @@ pub enum AlpacaWalletError {
     NoWalletFound { asset: String, network: String },
 
     #[error("Transfer not found: {transfer_id}")]
-    TransferNotFound { transfer_id: TransferId },
+    TransferNotFound { transfer_id: AlpacaTransferId },
 
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
     TransferTimeout {
-        transfer_id: TransferId,
+        transfer_id: AlpacaTransferId,
         elapsed: std::time::Duration,
     },
 
@@ -47,13 +47,13 @@ pub enum AlpacaWalletError {
     #[allow(dead_code)]
     #[error("Max retries ({retries}) exceeded for transfer {transfer_id}")]
     MaxRetriesExceeded {
-        transfer_id: TransferId,
+        transfer_id: AlpacaTransferId,
         retries: u32,
     },
 
     #[error("Invalid status transition for transfer {transfer_id}: {previous:?} -> {next:?}")]
     InvalidStatusTransition {
-        transfer_id: TransferId,
+        transfer_id: AlpacaTransferId,
         previous: TransferStatus,
         next: TransferStatus,
     },
@@ -382,7 +382,6 @@ mod tests {
 
         let result = client.get("/v1/error").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::UNAUTHORIZED
@@ -413,7 +412,6 @@ mod tests {
 
         let result = client.get("/v1/server_error").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::INTERNAL_SERVER_ERROR
@@ -480,7 +478,6 @@ mod tests {
         let body = json!({"test": "data"});
         let result = client.post("/v1/error", &body).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST

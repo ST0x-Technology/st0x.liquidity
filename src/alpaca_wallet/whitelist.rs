@@ -410,7 +410,6 @@ mod tests {
 
         let result = client.whitelist_address(&address, &asset, &network).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { .. }
@@ -449,7 +448,6 @@ mod tests {
 
         let result = client.whitelist_address(&address, &asset, &network).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { .. }

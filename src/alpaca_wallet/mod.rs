@@ -66,7 +66,7 @@ use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
-pub(crate) use transfer::{Network, TokenSymbol, Transfer, TransferId};
+pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -160,7 +160,7 @@ impl AlpacaWalletService {
     /// Returns an error if the transfer is not found or the API call fails.
     pub async fn get_transfer_status(
         &self,
-        transfer_id: &TransferId,
+        transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         transfer::get_transfer_status(&self.client, transfer_id).await
     }
@@ -177,7 +177,7 @@ impl AlpacaWalletService {
     /// - The API call fails persistently
     pub async fn poll_transfer_until_complete(
         &self,
-        transfer_id: &TransferId,
+        transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
     }

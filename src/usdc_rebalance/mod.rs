@@ -1,29 +1,17 @@
+use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::alpaca_wallet::AlpacaTransferId;
+
 mod cmd;
 mod event;
 
 pub(crate) use cmd::UsdcRebalanceCommand;
 pub(crate) use event::UsdcRebalanceEvent;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct UsdcRebalanceId(pub(crate) String);
-
-impl UsdcRebalanceId {
-    pub(crate) fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum RebalanceDirection {
-    AlpacaToRaindex,
-    RaindexToAlpaca,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum UsdcRebalance {
@@ -35,17 +23,40 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
     },
 
+    AlpacaWithdrawalCompleted {
+        amount: Decimal,
+        reference: AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    },
+
+    AlpacaWithdrawalFailed {
+        amount: Decimal,
+        reference: Option<AlpacaTransferId>,
+        initiated_at: DateTime<Utc>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+
+    RaindexWithdrawalCompleted {
+        amount: Decimal,
+        reference: TxHash,
+        initiated_at: DateTime<Utc>,
+        completed_at: DateTime<Utc>,
+    },
+
+    RaindexWithdrawalFailed {
+        amount: Decimal,
+        reference: Option<TxHash>,
+        initiated_at: DateTime<Utc>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+
     Completed {
         direction: RebalanceDirection,
         amount: Decimal,
         completed_at: DateTime<Utc>,
-    },
-
-    Failed {
-        direction: RebalanceDirection,
-        amount: Decimal,
-        reason: String,
-        failed_at: DateTime<Utc>,
     },
 }
 
@@ -53,18 +64,6 @@ impl Default for UsdcRebalance {
     fn default() -> Self {
         Self::NotStarted
     }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub(crate) enum UsdcRebalanceError {
-    #[error("Withdrawal not initiated")]
-    WithdrawalNotInitiated,
-
-    #[error("Already completed")]
-    AlreadyCompleted,
-
-    #[error("Already failed")]
-    AlreadyFailed,
 }
 
 #[async_trait]
@@ -84,7 +83,7 @@ impl Aggregate for UsdcRebalance {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match (self, command) {
-            (Self::NotStarted, UsdcRebalanceCommand::InitiateWithdrawal { direction, amount }) => {
+            (Self::NotStarted, UsdcRebalanceCommand::Initiate { direction, amount }) => {
                 Ok(vec![UsdcRebalanceEvent::WithdrawalInitiated {
                     direction,
                     amount,
@@ -92,29 +91,78 @@ impl Aggregate for UsdcRebalance {
                 }])
             }
 
-            (Self::WithdrawalInitiated { .. }, UsdcRebalanceCommand::InitiateWithdrawal { .. }) => {
-                Err(UsdcRebalanceError::WithdrawalNotInitiated)
-            }
-
             (
-                Self::NotStarted | Self::WithdrawalInitiated { .. },
-                UsdcRebalanceCommand::Fail { reason },
-            ) => Ok(vec![UsdcRebalanceEvent::Failed {
-                reason,
-                failed_at: Utc::now(),
+                Self::WithdrawalInitiated {
+                    direction: RebalanceDirection::AlpacaToRaindex,
+                    ..
+                },
+                UsdcRebalanceCommand::CompleteAlpaca { transfer_id },
+            ) => Ok(vec![UsdcRebalanceEvent::AlpacaWithdrawalCompleted {
+                transfer_id,
+                completed_at: Utc::now(),
             }]),
 
-            (Self::Completed { .. }, UsdcRebalanceCommand::Fail { .. }) => {
-                Err(UsdcRebalanceError::AlreadyCompleted)
-            }
+            (
+                Self::WithdrawalInitiated {
+                    direction: RebalanceDirection::RaindexToAlpaca,
+                    ..
+                },
+                UsdcRebalanceCommand::CompleteRaindex { tx_hash },
+            ) => Ok(vec![UsdcRebalanceEvent::RaindexWithdrawalCompleted {
+                withdrawal_tx_hash: tx_hash,
+                completed_at: Utc::now(),
+            }]),
 
-            (Self::Failed { .. }, UsdcRebalanceCommand::Fail { .. }) => {
-                Err(UsdcRebalanceError::AlreadyFailed)
+            (
+                Self::WithdrawalInitiated {
+                    direction: RebalanceDirection::AlpacaToRaindex,
+                    ..
+                },
+                UsdcRebalanceCommand::CompleteRaindex { .. },
+            )
+            | (
+                Self::WithdrawalInitiated {
+                    direction: RebalanceDirection::RaindexToAlpaca,
+                    ..
+                },
+                UsdcRebalanceCommand::CompleteAlpaca { .. },
+            ) => Err(UsdcRebalanceError::TransferRefMismatch),
+
+            (
+                Self::NotStarted,
+                UsdcRebalanceCommand::CompleteAlpaca { .. }
+                | UsdcRebalanceCommand::CompleteRaindex { .. },
+            )
+            | (Self::WithdrawalInitiated { .. }, UsdcRebalanceCommand::Initiate { .. }) => {
+                Err(UsdcRebalanceError::WithdrawalNotInitiated)
             }
 
             (Self::Completed { .. }, _) => Err(UsdcRebalanceError::AlreadyCompleted),
 
-            (Self::Failed { .. }, _) => Err(UsdcRebalanceError::AlreadyFailed),
+            (Self::AlpacaWithdrawalFailed { .. } | Self::RaindexWithdrawalFailed { .. }, _) => {
+                Err(UsdcRebalanceError::AlreadyFailed)
+            }
+
+            (_, UsdcRebalanceCommand::FailAlpaca { reference, reason }) => {
+                Ok(vec![UsdcRebalanceEvent::AlpacaWithdrawalFailed {
+                    reference,
+                    reason,
+                    failed_at: Utc::now(),
+                }])
+            }
+
+            (_, UsdcRebalanceCommand::FailRaindex { reference, reason }) => {
+                Ok(vec![UsdcRebalanceEvent::RaindexWithdrawalFailed {
+                    reference,
+                    reason,
+                    failed_at: Utc::now(),
+                }])
+            }
+
+            (
+                Self::AlpacaWithdrawalCompleted { .. } | Self::RaindexWithdrawalCompleted { .. },
+                _,
+            ) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
 
@@ -127,8 +175,31 @@ impl Aggregate for UsdcRebalance {
             } => {
                 self.apply_withdrawal_initiated(direction, amount, initiated_at);
             }
-            UsdcRebalanceEvent::Failed { reason, failed_at } => {
-                self.apply_failed(reason, failed_at);
+            UsdcRebalanceEvent::AlpacaWithdrawalCompleted {
+                transfer_id,
+                completed_at,
+            } => {
+                self.apply_alpaca_withdrawal_completed(transfer_id, completed_at);
+            }
+            UsdcRebalanceEvent::RaindexWithdrawalCompleted {
+                withdrawal_tx_hash,
+                completed_at,
+            } => {
+                self.apply_raindex_withdrawal_completed(withdrawal_tx_hash, completed_at);
+            }
+            UsdcRebalanceEvent::AlpacaWithdrawalFailed {
+                reference,
+                reason,
+                failed_at,
+            } => {
+                self.apply_alpaca_withdrawal_failed(reference, reason, failed_at);
+            }
+            UsdcRebalanceEvent::RaindexWithdrawalFailed {
+                reference,
+                reason,
+                failed_at,
+            } => {
+                self.apply_raindex_withdrawal_failed(reference, reason, failed_at);
             }
         }
     }
@@ -148,29 +219,145 @@ impl UsdcRebalance {
         };
     }
 
-    fn apply_failed(&mut self, reason: String, failed_at: DateTime<Utc>) {
-        let (direction, amount) = match self {
+    fn apply_alpaca_withdrawal_completed(
+        &mut self,
+        transfer_id: AlpacaTransferId,
+        completed_at: DateTime<Utc>,
+    ) {
+        let (amount, initiated_at) = match self {
             Self::WithdrawalInitiated {
-                direction, amount, ..
-            } => (direction.clone(), *amount),
-            Self::NotStarted | Self::Completed { .. } | Self::Failed { .. } => {
-                return;
-            }
+                amount,
+                initiated_at,
+                ..
+            } => (*amount, *initiated_at),
+            _ => return,
         };
 
-        *self = Self::Failed {
-            direction,
+        *self = Self::AlpacaWithdrawalCompleted {
             amount,
+            reference: transfer_id,
+            initiated_at,
+            completed_at,
+        };
+    }
+
+    fn apply_raindex_withdrawal_completed(
+        &mut self,
+        withdrawal_tx_hash: TxHash,
+        completed_at: DateTime<Utc>,
+    ) {
+        let (amount, initiated_at) = match self {
+            Self::WithdrawalInitiated {
+                amount,
+                initiated_at,
+                ..
+            } => (*amount, *initiated_at),
+            _ => return,
+        };
+
+        *self = Self::RaindexWithdrawalCompleted {
+            amount,
+            reference: withdrawal_tx_hash,
+            initiated_at,
+            completed_at,
+        };
+    }
+
+    fn apply_alpaca_withdrawal_failed(
+        &mut self,
+        reference: Option<AlpacaTransferId>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    ) {
+        let (amount, initiated_at) = match self {
+            Self::WithdrawalInitiated {
+                amount,
+                initiated_at,
+                ..
+            }
+            | Self::AlpacaWithdrawalCompleted {
+                amount,
+                initiated_at,
+                ..
+            } => (*amount, *initiated_at),
+            _ => return,
+        };
+
+        *self = Self::AlpacaWithdrawalFailed {
+            amount,
+            reference,
+            initiated_at,
+            reason,
+            failed_at,
+        };
+    }
+
+    fn apply_raindex_withdrawal_failed(
+        &mut self,
+        reference: Option<TxHash>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    ) {
+        let (amount, initiated_at) = match self {
+            Self::WithdrawalInitiated {
+                amount,
+                initiated_at,
+                ..
+            }
+            | Self::RaindexWithdrawalCompleted {
+                amount,
+                initiated_at,
+                ..
+            } => (*amount, *initiated_at),
+            _ => return,
+        };
+
+        *self = Self::RaindexWithdrawalFailed {
+            amount,
+            reference,
+            initiated_at,
             reason,
             failed_at,
         };
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct UsdcRebalanceId(pub(crate) String);
+
+impl UsdcRebalanceId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum RebalanceDirection {
+    AlpacaToRaindex,
+    RaindexToAlpaca,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub(crate) enum UsdcRebalanceError {
+    #[error("Withdrawal not initiated")]
+    WithdrawalNotInitiated,
+
+    #[error("Transfer reference type does not match rebalance direction")]
+    TransferRefMismatch,
+
+    #[error("Already completed")]
+    AlreadyCompleted,
+
+    #[error("Already failed")]
+    AlreadyFailed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Address;
     use rust_decimal_macros::dec;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_initiate_withdrawal_alpaca_to_raindex() {
@@ -178,7 +365,7 @@ mod tests {
 
         let events = aggregate
             .handle(
-                UsdcRebalanceCommand::InitiateWithdrawal {
+                UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToRaindex,
                     amount: dec!(1000.00),
                 },
@@ -200,7 +387,7 @@ mod tests {
 
         let events = aggregate
             .handle(
-                UsdcRebalanceCommand::InitiateWithdrawal {
+                UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::RaindexToAlpaca,
                     amount: dec!(500.50),
                 },

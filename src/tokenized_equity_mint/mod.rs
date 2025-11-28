@@ -95,7 +95,6 @@ mod view;
 
 pub(crate) use cmd::TokenizedEquityMintCommand;
 pub(crate) use event::TokenizedEquityMintEvent;
-pub(crate) use view::TokenizedEquityMintView;
 
 /// Unique identifier for a tokenized equity mint operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
