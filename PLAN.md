@@ -81,32 +81,51 @@ completion.
 - [x] Run `cargo clippy -- -D clippy::all` - no warnings
 - [x] Run `cargo fmt`
 
-## Task 2. Add Withdrawal Completion with Reference Tracking
+## Task 2. Add Type-Safe Withdrawal Completion States
 
-Extend aggregate to track withdrawal completion with Alpaca transfer_id or
-onchain tx_hash.
+Track completion of the withdrawal phase (phase 1 of 3: withdraw → bridge →
+deposit) with type-safe direction-specific states.
 
 ### Subtasks
 
-- [ ] Update `UsdcRebalance::WithdrawalInitiated` to include optional
-      `transfer_id` and `tx_hash`
-- [ ] Update `UsdcRebalance::Failed` to preserve optional `transfer_id` and
-      `tx_hash`
-- [ ] Add command
-      `RecordWithdrawalComplete { transfer_id: Option<String>, tx_hash: Option<TxHash> }`
-- [ ] Add event `WithdrawalCompleted { transfer_id, tx_hash, completed_at }`
-- [ ] Update `handle()` to support: WithdrawalInitiated →
-      RecordWithdrawalComplete
-- [ ] Update `apply()` to handle WithdrawalCompleted event
-- [ ] Add error `CompletionWithoutReferences` if both transfer_id and tx_hash
-      are None
+- [ ] Import `TransferId` from `alpaca_wallet` module
+- [ ] Remove `transfer_id` and `tx_hash` fields from `WithdrawalInitiated` state
+- [ ] Define `TransferRef` enum representing the reference to a completed
+      transfer:
+  - [ ] `AlpacaTransfer(TransferId)`
+  - [ ] `OnchainTransaction(TxHash)`
+- [ ] Add direction-specific withdrawal completion states:
+  - [ ] `AlpacaWithdrawalCompleted { amount, transfer_id: TransferId, initiated_at, completed_at }`
+  - [ ] `RaindexWithdrawalCompleted { amount, withdrawal_tx_hash: TxHash, initiated_at, completed_at }`
+- [ ] Define `FailureStage` enum capturing exact failure point (will expand in
+      later tasks):
+  - [ ] `WithdrawalInitiated { direction, amount, initiated_at }`
+  - [ ] `AlpacaWithdrawalCompleted { amount, transfer_id, initiated_at, completed_at }`
+  - [ ] `RaindexWithdrawalCompleted { amount, withdrawal_tx_hash, initiated_at, completed_at }`
+- [ ] Update `Failed` state to use `FailureStage`:
+  - [ ] `Failed { stage: FailureStage, reason: String, failed_at: DateTime<Utc> }`
+- [ ] Add command `CompleteWithdrawal { reference: TransferRef }`
+- [ ] Add events:
+  - [ ] `AlpacaWithdrawalCompleted { transfer_id: TransferId, completed_at }`
+  - [ ] `RaindexWithdrawalCompleted { withdrawal_tx_hash: TxHash, completed_at }`
+- [ ] Update `handle()` to validate reference type matches direction:
+  - [ ] `WithdrawalInitiated(AlpacaToRaindex)` +
+        `CompleteWithdrawal(AlpacaTransfer)` → emit `AlpacaWithdrawalCompleted`
+  - [ ] `WithdrawalInitiated(RaindexToAlpaca)` +
+        `CompleteWithdrawal(OnchainTransaction)` → emit
+        `RaindexWithdrawalCompleted`
+  - [ ] Reject mismatched reference type with error
+- [ ] Update `apply()` to handle new withdrawal completion events
+- [ ] Update `apply_failed()` to construct `FailureStage` from current state
+- [ ] Add error `TransferRefMismatch` - wrong reference type for direction
 
 ### Tests
 
-- [ ] `test_complete_withdrawal_with_alpaca_transfer_id`
-- [ ] `test_complete_withdrawal_with_onchain_tx_hash`
+- [ ] `test_complete_alpaca_withdrawal`
+- [ ] `test_complete_raindex_withdrawal`
+- [ ] `test_cannot_complete_alpaca_withdrawal_for_raindex_direction`
+- [ ] `test_cannot_complete_raindex_withdrawal_for_alpaca_direction`
 - [ ] `test_cannot_complete_withdrawal_before_initiating`
-- [ ] `test_withdrawal_completion_requires_at_least_one_reference`
 
 ### Validation
 
@@ -116,33 +135,47 @@ onchain tx_hash.
 
 ## Task 3. Add Bridge Burn and Mint Tracking
 
-Extend aggregate to track CCTP bridge operations (burn and mint).
+Extend aggregate to track CCTP bridge operations (burn on source chain, mint on
+destination chain).
 
 ### Subtasks
 
-- [ ] Add state variant
-      `BridgingInProgress { direction, amount, withdrawal_refs, burn_tx_hash, nonce, message_hash, bridging_started_at }`
-- [ ] Update `Completed` to store full flow data:
-      `{ direction, amount, withdrawal_refs, burn_tx_hash, mint_tx_hash, completed_at }`
-- [ ] Update `Failed` to preserve bridge references
-- [ ] Add command `RecordBridgeBurn { burn_tx_hash, nonce, message_hash }`
-- [ ] Add command `RecordBridgeMint { mint_tx_hash }`
-- [ ] Add event
-      `BridgeBurnRecorded { burn_tx_hash, nonce, message_hash, burned_at }`
-- [ ] Add event `BridgeMintRecorded { mint_tx_hash, minted_at }`
-- [ ] Add errors: `BridgingNotInProgress`
+- [ ] Add state `BridgeBurnCompleted`:
+  - [ ] For AlpacaToRaindex:
+        `{ amount, transfer_id, burn_tx_hash, nonce, message_hash, initiated_at, withdrawal_completed_at, burned_at }`
+  - [ ] For RaindexToAlpaca:
+        `{ amount, withdrawal_tx_hash, burn_tx_hash, nonce, message_hash, initiated_at, withdrawal_completed_at, burned_at }`
+- [ ] Add state `BridgeMintCompleted`:
+  - [ ] Carries all prior data plus `mint_tx_hash` and `minted_at`
+- [ ] Update `Failed` state to add bridge references:
+  - [ ] `burn_tx_hash: Option<TxHash>`
+  - [ ] `burn_nonce: Option<FixedBytes<32>>`
+  - [ ] `burn_message_hash: Option<FixedBytes<32>>`
+  - [ ] `mint_tx_hash: Option<TxHash>`
+- [ ] Add commands:
+  - [ ] `CompleteBridgeBurn { burn_tx_hash, nonce, message_hash }`
+  - [ ] `CompleteBridgeMint { mint_tx_hash }`
+- [ ] Add events:
+  - [ ] `BridgeBurnCompleted { burn_tx_hash, nonce, message_hash, burned_at }`
+  - [ ] `BridgeMintCompleted { mint_tx_hash, minted_at }`
+- [ ] Add error `WithdrawalNotCompleted`
+- [ ] Add error `BridgeBurnNotCompleted`
 - [ ] Update `handle()` to support:
-  - [ ] WithdrawalInitiated → RecordBridgeBurn (when withdrawal has references)
-  - [ ] BridgingInProgress → RecordBridgeMint
-- [ ] Update `apply()` to handle bridge events
+  - [ ] `AlpacaWithdrawalCompleted` → `CompleteBridgeBurn`
+  - [ ] `RaindexWithdrawalCompleted` → `CompleteBridgeBurn`
+  - [ ] `BridgeBurnCompleted` → `CompleteBridgeMint`
+- [ ] Update `apply()` to handle bridge burn and mint events, preserving all
+      prior data
 
 ### Tests
 
-- [ ] `test_record_bridge_burn`
+- [ ] `test_record_bridge_burn_after_alpaca_withdrawal`
+- [ ] `test_record_bridge_burn_after_raindex_withdrawal`
 - [ ] `test_record_bridge_mint`
 - [ ] `test_cannot_burn_before_withdrawal_complete`
 - [ ] `test_cannot_mint_before_burn`
-- [ ] `test_fail_from_bridging_in_progress`
+- [ ] `test_fail_from_bridge_burn_completed`
+- [ ] `test_fail_from_bridge_mint_completed`
 
 ### Validation
 
