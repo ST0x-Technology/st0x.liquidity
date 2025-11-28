@@ -38,48 +38,48 @@ completion.
 
 ### Subtasks
 
-- [ ] Create module `src/usdc_rebalance/mod.rs`
-- [ ] Define `RebalanceId` newtype wrapping String
-- [ ] Define `RebalanceDirection` enum with AlpacaToBase and BaseToAlpaca
+- [x] Create module `src/usdc_rebalance/mod.rs`
+- [x] Define `UsdcRebalanceId` newtype wrapping String
+- [x] Define `RebalanceDirection` enum with AlpacaToBase and BaseToAlpaca
       variants
-- [ ] Define `UsdcRebalance` enum with variants:
-  - [ ] `NotStarted`
-  - [ ] `WithdrawalInitiated { direction, amount, initiated_at }`
-  - [ ] `Completed { direction, amount, completed_at }` (stub for now, will
+- [x] Define `UsdcRebalance` enum with variants:
+  - [x] `NotStarted`
+  - [x] `WithdrawalInitiated { direction, amount, initiated_at }`
+  - [x] `Completed { direction, amount, completed_at }` (stub for now, will
         expand later)
-  - [ ] `Failed { direction, amount, reason, failed_at }`
-- [ ] Define `UsdcRebalanceError` enum with:
-  - [ ] `WithdrawalNotInitiated`
-  - [ ] `AlreadyCompleted`
-  - [ ] `AlreadyFailed`
-- [ ] Implement `Default` for `UsdcRebalance` returning `NotStarted`
-- [ ] Create `src/usdc_rebalance/cmd.rs` with commands:
-  - [ ] `InitiateWithdrawal { direction, amount }`
-  - [ ] `Fail { reason }`
-- [ ] Create `src/usdc_rebalance/event.rs` with events:
-  - [ ] `WithdrawalInitiated { direction, amount, initiated_at }`
-  - [ ] `Failed { reason, failed_at }`
-- [ ] Implement `DomainEvent` trait for events
-- [ ] Implement `Aggregate` trait for `UsdcRebalance`:
-  - [ ] `aggregate_type()` returns "UsdcRebalance"
-  - [ ] `handle()` supports: NotStarted → InitiateWithdrawal, non-terminal →
+  - [x] `Failed { direction, amount, reason, failed_at }`
+- [x] Define `UsdcRebalanceError` enum with:
+  - [x] `WithdrawalNotInitiated`
+  - [x] `AlreadyCompleted`
+  - [x] `AlreadyFailed`
+- [x] Implement `Default` for `UsdcRebalance` returning `NotStarted`
+- [x] Create `src/usdc_rebalance/cmd.rs` with commands:
+  - [x] `InitiateWithdrawal { direction, amount }`
+  - [x] `Fail { reason }`
+- [x] Create `src/usdc_rebalance/event.rs` with events:
+  - [x] `WithdrawalInitiated { direction, amount, initiated_at }`
+  - [x] `Failed { reason, failed_at }`
+- [x] Implement `DomainEvent` trait for events
+- [x] Implement `Aggregate` trait for `UsdcRebalance`:
+  - [x] `aggregate_type()` returns "UsdcRebalance"
+  - [x] `handle()` supports: NotStarted → InitiateWithdrawal, non-terminal →
         Fail
-  - [ ] `apply()` transitions states based on events
-- [ ] Export types in module
+  - [x] `apply()` transitions states based on events
+- [x] Export types in module
 
 ### Tests
 
-- [ ] `test_initiate_withdrawal_alpaca_to_base`
-- [ ] `test_initiate_withdrawal_base_to_alpaca`
-- [ ] `test_fail_from_withdrawal_initiated`
-- [ ] `test_cannot_fail_when_completed`
-- [ ] `test_cannot_fail_when_already_failed`
+- [x] `test_initiate_withdrawal_alpaca_to_base`
+- [x] `test_initiate_withdrawal_base_to_alpaca`
+- [x] `test_fail_from_withdrawal_initiated`
+- [x] `test_cannot_fail_when_completed`
+- [x] `test_cannot_fail_when_already_failed`
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
 
 ## Task 2. Add Withdrawal Completion with Reference Tracking
 
