@@ -2,6 +2,12 @@
 members = [".", "crates/broker"]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+homepage = "https://github.com/ST0x-Technology"
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -27,6 +33,9 @@ alloy = { version = "1.0.38", features = ["full", "rand"] }
 async-trait = "0.1.81"
 cqrs-es = "0.4"
 sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }
+revm = { version = "=25.0.0", default-features = false }
+# Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
+wasm-bindgen = "0.2.100"
 sqlx = { version = "0.8.6", features = [
   "sqlite",
   "chrono",
@@ -38,6 +47,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
 flate2 = "1.0"
 httpmock = "0.7.0"
+rain-math-float = { path = "lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
 reqwest = { version = "0.12.4", features = [
   "json",
   "rustls-tls",
@@ -59,6 +69,7 @@ opentelemetry = "0.30.0"
 opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.30.0"
 tracing-opentelemetry = "0.31.0"
+proptest = "1.7.0"
 
 [package]
 name = "st0x-hedge"
@@ -77,6 +88,7 @@ clap.workspace = true
 dotenvy = "0.15.7"
 futures-util = "0.3.31"
 lazy_static = "1.5.0"
+rain-math-float.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -106,7 +118,7 @@ tracing-opentelemetry.workspace = true
 httpmock.workspace = true
 serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
-proptest = "1.6.0"
+proptest.workspace = true
 
 [lints]
 workspace = true
