@@ -288,3 +288,359 @@ impl EquityRedemption {
         };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[tokio::test]
+    async fn test_send_tokens_from_not_started() {
+        let aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let events = aggregate
+            .handle(
+                EquityRedemptionCommand::SendTokens {
+                    symbol: symbol.clone(),
+                    quantity: dec!(50.25),
+                    redemption_wallet,
+                    tx_hash,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            EquityRedemptionEvent::TokensSent { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_detect_after_tokens_sent() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol,
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let events = aggregate
+            .handle(
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], EquityRedemptionEvent::Detected { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_complete_from_pending() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol,
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let detected_event = EquityRedemptionEvent::Detected {
+            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            detected_at: Utc::now(),
+        };
+        aggregate.apply(detected_event);
+
+        let events = aggregate
+            .handle(EquityRedemptionCommand::Complete, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], EquityRedemptionEvent::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_complete_redemption_flow_end_to_end() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let send_events = aggregate
+            .handle(
+                EquityRedemptionCommand::SendTokens {
+                    symbol: symbol.clone(),
+                    quantity: dec!(50.25),
+                    redemption_wallet,
+                    tx_hash,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send_events.len(), 1);
+        aggregate.apply(send_events[0].clone());
+
+        let detect_events = aggregate
+            .handle(
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detect_events.len(), 1);
+        aggregate.apply(detect_events[0].clone());
+
+        let complete_events = aggregate
+            .handle(EquityRedemptionCommand::Complete, &())
+            .await
+            .unwrap();
+        assert_eq!(complete_events.len(), 1);
+
+        assert!(matches!(aggregate, EquityRedemption::Pending { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_detect_before_sending_tokens() {
+        let aggregate = EquityRedemption::default();
+
+        let result = aggregate
+            .handle(
+                EquityRedemptionCommand::Detect {
+                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EquityRedemptionError::TokensNotSent)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_complete_before_pending() {
+        let aggregate = EquityRedemption::default();
+
+        let result = aggregate
+            .handle(EquityRedemptionCommand::Complete, &())
+            .await;
+
+        assert!(matches!(result, Err(EquityRedemptionError::NotPending)));
+    }
+
+    #[tokio::test]
+    async fn test_fail_from_tokens_sent_state() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol,
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let events = aggregate
+            .handle(
+                EquityRedemptionCommand::Fail {
+                    reason: "Redemption rejected".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], EquityRedemptionEvent::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_fail_from_pending_state() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol,
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let detected_event = EquityRedemptionEvent::Detected {
+            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            detected_at: Utc::now(),
+        };
+        aggregate.apply(detected_event);
+
+        let events = aggregate
+            .handle(
+                EquityRedemptionCommand::Fail {
+                    reason: "Redemption failed".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], EquityRedemptionEvent::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_when_completed() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol,
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let detected_event = EquityRedemptionEvent::Detected {
+            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            detected_at: Utc::now(),
+        };
+        aggregate.apply(detected_event);
+
+        let completed_event = EquityRedemptionEvent::Completed {
+            completed_at: Utc::now(),
+        };
+        aggregate.apply(completed_event);
+
+        let result = aggregate
+            .handle(
+                EquityRedemptionCommand::Fail {
+                    reason: "Cannot fail".to_string(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(EquityRedemptionError::AlreadyCompleted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_when_already_failed() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol,
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let failed_event = EquityRedemptionEvent::Failed {
+            reason: "First failure".to_string(),
+            failed_at: Utc::now(),
+        };
+        aggregate.apply(failed_event);
+
+        let result = aggregate
+            .handle(
+                EquityRedemptionCommand::Fail {
+                    reason: "Second failure".to_string(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(EquityRedemptionError::AlreadyFailed)));
+    }
+
+    #[tokio::test]
+    async fn test_failed_state_preserves_optional_context() {
+        let mut aggregate = EquityRedemption::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_wallet = Address::random();
+        let tx_hash = TxHash::random();
+
+        let sent_event = EquityRedemptionEvent::TokensSent {
+            symbol: symbol.clone(),
+            quantity: dec!(50.25),
+            redemption_wallet,
+            tx_hash,
+            sent_at: Utc::now(),
+        };
+        aggregate.apply(sent_event);
+
+        let detected_event = EquityRedemptionEvent::Detected {
+            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            detected_at: Utc::now(),
+        };
+        aggregate.apply(detected_event);
+
+        let failed_event = EquityRedemptionEvent::Failed {
+            reason: "Redemption failed".to_string(),
+            failed_at: Utc::now(),
+        };
+        aggregate.apply(failed_event);
+
+        let EquityRedemption::Failed {
+            symbol: failed_symbol,
+            quantity,
+            tx_hash: failed_tx_hash,
+            tokenization_request_id,
+            sent_at,
+            ..
+        } = aggregate
+        else {
+            panic!("Expected Failed state, got {aggregate:?}");
+        };
+
+        assert_eq!(failed_symbol, symbol);
+        assert_eq!(quantity, dec!(50.25));
+        assert_eq!(failed_tx_hash, Some(tx_hash));
+        assert_eq!(
+            tokenization_request_id,
+            Some(TokenizationRequestId("REQ789".to_string()))
+        );
+        assert!(sent_at.is_some());
+    }
+}

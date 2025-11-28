@@ -278,21 +278,12 @@ pub(crate) enum EquityRedemption {
 
 ## Task 5. Implement EquityRedemption aggregate logic with tests
 
-Implement the `Aggregate` trait with business logic and comprehensive tests.
+Write comprehensive tests for the EquityRedemption aggregate (business logic was
+implemented in Task 4).
 
 **Subtasks:**
 
-- [ ] In `src/equity_redemption/mod.rs`, implement `Aggregate` trait:
-  - `aggregate_type()` returns "EquityRedemption"
-  - `handle()` validates commands and produces events
-  - `apply()` transitions state based on events
-- [ ] Implement business rules in `handle()`:
-  - `SendTokens`: Only from `NotStarted` → emit `TokensSent`
-  - `Detect`: Only from `TokensSent` → emit `Detected`
-  - `Complete`: Only from `Pending` → emit `Completed`
-  - `Fail`: From any non-terminal state → emit `Failed`
-- [ ] Implement state transitions in `apply()` for each event
-- [ ] Write tests in `#[cfg(test)] mod tests`:
+- [x] Write tests in `#[cfg(test)] mod tests`:
   - `test_send_tokens_from_not_started` - Verify sending tokens works
   - `test_detect_after_tokens_sent` - Verify detection transition
   - `test_complete_from_pending` - Verify completion
@@ -305,8 +296,8 @@ Implement the `Aggregate` trait with business logic and comprehensive tests.
   - `test_cannot_fail_when_already_failed` - Expect `AlreadyFailed` error
   - `test_failed_state_preserves_optional_context` - Verify optional fields in
     failed state
-- [ ] Run `cargo test -q` - all EquityRedemption tests must pass
-- [ ] Run `cargo clippy`
+- [x] Run `cargo test -q equity_redemption` - all 11 EquityRedemption tests pass
+- [x] Run `cargo clippy` - no errors
 
 **State Transition Rules:**
 
