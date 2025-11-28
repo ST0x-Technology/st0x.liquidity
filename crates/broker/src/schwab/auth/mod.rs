@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use cqrs_es::Aggregate;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use super::encryption::{EncryptedToken, EncryptionError, EncryptionKey, encrypt_token};
 
@@ -113,6 +114,12 @@ impl Aggregate for SchwabAuth {
                     *old_access = access_token;
                     *old_fetched_at = refreshed_at;
                 } else {
+                    warn!(
+                        current_state = ?self,
+                        refreshed_at = %refreshed_at,
+                        "AccessTokenRefreshed event applied to NotAuthenticated aggregate - \
+                         indicates bug in command validation"
+                    );
                     *self = Self::NotAuthenticated;
                 }
             }
