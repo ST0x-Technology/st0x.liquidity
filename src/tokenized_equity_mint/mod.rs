@@ -15,6 +15,15 @@ pub(crate) use event::TokenizedEquityMintEvent;
 pub(crate) use view::TokenizedEquityMintView;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct MintId(pub(crate) String);
+
+impl MintId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IssuerRequestId(pub(crate) String);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

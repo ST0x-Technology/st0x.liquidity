@@ -6,23 +6,21 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::Symbol;
 use tracing::warn;
 
-use super::{IssuerRequestId, ReceiptId, TokenizationRequestId, TokenizedEquityMint};
+use super::{IssuerRequestId, MintId, ReceiptId, TokenizationRequestId, TokenizedEquityMint};
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum TokenizedEquityMintView {
-    NotStarted {
-        mint_id: String,
-    },
+    NotStarted,
     Requested {
-        mint_id: String,
+        mint_id: MintId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
         requested_at: DateTime<Utc>,
     },
     Accepted {
-        mint_id: String,
+        mint_id: MintId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
@@ -32,7 +30,7 @@ pub(crate) enum TokenizedEquityMintView {
         accepted_at: DateTime<Utc>,
     },
     TokensReceived {
-        mint_id: String,
+        mint_id: MintId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
@@ -46,7 +44,7 @@ pub(crate) enum TokenizedEquityMintView {
         received_at: DateTime<Utc>,
     },
     Completed {
-        mint_id: String,
+        mint_id: MintId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
@@ -59,7 +57,7 @@ pub(crate) enum TokenizedEquityMintView {
         completed_at: DateTime<Utc>,
     },
     Failed {
-        mint_id: String,
+        mint_id: MintId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
@@ -71,9 +69,7 @@ pub(crate) enum TokenizedEquityMintView {
 
 impl Default for TokenizedEquityMintView {
     fn default() -> Self {
-        Self::NotStarted {
-            mint_id: String::new(),
-        }
+        Self::NotStarted
     }
 }
 
@@ -129,7 +125,7 @@ impl TokenizedEquityMintView {
         requested_at: DateTime<Utc>,
     ) {
         *self = Self::Requested {
-            mint_id: aggregate_id.to_string(),
+            mint_id: MintId::new(aggregate_id),
             symbol: symbol.clone(),
             quantity,
             wallet,
@@ -338,7 +334,7 @@ mod tests {
             panic!("Expected Requested state, got {view:?}");
         };
 
-        assert_eq!(mint_id, "mint-123");
+        assert_eq!(mint_id, &MintId::new("mint-123"));
         assert_eq!(view_symbol, &symbol);
         assert_eq!(quantity, &dec!(100.5));
         assert_eq!(view_wallet, &wallet);
@@ -434,7 +430,7 @@ mod tests {
             panic!("Expected Requested state, got {view:?}");
         };
 
-        assert_eq!(mint_id, "mint-456");
+        assert_eq!(mint_id, &MintId::new("mint-456"));
 
         let event2 = create_event_envelope(
             "mint-456",

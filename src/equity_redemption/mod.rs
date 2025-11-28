@@ -10,9 +10,20 @@ use crate::tokenized_equity_mint::TokenizationRequestId;
 
 mod cmd;
 mod event;
+mod view;
 
 pub(crate) use cmd::EquityRedemptionCommand;
 pub(crate) use event::EquityRedemptionEvent;
+pub(crate) use view::EquityRedemptionView;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RedemptionId(pub(crate) String);
+
+impl RedemptionId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum EquityRedemption {

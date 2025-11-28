@@ -312,29 +312,24 @@ Create view projection to query aggregate state.
 
 **Subtasks:**
 
-- [ ] Create `src/equity_redemption/view.rs`
-- [ ] Define `RedemptionStatus` enum: `NotStarted`, `TokensSent`, `Pending`,
-      `Completed`, `Failed`
-- [ ] Define `EquityRedemptionView` struct with fields:
-  - `redemption_id: String`
-  - `symbol: Option<Symbol>`
-  - `quantity: Option<Decimal>`
-  - `redemption_wallet: Option<Address>`
-  - `status: RedemptionStatus`
-  - `tokenization_request_id: Option<TokenizationRequestId>`
-  - `tx_hash: Option<TxHash>`
-  - `sent_at: Option<DateTime<Utc>>`
-  - `completed_at: Option<DateTime<Utc>>`
-  - `failed_at: Option<DateTime<Utc>>`
-  - `failure_reason: Option<String>`
-- [ ] Implement `View<EquityRedemption>` trait with `update()` method
-- [ ] Update view fields based on each event type
-- [ ] Write tests:
+- [x] Create `src/equity_redemption/view.rs`
+- [x] Define `EquityRedemptionView` enum with state variants:
+  - `NotStarted { redemption_id }`
+  - `TokensSent { redemption_id, symbol, quantity, redemption_wallet, tx_hash, sent_at }`
+  - `Pending { redemption_id, symbol, quantity, tx_hash, tokenization_request_id, sent_at, detected_at }`
+  - `Completed { redemption_id, symbol, quantity, tx_hash, tokenization_request_id, completed_at }`
+  - `Failed { redemption_id, symbol, quantity, tx_hash, tokenization_request_id, failure_reason, sent_at, failed_at }`
+- [x] Implement `View<EquityRedemption>` trait with `update()` method
+- [x] Use helper methods for state transitions: `handle_tokens_sent`,
+      `handle_detected`, `handle_completed`, `handle_failed`
+- [x] Add warning logs before early returns in let-else patterns
+- [x] Write tests:
   - `test_view_tracks_complete_flow` - Verify view updates through all states
   - `test_view_captures_failure_state` - Verify failure tracking
-- [ ] Export view in module
-- [ ] Run `cargo test -q` - all tests must pass
-- [ ] Run `cargo clippy`
+- [x] Export view in module
+- [x] Run `cargo test -q equity_redemption` - all 13 tests pass (11 aggregate +
+      2 view)
+- [x] Run `cargo clippy` - no errors
 
 ## Task 7. Add documentation and final verification
 
