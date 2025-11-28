@@ -1,262 +1,252 @@
-# Implementation Plan: Rain OrderBook Vault Service (Issue #134)
+# Implementation Plan: Manual Integration Testing CLI Commands
 
 ## Overview
 
-Build a service layer for Rain OrderBook vault operations on Base to deposit and
-withdraw USDC using the `deposit2` and `withdraw2` contract functions.
+Add CLI commands for manual testing of rebalancing system components: position
+accumulation, execution creation, order placement, status polling, and audit
+trails.
 
-## Design Decisions
+## Technical Context
 
-**Module Location**: Create `src/onchain/vault.rs` organized by business feature
-(vault operations).
+Existing infrastructure:
 
-**Type Safety**: Use `VaultId` newtype wrapping `U256` to prevent parameter
-confusion.
+- Position accumulators in `src/onchain/accumulator.rs` with `find_by_symbol`
+  query
+- Execution records in `src/offchain/execution.rs` with
+  `find_executions_by_symbol_status_and_broker` and `find_execution_by_id`
+- Onchain trades in `src/onchain/trade.rs`
+- CLI infrastructure in `src/cli.rs` with `Commands` enum and
+  `run_command_with_writers` pattern
 
-**EVM Account Pattern**: Reuse existing `EvmAccount<P, S>` pattern from
-`cctp.rs` for provider and signer management.
+Database schema:
 
-**Contract Bindings**: Use existing `IOrderBookV4` bindings from
-`src/bindings.rs` - `deposit2` and `withdraw2` already available.
+- `onchain_trades`: Immutable blockchain trade records
+- `offchain_trades`: Execution tracking (PENDING → SUBMITTED → FILLED/FAILED)
+- `trade_accumulators`: Position state per symbol (accumulated_long,
+  accumulated_short, net_position, pending_execution_id)
+- `trade_execution_links`: Many-to-many audit trail linking trades to executions
 
-**Tasks Parameter**: Pass empty arrays for the `TaskV1[]` parameter - no
-additional tasks needed for basic vault operations.
+Code organization: Follow existing CLI pattern (add `Commands` variant →
+implement handler in `run_command_with_writers` → test with mocked writer). Use
+`run_command_with_writers<W: Write>` signature for testability.
 
-**Testing Strategy**: Use `alloy::providers::mock::Asserter` for deterministic
-contract interaction tests.
+## Task 1. Implement show-position command
 
-## Task 1. Create vault service module with types and core structure
+Inspect position accumulator state for a symbol.
 
-- [x] Create `src/onchain/vault.rs` module file
-- [x] Define `VaultId` newtype wrapping `U256`
-- [x] Define `VaultError` enum with variants:
-  - `Transaction(alloy::providers::PendingTransactionError)`
-  - `Contract(alloy::contract::Error)`
-  - `InsufficientBalance { requested: U256, available: U256 }`
-  - `ZeroAmount`
-- [x] Implement error traits using `thiserror`
-- [x] Define `VaultService<P, S>` struct with:
-  - `account: EvmAccount<P, S>`
-  - `orderbook: Address`
-- [x] Implement
-      `VaultService::new(account: EvmAccount<P, S>, orderbook: Address) -> Self`
-- [x] Export module in `src/onchain/mod.rs`
-- [x] Run `cargo build` and `cargo clippy` to verify clean compilation
+- [ ] Add `Commands::ShowPosition` variant with symbol field
+- [ ] Create handler `show_position_with_writer`
+  - Validate symbol using `validate_ticker`
+  - Call `accumulator::find_by_symbol(pool, &symbol)`
+  - Handle `None` result with helpful error message
+  - Format output: net position, accumulated long/short, pending execution ID,
+    threshold, last updated
+- [ ] Add integration tests
+  - `test_show_position_not_found`: helpful message when position doesn't exist
+  - `test_show_position_with_accumulation`: verify fractional display
+  - `test_show_position_with_pending_execution`: verify pending execution ID
+    shown
+- [ ] Run `cargo test -q` and `cargo clippy`
 
-### Completed Changes
+## Task 2. Implement show-executions and show-execution commands
 
-Created `src/onchain/vault.rs` with:
+Query offchain execution status with optional filtering.
 
-- `VaultId` newtype for type-safe vault identifiers
-- `VaultError` enum with comprehensive error variants using `thiserror`
-- `VaultService<P, S>` generic struct using `EvmAccount` pattern from cctp
-  module
-- Constructor method for initializing service with account and orderbook address
-- Module exported in `src/onchain/mod.rs`
+- [ ] Add `Commands::ShowExecutions` variant with optional symbol, status,
+      broker filters
+- [ ] Add `Commands::ShowExecution` variant with execution id field
+- [ ] Create handler `show_executions_with_writer`
+  - Parse and validate optional status, broker, symbol strings
+  - Call `find_executions_by_symbol_status_and_broker`
+  - Format as table: ID | Symbol | Shares | Direction | Broker | Status | Order
+    ID | Price
+  - Convert price_cents to dollars, show "N/A" for None fields
+- [ ] Create handler `show_execution_with_writer`
+  - Call `find_execution_by_id`, handle None with clear error
+  - Display full execution details with timestamps and order state
+- [ ] Add integration tests
+  - `test_show_executions_no_filters`,
+    `test_show_executions_with_symbol_filter`,
+    `test_show_executions_with_status_filter`,
+    `test_show_executions_combined_filters`,
+    `test_show_executions_empty_results`
+  - `test_show_executions_invalid_status`, `test_show_executions_invalid_broker`
+  - `test_show_execution_by_id`, `test_show_execution_not_found`
+- [ ] Run `cargo test -q` and `cargo clippy`
 
-Build and clippy checks pass with only expected dead_code warnings for unused
-types.
+## Task 3. Implement show-trades and show-trade commands
 
-## Task 2. Update bindings to use rain.orderbook submodule
+Inspect stored onchain trades and their linkages. Requires new database queries.
 
-- [x] Update `src/bindings.rs` to reference OrderBook from
-      `lib/rain.orderbook/out/OrderBook.sol/OrderBook.json`
-- [x] Verify `nix run .#prepSolArtifacts` builds artifacts correctly
-- [x] Run `cargo build` to ensure bindings compile
-- [x] Run `cargo clippy`
+- [ ] Add query function to `src/onchain/trade.rs`:
+      `find_recent_trades(pool, symbol_filter, limit)` querying `onchain_trades`
+      ordered by `created_at DESC`
+- [ ] Add query function to `src/onchain/trade.rs`:
+      `find_trade_linkages(pool, trade_id)` querying `trade_execution_links`
+      with joins to `offchain_trades`
+- [ ] Define `TradeExecutionLink` struct with fields: link_id, execution_id,
+      contributed_shares, created_at, execution_symbol, execution_direction
+- [ ] Add `Commands::ShowTrades` variant with optional symbol filter and limit
+      (default 50)
+- [ ] Add `Commands::ShowTrade` variant with trade id field
+- [ ] Create handler `show_trades_with_writer`
+  - Validate limit (1-500 range), validate symbol if provided
+  - Call `find_recent_trades`
+  - Format as table: ID | TX Hash | Log Index | Symbol | Amount | Direction |
+    Price | Created
+  - Truncate tx_hash to "0x1234...abcd" format
+- [ ] Create handler `show_trade_with_writer`
+  - Call `OnchainTrade::find_by_id` (add function if needed), call
+    `find_trade_linkages`
+  - Display full trade details with complete tx_hash
+  - Display linked executions table with contributed_shares
+- [ ] Add integration tests
+  - `test_show_trades_default_limit`, `test_show_trades_custom_limit`,
+    `test_show_trades_with_symbol_filter`, `test_show_trades_limit_validation`
+  - `test_show_trade_detail`, `test_show_trade_not_found`,
+    `test_show_trade_no_linkages`
+- [ ] Run `cargo test -q` and `cargo clippy`
 
-### Completed Changes
+## Task 4. Implement show-links command
 
-Updated bindings to reference the full OrderBook contract from rain.orderbook
-submodule:
+Inspect trade-execution linkages. Requires new database queries.
 
-- Modified `flake.nix` line 23 to build rain.orderbook instead of
-  rain.orderbook.interface
-- Updated `src/bindings.rs` to reference
-  `lib/rain.orderbook/out/OrderBook.sol/OrderBook.json`
-- Ran `nix run .#prepSolArtifacts` to build artifacts (compilation succeeded in
-  138.52s, linting error from rain.interpreter dependency is ignorable)
-- Verified bindings compile successfully with cargo build and clippy
+- [ ] Create `src/onchain/linkage.rs` module
+- [ ] Define `LinkageDetail` struct with fields: link_id, trade_id,
+      execution_id, contributed_shares, created_at, trade_symbol, trade_amount,
+      execution_symbol, execution_shares
+- [ ] Add function `find_links_by_execution(pool, execution_id)` querying
+      `trade_execution_links` with joins
+- [ ] Add function `find_links_by_trade(pool, trade_id)` querying
+      `trade_execution_links` with joins
+- [ ] Export linkage module in `src/onchain/mod.rs`
+- [ ] Add `Commands::ShowLinks` variant with optional execution_id and trade_id
+      fields
+- [ ] Create handler `show_links_with_writer`
+  - Validate at least one ID provided
+  - Call appropriate query function
+  - Format as table showing linked trades or executions
+  - Display summary: total contributed shares, number of links, date range
+- [ ] Add integration tests
+  - `test_show_links_requires_id`, `test_show_links_by_execution`,
+    `test_show_links_by_trade`, `test_show_links_not_found`,
+    `test_show_links_summary_calculation`
+- [ ] Run `cargo test -q` and `cargo clippy`
 
-## Task 3. Create LocalEvm test infrastructure
+## Task 5. Implement check-threshold command
 
-- [x] Create `src/onchain/vault/test_utils.rs` module
-- [x] Implement `LocalEvm` struct:
-  - Spawn Anvil instance
-  - Deploy OrderBook contract from artifacts
-  - Deploy mock ERC20 token
-  - Store provider, signer, contract instances
-  - Implement helper methods for minting and approving tokens
-- [x] Export test_utils module behind `#[cfg(test)]`
-- [x] Run `cargo test -q` to verify setup compiles
+Manually trigger threshold checking logic for a symbol.
 
-### Completed Changes
+- [ ] Add `Commands::CheckThreshold` variant with symbol field
+- [ ] Create handler `check_threshold_with_writer`
+  - Validate symbol
+  - Begin SQL transaction
+  - Call `accumulator::check_all_accumulated_positions` or equivalent for single
+    symbol
+  - Capture outcome: threshold met/not met, execution created, stale cleanup,
+    lock held
+  - Display detailed decision process with current position state
+  - Commit transaction if successful
+- [ ] Format output for different scenarios:
+  - Below threshold: show gap to threshold
+  - Threshold met: show execution created + remaining shares
+  - Stale execution cleaned: show cleanup details
+  - Lock held: explain concurrency protection
+- [ ] Add integration tests
+  - `test_check_threshold_below`, `test_check_threshold_exactly_one`,
+    `test_check_threshold_above`
+  - `test_check_threshold_with_pending`, `test_check_threshold_stale_cleanup`
+- [ ] Run `cargo test -q` and `cargo clippy`
 
-Created comprehensive LocalEvm test infrastructure:
+## Task 6. Implement poll-order command
 
-- Used existing Token contract artifact from
-  lib/rain.orderbook/out/ArbTest.sol/Token.json for test ERC20
-- Added TestERC20 binding in bindings.rs pointing to Token.json artifact
-- Created src/onchain/vault/test_utils.rs with:
-  - LocalEvm struct with Anvil instance, provider, signer, and deployed contract
-    addresses
-  - new() method that spawns Anvil, deploys OrderBook and TestERC20 contracts
-  - Helper methods: mint_tokens, approve_tokens, get_balance, get_vault_balance
-  - LocalEvmError with proper error propagation using #[from] and #[source]
-  - Concrete type alias LocalEvmProvider for the complex Fill Provider type
-    chain
-- All errors properly propagated using `?` operator without string formatting
-- All 404 tests pass
-- Clippy passes
+Manually poll broker for order status and update database.
 
-## Task 4. Implement and test deposit functionality
+- [ ] Add `Commands::PollOrder` variant with execution_id field
+- [ ] Create handler `poll_order_with_writer`
+  - Call `find_execution_by_id`, verify execution exists
+  - Verify execution is in Submitted status (error if Pending/Filled/Failed)
+  - Extract order_id from Submitted state
+  - Initialize broker based on execution.broker field (Schwab/Alpaca/DryRun)
+  - Call `broker.get_order_status(order_id)`
+  - Begin SQL transaction, update execution state, commit
+  - Display before/after state transition
+- [ ] Format output for different scenarios:
+  - No change: "still pending"
+  - Fill: show executed_at, price, total value
+  - Failure: show failure reason
+  - Error: explain why polling not applicable (wrong status)
+- [ ] Add integration tests with mocked broker
+  - `test_poll_order_submitted_to_filled`, `test_poll_order_no_change`
+  - `test_poll_order_pending_error`, `test_poll_order_filled_error`,
+    `test_poll_order_not_found`, `test_poll_order_broker_error`
+- [ ] Run `cargo test -q` and `cargo clippy`
 
-- [x] Implement `deposit` method:
+## Task 7. Implement simulate-execution command
+
+Create mock executions for testing database operations without broker API.
+
+- [ ] Add `Commands::SimulateExecution` variant with symbol, shares, direction
+      fields
+- [ ] Create handler `simulate_execution_with_writer`
+  - Validate symbol, validate shares > 0
+  - Parse direction string to Direction enum
+  - Create OffchainExecution with DryRun broker, Pending status
+  - Begin SQL transaction
+  - Save execution (Pending)
+  - Transition to Submitted with mock order_id (e.g., "MOCK_1234567890")
+  - Transition to Filled with mock price ($100.00) and current timestamp
+  - Commit transaction
+  - Display each state transition
+- [ ] Add integration tests
+  - `test_simulate_execution_buy`, `test_simulate_execution_sell`
+  - `test_simulate_execution_invalid_direction`,
+    `test_simulate_execution_zero_shares`
+  - `test_simulate_execution_database_state`
+- [ ] Run `cargo test -q` and `cargo clippy`
+
+## Task 8. Implement reset-position command
+
+Reset position accumulator state for testing. Requires safety confirmation.
+
+- [ ] Add `Commands::ResetPosition` variant with symbol and confirm fields
+- [ ] Create handler `reset_position_with_writer`
+  - Check confirm flag (error if false with helpful message showing command
+    usage)
+  - Load current accumulator state, display it
+  - Begin SQL transaction
+  - If pending_execution_id exists: load execution, mark as FAILED with reason
+    "Reset by user"
+  - Reset accumulator: accumulated_long = 0.0, accumulated_short = 0.0
+  - Clear pending_execution_id, update last_updated timestamp
+  - Commit transaction
+  - Display final state, warn that onchain trades remain intact
+- [ ] Add integration tests
+  - `test_reset_position_without_confirm`, `test_reset_position_with_confirm`
+  - `test_reset_position_with_pending_execution`,
+    `test_reset_position_no_pending_execution`
+  - `test_reset_position_onchain_trades_intact`
+- [ ] Run `cargo test -q` and `cargo clippy`
+
+## Task 9. Add documentation and help text
+
+Document all commands with usage examples.
+
+- [ ] Add doc comments to each command variant
   ```rust
-  pub async fn deposit(
-      &self,
-      token: Address,
-      vault_id: VaultId,
-      amount: U256,
-  ) -> Result<TxHash, VaultError>
+  /// Inspect position accumulator state for a symbol
+  ShowPosition { ... }
   ```
-  - Validate amount is non-zero
-  - Call `IOrderBookV4::deposit2` with empty tasks array
-  - Get transaction receipt before returning
-- [x] Write integration test: `test_deposit_succeeds_with_deployed_contract`
-  - Use LocalEvm to set up test environment
-  - Mint tokens to test account
-  - Approve orderbook to spend tokens
-  - Call deposit via VaultService
-  - Verify transaction succeeds
-  - Query vault balance and verify it increased correctly
-- [x] Write unit test: `deposit_rejects_zero_amount`
-  - Assert `VaultError::ZeroAmount` without contract call
-- [x] Run `cargo test -q` and `cargo clippy`
-
-### Completed Changes
-
-Wrote comprehensive tests for deposit functionality:
-
-- Updated `deposit_rejects_zero_amount` test to use LocalEvm instead of mocks
-- Wrote `test_deposit_succeeds_with_deployed_contract` integration test that:
-  - Deploys real OrderBook and ERC20 contracts via LocalEvm
-  - Approves orderbook to spend tokens
-  - Calls deposit via VaultService
-  - Verifies vault balance before deposit is zero
-  - Verifies vault balance after deposit equals deposited amount
-  - Verifies transaction hash is non-zero
-- Both tests pass (2/2 passed in 1.66s)
-- Clippy passes with no errors
-
-## Task 5. Implement and test withdraw functionality
-
-- [x] Implement `withdraw` method:
-  ```rust
-  pub async fn withdraw(
-      &self,
-      token: Address,
-      vault_id: VaultId,
-      target_amount: U256,
-  ) -> Result<TxHash, VaultError>
-  ```
-  - Validate target_amount is non-zero
-  - Call `IOrderBookV4::withdraw2` with empty tasks array
-  - Get transaction receipt before returning
-- [x] Write integration test: `test_withdraw_succeeds_with_deployed_contract`
-  - Use LocalEvm to set up test environment
-  - Deposit tokens first to create vault balance
-  - Call withdraw via VaultService
-  - Verify transaction succeeds
-  - Query vault balance and verify it decreased correctly
-- [x] Write unit test: `withdraw_rejects_zero_amount`
-  - Assert `VaultError::ZeroAmount` without contract call
-- [x] Run `cargo test -q` and `cargo clippy`
-
-### Completed Changes
-
-Implemented withdraw functionality with comprehensive tests:
-
-- Implemented `withdraw` method in `VaultService`:
-  - Validates target_amount is non-zero
-  - Calls `IOrderBookV4::withdraw2` with empty tasks array
-  - Returns transaction hash after getting receipt
-- Wrote `withdraw_rejects_zero_amount` test:
-  - Verifies `VaultError::ZeroAmount` is returned for zero amount
-- Wrote `test_withdraw_succeeds_with_deployed_contract` integration test:
-  - Deposits 1000 tokens to vault first
-  - Withdraws 500 tokens via VaultService
-  - Verifies vault balance decreased from 1000 to 500 tokens
-  - Verifies transaction hash is non-zero
-- All 4 vault tests pass (2 deposit + 2 withdraw)
-- Clippy passes with no errors
-
-## Task 6. Add and test USDC convenience methods
-
-- [x] Define constant:
-      `USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")`
-- [x] Implement `deposit_usdc`:
-  ```rust
-  pub async fn deposit_usdc(
-      &self,
-      vault_id: VaultId,
-      amount: U256,
-  ) -> Result<TxHash, VaultError>
-  ```
-  - Delegates to `self.deposit(USDC_BASE, vault_id, amount)`
-- [x] Implement `withdraw_usdc`:
-  ```rust
-  pub async fn withdraw_usdc(
-      &self,
-      vault_id: VaultId,
-      target_amount: U256,
-  ) -> Result<TxHash, VaultError>
-  ```
-  - Delegates to `self.withdraw(USDC_BASE, vault_id, target_amount)`
-- [x] Write test: `usdc_base_address_is_correct`
-  - Verify USDC_BASE address constant value
-- [x] Run `cargo test -q` and `cargo clippy`
-
-### Completed Changes
-
-Implemented USDC convenience methods:
-
-- Defined `USDC_BASE` constant with Base USDC address
-  (0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913)
-- Implemented `deposit_usdc` method that delegates to `deposit` with USDC_BASE
-- Implemented `withdraw_usdc` method that delegates to `withdraw` with USDC_BASE
-- Wrote `usdc_base_address_is_correct` test to verify the constant value
-- All 5 vault tests pass
-- Clippy passes with no errors
-
-## Task 7. Add documentation
-
-- [x] Add module-level doc comment:
-  - Purpose: vault deposit/withdraw for Rain OrderBook on Base
-  - Contract functions: `deposit2`, `withdraw2`
-  - Primary use: USDC vault management for inventory rebalancing
-- [x] Add doc comments to public types:
-  - `VaultId`: Vault identifier newtype
-  - `VaultService`: Usage example showing deposit/withdraw
-  - `deposit`: Parameters and error conditions
-  - `withdraw`: Parameters and target amount semantics
-  - `deposit_usdc`/`withdraw_usdc`: USDC-specific convenience methods
-- [x] Run `cargo fmt`
-- [x] Final `cargo build`, `cargo test -q`,
-      `cargo clippy --all-targets --all-features -- -D clippy::all`
-
-### Completed Changes
-
-Added comprehensive documentation:
-
-- Added module-level doc comment explaining the purpose and use case
-- Documented `VaultId` struct with clear description
-- Documented `VaultService` struct with usage example
-- Documented `deposit` method with parameters and error conditions
-- Documented `withdraw` method with parameters and error semantics
-- Documented `deposit_usdc` and `withdraw_usdc` convenience methods
-- Ran `cargo fmt` for clean formatting
-- All builds, tests, and clippy checks pass:
-  - ✅ `cargo build` - clean compilation
-  - ✅ `cargo test -q` - 5/5 vault tests pass
-  - ✅ `cargo clippy --all-targets --all-features -- -D clippy::all` - no errors
+- [ ] Create `examples/CLI_MANUAL_TESTING.md` with:
+  - Overview of manual testing workflow
+  - Example scenarios: inspecting accumulation, monitoring executions, audit
+    trail, testing, reset
+  - Expected outputs for each scenario
+  - Common troubleshooting tips
+- [ ] Test complete workflow end-to-end:
+  - Reset position → Process transaction → Check position → Check threshold →
+    Show executions → Show trades → Show links
+- [ ] Verify `cargo run --bin cli -- --help` shows all commands with
+      descriptions
+- [ ] Run final `cargo test -q`,
+      `cargo clippy --all-targets --all-features -- -D clippy::all`, `cargo fmt`
