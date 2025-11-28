@@ -1,3 +1,83 @@
+//! Equity Redemption aggregate for converting onchain tokens back to offchain Alpaca shares.
+//!
+//! This module implements the CQRS-ES aggregate pattern for managing the asynchronous workflow
+//! of redeeming tokenized equity shares. It tracks the complete lifecycle from sending tokens
+//! to Alpaca's redemption wallet through detecting the redemption to final completion.
+//!
+//! # State Flow
+//!
+//! The aggregate progresses through the following states:
+//!
+//! ```text
+//! NotStarted
+//!     |
+//!     | SendTokens
+//!     v
+//! TokensSent
+//!     |
+//!     | Detect (Alpaca API confirms receipt)
+//!     v
+//! Pending
+//!     |
+//!     | Complete (Alpaca processes redemption)
+//!     v
+//! Completed
+//!
+//! Any non-terminal state can transition to Failed via the Fail command.
+//! ```
+//!
+//! # Alpaca API Integration
+//!
+//! The redemption process integrates with Alpaca's redemption API:
+//!
+//! 1. **Send**: System initiates onchain transfer to Alpaca's redemption wallet
+//! 2. **Detection**: Alpaca detects the transfer and returns `tokenization_request_id`
+//! 3. **Processing**: Alpaca processes the redemption and credits the account
+//! 4. **Completion**: System confirms redemption is complete
+//!
+//! # Error Handling
+//!
+//! The aggregate enforces strict state transitions:
+//!
+//! - Commands that don't match current state return appropriate errors
+//! - Terminal states (Completed, Failed) reject all state-changing commands
+//! - Failed state preserves optional context (tx_hash, tokenization_request_id) depending on when failure occurred
+//! - All state transitions are captured as events for complete audit trail
+//!
+//! # Usage Example
+//!
+//! ```ignore
+//! use cqrs_es::Aggregate;
+//! use equity_redemption::*;
+//!
+//! let mut redemption = EquityRedemption::default();
+//!
+//! // Send tokens to redemption wallet
+//! let events = redemption.handle(
+//!     EquityRedemptionCommand::SendTokens {
+//!         symbol: Symbol::new("AAPL").unwrap(),
+//!         quantity: Decimal::from(50),
+//!         redemption_wallet: alpaca_wallet,
+//!         tx_hash: transaction_hash,
+//!     },
+//!     &()
+//! ).await?;
+//!
+//! for event in events {
+//!     redemption.apply(event);
+//! }
+//!
+//! // Detect Alpaca's acknowledgment
+//! let events = redemption.handle(
+//!     EquityRedemptionCommand::Detect {
+//!         tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+//!     },
+//!     &()
+//! ).await?;
+//!
+//! // Continue through remaining states...
+//! ```
+
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -16,6 +96,7 @@ pub(crate) use cmd::EquityRedemptionCommand;
 pub(crate) use event::EquityRedemptionEvent;
 pub(crate) use view::EquityRedemptionView;
 
+/// Unique identifier for an equity redemption operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct RedemptionId(pub(crate) String);
 
@@ -25,9 +106,16 @@ impl RedemptionId {
     }
 }
 
+/// Equity redemption aggregate state machine.
+///
+/// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
+/// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum EquityRedemption {
+    /// Initial state before any redemption has been initiated
     NotStarted,
+
+    /// Tokens sent to Alpaca's redemption wallet with transaction hash
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
@@ -35,6 +123,8 @@ pub(crate) enum EquityRedemption {
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
     },
+
+    /// Alpaca detected the token transfer and returned tracking identifier
     Pending {
         symbol: Symbol,
         quantity: Decimal,
@@ -43,6 +133,8 @@ pub(crate) enum EquityRedemption {
         sent_at: DateTime<Utc>,
         detected_at: DateTime<Utc>,
     },
+
+    /// Redemption successfully completed and account credited (terminal state)
     Completed {
         symbol: Symbol,
         quantity: Decimal,
@@ -50,6 +142,13 @@ pub(crate) enum EquityRedemption {
         tokenization_request_id: TokenizationRequestId,
         completed_at: DateTime<Utc>,
     },
+
+    /// Redemption failed with error reason (terminal state)
+    ///
+    /// Optional fields preserve context depending on when failure occurred:
+    /// - `tx_hash`: Present if tokens were sent
+    /// - `tokenization_request_id`: Present if Alpaca detected the transfer
+    /// - `sent_at`: Present if tokens were sent
     Failed {
         symbol: Symbol,
         quantity: Decimal,
@@ -67,17 +166,24 @@ impl Default for EquityRedemption {
     }
 }
 
+/// Errors that can occur during equity redemption operations.
+///
+/// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub(crate) enum EquityRedemptionError {
+    /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
 
+    /// Attempted to complete before redemption was detected as pending
     #[error("Cannot complete: not in pending state")]
     NotPending,
 
+    /// Attempted to modify a completed redemption operation
     #[error("Already completed")]
     AlreadyCompleted,
 
+    /// Attempted to modify a failed redemption operation
     #[error("Already failed")]
     AlreadyFailed,
 }

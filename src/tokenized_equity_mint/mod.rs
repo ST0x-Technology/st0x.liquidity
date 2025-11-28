@@ -1,3 +1,86 @@
+//! Tokenized Equity Mint aggregate for converting offchain Alpaca shares to onchain tokens.
+//!
+//! This module implements the CQRS-ES aggregate pattern for managing the asynchronous workflow
+//! of minting tokenized equity shares. It tracks the complete lifecycle from requesting a mint
+//! through Alpaca's tokenization API to receiving the onchain tokens.
+//!
+//! # State Flow
+//!
+//! The aggregate progresses through the following states:
+//!
+//! ```text
+//! NotStarted
+//!     |
+//!     | RequestMint
+//!     v
+//! MintRequested
+//!     |
+//!     | AcknowledgeAcceptance (Alpaca API confirms)
+//!     v
+//! MintAccepted
+//!     |
+//!     | ReceiveTokens (onchain transfer detected)
+//!     v
+//! TokensReceived
+//!     |
+//!     | Finalize
+//!     v
+//! Completed
+//!
+//! Any non-terminal state can transition to Failed via the Fail command.
+//! ```
+//!
+//! # Alpaca API Integration
+//!
+//! The mint process integrates with Alpaca's tokenization API:
+//!
+//! 1. **Request**: System initiates mint request with symbol, quantity, and destination wallet
+//! 2. **Acceptance**: Alpaca responds with `issuer_request_id` and `tokenization_request_id`
+//! 3. **Transfer**: Alpaca executes onchain transfer, system detects transaction
+//! 4. **Completion**: System verifies receipt and finalizes mint
+//!
+//! # Error Handling
+//!
+//! The aggregate enforces strict state transitions:
+//!
+//! - Commands that don't match current state return appropriate errors
+//! - Terminal states (Completed, Failed) reject all state-changing commands
+//! - All state transitions are captured as events for complete audit trail
+//!
+//! # Usage Example
+//!
+//! ```ignore
+//! use cqrs_es::Aggregate;
+//! use tokenized_equity_mint::*;
+//!
+//! let mut mint = TokenizedEquityMint::default();
+//!
+//! // Request mint
+//! let events = mint.handle(
+//!     TokenizedEquityMintCommand::RequestMint {
+//!         symbol: Symbol::new("AAPL").unwrap(),
+//!         quantity: Decimal::from(100),
+//!         wallet: destination_wallet,
+//!     },
+//!     &()
+//! ).await?;
+//!
+//! for event in events {
+//!     mint.apply(event);
+//! }
+//!
+//! // Acknowledge Alpaca's acceptance
+//! let events = mint.handle(
+//!     TokenizedEquityMintCommand::AcknowledgeAcceptance {
+//!         issuer_request_id: IssuerRequestId("ISS123".to_string()),
+//!         tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+//!     },
+//!     &()
+//! ).await?;
+//!
+//! // Continue through remaining states...
+//! ```
+
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -14,6 +97,7 @@ pub(crate) use cmd::TokenizedEquityMintCommand;
 pub(crate) use event::TokenizedEquityMintEvent;
 pub(crate) use view::TokenizedEquityMintView;
 
+/// Unique identifier for a tokenized equity mint operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct MintId(pub(crate) String);
 
@@ -23,38 +107,62 @@ impl MintId {
     }
 }
 
+/// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IssuerRequestId(pub(crate) String);
 
+/// Alpaca tokenization request identifier used to track the mint operation through their API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TokenizationRequestId(pub(crate) String);
 
+/// Onchain receipt identifier (U256) for the token transfer transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReceiptId(pub(crate) U256);
 
+/// Errors that can occur during tokenized equity mint operations.
+///
+/// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub(crate) enum TokenizedEquityMintError {
+    /// Attempted to acknowledge acceptance before requesting mint
     #[error("Cannot accept mint: not in requested state")]
     NotRequested,
+
+    /// Attempted to receive tokens before mint was accepted
     #[error("Cannot receive tokens: mint not accepted")]
     NotAccepted,
+
+    /// Attempted to finalize before tokens were received
     #[error("Cannot finalize: tokens not received")]
     TokensNotReceived,
+
+    /// Attempted to modify a completed mint operation
     #[error("Already completed")]
     AlreadyCompleted,
+
+    /// Attempted to modify a failed mint operation
     #[error("Already failed")]
     AlreadyFailed,
 }
 
+/// Tokenized equity mint aggregate state machine.
+///
+/// Uses the typestate pattern via enum variants to make invalid states unrepresentable.
+/// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum TokenizedEquityMint {
+    /// Initial state before any mint has been requested
     NotStarted,
+
+    /// Mint request initiated with symbol, quantity, and destination wallet
     MintRequested {
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
         requested_at: DateTime<Utc>,
     },
+
+    /// Alpaca API accepted the mint request and returned tracking identifiers
     MintAccepted {
         symbol: Symbol,
         quantity: Decimal,
@@ -64,6 +172,8 @@ pub(crate) enum TokenizedEquityMint {
         requested_at: DateTime<Utc>,
         accepted_at: DateTime<Utc>,
     },
+
+    /// Onchain token transfer detected with transaction details
     TokensReceived {
         symbol: Symbol,
         quantity: Decimal,
@@ -77,6 +187,8 @@ pub(crate) enum TokenizedEquityMint {
         accepted_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
     },
+
+    /// Mint operation successfully completed (terminal state)
     Completed {
         symbol: Symbol,
         quantity: Decimal,
@@ -89,6 +201,8 @@ pub(crate) enum TokenizedEquityMint {
         requested_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     },
+
+    /// Mint operation failed with error reason (terminal state)
     Failed {
         symbol: Symbol,
         quantity: Decimal,
