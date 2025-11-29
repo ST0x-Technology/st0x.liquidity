@@ -138,6 +138,7 @@ impl Aggregate for OnChainTrade {
                     Err(OnChainTradeError::AlreadyFilled)
                 }
             },
+
             OnChainTradeCommand::Enrich {
                 gas_used,
                 pyth_price,
@@ -178,6 +179,7 @@ impl Aggregate for OnChainTrade {
                     filled_at,
                 };
             }
+
             OnChainTradeEvent::Enriched {
                 gas_used,
                 pyth_price,
@@ -213,6 +215,7 @@ impl Aggregate for OnChainTrade {
                     );
                 }
             }
+
             OnChainTradeEvent::Migrated {
                 symbol,
                 amount,
