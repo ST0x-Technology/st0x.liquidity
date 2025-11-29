@@ -1,26 +1,26 @@
+use alloy::primitives::TxHash;
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, Symbol};
 use tracing::error;
 
-use super::{OnChainTrade, OnChainTradeEvent, PythPrice};
+use super::{OnChainTrade, OnChainTradeEvent, PythPrice, TradeAggregateId};
+use st0x_broker::{Direction, Symbol};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OnChainTradeViewError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Deserialization error: {0}")]
-    Deserialization(#[from] serde_json::Error),
+    #[error("sqlx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
+    #[error("serde error: {0}")]
+    SerdeJson(#[from] serde_json::Error),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum OnChainTradeView {
     Unavailable,
     Trade {
-        tx_hash: String,
+        tx_hash: TxHash,
         log_index: u64,
         symbol: Symbol,
         amount: Decimal,
@@ -41,7 +41,7 @@ impl Default for OnChainTradeView {
 }
 
 impl OnChainTradeView {
-    fn handle_filled(&mut self, event: &OnChainTradeEvent, tx_hash: String, log_index: u64) {
+    fn handle_filled(&mut self, event: &OnChainTradeEvent, tx_hash: TxHash, log_index: u64) {
         let OnChainTradeEvent::Filled {
             symbol,
             amount,
@@ -88,16 +88,17 @@ impl OnChainTradeView {
 
 impl View<OnChainTrade> for OnChainTradeView {
     fn update(&mut self, event: &EventEnvelope<OnChainTrade>) {
-        let parts: Vec<&str> = event.aggregate_id.split(':').collect();
-        let (tx_hash, log_index) = if parts.len() == 2 {
-            (parts[0].to_string(), parts[1].parse::<u64>().unwrap_or(0))
-        } else {
-            (event.aggregate_id.clone(), 0)
+        let Ok(aggregate_id) = event.aggregate_id.parse::<TradeAggregateId>() else {
+            error!(
+                aggregate_id = %event.aggregate_id,
+                "Failed to parse aggregate_id, cannot update view"
+            );
+            return;
         };
 
         match &event.payload {
             OnChainTradeEvent::Filled { .. } => {
-                self.handle_filled(&event.payload, tx_hash, log_index);
+                self.handle_filled(&event.payload, aggregate_id.tx_hash, aggregate_id.log_index);
             }
             OnChainTradeEvent::Enriched {
                 gas_used,
@@ -118,8 +119,8 @@ impl View<OnChainTrade> for OnChainTradeView {
                 migrated_at,
             } => {
                 *self = Self::Trade {
-                    tx_hash,
-                    log_index,
+                    tx_hash: aggregate_id.tx_hash,
+                    log_index: aggregate_id.log_index,
                     symbol: symbol.clone(),
                     amount: *amount,
                     direction: *direction,
@@ -138,6 +139,7 @@ impl View<OnChainTrade> for OnChainTradeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::fixed_bytes;
     use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
@@ -151,6 +153,8 @@ mod tests {
         let block_number = 12345;
         let block_timestamp = chrono::Utc::now();
         let filled_at = chrono::Utc::now();
+        let expected_tx_hash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
         let event = OnChainTradeEvent::Filled {
             symbol: symbol.clone(),
@@ -163,7 +167,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: "0xabc:5".to_string(),
+            aggregate_id: format!("{expected_tx_hash}:5"),
             sequence: 1,
             payload: event,
             metadata: HashMap::new(),
@@ -192,7 +196,7 @@ mod tests {
             panic!("Expected Trade variant");
         };
 
-        assert_eq!(tx_hash, "0xabc");
+        assert_eq!(tx_hash, expected_tx_hash);
         assert_eq!(log_index, 5);
         assert_eq!(view_symbol, symbol);
         assert_eq!(view_amount, amount);
@@ -201,7 +205,7 @@ mod tests {
         assert_eq!(view_block_number, block_number);
         assert_eq!(view_block_timestamp, block_timestamp);
         assert_eq!(gas_used, None);
-        assert_eq!(pyth_price, Box::new(None));
+        assert_eq!(*pyth_price, None);
         assert_eq!(recorded_at, filled_at);
     }
 
@@ -210,9 +214,11 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let block_timestamp = chrono::Utc::now();
         let filled_at = chrono::Utc::now();
+        let tx_hash =
+            fixed_bytes!("0x0def123456789012def0123456789012def0123456789012def0123456789012");
 
         let mut view = OnChainTradeView::Trade {
-            tx_hash: "0xdef".to_string(),
+            tx_hash,
             log_index: 3,
             symbol,
             amount: dec!(10.5),
@@ -241,7 +247,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: "0xdef:3".to_string(),
+            aggregate_id: format!("{tx_hash}:3"),
             sequence: 2,
             payload: event,
             metadata: HashMap::new(),
@@ -260,7 +266,7 @@ mod tests {
         };
 
         assert_eq!(view_gas_used, Some(50000));
-        assert_eq!(view_pyth_price, Box::new(Some(pyth_price)));
+        assert_eq!(*view_pyth_price, Some(pyth_price));
         assert_eq!(view_recorded_at, filled_at);
     }
 
@@ -273,6 +279,8 @@ mod tests {
         let block_number = 12345;
         let block_timestamp = chrono::Utc::now();
         let migrated_at = chrono::Utc::now();
+        let expected_tx_hash =
+            fixed_bytes!("0x09a1234567890123091234567890123091234567890123091234567890123091");
 
         let pyth_price = PythPrice {
             value: "150250000".to_string(),
@@ -294,7 +302,7 @@ mod tests {
         };
 
         let envelope = EventEnvelope {
-            aggregate_id: "0xghi:1".to_string(),
+            aggregate_id: format!("{expected_tx_hash}:1"),
             sequence: 1,
             payload: event,
             metadata: HashMap::new(),
@@ -316,11 +324,11 @@ mod tests {
             panic!("Expected Trade variant");
         };
 
-        assert_eq!(tx_hash, "0xghi");
+        assert_eq!(tx_hash, expected_tx_hash);
         assert_eq!(log_index, 1);
         assert_eq!(view_symbol, symbol);
         assert_eq!(gas_used, Some(50000));
-        assert_eq!(view_pyth_price, Box::new(Some(pyth_price)));
+        assert_eq!(*view_pyth_price, Some(pyth_price));
     }
 
     #[test]
@@ -345,8 +353,11 @@ mod tests {
             migrated_at,
         };
 
+        let tx_hash =
+            fixed_bytes!("0x0bcd123456789012bcdbcd123456789012bcdbcd123456789012bcd1234567ab");
+
         let envelope = EventEnvelope {
-            aggregate_id: "0xjkl:2".to_string(),
+            aggregate_id: format!("{tx_hash}:2"),
             sequence: 1,
             payload: event,
             metadata: HashMap::new(),
@@ -368,7 +379,7 @@ mod tests {
 
         assert_eq!(view_symbol, symbol);
         assert_eq!(gas_used, None);
-        assert_eq!(pyth_price, Box::new(None));
+        assert_eq!(*pyth_price, None);
     }
 
     #[test]
@@ -388,8 +399,11 @@ mod tests {
             enriched_at: chrono::Utc::now(),
         };
 
+        let tx_hash =
+            fixed_bytes!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+
         let envelope = EventEnvelope {
-            aggregate_id: "0xmno:4".to_string(),
+            aggregate_id: format!("{tx_hash}:4"),
             sequence: 1,
             payload: event,
             metadata: HashMap::new(),
