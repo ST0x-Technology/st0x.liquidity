@@ -1,4 +1,4 @@
-use alloy::primitives::B256;
+use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
@@ -18,7 +18,7 @@ use st0x_broker::{Direction, Symbol};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TradeAggregateId {
-    pub(crate) tx_hash: B256,
+    pub(crate) tx_hash: TxHash,
     pub(crate) log_index: u64,
 }
 
@@ -41,7 +41,7 @@ impl FromStr for TradeAggregateId {
             return Err(AggregateIdError::InvalidFormat(s.to_string()));
         }
 
-        let tx_hash = B256::from_str(parts[0])?;
+        let tx_hash = TxHash::from_str(parts[0])?;
         let log_index = parts[1].parse::<u64>()?;
 
         Ok(Self { tx_hash, log_index })
@@ -517,7 +517,7 @@ mod tests {
             tx_hash_bytes in prop::array::uniform32(any::<u8>()),
             log_index in any::<u64>()
         ) {
-            let tx_hash = B256::from(tx_hash_bytes);
+            let tx_hash = TxHash::from(tx_hash_bytes);
             let aggregate_id = TradeAggregateId { tx_hash, log_index };
 
             let serialized = aggregate_id.to_string();
