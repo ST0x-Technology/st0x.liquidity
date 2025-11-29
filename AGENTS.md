@@ -72,10 +72,26 @@ This project uses a Cargo workspace with:
 ### Database Management
 
 - `sqlx db create` - Create the database
+- `sqlx db reset -y` - Drop the database and re-run all migrations
 - `sqlx migrate run` - Apply database migrations
 - `sqlx migrate revert` - Revert last migration
-- `sqlx migrate reset -y` - Drop the database and re-run all migrations
+- `sqlx migrate add <migration_name>` - Create a new migration file
 - Database URL configured via `DATABASE_URL` environment variable
+
+**CRITICAL: NEVER manually create migration files.** Always use `sqlx migrate add
+<migration_name>` to create migrations. This ensures proper timestamping and
+sequencing.
+
+### Dependency Management
+
+**CRITICAL: NEVER manually edit `Cargo.toml` to add dependencies.** Always use
+`cargo add <crate_name>` to add dependencies. This ensures proper version
+resolution and feature selection.
+
+- `cargo add <crate_name>` - Add a dependency to the current crate
+- `cargo add <crate_name> --dev` - Add a dev-dependency
+- `cargo add <crate_name> --build` - Add a build-dependency
+- `cargo add <crate_name> -F <feature>` - Add a dependency with specific features
 
 ### Development Tools
 
