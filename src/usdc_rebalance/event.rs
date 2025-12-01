@@ -4,31 +4,51 @@ use cqrs_es::DomainEvent;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use super::RebalanceDirection;
-use crate::alpaca_wallet::AlpacaTransferId;
+use super::{RebalanceDirection, TransferRef};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum UsdcRebalanceEvent {
-    WithdrawalInitiated {
+    Initiated {
         direction: RebalanceDirection,
         amount: Decimal,
+        withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
-    AlpacaWithdrawalCompleted {
-        transfer_id: AlpacaTransferId,
-        completed_at: DateTime<Utc>,
+    WithdrawalConfirmed {
+        confirmed_at: DateTime<Utc>,
     },
-    RaindexWithdrawalCompleted {
-        withdrawal_tx_hash: TxHash,
-        completed_at: DateTime<Utc>,
-    },
-    AlpacaWithdrawalFailed {
-        reference: Option<AlpacaTransferId>,
+    WithdrawalFailed {
         reason: String,
         failed_at: DateTime<Utc>,
     },
-    RaindexWithdrawalFailed {
-        reference: Option<TxHash>,
+    BridgingInitiated {
+        burn_tx_hash: TxHash,
+        cctp_nonce: u64,
+        burned_at: DateTime<Utc>,
+    },
+    BridgeAttestationReceived {
+        attestation: Vec<u8>,
+        attested_at: DateTime<Utc>,
+    },
+    Bridged {
+        mint_tx_hash: TxHash,
+        minted_at: DateTime<Utc>,
+    },
+    BridgingFailed {
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+    DepositInitiated {
+        deposit_ref: TransferRef,
+        deposit_initiated_at: DateTime<Utc>,
+    },
+    DepositConfirmed {
+        deposit_confirmed_at: DateTime<Utc>,
+    },
+    DepositFailed {
+        deposit_ref: Option<TransferRef>,
         reason: String,
         failed_at: DateTime<Utc>,
     },
@@ -37,22 +57,18 @@ pub(crate) enum UsdcRebalanceEvent {
 impl DomainEvent for UsdcRebalanceEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::WithdrawalInitiated { .. } => {
-                "UsdcRebalanceEvent::WithdrawalInitiated".to_string()
-            }
-            Self::AlpacaWithdrawalCompleted { .. } => {
-                "UsdcRebalanceEvent::AlpacaWithdrawalCompleted".to_string()
-            }
-            Self::RaindexWithdrawalCompleted { .. } => {
-                "UsdcRebalanceEvent::RaindexWithdrawalCompleted".to_string()
-            }
-            Self::AlpacaWithdrawalFailed { .. } => {
-                "UsdcRebalanceEvent::AlpacaWithdrawalFailed".to_string()
-            }
-            Self::RaindexWithdrawalFailed { .. } => {
-                "UsdcRebalanceEvent::RaindexWithdrawalFailed".to_string()
-            }
+            Self::Initiated { .. } => "Initiated",
+            Self::WithdrawalConfirmed { .. } => "WithdrawalConfirmed",
+            Self::WithdrawalFailed { .. } => "WithdrawalFailed",
+            Self::BridgingInitiated { .. } => "BridgingInitiated",
+            Self::BridgeAttestationReceived { .. } => "BridgeAttestationReceived",
+            Self::Bridged { .. } => "Bridged",
+            Self::BridgingFailed { .. } => "BridgingFailed",
+            Self::DepositInitiated { .. } => "DepositInitiated",
+            Self::DepositConfirmed { .. } => "DepositConfirmed",
+            Self::DepositFailed { .. } => "DepositFailed",
         }
+        .to_string()
     }
 
     fn event_version(&self) -> String {
