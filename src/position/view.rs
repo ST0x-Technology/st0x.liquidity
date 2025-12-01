@@ -236,7 +236,9 @@ mod tests {
     use std::str::FromStr;
 
     use super::super::ExecutionThreshold;
-    use super::super::event::{BrokerOrderId, ExecutionId, PriceCents, TradeId, TriggerReason};
+    use super::super::event::{
+        BrokerOrderId, ExecutionId, PriceCents, TradeId, TriggerReason, Usdc,
+    };
 
     #[test]
     fn test_view_update_from_initialized_event() {
@@ -245,7 +247,7 @@ mod tests {
 
         let event = PositionEvent::Initialized {
             initialized_at,
-            threshold: ExecutionThreshold::Shares(dec!(100)),
+            threshold: ExecutionThreshold::Shares(FractionalShares::new(dec!(100)).unwrap()),
         };
 
         let envelope = EventEnvelope {
@@ -607,8 +609,8 @@ mod tests {
         };
 
         let event = PositionEvent::ThresholdUpdated {
-            old_threshold: ExecutionThreshold::Shares(dec!(100)),
-            new_threshold: ExecutionThreshold::DollarValue(dec!(10000)),
+            old_threshold: ExecutionThreshold::Shares(FractionalShares::new(dec!(100)).unwrap()),
+            new_threshold: ExecutionThreshold::DollarValue(Usdc::new(dec!(10000)).unwrap()),
             updated_at,
         };
 
@@ -638,7 +640,7 @@ mod tests {
             net_position: FractionalShares(dec!(150.5)),
             accumulated_long: FractionalShares(dec!(200.0)),
             accumulated_short: FractionalShares(dec!(49.5)),
-            threshold: ExecutionThreshold::Shares(dec!(100)),
+            threshold: ExecutionThreshold::Shares(FractionalShares::new(dec!(100)).unwrap()),
             migrated_at,
         };
 
@@ -788,8 +790,8 @@ mod tests {
         let mut view = PositionView::Unavailable;
 
         let event = PositionEvent::ThresholdUpdated {
-            old_threshold: ExecutionThreshold::Shares(dec!(100)),
-            new_threshold: ExecutionThreshold::DollarValue(dec!(10000)),
+            old_threshold: ExecutionThreshold::Shares(FractionalShares::new(dec!(100)).unwrap()),
+            new_threshold: ExecutionThreshold::DollarValue(Usdc::new(dec!(10000)).unwrap()),
             updated_at: chrono::Utc::now(),
         };
 
@@ -811,7 +813,7 @@ mod tests {
 
         let event = PositionEvent::Initialized {
             initialized_at: chrono::Utc::now(),
-            threshold: ExecutionThreshold::Shares(dec!(100)),
+            threshold: ExecutionThreshold::Shares(FractionalShares::new(dec!(100)).unwrap()),
         };
 
         let envelope = EventEnvelope {

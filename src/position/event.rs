@@ -65,10 +65,59 @@ impl std::ops::SubAssign for FractionalShares {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl FractionalShares {
+    pub(crate) fn new(value: Decimal) -> Result<Self, InvalidThresholdError> {
+        if value.is_sign_negative() {
+            return Err(InvalidThresholdError::Negative(value));
+        }
+
+        if value.is_zero() {
+            return Err(InvalidThresholdError::Zero);
+        }
+
+        Ok(Self(value))
+    }
+
+    pub(crate) fn one() -> Self {
+        Self(Decimal::ONE)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Usdc(Decimal);
+
+impl Usdc {
+    pub(crate) fn new(value: Decimal) -> Result<Self, InvalidThresholdError> {
+        if value.is_sign_negative() {
+            return Err(InvalidThresholdError::Negative(value));
+        }
+
+        if value.is_zero() {
+            return Err(InvalidThresholdError::Zero);
+        }
+
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ExecutionThreshold {
-    Shares(Decimal),
-    DollarValue(Decimal),
+    Shares(FractionalShares),
+    DollarValue(Usdc),
+}
+
+impl ExecutionThreshold {
+    pub(crate) fn whole_share() -> Self {
+        Self::Shares(FractionalShares::one())
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub(crate) enum InvalidThresholdError {
+    #[error("Threshold value cannot be negative: {0}")]
+    Negative(Decimal),
+    #[error("Threshold value cannot be zero")]
+    Zero,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -150,5 +199,59 @@ impl DomainEvent for PositionEvent {
 
     fn event_version(&self) -> String {
         "1.0".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_whole_share_matches_smart_constructor() {
+        let from_whole_share = ExecutionThreshold::whole_share();
+        let from_constructor = ExecutionThreshold::Shares(FractionalShares::one());
+        assert_eq!(from_whole_share, from_constructor);
+    }
+
+    #[test]
+    fn test_fractional_shares_validation_rejects_zero() {
+        let result = FractionalShares::new(Decimal::ZERO);
+        assert_eq!(result.unwrap_err(), InvalidThresholdError::Zero);
+    }
+
+    #[test]
+    fn test_fractional_shares_validation_rejects_negative() {
+        let result = FractionalShares::new(Decimal::NEGATIVE_ONE);
+        assert_eq!(
+            result.unwrap_err(),
+            InvalidThresholdError::Negative(Decimal::NEGATIVE_ONE)
+        );
+    }
+
+    #[test]
+    fn test_fractional_shares_validation_accepts_positive() {
+        let result = FractionalShares::new(Decimal::ONE);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_usdc_validation_rejects_zero() {
+        let result = Usdc::new(Decimal::ZERO);
+        assert_eq!(result.unwrap_err(), InvalidThresholdError::Zero);
+    }
+
+    #[test]
+    fn test_usdc_validation_rejects_negative() {
+        let result = Usdc::new(Decimal::NEGATIVE_ONE);
+        assert_eq!(
+            result.unwrap_err(),
+            InvalidThresholdError::Negative(Decimal::NEGATIVE_ONE)
+        );
+    }
+
+    #[test]
+    fn test_usdc_validation_accepts_positive() {
+        let result = Usdc::new(Decimal::ONE);
+        assert!(result.is_ok());
     }
 }
