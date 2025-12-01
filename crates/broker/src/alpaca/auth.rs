@@ -154,8 +154,8 @@ mod tests {
     #[test]
     fn test_alpaca_client_new_empty_credentials() {
         let empty_config = AlpacaAuthEnv {
-            alpaca_api_key: "".to_string(),
-            alpaca_api_secret: "".to_string(),
+            alpaca_api_key: String::new(),
+            alpaca_api_secret: String::new(),
             alpaca_trading_mode: AlpacaTradingMode::Paper,
         };
 
@@ -185,7 +185,7 @@ mod tests {
             alpaca_trading_mode: AlpacaTradingMode::Paper,
         };
 
-        let debug_output = format!("{:?}", config);
+        let debug_output = format!("{config:?}");
 
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("secret_key_id_123"));
@@ -198,7 +198,7 @@ mod tests {
         let config = create_test_paper_config();
         let client = AlpacaClient::new(&config).unwrap();
 
-        let debug_output = format!("{:?}", client);
+        let debug_output = format!("{client:?}");
 
         assert!(!debug_output.contains("test_key_id"));
         assert!(!debug_output.contains("test_secret_key"));

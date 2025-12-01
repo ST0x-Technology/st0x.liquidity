@@ -423,7 +423,7 @@ mod tests {
             then.status(422)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "code": 40010001,
+                    "code": 40_010_001,
                     "message": "symbol INVALID is not supported"
                 }));
         });
@@ -451,7 +451,7 @@ mod tests {
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "code": 40110000,
+                    "code": 40_110_000,
                     "message": "Invalid credentials"
                 }));
         });
@@ -504,7 +504,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v2/orders/{}", order_id.replace("-", "")));
+                .path(format!("/v2/orders/{}", order_id.replace('-', "")));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -556,7 +556,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v2/orders/{}", order_id.replace("-", "")));
+                .path(format!("/v2/orders/{}", order_id.replace('-', "")));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -608,7 +608,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v2/orders/{}", order_id.replace("-", "")));
+                .path(format!("/v2/orders/{}", order_id.replace('-', "")));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -660,7 +660,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v2/orders/{}", order_id.replace("-", "")));
+                .path(format!("/v2/orders/{}", order_id.replace('-', "")));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -932,7 +932,7 @@ mod tests {
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "code": 40110000,
+                    "code": 40_110_000,
                     "message": "Invalid credentials"
                 }));
         });

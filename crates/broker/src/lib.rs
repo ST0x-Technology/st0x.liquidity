@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use clap::ValueEnum;
+use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tokio::task::JoinHandle;
 
@@ -69,7 +71,7 @@ pub trait Broker: Send + Sync + 'static {
 ///
 /// Ensures symbols are non-empty and provides type safety to prevent
 /// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Symbol(String);
 
 impl Symbol {
@@ -88,6 +90,16 @@ impl Symbol {
     }
 }
 
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -98,7 +110,7 @@ impl Display for Symbol {
 ///
 /// Represents whole share quantities with bounds checking.
 /// Values are constrained to 1..=u32::MAX for practical trading limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Shares(u32);
 
 impl Shares {
@@ -124,6 +136,16 @@ impl Shares {
     }
 }
 
+impl<'de> Deserialize<'de> for Shares {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let shares = u64::deserialize(deserializer)?;
+        Self::new(shares).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Display for Shares {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -141,7 +163,7 @@ impl std::fmt::Display for InvalidDirectionError {
 
 impl std::error::Error for InvalidDirectionError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum SupportedBroker {
     Schwab,
     Alpaca,
@@ -175,7 +197,7 @@ impl std::str::FromStr for SupportedBroker {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Direction {
     Buy,
     Sell,
@@ -344,10 +366,10 @@ mod tests {
 
     #[test]
     fn test_shares_new_max_boundary() {
-        let shares = Shares::new(u32::MAX as u64).unwrap();
+        let shares = Shares::new(u64::from(u32::MAX)).unwrap();
         assert_eq!(shares.to_string(), u32::MAX.to_string());
 
-        let result = Shares::new(u32::MAX as u64 + 1);
+        let result = Shares::new(u64::from(u32::MAX) + 1);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),

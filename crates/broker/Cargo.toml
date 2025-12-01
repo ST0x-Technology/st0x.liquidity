@@ -26,6 +26,8 @@ num-traits.workspace = true
 apca = "0.30.0"
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
 aes-gcm = "0.10.3"
+cqrs-es.workspace = true
+sqlite-es.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true

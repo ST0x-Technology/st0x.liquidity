@@ -29,8 +29,10 @@ must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-alloy = { version = "1.0.38", features = ["full"] }
+alloy = { version = "1.0.38", features = ["full", "rand"] }
 async-trait = "0.1.81"
+cqrs-es = "0.4"
+sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }
 revm = { version = "=25.0.0", default-features = false }
 # Pin wasm-bindgen version for compatibility with rain.wasm transitive dependency
 wasm-bindgen = "0.2.100"
@@ -78,6 +80,8 @@ edition = "2024"
 alloy.workspace = true
 anyhow = "1.0.98"
 async-trait.workspace = true
+cqrs-es.workspace = true
+sqlite-es.workspace = true
 st0x-broker = { path = "crates/broker" }
 backon.workspace = true
 clap.workspace = true
