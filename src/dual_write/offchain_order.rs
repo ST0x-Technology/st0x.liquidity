@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use st0x_broker::{OrderState, Symbol};
+use st0x_broker::OrderState;
 
 use crate::offchain::execution::OffchainExecution;
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
@@ -101,10 +101,10 @@ pub(crate) async fn mark_failed(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use st0x_broker::{Direction, Symbol};
 
     use super::*;
     use crate::test_utils::setup_test_db;
-    use st0x_broker::Direction;
 
     #[tokio::test]
     async fn test_place_order_success() {

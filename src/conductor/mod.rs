@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
-use st0x_broker::{Broker, MarketOrder, SupportedBroker};
+use st0x_broker::{Broker, MarketOrder, SupportedBroker, Symbol};
 
 use crate::bindings::IOrderBookV4::{ClearV2, IOrderBookV4Instance, TakeOrderV2};
 use crate::dual_write::DualWriteContext;
@@ -19,7 +19,9 @@ use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
-use crate::onchain::accumulator::check_all_accumulated_positions;
+use crate::onchain::accumulator::{
+    CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
+};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
@@ -631,6 +633,109 @@ async fn process_valid_trade(
     .await
 }
 
+async fn execute_onchain_trade_dual_write(
+    dual_write_context: &DualWriteContext,
+    trade: &OnchainTrade,
+    block_number: u64,
+) {
+    if let Err(e) = crate::dual_write::witness_trade(dual_write_context, trade, block_number).await
+    {
+        error!(
+            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        );
+    } else {
+        info!(
+            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        );
+    }
+
+    if let Err(e) = crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
+        error!(
+            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        );
+    } else {
+        info!(
+            "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        );
+    }
+}
+
+async fn execute_new_execution_dual_write(
+    dual_write_context: &DualWriteContext,
+    execution: &OffchainExecution,
+    base_symbol: &Symbol,
+) {
+    if let Err(e) =
+        crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
+    {
+        error!(
+            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
+            execution.id, base_symbol
+        );
+    } else {
+        info!(
+            "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
+            execution.id, base_symbol
+        );
+    }
+
+    if let Err(e) = crate::dual_write::place_order(dual_write_context, execution).await {
+        error!(
+            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
+            execution.id, execution.symbol
+        );
+    } else {
+        info!(
+            "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
+            execution.id, execution.symbol
+        );
+    }
+}
+
+async fn execute_stale_execution_cleanup_dual_write(
+    dual_write_context: &DualWriteContext,
+    cleaned_up_executions: Vec<CleanedUpExecution>,
+) {
+    for cleaned_up in cleaned_up_executions {
+        let execution_id = cleaned_up.execution_id;
+        let symbol = cleaned_up.symbol;
+        let error_reason = cleaned_up.error_reason;
+        if let Err(e) =
+            crate::dual_write::mark_failed(dual_write_context, execution_id, error_reason.clone())
+                .await
+        {
+            error!(
+                "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
+            );
+        } else {
+            info!(
+                "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
+            );
+        }
+
+        if let Err(e) = crate::dual_write::fail_offchain_order(
+            dual_write_context,
+            execution_id,
+            &symbol,
+            error_reason,
+        )
+        .await
+        {
+            error!(
+                "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
+            );
+        } else {
+            info!(
+                "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
+            );
+        }
+    }
+}
+
 async fn process_trade_within_transaction(
     broker_type: SupportedBroker,
     pool: &SqlitePool,
@@ -649,7 +754,10 @@ async fn process_trade_within_transaction(
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    let execution = accumulator::process_onchain_trade(&mut sql_tx, trade.clone(), broker_type)
+    let TradeProcessingResult {
+        execution,
+        cleaned_up_executions,
+    } = accumulator::process_onchain_trade(&mut sql_tx, trade.clone(), broker_type)
         .await
         .map_err(|e| {
             error!(
@@ -681,62 +789,14 @@ async fn process_trade_within_transaction(
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    if let Err(e) =
-        crate::dual_write::witness_trade(dual_write_context, &trade, queued_event.block_number)
-            .await
-    {
-        error!(
-            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    } else {
-        info!(
-            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
-            trade.tx_hash, trade.log_index
-        );
-    }
-
-    if let Err(e) = crate::dual_write::acknowledge_onchain_fill(dual_write_context, &trade).await {
-        error!(
-            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    } else {
-        info!(
-            "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    }
+    execute_onchain_trade_dual_write(dual_write_context, &trade, queued_event.block_number).await;
 
     if let Some(ref exec) = execution {
         let base_symbol = trade.symbol.base();
-
-        if let Err(e) =
-            crate::dual_write::place_offchain_order(dual_write_context, exec, base_symbol).await
-        {
-            error!(
-                "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
-                exec.id, base_symbol
-            );
-        } else {
-            info!(
-                "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
-                exec.id, base_symbol
-            );
-        }
-
-        if let Err(e) = crate::dual_write::place_order(dual_write_context, exec).await {
-            error!(
-                "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
-                exec.id, exec.symbol
-            );
-        } else {
-            info!(
-                "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
-                exec.id, exec.symbol
-            );
-        }
+        execute_new_execution_dual_write(dual_write_context, exec, base_symbol).await;
     }
+
+    execute_stale_execution_cleanup_dual_write(dual_write_context, cleaned_up_executions).await;
 
     Ok(execution)
 }
@@ -1099,9 +1159,10 @@ mod tests {
             .await
             {
                 let mut sql_tx = pool.begin().await.unwrap();
-                accumulator::process_onchain_trade(&mut sql_tx, trade, SupportedBroker::DryRun)
-                    .await
-                    .unwrap();
+                let TradeProcessingResult { .. } =
+                    accumulator::process_onchain_trade(&mut sql_tx, trade, SupportedBroker::DryRun)
+                        .await
+                        .unwrap();
                 sql_tx.commit().await.unwrap();
             }
         }

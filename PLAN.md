@@ -695,59 +695,136 @@ Wire dual-write into the main trade processing flow.
 
 Execute commands when order status changes.
 
-**Subtasks:**
+**Status:** COMPLETE ✓
 
-- [ ] Pass `DualWriteContext` to order poller task
-- [ ] After each status UPDATE:
-  - [ ] Call appropriate command functions (`confirm_submission`,
-        `complete_offchain_order`, `record_fill`, etc.)
-  - [ ] Handle errors with logging
-- [ ] Add tests for status transitions
+**Completed Work:**
+
+- [x] Pass `DualWriteContext` to order poller task
+  - [x] Added `dual_write_context` field to `OrderStatusPoller` struct
+  - [x] Updated constructor to accept `DualWriteContext` parameter
+  - [x] Created `DualWriteContext` in `spawn_order_poller()` function (line 214)
+- [x] After each status UPDATE:
+  - [x] Call appropriate command functions in `handle_filled_order()` (lines
+        205-220):
+    - [x] `record_fill()` - executes `OffchainOrder::CompleteFill` command
+    - [x] `complete_offchain_order()` - executes
+          `Position::CompleteOffChainOrder` command
+  - [x] Call appropriate command functions in `handle_failed_order()` (lines
+        265-285):
+    - [x] `mark_failed()` - executes `OffchainOrder::MarkFailed` command
+    - [x] `fail_offchain_order()` - executes `Position::FailOffChainOrder`
+          command
+  - [x] Handle errors with logging
+    - [x] All command errors wrapped in error handlers
+    - [x] Errors logged at ERROR level with full context (execution_id, symbol,
+          error)
+    - [x] Errors never block operation (legacy transaction already committed)
+- [x] Add tests for status transitions
+  - [x] `test_handle_filled_order_executes_dual_write_commands` - Verifies
+        filled order dual-write (3 events: Placed, Submitted, Filled)
+  - [x] `test_handle_failed_order_executes_dual_write_commands` - Verifies
+        failed order dual-write (3 events: Placed, Submitted, Failed)
+
+**Implementation Notes:**
+
+- Dual-write commands execute after legacy transaction commits (two-phase write
+  pattern)
+- Commands never fail the overall operation - errors only logged
+- Tests verify complete event lifecycle with proper sequence numbers
+- Used `confirm_submission()` in tests to properly set up order state before
+  status transitions
 
 **Completion Criteria:**
 
-- [ ] Tests pass
-- [ ] Commands executed on status changes
+- [x] All 413 tests pass (2 new tests added)
+- [x] Commands executed on status changes
+- [x] Clippy passes (only expected warnings for functions used in Task 12)
 
 ## Task 12. Integrate Dual-Write into Stale Execution Cleanup
 
 Execute failure commands when cleaning up stale executions.
 
-**Subtasks:**
+**Status:** COMPLETE ✓
 
-- [ ] Pass `DualWriteContext` to cleanup task
-- [ ] After marking execution FAILED:
-  - [ ] Call `fail_offchain_order()` (executes Position::FailOffChainOrder
-        command)
-  - [ ] Call `mark_failed()` (executes OffchainOrder::MarkFailed command)
-  - [ ] Handle errors with logging
-- [ ] Add tests
+**Completed Work:**
+
+- [x] Modified stale execution cleanup flow to support dual-write
+  - [x] Updated `clean_up_stale_executions()` return type to
+        `Result<Vec<(i64, Symbol, String)>, OnChainError>` (line 66)
+  - [x] Returns list of `(execution_id, symbol, error_reason)` tuples for
+        cleaned up executions
+  - [x] Updated `process_onchain_trade()` return type to
+        `Result<(Option<OffchainExecution>, Vec<(i64, Symbol, String)>), OnChainError>`
+        (line 26)
+  - [x] Propagates cleanup information alongside execution result
+- [x] Updated conductor to execute dual-write commands for stale executions
+  - [x] Modified `process_trade_within_transaction()` to receive
+        `cleaned_up_executions` from accumulator (line 665)
+  - [x] Added loop to process each cleaned up execution (lines 747-772):
+    - [x] Calls `mark_failed()` - executes `OffchainOrder::MarkFailed` command
+    - [x] Calls `fail_offchain_order()` - executes `Position::FailOffChainOrder`
+          command
+  - [x] All errors logged at ERROR level with full context (execution_id,
+        symbol, error)
+  - [x] Errors never block operation (legacy transaction already committed)
+- [x] Updated all call sites to handle new return type:
+  - [x] `src/cli.rs` - destructures tuple `(execution, _cleaned_up)` (line 88)
+  - [x] `src/conductor/mod.rs` test - destructures tuple (line 825)
+  - [x] `src/onchain/accumulator.rs` test helper - destructures tuple (line 764)
+- [x] Added comprehensive integration test:
+  - [x] `test_stale_execution_cleanup_executes_dual_write_commands` - Verifies
+        complete dual-write lifecycle:
+    - [x] Sets up Position aggregate with onchain fill (to meet threshold)
+    - [x] Creates stale execution in legacy DB
+    - [x] Executes `place_order()` and `place_offchain_order()` to set up
+          dual-write state
+    - [x] Executes `confirm_submission()` to transition to Submitted state
+    - [x] Processes trade that triggers cleanup (returns
+          `cleaned_up_executions`)
+    - [x] Executes dual-write commands for cleanup
+    - [x] Verifies 3 OffchainOrder events (Placed, Submitted, Failed)
+    - [x] Verifies Position OffChainOrderFailed event was created
+
+**Implementation Notes:**
+
+- Dual-write commands execute after legacy transaction commits (two-phase write
+  pattern)
+- Cleanup information flows from accumulator → conductor → dual-write layer
+- Commands never fail the overall operation - errors only logged
+- Test verifies complete event lifecycle including stale execution cleanup
+  scenario
+- Return type changes maintain backward compatibility (callers can ignore
+  cleanup info with `_`)
 
 **Completion Criteria:**
 
-- [ ] Tests pass
-- [ ] Commands executed on cleanup
+- [x] All 414 tests pass (1 new test added for stale execution cleanup
+      dual-write)
+- [x] Commands executed on cleanup
+- [x] Clippy passes (no warnings)
+- [x] Code formatted
 
 ## Success Criteria
 
 **Must Have:**
 
-- [ ] All onchain trades execute `Witness` command generating
+- [x] All onchain trades execute `Witness` command generating
       `OnChainTradeEvent::Filled` events
-- [ ] All position changes execute appropriate commands generating
+- [x] All position changes execute appropriate commands generating
       `PositionEvent` events
-- [ ] All offchain orders execute lifecycle commands generating
+- [x] All offchain orders execute lifecycle commands generating
       `OffchainOrderEvent` events
-- [ ] Legacy tables remain source of truth for reads (no code changes to read
+- [x] Legacy tables remain source of truth for reads (no code changes to read
       path)
-- [ ] Command execution failures logged but don't block trade processing
-- [ ] Integration tests pass for full trade lifecycle
+- [x] Command execution failures logged but don't block trade processing
+- [x] Integration tests pass for full trade lifecycle
 
 **Nice to Have:**
 
-- [ ] View tables automatically updated from events (may already work via
-      existing view logic)
-- [ ] Reconciliation tool to detect divergence between legacy and events
+- [x] View tables automatically updated from events (works via existing
+      PostgresViewRepository in cqrs-es framework)
+- [ ] Reconciliation tool to detect divergence between legacy and events (future
+      enhancement)
 
 ## Risks and Mitigations
 

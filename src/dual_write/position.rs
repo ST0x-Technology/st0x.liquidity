@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use st0x_broker::{OrderState, SupportedBroker, Symbol};
+use st0x_broker::{OrderState, Symbol};
 
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
@@ -152,7 +152,7 @@ pub(crate) async fn fail_offchain_order(
 mod tests {
     use alloy::primitives::fixed_bytes;
     use chrono::Utc;
-    use st0x_broker::Direction;
+    use st0x_broker::{Direction, SupportedBroker};
 
     use crate::onchain::io::TokenizedEquitySymbol;
     use crate::test_utils::setup_test_db;
