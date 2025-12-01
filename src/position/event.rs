@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
 use super::FractionalShares;
-use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents, Usdc};
+use crate::offchain_order::{BrokerOrderId, ExecutionId, InvalidThresholdError, PriceCents, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TradeId {
@@ -27,8 +27,20 @@ pub(crate) enum ExecutionThreshold {
 }
 
 impl ExecutionThreshold {
+    pub(crate) fn shares(value: Decimal) -> Result<Self, InvalidThresholdError> {
+        if value.is_sign_negative() {
+            return Err(InvalidThresholdError::Negative(value));
+        }
+
+        if value.is_zero() {
+            return Err(InvalidThresholdError::Zero);
+        }
+
+        Ok(Self::Shares(FractionalShares(value)))
+    }
+
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(FractionalShares::one())
+        Self::Shares(FractionalShares::ONE)
     }
 }
 
@@ -116,12 +128,40 @@ impl DomainEvent for PositionEvent {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
+
     use super::*;
 
     #[test]
     fn test_whole_share_matches_smart_constructor() {
         let from_whole_share = ExecutionThreshold::whole_share();
-        let from_constructor = ExecutionThreshold::Shares(FractionalShares::one());
-        assert_eq!(from_whole_share, from_constructor);
+        let from_shares = ExecutionThreshold::shares(Decimal::ONE).unwrap();
+        assert_eq!(from_whole_share, from_shares);
+    }
+
+    #[test]
+    fn test_shares_positive_value_succeeds() {
+        let value = dec!(1.5);
+        let threshold = ExecutionThreshold::shares(value).unwrap();
+        assert_eq!(
+            threshold,
+            ExecutionThreshold::Shares(FractionalShares(value))
+        );
+    }
+
+    #[test]
+    fn test_shares_zero_fails() {
+        let result = ExecutionThreshold::shares(Decimal::ZERO);
+        assert_eq!(result.unwrap_err(), InvalidThresholdError::Zero);
+    }
+
+    #[test]
+    fn test_shares_negative_fails() {
+        let negative = dec!(-1.0);
+        let result = ExecutionThreshold::shares(negative);
+        assert_eq!(
+            result.unwrap_err(),
+            InvalidThresholdError::Negative(negative)
+        );
     }
 }

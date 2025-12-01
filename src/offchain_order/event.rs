@@ -1,6 +1,5 @@
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
@@ -31,7 +30,7 @@ pub(crate) enum OffchainOrderEvent {
     },
     Placed {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         placed_at: DateTime<Utc>,
@@ -41,7 +40,7 @@ pub(crate) enum OffchainOrderEvent {
         submitted_at: DateTime<Utc>,
     },
     PartiallyFilled {
-        shares_filled: Decimal,
+        shares_filled: FractionalShares,
         avg_price_cents: PriceCents,
         partially_filled_at: DateTime<Utc>,
     },

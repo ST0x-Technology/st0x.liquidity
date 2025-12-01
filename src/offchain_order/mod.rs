@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
+use crate::position::FractionalShares;
+
 mod cmd;
 mod event;
 mod view;
@@ -55,6 +57,8 @@ pub(crate) enum InvalidThresholdError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OffchainOrderError {
+    #[error("Cannot place order: order has already been placed")]
+    AlreadyPlaced,
     #[error("Cannot confirm submission: order has not been placed")]
     NotPlaced,
 
@@ -70,14 +74,14 @@ pub(crate) enum OffchainOrder {
     NotPlaced,
     Pending {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         placed_at: DateTime<Utc>,
     },
     Submitted {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
@@ -86,8 +90,8 @@ pub(crate) enum OffchainOrder {
     },
     PartiallyFilled {
         symbol: Symbol,
-        shares: Decimal,
-        shares_filled: Decimal,
+        shares: FractionalShares,
+        shares_filled: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
@@ -98,7 +102,7 @@ pub(crate) enum OffchainOrder {
     },
     Filled {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
@@ -109,7 +113,7 @@ pub(crate) enum OffchainOrder {
     },
     Failed {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         error: String,
@@ -146,17 +150,24 @@ impl Aggregate for OffchainOrder {
                 shares,
                 direction,
                 broker,
-            } => {
-                let now = Utc::now();
+            } => match self {
+                Self::NotPlaced => {
+                    let now = Utc::now();
 
-                Ok(vec![OffchainOrderEvent::Placed {
-                    symbol,
-                    shares,
-                    direction,
-                    broker,
-                    placed_at: now,
-                }])
-            }
+                    Ok(vec![OffchainOrderEvent::Placed {
+                        symbol,
+                        shares,
+                        direction,
+                        broker,
+                        placed_at: now,
+                    }])
+                }
+                Self::Pending { .. }
+                | Self::Submitted { .. }
+                | Self::PartiallyFilled { .. }
+                | Self::Filled { .. }
+                | Self::Failed { .. } => Err(OffchainOrderError::AlreadyPlaced),
+            },
             OffchainOrderCommand::ConfirmSubmission { broker_order_id } => match self {
                 Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
                 Self::Pending { .. } => {
@@ -237,7 +248,7 @@ impl Aggregate for OffchainOrder {
                 MigratedOrderStatus::Pending => {
                     *self = Self::Pending {
                         symbol,
-                        shares: shares.0,
+                        shares,
                         direction,
                         broker,
                         placed_at: executed_at.unwrap_or(migrated_at),
@@ -246,7 +257,7 @@ impl Aggregate for OffchainOrder {
                 MigratedOrderStatus::Submitted => {
                     *self = Self::Submitted {
                         symbol,
-                        shares: shares.0,
+                        shares,
                         direction,
                         broker,
                         broker_order_id: broker_order_id
@@ -258,7 +269,7 @@ impl Aggregate for OffchainOrder {
                 MigratedOrderStatus::Filled => {
                     *self = Self::Filled {
                         symbol,
-                        shares: shares.0,
+                        shares,
                         direction,
                         broker,
                         broker_order_id: broker_order_id
@@ -272,7 +283,7 @@ impl Aggregate for OffchainOrder {
                 MigratedOrderStatus::Failed { error } => {
                     *self = Self::Failed {
                         symbol,
-                        shares: shares.0,
+                        shares,
                         direction,
                         broker,
                         error,
@@ -351,7 +362,7 @@ impl OffchainOrder {
 
     fn apply_partially_filled(
         &mut self,
-        shares_filled: Decimal,
+        shares_filled: FractionalShares,
         avg_price_cents: PriceCents,
         partially_filled_at: DateTime<Utc>,
     ) {
@@ -499,7 +510,7 @@ mod tests {
 
         let command = OffchainOrderCommand::Place {
             symbol: symbol.clone(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
         };
@@ -515,10 +526,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cannot_place_when_already_pending() {
+        let order = OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            placed_at: Utc::now(),
+        };
+
+        let command = OffchainOrderCommand::Place {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+        };
+
+        let result = order.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_place_when_filled() {
+        let order = OffchainOrder::Filled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            price_cents: PriceCents(15000),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+            filled_at: Utc::now(),
+        };
+
+        let command = OffchainOrderCommand::Place {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+        };
+
+        let result = order.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_place_when_failed() {
+        let order = OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            error: "Market closed".to_string(),
+            placed_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+
+        let command = OffchainOrderCommand::Place {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+        };
+
+        let result = order.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+    }
+
+    #[tokio::test]
     async fn test_confirm_submission_after_place() {
         let mut order = OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
@@ -555,7 +638,7 @@ mod tests {
     async fn test_cannot_submit_twice() {
         let order = OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -576,7 +659,7 @@ mod tests {
     async fn test_partial_fill_from_submitted() {
         let mut order = OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -585,7 +668,7 @@ mod tests {
         };
 
         let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: dec!(50),
+            shares_filled: FractionalShares(dec!(50)),
             avg_price_cents: PriceCents(15000),
         };
 
@@ -606,8 +689,8 @@ mod tests {
     async fn test_partial_fill_updates_from_partially_filled() {
         let mut order = OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
-            shares_filled: dec!(50),
+            shares: FractionalShares(dec!(100)),
+            shares_filled: FractionalShares(dec!(50)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -618,7 +701,7 @@ mod tests {
         };
 
         let command = OffchainOrderCommand::UpdatePartialFill {
-            shares_filled: dec!(75),
+            shares_filled: FractionalShares(dec!(75)),
             avg_price_cents: PriceCents(15050),
         };
 
@@ -629,7 +712,7 @@ mod tests {
         order.apply(events[0].clone());
 
         if let OffchainOrder::PartiallyFilled { shares_filled, .. } = order {
-            assert_eq!(shares_filled, dec!(75));
+            assert_eq!(shares_filled, FractionalShares(dec!(75)));
         } else {
             panic!("Expected PartiallyFilled state");
         }
@@ -639,7 +722,7 @@ mod tests {
     async fn test_complete_fill_from_submitted() {
         let mut order = OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -665,8 +748,8 @@ mod tests {
     async fn test_complete_fill_from_partially_filled() {
         let mut order = OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
-            shares_filled: dec!(75),
+            shares: FractionalShares(dec!(100)),
+            shares_filled: FractionalShares(dec!(75)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -693,7 +776,7 @@ mod tests {
     async fn test_cannot_fill_if_not_submitted() {
         let order = OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
@@ -712,7 +795,7 @@ mod tests {
     async fn test_cannot_fill_already_filled() {
         let order = OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -735,7 +818,7 @@ mod tests {
     async fn test_mark_failed_from_pending() {
         let mut order = OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
@@ -759,7 +842,7 @@ mod tests {
     async fn test_mark_failed_from_submitted() {
         let mut order = OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -784,8 +867,8 @@ mod tests {
     async fn test_mark_failed_from_partially_filled() {
         let mut order = OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
-            shares_filled: dec!(50),
+            shares: FractionalShares(dec!(100)),
+            shares_filled: FractionalShares(dec!(50)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -812,7 +895,7 @@ mod tests {
     async fn test_cannot_fail_already_filled() {
         let order = OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: dec!(100),
+            shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),

@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use cqrs_es::{EventEnvelope, View};
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
+
+use crate::position::FractionalShares;
 
 use super::{
     BrokerOrderId, ExecutionId, MigratedOrderStatus, OffchainOrder, OffchainOrderEvent, PriceCents,
@@ -23,7 +24,7 @@ pub(crate) enum OffchainOrderView {
     Execution {
         execution_id: ExecutionId,
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         status: ExecutionStatus,
@@ -74,7 +75,7 @@ impl View<OffchainOrder> for OffchainOrderView {
                 *self = Self::Execution {
                     execution_id,
                     symbol: symbol.clone(),
-                    shares: shares.0,
+                    shares: *shares,
                     direction: *direction,
                     broker: *broker,
                     status,
@@ -126,7 +127,7 @@ impl OffchainOrderView {
         &mut self,
         execution_id: ExecutionId,
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         placed_at: DateTime<Utc>,
@@ -263,7 +264,7 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(view_symbol, symbol);
-        assert_eq!(shares, dec!(100.5));
+        assert_eq!(shares, FractionalShares(dec!(100.5)));
         assert_eq!(direction, Direction::Buy);
         assert_eq!(broker, SupportedBroker::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
@@ -432,7 +433,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Placed {
             symbol: symbol.clone(),
-            shares: dec!(75.25),
+            shares: FractionalShares(dec!(75.25)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at,
@@ -466,7 +467,7 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(view_symbol, symbol);
-        assert_eq!(shares, dec!(75.25));
+        assert_eq!(shares, FractionalShares(dec!(75.25)));
         assert_eq!(direction, Direction::Buy);
         assert_eq!(broker, SupportedBroker::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
@@ -486,7 +487,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: dec!(50.0),
+            shares: FractionalShares(dec!(50.0)),
             direction: Direction::Sell,
             broker: SupportedBroker::Alpaca,
             status: ExecutionStatus::Pending,
@@ -533,7 +534,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: dec!(100.0),
+            shares: FractionalShares(dec!(100.0)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             status: ExecutionStatus::Submitted,
@@ -544,7 +545,7 @@ mod tests {
         };
 
         let event = OffchainOrderEvent::PartiallyFilled {
-            shares_filled: dec!(60.0),
+            shares_filled: FractionalShares(dec!(60.0)),
             avg_price_cents: PriceCents(32500),
             partially_filled_at,
         };
@@ -575,7 +576,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: dec!(30.0),
+            shares: FractionalShares(dec!(30.0)),
             direction: Direction::Sell,
             broker: SupportedBroker::Alpaca,
             status: ExecutionStatus::Submitted,
@@ -624,7 +625,7 @@ mod tests {
         let mut view = OffchainOrderView::Execution {
             execution_id,
             symbol,
-            shares: dec!(200.0),
+            shares: FractionalShares(dec!(200.0)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             status: ExecutionStatus::Submitted,
@@ -687,7 +688,7 @@ mod tests {
         let mut view = OffchainOrderView::Unavailable;
 
         let event = OffchainOrderEvent::PartiallyFilled {
-            shares_filled: dec!(50.0),
+            shares_filled: FractionalShares(dec!(50.0)),
             avg_price_cents: PriceCents(30000),
             partially_filled_at: chrono::Utc::now(),
         };
@@ -782,7 +783,7 @@ mod tests {
 
         let event = OffchainOrderEvent::Placed {
             symbol,
-            shares: dec!(50.0),
+            shares: FractionalShares(dec!(50.0)),
             direction: Direction::Sell,
             broker: SupportedBroker::Alpaca,
             placed_at: chrono::Utc::now(),

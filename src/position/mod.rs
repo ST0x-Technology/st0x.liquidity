@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::Direction;
 
-use crate::offchain_order::{ExecutionId, InvalidThresholdError};
+use crate::offchain_order::ExecutionId;
 
 mod cmd;
 mod event;
@@ -19,22 +19,7 @@ pub(crate) struct FractionalShares(pub(crate) Decimal);
 
 impl FractionalShares {
     pub(crate) const ZERO: Self = Self(Decimal::ZERO);
-
-    pub(crate) fn new(value: Decimal) -> Result<Self, InvalidThresholdError> {
-        if value.is_sign_negative() {
-            return Err(InvalidThresholdError::Negative(value));
-        }
-
-        if value.is_zero() {
-            return Err(InvalidThresholdError::Zero);
-        }
-
-        Ok(Self(value))
-    }
-
-    pub(crate) fn one() -> Self {
-        Self(Decimal::ONE)
-    }
+    pub(crate) const ONE: Self = Self(Decimal::ONE);
 
     pub(crate) fn abs(self) -> Self {
         Self(self.0.abs())
@@ -341,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_initialize_sets_threshold() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
 
         let result = TestFramework::<Position>::with(())
             .given_no_previous_events()
@@ -353,7 +338,7 @@ mod tests {
 
     #[test]
     fn test_acknowledge_onchain_fill_accumulates_position() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let trade_id = TradeId {
             tx_hash: TxHash::random(),
             log_index: 1,
@@ -381,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_shares_threshold_triggers_execution() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let trade_id1 = TradeId {
             tx_hash: TxHash::random(),
             log_index: 1,
@@ -430,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_place_offchain_order_below_threshold_fails() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let trade_id = TradeId {
             tx_hash: TxHash::random(),
             log_index: 1,
@@ -466,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_pending_execution_prevents_new_execution() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let trade_id = TradeId {
             tx_hash: TxHash::random(),
             log_index: 1,
@@ -510,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_complete_offchain_order_clears_pending() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let trade_id = TradeId {
             tx_hash: TxHash::random(),
             log_index: 1,
@@ -560,7 +545,7 @@ mod tests {
 
     #[test]
     fn test_fail_offchain_order_clears_pending() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let trade_id = TradeId {
             tx_hash: TxHash::random(),
             log_index: 1,
@@ -604,7 +589,7 @@ mod tests {
 
     #[test]
     fn test_offchain_sell_reduces_net_position() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let execution_id = ExecutionId(1);
         let broker_order_id = BrokerOrderId("ORDER123".to_string());
         let price_cents = PriceCents(15050);
@@ -661,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_offchain_buy_increases_net_position() {
-        let threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
+        let threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
         let execution_id = ExecutionId(1);
         let broker_order_id = BrokerOrderId("ORDER456".to_string());
         let price_cents = PriceCents(15050);
@@ -718,8 +703,8 @@ mod tests {
 
     #[test]
     fn test_update_threshold_creates_audit_trail() {
-        let old_threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(1.0)).unwrap());
-        let new_threshold = ExecutionThreshold::Shares(FractionalShares::new(dec!(5.0)).unwrap());
+        let old_threshold = ExecutionThreshold::shares(dec!(1.0)).unwrap();
+        let new_threshold = ExecutionThreshold::shares(dec!(5.0)).unwrap();
 
         let result = TestFramework::<Position>::with(())
             .given(vec![PositionEvent::Initialized {

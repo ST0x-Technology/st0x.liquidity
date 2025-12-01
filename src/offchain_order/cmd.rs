@@ -1,6 +1,7 @@
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
+
+use crate::position::FractionalShares;
 
 use super::{BrokerOrderId, PriceCents};
 
@@ -8,7 +9,7 @@ use super::{BrokerOrderId, PriceCents};
 pub(crate) enum OffchainOrderCommand {
     Place {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
     },
@@ -16,7 +17,7 @@ pub(crate) enum OffchainOrderCommand {
         broker_order_id: BrokerOrderId,
     },
     UpdatePartialFill {
-        shares_filled: Decimal,
+        shares_filled: FractionalShares,
         avg_price_cents: PriceCents,
     },
     CompleteFill {
