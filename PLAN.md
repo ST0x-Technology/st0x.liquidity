@@ -199,6 +199,8 @@ Update `src/position/mod.rs` to wrap the position data in `State`.
 - [x] Implement `Aggregate` for `State<Position, ArithmeticError>` directly
 - [x] Implement `Default` returning `Active(Position::default())`
 - [x] Refactor `apply` to use `State::transition` with fallible arithmetic
+- [x] Set `type Error = PositionError` with `PositionError` having
+      `#[from] StateError<ArithmeticError>` for state errors
 - [x] Update `handle` method to use `self.active()?` helper
 - [x] Update all tests to work with new structure
 

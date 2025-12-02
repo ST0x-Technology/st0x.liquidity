@@ -34,6 +34,8 @@ pub(crate) enum PositionError {
         expected: ExecutionId,
         actual: ExecutionId,
     },
+    #[error(transparent)]
+    State(#[from] StateError<ArithmeticError>),
 }
 
 impl Default for State<Position, ArithmeticError> {
@@ -69,7 +71,7 @@ impl Default for Position {
 impl Aggregate for State<Position, ArithmeticError> {
     type Command = PositionCommand;
     type Event = PositionEvent;
-    type Error = StateError<PositionError>;
+    type Error = PositionError;
     type Services = ();
 
     fn aggregate_type() -> String {
@@ -111,8 +113,7 @@ impl Aggregate for State<Position, ArithmeticError> {
                 if let Some(pending) = position.pending_execution_id {
                     return Err(PositionError::PendingExecution {
                         execution_id: pending,
-                    }
-                    .into());
+                    });
                 }
 
                 let trigger_reason = position.create_trigger_reason(&position.threshold).ok_or(
@@ -289,20 +290,16 @@ impl Position {
         }
     }
 
-    fn validate_pending_execution(
-        &self,
-        execution_id: ExecutionId,
-    ) -> Result<(), StateError<PositionError>> {
+    fn validate_pending_execution(&self, execution_id: ExecutionId) -> Result<(), PositionError> {
         let Some(pending_id) = self.pending_execution_id else {
-            return Err(PositionError::NoPendingExecution.into());
+            return Err(PositionError::NoPendingExecution);
         };
 
         if pending_id != execution_id {
             return Err(PositionError::ExecutionIdMismatch {
                 expected: pending_id,
                 actual: execution_id,
-            }
-            .into());
+            });
         }
 
         Ok(())
@@ -443,10 +440,10 @@ mod tests {
                 direction: Direction::Sell,
                 broker: SupportedBroker::Schwab,
             })
-            .then_expect_error(StateError::Custom(PositionError::ThresholdNotMet {
+            .then_expect_error(PositionError::ThresholdNotMet {
                 net_position: FractionalShares(dec!(0.5)),
                 threshold,
-            }));
+            });
     }
 
     #[test]
@@ -490,9 +487,7 @@ mod tests {
                 direction: Direction::Sell,
                 broker: SupportedBroker::Schwab,
             })
-            .then_expect_error(StateError::Custom(PositionError::PendingExecution {
-                execution_id,
-            }));
+            .then_expect_error(PositionError::PendingExecution { execution_id });
     }
 
     #[test]

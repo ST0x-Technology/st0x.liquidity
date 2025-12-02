@@ -15,15 +15,26 @@ pub(crate) enum State<T, E> {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StateError<E> {
-    #[error("event applied to uninitialized state")]
-    EventOnUninitialized,
+    #[error("operation on uninitialized state")]
+    Uninitialized,
     #[error("event '{event}' not applicable to state '{state}'")]
-    EventNotApplicable { state: String, event: String },
+    NotApplicable { state: String, event: String },
     #[error(transparent)]
-    Custom(E),
+    Custom(#[from] E),
 }
 
 impl<T, E: Display> State<T, E> {
+    pub(crate) fn active(&self) -> Result<&T, StateError<E>>
+    where
+        E: Clone,
+    {
+        match self {
+            Self::Active(inner) => Ok(inner),
+            Self::Uninitialized => Err(StateError::Uninitialized),
+            Self::Corrupted { error, .. } => Err(error.clone()),
+        }
+    }
+
     pub(crate) fn initialize<Ev, F>(&mut self, event: Ev, f: F)
     where
         Ev: DomainEvent,
@@ -49,7 +60,7 @@ impl<T, E: Display> State<T, E> {
                     "State corrupted: event '{event_name}' not applicable to state '{state_name}'"
                 );
                 *self = Self::Corrupted {
-                    error: StateError::EventNotApplicable {
+                    error: StateError::NotApplicable {
                         state: state_name.into(),
                         event: event_name,
                     },
@@ -85,7 +96,7 @@ impl<T, E: Display> State<T, E> {
                 let event_name = event.event_type();
                 error!("State corrupted: event '{event_name}' applied to uninitialized state");
                 *self = Self::Corrupted {
-                    error: StateError::EventOnUninitialized,
+                    error: StateError::Uninitialized,
                     last_valid_state: None,
                 };
             }
@@ -182,8 +193,8 @@ mod tests {
             panic!("Expected Corrupted state");
         };
 
-        let StateError::EventNotApplicable { state, event } = error else {
-            panic!("Expected EventNotApplicable");
+        let StateError::NotApplicable { state, event } = error else {
+            panic!("Expected NotApplicable");
         };
         assert!(state.contains("TestState"));
         assert_eq!(event, "TestEvent::Initialize");
@@ -263,7 +274,7 @@ mod tests {
             panic!("Expected Corrupted state");
         };
 
-        assert!(matches!(error, StateError::EventOnUninitialized));
+        assert!(matches!(error, StateError::Uninitialized));
         assert!(last_valid_state.is_none());
     }
 
