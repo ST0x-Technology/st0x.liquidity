@@ -1,5 +1,5 @@
 use alloy::primitives::TxHash;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
@@ -17,6 +17,7 @@ struct OnchainTradeRow {
     amount: f64,
     direction: String,
     price_usdc: f64,
+    created_at: DateTime<Utc>,
 }
 
 pub async fn migrate_onchain_trades(
@@ -25,7 +26,7 @@ pub async fn migrate_onchain_trades(
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, OnchainTradeRow>(
-        "SELECT tx_hash, log_index, symbol, amount, direction, price_usdc
+        "SELECT tx_hash, log_index, symbol, amount, direction, price_usdc, created_at
          FROM onchain_trades
          ORDER BY created_at ASC",
     )
@@ -54,7 +55,7 @@ pub async fn migrate_onchain_trades(
             direction,
             price_usdc,
             block_number: 0,
-            block_timestamp: Utc::now(),
+            block_timestamp: row.created_at,
             gas_used: None,
             pyth_price: None,
         };

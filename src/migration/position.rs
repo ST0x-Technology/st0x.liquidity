@@ -62,7 +62,7 @@ pub async fn migrate_positions(
             net_position: FractionalShares(net_position),
             accumulated_long: FractionalShares(accumulated_long),
             accumulated_short: FractionalShares(accumulated_short),
-            threshold: ExecutionThreshold::Shares(Decimal::ONE),
+            threshold: ExecutionThreshold::whole_share(),
         };
 
         match execution {
@@ -188,7 +188,21 @@ mod tests {
         let pool = create_test_pool().await;
         let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
+        sqlx::query!(
+            "INSERT INTO offchain_trades (symbol, shares, direction, status)
+             VALUES ('AAPL', 5, 'SELL', 'PENDING')"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let execution_id: i64 = sqlx::query_scalar!("SELECT id FROM offchain_trades LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+
+        insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, Some(execution_id)).await;
 
         let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await

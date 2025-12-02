@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
-use crate::offchain_order::ExecutionId;
+use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 
 mod cmd;
 mod event;
@@ -290,12 +290,12 @@ impl Position {
             });
         }
 
-        let trigger_reason = self.create_trigger_reason(&self.threshold).ok_or_else(|| {
-            PositionError::ThresholdNotMet {
-                net_position: self.net,
-                threshold: self.threshold.clone(),
-            }
-        })?;
+        let trigger_reason =
+            self.create_trigger_reason(&self.threshold)
+                .ok_or(PositionError::ThresholdNotMet {
+                    net_position: self.net,
+                    threshold: self.threshold,
+                })?;
 
         Ok(vec![PositionEvent::OffChainOrderPlaced {
             execution_id,
@@ -781,7 +781,7 @@ mod tests {
         let net_position = FractionalShares(dec!(5.5));
         let accumulated_long = FractionalShares(dec!(10.0));
         let accumulated_short = FractionalShares(dec!(4.5));
-        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+        let threshold = ExecutionThreshold::whole_share();
 
         let result = TestFramework::<Position>::with(())
             .given_no_previous_events()
@@ -790,7 +790,7 @@ mod tests {
                 net_position,
                 accumulated_long,
                 accumulated_short,
-                threshold: threshold.clone(),
+                threshold,
             })
             .inspect_result();
 
@@ -822,7 +822,7 @@ mod tests {
         let net_position = FractionalShares(dec!(-2.0));
         let accumulated_long = FractionalShares(dec!(3.0));
         let accumulated_short = FractionalShares(dec!(5.0));
-        let threshold = ExecutionThreshold::Shares(dec!(2.0));
+        let threshold = ExecutionThreshold::shares(dec!(2.0)).unwrap();
 
         let result = TestFramework::<Position>::with(())
             .given_no_previous_events()
@@ -831,7 +831,7 @@ mod tests {
                 net_position,
                 accumulated_long,
                 accumulated_short,
-                threshold: threshold.clone(),
+                threshold,
             })
             .inspect_result();
 
@@ -864,7 +864,7 @@ mod tests {
         let net_position = FractionalShares::ZERO;
         let accumulated_long = FractionalShares::ZERO;
         let accumulated_short = FractionalShares::ZERO;
-        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+        let threshold = ExecutionThreshold::whole_share();
 
         let result = TestFramework::<Position>::with(())
             .given_no_previous_events()
@@ -902,7 +902,7 @@ mod tests {
         let net_position = FractionalShares(dec!(-10.5));
         let accumulated_long = FractionalShares(dec!(5.0));
         let accumulated_short = FractionalShares(dec!(15.5));
-        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+        let threshold = ExecutionThreshold::whole_share();
 
         let result = TestFramework::<Position>::with(())
             .given_no_previous_events()
@@ -937,7 +937,7 @@ mod tests {
         let net_position = FractionalShares(dec!(1.5));
         let accumulated_long = FractionalShares(dec!(1.5));
         let accumulated_short = FractionalShares::ZERO;
-        let threshold = ExecutionThreshold::Shares(dec!(1.0));
+        let threshold = ExecutionThreshold::whole_share();
 
         let trade_id = TradeId {
             tx_hash: TxHash::random(),

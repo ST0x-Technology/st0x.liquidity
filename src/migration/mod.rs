@@ -11,9 +11,9 @@ use sqlx::SqlitePool;
 use std::io;
 use tracing::{info, warn};
 
-use crate::offchain_order::{InvalidMigratedOrderStatus, OffchainOrderError};
+use crate::offchain_order::{InvalidMigratedOrderStatus, NegativePriceCents, OffchainOrderError};
 use crate::onchain_trade::OnChainTradeError;
-use crate::position::{NegativePriceCents, PositionError};
+use crate::position::PositionError;
 use offchain_order::migrate_offchain_orders;
 use onchain_trade::migrate_onchain_trades;
 use position::migrate_positions;
@@ -100,6 +100,11 @@ enum MigrationError {
     Io(#[from] std::io::Error),
     #[error("User cancelled migration")]
     UserCancelled,
+    #[error(
+        "Events already exist for {aggregate_type} (count: {count}). \
+        Use --clean delete to remove existing events first, or run in interactive mode."
+    )]
+    EventsExist { aggregate_type: String, count: i64 },
     #[error("Hex parsing error: {0}")]
     FromHex(#[from] alloy::hex::FromHexError),
     #[error("OnChainTrade aggregate error: {0}")]
@@ -153,10 +158,10 @@ pub async fn run_migration(
         }
     }
 
-    check_existing_events(pool, "OnChainTrade", env.confirmation).await?;
-    check_existing_events(pool, "Position", env.confirmation).await?;
-    check_existing_events(pool, "OffchainOrder", env.confirmation).await?;
-    check_existing_events(pool, "SchwabAuth", env.confirmation).await?;
+    check_existing_events(pool, "OnChainTrade", env.confirmation, env.clean).await?;
+    check_existing_events(pool, "Position", env.confirmation, env.clean).await?;
+    check_existing_events(pool, "OffchainOrder", env.confirmation, env.clean).await?;
+    check_existing_events(pool, "SchwabAuth", env.confirmation, env.clean).await?;
 
     safety_prompt(env.confirmation)?;
 
@@ -187,19 +192,42 @@ async fn check_existing_events(
     pool: &SqlitePool,
     aggregate_type: &str,
     confirmation: ConfirmationMode,
+    clean: CleanMode,
 ) -> Result<(), MigrationError> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_type = ?")
         .bind(aggregate_type)
         .fetch_one(pool)
         .await?;
 
-    if count > 0 && matches!(confirmation, ConfirmationMode::Interactive) {
-        warn!("Events detected for {aggregate_type} (count: {count}). Continue? [y/N]");
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
+    if count == 0 {
+        return Ok(());
+    }
 
-        if !input.trim().eq_ignore_ascii_case("y") {
-            return Err(MigrationError::UserCancelled);
+    // Events exist - behavior depends on clean mode and confirmation mode
+    match (clean, confirmation) {
+        // If cleaning, just log and continue (delete will happen later)
+        (CleanMode::Delete, _) => {
+            info!("Events exist for {aggregate_type} (count: {count}) - will be deleted");
+        }
+        // Interactive mode without clean: prompt user
+        (CleanMode::Preserve, ConfirmationMode::Interactive) => {
+            warn!(
+                "Events detected for {aggregate_type} (count: {count}). \
+                This may create duplicates. Continue? [y/N]"
+            );
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+
+            if !input.trim().eq_ignore_ascii_case("y") {
+                return Err(MigrationError::UserCancelled);
+            }
+        }
+        // Force mode without clean: error to prevent accidental duplicates
+        (CleanMode::Preserve, ConfirmationMode::Force) => {
+            return Err(MigrationError::EventsExist {
+                aggregate_type: aggregate_type.to_string(),
+                count,
+            });
         }
     }
 
@@ -236,15 +264,19 @@ async fn clean_events(
         }
     }
 
+    let mut tx = pool.begin().await?;
+
     let deleted_events = sqlx::query("DELETE FROM events")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
 
     let deleted_snapshots = sqlx::query("DELETE FROM snapshots")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+
+    tx.commit().await?;
 
     info!("Deleted {deleted_events} events and {deleted_snapshots} snapshots from event store");
 
@@ -311,13 +343,18 @@ mod tests {
     async fn test_check_existing_events_empty_database() {
         let pool = create_test_pool().await;
 
-        check_existing_events(&pool, "OnChainTrade", ConfirmationMode::Force)
-            .await
-            .unwrap();
+        check_existing_events(
+            &pool,
+            "OnChainTrade",
+            ConfirmationMode::Force,
+            CleanMode::Preserve,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
-    async fn test_check_existing_events_with_force_mode() {
+    async fn test_check_existing_events_force_mode_with_clean_delete() {
         let pool = create_test_pool().await;
 
         sqlx::query!(
@@ -336,9 +373,48 @@ mod tests {
         .await
         .unwrap();
 
-        check_existing_events(&pool, "OnChainTrade", ConfirmationMode::Force)
-            .await
-            .unwrap();
+        check_existing_events(
+            &pool,
+            "OnChainTrade",
+            ConfirmationMode::Force,
+            CleanMode::Delete,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_check_existing_events_force_mode_without_clean_errors() {
+        let pool = create_test_pool().await;
+
+        sqlx::query!(
+            "INSERT INTO events (
+                aggregate_type,
+                aggregate_id,
+                sequence,
+                event_type,
+                event_version,
+                payload,
+                metadata
+            )
+            VALUES ('OnChainTrade', 'test:0', 1, 'Migrated', '1.0', '{}', '{}')"
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = check_existing_events(
+            &pool,
+            "OnChainTrade",
+            ConfirmationMode::Force,
+            CleanMode::Preserve,
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            super::MigrationError::EventsExist { .. }
+        ));
     }
 
     #[tokio::test]

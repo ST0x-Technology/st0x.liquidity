@@ -191,85 +191,18 @@ impl Aggregate for OffchainOrder {
                 shares,
                 direction,
                 broker,
-            } => match self {
-                Self::NotPlaced => {
-                    let now = Utc::now();
-
-                    Ok(vec![OffchainOrderEvent::Placed {
-                        symbol,
-                        shares,
-                        direction,
-                        broker,
-                        placed_at: now,
-                    }])
-                }
-                Self::Pending { .. }
-                | Self::Submitted { .. }
-                | Self::PartiallyFilled { .. }
-                | Self::Filled { .. }
-                | Self::Failed { .. } => Err(OffchainOrderError::AlreadyPlaced),
-            },
-            OffchainOrderCommand::ConfirmSubmission { broker_order_id } => match self {
-                Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
-                Self::Pending { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![OffchainOrderEvent::Submitted {
-                        broker_order_id,
-                        submitted_at: now,
-                    }])
-                }
-                Self::Submitted { .. }
-                | Self::PartiallyFilled { .. }
-                | Self::Filled { .. }
-                | Self::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
-            },
+            } => self.handle_place(symbol, shares, direction, broker),
+            OffchainOrderCommand::ConfirmSubmission { broker_order_id } => {
+                self.handle_confirm_submission(broker_order_id)
+            }
             OffchainOrderCommand::UpdatePartialFill {
                 shares_filled,
                 avg_price_cents,
-            } => match self {
-                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![OffchainOrderEvent::PartiallyFilled {
-                        shares_filled,
-                        avg_price_cents,
-                        partially_filled_at: now,
-                    }])
-                }
-                Self::NotPlaced | Self::Pending { .. } => Err(OffchainOrderError::NotPlaced),
-                Self::Filled { .. } | Self::Failed { .. } => {
-                    Err(OffchainOrderError::AlreadyCompleted)
-                }
-            },
-            OffchainOrderCommand::CompleteFill { price_cents } => match self {
-                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![OffchainOrderEvent::Filled {
-                        price_cents,
-                        filled_at: now,
-                    }])
-                }
-                Self::NotPlaced | Self::Pending { .. } => Err(OffchainOrderError::NotPlaced),
-                Self::Filled { .. } | Self::Failed { .. } => {
-                    Err(OffchainOrderError::AlreadyCompleted)
-                }
-            },
-            OffchainOrderCommand::MarkFailed { error } => match self {
-                Self::Pending { .. } | Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![OffchainOrderEvent::Failed {
-                        error,
-                        failed_at: now,
-                    }])
-                }
-                Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
-                Self::Filled { .. } | Self::Failed { .. } => {
-                    Err(OffchainOrderError::AlreadyCompleted)
-                }
-            },
+            } => self.handle_update_partial_fill(shares_filled, avg_price_cents),
+            OffchainOrderCommand::CompleteFill { price_cents } => {
+                self.handle_complete_fill(price_cents)
+            }
+            OffchainOrderCommand::MarkFailed { error } => self.handle_mark_failed(error),
         }
     }
 
@@ -375,6 +308,89 @@ impl Aggregate for OffchainOrder {
 }
 
 impl OffchainOrder {
+    fn handle_place(
+        &self,
+        symbol: Symbol,
+        shares: FractionalShares,
+        direction: Direction,
+        broker: SupportedBroker,
+    ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+        match self {
+            Self::NotPlaced => Ok(vec![OffchainOrderEvent::Placed {
+                symbol,
+                shares,
+                direction,
+                broker,
+                placed_at: Utc::now(),
+            }]),
+            _ => Err(OffchainOrderError::AlreadyPlaced),
+        }
+    }
+
+    fn handle_confirm_submission(
+        &self,
+        broker_order_id: BrokerOrderId,
+    ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+        match self {
+            Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
+            Self::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
+                broker_order_id,
+                submitted_at: Utc::now(),
+            }]),
+            _ => Err(OffchainOrderError::AlreadySubmitted),
+        }
+    }
+
+    fn handle_update_partial_fill(
+        &self,
+        shares_filled: FractionalShares,
+        avg_price_cents: PriceCents,
+    ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+        match self {
+            Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                Ok(vec![OffchainOrderEvent::PartiallyFilled {
+                    shares_filled,
+                    avg_price_cents,
+                    partially_filled_at: Utc::now(),
+                }])
+            }
+            Self::NotPlaced | Self::Pending { .. } => Err(OffchainOrderError::NotPlaced),
+            Self::Filled { .. } | Self::Failed { .. } => Err(OffchainOrderError::AlreadyCompleted),
+        }
+    }
+
+    fn handle_complete_fill(
+        &self,
+        price_cents: PriceCents,
+    ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+        match self {
+            Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                Ok(vec![OffchainOrderEvent::Filled {
+                    price_cents,
+                    filled_at: Utc::now(),
+                }])
+            }
+            Self::NotPlaced | Self::Pending { .. } => Err(OffchainOrderError::NotPlaced),
+            Self::Filled { .. } | Self::Failed { .. } => Err(OffchainOrderError::AlreadyCompleted),
+        }
+    }
+
+    fn handle_mark_failed(
+        &self,
+        error: String,
+    ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+        match self {
+            Self::Pending { .. } | Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                Ok(vec![OffchainOrderEvent::Failed {
+                    error,
+                    failed_at: Utc::now(),
+                }])
+            }
+            Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
+            Self::Filled { .. } | Self::Failed { .. } => Err(OffchainOrderError::AlreadyCompleted),
+        }
+    }
+
     fn apply_submitted(&mut self, broker_order_id: BrokerOrderId, submitted_at: DateTime<Utc>) {
         if let Self::Pending {
             symbol,

@@ -2,9 +2,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
-use crate::position::{BrokerOrderId, FractionalShares, PriceCents};
+use crate::position::FractionalShares;
 
 use super::event::MigratedOrderStatus;
+use super::{BrokerOrderId, PriceCents};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OffchainOrderCommand {

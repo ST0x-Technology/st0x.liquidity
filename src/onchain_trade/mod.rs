@@ -286,43 +286,6 @@ impl Aggregate for OnChainTrade {
                     );
                 }
             }
-
-            OnChainTradeEvent::Migrated {
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_number,
-                block_timestamp,
-                gas_used,
-                pyth_price,
-                migrated_at: _,
-            } => {
-                if let (Some(gas), Some(pyth)) = (gas_used, pyth_price) {
-                    *self = Self::Enriched {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
-                        gas_used: gas,
-                        pyth_price: pyth,
-                        enriched_at: block_timestamp,
-                    };
-                } else {
-                    *self = Self::Filled {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
-                    };
-                }
-            }
         }
     }
 }
