@@ -18,6 +18,7 @@ mod onchain_trade;
 mod position;
 mod queue;
 pub mod reporter;
+mod state;
 mod symbol;
 mod telemetry;
 mod trade_execution_link;

@@ -73,13 +73,40 @@ with context, no silent failures.
 Per AGENTS.md's preference for functional programming, the `State<T, E>` type
 provides functional helpers:
 
-- `initialize`: For the single event variant that can transition `Uninitialized`
-  → `Active`
-- `mutate`: Takes current state + event, returns new state; handles `Corrupted`
-  by logging and ignoring
+- `initialize`: Takes an event implementing `cqrs_es::DomainEvent` and a closure
+  that processes the event to produce the initial state
+- `transition`: Takes an event and a closure that transforms the current state
 
-This makes each aggregate's `apply` implementation declarative: provide an
-initializer function and a mutation function, and `State` handles the plumbing.
+The closures return `Result<T, StateError<E>>`, giving callers control over
+error handling while the `State` wrapper handles state machine transitions.
+
+This makes each aggregate's `apply` implementation declarative: match on event
+variants and call `initialize` or `transition` accordingly.
+
+### Error handling design
+
+There are three categories of errors that can occur in `apply` implementations:
+
+1. **Event on uninitialized state** - A transition event is applied but the
+   aggregate hasn't been initialized yet
+2. **Event not applicable** - An initialization event is applied but the
+   aggregate is already active (includes state name and event name for
+   debugging)
+3. **Custom error** - Aggregate-specific errors like arithmetic overflow
+
+We wrap the user's error type in `StateError<E>`:
+
+```rust
+pub(crate) enum StateError<E> {
+    EventOnUninitialized,
+    EventNotApplicable { state: String, event: String },
+    Custom(E),
+}
+```
+
+The `initialize` and `transition` methods take events implementing
+`cqrs_es::DomainEvent`, which provides `event_type()` for informative error
+messages.
 
 ---
 
@@ -87,27 +114,55 @@ initializer function and a mutation function, and `State` handles the plumbing.
 
 Create a new module `src/state.rs` with the generic state wrapper.
 
-- [ ] Define the `State<T, E>` enum with three variants
-- [ ] Implement helper methods for state inspection (`is_active`,
-      `is_corrupted`, etc.)
-- [ ] Implement `State::initialize` - takes `FnOnce(Event) -> Result<T, E>`,
-      transitions `Uninitialized` → `Active(T)` or `Corrupted(E)`
-- [ ] Implement `State::mutate` - takes `FnOnce(T, Event) -> Result<T, E>`,
-      transforms `Active` state or logs and ignores if `Corrupted`
-- [ ] Add comprehensive tests for the wrapper type
-- [ ] Add module declaration to `src/lib.rs`
+- [x] Define `StateError<E>` enum with three variants (including state/event
+      names in `EventNotApplicable`)
+- [x] Define the `State<T, E>` enum with three variants
+- [x] Implement `State::initialize` - takes event `Ev: DomainEvent` and
+      `FnOnce(Ev) -> Result<T, StateError<E>>`, transitions `Uninitialized` →
+      `Active(T)` or `Corrupted`
+- [x] Implement `State::transition` - takes event `Ev: DomainEvent` and
+      `FnOnce(Ev, &T) -> Result<T, StateError<E>>`, transforms `Active` state or
+      transitions to `Corrupted`
+- [x] Add comprehensive tests for the wrapper type
+- [x] Add module declaration to `src/lib.rs`
 
-### Type definition
+### Type definitions
 
 ```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum StateError<E> {
+    #[error("event applied to uninitialized state")]
+    EventOnUninitialized,
+    #[error("event '{event}' not applicable to state '{state}'")]
+    EventNotApplicable { state: String, event: String },
+    #[error(transparent)]
+    Custom(E),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum State<T, E> {
     Uninitialized,
     Active(T),
     Corrupted {
-        error: E,
+        error: StateError<E>,
         last_valid_state: Option<Box<T>>,
     },
+}
+```
+
+### Method signatures
+
+```rust
+impl<T, E: Display> State<T, E> {
+    pub(crate) fn initialize<Ev, F>(&mut self, event: Ev, f: F)
+    where
+        Ev: DomainEvent,
+        F: FnOnce(Ev) -> Result<T, StateError<E>>;
+
+    pub(crate) fn transition<Ev, F>(&mut self, event: Ev, f: F)
+    where
+        Ev: DomainEvent,
+        F: FnOnce(Ev, &T) -> Result<T, StateError<E>>;
 }
 ```
 
@@ -121,12 +176,13 @@ debugging/recovery.
 Modify `src/position/event.rs` to provide arithmetic operations that return
 `Result`.
 
-- [ ] Define `ArithmeticError` enum with overflow context (operation, lhs, rhs
+- [ ] Define `ArithmeticError` struct with overflow context (operation, lhs, rhs
       values)
-- [ ] Add `try_add` method returning `Result<FractionalShares, ArithmeticError>`
-- [ ] Add `try_sub` method returning `Result<FractionalShares, ArithmeticError>`
-- [ ] Keep existing operator impls for backwards compatibility (they'll be used
-      in controlled contexts)
+- [ ] Update `Add` impl to set `type Output = Result<Self, ArithmeticError>`
+- [ ] Update `Sub` impl to set `type Output = Result<Self, ArithmeticError>`
+- [ ] Update `AddAssign` and `SubAssign` impls to use checked arithmetic and
+      panic on overflow (these are used in controlled contexts where Result
+      isn't ergonomic)
 - [ ] Add tests for fallible arithmetic, including overflow scenarios
 
 ### Error type
@@ -141,12 +197,15 @@ pub(crate) struct ArithmeticError {
 }
 ```
 
-### Method signatures
+### Trait impl signatures
 
 ```rust
-impl FractionalShares {
-    pub(crate) fn try_add(self, rhs: Self) -> Result<Self, ArithmeticError>;
-    pub(crate) fn try_sub(self, rhs: Self) -> Result<Self, ArithmeticError>;
+impl std::ops::Add for FractionalShares {
+    type Output = Result<Self, ArithmeticError>;
+}
+
+impl std::ops::Sub for FractionalShares {
+    type Output = Result<Self, ArithmeticError>;
 }
 ```
 
@@ -184,7 +243,7 @@ Update `src/position/mod.rs` to wrap the position data in `State`.
 - [ ] Implement `Default` for `PositionAggregate` returning
       `Active(Position::default())`
 - [ ] Update `Aggregate` implementation to use `PositionAggregate`
-- [ ] Refactor `apply` to use `State::mutate` with fallible arithmetic
+- [ ] Refactor `apply` to use `State::transition` with fallible arithmetic
 - [ ] Update `handle` method to check for corrupted state and reject commands
 - [ ] Update all tests to work with new structure
 
@@ -202,7 +261,7 @@ variant.
       `State<OnChainTrade, OnChainTradeCorruptionError>`
 - [ ] Implement `Default` for `OnChainTradeAggregate` returning `Uninitialized`
 - [ ] Update `Aggregate` implementation to use `State::initialize` for `Witness`
-      command and `State::mutate` for `Enrich`
+      command and `State::transition` for `Enrich`
 - [ ] Update `handle` method to check for corrupted state and reject commands
 - [ ] Update all tests to work with new structure
 
