@@ -62,7 +62,7 @@ pub async fn migrate_positions(
             net_position: FractionalShares(net_position),
             accumulated_long: FractionalShares(accumulated_long),
             accumulated_short: FractionalShares(accumulated_short),
-            threshold: ExecutionThreshold::Shares(Decimal::ONE),
+            threshold: ExecutionThreshold::whole_share(),
             migrated_at: Utc::now(),
         };
 

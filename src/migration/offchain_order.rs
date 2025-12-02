@@ -6,8 +6,8 @@ use st0x_broker::{SupportedBroker, Symbol};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
-use crate::offchain_order::{OffchainOrder, OffchainOrderEvent};
-use crate::position::{BrokerOrderId, FractionalShares, PriceCents};
+use crate::offchain_order::{BrokerOrderId, OffchainOrder, OffchainOrderEvent, PriceCents};
+use crate::position::FractionalShares;
 
 #[derive(sqlx::FromRow)]
 struct OffchainOrderRow {

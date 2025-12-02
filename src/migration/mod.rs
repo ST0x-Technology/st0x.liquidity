@@ -8,8 +8,7 @@ use sqlx::SqlitePool;
 use std::io;
 use tracing::{info, warn};
 
-use crate::offchain_order::InvalidMigratedOrderStatus;
-use crate::position::NegativePriceCents;
+use crate::offchain_order::{InvalidMigratedOrderStatus, NegativePriceCents};
 use offchain_order::migrate_offchain_orders;
 use onchain_trade::migrate_onchain_trades;
 use position::migrate_positions;
