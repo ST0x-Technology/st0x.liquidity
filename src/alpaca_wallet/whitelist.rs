@@ -29,53 +29,14 @@ pub(crate) struct WhitelistEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::super::client::{AlpacaWalletClient, AlpacaWalletError};
-    use super::super::transfer::{Network, TokenSymbol};
-    use super::*;
     use alloy::primitives::Address;
     use httpmock::prelude::*;
     use serde_json::json;
     use std::str::FromStr;
 
-    fn create_account_mock<'a>(server: &'a MockServer, account_id: &str) -> httpmock::Mock<'a> {
-        server.mock(|when, then| {
-            when.method(GET).path("/v2/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": account_id,
-                    "account_number": "PA1234567890",
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "buying_power": "100000.00",
-                    "regt_buying_power": "100000.00",
-                    "daytrading_buying_power": "400000.00",
-                    "non_marginable_buying_power": "100000.00",
-                    "cash": "100000.00",
-                    "accrued_fees": "0",
-                    "pending_transfer_out": "0",
-                    "pending_transfer_in": "0",
-                    "portfolio_value": "100000.00",
-                    "pattern_day_trader": false,
-                    "trading_blocked": false,
-                    "transfers_blocked": false,
-                    "account_blocked": false,
-                    "created_at": "2020-01-01T00:00:00Z",
-                    "trade_suspended_by_user": false,
-                    "multiplier": "4",
-                    "shorting_enabled": true,
-                    "equity": "100000.00",
-                    "last_equity": "100000.00",
-                    "long_market_value": "0",
-                    "short_market_value": "0",
-                    "initial_margin": "0",
-                    "maintenance_margin": "0",
-                    "last_maintenance_margin": "0",
-                    "sma": "0",
-                    "daytrade_count": 0
-                }));
-        })
-    }
+    use super::super::client::{AlpacaWalletClient, AlpacaWalletError, create_account_mock};
+    use super::super::transfer::{Network, TokenSymbol};
+    use super::*;
 
     #[tokio::test]
     async fn test_whitelist_address_success() {

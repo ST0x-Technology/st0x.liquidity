@@ -101,50 +101,14 @@ fn is_status_regression(prev: TransferStatus, next: TransferStatus) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use httpmock::prelude::*;
     use serde_json::json;
     use uuid::Uuid;
 
-    fn create_account_mock<'a>(server: &'a MockServer, account_id: &str) -> httpmock::Mock<'a> {
-        server.mock(|when, then| {
-            when.method(GET).path("/v2/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": account_id,
-                    "account_number": "PA1234567890",
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "buying_power": "100000.00",
-                    "regt_buying_power": "100000.00",
-                    "daytrading_buying_power": "400000.00",
-                    "non_marginable_buying_power": "100000.00",
-                    "cash": "100000.00",
-                    "accrued_fees": "0",
-                    "pending_transfer_out": "0",
-                    "pending_transfer_in": "0",
-                    "portfolio_value": "100000.00",
-                    "pattern_day_trader": false,
-                    "trading_blocked": false,
-                    "transfers_blocked": false,
-                    "account_blocked": false,
-                    "created_at": "2020-01-01T00:00:00Z",
-                    "trade_suspended_by_user": false,
-                    "multiplier": "4",
-                    "shorting_enabled": true,
-                    "equity": "100000.00",
-                    "last_equity": "100000.00",
-                    "long_market_value": "0",
-                    "short_market_value": "0",
-                    "initial_margin": "0",
-                    "maintenance_margin": "0",
-                    "last_maintenance_margin": "0",
-                    "sma": "0",
-                    "daytrade_count": 0
-                }));
-        })
-    }
+    use super::super::client::create_account_mock;
+    use super::*;
 
     #[tokio::test]
     async fn test_poll_transfer_processing_to_complete() {
@@ -370,7 +334,59 @@ mod tests {
 
         let transfer_id = Uuid::new_v4();
 
-        let status_mock = server.mock(|when, then| {
+        let client = Arc::new(
+            AlpacaWalletClient::new_with_base_url(
+                server.base_url(),
+                "test_key_id".to_string(),
+                "test_secret_key".to_string(),
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut processing_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(format!(
+                    "/v1/accounts/{expected_account_id}/wallets/transfers"
+                ))
+                .query_param("transfer_id", transfer_id.to_string());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body_obj(&json!([{
+                    "id": transfer_id,
+                    "relationship": "OUTGOING",
+                    "amount": "100.0",
+                    "asset": "USDC",
+                    "from_address": null,
+                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "status": "PROCESSING",
+                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee_amount": "0.5"
+                }]));
+        });
+
+        let config = PollingConfig {
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let client_clone = Arc::clone(&client);
+        let transfer_id_clone = TransferId::from(transfer_id);
+        let poll_handle = tokio::spawn(async move {
+            poll_transfer_status(&client_clone, &transfer_id_clone, &config).await
+        });
+
+        while processing_mock.hits() < 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        processing_mock.delete();
+
+        let pending_mock = server.mock(|when, then| {
             when.method(GET)
                 .path(format!(
                     "/v1/accounts/{expected_account_id}/wallets/transfers"
@@ -392,35 +408,19 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        let result = poll_handle.await.unwrap();
 
-        let config = PollingConfig {
-            interval: Duration::from_millis(100),
-            timeout: Duration::from_secs(5),
-            max_retries: 3,
-            min_retry_delay: Duration::from_millis(10),
-            max_retry_delay: Duration::from_millis(100),
-        };
-
-        let result = poll_transfer_status(&client, &TransferId::from(transfer_id), &config).await;
-
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            AlpacaWalletError::TransferTimeout { .. }
+            AlpacaWalletError::InvalidStatusTransition {
+                previous: TransferStatus::Processing,
+                next: TransferStatus::Pending,
+                ..
+            }
         ));
 
         account_mock.assert();
-        assert!(
-            status_mock.hits() >= 2,
-            "Expected multiple poll attempts before timeout"
-        );
+        pending_mock.assert();
     }
 
     #[test]
