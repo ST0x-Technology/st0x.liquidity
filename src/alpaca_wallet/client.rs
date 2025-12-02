@@ -1,8 +1,10 @@
 use alloy::primitives::{Address, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use st0x_broker::alpaca::AlpacaAuthEnv;
+use serde::Serialize;
+
+#[cfg(test)]
+use serde::Deserialize;
 use thiserror::Error;
 
 use super::transfer::{Network, TokenSymbol, TransferId, TransferStatus};
@@ -71,6 +73,7 @@ pub enum AlpacaWalletError {
     },
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct AccountResponse {
     id: String,
@@ -85,27 +88,6 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    pub async fn new(env: AlpacaAuthEnv) -> Result<Self, AlpacaWalletError> {
-        let base_url = env.base_url();
-        let client = Client::new();
-
-        let account_id = Self::fetch_account_id(
-            &client,
-            &base_url,
-            &env.alpaca_api_key,
-            &env.alpaca_api_secret,
-        )
-        .await?;
-
-        Ok(Self {
-            client,
-            account_id,
-            base_url,
-            api_key: env.alpaca_api_key,
-            api_secret: env.alpaca_api_secret,
-        })
-    }
-
     #[cfg(test)]
     pub(super) async fn new_with_base_url(
         base_url: String,
@@ -125,6 +107,7 @@ impl AlpacaWalletClient {
         })
     }
 
+    #[cfg(test)]
     async fn fetch_account_id(
         client: &Client,
         base_url: &str,

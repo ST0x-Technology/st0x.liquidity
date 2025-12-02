@@ -5,7 +5,7 @@
 //!
 //! # Authentication
 //!
-//! Authentication uses Alpaca API credentials via `AlpacaAuthEnv` from the broker crate.
+//! Authentication uses Alpaca API credentials (API key and secret).
 //! The client automatically fetches and caches the account ID.
 //!
 //! # Whitelisting
@@ -17,38 +17,6 @@
 //!
 //! Transfers progress through states: Pending → Processing → Complete/Failed.
 //! Use `poll_transfer_until_complete()` to wait for a transfer to reach a terminal state.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use alloy::primitives::Address;
-//! use rust_decimal::Decimal;
-//! use st0x_broker::alpaca::AlpacaAuthEnv;
-//! use std::str::FromStr;
-//!
-//! let env = AlpacaAuthEnv::from_env().await?;
-//! let service = AlpacaWalletService::new(env, None).await?;
-//!
-//! // Get deposit address
-//! let asset = TokenSymbol::new("USDC");
-//! let network = Network::new("ethereum");
-//! let deposit = service.get_deposit_address(&asset, &network).await?;
-//! println!("Deposit to: {}", deposit.address);
-//!
-//! // Whitelist withdrawal address
-//! let address = Address::from_str("0x...")?;
-//! service.whitelist_address(&address, &asset, &network).await?;
-//!
-//! // Initiate withdrawal (after 24h approval)
-//! let transfer = service.initiate_withdrawal(
-//!     Decimal::new(100, 0),
-//!     &asset,
-//!     &address,
-//! ).await?;
-//!
-//! // Poll until complete
-//! let final_transfer = service.poll_transfer_until_complete(&transfer.id).await?;
-//! ```
 
 mod client;
 mod status;
@@ -57,7 +25,6 @@ mod whitelist;
 
 use alloy::primitives::Address;
 use rust_decimal::Decimal;
-use st0x_broker::alpaca::AlpacaAuthEnv;
 use std::sync::Arc;
 
 use client::AlpacaWalletClient;
@@ -67,14 +34,6 @@ use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
 pub(crate) use transfer::{Network, TokenSymbol, Transfer, TransferId};
-
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
-#[allow(dead_code)]
-/// Configuration for `AlpacaWalletService`.
-pub(crate) struct AlpacaWalletConfig {
-    pub(crate) auth_env: AlpacaAuthEnv,
-    pub(crate) polling_config: Option<PollingConfig>,
-}
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -89,24 +48,6 @@ pub(crate) struct AlpacaWalletService {
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
 impl AlpacaWalletService {
-    /// Creates a new service instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if authentication fails or the account ID cannot be fetched.
-    pub async fn new(
-        auth_env: AlpacaAuthEnv,
-        polling_config: Option<PollingConfig>,
-    ) -> Result<Self, AlpacaWalletError> {
-        let client = Arc::new(AlpacaWalletClient::new(auth_env).await?);
-        let polling_config = polling_config.unwrap_or_default();
-
-        Ok(Self {
-            client,
-            polling_config,
-        })
-    }
-
     /// Gets the deposit address for an asset and network.
     ///
     /// # Errors
