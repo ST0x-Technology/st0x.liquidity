@@ -43,7 +43,14 @@ pub async fn migrate_onchain_trades(
         }
 
         let tx_hash: TxHash = row.tx_hash.parse()?;
-        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, row.log_index);
+        let log_index: u64 =
+            row.log_index
+                .try_into()
+                .map_err(|_| MigrationError::NegativeValue {
+                    field: "log_index".to_string(),
+                    value: row.log_index,
+                })?;
+        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);
         let symbol = Symbol::new(&row.symbol)?;
         let amount = Decimal::try_from(row.amount)?;
         let direction = row.direction.parse()?;

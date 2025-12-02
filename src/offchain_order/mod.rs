@@ -175,17 +175,20 @@ impl Aggregate for OffchainOrder {
                 broker_order_id,
                 price_cents,
                 executed_at,
-            } => Ok(vec![OffchainOrderEvent::Migrated {
-                symbol,
-                shares,
-                direction,
-                broker,
-                status,
-                broker_order_id,
-                price_cents,
-                executed_at,
-                migrated_at: Utc::now(),
-            }]),
+            } => match self {
+                Self::NotPlaced => Ok(vec![OffchainOrderEvent::Migrated {
+                    symbol,
+                    shares,
+                    direction,
+                    broker,
+                    status,
+                    broker_order_id,
+                    price_cents,
+                    executed_at,
+                    migrated_at: Utc::now(),
+                }]),
+                _ => Err(OffchainOrderError::AlreadyPlaced),
+            },
             OffchainOrderCommand::Place {
                 symbol,
                 shares,
@@ -554,10 +557,11 @@ impl OffchainOrder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
     use st0x_broker::{Direction, SupportedBroker, Symbol};
 
+    use super::*;
     use crate::position::FractionalShares;
 
     #[tokio::test]
@@ -1093,8 +1097,6 @@ mod tests {
 
     #[test]
     fn test_migrate_command_creates_migrated_event() {
-        use cqrs_es::test::TestFramework;
-
         let symbol = Symbol::new("AAPL").unwrap();
         let command = OffchainOrderCommand::Migrate {
             symbol: symbol.clone(),
@@ -1143,8 +1145,6 @@ mod tests {
 
     #[test]
     fn test_migrate_command_all_status_types() {
-        use cqrs_es::test::TestFramework;
-
         let symbol = Symbol::new("TSLA").unwrap();
 
         let pending_cmd = OffchainOrderCommand::Migrate {
@@ -1256,8 +1256,6 @@ mod tests {
 
     #[test]
     fn test_operations_after_migrate() {
-        use cqrs_es::test::TestFramework;
-
         let symbol = Symbol::new("GOOGL").unwrap();
 
         let migrated_event = OffchainOrderEvent::Migrated {
@@ -1285,5 +1283,39 @@ mod tests {
         let events = result.unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], OffchainOrderEvent::Submitted { .. }));
+    }
+
+    #[test]
+    fn test_cannot_migrate_when_already_placed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let placed_event = OffchainOrderEvent::Placed {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            placed_at: Utc::now(),
+        };
+
+        let migrate_cmd = OffchainOrderCommand::Migrate {
+            symbol,
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+        };
+
+        let result = TestFramework::<OffchainOrder>::with(())
+            .given(vec![placed_event])
+            .when(migrate_cmd)
+            .inspect_result();
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OffchainOrderError::AlreadyPlaced
+        ));
     }
 }

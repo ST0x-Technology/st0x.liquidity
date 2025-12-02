@@ -97,7 +97,7 @@ impl Default for OnChainTrade {
 }
 
 impl OnChainTrade {
-    pub(crate) fn aggregate_id(tx_hash: TxHash, log_index: i64) -> String {
+    pub(crate) fn aggregate_id(tx_hash: TxHash, log_index: u64) -> String {
         format!("{tx_hash}:{log_index}")
     }
 }
