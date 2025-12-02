@@ -229,7 +229,6 @@ mod tests {
         .await
         .unwrap();
 
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -278,7 +277,6 @@ mod tests {
         .await
         .unwrap();
 
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
