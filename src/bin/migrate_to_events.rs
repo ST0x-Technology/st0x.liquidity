@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let env = MigrationEnv::parse();
     let database_url = &env.database_url;
 
-    info!("Connecting to database: {database_url}");
+    info!("Connecting to database");
     let pool = SqlitePool::connect(database_url).await?;
 
     info!("Running database migrations...");
