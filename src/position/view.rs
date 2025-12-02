@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, Symbol};
 use tracing::error;
 
-use super::event::{ExecutionId, FractionalShares};
+use crate::state::State;
+
+use super::event::{ArithmeticError, ExecutionId, FractionalShares};
 use super::{Position, PositionEvent};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

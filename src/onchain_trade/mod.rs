@@ -160,6 +160,43 @@ impl Aggregate for OnChainTrade {
 
     fn apply(&mut self, event: Self::Event) {
         match event {
+            OnChainTradeEvent::Migrated {
+                symbol,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                block_timestamp,
+                gas_used,
+                pyth_price,
+                migrated_at: _,
+            } => {
+                if let (Some(gas), Some(pyth)) = (gas_used, pyth_price) {
+                    *self = Self::Enriched {
+                        symbol,
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_number,
+                        block_timestamp,
+                        filled_at: block_timestamp,
+                        gas_used: gas,
+                        pyth_price: pyth,
+                        enriched_at: block_timestamp,
+                    };
+                } else {
+                    *self = Self::Filled {
+                        symbol,
+                        amount,
+                        direction,
+                        price_usdc,
+                        block_number,
+                        block_timestamp,
+                        filled_at: block_timestamp,
+                    };
+                }
+            }
+
             OnChainTradeEvent::Filled {
                 symbol,
                 amount,
@@ -213,43 +250,6 @@ impl Aggregate for OnChainTrade {
                         enriched_at = %enriched_at,
                         "Enriched event applied to non-Filled aggregate - indicates bug in command validation"
                     );
-                }
-            }
-
-            OnChainTradeEvent::Migrated {
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_number,
-                block_timestamp,
-                gas_used,
-                pyth_price,
-                migrated_at: _,
-            } => {
-                if let (Some(gas), Some(pyth)) = (gas_used, pyth_price) {
-                    *self = Self::Enriched {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
-                        gas_used: gas,
-                        pyth_price: pyth,
-                        enriched_at: block_timestamp,
-                    };
-                } else {
-                    *self = Self::Filled {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
-                    };
                 }
             }
         }

@@ -173,130 +173,81 @@ debugging/recovery.
 
 ## Task 2. Add fallible arithmetic to `FractionalShares`
 
-Modify `src/position/event.rs` to provide arithmetic operations that return
-`Result`.
+Extract `FractionalShares` to its own module (`src/shares.rs`) and provide
+arithmetic operations that return `Result`.
 
-- [ ] Define `ArithmeticError` struct with overflow context (operation, lhs, rhs
-      values)
-- [ ] Update `Add` impl to set `type Output = Result<Self, ArithmeticError>`
-- [ ] Update `Sub` impl to set `type Output = Result<Self, ArithmeticError>`
-- [ ] Update `AddAssign` and `SubAssign` impls to use checked arithmetic and
-      panic on overflow (these are used in controlled contexts where Result
-      isn't ergonomic)
-- [ ] Add tests for fallible arithmetic, including overflow scenarios
-
-### Error type
-
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("Arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
-pub(crate) struct ArithmeticError {
-    pub(crate) operation: &'static str,
-    pub(crate) lhs: FractionalShares,
-    pub(crate) rhs: FractionalShares,
-}
-```
-
-### Trait impl signatures
-
-```rust
-impl std::ops::Add for FractionalShares {
-    type Output = Result<Self, ArithmeticError>;
-}
-
-impl std::ops::Sub for FractionalShares {
-    type Output = Result<Self, ArithmeticError>;
-}
-```
+- [x] Create `src/shares.rs` module with `FractionalShares` and
+      `ArithmeticError`
+- [x] Define `ArithmeticError` struct with overflow context (operation, lhs,
+      rhs)
+- [x] Update `Add` impl to set `type Output = Result<Self, ArithmeticError>`
+- [x] Update `Sub` impl to set `type Output = Result<Self, ArithmeticError>`
+- [x] Add helper methods: `is_negative()`, `is_zero()`, `abs()`
+- [x] Add `ZERO` and `ONE` constants
+- [x] Add tests for fallible arithmetic, including overflow scenarios
+- [x] Update `src/position/event.rs` to import from `crate::shares`
+- [x] Move threshold validation to `ExecutionThreshold` constructors
+- [x] Add module declaration to `src/lib.rs`
 
 ---
 
-## Task 3. Define `PositionCorruptionError` type
-
-Create an error type in `src/position/mod.rs` for corruption scenarios.
-
-- [ ] Define `PositionCorruptionError` enum with variants for each failure mode
-- [ ] Include `ArithmeticError` from Task 2 via `#[from]`
-- [ ] Generate `Display` and `Error` trait implementations via `thiserror`
-
-### Error variants
-
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum PositionCorruptionError {
-    #[error(transparent)]
-    Arithmetic(#[from] ArithmeticError),
-    #[error("Event applied to uninitialized position: {event_type}")]
-    EventBeforeInitialization { event_type: String },
-}
-```
-
----
-
-## Task 4. Refactor `Position` aggregate to use `State`
+## Task 3. Refactor `Position` aggregate to use `State`
 
 Update `src/position/mod.rs` to wrap the position data in `State`.
 
-- [ ] Change `Position` struct to contain only the position data (remove it
-      being the aggregate root)
-- [ ] Create `PositionAggregate` as `State<Position, PositionCorruptionError>`
-- [ ] Implement `Default` for `PositionAggregate` returning
-      `Active(Position::default())`
-- [ ] Update `Aggregate` implementation to use `PositionAggregate`
-- [ ] Refactor `apply` to use `State::transition` with fallible arithmetic
-- [ ] Update `handle` method to check for corrupted state and reject commands
-- [ ] Update all tests to work with new structure
+- [x] Change `Position` struct to contain only the position data
+- [x] Implement `Aggregate` for `State<Position, ArithmeticError>` directly
+- [x] Implement `Default` returning `Active(Position::default())`
+- [x] Refactor `apply` to use `State::transition` with fallible arithmetic
+- [x] Update `handle` method to use `self.active()?` helper
+- [x] Update all tests to work with new structure
 
 ---
 
-## Task 5. Refactor `OnChainTrade` aggregate to use `State`
+## Task 4. Refactor `OnChainTrade` aggregate to use `State`
 
 Update `src/onchain_trade/mod.rs` to use `State` instead of manual `Unfilled`
 variant.
 
-- [ ] Define `OnChainTradeCorruptionError` for corruption scenarios
-- [ ] Remove `Unfilled` variant from `OnChainTrade` enum, keep `Filled` and
-      `Enriched` as the inner type
-- [ ] Create `OnChainTradeAggregate` as
-      `State<OnChainTrade, OnChainTradeCorruptionError>`
-- [ ] Implement `Default` for `OnChainTradeAggregate` returning `Uninitialized`
-- [ ] Update `Aggregate` implementation to use `State::initialize` for `Witness`
-      command and `State::transition` for `Enrich`
-- [ ] Update `handle` method to check for corrupted state and reject commands
+- [ ] Remove `Unfilled` variant, keep `Filled` and `Enriched` as inner type
+- [ ] Implement `Aggregate` for `State<OnChainTrade, Infallible>` directly
+- [ ] Implement `Default` returning `Uninitialized`
+- [ ] Use `State::initialize` for `Filled` event, `State::transition` for
+      `Enriched` event
+- [ ] Update `handle` to use `self.active()?`
 - [ ] Update all tests to work with new structure
 
 ---
 
-## Task 6. Update `PositionView` to handle corrupted state
+## Task 5. Update `PositionView` to handle corrupted state
 
 Update `src/position/view.rs` to reflect corruption in the view.
 
-- [ ] Add `Corrupted` variant to `PositionView` enum
-- [ ] Update `View::update` to handle `Corrupted` aggregate state
+- [x] Add `Corrupted` variant to `PositionView` enum
+- [x] Update `View::update` to handle `Corrupted` aggregate state
 - [ ] Add tests for corrupted state propagation to view
-
-### Updated enum
-
-```rust
-pub(crate) enum PositionView {
-    Unavailable,
-    Position { /* ... */ },
-    Corrupted {
-        symbol: Symbol,
-        error: String,
-        last_known_position: Option<FractionalShares>,
-    },
-}
-```
 
 ---
 
-## Task 7. Add logging for corruption events
+## Task 6. Add logging for corruption events
 
 Ensure corruption is visible in logs.
 
-- [ ] Add `error!` log when transitioning to `Corrupted` state
-- [ ] Include aggregate ID and error details in log
+- [x] Add `error!` log when transitioning to `Corrupted` state
+- [x] Include aggregate ID and error details in log
+
+---
+
+## Task 7. Create `Projection<T, E>` helper for views
+
+Create a state wrapper for views similar to `State<T, E>` but tailored for
+view-specific needs (views receive events but don't validate/reject them).
+
+- [ ] Create `Projection<T, E>` enum with `Unavailable`, `Available(T)`,
+      `Corrupted` variants
+- [ ] Add helper methods for transitioning between states
+- [ ] Refactor `PositionView` to use `Projection`
+- [ ] Update tests
 
 ---
 

@@ -5,6 +5,8 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
+pub(crate) use crate::shares::{ArithmeticError, FractionalShares};
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TradeId {
     pub(crate) tx_hash: TxHash,
@@ -27,76 +29,15 @@ pub(crate) struct BrokerOrderId(pub(crate) String);
 pub(crate) struct PriceCents(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct FractionalShares(pub(crate) Decimal);
-
-impl FractionalShares {
-    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
-
-    pub(crate) fn abs(self) -> Self {
-        Self(self.0.abs())
-    }
-}
-
-impl std::ops::Add for FractionalShares {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self(self.0 + rhs.0)
-    }
-}
-
-impl std::ops::Sub for FractionalShares {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self(self.0 - rhs.0)
-    }
-}
-
-impl std::ops::AddAssign for FractionalShares {
-    fn add_assign(&mut self, rhs: Self) {
-        self.0 += rhs.0;
-    }
-}
-
-impl std::ops::SubAssign for FractionalShares {
-    fn sub_assign(&mut self, rhs: Self) {
-        self.0 -= rhs.0;
-    }
-}
-
-impl FractionalShares {
-    pub(crate) fn new(value: Decimal) -> Result<Self, InvalidThresholdError> {
-        if value.is_sign_negative() {
-            return Err(InvalidThresholdError::Negative(value));
-        }
-
-        if value.is_zero() {
-            return Err(InvalidThresholdError::Zero);
-        }
-
-        Ok(Self(value))
-    }
-
-    pub(crate) fn one() -> Self {
-        Self(Decimal::ONE)
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Usdc(Decimal);
+pub(crate) struct Usdc(pub(crate) Decimal);
 
 impl Usdc {
-    pub(crate) fn new(value: Decimal) -> Result<Self, InvalidThresholdError> {
-        if value.is_sign_negative() {
-            return Err(InvalidThresholdError::Negative(value));
-        }
+    pub(crate) fn is_negative(self) -> bool {
+        self.0.is_sign_negative()
+    }
 
-        if value.is_zero() {
-            return Err(InvalidThresholdError::Zero);
-        }
-
-        Ok(Self(value))
+    pub(crate) fn is_zero(self) -> bool {
+        self.0.is_zero()
     }
 }
 
@@ -107,17 +48,45 @@ pub(crate) enum ExecutionThreshold {
 }
 
 impl ExecutionThreshold {
+    pub(crate) fn shares(value: FractionalShares) -> Result<Self, InvalidThresholdError> {
+        if value.is_negative() {
+            return Err(InvalidThresholdError::NegativeShares(value));
+        }
+
+        if value.is_zero() {
+            return Err(InvalidThresholdError::ZeroShares);
+        }
+
+        Ok(Self::Shares(value))
+    }
+
+    pub(crate) fn dollar_value(value: Usdc) -> Result<Self, InvalidThresholdError> {
+        if value.is_negative() {
+            return Err(InvalidThresholdError::NegativeDollarValue(value));
+        }
+
+        if value.is_zero() {
+            return Err(InvalidThresholdError::ZeroDollarValue);
+        }
+
+        Ok(Self::DollarValue(value))
+    }
+
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(FractionalShares::one())
+        Self::Shares(FractionalShares::ONE)
     }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub(crate) enum InvalidThresholdError {
-    #[error("Threshold value cannot be negative: {0}")]
-    Negative(Decimal),
-    #[error("Threshold value cannot be zero")]
-    Zero,
+    #[error("Shares threshold cannot be negative: {0:?}")]
+    NegativeShares(FractionalShares),
+    #[error("Dollar threshold cannot be negative: {0:?}")]
+    NegativeDollarValue(Usdc),
+    #[error("Shares threshold cannot be zero")]
+    ZeroShares,
+    #[error("Dollar threshold cannot be zero")]
+    ZeroDollarValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,51 +176,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_whole_share_matches_smart_constructor() {
+    fn whole_share_matches_smart_constructor() {
         let from_whole_share = ExecutionThreshold::whole_share();
-        let from_constructor = ExecutionThreshold::Shares(FractionalShares::one());
+        let from_constructor = ExecutionThreshold::Shares(FractionalShares::ONE);
         assert_eq!(from_whole_share, from_constructor);
     }
 
     #[test]
-    fn test_fractional_shares_validation_rejects_zero() {
-        let result = FractionalShares::new(Decimal::ZERO);
-        assert_eq!(result.unwrap_err(), InvalidThresholdError::Zero);
+    fn shares_threshold_rejects_zero() {
+        let result = ExecutionThreshold::shares(FractionalShares::ZERO);
+        assert_eq!(result.unwrap_err(), InvalidThresholdError::ZeroShares);
     }
 
     #[test]
-    fn test_fractional_shares_validation_rejects_negative() {
-        let result = FractionalShares::new(Decimal::NEGATIVE_ONE);
+    fn shares_threshold_rejects_negative() {
+        let negative = FractionalShares(Decimal::NEGATIVE_ONE);
+        let result = ExecutionThreshold::shares(negative);
         assert_eq!(
             result.unwrap_err(),
-            InvalidThresholdError::Negative(Decimal::NEGATIVE_ONE)
+            InvalidThresholdError::NegativeShares(negative)
         );
     }
 
     #[test]
-    fn test_fractional_shares_validation_accepts_positive() {
-        let result = FractionalShares::new(Decimal::ONE);
+    fn shares_threshold_accepts_positive() {
+        let result = ExecutionThreshold::shares(FractionalShares::ONE);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_usdc_validation_rejects_zero() {
-        let result = Usdc::new(Decimal::ZERO);
-        assert_eq!(result.unwrap_err(), InvalidThresholdError::Zero);
+    fn dollar_threshold_rejects_zero() {
+        let result = ExecutionThreshold::dollar_value(Usdc(Decimal::ZERO));
+        assert_eq!(result.unwrap_err(), InvalidThresholdError::ZeroDollarValue);
     }
 
     #[test]
-    fn test_usdc_validation_rejects_negative() {
-        let result = Usdc::new(Decimal::NEGATIVE_ONE);
+    fn dollar_threshold_rejects_negative() {
+        let negative = Usdc(Decimal::NEGATIVE_ONE);
+        let result = ExecutionThreshold::dollar_value(negative);
         assert_eq!(
             result.unwrap_err(),
-            InvalidThresholdError::Negative(Decimal::NEGATIVE_ONE)
+            InvalidThresholdError::NegativeDollarValue(negative)
         );
     }
 
     #[test]
-    fn test_usdc_validation_accepts_positive() {
-        let result = Usdc::new(Decimal::ONE);
+    fn dollar_threshold_accepts_positive() {
+        let result = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE));
         assert!(result.is_ok());
     }
 }
