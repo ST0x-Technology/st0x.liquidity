@@ -206,7 +206,27 @@ Update `src/position/mod.rs` to wrap the position data in `State`.
 
 ---
 
-## Task 4. Refactor `OnChainTrade` aggregate to use `State`
+## Task 4. Create `Projection<T, E>` helper for views
+
+Create a state wrapper for views similar to `State<T, E>` but tailored for
+view-specific needs (views receive events but don't validate/reject them).
+
+- [ ] Create `Projection<T, E>` enum with `Unavailable`, `Available(T)`,
+      `Corrupted` variants
+- [ ] Add helper methods for transitioning between states
+
+---
+
+## Task 5. Update `PositionView` to use `Projection`
+
+Update `src/position/view.rs` to use the `Projection` wrapper.
+
+- [ ] Refactor `PositionView` to use `Projection`
+- [ ] Update tests for corrupted state propagation to view
+
+---
+
+## Task 6. Refactor `OnChainTrade` aggregate to use `State`
 
 Update `src/onchain_trade/mod.rs` to use `State` instead of manual `Unfilled`
 variant.
@@ -221,35 +241,12 @@ variant.
 
 ---
 
-## Task 5. Update `PositionView` to handle corrupted state
-
-Update `src/position/view.rs` to reflect corruption in the view.
-
-- [x] Add `Corrupted` variant to `PositionView` enum
-- [x] Update `View::update` to handle `Corrupted` aggregate state
-- [ ] Add tests for corrupted state propagation to view
-
----
-
-## Task 6. Add logging for corruption events
+## Task 7. Add logging for corruption events
 
 Ensure corruption is visible in logs.
 
 - [x] Add `error!` log when transitioning to `Corrupted` state
 - [x] Include aggregate ID and error details in log
-
----
-
-## Task 7. Create `Projection<T, E>` helper for views
-
-Create a state wrapper for views similar to `State<T, E>` but tailored for
-view-specific needs (views receive events but don't validate/reject them).
-
-- [ ] Create `Projection<T, E>` enum with `Unavailable`, `Available(T)`,
-      `Corrupted` variants
-- [ ] Add helper methods for transitioning between states
-- [ ] Refactor `PositionView` to use `Projection`
-- [ ] Update tests
 
 ---
 
