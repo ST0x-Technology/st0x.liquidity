@@ -175,6 +175,36 @@ impl Position {
 
         Ok(())
     }
+
+    fn handle_place_offchain_order(
+        &self,
+        execution_id: ExecutionId,
+        shares: FractionalShares,
+        direction: Direction,
+        broker: SupportedBroker,
+    ) -> Result<Vec<PositionEvent>, PositionError> {
+        if let Some(pending) = self.pending_execution_id {
+            return Err(PositionError::PendingExecution {
+                execution_id: pending,
+            });
+        }
+
+        let trigger_reason =
+            self.create_trigger_reason(&self.threshold)
+                .ok_or(PositionError::ThresholdNotMet {
+                    net_position: self.net,
+                    threshold: self.threshold,
+                })?;
+
+        Ok(vec![PositionEvent::OffChainOrderPlaced {
+            execution_id,
+            shares,
+            direction,
+            broker,
+            trigger_reason,
+            placed_at: Utc::now(),
+        }])
+    }
 }
 
 #[async_trait]
@@ -201,7 +231,11 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match (&command, self.live()) {
-            (PositionCommand::Initialize { symbol, threshold }, _) => {
+            (PositionCommand::Initialize { .. }, Ok(_)) => {
+                Err(LifecycleError::AlreadyInitialized.into())
+            }
+
+            (PositionCommand::Initialize { symbol, threshold }, Err(_)) => {
                 Ok(vec![PositionEvent::Initialized {
                     symbol: symbol.clone(),
                     threshold: *threshold,
@@ -237,29 +271,7 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
                     broker,
                 },
                 Ok(position),
-            ) => {
-                if let Some(pending) = position.pending_execution_id {
-                    return Err(PositionError::PendingExecution {
-                        execution_id: pending,
-                    });
-                }
-
-                let trigger_reason = position.create_trigger_reason(&position.threshold).ok_or(
-                    PositionError::ThresholdNotMet {
-                        net_position: position.net,
-                        threshold: position.threshold,
-                    },
-                )?;
-
-                Ok(vec![PositionEvent::OffChainOrderPlaced {
-                    execution_id: *execution_id,
-                    shares: *shares,
-                    direction: *direction,
-                    broker: *broker,
-                    trigger_reason,
-                    placed_at: Utc::now(),
-                }])
-            }
+            ) => position.handle_place_offchain_order(*execution_id, *shares, *direction, *broker),
 
             (
                 PositionCommand::CompleteOffChainOrder {
