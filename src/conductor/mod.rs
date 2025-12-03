@@ -1589,4 +1589,18 @@ mod tests {
 
         conductor.abort_all();
     }
+
+    #[test]
+    fn test_to_broker_ticker_splg_maps_to_spym() {
+        let splg = Symbol::new("SPLG").unwrap();
+        assert_eq!(to_broker_ticker(&splg).unwrap().to_string(), "SPYM");
+    }
+
+    #[test]
+    fn test_to_broker_ticker_other_symbols_unchanged() {
+        for ticker in ["AAPL", "NVDA", "MSTR", "IAU", "COIN"] {
+            let symbol = Symbol::new(ticker).unwrap();
+            assert_eq!(to_broker_ticker(&symbol).unwrap().to_string(), ticker);
+        }
+    }
 }
