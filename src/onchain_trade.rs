@@ -1,59 +1,16 @@
+//! OnChainTrade aggregate for tracking blockchain trades.
+
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent};
+use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-
-mod cmd;
-mod event;
-pub(crate) mod view;
-
-pub(crate) use cmd::OnChainTradeCommand;
-pub(crate) use event::{OnChainTradeEvent, PythPrice};
 use st0x_broker::{Direction, Symbol};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TradeAggregateId {
-    pub(crate) tx_hash: TxHash,
-    pub(crate) log_index: u64,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AggregateIdError {
-    #[error("Invalid format: expected 'tx_hash:log_index', got '{0}'")]
-    InvalidFormat(String),
-    #[error("Failed to parse tx_hash: {0}")]
-    ParseTxHash(#[from] alloy::hex::FromHexError),
-    #[error("Failed to parse log_index: {0}")]
-    ParseLogIndex(#[from] std::num::ParseIntError),
-}
-
-impl FromStr for TradeAggregateId {
-    type Err = AggregateIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 {
-            return Err(AggregateIdError::InvalidFormat(s.to_string()));
-        }
-
-        let tx_hash = TxHash::from_str(parts[0])?;
-        let log_index = parts[1].parse::<u64>()?;
-
-        Ok(Self { tx_hash, log_index })
-    }
-}
-
-impl Display for TradeAggregateId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.tx_hash, self.log_index)
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OnChainTrade {
@@ -67,106 +24,12 @@ pub(crate) struct OnChainTrade {
     pub(crate) enrichment: Option<Enrichment>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum OnChainTradeError {
-    #[error("Cannot enrich trade that hasn't been filled yet")]
-    NotFilled,
-    #[error("Trade has already been enriched")]
-    AlreadyEnriched,
-    #[error("Trade has already been filled")]
-    AlreadyFilled,
-    #[error(transparent)]
-    State(#[from] LifecycleError<Never>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct Enrichment {
-    pub(crate) gas_used: u64,
-    pub(crate) pyth_price: PythPrice,
-    pub(crate) enriched_at: DateTime<Utc>,
-}
-
 impl OnChainTrade {
-    fn is_enriched(&self) -> bool {
+    pub(crate) fn is_enriched(&self) -> bool {
         self.enrichment.is_some()
     }
-}
 
-#[async_trait]
-impl Aggregate for Lifecycle<OnChainTrade, Never> {
-    type Command = OnChainTradeCommand;
-    type Event = OnChainTradeEvent;
-    type Error = OnChainTradeError;
-    type Services = ();
-
-    fn aggregate_type() -> String {
-        "OnChainTrade".to_string()
-    }
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        _services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (&command, self.live()) {
-            (
-                OnChainTradeCommand::Witness {
-                    symbol,
-                    amount,
-                    direction,
-                    price_usdc,
-                    block_number,
-                    block_timestamp,
-                },
-                Err(LifecycleError::Uninitialized),
-            ) => Ok(vec![OnChainTradeEvent::Filled {
-                symbol: symbol.clone(),
-                amount: *amount,
-                direction: *direction,
-                price_usdc: *price_usdc,
-                block_number: *block_number,
-                block_timestamp: *block_timestamp,
-                filled_at: Utc::now(),
-            }]),
-
-            (OnChainTradeCommand::Witness { .. }, Ok(_)) => Err(OnChainTradeError::AlreadyFilled),
-
-            (
-                OnChainTradeCommand::Enrich {
-                    gas_used,
-                    pyth_price,
-                },
-                Ok(trade),
-            ) => {
-                if trade.is_enriched() {
-                    return Err(OnChainTradeError::AlreadyEnriched);
-                }
-
-                Ok(vec![OnChainTradeEvent::Enriched {
-                    gas_used: *gas_used,
-                    pyth_price: pyth_price.clone(),
-                    enriched_at: Utc::now(),
-                }])
-            }
-
-            (OnChainTradeCommand::Enrich { .. }, Err(LifecycleError::Uninitialized)) => {
-                Err(OnChainTradeError::NotFilled)
-            }
-
-            (_, Err(e)) => Err(e.into()),
-        }
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        *self = self
-            .clone()
-            .transition(&event, OnChainTrade::apply_transition)
-            .or_initialize(&event, OnChainTrade::from_event);
-    }
-}
-
-impl OnChainTrade {
-    fn apply_transition(
+    pub(crate) fn apply_transition(
         event: &OnChainTradeEvent,
         trade: &Self,
     ) -> Result<Self, LifecycleError<Never>> {
@@ -193,7 +56,7 @@ impl OnChainTrade {
         }
     }
 
-    fn from_event(event: &OnChainTradeEvent) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn from_event(event: &OnChainTradeEvent) -> Result<Self, LifecycleError<Never>> {
         match event {
             OnChainTradeEvent::Filled {
                 symbol,
@@ -253,12 +116,231 @@ impl OnChainTrade {
     }
 }
 
+#[async_trait]
+impl Aggregate for Lifecycle<OnChainTrade, Never> {
+    type Command = OnChainTradeCommand;
+    type Event = OnChainTradeEvent;
+    type Error = OnChainTradeError;
+    type Services = ();
+
+    fn aggregate_type() -> String {
+        "OnChainTrade".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        *self = self
+            .clone()
+            .transition(&event, OnChainTrade::apply_transition)
+            .or_initialize(&event, OnChainTrade::from_event);
+    }
+
+    async fn handle(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match (&command, self.live()) {
+            (
+                OnChainTradeCommand::Witness {
+                    symbol,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_number,
+                    block_timestamp,
+                },
+                Err(LifecycleError::Uninitialized),
+            ) => Ok(vec![OnChainTradeEvent::Filled {
+                symbol: symbol.clone(),
+                amount: *amount,
+                direction: *direction,
+                price_usdc: *price_usdc,
+                block_number: *block_number,
+                block_timestamp: *block_timestamp,
+                filled_at: Utc::now(),
+            }]),
+
+            (OnChainTradeCommand::Witness { .. }, Ok(_)) => Err(OnChainTradeError::AlreadyFilled),
+
+            (
+                OnChainTradeCommand::Enrich {
+                    gas_used,
+                    pyth_price,
+                },
+                Ok(trade),
+            ) => {
+                if trade.is_enriched() {
+                    return Err(OnChainTradeError::AlreadyEnriched);
+                }
+
+                Ok(vec![OnChainTradeEvent::Enriched {
+                    gas_used: *gas_used,
+                    pyth_price: pyth_price.clone(),
+                    enriched_at: Utc::now(),
+                }])
+            }
+
+            (OnChainTradeCommand::Enrich { .. }, Err(LifecycleError::Uninitialized)) => {
+                Err(OnChainTradeError::NotFilled)
+            }
+
+            (_, Err(e)) => Err(e.into()),
+        }
+    }
+}
+
+impl View<Self> for Lifecycle<OnChainTrade, Never> {
+    fn update(&mut self, event: &EventEnvelope<Self>) {
+        *self = self
+            .clone()
+            .transition(&event.payload, OnChainTrade::apply_transition)
+            .or_initialize(&event.payload, OnChainTrade::from_event);
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OnChainTradeError {
+    #[error("Cannot enrich trade that hasn't been filled yet")]
+    NotFilled,
+    #[error("Trade has already been enriched")]
+    AlreadyEnriched,
+    #[error("Trade has already been filled")]
+    AlreadyFilled,
+    #[error(transparent)]
+    State(#[from] LifecycleError<Never>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum OnChainTradeCommand {
+    Witness {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+    },
+    Enrich {
+        gas_used: u64,
+        pyth_price: PythPrice,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum OnChainTradeEvent {
+    Migrated {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+        migrated_at: DateTime<Utc>,
+    },
+    Filled {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        filled_at: DateTime<Utc>,
+    },
+    Enriched {
+        gas_used: u64,
+        pyth_price: PythPrice,
+        enriched_at: DateTime<Utc>,
+    },
+}
+
+impl DomainEvent for OnChainTradeEvent {
+    fn event_type(&self) -> String {
+        match self {
+            Self::Migrated { .. } => "OnChainTradeEvent::Migrated".to_string(),
+            Self::Filled { .. } => "OnChainTradeEvent::Filled".to_string(),
+            Self::Enriched { .. } => "OnChainTradeEvent::Enriched".to_string(),
+        }
+    }
+
+    fn event_version(&self) -> String {
+        "1.0".to_string()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct Enrichment {
+    pub(crate) gas_used: u64,
+    pub(crate) pyth_price: PythPrice,
+    pub(crate) enriched_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PythPrice {
+    pub(crate) value: String,
+    pub(crate) expo: i32,
+    pub(crate) conf: String,
+    pub(crate) publish_time: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TradeAggregateId {
+    pub(crate) tx_hash: TxHash,
+    pub(crate) log_index: u64,
+}
+
+impl FromStr for TradeAggregateId {
+    type Err = AggregateIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 2 {
+            return Err(AggregateIdError::InvalidFormat(s.to_string()));
+        }
+
+        let tx_hash = TxHash::from_str(parts[0])?;
+        let log_index = parts[1].parse::<u64>()?;
+
+        Ok(Self { tx_hash, log_index })
+    }
+}
+
+impl Display for TradeAggregateId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.tx_hash, self.log_index)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AggregateIdError {
+    #[error("Invalid format: expected 'tx_hash:log_index', got '{0}'")]
+    InvalidFormat(String),
+    #[error("Failed to parse tx_hash: {0}")]
+    ParseTxHash(#[from] alloy::hex::FromHexError),
+    #[error("Failed to parse log_index: {0}")]
+    ParseLogIndex(#[from] std::num::ParseIntError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
     use proptest::prelude::*;
     use rust_decimal_macros::dec;
+    use std::collections::HashMap;
+
+    fn make_envelope(
+        aggregate_id: &str,
+        sequence: usize,
+        event: OnChainTradeEvent,
+    ) -> EventEnvelope<Lifecycle<OnChainTrade, Never>> {
+        EventEnvelope {
+            aggregate_id: aggregate_id.to_string(),
+            sequence,
+            payload: event,
+            metadata: HashMap::new(),
+        }
+    }
 
     #[tokio::test]
     async fn witness_command_creates_filled_event() {
@@ -562,5 +644,162 @@ mod tests {
             result.unwrap_err(),
             AggregateIdError::ParseLogIndex(_)
         ));
+    }
+
+    #[test]
+    fn filled_creates_live_state() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let event = OnChainTradeEvent::Filled {
+            symbol,
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+        };
+
+        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        assert!(matches!(view, Lifecycle::Uninitialized));
+
+        view.update(&make_envelope("0x1234:0", 1, event));
+
+        let Lifecycle::Live(trade) = view else {
+            panic!("Expected Live state");
+        };
+
+        assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
+        assert_eq!(trade.amount, dec!(10.5));
+        assert_eq!(trade.direction, Direction::Buy);
+        assert!(!trade.is_enriched());
+    }
+
+    #[test]
+    fn enriched_updates_live_state() {
+        let now = Utc::now();
+
+        let mut view = Lifecycle::Live(OnChainTrade {
+            symbol: Symbol::new("AAPL").unwrap(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+            enrichment: None,
+        });
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: now,
+        };
+
+        let event = OnChainTradeEvent::Enriched {
+            gas_used: 50000,
+            pyth_price: pyth_price.clone(),
+            enriched_at: now,
+        };
+
+        view.update(&make_envelope("0x1234:0", 2, event));
+
+        let Lifecycle::Live(trade) = view else {
+            panic!("Expected Live state");
+        };
+
+        assert!(trade.is_enriched());
+        let enrichment = trade.enrichment.unwrap();
+        assert_eq!(enrichment.gas_used, 50000);
+        assert_eq!(enrichment.pyth_price, pyth_price);
+    }
+
+    #[test]
+    fn migrated_creates_live_state_with_enrichment() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: now,
+        };
+
+        let event = OnChainTradeEvent::Migrated {
+            symbol,
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            gas_used: Some(50000),
+            pyth_price: Some(pyth_price),
+            migrated_at: now,
+        };
+
+        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        view.update(&make_envelope("0x1234:0", 1, event));
+
+        let Lifecycle::Live(trade) = view else {
+            panic!("Expected Live state");
+        };
+
+        assert_eq!(trade.symbol, Symbol::new("AAPL").unwrap());
+        assert!(trade.is_enriched());
+        let enrichment = trade.enrichment.unwrap();
+        assert_eq!(enrichment.gas_used, 50000);
+    }
+
+    #[test]
+    fn migrated_creates_live_state_without_enrichment() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let event = OnChainTradeEvent::Migrated {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            gas_used: None,
+            pyth_price: None,
+            migrated_at: now,
+        };
+
+        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        view.update(&make_envelope("0x1234:0", 1, event));
+
+        let Lifecycle::Live(trade) = view else {
+            panic!("Expected Live state");
+        };
+
+        assert_eq!(trade.symbol, symbol);
+        assert!(!trade.is_enriched());
+    }
+
+    #[test]
+    fn transition_on_uninitialized_fails() {
+        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: Utc::now(),
+        };
+
+        let event = OnChainTradeEvent::Enriched {
+            gas_used: 50000,
+            pyth_price,
+            enriched_at: Utc::now(),
+        };
+
+        view.update(&make_envelope("0x1234:0", 1, event));
+
+        assert!(matches!(view, Lifecycle::Failed { .. }));
     }
 }

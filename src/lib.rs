@@ -22,6 +22,8 @@ pub mod reporter;
 mod shares;
 mod symbol;
 mod telemetry;
+#[allow(dead_code)]
+mod threshold;
 mod trade_execution_link;
 
 pub use telemetry::{TelemetryError, TelemetryGuard};
