@@ -236,32 +236,33 @@ struct already contains all fields needed by the view.
 
 ---
 
-## Task 5. Update `OnChainTradeView` to use `State`
+## Task 5. Refactor `OnChainTrade` aggregate to use `State`
 
-Update `src/onchain_trade/view.rs` to use `State<OnChainTradeViewData, E>`.
+Update `src/onchain_trade/mod.rs` to use `State` instead of manual `Unfilled`
+variant. Follow the same clean pattern as Position aggregate.
 
-- [ ] Create `OnChainTradeViewData` struct with the view fields
-- [ ] Change `OnChainTradeView` to be a type alias for
-      `State<OnChainTradeViewData, Infallible>` (no fallible operations)
-- [ ] Refactor `View::update` to use `initialize` for `Filled`/`Migrated` and
-      `transition` for `Enriched`
-- [ ] Replace silent `return` on pattern mismatches with proper corruption
-- [ ] Update tests
+- [x] Create `OnChainTrade` struct with the trade data fields
+- [x] Create `Enrichment` struct to group enrichment fields (gas_used,
+      pyth_price, enriched_at)
+- [x] Implement `Aggregate` for `State<OnChainTrade, Never>` directly
+- [x] Create `Never` type (serializable uninhabited type) in `state.rs`
+- [x] Implement `Default` returning `Uninitialized`
+- [x] Create `OnChainTrade::apply_transition` and `OnChainTrade::from_event`
+      helper methods
+- [x] Use `.transition().or_initialize()` pattern in `apply`
+- [x] Update `handle` to use `self.active()?`
+- [x] Update all tests to work with new structure
 
 ---
 
-## Task 6. Refactor `OnChainTrade` aggregate to use `State`
+## Task 6. Update `OnChainTradeView` to use `State`
 
-Update `src/onchain_trade/mod.rs` to use `State` instead of manual `Unfilled`
-variant.
+Update `src/onchain_trade/view.rs` to use `State<OnChainTrade, Never>` directly.
 
-- [ ] Remove `Unfilled` variant, keep `Filled` and `Enriched` as inner type
-- [ ] Implement `Aggregate` for `State<OnChainTrade, Infallible>` directly
-- [ ] Implement `Default` returning `Uninitialized`
-- [ ] Use `State::initialize` for `Filled` event, `State::transition` for
-      `Enriched` event
-- [ ] Update `handle` to use `self.active()?`
-- [ ] Update all tests to work with new structure
+- [x] Update `View<OnChainTrade>` to `View<State<OnChainTrade, Never>>`
+- [x] Update `EventEnvelope` type parameter
+- [x] Tests continue to work (view keeps its own structure with tx_hash and
+      log_index)
 
 ---
 
@@ -278,19 +279,21 @@ Ensure corruption is visible in logs.
 
 Ensure code that uses the aggregates handles the new structure.
 
-- [ ] Search for usages of `Position` and `OnChainTrade` aggregates in the
+- [x] Search for usages of `Position` and `OnChainTrade` aggregates in the
       codebase
-- [ ] Update any code that directly accesses aggregate fields
-- [ ] Ensure command handlers properly reject commands on corrupted aggregates
+- [x] No external usages found - modules are marked `#[allow(dead_code)]`
+      pending dual-write implementation (TODO #130)
+- [x] Command handlers already reject commands on corrupted aggregates via
+      `self.active()?`
 
 ---
 
 ## Task 9. Clean up and final testing
 
-- [ ] Run `cargo test -q` to ensure all tests pass
-- [ ] Run `cargo clippy --all-targets --all-features -- -D clippy::all`
-- [ ] Run `cargo fmt`
-- [ ] Review all changes for adherence to AGENTS.md guidelines
+- [x] Run `cargo test -q` to ensure all tests pass (342 tests)
+- [x] Run `cargo clippy --all-targets --all-features -- -D clippy::all`
+- [x] Run `cargo fmt`
+- [x] Review all changes for adherence to AGENTS.md guidelines
 
 ---
 

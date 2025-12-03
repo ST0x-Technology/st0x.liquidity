@@ -1,12 +1,13 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::Aggregate;
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
-use tracing::warn;
+
+use crate::state::{Never, State, StateError};
 
 mod cmd;
 mod event;
@@ -54,6 +55,18 @@ impl Display for TradeAggregateId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct OnChainTrade {
+    pub(crate) symbol: Symbol,
+    pub(crate) amount: Decimal,
+    pub(crate) direction: Direction,
+    pub(crate) price_usdc: Decimal,
+    pub(crate) block_number: u64,
+    pub(crate) block_timestamp: DateTime<Utc>,
+    pub(crate) filled_at: DateTime<Utc>,
+    pub(crate) enrichment: Option<Enrichment>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OnChainTradeError {
     #[error("Cannot enrich trade that hasn't been filled yet")]
@@ -62,42 +75,31 @@ pub(crate) enum OnChainTradeError {
     AlreadyEnriched,
     #[error("Trade has already been filled")]
     AlreadyFilled,
+    #[error(transparent)]
+    State(#[from] StateError<Never>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum OnChainTrade {
-    Unfilled,
-    Filled {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        filled_at: DateTime<Utc>,
-    },
-    Enriched {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        filled_at: DateTime<Utc>,
-        gas_used: u64,
-        pyth_price: PythPrice,
-        enriched_at: DateTime<Utc>,
-    },
+pub(crate) struct Enrichment {
+    pub(crate) gas_used: u64,
+    pub(crate) pyth_price: PythPrice,
+    pub(crate) enriched_at: DateTime<Utc>,
 }
 
-impl Default for OnChainTrade {
+impl OnChainTrade {
+    fn is_enriched(&self) -> bool {
+        self.enrichment.is_some()
+    }
+}
+
+impl Default for State<OnChainTrade, Never> {
     fn default() -> Self {
-        Self::Unfilled
+        Self::Uninitialized
     }
 }
 
 #[async_trait]
-impl Aggregate for OnChainTrade {
+impl Aggregate for State<OnChainTrade, Never> {
     type Command = OnChainTradeCommand;
     type Event = OnChainTradeEvent;
     type Error = OnChainTradeError;
@@ -112,54 +114,112 @@ impl Aggregate for OnChainTrade {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            OnChainTradeCommand::Witness {
+        match (&command, self.active()) {
+            (
+                OnChainTradeCommand::Witness {
+                    symbol,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_number,
+                    block_timestamp,
+                },
+                Err(StateError::Uninitialized),
+            ) => Ok(vec![OnChainTradeEvent::Filled {
+                symbol: symbol.clone(),
+                amount: *amount,
+                direction: *direction,
+                price_usdc: *price_usdc,
+                block_number: *block_number,
+                block_timestamp: *block_timestamp,
+                filled_at: Utc::now(),
+            }]),
+
+            (OnChainTradeCommand::Witness { .. }, Ok(_)) => Err(OnChainTradeError::AlreadyFilled),
+
+            (
+                OnChainTradeCommand::Enrich {
+                    gas_used,
+                    pyth_price,
+                },
+                Ok(trade),
+            ) => {
+                if trade.is_enriched() {
+                    return Err(OnChainTradeError::AlreadyEnriched);
+                }
+
+                Ok(vec![OnChainTradeEvent::Enriched {
+                    gas_used: *gas_used,
+                    pyth_price: pyth_price.clone(),
+                    enriched_at: Utc::now(),
+                }])
+            }
+
+            (OnChainTradeCommand::Enrich { .. }, Err(StateError::Uninitialized)) => {
+                Err(OnChainTradeError::NotFilled)
+            }
+
+            (_, Err(e)) => Err(e.into()),
+        }
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        *self = self
+            .clone()
+            .transition(&event, OnChainTrade::apply_transition)
+            .or_initialize(&event, OnChainTrade::from_event);
+    }
+}
+
+impl OnChainTrade {
+    fn apply_transition(
+        event: &OnChainTradeEvent,
+        trade: &Self,
+    ) -> Result<Self, StateError<Never>> {
+        match event {
+            OnChainTradeEvent::Enriched {
+                gas_used,
+                pyth_price,
+                enriched_at,
+            } => Ok(Self {
+                enrichment: Some(Enrichment {
+                    gas_used: *gas_used,
+                    pyth_price: pyth_price.clone(),
+                    enriched_at: *enriched_at,
+                }),
+                ..trade.clone()
+            }),
+
+            OnChainTradeEvent::Filled { .. } | OnChainTradeEvent::Migrated { .. } => {
+                Err(StateError::Mismatch {
+                    state: format!("{trade:?}"),
+                    event: event.event_type(),
+                })
+            }
+        }
+    }
+
+    fn from_event(event: &OnChainTradeEvent) -> Result<Self, StateError<Never>> {
+        match event {
+            OnChainTradeEvent::Filled {
                 symbol,
                 amount,
                 direction,
                 price_usdc,
                 block_number,
                 block_timestamp,
-            } => match self {
-                Self::Unfilled => {
-                    let now = Utc::now();
+                filled_at,
+            } => Ok(Self {
+                symbol: symbol.clone(),
+                amount: *amount,
+                direction: *direction,
+                price_usdc: *price_usdc,
+                block_number: *block_number,
+                block_timestamp: *block_timestamp,
+                filled_at: *filled_at,
+                enrichment: None,
+            }),
 
-                    Ok(vec![OnChainTradeEvent::Filled {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: now,
-                    }])
-                }
-                Self::Filled { .. } | Self::Enriched { .. } => {
-                    Err(OnChainTradeError::AlreadyFilled)
-                }
-            },
-
-            OnChainTradeCommand::Enrich {
-                gas_used,
-                pyth_price,
-            } => match self {
-                Self::Unfilled => Err(OnChainTradeError::NotFilled),
-                Self::Enriched { .. } => Err(OnChainTradeError::AlreadyEnriched),
-                Self::Filled { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![OnChainTradeEvent::Enriched {
-                        gas_used,
-                        pyth_price,
-                        enriched_at: now,
-                    }])
-                }
-            },
-        }
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        match event {
             OnChainTradeEvent::Migrated {
                 symbol,
                 amount,
@@ -169,89 +229,32 @@ impl Aggregate for OnChainTrade {
                 block_timestamp,
                 gas_used,
                 pyth_price,
-                migrated_at: _,
+                migrated_at,
             } => {
-                if let (Some(gas), Some(pyth)) = (gas_used, pyth_price) {
-                    *self = Self::Enriched {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
+                let enrichment = gas_used
+                    .zip(pyth_price.clone())
+                    .map(|(gas, pyth)| Enrichment {
                         gas_used: gas,
                         pyth_price: pyth,
-                        enriched_at: block_timestamp,
-                    };
-                } else {
-                    *self = Self::Filled {
-                        symbol,
-                        amount,
-                        direction,
-                        price_usdc,
-                        block_number,
-                        block_timestamp,
-                        filled_at: block_timestamp,
-                    };
-                }
+                        enriched_at: *migrated_at,
+                    });
+
+                Ok(Self {
+                    symbol: symbol.clone(),
+                    amount: *amount,
+                    direction: *direction,
+                    price_usdc: *price_usdc,
+                    block_number: *block_number,
+                    block_timestamp: *block_timestamp,
+                    filled_at: *block_timestamp,
+                    enrichment,
+                })
             }
 
-            OnChainTradeEvent::Filled {
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_number,
-                block_timestamp,
-                filled_at,
-            } => {
-                *self = Self::Filled {
-                    symbol,
-                    amount,
-                    direction,
-                    price_usdc,
-                    block_number,
-                    block_timestamp,
-                    filled_at,
-                };
-            }
-
-            OnChainTradeEvent::Enriched {
-                gas_used,
-                pyth_price,
-                enriched_at,
-            } => {
-                if let Self::Filled {
-                    symbol,
-                    amount,
-                    direction,
-                    price_usdc,
-                    block_number,
-                    block_timestamp,
-                    filled_at,
-                } = self
-                {
-                    *self = Self::Enriched {
-                        symbol: symbol.clone(),
-                        amount: *amount,
-                        direction: *direction,
-                        price_usdc: *price_usdc,
-                        block_number: *block_number,
-                        block_timestamp: *block_timestamp,
-                        filled_at: *filled_at,
-                        gas_used,
-                        pyth_price,
-                        enriched_at,
-                    };
-                } else {
-                    warn!(
-                        current_state = ?self,
-                        enriched_at = %enriched_at,
-                        "Enriched event applied to non-Filled aggregate - indicates bug in command validation"
-                    );
-                }
-            }
+            OnChainTradeEvent::Enriched { .. } => Err(StateError::Mismatch {
+                state: "Uninitialized".into(),
+                event: event.event_type(),
+            }),
         }
     }
 }
@@ -264,8 +267,8 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[tokio::test]
-    async fn test_witness_command_creates_filled_event() {
-        let aggregate = OnChainTrade::default();
+    async fn witness_command_creates_filled_event() {
+        let aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -285,8 +288,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enrich_command_creates_enriched_event() {
-        let mut aggregate = OnChainTrade::default();
+    async fn enrich_command_creates_enriched_event() {
+        let mut aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -320,8 +323,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_enrich_twice() {
-        let mut aggregate = OnChainTrade::default();
+    async fn cannot_enrich_twice() {
+        let mut aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -361,8 +364,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_enrich_before_fill() {
-        let aggregate = OnChainTrade::default();
+    async fn cannot_enrich_before_fill() {
+        let aggregate = State::<OnChainTrade, Never>::default();
         let now = Utc::now();
 
         let pyth_price = PythPrice {
@@ -383,8 +386,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_migrated_event_with_enrichment() {
-        let mut aggregate = OnChainTrade::default();
+    async fn migrated_event_with_enrichment() {
+        let mut aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -409,12 +412,15 @@ mod tests {
 
         aggregate.apply(migrated_event);
 
-        assert!(matches!(aggregate, OnChainTrade::Enriched { .. }));
+        let State::Active(trade) = aggregate else {
+            panic!("Expected Active state");
+        };
+        assert!(trade.is_enriched());
     }
 
     #[tokio::test]
-    async fn test_migrated_event_without_enrichment() {
-        let mut aggregate = OnChainTrade::default();
+    async fn migrated_event_without_enrichment() {
+        let mut aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -432,12 +438,15 @@ mod tests {
 
         aggregate.apply(migrated_event);
 
-        assert!(matches!(aggregate, OnChainTrade::Filled { .. }));
+        let State::Active(trade) = aggregate else {
+            panic!("Expected Active state");
+        };
+        assert!(!trade.is_enriched());
     }
 
     #[tokio::test]
-    async fn test_cannot_witness_twice_when_filled() {
-        let mut aggregate = OnChainTrade::default();
+    async fn cannot_witness_twice_when_filled() {
+        let mut aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 

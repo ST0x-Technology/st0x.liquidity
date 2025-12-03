@@ -2,11 +2,11 @@ use cqrs_es::{EventEnvelope, View};
 
 use crate::state::State;
 
+use super::Position;
 use super::event::ArithmeticError;
-use super::{Position, PositionEvent};
 
-impl View<State<Position, ArithmeticError>> for State<Position, ArithmeticError> {
-    fn update(&mut self, event: &EventEnvelope<State<Position, ArithmeticError>>) {
+impl View<Self> for State<Position, ArithmeticError> {
+    fn update(&mut self, event: &EventEnvelope<Self>) {
         *self = self
             .clone()
             .transition(&event.payload, Position::apply_transition)
@@ -25,6 +25,7 @@ mod tests {
     use std::collections::HashMap;
     use std::str::FromStr;
 
+    use super::super::event::PositionEvent;
     use super::super::event::{
         BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PriceCents, TradeId,
         TriggerReason, Usdc,

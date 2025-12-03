@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tracing::error;
 
+/// A type that cannot be constructed, similar to `std::convert::Infallible`,
+/// but implements `Serialize`/`Deserialize` for use in `State<T, E>` where
+/// no custom errors are possible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("never")]
+pub(crate) enum Never {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum State<T, E> {
     Uninitialized,
