@@ -293,9 +293,9 @@ Environment variables (can be set via `.env` file):
   braces jumping between blocks and for easier reading
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
-  module is clear (e.g. use `info!` instead of `tracing::info!`). Generally
-  avoid imports inside functions. We don't do function-level imports, instead we
-  do top-of-module imports. Note that I said top-of-module and not top-of-file,
+  module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
+  imports inside functions. We don't do function-level imports, instead we do
+  top-of-module imports. Note that I said top-of-module and not top-of-file,
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
