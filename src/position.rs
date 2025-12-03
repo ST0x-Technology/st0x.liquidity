@@ -55,37 +55,69 @@ impl Position {
                 execution_id,
                 placed_at,
                 ..
-            } => Ok(Self {
-                pending_execution_id: Some(*execution_id),
-                last_updated: Some(*placed_at),
-                ..position.clone()
-            }),
+            } => {
+                if position.pending_execution_id.is_some() {
+                    return Err(LifecycleError::Mismatch {
+                        state: format!("{position:?}"),
+                        event: event.event_type(),
+                    });
+                }
+
+                Ok(Self {
+                    pending_execution_id: Some(*execution_id),
+                    last_updated: Some(*placed_at),
+                    ..position.clone()
+                })
+            }
 
             PositionEvent::OffChainOrderFilled {
+                execution_id,
                 shares_filled,
                 direction,
                 broker_timestamp,
                 ..
-            } => match direction {
-                Direction::Sell => Ok(Self {
-                    net: (position.net - *shares_filled).map_err(LifecycleError::from)?,
-                    pending_execution_id: None,
-                    last_updated: Some(*broker_timestamp),
-                    ..position.clone()
-                }),
-                Direction::Buy => Ok(Self {
-                    net: (position.net + *shares_filled).map_err(LifecycleError::from)?,
-                    pending_execution_id: None,
-                    last_updated: Some(*broker_timestamp),
-                    ..position.clone()
-                }),
-            },
+            } => {
+                if position.pending_execution_id != Some(*execution_id) {
+                    return Err(LifecycleError::Mismatch {
+                        state: format!("{position:?}"),
+                        event: event.event_type(),
+                    });
+                }
 
-            PositionEvent::OffChainOrderFailed { failed_at, .. } => Ok(Self {
-                pending_execution_id: None,
-                last_updated: Some(*failed_at),
-                ..position.clone()
-            }),
+                match direction {
+                    Direction::Sell => Ok(Self {
+                        net: (position.net - *shares_filled).map_err(LifecycleError::from)?,
+                        pending_execution_id: None,
+                        last_updated: Some(*broker_timestamp),
+                        ..position.clone()
+                    }),
+                    Direction::Buy => Ok(Self {
+                        net: (position.net + *shares_filled).map_err(LifecycleError::from)?,
+                        pending_execution_id: None,
+                        last_updated: Some(*broker_timestamp),
+                        ..position.clone()
+                    }),
+                }
+            }
+
+            PositionEvent::OffChainOrderFailed {
+                execution_id,
+                failed_at,
+                ..
+            } => {
+                if position.pending_execution_id != Some(*execution_id) {
+                    return Err(LifecycleError::Mismatch {
+                        state: format!("{position:?}"),
+                        event: event.event_type(),
+                    });
+                }
+
+                Ok(Self {
+                    pending_execution_id: None,
+                    last_updated: Some(*failed_at),
+                    ..position.clone()
+                })
+            }
 
             PositionEvent::ThresholdUpdated {
                 new_threshold,
