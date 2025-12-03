@@ -38,12 +38,6 @@ pub(crate) enum PositionError {
     State(#[from] StateError<ArithmeticError>),
 }
 
-impl Default for State<Position, ArithmeticError> {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Position {
     pub(crate) symbol: Symbol,

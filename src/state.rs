@@ -19,6 +19,12 @@ pub(crate) enum State<T, E> {
     },
 }
 
+impl<T, E> Default for State<T, E> {
+    fn default() -> Self {
+        Self::Uninitialized
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StateError<E> {
     #[error("operation on uninitialized state")]

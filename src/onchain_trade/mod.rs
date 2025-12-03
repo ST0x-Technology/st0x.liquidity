@@ -92,12 +92,6 @@ impl OnChainTrade {
     }
 }
 
-impl Default for State<OnChainTrade, Never> {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
-}
-
 #[async_trait]
 impl Aggregate for State<OnChainTrade, Never> {
     type Command = OnChainTradeCommand;
@@ -476,8 +470,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_witness_when_enriched() {
-        let mut aggregate = OnChainTrade::default();
+    async fn cannot_witness_when_enriched() {
+        let mut aggregate = State::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
