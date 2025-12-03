@@ -221,17 +221,18 @@ Update `src/position/mod.rs` to wrap the position data in `State`.
 
 ## Task 4. Update `PositionView` to use `State`
 
-Update `src/position/view.rs` to use `State<PositionViewData, ArithmeticError>`
-instead of the manual `Unavailable`/`Position`/`Corrupted` enum.
+Update `src/position/view.rs` to use `State<Position, ArithmeticError>` directly
+instead of the manual `Unavailable`/`Position`/`Corrupted` enum. The `Position`
+struct already contains all fields needed by the view.
 
-- [ ] Create `PositionViewData` struct with the view fields (symbol, net,
-      accumulated_long, accumulated_short, pending_execution_id, last_updated)
-- [ ] Change `PositionView` to be a type alias for
-      `State<PositionViewData, ArithmeticError>`
-- [ ] Refactor `View::update` to use `initialize` for `Initialized`/`Migrated`
-      events and `transition` for update events
-- [ ] Replace silent `return` on pattern mismatches with proper corruption
-- [ ] Update tests
+- [x] Implement `View<State<Position, ArithmeticError>>` for
+      `State<Position, ArithmeticError>` directly (no type alias needed)
+- [x] Reuse `Position::apply_transition` and `Position::from_event` in the
+      `View::update` implementation
+- [x] Replace silent `return` on pattern mismatches with proper corruption via
+      the `State` wrapper
+- [x] Update tests to use `State::Active(Position { ... })` instead of the old
+      `PositionView::Position { ... }` variant
 
 ---
 
