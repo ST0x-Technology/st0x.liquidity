@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use crate::state::{Never, State};
+use crate::lifecycle::{Lifecycle, Never};
 
 use super::{OnChainTrade, OnChainTradeEvent, PythPrice, TradeAggregateId};
 use st0x_broker::{Direction, Symbol};
@@ -88,8 +88,8 @@ impl OnChainTradeView {
     }
 }
 
-impl View<State<OnChainTrade, Never>> for OnChainTradeView {
-    fn update(&mut self, event: &EventEnvelope<State<OnChainTrade, Never>>) {
+impl View<Lifecycle<OnChainTrade, Never>> for OnChainTradeView {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<OnChainTrade, Never>>) {
         let Ok(aggregate_id) = event.aggregate_id.parse::<TradeAggregateId>() else {
             error!(
                 aggregate_id = %event.aggregate_id,

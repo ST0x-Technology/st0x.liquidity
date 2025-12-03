@@ -4,7 +4,7 @@ use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, Symbol};
 
-use crate::state::{State, StateError};
+use crate::lifecycle::{Lifecycle, LifecycleError};
 
 mod cmd;
 mod event;
@@ -35,7 +35,7 @@ pub(crate) enum PositionError {
         actual: ExecutionId,
     },
     #[error(transparent)]
-    State(#[from] StateError<ArithmeticError>),
+    State(#[from] LifecycleError<ArithmeticError>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,7 +50,7 @@ pub(crate) struct Position {
 }
 
 #[async_trait]
-impl Aggregate for State<Position, ArithmeticError> {
+impl Aggregate for Lifecycle<Position, ArithmeticError> {
     type Command = PositionCommand;
     type Event = PositionEvent;
     type Error = PositionError;
@@ -65,7 +65,7 @@ impl Aggregate for State<Position, ArithmeticError> {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (&command, self.active()) {
+        match (&command, self.live()) {
             (PositionCommand::Initialize { symbol, threshold }, _) => {
                 Ok(vec![PositionEvent::Initialized {
                     symbol: symbol.clone(),
@@ -187,7 +187,7 @@ impl Position {
     fn apply_transition(
         event: &PositionEvent,
         position: &Self,
-    ) -> Result<Self, StateError<ArithmeticError>> {
+    ) -> Result<Self, LifecycleError<ArithmeticError>> {
         match event {
             PositionEvent::OnChainOrderFilled {
                 amount,
@@ -196,16 +196,16 @@ impl Position {
                 ..
             } => match direction {
                 Direction::Buy => Ok(Self {
-                    net: (position.net + *amount).map_err(StateError::from)?,
+                    net: (position.net + *amount).map_err(LifecycleError::from)?,
                     accumulated_long: (position.accumulated_long + *amount)
-                        .map_err(StateError::from)?,
+                        .map_err(LifecycleError::from)?,
                     last_updated: Some(*seen_at),
                     ..position.clone()
                 }),
                 Direction::Sell => Ok(Self {
-                    net: (position.net - *amount).map_err(StateError::from)?,
+                    net: (position.net - *amount).map_err(LifecycleError::from)?,
                     accumulated_short: (position.accumulated_short + *amount)
-                        .map_err(StateError::from)?,
+                        .map_err(LifecycleError::from)?,
                     last_updated: Some(*seen_at),
                     ..position.clone()
                 }),
@@ -228,13 +228,13 @@ impl Position {
                 ..
             } => match direction {
                 Direction::Sell => Ok(Self {
-                    net: (position.net - *shares_filled).map_err(StateError::from)?,
+                    net: (position.net - *shares_filled).map_err(LifecycleError::from)?,
                     pending_execution_id: None,
                     last_updated: Some(*broker_timestamp),
                     ..position.clone()
                 }),
                 Direction::Buy => Ok(Self {
-                    net: (position.net + *shares_filled).map_err(StateError::from)?,
+                    net: (position.net + *shares_filled).map_err(LifecycleError::from)?,
                     pending_execution_id: None,
                     last_updated: Some(*broker_timestamp),
                     ..position.clone()
@@ -258,7 +258,7 @@ impl Position {
             }),
 
             PositionEvent::Initialized { .. } | PositionEvent::Migrated { .. } => {
-                Err(StateError::Mismatch {
+                Err(LifecycleError::Mismatch {
                     state: format!("{position:?}"),
                     event: event.event_type(),
                 })
@@ -266,7 +266,7 @@ impl Position {
         }
     }
 
-    fn from_event(event: &PositionEvent) -> Result<Self, StateError<ArithmeticError>> {
+    fn from_event(event: &PositionEvent) -> Result<Self, LifecycleError<ArithmeticError>> {
         match event {
             PositionEvent::Initialized {
                 symbol,
@@ -299,7 +299,7 @@ impl Position {
                 last_updated: Some(*migrated_at),
             }),
 
-            _ => Err(StateError::Mismatch {
+            _ => Err(LifecycleError::Mismatch {
                 state: "Uninitialized".into(),
                 event: event.event_type(),
             }),
@@ -354,7 +354,7 @@ mod tests {
     fn initialize_sets_threshold() {
         let threshold = one_share_threshold();
 
-        let result = TestFramework::<State<Position, ArithmeticError>>::with(())
+        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given_no_previous_events()
             .when(PositionCommand::Initialize {
                 symbol: Symbol::new("AAPL").unwrap(),
@@ -376,7 +376,7 @@ mod tests {
         let price_usdc = dec!(150.0);
         let block_timestamp = Utc::now();
 
-        let result = TestFramework::<State<Position, ArithmeticError>>::with(())
+        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
@@ -409,7 +409,7 @@ mod tests {
         let execution_id = ExecutionId(1);
         let shares = FractionalShares::ONE;
 
-        let result = TestFramework::<State<Position, ArithmeticError>>::with(())
+        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -453,7 +453,7 @@ mod tests {
         };
         let execution_id = ExecutionId(1);
 
-        TestFramework::<State<Position, ArithmeticError>>::with(())
+        TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -490,7 +490,7 @@ mod tests {
         };
         let execution_id = ExecutionId(1);
 
-        TestFramework::<State<Position, ArithmeticError>>::with(())
+        TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -537,7 +537,7 @@ mod tests {
         let broker_order_id = BrokerOrderId("ORDER123".to_string());
         let price_cents = PriceCents(15050);
 
-        let result = TestFramework::<State<Position, ArithmeticError>>::with(())
+        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -586,7 +586,7 @@ mod tests {
         };
         let execution_id = ExecutionId(1);
 
-        let result = TestFramework::<State<Position, ArithmeticError>>::with(())
+        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -667,12 +667,12 @@ mod tests {
             },
         ];
 
-        let mut aggregate = State::<Position, ArithmeticError>::default();
+        let mut aggregate = Lifecycle::<Position, ArithmeticError>::default();
         for event in events {
             aggregate.apply(event);
         }
 
-        let State::Active(position) = aggregate else {
+        let Lifecycle::Live(position) = aggregate else {
             panic!("Expected Active state");
         };
 
@@ -729,12 +729,12 @@ mod tests {
             },
         ];
 
-        let mut aggregate = State::<Position, ArithmeticError>::default();
+        let mut aggregate = Lifecycle::<Position, ArithmeticError>::default();
         for event in events {
             aggregate.apply(event);
         }
 
-        let State::Active(position) = aggregate else {
+        let Lifecycle::Live(position) = aggregate else {
             panic!("Expected Active state");
         };
 
@@ -751,7 +751,7 @@ mod tests {
         let old_threshold = one_share_threshold();
         let new_threshold = ExecutionThreshold::shares(FractionalShares(dec!(5.0))).unwrap();
 
-        let result = TestFramework::<State<Position, ArithmeticError>>::with(())
+        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
             .given(vec![PositionEvent::Initialized {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold: old_threshold,

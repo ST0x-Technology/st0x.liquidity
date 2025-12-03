@@ -1,11 +1,11 @@
 use cqrs_es::{EventEnvelope, View};
 
-use crate::state::State;
+use crate::lifecycle::Lifecycle;
 
 use super::Position;
 use super::event::ArithmeticError;
 
-impl View<Self> for State<Position, ArithmeticError> {
+impl View<Self> for Lifecycle<Position, ArithmeticError> {
     fn update(&mut self, event: &EventEnvelope<Self>) {
         *self = self
             .clone()
@@ -35,7 +35,7 @@ mod tests {
         aggregate_id: &str,
         sequence: usize,
         event: PositionEvent,
-    ) -> EventEnvelope<State<Position, ArithmeticError>> {
+    ) -> EventEnvelope<Lifecycle<Position, ArithmeticError>> {
         EventEnvelope {
             aggregate_id: aggregate_id.to_string(),
             sequence,
@@ -55,12 +55,12 @@ mod tests {
             initialized_at,
         };
 
-        let mut view = State::<Position, ArithmeticError>::default();
-        assert!(matches!(view, State::Uninitialized));
+        let mut view = Lifecycle::<Position, ArithmeticError>::default();
+        assert!(matches!(view, Lifecycle::Uninitialized));
 
         view.update(&make_envelope(&symbol.to_string(), 1, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -78,7 +78,7 @@ mod tests {
         let initialized_at = Utc::now();
         let seen_at = Utc::now();
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares::ZERO,
             accumulated_long: FractionalShares::ZERO,
@@ -105,7 +105,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 2, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -121,7 +121,7 @@ mod tests {
         let initialized_at = Utc::now();
         let seen_at = Utc::now();
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares(dec!(20.0)),
             accumulated_long: FractionalShares(dec!(20.0)),
@@ -148,7 +148,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 3, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -165,7 +165,7 @@ mod tests {
         let placed_at = Utc::now();
         let execution_id = ExecutionId(42);
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares(dec!(100.0)),
             accumulated_long: FractionalShares(dec!(100.0)),
@@ -189,7 +189,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 4, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -204,7 +204,7 @@ mod tests {
         let broker_timestamp = Utc::now();
         let execution_id = ExecutionId(42);
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares(dec!(100.0)),
             accumulated_long: FractionalShares(dec!(100.0)),
@@ -225,7 +225,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 5, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -241,7 +241,7 @@ mod tests {
         let broker_timestamp = Utc::now();
         let execution_id = ExecutionId(43);
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares(dec!(50.0)),
             accumulated_long: FractionalShares(dec!(50.0)),
@@ -262,7 +262,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 6, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -278,7 +278,7 @@ mod tests {
         let failed_at = Utc::now();
         let execution_id = ExecutionId(42);
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares(dec!(100.0)),
             accumulated_long: FractionalShares(dec!(100.0)),
@@ -296,7 +296,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 7, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -311,7 +311,7 @@ mod tests {
         let initialized_at = Utc::now();
         let updated_at = Utc::now();
 
-        let mut view = State::Active(Position {
+        let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares(dec!(100.0)),
             accumulated_long: FractionalShares(dec!(100.0)),
@@ -329,7 +329,7 @@ mod tests {
 
         view.update(&make_envelope(&symbol.to_string(), 8, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -350,12 +350,12 @@ mod tests {
             migrated_at,
         };
 
-        let mut view = State::<Position, ArithmeticError>::default();
-        assert!(matches!(view, State::Uninitialized));
+        let mut view = Lifecycle::<Position, ArithmeticError>::default();
+        assert!(matches!(view, Lifecycle::Uninitialized));
 
         view.update(&make_envelope(&symbol.to_string(), 1, event));
 
-        let State::Active(position) = view else {
+        let Lifecycle::Live(position) = view else {
             panic!("Expected Active state");
         };
 
@@ -369,7 +369,7 @@ mod tests {
 
     #[test]
     fn transition_on_uninitialized_corrupts_state() {
-        let mut view = State::<Position, ArithmeticError>::default();
+        let mut view = Lifecycle::<Position, ArithmeticError>::default();
 
         let event = PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {
@@ -388,6 +388,6 @@ mod tests {
 
         view.update(&make_envelope("AAPL", 1, event));
 
-        assert!(matches!(view, State::Corrupted { .. }));
+        assert!(matches!(view, Lifecycle::Failed { .. }));
     }
 }

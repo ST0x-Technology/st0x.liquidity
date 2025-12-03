@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
 
-use crate::state::{Never, State, StateError};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
 mod cmd;
 mod event;
@@ -76,7 +76,7 @@ pub(crate) enum OnChainTradeError {
     #[error("Trade has already been filled")]
     AlreadyFilled,
     #[error(transparent)]
-    State(#[from] StateError<Never>),
+    State(#[from] LifecycleError<Never>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,7 +93,7 @@ impl OnChainTrade {
 }
 
 #[async_trait]
-impl Aggregate for State<OnChainTrade, Never> {
+impl Aggregate for Lifecycle<OnChainTrade, Never> {
     type Command = OnChainTradeCommand;
     type Event = OnChainTradeEvent;
     type Error = OnChainTradeError;
@@ -108,7 +108,7 @@ impl Aggregate for State<OnChainTrade, Never> {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (&command, self.active()) {
+        match (&command, self.live()) {
             (
                 OnChainTradeCommand::Witness {
                     symbol,
@@ -118,7 +118,7 @@ impl Aggregate for State<OnChainTrade, Never> {
                     block_number,
                     block_timestamp,
                 },
-                Err(StateError::Uninitialized),
+                Err(LifecycleError::Uninitialized),
             ) => Ok(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
                 amount: *amount,
@@ -149,7 +149,7 @@ impl Aggregate for State<OnChainTrade, Never> {
                 }])
             }
 
-            (OnChainTradeCommand::Enrich { .. }, Err(StateError::Uninitialized)) => {
+            (OnChainTradeCommand::Enrich { .. }, Err(LifecycleError::Uninitialized)) => {
                 Err(OnChainTradeError::NotFilled)
             }
 
@@ -169,7 +169,7 @@ impl OnChainTrade {
     fn apply_transition(
         event: &OnChainTradeEvent,
         trade: &Self,
-    ) -> Result<Self, StateError<Never>> {
+    ) -> Result<Self, LifecycleError<Never>> {
         match event {
             OnChainTradeEvent::Enriched {
                 gas_used,
@@ -185,7 +185,7 @@ impl OnChainTrade {
             }),
 
             OnChainTradeEvent::Filled { .. } | OnChainTradeEvent::Migrated { .. } => {
-                Err(StateError::Mismatch {
+                Err(LifecycleError::Mismatch {
                     state: format!("{trade:?}"),
                     event: event.event_type(),
                 })
@@ -193,7 +193,7 @@ impl OnChainTrade {
         }
     }
 
-    fn from_event(event: &OnChainTradeEvent) -> Result<Self, StateError<Never>> {
+    fn from_event(event: &OnChainTradeEvent) -> Result<Self, LifecycleError<Never>> {
         match event {
             OnChainTradeEvent::Filled {
                 symbol,
@@ -245,7 +245,7 @@ impl OnChainTrade {
                 })
             }
 
-            OnChainTradeEvent::Enriched { .. } => Err(StateError::Mismatch {
+            OnChainTradeEvent::Enriched { .. } => Err(LifecycleError::Mismatch {
                 state: "Uninitialized".into(),
                 event: event.event_type(),
             }),
@@ -262,7 +262,7 @@ mod tests {
 
     #[tokio::test]
     async fn witness_command_creates_filled_event() {
-        let aggregate = State::<OnChainTrade, Never>::default();
+        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -283,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_command_creates_enriched_event() {
-        let mut aggregate = State::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -318,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_enrich_twice() {
-        let mut aggregate = State::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -359,7 +359,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_enrich_before_fill() {
-        let aggregate = State::<OnChainTrade, Never>::default();
+        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let now = Utc::now();
 
         let pyth_price = PythPrice {
@@ -381,7 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_event_with_enrichment() {
-        let mut aggregate = State::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -406,7 +406,7 @@ mod tests {
 
         aggregate.apply(migrated_event);
 
-        let State::Active(trade) = aggregate else {
+        let Lifecycle::Live(trade) = aggregate else {
             panic!("Expected Active state");
         };
         assert!(trade.is_enriched());
@@ -414,7 +414,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_event_without_enrichment() {
-        let mut aggregate = State::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -432,7 +432,7 @@ mod tests {
 
         aggregate.apply(migrated_event);
 
-        let State::Active(trade) = aggregate else {
+        let Lifecycle::Live(trade) = aggregate else {
             panic!("Expected Active state");
         };
         assert!(!trade.is_enriched());
@@ -440,7 +440,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_witness_twice_when_filled() {
-        let mut aggregate = State::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -471,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_witness_when_enriched() {
-        let mut aggregate = State::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 

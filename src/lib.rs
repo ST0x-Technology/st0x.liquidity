@@ -14,12 +14,12 @@ mod onchain;
 #[allow(dead_code)]
 mod onchain_trade;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
+mod lifecycle;
 #[allow(dead_code)]
 mod position;
 mod queue;
 pub mod reporter;
 mod shares;
-mod state;
 mod symbol;
 mod telemetry;
 mod trade_execution_link;
