@@ -1,4 +1,3 @@
-use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use tracing::error;
@@ -18,7 +17,7 @@ pub(crate) enum StateError<E> {
     #[error("operation on uninitialized state")]
     Uninitialized,
     #[error("event '{event}' not applicable to state '{state}'")]
-    NotApplicable { state: String, event: String },
+    Mismatch { state: String, event: String },
     #[error(transparent)]
     Custom(#[from] E),
 }
@@ -35,75 +34,79 @@ impl<T, E: Display> State<T, E> {
         }
     }
 
-    pub(crate) fn initialize<Ev, F>(&mut self, event: Ev, f: F)
+    /// Apply a transition to an active state.
+    ///
+    /// - If Active: applies the transition
+    /// - If Uninitialized: returns Corrupted with last_valid_state = None
+    /// - If Corrupted: returns self unchanged
+    pub(crate) fn transition<Ev, F>(self, event: &Ev, f: F) -> Self
     where
-        Ev: DomainEvent,
-        F: FnOnce(Ev) -> Result<T, StateError<E>>,
+        F: FnOnce(&Ev, &T) -> Result<T, StateError<E>>,
     {
-        let old = std::mem::replace(self, Self::Uninitialized);
-
-        match old {
-            Self::Uninitialized => match f(event) {
-                Ok(state) => *self = Self::Active(state),
+        match self {
+            Self::Active(current) => match f(event, &current) {
+                Ok(new_state) => Self::Active(new_state),
                 Err(err) => {
-                    error!("State corrupted during initialization: {err}");
-                    *self = Self::Corrupted {
+                    error!("State corrupted during transition: {err}");
+                    Self::Corrupted {
                         error: err,
-                        last_valid_state: None,
-                    };
+                        last_valid_state: Some(Box::new(current)),
+                    }
                 }
             },
-            Self::Active(prev) => {
-                let state_name = std::any::type_name::<T>();
-                let event_name = event.event_type();
-                error!(
-                    "State corrupted: event '{event_name}' not applicable to state '{state_name}'"
-                );
-                *self = Self::Corrupted {
-                    error: StateError::NotApplicable {
-                        state: state_name.into(),
-                        event: event_name,
-                    },
-                    last_valid_state: Some(Box::new(prev)),
-                };
-            }
-            corrupted @ Self::Corrupted { .. } => {
-                error!("initialize called on corrupted state, preserving original error");
-                *self = corrupted;
-            }
+            Self::Uninitialized => Self::Corrupted {
+                error: StateError::Uninitialized,
+                last_valid_state: None,
+            },
+            corrupted @ Self::Corrupted { .. } => corrupted,
         }
     }
 
-    pub(crate) fn transition<Ev, F>(&mut self, event: Ev, f: F)
+    /// Initialize from an uninitialized state.
+    pub(crate) fn initialize<Ev, F>(self, event: &Ev, f: F) -> Self
     where
-        Ev: DomainEvent,
-        F: FnOnce(Ev, &T) -> Result<T, StateError<E>>,
+        F: FnOnce(&Ev) -> Result<T, StateError<E>>,
     {
-        let old = std::mem::replace(self, Self::Uninitialized);
-
-        match old {
-            Self::Active(current) => match f(event, &current) {
-                Ok(new_state) => *self = Self::Active(new_state),
+        match self {
+            Self::Uninitialized
+            | Self::Corrupted {
+                last_valid_state: None,
+                ..
+            } => match f(event) {
+                Ok(new_state) => Self::Active(new_state),
                 Err(err) => {
-                    error!("State corrupted: {err}");
-                    *self = Self::Corrupted {
+                    error!("State corrupted during initialization: {err}");
+                    Self::Corrupted {
                         error: err,
-                        last_valid_state: Some(Box::new(current)),
-                    };
+                        last_valid_state: None,
+                    }
                 }
             },
-            Self::Uninitialized => {
-                let event_name = event.event_type();
-                error!("State corrupted: event '{event_name}' applied to uninitialized state");
-                *self = Self::Corrupted {
-                    error: StateError::Uninitialized,
-                    last_valid_state: None,
-                };
+            already_initialized => already_initialized,
+        }
+    }
+
+    /// Try to initialize if transition failed on uninitialized state.
+    ///
+    /// - If Active: returns self (transition succeeded)
+    /// - If Corrupted with last_valid_state = Some: returns self (real error)
+    /// - If Corrupted with last_valid_state = None: was uninitialized, try to init
+    /// - If Uninitialized: try to init
+    pub(crate) fn or_initialize<Ev, F>(self, event: &Ev, f: F) -> Self
+    where
+        F: FnOnce(&Ev) -> Result<T, StateError<E>>,
+    {
+        match &self {
+            Self::Active(_)
+            | Self::Corrupted {
+                last_valid_state: Some(_),
+                ..
+            } => self,
+            Self::Corrupted {
+                last_valid_state: None,
+                ..
             }
-            corrupted @ Self::Corrupted { .. } => {
-                error!("transition called on corrupted state, preserving original error");
-                *self = corrupted;
-            }
+            | Self::Uninitialized => self.initialize(event, f),
         }
     }
 }
@@ -124,112 +127,22 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     enum TestEvent {
         Initialize { value: i32 },
+        Migrate { value: i32 },
         Increment { amount: i32 },
     }
 
-    impl DomainEvent for TestEvent {
-        fn event_type(&self) -> String {
-            match self {
-                Self::Initialize { .. } => "TestEvent::Initialize".into(),
-                Self::Increment { .. } => "TestEvent::Increment".into(),
-            }
-        }
-
-        fn event_version(&self) -> String {
-            "1.0".into()
-        }
-    }
-
     #[test]
-    fn initialize_transitions_uninitialized_to_active() {
-        let mut state: State<TestState, TestError> = State::Uninitialized;
+    fn transition_on_active_succeeds() {
+        let state: State<TestState, TestError> = State::Active(TestState { value: 42 });
 
-        state.initialize(TestEvent::Initialize { value: 42 }, |event| {
-            let TestEvent::Initialize { value } = event else {
-                return Err(StateError::Custom(TestError("wrong event".into())));
-            };
-            Ok(TestState { value })
-        });
-
-        let State::Active(inner) = state else {
-            panic!("Expected Active state");
-        };
-        assert_eq!(inner.value, 42);
-    }
-
-    #[test]
-    fn initialize_transitions_to_corrupted_on_error() {
-        let mut state: State<TestState, TestError> = State::Uninitialized;
-
-        state.initialize(TestEvent::Initialize { value: 42 }, |_| {
-            Err(StateError::Custom(TestError("init failed".into())))
-        });
-
-        let State::Corrupted {
-            error,
-            last_valid_state,
-        } = state
-        else {
-            panic!("Expected Corrupted state");
-        };
-
-        assert!(matches!(error, StateError::Custom(TestError(msg)) if msg == "init failed"));
-        assert!(last_valid_state.is_none());
-    }
-
-    #[test]
-    fn initialize_on_active_corrupts_with_event_info() {
-        let mut state: State<TestState, TestError> = State::Active(TestState { value: 42 });
-
-        state.initialize(TestEvent::Initialize { value: 100 }, |_| {
-            Ok(TestState { value: 100 })
-        });
-
-        let State::Corrupted {
-            error,
-            last_valid_state,
-        } = state
-        else {
-            panic!("Expected Corrupted state");
-        };
-
-        let StateError::NotApplicable { state, event } = error else {
-            panic!("Expected NotApplicable");
-        };
-        assert!(state.contains("TestState"));
-        assert_eq!(event, "TestEvent::Initialize");
-        assert_eq!(last_valid_state.unwrap().value, 42);
-    }
-
-    #[test]
-    fn initialize_on_corrupted_preserves_original_error() {
-        let mut state: State<TestState, TestError> = State::Corrupted {
-            error: StateError::Custom(TestError("original".into())),
-            last_valid_state: None,
-        };
-
-        state.initialize(TestEvent::Initialize { value: 100 }, |_| {
-            Ok(TestState { value: 100 })
-        });
-
-        let State::Corrupted { error, .. } = state else {
-            panic!("Expected Corrupted state");
-        };
-
-        assert!(matches!(error, StateError::Custom(TestError(msg)) if msg == "original"));
-    }
-
-    #[test]
-    fn transition_transforms_active_state() {
-        let mut state: State<TestState, TestError> = State::Active(TestState { value: 42 });
-
-        state.transition(TestEvent::Increment { amount: 10 }, |event, current| {
-            let TestEvent::Increment { amount } = event else {
-                return Err(StateError::Custom(TestError("wrong event".into())));
-            };
-            Ok(TestState {
-                value: current.value + amount,
-            })
+        let state = state.transition(&TestEvent::Increment { amount: 10 }, |ev, cur| match ev {
+            TestEvent::Increment { amount } => Ok(TestState {
+                value: cur.value + amount,
+            }),
+            _ => Err(StateError::Mismatch {
+                state: format!("{cur:?}"),
+                event: format!("{ev:?}"),
+            }),
         });
 
         let State::Active(inner) = state else {
@@ -239,30 +152,10 @@ mod tests {
     }
 
     #[test]
-    fn transition_to_corrupted_on_error() {
-        let mut state: State<TestState, TestError> = State::Active(TestState { value: 42 });
+    fn transition_on_uninitialized_corrupts_with_none() {
+        let state: State<TestState, TestError> = State::Uninitialized;
 
-        state.transition(TestEvent::Increment { amount: 10 }, |_, _| {
-            Err(StateError::Custom(TestError("transition failed".into())))
-        });
-
-        let State::Corrupted {
-            error,
-            last_valid_state,
-        } = state
-        else {
-            panic!("Expected Corrupted state");
-        };
-
-        assert!(matches!(error, StateError::Custom(TestError(msg)) if msg == "transition failed"));
-        assert_eq!(last_valid_state.unwrap().value, 42);
-    }
-
-    #[test]
-    fn transition_on_uninitialized_corrupts() {
-        let mut state: State<TestState, TestError> = State::Uninitialized;
-
-        state.transition(TestEvent::Increment { amount: 10 }, |_, _| {
+        let state = state.transition(&TestEvent::Increment { amount: 10 }, |_, _| {
             Ok(TestState { value: 100 })
         });
 
@@ -273,21 +166,64 @@ mod tests {
         else {
             panic!("Expected Corrupted state");
         };
-
         assert!(matches!(error, StateError::Uninitialized));
         assert!(last_valid_state.is_none());
     }
 
     #[test]
-    fn transition_on_corrupted_preserves_original_error() {
-        let mut state: State<TestState, TestError> = State::Corrupted {
-            error: StateError::Custom(TestError("original".into())),
-            last_valid_state: Some(Box::new(TestState { value: 42 })),
-        };
+    fn or_initialize_after_transition_on_uninitialized() {
+        let state: State<TestState, TestError> = State::Uninitialized;
+        let event = TestEvent::Initialize { value: 42 };
 
-        state.transition(TestEvent::Increment { amount: 10 }, |_, _| {
-            Ok(TestState { value: 100 })
-        });
+        let state = state
+            .transition(&event, |_, _| Ok(TestState { value: 999 }))
+            .or_initialize(&event, |ev| match ev {
+                TestEvent::Initialize { value } => Ok(TestState { value: *value }),
+                _ => Err(StateError::Mismatch {
+                    state: "Uninitialized".into(),
+                    event: format!("{ev:?}"),
+                }),
+            });
+
+        let State::Active(inner) = state else {
+            panic!("Expected Active state");
+        };
+        assert_eq!(inner.value, 42);
+    }
+
+    #[test]
+    fn or_initialize_skipped_after_successful_transition() {
+        let state: State<TestState, TestError> = State::Active(TestState { value: 10 });
+        let event = TestEvent::Increment { amount: 5 };
+
+        let state = state
+            .transition(&event, |ev, cur| match ev {
+                TestEvent::Increment { amount } => Ok(TestState {
+                    value: cur.value + amount,
+                }),
+                _ => Err(StateError::Mismatch {
+                    state: format!("{cur:?}"),
+                    event: format!("{ev:?}"),
+                }),
+            })
+            .or_initialize(&event, |_| Ok(TestState { value: 999 }));
+
+        let State::Active(inner) = state else {
+            panic!("Expected Active state");
+        };
+        assert_eq!(inner.value, 15);
+    }
+
+    #[test]
+    fn or_initialize_skipped_after_real_transition_error() {
+        let state: State<TestState, TestError> = State::Active(TestState { value: 42 });
+        let event = TestEvent::Increment { amount: 10 };
+
+        let state = state
+            .transition(&event, |_, _| {
+                Err(StateError::Custom(TestError("real error".into())))
+            })
+            .or_initialize(&event, |_| Ok(TestState { value: 999 }));
 
         let State::Corrupted {
             error,
@@ -296,39 +232,59 @@ mod tests {
         else {
             panic!("Expected Corrupted state");
         };
+        assert!(matches!(error, StateError::Custom(TestError(msg)) if msg == "real error"));
+        assert!(last_valid_state.is_some());
+    }
 
-        assert!(matches!(error, StateError::Custom(TestError(msg)) if msg == "original"));
-        assert_eq!(last_valid_state.unwrap().value, 42);
+    #[test]
+    fn or_initialize_with_non_init_event_corrupts() {
+        let state: State<TestState, TestError> = State::Uninitialized;
+        let event = TestEvent::Increment { amount: 10 };
+
+        let state = state
+            .transition(&event, |_, _| Ok(TestState { value: 999 }))
+            .or_initialize(&event, |ev| match ev {
+                TestEvent::Initialize { value } => Ok(TestState { value: *value }),
+                _ => Err(StateError::Mismatch {
+                    state: "Uninitialized".into(),
+                    event: format!("{ev:?}"),
+                }),
+            });
+
+        let State::Corrupted {
+            error,
+            last_valid_state,
+        } = state
+        else {
+            panic!("Expected Corrupted state");
+        };
+        assert!(matches!(error, StateError::Mismatch { .. }));
+        assert!(last_valid_state.is_none());
     }
 
     #[test]
     fn multiple_transitions_accumulate() {
         let mut state: State<TestState, TestError> = State::Active(TestState { value: 0 });
 
-        state.transition(TestEvent::Increment { amount: 1 }, |event, current| {
-            let TestEvent::Increment { amount } = event else {
-                return Err(StateError::Custom(TestError("wrong".into())));
-            };
-            Ok(TestState {
-                value: current.value + amount,
-            })
-        });
-        state.transition(TestEvent::Increment { amount: 2 }, |event, current| {
-            let TestEvent::Increment { amount } = event else {
-                return Err(StateError::Custom(TestError("wrong".into())));
-            };
-            Ok(TestState {
-                value: current.value + amount,
-            })
-        });
-        state.transition(TestEvent::Increment { amount: 3 }, |event, current| {
-            let TestEvent::Increment { amount } = event else {
-                return Err(StateError::Custom(TestError("wrong".into())));
-            };
-            Ok(TestState {
-                value: current.value + amount,
-            })
-        });
+        for i in 1..=3 {
+            let event = TestEvent::Increment { amount: i };
+            state = state
+                .transition(&event, |ev, cur| match ev {
+                    TestEvent::Increment { amount } => Ok(TestState {
+                        value: cur.value + amount,
+                    }),
+                    _ => Err(StateError::Mismatch {
+                        state: format!("{cur:?}"),
+                        event: format!("{ev:?}"),
+                    }),
+                })
+                .or_initialize(&event, |ev| {
+                    Err(StateError::Mismatch {
+                        state: "Uninitialized".into(),
+                        event: format!("{ev:?}"),
+                    })
+                });
+        }
 
         let State::Active(inner) = state else {
             panic!("Expected Active state");
@@ -337,30 +293,53 @@ mod tests {
     }
 
     #[test]
-    fn transition_after_corruption_preserves_first_error() {
-        let mut state: State<TestState, TestError> = State::Active(TestState { value: 42 });
+    fn init_then_transitions() {
+        let mut state: State<TestState, TestError> = State::Uninitialized;
 
-        state.transition(TestEvent::Increment { amount: 10 }, |_, _| {
-            Err(StateError::Custom(TestError("first failure".into())))
-        });
-        state.transition(TestEvent::Increment { amount: 100 }, |event, current| {
-            let TestEvent::Increment { amount } = event else {
-                return Err(StateError::Custom(TestError("wrong".into())));
-            };
-            Ok(TestState {
-                value: current.value + amount,
+        let init_event = TestEvent::Initialize { value: 10 };
+        state = state
+            .transition(&init_event, |ev, cur| {
+                Err(StateError::Mismatch {
+                    state: format!("{cur:?}"),
+                    event: format!("{ev:?}"),
+                })
             })
-        });
+            .or_initialize(&init_event, |ev| match ev {
+                TestEvent::Initialize { value } | TestEvent::Migrate { value } => {
+                    Ok(TestState { value: *value })
+                }
+                TestEvent::Increment { .. } => Err(StateError::Mismatch {
+                    state: "Uninitialized".into(),
+                    event: format!("{ev:?}"),
+                }),
+            });
 
-        let State::Corrupted {
-            error,
-            last_valid_state,
-        } = state
-        else {
-            panic!("Expected Corrupted state");
+        let State::Active(inner) = &state else {
+            panic!("Expected Active state after init");
         };
+        assert_eq!(inner.value, 10);
 
-        assert!(matches!(error, StateError::Custom(TestError(msg)) if msg == "first failure"));
-        assert_eq!(last_valid_state.unwrap().value, 42);
+        let transition_event = TestEvent::Increment { amount: 5 };
+        state = state
+            .transition(&transition_event, |ev, cur| match ev {
+                TestEvent::Increment { amount } => Ok(TestState {
+                    value: cur.value + amount,
+                }),
+                _ => Err(StateError::Mismatch {
+                    state: format!("{cur:?}"),
+                    event: format!("{ev:?}"),
+                }),
+            })
+            .or_initialize(&transition_event, |ev| {
+                Err(StateError::Mismatch {
+                    state: "Uninitialized".into(),
+                    event: format!("{ev:?}"),
+                })
+            });
+
+        let State::Active(inner) = state else {
+            panic!("Expected Active state after transition");
+        };
+        assert_eq!(inner.value, 15);
     }
 }

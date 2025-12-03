@@ -13,12 +13,13 @@ This creates a fundamental tension:
 2. We cannot panic in a financial application (violates AGENTS.md principles)
 3. We need to handle arithmetic overflow gracefully
 
-Additionally, there's duplicated boilerplate across aggregates for handling
-uninitialized state:
+Additionally, there's duplicated boilerplate across aggregates and views for
+handling uninitialized state:
 
 - `OnChainTrade` uses `Unfilled` variant
 - `PositionView` uses `Unavailable` variant
-- Both represent "no events applied yet"
+- `OnChainTradeView` uses `Unavailable` variant
+- All represent "no events applied yet"
 
 ## Proposed Solution
 
@@ -34,6 +35,7 @@ This approach:
 - Eliminates panics by capturing errors as state transitions
 - Reduces boilerplate for the "not yet initialized" pattern
 - Allows monitoring/alerting on corrupted aggregates
+- Works for both aggregates and views (same state machine pattern)
 
 ## Design Decisions
 
@@ -59,6 +61,17 @@ present across multiple aggregates in the codebase. It's not specific to
 positions - it's a feature for internal consumption by the CQRS system. This
 justifies its existence as a standalone module rather than being embedded in a
 specific domain feature.
+
+### Using State for both aggregates and views
+
+Both aggregates and views suffer from the same pattern mismatch problems:
+
+1. Update events on uninitialized state → silent skip with log
+2. Initialization events on already-active state → silent overwrite or skip
+
+The `State<T, E>` wrapper with `initialize` and `transition` methods addresses
+both cases uniformly. Views use the same API as aggregates since the
+`View::update` method has the same infallible signature as `Aggregate::apply`.
 
 ### Checked arithmetic approach
 
@@ -206,23 +219,33 @@ Update `src/position/mod.rs` to wrap the position data in `State`.
 
 ---
 
-## Task 4. Create `Projection<T, E>` helper for views
+## Task 4. Update `PositionView` to use `State`
 
-Create a state wrapper for views similar to `State<T, E>` but tailored for
-view-specific needs (views receive events but don't validate/reject them).
+Update `src/position/view.rs` to use `State<PositionViewData, ArithmeticError>`
+instead of the manual `Unavailable`/`Position`/`Corrupted` enum.
 
-- [ ] Create `Projection<T, E>` enum with `Unavailable`, `Available(T)`,
-      `Corrupted` variants
-- [ ] Add helper methods for transitioning between states
+- [ ] Create `PositionViewData` struct with the view fields (symbol, net,
+      accumulated_long, accumulated_short, pending_execution_id, last_updated)
+- [ ] Change `PositionView` to be a type alias for
+      `State<PositionViewData, ArithmeticError>`
+- [ ] Refactor `View::update` to use `initialize` for `Initialized`/`Migrated`
+      events and `transition` for update events
+- [ ] Replace silent `return` on pattern mismatches with proper corruption
+- [ ] Update tests
 
 ---
 
-## Task 5. Update `PositionView` to use `Projection`
+## Task 5. Update `OnChainTradeView` to use `State`
 
-Update `src/position/view.rs` to use the `Projection` wrapper.
+Update `src/onchain_trade/view.rs` to use `State<OnChainTradeViewData, E>`.
 
-- [ ] Refactor `PositionView` to use `Projection`
-- [ ] Update tests for corrupted state propagation to view
+- [ ] Create `OnChainTradeViewData` struct with the view fields
+- [ ] Change `OnChainTradeView` to be a type alias for
+      `State<OnChainTradeViewData, Infallible>` (no fallible operations)
+- [ ] Refactor `View::update` to use `initialize` for `Filled`/`Migrated` and
+      `transition` for `Enriched`
+- [ ] Replace silent `return` on pattern mismatches with proper corruption
+- [ ] Update tests
 
 ---
 

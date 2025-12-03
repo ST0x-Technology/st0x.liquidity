@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::Aggregate;
+use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
-use st0x_broker::Direction;
+use st0x_broker::{Direction, Symbol};
 
 use crate::state::{State, StateError};
 
@@ -40,31 +40,19 @@ pub(crate) enum PositionError {
 
 impl Default for State<Position, ArithmeticError> {
     fn default() -> Self {
-        Self::Active(Position::default())
+        Self::Uninitialized
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Position {
+    pub(crate) symbol: Symbol,
     pub(crate) net: FractionalShares,
     pub(crate) accumulated_long: FractionalShares,
     pub(crate) accumulated_short: FractionalShares,
     pub(crate) pending_execution_id: Option<ExecutionId>,
     pub(crate) threshold: ExecutionThreshold,
     pub(crate) last_updated: Option<DateTime<Utc>>,
-}
-
-impl Default for Position {
-    fn default() -> Self {
-        Self {
-            net: FractionalShares::ZERO,
-            accumulated_long: FractionalShares::ZERO,
-            accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
-            threshold: ExecutionThreshold::whole_share(),
-            last_updated: None,
-        }
-    }
 }
 
 #[async_trait]
@@ -83,33 +71,44 @@ impl Aggregate for State<Position, ArithmeticError> {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        let position = self.active()?;
+        match (&command, self.active()) {
+            (PositionCommand::Initialize { symbol, threshold }, _) => {
+                Ok(vec![PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold: *threshold,
+                    initialized_at: Utc::now(),
+                }])
+            }
 
-        match command {
-            PositionCommand::Initialize { threshold } => Ok(vec![PositionEvent::Initialized {
-                threshold,
-                initialized_at: Utc::now(),
-            }]),
-            PositionCommand::AcknowledgeOnChainFill {
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
-            } => Ok(vec![PositionEvent::OnChainOrderFilled {
-                trade_id,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
+            (_, Err(e)) => Err(e.into()),
+
+            (
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_timestamp,
+                },
+                Ok(_),
+            ) => Ok(vec![PositionEvent::OnChainOrderFilled {
+                trade_id: trade_id.clone(),
+                amount: *amount,
+                direction: *direction,
+                price_usdc: *price_usdc,
+                block_timestamp: *block_timestamp,
                 seen_at: Utc::now(),
             }]),
-            PositionCommand::PlaceOffChainOrder {
-                execution_id,
-                shares,
-                direction,
-                broker,
-            } => {
+
+            (
+                PositionCommand::PlaceOffChainOrder {
+                    execution_id,
+                    shares,
+                    direction,
+                    broker,
+                },
+                Ok(position),
+            ) => {
                 if let Some(pending) = position.pending_execution_id {
                     return Err(PositionError::PendingExecution {
                         execution_id: pending,
@@ -124,49 +123,58 @@ impl Aggregate for State<Position, ArithmeticError> {
                 )?;
 
                 Ok(vec![PositionEvent::OffChainOrderPlaced {
-                    execution_id,
-                    shares,
-                    direction,
-                    broker,
+                    execution_id: *execution_id,
+                    shares: *shares,
+                    direction: *direction,
+                    broker: *broker,
                     trigger_reason,
                     placed_at: Utc::now(),
                 }])
             }
-            PositionCommand::CompleteOffChainOrder {
-                execution_id,
-                shares_filled,
-                direction,
-                broker_order_id,
-                price_cents,
-                broker_timestamp,
-            } => {
-                position.validate_pending_execution(execution_id)?;
 
-                Ok(vec![PositionEvent::OffChainOrderFilled {
+            (
+                PositionCommand::CompleteOffChainOrder {
                     execution_id,
                     shares_filled,
                     direction,
                     broker_order_id,
                     price_cents,
                     broker_timestamp,
+                },
+                Ok(position),
+            ) => {
+                position.validate_pending_execution(*execution_id)?;
+
+                Ok(vec![PositionEvent::OffChainOrderFilled {
+                    execution_id: *execution_id,
+                    shares_filled: *shares_filled,
+                    direction: *direction,
+                    broker_order_id: broker_order_id.clone(),
+                    price_cents: *price_cents,
+                    broker_timestamp: *broker_timestamp,
                 }])
             }
-            PositionCommand::FailOffChainOrder {
-                execution_id,
-                error,
-            } => {
-                position.validate_pending_execution(execution_id)?;
 
-                Ok(vec![PositionEvent::OffChainOrderFailed {
+            (
+                PositionCommand::FailOffChainOrder {
                     execution_id,
                     error,
+                },
+                Ok(position),
+            ) => {
+                position.validate_pending_execution(*execution_id)?;
+
+                Ok(vec![PositionEvent::OffChainOrderFailed {
+                    execution_id: *execution_id,
+                    error: error.clone(),
                     failed_at: Utc::now(),
                 }])
             }
-            PositionCommand::UpdateThreshold { threshold } => {
+
+            (PositionCommand::UpdateThreshold { threshold }, Ok(position)) => {
                 Ok(vec![PositionEvent::ThresholdUpdated {
                     old_threshold: position.threshold,
-                    new_threshold: threshold,
+                    new_threshold: *threshold,
                     updated_at: Utc::now(),
                 }])
             }
@@ -174,68 +182,49 @@ impl Aggregate for State<Position, ArithmeticError> {
     }
 
     fn apply(&mut self, event: Self::Event) {
-        self.transition(event, |event, pos| match &event {
-            PositionEvent::Migrated {
-                net_position,
-                accumulated_long,
-                accumulated_short,
-                threshold,
-                migrated_at,
-                ..
-            } => Ok(Position {
-                net: *net_position,
-                accumulated_long: *accumulated_long,
-                accumulated_short: *accumulated_short,
-                threshold: *threshold,
-                last_updated: Some(*migrated_at),
-                ..pos.clone()
-            }),
+        *self = self
+            .clone()
+            .transition(&event, Position::apply_transition)
+            .or_initialize(&event, Position::from_event);
+    }
+}
 
-            PositionEvent::Initialized {
-                threshold,
-                initialized_at,
-            } => Ok(Position {
-                threshold: *threshold,
-                last_updated: Some(*initialized_at),
-                ..pos.clone()
-            }),
-
+impl Position {
+    fn apply_transition(
+        event: &PositionEvent,
+        position: &Self,
+    ) -> Result<Self, StateError<ArithmeticError>> {
+        match event {
             PositionEvent::OnChainOrderFilled {
                 amount,
                 direction,
                 seen_at,
                 ..
-            } => {
-                let (net, accumulated_long, accumulated_short) = match direction {
-                    Direction::Buy => (
-                        (pos.net + *amount).map_err(StateError::from)?,
-                        (pos.accumulated_long + *amount).map_err(StateError::from)?,
-                        pos.accumulated_short,
-                    ),
-                    Direction::Sell => (
-                        (pos.net - *amount).map_err(StateError::from)?,
-                        pos.accumulated_long,
-                        (pos.accumulated_short + *amount).map_err(StateError::from)?,
-                    ),
-                };
-
-                Ok(Position {
-                    net,
-                    accumulated_long,
-                    accumulated_short,
+            } => match direction {
+                Direction::Buy => Ok(Self {
+                    net: (position.net + *amount).map_err(StateError::from)?,
+                    accumulated_long: (position.accumulated_long + *amount)
+                        .map_err(StateError::from)?,
                     last_updated: Some(*seen_at),
-                    ..pos.clone()
-                })
-            }
+                    ..position.clone()
+                }),
+                Direction::Sell => Ok(Self {
+                    net: (position.net - *amount).map_err(StateError::from)?,
+                    accumulated_short: (position.accumulated_short + *amount)
+                        .map_err(StateError::from)?,
+                    last_updated: Some(*seen_at),
+                    ..position.clone()
+                }),
+            },
 
             PositionEvent::OffChainOrderPlaced {
                 execution_id,
                 placed_at,
                 ..
-            } => Ok(Position {
+            } => Ok(Self {
                 pending_execution_id: Some(*execution_id),
                 last_updated: Some(*placed_at),
-                ..pos.clone()
+                ..position.clone()
             }),
 
             PositionEvent::OffChainOrderFilled {
@@ -243,40 +232,86 @@ impl Aggregate for State<Position, ArithmeticError> {
                 direction,
                 broker_timestamp,
                 ..
-            } => {
-                let net = match direction {
-                    Direction::Sell => (pos.net - *shares_filled).map_err(StateError::from)?,
-                    Direction::Buy => (pos.net + *shares_filled).map_err(StateError::from)?,
-                };
-
-                Ok(Position {
-                    net,
+            } => match direction {
+                Direction::Sell => Ok(Self {
+                    net: (position.net - *shares_filled).map_err(StateError::from)?,
                     pending_execution_id: None,
                     last_updated: Some(*broker_timestamp),
-                    ..pos.clone()
-                })
-            }
+                    ..position.clone()
+                }),
+                Direction::Buy => Ok(Self {
+                    net: (position.net + *shares_filled).map_err(StateError::from)?,
+                    pending_execution_id: None,
+                    last_updated: Some(*broker_timestamp),
+                    ..position.clone()
+                }),
+            },
 
-            PositionEvent::OffChainOrderFailed { failed_at, .. } => Ok(Position {
+            PositionEvent::OffChainOrderFailed { failed_at, .. } => Ok(Self {
                 pending_execution_id: None,
                 last_updated: Some(*failed_at),
-                ..pos.clone()
+                ..position.clone()
             }),
 
             PositionEvent::ThresholdUpdated {
                 new_threshold,
                 updated_at,
                 ..
-            } => Ok(Position {
+            } => Ok(Self {
                 threshold: *new_threshold,
                 last_updated: Some(*updated_at),
-                ..pos.clone()
+                ..position.clone()
             }),
-        });
-    }
-}
 
-impl Position {
+            PositionEvent::Initialized { .. } | PositionEvent::Migrated { .. } => {
+                Err(StateError::Mismatch {
+                    state: format!("{position:?}"),
+                    event: event.event_type(),
+                })
+            }
+        }
+    }
+
+    fn from_event(event: &PositionEvent) -> Result<Self, StateError<ArithmeticError>> {
+        match event {
+            PositionEvent::Initialized {
+                symbol,
+                threshold,
+                initialized_at,
+            } => Ok(Self {
+                symbol: symbol.clone(),
+                net: FractionalShares::ZERO,
+                accumulated_long: FractionalShares::ZERO,
+                accumulated_short: FractionalShares::ZERO,
+                pending_execution_id: None,
+                threshold: *threshold,
+                last_updated: Some(*initialized_at),
+            }),
+
+            PositionEvent::Migrated {
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                threshold,
+                migrated_at,
+            } => Ok(Self {
+                symbol: symbol.clone(),
+                net: *net_position,
+                accumulated_long: *accumulated_long,
+                accumulated_short: *accumulated_short,
+                pending_execution_id: None,
+                threshold: *threshold,
+                last_updated: Some(*migrated_at),
+            }),
+
+            _ => Err(StateError::Mismatch {
+                state: "Uninitialized".into(),
+                event: event.event_type(),
+            }),
+        }
+    }
+
     fn create_trigger_reason(&self, threshold: &ExecutionThreshold) -> Option<TriggerReason> {
         match threshold {
             ExecutionThreshold::Shares(threshold_shares) => {
@@ -327,7 +362,10 @@ mod tests {
 
         let result = TestFramework::<State<Position, ArithmeticError>>::with(())
             .given_no_previous_events()
-            .when(PositionCommand::Initialize { threshold })
+            .when(PositionCommand::Initialize {
+                symbol: Symbol::new("AAPL").unwrap(),
+                threshold,
+            })
             .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
@@ -346,6 +384,7 @@ mod tests {
 
         let result = TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
                 initialized_at: Utc::now(),
             }])
@@ -379,6 +418,7 @@ mod tests {
         let result = TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
                     threshold,
                     initialized_at: Utc::now(),
                 },
@@ -422,6 +462,7 @@ mod tests {
         TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
                     threshold,
                     initialized_at: Utc::now(),
                 },
@@ -458,6 +499,7 @@ mod tests {
         TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
                     threshold,
                     initialized_at: Utc::now(),
                 },
@@ -504,6 +546,7 @@ mod tests {
         let result = TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
                     threshold,
                     initialized_at: Utc::now(),
                 },
@@ -552,6 +595,7 @@ mod tests {
         let result = TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
                     threshold,
                     initialized_at: Utc::now(),
                 },
@@ -593,6 +637,7 @@ mod tests {
 
         let events = vec![
             PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
                 initialized_at: Utc::now(),
             },
@@ -654,6 +699,7 @@ mod tests {
 
         let events = vec![
             PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
                 initialized_at: Utc::now(),
             },
@@ -713,6 +759,7 @@ mod tests {
 
         let result = TestFramework::<State<Position, ArithmeticError>>::with(())
             .given(vec![PositionEvent::Initialized {
+                symbol: Symbol::new("AAPL").unwrap(),
                 threshold: old_threshold,
                 initialized_at: Utc::now(),
             }])

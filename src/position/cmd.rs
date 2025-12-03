@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, SupportedBroker};
+use st0x_broker::{Direction, SupportedBroker, Symbol};
 
 use super::event::{
     BrokerOrderId, ExecutionId, ExecutionThreshold, FractionalShares, PriceCents, TradeId,
@@ -10,6 +10,7 @@ use super::event::{
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PositionCommand {
     Initialize {
+        symbol: Symbol,
         threshold: ExecutionThreshold,
     },
     AcknowledgeOnChainFill {

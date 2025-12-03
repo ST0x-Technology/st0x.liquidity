@@ -114,6 +114,7 @@ pub(crate) enum PositionEvent {
         migrated_at: DateTime<Utc>,
     },
     Initialized {
+        symbol: Symbol,
         threshold: ExecutionThreshold,
         initialized_at: DateTime<Utc>,
     },
