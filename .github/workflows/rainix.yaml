@@ -1,38 +1,61 @@
 name: Rainix CI
 on: [push]
+
 concurrency:
   group: ${{ github.ref }}-rainix
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+x-free-disk-space-step: &free-disk-space-step
+  name: Free disk space
+  uses: jlumbroso/free-disk-space@v1.3.1
+  with:
+    android: true
+    dotnet: true
+    haskell: true
+    large-packages: false
+    docker-images: false
+    swap-storage: false
+
 jobs:
   docker-build:
     runs-on: ubuntu-latest
     steps:
+      - *free-disk-space-step
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
       - name: Build Docker image
         run: docker build .
 
   rainix:
     env:
       DATABASE_URL: "sqlite:schwab.db"
+
     strategy:
       matrix:
         os: [ubuntu-latest]
         task: [rainix-rs-test, rainix-rs-static]
       fail-fast: false
+
     runs-on: ${{ matrix.os }}
+
     steps:
+      - *free-disk-space-step
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
       - uses: nixbuild/nix-quick-install-action@v30
         with:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
+
       - name: Restore and save Nix store
         uses: nix-community/cache-nix-action@v6
         with:
@@ -42,6 +65,7 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           # collect garbage until the Nix store size (in bytes) is at most this number
           gc-max-store-size-linux: 10G
+
       - run: nix run .#prepSolArtifacts
       - run: nix flake check
 
