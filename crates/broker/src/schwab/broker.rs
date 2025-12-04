@@ -445,8 +445,16 @@ mod tests {
             .unwrap();
 
         // Mock market hours API to return open market
-        // Use today's date with market hours that encompass current time
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // Use realistic market hours that are currently open in Eastern time
+        let now_eastern = chrono::Utc::now().with_timezone(&chrono_tz::America::New_York);
+        let today = now_eastern.format("%Y-%m-%d").to_string();
+        let one_hour_ago = (now_eastern - Duration::hours(1))
+            .format("%H:%M:%S")
+            .to_string();
+        let one_hour_later = (now_eastern + Duration::hours(1))
+            .format("%H:%M:%S")
+            .to_string();
+
         let market_hours_mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/marketdata/v1/markets/equity")
@@ -466,14 +474,14 @@ mod tests {
                             "sessionHours": {
                                 "preMarket": [
                                     {
-                                        "start": format!("{}T04:00:00-05:00", today),
-                                        "end": format!("{}T09:30:00-05:00", today)
+                                        "start": format!("{today}T04:00:00-05:00"),
+                                        "end": format!("{today}T09:30:00-05:00")
                                     }
                                 ],
                                 "regularMarket": [
                                     {
-                                        "start": format!("{}T00:00:00-05:00", today),
-                                        "end": format!("{}T23:59:59-05:00", today)
+                                        "start": format!("{today}T{one_hour_ago}-05:00"),
+                                        "end": format!("{today}T{one_hour_later}-05:00")
                                     }
                                 ]
                             }
