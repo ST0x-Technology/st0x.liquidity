@@ -106,14 +106,16 @@ pub(crate) struct BurnReceipt {
     pub(crate) amount: U256,
 }
 
-/// EVM chain connection with signer and contract instances for CCTP operations.
+/// EVM chain connection with provider, signer, and contract instances.
 pub(crate) struct Evm<P, S>
 where
     P: Provider + Clone,
     S: Signer + Clone + Sync,
 {
+    /// Provider for reading chain state and sending transactions
+    pub(crate) provider: P,
     /// Transaction signer for authorizing transactions
-    signer: S,
+    pub(crate) signer: S,
     /// USDC token contract instance
     usdc: IERC20::IERC20Instance<P>,
     /// TokenMessengerV2 contract instance for CCTP burns
@@ -136,6 +138,7 @@ where
         message_transmitter: Address,
     ) -> Self {
         Self {
+            provider: provider.clone(),
             signer,
             usdc: IERC20::new(usdc, provider.clone()),
             token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
