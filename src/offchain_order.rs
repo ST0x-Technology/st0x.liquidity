@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::position::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::shares::FractionalShares;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) enum OffchainOrder {
-    NotPlaced,
+pub(crate) enum Order {
     Pending {
         symbol: Symbol,
         shares: FractionalShares,
@@ -63,131 +63,179 @@ pub(crate) enum OffchainOrder {
     },
 }
 
-impl Default for OffchainOrder {
-    fn default() -> Self {
-        Self::NotPlaced
-    }
-}
+impl Order {
+    pub(crate) fn apply_transition(
+        event: &OffchainOrderEvent,
+        order: &Self,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match event {
+            OffchainOrderEvent::Submitted {
+                broker_order_id,
+                submitted_at,
+            } => Self::apply_submitted(order, broker_order_id, *submitted_at, event),
 
-impl OffchainOrder {
-    fn apply_submitted(&mut self, broker_order_id: BrokerOrderId, submitted_at: DateTime<Utc>) {
-        if let Self::Pending {
+            OffchainOrderEvent::PartiallyFilled {
+                shares_filled,
+                avg_price_cents,
+                partially_filled_at,
+            } => Self::apply_partially_filled(
+                order,
+                *shares_filled,
+                *avg_price_cents,
+                *partially_filled_at,
+                event,
+            ),
+
+            OffchainOrderEvent::Filled {
+                price_cents,
+                filled_at,
+            } => Self::apply_filled(order, *price_cents, *filled_at, event),
+
+            OffchainOrderEvent::Failed { error, failed_at } => {
+                Self::apply_failed(order, error, *failed_at, event)
+            }
+
+            OffchainOrderEvent::Migrated { .. } | OffchainOrderEvent::Placed { .. } => {
+                Err(LifecycleError::Mismatch {
+                    state: format!("{order:?}"),
+                    event: event.event_type(),
+                })
+            }
+        }
+    }
+
+    fn apply_submitted(
+        order: &Self,
+        broker_order_id: &BrokerOrderId,
+        submitted_at: DateTime<Utc>,
+        event: &OffchainOrderEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Pending {
             symbol,
             shares,
             direction,
             broker,
             placed_at,
-        } = self
-        {
-            *self = Self::Submitted {
+        } = order
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{order:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::Submitted {
+            symbol: symbol.clone(),
+            shares: *shares,
+            direction: *direction,
+            broker: *broker,
+            broker_order_id: broker_order_id.clone(),
+            placed_at: *placed_at,
+            submitted_at,
+        })
+    }
+
+    fn apply_partially_filled(
+        order: &Self,
+        shares_filled: FractionalShares,
+        avg_price_cents: PriceCents,
+        partially_filled_at: DateTime<Utc>,
+        event: &OffchainOrderEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match order {
+            Self::Submitted {
+                symbol,
+                shares,
+                direction,
+                broker,
+                broker_order_id,
+                placed_at,
+                submitted_at,
+            }
+            | Self::PartiallyFilled {
+                symbol,
+                shares,
+                direction,
+                broker,
+                broker_order_id,
+                placed_at,
+                submitted_at,
+                ..
+            } => Ok(Self::PartiallyFilled {
+                symbol: symbol.clone(),
+                shares: *shares,
+                shares_filled,
+                direction: *direction,
+                broker: *broker,
+                broker_order_id: broker_order_id.clone(),
+                avg_price_cents,
+                placed_at: *placed_at,
+                submitted_at: *submitted_at,
+                partially_filled_at,
+            }),
+
+            Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
+                Err(LifecycleError::Mismatch {
+                    state: format!("{order:?}"),
+                    event: event.event_type(),
+                })
+            }
+        }
+    }
+
+    fn apply_filled(
+        order: &Self,
+        price_cents: PriceCents,
+        filled_at: DateTime<Utc>,
+        event: &OffchainOrderEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match order {
+            Self::Submitted {
+                symbol,
+                shares,
+                direction,
+                broker,
+                broker_order_id,
+                placed_at,
+                submitted_at,
+            }
+            | Self::PartiallyFilled {
+                symbol,
+                shares,
+                direction,
+                broker,
+                broker_order_id,
+                placed_at,
+                submitted_at,
+                ..
+            } => Ok(Self::Filled {
                 symbol: symbol.clone(),
                 shares: *shares,
                 direction: *direction,
                 broker: *broker,
-                broker_order_id,
+                broker_order_id: broker_order_id.clone(),
+                price_cents,
                 placed_at: *placed_at,
-                submitted_at,
-            };
-        } else {
-            error!(
-                current_state = ?self,
-                "Submitted event applied to non-Pending state. Event ignored."
-            );
-        }
-    }
+                submitted_at: *submitted_at,
+                filled_at,
+            }),
 
-    fn apply_partially_filled(
-        &mut self,
-        shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
-        partially_filled_at: DateTime<Utc>,
-    ) {
-        match self {
-            Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                broker,
-                broker_order_id,
-                placed_at,
-                submitted_at,
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                broker,
-                broker_order_id,
-                placed_at,
-                submitted_at,
-                ..
-            } => {
-                *self = Self::PartiallyFilled {
-                    symbol: symbol.clone(),
-                    shares: *shares,
-                    shares_filled,
-                    direction: *direction,
-                    broker: *broker,
-                    broker_order_id: broker_order_id.clone(),
-                    avg_price_cents,
-                    placed_at: *placed_at,
-                    submitted_at: *submitted_at,
-                    partially_filled_at,
-                };
-            }
-            Self::NotPlaced | Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
-                error!(
-                    current_state = ?self,
-                    "PartiallyFilled event applied to invalid state. Event ignored."
-                );
+            Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
+                Err(LifecycleError::Mismatch {
+                    state: format!("{order:?}"),
+                    event: event.event_type(),
+                })
             }
         }
     }
 
-    fn apply_filled(&mut self, price_cents: PriceCents, filled_at: DateTime<Utc>) {
-        match self {
-            Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                broker,
-                broker_order_id,
-                placed_at,
-                submitted_at,
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                broker,
-                broker_order_id,
-                placed_at,
-                submitted_at,
-                ..
-            } => {
-                *self = Self::Filled {
-                    symbol: symbol.clone(),
-                    shares: *shares,
-                    direction: *direction,
-                    broker: *broker,
-                    broker_order_id: broker_order_id.clone(),
-                    price_cents,
-                    placed_at: *placed_at,
-                    submitted_at: *submitted_at,
-                    filled_at,
-                };
-            }
-            Self::NotPlaced | Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
-                error!(
-                    current_state = ?self,
-                    "Filled event applied to invalid state. Event ignored."
-                );
-            }
-        }
-    }
-
-    fn apply_failed(&mut self, error: String, failed_at: DateTime<Utc>) {
-        match self {
+    fn apply_failed(
+        order: &Self,
+        error: &str,
+        failed_at: DateTime<Utc>,
+        event: &OffchainOrderEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match order {
             Self::Pending {
                 symbol,
                 shares,
@@ -210,40 +258,39 @@ impl OffchainOrder {
                 broker,
                 placed_at,
                 ..
-            } => {
-                *self = Self::Failed {
-                    symbol: symbol.clone(),
-                    shares: *shares,
-                    direction: *direction,
-                    broker: *broker,
-                    error,
-                    placed_at: *placed_at,
-                    failed_at,
-                };
-            }
-            Self::NotPlaced | Self::Filled { .. } | Self::Failed { .. } => {
-                error!(
-                    current_state = ?self,
-                    "Failed event applied to invalid state. Event ignored."
-                );
-            }
+            } => Ok(Self::Failed {
+                symbol: symbol.clone(),
+                shares: *shares,
+                direction: *direction,
+                broker: *broker,
+                error: error.to_string(),
+                placed_at: *placed_at,
+                failed_at,
+            }),
+
+            Self::Filled { .. } | Self::Failed { .. } => Err(LifecycleError::Mismatch {
+                state: format!("{order:?}"),
+                event: event.event_type(),
+            }),
         }
     }
-}
 
-#[async_trait]
-impl Aggregate for OffchainOrder {
-    type Command = OffchainOrderCommand;
-    type Event = OffchainOrderEvent;
-    type Error = OffchainOrderError;
-    type Services = ();
-
-    fn aggregate_type() -> String {
-        "OffchainOrder".to_string()
-    }
-
-    fn apply(&mut self, event: Self::Event) {
+    pub(crate) fn from_event(event: &OffchainOrderEvent) -> Result<Self, LifecycleError<Never>> {
         match event {
+            OffchainOrderEvent::Placed {
+                symbol,
+                shares,
+                direction,
+                broker,
+                placed_at,
+            } => Ok(Self::Pending {
+                symbol: symbol.clone(),
+                shares: *shares,
+                direction: *direction,
+                broker: *broker,
+                placed_at: *placed_at,
+            }),
+
             OffchainOrderEvent::Migrated {
                 symbol,
                 shares,
@@ -255,91 +302,72 @@ impl Aggregate for OffchainOrder {
                 executed_at,
                 migrated_at,
             } => match status {
-                MigratedOrderStatus::Pending => {
-                    *self = Self::Pending {
-                        symbol,
-                        shares,
-                        direction,
-                        broker,
-                        placed_at: executed_at.unwrap_or(migrated_at),
-                    };
-                }
-                MigratedOrderStatus::Submitted => {
-                    *self = Self::Submitted {
-                        symbol,
-                        shares,
-                        direction,
-                        broker,
-                        broker_order_id: broker_order_id
-                            .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
-                        placed_at: migrated_at,
-                        submitted_at: executed_at.unwrap_or(migrated_at),
-                    };
-                }
-                MigratedOrderStatus::Filled => {
-                    *self = Self::Filled {
-                        symbol,
-                        shares,
-                        direction,
-                        broker,
-                        broker_order_id: broker_order_id
-                            .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
-                        price_cents: price_cents.unwrap_or(PriceCents(0)),
-                        placed_at: migrated_at,
-                        submitted_at: migrated_at,
-                        filled_at: executed_at.unwrap_or(migrated_at),
-                    };
-                }
-                MigratedOrderStatus::Failed { error } => {
-                    *self = Self::Failed {
-                        symbol,
-                        shares,
-                        direction,
-                        broker,
-                        error,
-                        placed_at: migrated_at,
-                        failed_at: executed_at.unwrap_or(migrated_at),
-                    };
-                }
+                MigratedOrderStatus::Pending => Ok(Self::Pending {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    broker: *broker,
+                    placed_at: executed_at.unwrap_or(*migrated_at),
+                }),
+                MigratedOrderStatus::Submitted => Ok(Self::Submitted {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    broker: *broker,
+                    broker_order_id: broker_order_id
+                        .clone()
+                        .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
+                    placed_at: *migrated_at,
+                    submitted_at: executed_at.unwrap_or(*migrated_at),
+                }),
+                MigratedOrderStatus::Filled => Ok(Self::Filled {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    broker: *broker,
+                    broker_order_id: broker_order_id
+                        .clone()
+                        .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
+                    price_cents: price_cents.unwrap_or(PriceCents(0)),
+                    placed_at: *migrated_at,
+                    submitted_at: *migrated_at,
+                    filled_at: executed_at.unwrap_or(*migrated_at),
+                }),
+                MigratedOrderStatus::Failed { error } => Ok(Self::Failed {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    broker: *broker,
+                    error: error.clone(),
+                    placed_at: *migrated_at,
+                    failed_at: executed_at.unwrap_or(*migrated_at),
+                }),
             },
-            OffchainOrderEvent::Placed {
-                symbol,
-                shares,
-                direction,
-                broker,
-                placed_at,
-            } => {
-                *self = Self::Pending {
-                    symbol,
-                    shares,
-                    direction,
-                    broker,
-                    placed_at,
-                };
-            }
-            OffchainOrderEvent::Submitted {
-                broker_order_id,
-                submitted_at,
-            } => {
-                self.apply_submitted(broker_order_id, submitted_at);
-            }
-            OffchainOrderEvent::PartiallyFilled {
-                shares_filled,
-                avg_price_cents,
-                partially_filled_at,
-            } => {
-                self.apply_partially_filled(shares_filled, avg_price_cents, partially_filled_at);
-            }
-            OffchainOrderEvent::Filled {
-                price_cents,
-                filled_at,
-            } => {
-                self.apply_filled(price_cents, filled_at);
-            }
-            OffchainOrderEvent::Failed { error, failed_at } => {
-                self.apply_failed(error, failed_at);
-            }
+
+            _ => Err(LifecycleError::Mismatch {
+                state: "Uninitialized".into(),
+                event: event.event_type(),
+            }),
         }
+    }
+}
+
+#[async_trait]
+impl Aggregate for Lifecycle<Order, Never> {
+    type Command = OffchainOrderCommand;
+    type Event = OffchainOrderEvent;
+    type Error = OffchainOrderError;
+    type Services = ();
+
+    fn aggregate_type() -> String {
+        "OffchainOrder".to_string()
+    }
+
+    fn apply(&mut self, event: Self::Event) {
+        *self = self
+            .clone()
+            .transition(&event, Order::apply_transition)
+            .or_initialize(&event, Order::from_event);
     }
 
     async fn handle(
@@ -347,92 +375,80 @@ impl Aggregate for OffchainOrder {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match command {
-            OffchainOrderCommand::Place {
-                symbol,
-                shares,
-                direction,
-                broker,
-            } => match self {
-                Self::NotPlaced => {
-                    let now = Utc::now();
+        match (self.live(), &command) {
+            (
+                Err(LifecycleError::Uninitialized),
+                OffchainOrderCommand::Place {
+                    symbol,
+                    shares,
+                    direction,
+                    broker,
+                },
+            ) => Ok(vec![OffchainOrderEvent::Placed {
+                symbol: symbol.clone(),
+                shares: *shares,
+                direction: *direction,
+                broker: *broker,
+                placed_at: Utc::now(),
+            }]),
 
-                    Ok(vec![OffchainOrderEvent::Placed {
-                        symbol,
-                        shares,
-                        direction,
-                        broker,
-                        placed_at: now,
-                    }])
-                }
-                Self::Pending { .. }
-                | Self::Submitted { .. }
-                | Self::PartiallyFilled { .. }
-                | Self::Filled { .. }
-                | Self::Failed { .. } => Err(OffchainOrderError::AlreadyPlaced),
+            (Ok(_), OffchainOrderCommand::Place { .. }) => Err(OffchainOrderError::AlreadyPlaced),
+
+            (Err(e), _) => Err(e.into()),
+
+            (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => match order
+            {
+                Order::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
+                    broker_order_id: broker_order_id.clone(),
+                    submitted_at: Utc::now(),
+                }]),
+                Order::Submitted { .. }
+                | Order::PartiallyFilled { .. }
+                | Order::Filled { .. }
+                | Order::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
             },
 
-            OffchainOrderCommand::ConfirmSubmission { broker_order_id } => match self {
-                Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
-                Self::Pending { .. } => {
-                    let now = Utc::now();
-
-                    Ok(vec![OffchainOrderEvent::Submitted {
-                        broker_order_id,
-                        submitted_at: now,
-                    }])
-                }
-                Self::Submitted { .. }
-                | Self::PartiallyFilled { .. }
-                | Self::Filled { .. }
-                | Self::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
-            },
-
-            OffchainOrderCommand::UpdatePartialFill {
-                shares_filled,
-                avg_price_cents,
-            } => match self {
-                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    let now = Utc::now();
-
+            (
+                Ok(order),
+                OffchainOrderCommand::UpdatePartialFill {
+                    shares_filled,
+                    avg_price_cents,
+                },
+            ) => match order {
+                Order::Submitted { .. } | Order::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::PartiallyFilled {
-                        shares_filled,
-                        avg_price_cents,
-                        partially_filled_at: now,
+                        shares_filled: *shares_filled,
+                        avg_price_cents: *avg_price_cents,
+                        partially_filled_at: Utc::now(),
                     }])
                 }
-                Self::NotPlaced | Self::Pending { .. } => Err(OffchainOrderError::NotPlaced),
-                Self::Filled { .. } | Self::Failed { .. } => {
+                Order::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Order::Filled { .. } | Order::Failed { .. } => {
                     Err(OffchainOrderError::AlreadyCompleted)
                 }
             },
 
-            OffchainOrderCommand::CompleteFill { price_cents } => match self {
-                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    let now = Utc::now();
-
+            (Ok(order), OffchainOrderCommand::CompleteFill { price_cents }) => match order {
+                Order::Submitted { .. } | Order::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::Filled {
-                        price_cents,
-                        filled_at: now,
+                        price_cents: *price_cents,
+                        filled_at: Utc::now(),
                     }])
                 }
-                Self::NotPlaced | Self::Pending { .. } => Err(OffchainOrderError::NotPlaced),
-                Self::Filled { .. } | Self::Failed { .. } => {
+                Order::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Order::Filled { .. } | Order::Failed { .. } => {
                     Err(OffchainOrderError::AlreadyCompleted)
                 }
             },
 
-            OffchainOrderCommand::MarkFailed { error } => match self {
-                Self::Pending { .. } | Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
-                    let now = Utc::now();
-
+            (Ok(order), OffchainOrderCommand::MarkFailed { error }) => match order {
+                Order::Pending { .. } | Order::Submitted { .. } | Order::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::Failed {
-                        error,
-                        failed_at: now,
+                        error: error.clone(),
+                        failed_at: Utc::now(),
                     }])
                 }
-                Self::NotPlaced => Err(OffchainOrderError::NotPlaced),
-                Self::Filled { .. } | Self::Failed { .. } => {
+                Order::Filled { .. } | Order::Failed { .. } => {
                     Err(OffchainOrderError::AlreadyCompleted)
                 }
             },
@@ -471,8 +487,8 @@ impl Default for OffchainOrderView {
     }
 }
 
-impl View<OffchainOrder> for OffchainOrderView {
-    fn update(&mut self, event: &EventEnvelope<OffchainOrder>) {
+impl View<Lifecycle<Order, Never>> for OffchainOrderView {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<Order, Never>>) {
         let Ok(execution_id) = event.aggregate_id.parse::<i64>() else {
             error!(
                 aggregate_id = %event.aggregate_id,
@@ -639,12 +655,14 @@ impl OffchainOrderView {
 pub(crate) enum OffchainOrderError {
     #[error("Cannot place order: order has already been placed")]
     AlreadyPlaced,
-    #[error("Cannot confirm submission: order has not been placed")]
-    NotPlaced,
+    #[error("Cannot confirm submission: order has not been submitted to broker yet")]
+    NotSubmitted,
     #[error("Cannot update order: order has already been completed (filled or failed)")]
     AlreadyCompleted,
     #[error("Cannot submit order: order has already been submitted")]
     AlreadySubmitted,
+    #[error(transparent)]
+    State(#[from] LifecycleError<Never>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -743,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_place_order() {
-        let mut order = OffchainOrder::default();
+        let mut order = Lifecycle::<Order, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
 
         let command = OffchainOrderCommand::Place {
@@ -760,18 +778,21 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Pending { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Pending { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_place_when_already_pending() {
-        let order = OffchainOrder::Pending {
+        let order = Lifecycle::Live(Order::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -787,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_place_when_filled() {
-        let order = OffchainOrder::Filled {
+        let order = Lifecycle::Live(Order::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -797,7 +818,7 @@ mod tests {
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
             filled_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -813,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_place_when_failed() {
-        let order = OffchainOrder::Failed {
+        let order = Lifecycle::Live(Order::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -821,7 +842,7 @@ mod tests {
             error: "Market closed".to_string(),
             placed_at: Utc::now(),
             failed_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::Place {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -837,13 +858,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_submission_after_place() {
-        let mut order = OffchainOrder::Pending {
+        let mut order = Lifecycle::Live(Order::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::ConfirmSubmission {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -856,12 +877,15 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Submitted { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Submitted { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_submission_if_not_placed() {
-        let order = OffchainOrder::default();
+        let order = Lifecycle::<Order, Never>::default();
 
         let command = OffchainOrderCommand::ConfirmSubmission {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -869,12 +893,15 @@ mod tests {
 
         let result = order.handle(command, &()).await;
 
-        assert!(matches!(result, Err(OffchainOrderError::NotPlaced)));
+        assert!(matches!(
+            result,
+            Err(OffchainOrderError::State(LifecycleError::Uninitialized))
+        ));
     }
 
     #[tokio::test]
     async fn test_cannot_submit_twice() {
-        let order = OffchainOrder::Submitted {
+        let order = Lifecycle::Live(Order::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -882,7 +909,7 @@ mod tests {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::ConfirmSubmission {
             broker_order_id: BrokerOrderId("ORD456".to_string()),
@@ -895,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_fill_from_submitted() {
-        let mut order = OffchainOrder::Submitted {
+        let mut order = Lifecycle::Live(Order::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -903,7 +930,7 @@ mod tests {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::UpdatePartialFill {
             shares_filled: FractionalShares(dec!(50)),
@@ -920,12 +947,15 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::PartiallyFilled { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::PartiallyFilled { .. }));
     }
 
     #[tokio::test]
     async fn test_partial_fill_updates_from_partially_filled() {
-        let mut order = OffchainOrder::PartiallyFilled {
+        let mut order = Lifecycle::Live(Order::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(50)),
@@ -936,7 +966,7 @@ mod tests {
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
             partially_filled_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::UpdatePartialFill {
             shares_filled: FractionalShares(dec!(75)),
@@ -949,16 +979,16 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        if let OffchainOrder::PartiallyFilled { shares_filled, .. } = order {
-            assert_eq!(shares_filled, FractionalShares(dec!(75)));
-        } else {
-            panic!("Expected PartiallyFilled state");
-        }
+        let Lifecycle::Live(Order::PartiallyFilled { shares_filled, .. }) = order else {
+            panic!("Expected Live PartiallyFilled state");
+        };
+
+        assert_eq!(shares_filled, FractionalShares(dec!(75)));
     }
 
     #[tokio::test]
     async fn test_complete_fill_from_submitted() {
-        let mut order = OffchainOrder::Submitted {
+        let mut order = Lifecycle::Live(Order::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -966,7 +996,7 @@ mod tests {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::CompleteFill {
             price_cents: PriceCents(15000),
@@ -979,12 +1009,15 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Filled { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_complete_fill_from_partially_filled() {
-        let mut order = OffchainOrder::PartiallyFilled {
+        let mut order = Lifecycle::Live(Order::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(75)),
@@ -995,7 +1028,7 @@ mod tests {
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
             partially_filled_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::CompleteFill {
             price_cents: PriceCents(15025),
@@ -1007,18 +1040,21 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Filled { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_fill_if_not_submitted() {
-        let order = OffchainOrder::Pending {
+        let order = Lifecycle::Live(Order::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::CompleteFill {
             price_cents: PriceCents(15000),
@@ -1026,12 +1062,12 @@ mod tests {
 
         let result = order.handle(command, &()).await;
 
-        assert!(matches!(result, Err(OffchainOrderError::NotPlaced)));
+        assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
     }
 
     #[tokio::test]
     async fn test_cannot_fill_already_filled() {
-        let order = OffchainOrder::Filled {
+        let order = Lifecycle::Live(Order::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1041,7 +1077,7 @@ mod tests {
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
             filled_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::CompleteFill {
             price_cents: PriceCents(15000),
@@ -1054,13 +1090,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_failed_from_pending() {
-        let mut order = OffchainOrder::Pending {
+        let mut order = Lifecycle::Live(Order::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
             broker: SupportedBroker::Schwab,
             placed_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::MarkFailed {
             error: "Market closed".to_string(),
@@ -1073,12 +1109,15 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Failed { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_mark_failed_from_submitted() {
-        let mut order = OffchainOrder::Submitted {
+        let mut order = Lifecycle::Live(Order::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1086,7 +1125,7 @@ mod tests {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::MarkFailed {
             error: "Insufficient funds".to_string(),
@@ -1098,12 +1137,15 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Failed { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_mark_failed_from_partially_filled() {
-        let mut order = OffchainOrder::PartiallyFilled {
+        let mut order = Lifecycle::Live(Order::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(50)),
@@ -1114,7 +1156,7 @@ mod tests {
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
             partially_filled_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::MarkFailed {
             error: "Order cancelled".to_string(),
@@ -1126,12 +1168,15 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        assert!(matches!(order, OffchainOrder::Failed { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_already_filled() {
-        let order = OffchainOrder::Filled {
+        let order = Lifecycle::Live(Order::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1141,7 +1186,7 @@ mod tests {
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
             filled_at: Utc::now(),
-        };
+        });
 
         let command = OffchainOrderCommand::MarkFailed {
             error: "Test error".to_string(),
@@ -1154,7 +1199,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrated_event_pending_status() {
-        let mut order = OffchainOrder::default();
+        let mut order = Lifecycle::<Order, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1170,12 +1215,15 @@ mod tests {
 
         order.apply(event);
 
-        assert!(matches!(order, OffchainOrder::Pending { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Pending { .. }));
     }
 
     #[tokio::test]
     async fn test_migrated_event_submitted_status() {
-        let mut order = OffchainOrder::default();
+        let mut order = Lifecycle::<Order, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1191,12 +1239,15 @@ mod tests {
 
         order.apply(event);
 
-        assert!(matches!(order, OffchainOrder::Submitted { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Submitted { .. }));
     }
 
     #[tokio::test]
     async fn test_migrated_event_filled_status() {
-        let mut order = OffchainOrder::default();
+        let mut order = Lifecycle::<Order, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1212,12 +1263,15 @@ mod tests {
 
         order.apply(event);
 
-        assert!(matches!(order, OffchainOrder::Filled { .. }));
+        let Lifecycle::Live(inner) = order else {
+            panic!("Expected Live state");
+        };
+        assert!(matches!(inner, Order::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_migrated_event_failed_status() {
-        let mut order = OffchainOrder::default();
+        let mut order = Lifecycle::<Order, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1235,11 +1289,10 @@ mod tests {
 
         order.apply(event);
 
-        if let OffchainOrder::Failed { error, .. } = order {
-            assert_eq!(error, "Insufficient funds");
-        } else {
-            panic!("Expected Failed state");
-        }
+        let Lifecycle::Live(Order::Failed { error, .. }) = order else {
+            panic!("Expected Live Failed state");
+        };
+        assert_eq!(error, "Insufficient funds");
     }
 
     #[test]
@@ -1826,5 +1879,19 @@ mod tests {
         view.update(&envelope);
 
         assert!(matches!(view, OffchainOrderView::Unavailable));
+    }
+
+    #[test]
+    fn test_transition_on_uninitialized_corrupts_state() {
+        let mut order = Lifecycle::<Order, Never>::default();
+
+        let event = OffchainOrderEvent::Submitted {
+            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            submitted_at: Utc::now(),
+        };
+
+        order.apply(event);
+
+        assert!(matches!(order, Lifecycle::Failed { .. }));
     }
 }
