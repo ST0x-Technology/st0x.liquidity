@@ -4,11 +4,10 @@ use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
-use crate::position::FractionalShares;
+use crate::position::ExecutionId;
+use crate::shares::FractionalShares;
 
-use super::{
-    BrokerOrderId, ExecutionId, MigratedOrderStatus, OffchainOrder, OffchainOrderEvent, PriceCents,
-};
+use super::{BrokerOrderId, MigratedOrderStatus, OffchainOrder, OffchainOrderEvent, PriceCents};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ExecutionStatus {
@@ -213,7 +212,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::super::{MigratedOrderStatus, OffchainOrderEvent};
-    use crate::position::FractionalShares;
+    use crate::shares::FractionalShares;
 
     #[test]
     fn test_view_update_from_migrated_event_pending_status() {

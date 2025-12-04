@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::Aggregate;
-use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
-use crate::position::FractionalShares;
+use crate::position::{BrokerOrderId, PriceCents};
+use crate::shares::FractionalShares;
 
 mod cmd;
 mod event;
@@ -14,46 +14,6 @@ mod view;
 
 pub(crate) use cmd::OffchainOrderCommand;
 pub(crate) use event::{MigratedOrderStatus, OffchainOrderEvent};
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ExecutionId(pub(crate) i64);
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct BrokerOrderId(pub(crate) String);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct PriceCents(pub(crate) u64);
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Usdc(Decimal);
-
-impl Usdc {
-    pub(crate) fn new(value: Decimal) -> Result<Self, InvalidThresholdError> {
-        if value.is_sign_negative() {
-            return Err(InvalidThresholdError::Negative(value));
-        }
-
-        if value.is_zero() {
-            return Err(InvalidThresholdError::Zero);
-        }
-
-        Ok(Self(value))
-    }
-
-    #[cfg(test)]
-    fn as_decimal(&self) -> Decimal {
-        self.0
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub(crate) enum InvalidThresholdError {
-    #[error("Threshold value cannot be negative: {0}")]
-    Negative(Decimal),
-
-    #[error("Threshold value cannot be zero")]
-    Zero,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OffchainOrderError {
@@ -500,8 +460,6 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
     use st0x_broker::{Direction, SupportedBroker, Symbol};
-
-    use crate::position::FractionalShares;
 
     #[tokio::test]
     async fn test_place_order() {
@@ -1002,28 +960,5 @@ mod tests {
         } else {
             panic!("Expected Failed state");
         }
-    }
-
-    #[test]
-    fn test_usdc_new_positive_value_succeeds() {
-        let value = dec!(100.50);
-        let usdc = Usdc::new(value).unwrap();
-        assert_eq!(usdc.as_decimal(), value);
-    }
-
-    #[test]
-    fn test_usdc_new_zero_fails() {
-        let result = Usdc::new(Decimal::ZERO);
-        assert_eq!(result.unwrap_err(), InvalidThresholdError::Zero);
-    }
-
-    #[test]
-    fn test_usdc_new_negative_value_fails() {
-        let negative = dec!(-50.25);
-        let result = Usdc::new(negative);
-        assert_eq!(
-            result.unwrap_err(),
-            InvalidThresholdError::Negative(negative)
-        );
     }
 }

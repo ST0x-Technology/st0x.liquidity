@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use st0x_broker::{Direction, SupportedBroker, Symbol};
 
-use crate::position::FractionalShares;
+use crate::shares::FractionalShares;
 
 use super::{BrokerOrderId, PriceCents};
 
