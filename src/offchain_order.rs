@@ -12,7 +12,7 @@ use crate::position::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::shares::FractionalShares;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) enum Order {
+pub(crate) enum OffchainOrder {
     Pending {
         symbol: Symbol,
         shares: FractionalShares,
@@ -63,7 +63,7 @@ pub(crate) enum Order {
     },
 }
 
-impl Order {
+impl OffchainOrder {
     pub(crate) fn apply_transition(
         event: &OffchainOrderEvent,
         order: &Self,
@@ -353,7 +353,7 @@ impl Order {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<Order, Never> {
+impl Aggregate for Lifecycle<OffchainOrder, Never> {
     type Command = OffchainOrderCommand;
     type Event = OffchainOrderEvent;
     type Error = OffchainOrderError;
@@ -366,8 +366,8 @@ impl Aggregate for Lifecycle<Order, Never> {
     fn apply(&mut self, event: Self::Event) {
         *self = self
             .clone()
-            .transition(&event, Order::apply_transition)
-            .or_initialize(&event, Order::from_event);
+            .transition(&event, OffchainOrder::apply_transition)
+            .or_initialize(&event, OffchainOrder::from_event);
     }
 
     async fn handle(
@@ -398,14 +398,14 @@ impl Aggregate for Lifecycle<Order, Never> {
 
             (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => match order
             {
-                Order::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
+                OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
                     broker_order_id: broker_order_id.clone(),
                     submitted_at: Utc::now(),
                 }]),
-                Order::Submitted { .. }
-                | Order::PartiallyFilled { .. }
-                | Order::Filled { .. }
-                | Order::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
+                OffchainOrder::Submitted { .. }
+                | OffchainOrder::PartiallyFilled { .. }
+                | OffchainOrder::Filled { .. }
+                | OffchainOrder::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
             },
 
             (
@@ -415,40 +415,40 @@ impl Aggregate for Lifecycle<Order, Never> {
                     avg_price_cents,
                 },
             ) => match order {
-                Order::Submitted { .. } | Order::PartiallyFilled { .. } => {
+                OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::PartiallyFilled {
                         shares_filled: *shares_filled,
                         avg_price_cents: *avg_price_cents,
                         partially_filled_at: Utc::now(),
                     }])
                 }
-                Order::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-                Order::Filled { .. } | Order::Failed { .. } => {
+                OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
                     Err(OffchainOrderError::AlreadyCompleted)
                 }
             },
 
             (Ok(order), OffchainOrderCommand::CompleteFill { price_cents }) => match order {
-                Order::Submitted { .. } | Order::PartiallyFilled { .. } => {
+                OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
                     Ok(vec![OffchainOrderEvent::Filled {
                         price_cents: *price_cents,
                         filled_at: Utc::now(),
                     }])
                 }
-                Order::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-                Order::Filled { .. } | Order::Failed { .. } => {
+                OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
                     Err(OffchainOrderError::AlreadyCompleted)
                 }
             },
 
             (Ok(order), OffchainOrderCommand::MarkFailed { error }) => match order {
-                Order::Pending { .. } | Order::Submitted { .. } | Order::PartiallyFilled { .. } => {
-                    Ok(vec![OffchainOrderEvent::Failed {
-                        error: error.clone(),
-                        failed_at: Utc::now(),
-                    }])
-                }
-                Order::Filled { .. } | Order::Failed { .. } => {
+                OffchainOrder::Pending { .. }
+                | OffchainOrder::Submitted { .. }
+                | OffchainOrder::PartiallyFilled { .. } => Ok(vec![OffchainOrderEvent::Failed {
+                    error: error.clone(),
+                    failed_at: Utc::now(),
+                }]),
+                OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
                     Err(OffchainOrderError::AlreadyCompleted)
                 }
             },
@@ -487,8 +487,8 @@ impl Default for OffchainOrderView {
     }
 }
 
-impl View<Lifecycle<Order, Never>> for OffchainOrderView {
-    fn update(&mut self, event: &EventEnvelope<Lifecycle<Order, Never>>) {
+impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<OffchainOrder, Never>>) {
         let Ok(execution_id) = event.aggregate_id.parse::<i64>() else {
             error!(
                 aggregate_id = %event.aggregate_id,
@@ -761,7 +761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_place_order() {
-        let mut order = Lifecycle::<Order, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
 
         let command = OffchainOrderCommand::Place {
@@ -781,12 +781,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Pending { .. }));
+        assert!(matches!(inner, OffchainOrder::Pending { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_place_when_already_pending() {
-        let order = Lifecycle::Live(Order::Pending {
+        let order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -808,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_place_when_filled() {
-        let order = Lifecycle::Live(Order::Filled {
+        let order = Lifecycle::Live(OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -834,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_place_when_failed() {
-        let order = Lifecycle::Live(Order::Failed {
+        let order = Lifecycle::Live(OffchainOrder::Failed {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -858,7 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_confirm_submission_after_place() {
-        let mut order = Lifecycle::Live(Order::Pending {
+        let mut order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -880,12 +880,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Submitted { .. }));
+        assert!(matches!(inner, OffchainOrder::Submitted { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_confirm_submission_if_not_placed() {
-        let order = Lifecycle::<Order, Never>::default();
+        let order = Lifecycle::<OffchainOrder, Never>::default();
 
         let command = OffchainOrderCommand::ConfirmSubmission {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
@@ -901,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_submit_twice() {
-        let order = Lifecycle::Live(Order::Submitted {
+        let order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -922,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_fill_from_submitted() {
-        let mut order = Lifecycle::Live(Order::Submitted {
+        let mut order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -950,12 +950,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::PartiallyFilled { .. }));
+        assert!(matches!(inner, OffchainOrder::PartiallyFilled { .. }));
     }
 
     #[tokio::test]
     async fn test_partial_fill_updates_from_partially_filled() {
-        let mut order = Lifecycle::Live(Order::PartiallyFilled {
+        let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(50)),
@@ -979,7 +979,7 @@ mod tests {
 
         order.apply(events[0].clone());
 
-        let Lifecycle::Live(Order::PartiallyFilled { shares_filled, .. }) = order else {
+        let Lifecycle::Live(OffchainOrder::PartiallyFilled { shares_filled, .. }) = order else {
             panic!("Expected Live PartiallyFilled state");
         };
 
@@ -988,7 +988,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_fill_from_submitted() {
-        let mut order = Lifecycle::Live(Order::Submitted {
+        let mut order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1012,12 +1012,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Filled { .. }));
+        assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_complete_fill_from_partially_filled() {
-        let mut order = Lifecycle::Live(Order::PartiallyFilled {
+        let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(75)),
@@ -1043,12 +1043,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Filled { .. }));
+        assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_fill_if_not_submitted() {
-        let order = Lifecycle::Live(Order::Pending {
+        let order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1067,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_fill_already_filled() {
-        let order = Lifecycle::Live(Order::Filled {
+        let order = Lifecycle::Live(OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1090,7 +1090,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mark_failed_from_pending() {
-        let mut order = Lifecycle::Live(Order::Pending {
+        let mut order = Lifecycle::Live(OffchainOrder::Pending {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1112,12 +1112,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Failed { .. }));
+        assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_mark_failed_from_submitted() {
-        let mut order = Lifecycle::Live(Order::Submitted {
+        let mut order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1140,12 +1140,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Failed { .. }));
+        assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_mark_failed_from_partially_filled() {
-        let mut order = Lifecycle::Live(Order::PartiallyFilled {
+        let mut order = Lifecycle::Live(OffchainOrder::PartiallyFilled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(50)),
@@ -1171,12 +1171,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Failed { .. }));
+        assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
     #[tokio::test]
     async fn test_cannot_fail_already_filled() {
-        let order = Lifecycle::Live(Order::Filled {
+        let order = Lifecycle::Live(OffchainOrder::Filled {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
@@ -1199,7 +1199,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrated_event_pending_status() {
-        let mut order = Lifecycle::<Order, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1218,12 +1218,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Pending { .. }));
+        assert!(matches!(inner, OffchainOrder::Pending { .. }));
     }
 
     #[tokio::test]
     async fn test_migrated_event_submitted_status() {
-        let mut order = Lifecycle::<Order, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1242,12 +1242,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Submitted { .. }));
+        assert!(matches!(inner, OffchainOrder::Submitted { .. }));
     }
 
     #[tokio::test]
     async fn test_migrated_event_filled_status() {
-        let mut order = Lifecycle::<Order, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1266,12 +1266,12 @@ mod tests {
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
-        assert!(matches!(inner, Order::Filled { .. }));
+        assert!(matches!(inner, OffchainOrder::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_migrated_event_failed_status() {
-        let mut order = Lifecycle::<Order, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let event = OffchainOrderEvent::Migrated {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1289,7 +1289,7 @@ mod tests {
 
         order.apply(event);
 
-        let Lifecycle::Live(Order::Failed { error, .. }) = order else {
+        let Lifecycle::Live(OffchainOrder::Failed { error, .. }) = order else {
             panic!("Expected Live Failed state");
         };
         assert_eq!(error, "Insufficient funds");
@@ -1883,7 +1883,7 @@ mod tests {
 
     #[test]
     fn test_transition_on_uninitialized_corrupts_state() {
-        let mut order = Lifecycle::<Order, Never>::default();
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let event = OffchainOrderEvent::Submitted {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
