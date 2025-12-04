@@ -18,12 +18,16 @@ mod onchain;
 #[allow(dead_code)]
 pub(crate) mod onchain_trade;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
+mod lifecycle;
 #[allow(dead_code)]
 mod position;
 mod queue;
 pub mod reporter;
+mod shares;
 mod symbol;
 mod telemetry;
+#[allow(dead_code)]
+mod threshold;
 mod trade_execution_link;
 
 pub use telemetry::{TelemetryError, TelemetryGuard};

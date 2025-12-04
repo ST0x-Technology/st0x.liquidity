@@ -7,6 +7,7 @@ use st0x_broker::Symbol;
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand};
 
 #[derive(sqlx::FromRow)]
@@ -22,7 +23,7 @@ struct OnchainTradeRow {
 
 pub async fn migrate_onchain_trades(
     pool: &SqlitePool,
-    cqrs: &SqliteCqrs<OnChainTrade>,
+    cqrs: &SqliteCqrs<Lifecycle<OnChainTrade, Never>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, OnchainTradeRow>(

@@ -5,7 +5,10 @@ use st0x_broker::Symbol;
 use tracing::{info, warn};
 
 use super::{ExecutionMode, MigrationError};
-use crate::position::{ExecutionThreshold, FractionalShares, Position, PositionCommand};
+use crate::lifecycle::Lifecycle;
+use crate::position::{Position, PositionCommand};
+use crate::shares::{ArithmeticError, FractionalShares};
+use crate::threshold::ExecutionThreshold;
 
 #[derive(sqlx::FromRow)]
 struct PositionRow {
@@ -18,7 +21,7 @@ struct PositionRow {
 
 pub async fn migrate_positions(
     pool: &SqlitePool,
-    cqrs: &SqliteCqrs<Position>,
+    cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, PositionRow>(

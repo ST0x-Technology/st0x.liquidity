@@ -6,8 +6,10 @@ use st0x_broker::{SupportedBroker, Symbol};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
-use crate::offchain_order::{BrokerOrderId, OffchainOrder, OffchainOrderCommand, PriceCents};
-use crate::position::FractionalShares;
+use crate::lifecycle::{Lifecycle, Never};
+use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
+use crate::position::{BrokerOrderId, PriceCents};
+use crate::shares::FractionalShares;
 
 #[derive(sqlx::FromRow)]
 struct OffchainOrderRow {
@@ -23,7 +25,7 @@ struct OffchainOrderRow {
 
 pub async fn migrate_offchain_orders(
     pool: &SqlitePool,
-    cqrs: &SqliteCqrs<OffchainOrder>,
+    cqrs: &SqliteCqrs<Lifecycle<OffchainOrder, Never>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, OffchainOrderRow>(
