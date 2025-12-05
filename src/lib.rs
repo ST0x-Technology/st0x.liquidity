@@ -8,6 +8,7 @@ mod conductor;
 pub mod env;
 mod error;
 mod lock;
+pub mod migration;
 mod offchain;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
 #[allow(dead_code)]
@@ -15,7 +16,7 @@ mod offchain_order;
 mod onchain;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
 #[allow(dead_code)]
-mod onchain_trade;
+pub(crate) mod onchain_trade;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
 mod lifecycle;
 #[allow(dead_code)]
