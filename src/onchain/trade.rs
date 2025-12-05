@@ -474,6 +474,42 @@ mod tests {
         assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
     }
 
+    /// Test with real production event data from tx 0xf05d240c99c7c3f8d4562130f655d2b571b1b82643b621987bed3d8aabab304d
+    /// The trade was for 2 shares of tSPLG at ~$80/share.
+    ///
+    /// TakeOrderV3 event field semantics (counterintuitive naming):
+    /// - event.input = amount the order GAVE = 2 tSPLG shares
+    /// - event.output = amount the order RECEIVED = ~160 USDC
+    #[test]
+    fn test_float_to_f64_production_event_data() {
+        // event.input Float: 2 shares the order gave
+        // Raw bytes: ffffffee00000000000000000000000000000000000000001bc16d674ec80000
+        let event_input_float =
+            fixed_bytes!("ffffffee00000000000000000000000000000000000000001bc16d674ec80000");
+        let shares_amount = float_to_f64(event_input_float).unwrap();
+        assert!(
+            (shares_amount - 2.0).abs() < f64::EPSILON,
+            "Expected 2.0 shares but got {shares_amount}"
+        );
+
+        // event.output Float: ~160 USDC the order received
+        // Raw bytes: ffffffe500000000000000000000000000000002057d2cd516a29b6174400000
+        let event_output_float =
+            fixed_bytes!("ffffffe500000000000000000000000000000002057d2cd516a29b6174400000");
+        let usdc_amount = float_to_f64(event_output_float).unwrap();
+        assert!(
+            (usdc_amount - 160.155_077_52).abs() < 0.00001,
+            "Expected ~160.15 USDC but got {usdc_amount}"
+        );
+
+        // After swapping (as done in take_order.rs):
+        // - input_amount (order's input token = USDC) = event.output = 160.15
+        // - output_amount (order's output token = tSPLG) = event.input = 2.0
+        // Then TradeDetails::try_from_io("USDC", 160.15, "tSPLG", 2.0) correctly extracts:
+        // - equity_amount = 2.0 (from output since output is tokenized equity)
+        // - usdc_amount = 160.15 (from input since input is USDC)
+    }
+
     #[test]
     fn test_float_to_f64_edge_cases() {
         let float_zero = Float::from_fixed_decimal(uint!(0_U256), 0)

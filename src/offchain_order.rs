@@ -64,6 +64,10 @@ pub(crate) enum OffchainOrder {
 }
 
 impl OffchainOrder {
+    pub(crate) fn aggregate_id(id: i64) -> String {
+        format!("{id}")
+    }
+
     pub(crate) fn apply_transition(
         event: &OffchainOrderEvent,
         order: &Self,
@@ -378,6 +382,30 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
         match (self.live(), &command) {
             (
                 Err(LifecycleError::Uninitialized),
+                OffchainOrderCommand::Migrate {
+                    symbol,
+                    shares,
+                    direction,
+                    broker,
+                    status,
+                    broker_order_id,
+                    price_cents,
+                    executed_at,
+                },
+            ) => Ok(vec![OffchainOrderEvent::Migrated {
+                symbol: symbol.clone(),
+                shares: *shares,
+                direction: *direction,
+                broker: *broker,
+                status: status.clone(),
+                broker_order_id: broker_order_id.clone(),
+                price_cents: *price_cents,
+                executed_at: *executed_at,
+                migrated_at: Utc::now(),
+            }]),
+
+            (
+                Err(LifecycleError::Uninitialized),
                 OffchainOrderCommand::Place {
                     symbol,
                     shares,
@@ -392,7 +420,9 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
                 placed_at: Utc::now(),
             }]),
 
-            (Ok(_), OffchainOrderCommand::Place { .. }) => Err(OffchainOrderError::AlreadyPlaced),
+            (Ok(_), OffchainOrderCommand::Migrate { .. } | OffchainOrderCommand::Place { .. }) => {
+                Err(OffchainOrderError::AlreadyPlaced)
+            }
 
             (Err(e), _) => Err(e.into()),
 
@@ -667,6 +697,16 @@ pub(crate) enum OffchainOrderError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OffchainOrderCommand {
+    Migrate {
+        symbol: Symbol,
+        shares: FractionalShares,
+        direction: Direction,
+        broker: SupportedBroker,
+        status: MigratedOrderStatus,
+        broker_order_id: Option<BrokerOrderId>,
+        price_cents: Option<PriceCents>,
+        executed_at: Option<DateTime<Utc>>,
+    },
     Place {
         symbol: Symbol,
         shares: FractionalShares,
@@ -694,6 +734,40 @@ pub(crate) enum MigratedOrderStatus {
     Submitted,
     Filled,
     Failed { error: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid migrated order status: '{0}'")]
+pub(crate) struct InvalidMigratedOrderStatus(pub String);
+
+impl std::str::FromStr for MigratedOrderStatus {
+    type Err = InvalidMigratedOrderStatus;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "PENDING" => Ok(Self::Pending),
+            "SUBMITTED" => Ok(Self::Submitted),
+            "FILLED" => Ok(Self::Filled),
+            "FAILED" => Ok(Self::Failed {
+                error: "Unknown failure".to_string(),
+            }),
+            _ => Err(InvalidMigratedOrderStatus(s.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("Price in cents cannot be negative: {0}")]
+pub(crate) struct NegativePriceCents(pub i64);
+
+impl TryFrom<i64> for PriceCents {
+    type Error = NegativePriceCents;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        u64::try_from(value)
+            .map(Self)
+            .map_err(|_| NegativePriceCents(value))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1893,5 +1967,166 @@ mod tests {
         order.apply(event);
 
         assert!(matches!(order, Lifecycle::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_command_creates_migrated_event() {
+        let order = Lifecycle::<OffchainOrder, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let command = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+        };
+
+        let events = order.handle(command, &()).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OffchainOrderEvent::Migrated {
+                symbol: evt_symbol,
+                shares,
+                direction,
+                broker,
+                status,
+                broker_order_id,
+                price_cents,
+                executed_at,
+                ..
+            } => {
+                assert_eq!(evt_symbol, &symbol);
+                assert_eq!(shares.0, dec!(100));
+                assert_eq!(direction, &Direction::Buy);
+                assert_eq!(broker, &SupportedBroker::Schwab);
+                assert!(matches!(status, MigratedOrderStatus::Pending));
+                assert!(broker_order_id.is_none());
+                assert!(price_cents.is_none());
+                assert!(executed_at.is_none());
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_migrate_command_all_status_types() {
+        let symbol = Symbol::new("TSLA").unwrap();
+
+        // Test Pending status
+        let order = Lifecycle::<OffchainOrder, Never>::default();
+        let command = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+        };
+        let events = order.handle(command, &()).await.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Pending,
+                ..
+            }
+        ));
+
+        // Test Submitted status
+        let order = Lifecycle::<OffchainOrder, Never>::default();
+        let command = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Submitted,
+            broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
+            price_cents: None,
+            executed_at: Some(Utc::now()),
+        };
+        let events = order.handle(command, &()).await.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Submitted,
+                ..
+            }
+        ));
+
+        // Test Filled status
+        let order = Lifecycle::<OffchainOrder, Never>::default();
+        let command = OffchainOrderCommand::Migrate {
+            symbol: symbol.clone(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Filled,
+            broker_order_id: Some(BrokerOrderId("ORD456".to_string())),
+            price_cents: Some(PriceCents(20000)),
+            executed_at: Some(Utc::now()),
+        };
+        let events = order.handle(command, &()).await.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Filled,
+                ..
+            }
+        ));
+
+        // Test Failed status
+        let order = Lifecycle::<OffchainOrder, Never>::default();
+        let command = OffchainOrderCommand::Migrate {
+            symbol,
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Failed {
+                error: "Insufficient funds".to_string(),
+            },
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: Some(Utc::now()),
+        };
+        let events = order.handle(command, &()).await.unwrap();
+        assert!(matches!(
+            events[0],
+            OffchainOrderEvent::Migrated {
+                status: MigratedOrderStatus::Failed { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_migrate_when_already_placed() {
+        let order = Lifecycle::Live(OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            placed_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::Migrate {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(50)),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            status: MigratedOrderStatus::Pending,
+            broker_order_id: None,
+            price_cents: None,
+            executed_at: None,
+        };
+
+        let result = order.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
     }
 }
