@@ -3210,4 +3210,405 @@ mod tests {
 
         assert_eq!(*state_deposit_ref, Some(deposit_ref));
     }
+
+    #[tokio::test]
+    async fn test_complete_alpaca_to_base_full_flow() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(10000.00)),
+                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce: 12345,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let attestation = vec![0xAB, 0xCD, 0xEF];
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: attestation.clone(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint_tx_hash,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let deposit_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(deposit_tx),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::DepositConfirmed {
+            direction,
+            amount,
+            burn_tx_hash: final_burn_tx,
+            mint_tx_hash: final_mint_tx,
+            initiated_at: final_initiated_at,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected DepositConfirmed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(10000.00)));
+        assert_eq!(*final_burn_tx, burn_tx_hash);
+        assert_eq!(*final_mint_tx, mint_tx_hash);
+        assert!(*final_initiated_at >= initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_complete_base_to_alpaca_full_flow() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let withdrawal_tx =
+            fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
+        let initiated_at = Utc::now();
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc(dec!(5000.00)),
+                    withdrawal: TransferRef::OnchainTx(withdrawal_tx),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let burn_tx_hash =
+            fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce: 67890,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let attestation = vec![0x11, 0x22, 0x33, 0x44];
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::ReceiveAttestation { attestation },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let mint_tx_hash =
+            fixed_bytes!("0x5555555555555555555555555555555555555555555555555555555555555555");
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint_tx_hash,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::AlpacaId(deposit_transfer_id),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+            .await
+            .unwrap();
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::DepositConfirmed {
+            direction,
+            amount,
+            burn_tx_hash: final_burn_tx,
+            mint_tx_hash: final_mint_tx,
+            initiated_at: final_initiated_at,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected DepositConfirmed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(*amount, Usdc(dec!(5000.00)));
+        assert_eq!(*final_burn_tx, burn_tx_hash);
+        assert_eq!(*final_mint_tx, mint_tx_hash);
+        assert!(*final_initiated_at >= initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_withdrawal_failed_rejects_commands() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        agg.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(100.00)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::WithdrawalFailed {
+            reason: "Test failure".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        assert!(
+            agg.handle(UsdcRebalanceCommand::ConfirmWithdrawal, &())
+                .await
+                .is_err()
+        );
+        assert!(
+            agg.handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx,
+                    cctp_nonce: 1
+                },
+                &()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bridging_failed_rejects_commands() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        agg.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(100.00)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: Some(burn_tx),
+            cctp_nonce: Some(12345),
+            reason: "Bridge failed".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        assert!(
+            agg.handle(
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: vec![0x01]
+                },
+                &()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            agg.handle(UsdcRebalanceCommand::ConfirmBridging { mint_tx }, &())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deposit_failed_rejects_commands() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        agg.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(100.00)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            attested_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::OnchainTx(mint_tx),
+            deposit_initiated_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::DepositFailed {
+            deposit_ref: Some(TransferRef::OnchainTx(mint_tx)),
+            reason: "Deposit failed".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        assert!(
+            agg.handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deposit_confirmed_rejects_commands() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let mut agg = Lifecycle::<UsdcRebalance, Never>::default();
+        agg.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(100.00)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            attested_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::OnchainTx(mint_tx),
+            deposit_initiated_at: Utc::now(),
+        });
+        agg.apply(UsdcRebalanceEvent::DepositConfirmed {
+            deposit_confirmed_at: Utc::now(),
+        });
+
+        assert!(
+            agg.handle(
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(100.00)),
+                    withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                },
+                &()
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            agg.handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+                .await
+                .is_err()
+        );
+    }
 }
