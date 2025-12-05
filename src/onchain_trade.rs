@@ -139,8 +139,9 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (&command, self.live()) {
+        match (self.live(), &command) {
             (
+                Err(LifecycleError::Uninitialized),
                 OnChainTradeCommand::Witness {
                     symbol,
                     amount,
@@ -149,7 +150,6 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
                     block_number,
                     block_timestamp,
                 },
-                Err(LifecycleError::Uninitialized),
             ) => Ok(vec![OnChainTradeEvent::Filled {
                 symbol: symbol.clone(),
                 amount: *amount,
@@ -160,14 +160,14 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
                 filled_at: Utc::now(),
             }]),
 
-            (OnChainTradeCommand::Witness { .. }, Ok(_)) => Err(OnChainTradeError::AlreadyFilled),
+            (Ok(_), OnChainTradeCommand::Witness { .. }) => Err(OnChainTradeError::AlreadyFilled),
 
             (
+                Ok(trade),
                 OnChainTradeCommand::Enrich {
                     gas_used,
                     pyth_price,
                 },
-                Ok(trade),
             ) => {
                 if trade.is_enriched() {
                     return Err(OnChainTradeError::AlreadyEnriched);
@@ -180,11 +180,11 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
                 }])
             }
 
-            (OnChainTradeCommand::Enrich { .. }, Err(LifecycleError::Uninitialized)) => {
+            (Err(LifecycleError::Uninitialized), OnChainTradeCommand::Enrich { .. }) => {
                 Err(OnChainTradeError::NotFilled)
             }
 
-            (_, Err(e)) => Err(e.into()),
+            (Err(e), _) => Err(e.into()),
         }
     }
 }

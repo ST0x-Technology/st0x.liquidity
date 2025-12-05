@@ -262,12 +262,12 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (&command, self.live()) {
-            (PositionCommand::Initialize { .. }, Ok(_)) => {
+        match (self.live(), &command) {
+            (Ok(_), PositionCommand::Initialize { .. }) => {
                 Err(LifecycleError::AlreadyInitialized.into())
             }
 
-            (PositionCommand::Initialize { symbol, threshold }, Err(_)) => {
+            (Err(_), PositionCommand::Initialize { symbol, threshold }) => {
                 Ok(vec![PositionEvent::Initialized {
                     symbol: symbol.clone(),
                     threshold: *threshold,
@@ -275,9 +275,10 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
                 }])
             }
 
-            (_, Err(e)) => Err(e.into()),
+            (Err(e), _) => Err(e.into()),
 
             (
+                Ok(_),
                 PositionCommand::AcknowledgeOnChainFill {
                     trade_id,
                     amount,
@@ -285,7 +286,6 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
                     price_usdc,
                     block_timestamp,
                 },
-                Ok(_),
             ) => Ok(vec![PositionEvent::OnChainOrderFilled {
                 trade_id: trade_id.clone(),
                 amount: *amount,
@@ -296,16 +296,17 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
             }]),
 
             (
+                Ok(position),
                 PositionCommand::PlaceOffChainOrder {
                     execution_id,
                     shares,
                     direction,
                     broker,
                 },
-                Ok(position),
             ) => position.handle_place_offchain_order(*execution_id, *shares, *direction, *broker),
 
             (
+                Ok(position),
                 PositionCommand::CompleteOffChainOrder {
                     execution_id,
                     shares_filled,
@@ -314,7 +315,6 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
                     price_cents,
                     broker_timestamp,
                 },
-                Ok(position),
             ) => {
                 position.validate_pending_execution(*execution_id)?;
 
@@ -329,11 +329,11 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
             }
 
             (
+                Ok(position),
                 PositionCommand::FailOffChainOrder {
                     execution_id,
                     error,
                 },
-                Ok(position),
             ) => {
                 position.validate_pending_execution(*execution_id)?;
 
@@ -344,7 +344,7 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
                 }])
             }
 
-            (PositionCommand::UpdateThreshold { threshold }, Ok(position)) => {
+            (Ok(position), PositionCommand::UpdateThreshold { threshold }) => {
                 Ok(vec![PositionEvent::ThresholdUpdated {
                     old_threshold: position.threshold,
                     new_threshold: *threshold,
