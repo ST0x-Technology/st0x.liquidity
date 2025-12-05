@@ -255,6 +255,23 @@ Environment variables (can be set via `.env` file):
 
 ### Code Quality & Best Practices
 
+- **CRITICAL: Package by Feature, Not by Layer**: NEVER organize code by
+  language primitives or technical layers. ALWAYS organize by business
+  feature/domain.
+  - **FORBIDDEN**: `types.rs`, `error.rs`, `models.rs`, `utils.rs`,
+    `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`, `services.rs` (when used
+    as catch-all technical layer modules)
+  - **CORRECT**: `account.rs`, `trade.rs`, `position.rs` (organized by business
+    domain), with submodules like `position/cmd.rs`, `position/event.rs` if
+    needed
+  - Each feature module should contain ALL related code: types, errors,
+    commands, events, aggregates, views, and endpoints
+  - This makes it easy to understand and modify a feature without jumping
+    between unrelated files
+  - Example: `src/position/` contains everything related to positions - newtypes
+    (FractionalShares, ExecutionId), commands (Initialize, PlaceOffChainOrder),
+    events (OnChainOrderFilled, OffChainOrderPlaced), aggregate (Position), view
+    (PositionView), errors (PositionError)
 - **Event-Driven Architecture**: Each trade spawns independent async task for
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
@@ -265,6 +282,23 @@ Environment variables (can be set via `.env` file):
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `SchwabError`) with proper propagation
+- **CRITICAL: Package by Feature, Not by Layer**: NEVER organize code by
+  language primitives or technical layers. ALWAYS organize by business
+  feature/domain.
+  - **FORBIDDEN**: `types.rs`, `error.rs`, `models.rs`, `utils.rs`,
+    `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`, `services.rs`, `domain.rs`
+    (when used as catch-all technical layer modules)
+  - **CORRECT**: `position.rs`, `offchain_order.rs`, `onchain_trade.rs`
+    (organized by business domain), with submodules like `position/cmd.rs`,
+    `position/event.rs` if needed
+  - Each feature module should contain ALL related code: types, errors,
+    commands, events, aggregates, views, and endpoints
+  - This makes it easy to understand and modify a feature without jumping
+    between unrelated files
+  - Value objects and newtypes should live in the feature module where they're
+    primarily defined/used
+  - When types are shared across features, import from the owning feature (e.g.,
+    `offchain_order` can import `FractionalShares` from `position` module)
 - **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
   cqrs-es framework for event sourcing. **NEVER write directly to the `events`
   table**. This is strictly forbidden and violates the CQRS architecture:
@@ -406,7 +440,7 @@ Environment variables (can be set via `.env` file):
     2. Use `#[from]` for error types from external crates
     3. Use `#[source]` for wrapped errors in struct variants
     4. Never use `.to_string()`, `.map_err(|e| Foo(e.to_string()))`, or similar
-      patterns
+       patterns
     5. If an error needs context, use a struct variant with fields + `#[source]`
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable

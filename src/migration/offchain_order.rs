@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
@@ -5,8 +6,10 @@ use st0x_broker::{SupportedBroker, Symbol};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
-use crate::position::{BrokerOrderId, FractionalShares, PriceCents};
+use crate::position::{BrokerOrderId, PriceCents};
+use crate::shares::FractionalShares;
 
 #[derive(sqlx::FromRow)]
 struct OffchainOrderRow {
@@ -17,11 +20,12 @@ struct OffchainOrderRow {
     order_id: Option<String>,
     price_cents: Option<i64>,
     status: String,
+    executed_at: Option<DateTime<Utc>>,
 }
 
 pub async fn migrate_offchain_orders(
     pool: &SqlitePool,
-    cqrs: &SqliteCqrs<OffchainOrder>,
+    cqrs: &SqliteCqrs<Lifecycle<OffchainOrder, Never>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, OffchainOrderRow>(
@@ -33,7 +37,8 @@ pub async fn migrate_offchain_orders(
             direction,
             broker_order_id as order_id,
             price_cents,
-            status
+            status,
+            executed_at
         FROM offchain_trades
         ORDER BY id ASC
         ",
@@ -86,7 +91,7 @@ pub async fn migrate_offchain_orders(
             status: migrated_status,
             broker_order_id,
             price_cents,
-            executed_at: None,
+            executed_at: row.executed_at,
         };
 
         match execution {

@@ -1,5 +1,5 @@
 use alloy::primitives::TxHash;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
@@ -7,6 +7,7 @@ use st0x_broker::Symbol;
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand};
 
 #[derive(sqlx::FromRow)]
@@ -17,15 +18,16 @@ struct OnchainTradeRow {
     amount: f64,
     direction: String,
     price_usdc: f64,
+    created_at: DateTime<Utc>,
 }
 
 pub async fn migrate_onchain_trades(
     pool: &SqlitePool,
-    cqrs: &SqliteCqrs<OnChainTrade>,
+    cqrs: &SqliteCqrs<Lifecycle<OnChainTrade, Never>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, OnchainTradeRow>(
-        "SELECT tx_hash, log_index, symbol, amount, direction, price_usdc
+        "SELECT tx_hash, log_index, symbol, amount, direction, price_usdc, created_at
          FROM onchain_trades
          ORDER BY created_at ASC",
     )
@@ -42,7 +44,14 @@ pub async fn migrate_onchain_trades(
         }
 
         let tx_hash: TxHash = row.tx_hash.parse()?;
-        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, row.log_index);
+        let log_index: u64 =
+            row.log_index
+                .try_into()
+                .map_err(|_| MigrationError::NegativeValue {
+                    field: "log_index".to_string(),
+                    value: row.log_index,
+                })?;
+        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);
         let symbol = Symbol::new(&row.symbol)?;
         let amount = Decimal::try_from(row.amount)?;
         let direction = row.direction.parse()?;
@@ -54,7 +63,7 @@ pub async fn migrate_onchain_trades(
             direction,
             price_usdc,
             block_number: 0,
-            block_timestamp: Utc::now(),
+            block_timestamp: row.created_at,
             gas_used: None,
             pyth_price: None,
         };

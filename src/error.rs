@@ -3,9 +3,10 @@
 
 use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
+use rain_math_float::FloatError;
 use st0x_broker::order::status::ParseOrderStatusError;
 use st0x_broker::{InvalidBrokerError, PersistenceError};
-use std::num::ParseFloatError;
+use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::onchain::position_calculator::ConversionError;
 
@@ -77,10 +78,10 @@ pub(crate) enum EventQueueError {
 pub(crate) enum EventProcessingError {
     #[error("Event queue error: {0}")]
     Queue(#[from] EventQueueError),
-    #[error("Failed to enqueue ClearV2 event: {0}")]
-    EnqueueClearV2(#[source] EventQueueError),
-    #[error("Failed to enqueue TakeOrderV2 event: {0}")]
-    EnqueueTakeOrderV2(#[source] EventQueueError),
+    #[error("Failed to enqueue ClearV3 event: {0}")]
+    EnqueueClearV3(#[source] EventQueueError),
+    #[error("Failed to enqueue TakeOrderV3 event: {0}")]
+    EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Failed to process trade through accumulator: {0}")]
     AccumulatorProcessing(String),
     #[error("Onchain trade processing error: {0}")]
@@ -130,6 +131,10 @@ pub(crate) enum OnChainError {
     InvalidBroker(#[from] InvalidBrokerError),
     #[error("Numeric conversion error: {0}")]
     Conversion(#[from] ConversionError),
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] TryFromIntError),
 }
 
 impl From<sqlx::Error> for OnChainError {
@@ -171,11 +176,5 @@ impl From<alloy::sol_types::Error> for OnChainError {
 impl From<RpcError<TransportErrorKind>> for OnChainError {
     fn from(err: RpcError<TransportErrorKind>) -> Self {
         Self::Alloy(AlloyError::RpcTransport(err))
-    }
-}
-
-impl From<std::num::TryFromIntError> for OnChainError {
-    fn from(err: std::num::TryFromIntError) -> Self {
-        Self::Validation(TradeValidationError::IntConversion(err))
     }
 }
