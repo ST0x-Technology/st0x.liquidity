@@ -309,7 +309,58 @@ mod tests {
 
     use super::*;
     use crate::position::BrokerOrderId;
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
+    use crate::threshold::ExecutionThreshold;
+
+    async fn setup_position_with_onchain_fill(
+        dual_write_context: &DualWriteContext,
+        symbol: &st0x_broker::Symbol,
+        tokenized_symbol: &str,
+        amount: f64,
+    ) {
+        crate::dual_write::initialize_position(
+            dual_write_context,
+            symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let mut onchain_trade = OnchainTradeBuilder::new()
+            .with_symbol(tokenized_symbol)
+            .with_amount(amount)
+            .with_price(150.0)
+            .build();
+        onchain_trade.direction = Direction::Buy;
+        onchain_trade.block_timestamp = Some(Utc::now());
+
+        crate::dual_write::acknowledge_onchain_fill(dual_write_context, &onchain_trade)
+            .await
+            .unwrap();
+    }
+
+    async fn setup_offchain_order_aggregate(
+        dual_write_context: &DualWriteContext,
+        execution: &OffchainExecution,
+        symbol: &st0x_broker::Symbol,
+        order_id: &str,
+    ) {
+        crate::dual_write::place_order(dual_write_context, execution)
+            .await
+            .unwrap();
+
+        crate::dual_write::place_offchain_order(dual_write_context, execution, symbol)
+            .await
+            .unwrap();
+
+        crate::dual_write::confirm_submission(
+            dual_write_context,
+            execution.id.unwrap(),
+            BrokerOrderId::new(order_id),
+        )
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn test_handle_filled_order_executes_dual_write_commands() {
@@ -320,6 +371,8 @@ mod tests {
 
         let symbol = st0x_broker::Symbol::new("AAPL").unwrap();
         let shares = Shares::new(10).unwrap();
+
+        setup_position_with_onchain_fill(&dual_write_context, &symbol, "AAPL0x", 10.0).await;
 
         let mut tx = pool.begin().await.unwrap();
         let submitted_state = OrderState::Submitted {
@@ -346,17 +399,8 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        crate::dual_write::confirm_submission(
-            &dual_write_context,
-            execution_id,
-            BrokerOrderId::new("ORD123"),
-        )
-        .await
-        .unwrap();
+        setup_offchain_order_aggregate(&dual_write_context, &pending_execution, &symbol, "ORD123")
+            .await;
 
         let filled_state = OrderState::Filled {
             order_id: "ORD123".to_string(),
@@ -365,7 +409,6 @@ mod tests {
         };
 
         let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-
         let result = poller
             .handle_filled_order(execution_id, &filled_state)
             .await;
@@ -373,22 +416,32 @@ mod tests {
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
             aggregate_id
         )
         .fetch_all(&pool)
         .await
         .unwrap();
 
-        assert_eq!(
-            offchain_order_events.len(),
-            3,
-            "Expected 3 events (Placed, Submitted, Filled), got {offchain_order_events:?}"
-        );
-
+        assert_eq!(offchain_order_events.len(), 3);
         assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
         assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
         assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Filled");
+
+        let position_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(position_events.len(), 4);
+        assert_eq!(position_events[0], "PositionEvent::Initialized");
+        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
+        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFilled");
     }
 
     #[tokio::test]
@@ -400,6 +453,8 @@ mod tests {
 
         let symbol = st0x_broker::Symbol::new("TSLA").unwrap();
         let shares = Shares::new(5).unwrap();
+
+        setup_position_with_onchain_fill(&dual_write_context, &symbol, "TSLA0x", 5.0).await;
 
         let mut tx = pool.begin().await.unwrap();
         let submitted_state = OrderState::Submitted {
@@ -426,17 +481,8 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        crate::dual_write::confirm_submission(
-            &dual_write_context,
-            execution_id,
-            BrokerOrderId::new("ORD456"),
-        )
-        .await
-        .unwrap();
+        setup_offchain_order_aggregate(&dual_write_context, &pending_execution, &symbol, "ORD456")
+            .await;
 
         let failed_state = OrderState::Failed {
             failed_at: Utc::now(),
@@ -444,7 +490,6 @@ mod tests {
         };
 
         let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-
         let result = poller
             .handle_failed_order(execution_id, &failed_state)
             .await;
@@ -452,21 +497,31 @@ mod tests {
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
             aggregate_id
         )
         .fetch_all(&pool)
         .await
         .unwrap();
 
-        assert_eq!(
-            offchain_order_events.len(),
-            3,
-            "Expected 3 events (Placed, Submitted, Failed), got {offchain_order_events:?}"
-        );
-
+        assert_eq!(offchain_order_events.len(), 3);
         assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
         assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
         assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Failed");
+
+        let position_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'TSLA' ORDER BY sequence"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(position_events.len(), 4);
+        assert_eq!(position_events[0], "PositionEvent::Initialized");
+        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
+        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
     }
 }

@@ -1072,10 +1072,12 @@ mod tests {
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3};
     use crate::env::tests::create_test_config;
+    use crate::offchain::execution::OffchainExecution;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
+    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
-    use st0x_broker::{Direction, MockBrokerConfig, TryIntoBroker};
+    use st0x_broker::{Direction, MockBrokerConfig, OrderState, Shares, TryIntoBroker};
 
     #[tokio::test]
     async fn test_event_enqueued_when_trade_conversion_returns_none() {
@@ -1712,6 +1714,190 @@ mod tests {
             result.unwrap_err(),
             EventProcessingError::AccumulatorProcessing(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn test_execute_onchain_trade_dual_write_creates_events() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let mut trade = OnchainTradeBuilder::new()
+            .with_symbol("NVDA0x")
+            .with_amount(5.5)
+            .with_price(450.0)
+            .build();
+        trade.direction = Direction::Buy;
+        trade.block_timestamp = Some(chrono::Utc::now());
+
+        execute_onchain_trade_dual_write(&dual_write_context, &trade, 12345).await;
+
+        // Verify OnChainTrade event was created
+        let onchain_trade_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events WHERE aggregate_type = 'OnChainTrade'"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            onchain_trade_events.len(),
+            1,
+            "Expected 1 OnChainTrade event, got {onchain_trade_events:?}"
+        );
+        assert_eq!(onchain_trade_events[0], "OnChainTradeEvent::Filled");
+
+        let position_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'NVDA' \
+            ORDER BY sequence"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            position_events.len(),
+            2,
+            "Expected 2 Position events (Initialized, OnChainOrderFilled), got {position_events:?}"
+        );
+        assert_eq!(position_events[0], "PositionEvent::Initialized");
+        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
+    }
+
+    #[tokio::test]
+    async fn test_execute_new_execution_dual_write_creates_events() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let symbol = st0x_broker::Symbol::new("GOOGL").unwrap();
+        let shares = Shares::new(5).unwrap();
+
+        crate::dual_write::initialize_position(
+            &dual_write_context,
+            &symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let mut onchain_trade = OnchainTradeBuilder::new()
+            .with_symbol("GOOGL0x")
+            .with_amount(5.0)
+            .with_price(140.0)
+            .build();
+        onchain_trade.direction = Direction::Buy;
+        onchain_trade.block_timestamp = Some(chrono::Utc::now());
+
+        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &onchain_trade)
+            .await
+            .unwrap();
+
+        let execution = OffchainExecution {
+            id: Some(42),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: st0x_broker::SupportedBroker::DryRun,
+            state: OrderState::Pending,
+        };
+
+        execute_new_execution_dual_write(&dual_write_context, &execution, &symbol).await;
+
+        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '42' \
+            ORDER BY sequence"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            offchain_order_events.len(),
+            1,
+            "Expected 1 OffchainOrder event (Placed), got {offchain_order_events:?}"
+        );
+        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
+
+        let position_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'GOOGL' \
+            ORDER BY sequence"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            position_events.len(),
+            3,
+            "Expected 3 Position events (Initialized, OnChainOrderFilled, OffChainOrderPlaced), \
+            got {position_events:?}"
+        );
+        assert_eq!(position_events[0], "PositionEvent::Initialized");
+        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
+    }
+
+    #[tokio::test]
+    async fn test_execute_pending_offchain_execution_calls_confirm_submission() {
+        let pool = setup_test_db().await;
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let symbol = st0x_broker::Symbol::new("AMZN").unwrap();
+        let shares = Shares::new(10).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let pending_state = OrderState::Pending;
+        let execution_id = pending_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                st0x_broker::SupportedBroker::DryRun,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: st0x_broker::SupportedBroker::DryRun,
+            state: OrderState::Pending,
+        };
+
+        crate::dual_write::place_order(&dual_write_context, &pending_execution)
+            .await
+            .unwrap();
+
+        let result =
+            execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+                .await;
+        assert!(result.is_ok());
+
+        let aggregate_id = execution_id.to_string();
+        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+            ORDER BY sequence",
+            aggregate_id
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            offchain_order_events.len(),
+            2,
+            "Expected 2 OffchainOrder events (Placed, Submitted), got {offchain_order_events:?}"
+        );
+        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
+        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
     }
 
     #[tokio::test]
