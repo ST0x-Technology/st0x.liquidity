@@ -333,38 +333,78 @@ Withdrawing --FailWithdrawal--> WithdrawalFailed
 **Tests Added:** 9 new tests covering all withdrawal confirmation/failure
 scenarios including edge cases for attempting operations on terminal states.
 
-## Task 5. Bridge Burn Initiation
+## Task 5. Bridge Burn Initiation ✅
 
-Implement WithdrawalConfirmed → BridgingInitiated transition. (View updates are
-handled by the Lifecycle self-view pattern.)
+Implement WithdrawalComplete → Bridging transition. (View updates are handled by
+the Lifecycle self-view pattern.)
 
 ### Subtasks
 
-- [ ] Add state `BridgingInitiated`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
-  - [ ] `burn_tx_hash: TxHash`
-  - [ ] `cctp_nonce: u64`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `burned_at: DateTime<Utc>`
-- [ ] Add command `InitiateBridging { burn_tx: TxHash, cctp_nonce: u64 }`
-- [ ] Add event
+- [x] Add state `Bridging`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `burn_tx_hash: TxHash`
+  - [x] `cctp_nonce: u64`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `burned_at: DateTime<Utc>`
+- [x] Add command `InitiateBridging { burn_tx: TxHash, cctp_nonce: u64 }`
+- [x] Add event
       `BridgingInitiated { burn_tx_hash: TxHash, cctp_nonce: u64, burned_at }`
-- [ ] Update `handle()`:
-  - [ ] `WithdrawalConfirmed` + `InitiateBridging` → emit `BridgingInitiated`
-- [ ] Update `apply_transition()` for `BridgingInitiated` event
-- [ ] Add error `WithdrawalNotConfirmed`
+- [x] Update `handle()`:
+  - [x] `WithdrawalComplete` + `InitiateBridging` → emit `BridgingInitiated`
+- [x] Update `apply_transition()` for `BridgingInitiated` event
+- [x] Add error `WithdrawalNotConfirmed`
 
 ### Tests
 
-- [ ] `test_initiate_bridging`
-- [ ] `test_cannot_bridge_before_withdrawal_confirmed`
+- [x] `test_initiate_bridging_after_withdrawal_confirmed`
+- [x] `test_cannot_initiate_bridging_before_withdrawal`
+- [x] `test_cannot_initiate_bridging_while_withdrawing`
+- [x] `test_cannot_initiate_bridging_after_withdrawal_failed`
+- [x] `test_cannot_initiate_bridging_twice`
+- [x] `test_view_tracks_bridging_initiation`
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass (21 usdc_rebalance tests)
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
+
+### Implementation Summary
+
+**Key Changes:**
+
+- Added `Bridging` state variant to `UsdcRebalance` enum with fields: direction,
+  amount, burn_tx_hash, cctp_nonce, initiated_at, burned_at
+- Added `WithdrawalNotConfirmed` error variant for attempting to bridge before
+  withdrawal is confirmed
+- Implemented `handle_initiate_bridging()` command handler with proper state
+  validation:
+  - Returns `WithdrawalNotConfirmed` error from Uninitialized, Withdrawing, or
+    WithdrawalFailed states
+  - Emits `BridgingInitiated` event from `WithdrawalComplete` state
+  - Returns `InvalidCommand` error from `Bridging` state (can't bridge twice)
+- Updated `apply_transition()` to handle `BridgingInitiated` event,
+  transitioning from `WithdrawalComplete` to `Bridging` state
+- Added `Bridging` state to `handle_confirm_withdrawal` and
+  `handle_fail_withdrawal` match arms to properly return
+  `WithdrawalAlreadyCompleted` error
+
+**State Machine:**
+
+```
+Lifecycle::Uninitialized --Initiate--> Withdrawing
+Withdrawing --ConfirmWithdrawal--> WithdrawalComplete
+Withdrawing --FailWithdrawal--> WithdrawalFailed
+WithdrawalComplete --InitiateBridging--> Bridging
+```
+
+**Tests Added:** 6 new tests covering:
+
+- Happy path: bridging after withdrawal confirmed
+- Error cases: bridging before withdrawal, during withdrawal, after failure
+- Edge case: attempting to bridge twice
+- View tracking: verifying state transitions through event envelope updates
 
 ## Task 6. Bridge Attestation Receipt
 

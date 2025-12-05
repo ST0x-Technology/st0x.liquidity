@@ -68,6 +68,9 @@ pub(crate) enum UsdcRebalanceError {
     /// Withdrawal has already been confirmed or failed
     #[error("Withdrawal has already completed")]
     WithdrawalAlreadyCompleted,
+    /// Withdrawal has not been confirmed yet
+    #[error("Withdrawal has not been confirmed")]
+    WithdrawalNotConfirmed,
     /// Command not valid for current state
     #[error("Command {command} not valid for state {state}")]
     InvalidCommand { command: String, state: String },
@@ -212,6 +215,15 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+    /// CCTP bridging has been initiated (burn transaction submitted)
+    Bridging {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        cctp_nonce: u64,
+        initiated_at: DateTime<Utc>,
+        burned_at: DateTime<Utc>,
+    },
 }
 
 #[async_trait]
@@ -247,6 +259,11 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
             UsdcRebalanceCommand::ConfirmWithdrawal => self.handle_confirm_withdrawal(),
 
             UsdcRebalanceCommand::FailWithdrawal { reason } => self.handle_fail_withdrawal(reason),
+
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx,
+                cctp_nonce,
+            } => self.handle_initiate_bridging(burn_tx, *cctp_nonce),
 
             _ => {
                 // Other commands will be implemented in subsequent tasks
@@ -287,7 +304,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 }])
             }
             Ok(
-                UsdcRebalance::WithdrawalComplete { .. } | UsdcRebalance::WithdrawalFailed { .. },
+                UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::Bridging { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
             Err(e) => Err(e.into()),
         }
@@ -306,8 +325,38 @@ impl Lifecycle<UsdcRebalance, Never> {
                 }])
             }
             Ok(
-                UsdcRebalance::WithdrawalComplete { .. } | UsdcRebalance::WithdrawalFailed { .. },
+                UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::Bridging { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_initiate_bridging(
+        &self,
+        burn_tx: &TxHash,
+        cctp_nonce: u64,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(UsdcRebalance::Withdrawing { .. } | UsdcRebalance::WithdrawalFailed { .. }) => {
+                Err(UsdcRebalanceError::WithdrawalNotConfirmed)
+            }
+
+            Ok(UsdcRebalance::WithdrawalComplete { .. }) => {
+                Ok(vec![UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash: *burn_tx,
+                    cctp_nonce,
+                    burned_at: Utc::now(),
+                }])
+            }
+
+            Ok(UsdcRebalance::Bridging { .. }) => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateBridging".to_string(),
+                state: "Bridging".to_string(),
+            }),
+
             Err(e) => Err(e.into()),
         }
     }
@@ -350,6 +399,27 @@ impl UsdcRebalance {
                 reason: reason.clone(),
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
+            }),
+
+            (
+                Self::WithdrawalComplete {
+                    direction,
+                    amount,
+                    initiated_at,
+                    ..
+                },
+                UsdcRebalanceEvent::BridgingInitiated {
+                    burn_tx_hash,
+                    cctp_nonce,
+                    burned_at,
+                },
+            ) => Ok(Self::Bridging {
+                direction: direction.clone(),
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                cctp_nonce: *cctp_nonce,
+                initiated_at: *initiated_at,
+                burned_at: *burned_at,
             }),
 
             _ => Err(LifecycleError::Mismatch {
@@ -873,5 +943,252 @@ mod tests {
         assert_eq!(reason, "Network error");
         assert_eq!(view_initiated_at, initiated_at);
         assert_eq!(view_failed_at, failed_at);
+    }
+
+    #[tokio::test]
+    async fn test_initiate_bridging_after_withdrawal_confirmed() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let confirmed_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at,
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let cctp_nonce = 12345u64;
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: event_tx_hash,
+            cctp_nonce: event_nonce,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingInitiated event");
+        };
+
+        assert_eq!(*event_tx_hash, burn_tx_hash);
+        assert_eq!(*event_nonce, cctp_nonce);
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let Lifecycle::Live(UsdcRebalance::Bridging {
+            direction,
+            amount,
+            burn_tx_hash: state_tx_hash,
+            cctp_nonce: state_nonce,
+            initiated_at: state_initiated_at,
+            ..
+        }) = aggregate
+        else {
+            panic!("Expected Bridging state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(state_tx_hash, burn_tx_hash);
+        assert_eq!(state_nonce, cctp_nonce);
+        assert_eq!(state_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_bridging_before_withdrawal() {
+        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce: 12345,
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::WithdrawalNotConfirmed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_bridging_while_withdrawing() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce: 12345,
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::WithdrawalNotConfirmed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_bridging_after_withdrawal_failed() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalFailed {
+            reason: "Test failure".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce: 12345,
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::WithdrawalNotConfirmed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_bridging_twice() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_tx_hash,
+                    cctp_nonce: 99999,
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::InvalidCommand { .. }
+        ));
+    }
+
+    #[test]
+    fn test_view_tracks_bridging_initiation() {
+        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let confirmed_at = Utc::now();
+        let burned_at = Utc::now();
+        let burn_tx_hash = Address::ZERO.into_word();
+        let cctp_nonce = 12345u64;
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 1,
+            payload: UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 2,
+            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 3,
+            payload: UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash,
+                cctp_nonce,
+                burned_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        let Lifecycle::Live(UsdcRebalance::Bridging {
+            direction,
+            amount,
+            burn_tx_hash: view_tx_hash,
+            cctp_nonce: view_nonce,
+            initiated_at: view_initiated_at,
+            burned_at: view_burned_at,
+        }) = view
+        else {
+            panic!("Expected Bridging state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(view_tx_hash, burn_tx_hash);
+        assert_eq!(view_nonce, cctp_nonce);
+        assert_eq!(view_initiated_at, initiated_at);
+        assert_eq!(view_burned_at, burned_at);
     }
 }
