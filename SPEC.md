@@ -2426,48 +2426,45 @@ async fn test_full_flow_blockchain_to_broker() {
 
 ### **Code Organization**
 
+Aggregates use flat file structure by default. Submodules are only introduced
+when natural business logic boundaries emerge (e.g., `schwab/auth/` uses CQRS
+submodules because auth is a complex domain with distinct commands, events, and
+views).
+
 ```
 Cargo.toml                        - Workspace definition (st0x-hedge + crates/broker)
 src/                              - Main st0x-hedge library crate
   lib.rs                          - Library exports, CQRS setup
   bin/
-    server.rs                     - Main arbitrage bot server (existing)
-    cli.rs                        - CLI for manual operations (existing)
-    reporter.rs                   - Reporter binary (existing)
-    migrate_to_events.rs          - One-time existing data import (NEW)
-  onchain_trade/
-    mod.rs                        - OnChainTrade aggregate
-    cmd.rs                        - OnChainTradeCommand enum
-    event.rs                      - OnChainTradeEvent enum
-    view.rs                       - OnChainTradeView + queries
-  position/
-    mod.rs                        - Position aggregate
-    cmd.rs                        - PositionCommand enum
-    event.rs                      - PositionEvent enum
-    view.rs                       - PositionView + queries
-  offchain_order/
-    mod.rs                        - OffchainOrder aggregate
-    cmd.rs                        - OffchainOrderCommand enum
-    event.rs                      - OffchainOrderEvent enum
-    view.rs                       - OffchainTradeView + queries
-    manager.rs                    - OrderManager for broker workflows
-  managers/
-    trade.rs                      - TradeManager for onchain->position coordination
-    order.rs                      - OrderManager for broker order workflows
+    server.rs                     - Main arbitrage bot server
+    cli.rs                        - CLI for manual operations
+    reporter.rs                   - P&L reporter binary
+  position.rs                     - Position aggregate (commands, events, state in one file)
+  onchain_trade.rs                - OnChainTrade aggregate
+  offchain_order.rs               - OffchainOrder aggregate
+  shares.rs                       - FractionalShares newtype and arithmetic
+  threshold.rs                    - Execution threshold logic
+  queue.rs                        - Event queue for idempotent processing
+  onchain/                        - Blockchain event processing
+  offchain/                       - Off-chain order execution
+  conductor/                      - Trade accumulation and broker orchestration
+  reporter/                       - FIFO P&L calculation and metrics
+  symbol/                         - Token symbol caching and locking
+  alpaca_wallet/                  - Alpaca cryptocurrency wallet management
+  api.rs                          - REST API endpoints
+  env.rs                          - Environment configuration
+  cctp.rs                         - Cross-chain token bridge (Circle CCTP)
 crates/
-  broker/                         - Broker abstraction library (existing)
-    Cargo.toml
+  broker/                         - Broker abstraction library
     src/
-      lib.rs
-      broker.rs                   - Broker trait
+      lib.rs                      - Broker trait and shared types
+      order/                      - Shared order types
       schwab/
-        mod.rs                    - Schwab broker implementation
-        auth.rs                   - SchwabAuth aggregate
-        cmd.rs                    - SchwabAuthCommand enum
-        event.rs                  - SchwabAuthEvent enum
-        view.rs                   - SchwabAuthView
-      alpaca.rs                   - Alpaca broker implementation
-      test_broker.rs              - Mock broker for testing
+        mod.rs                    - SchwabBroker, SchwabAuthEnv, SchwabError
+        auth/                     - CQRS submodule (cmd.rs, event.rs, view.rs, oauth.rs)
+        broker.rs, order.rs, etc. - Private implementation
+      alpaca/                     - Alpaca broker implementation
+      mock.rs                     - Mock broker for testing
 ```
 
 ### **Dependencies**
