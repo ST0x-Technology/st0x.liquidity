@@ -3,13 +3,34 @@ use alloy::sol;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV5, "lib/rain.orderbook.interface/out/IOrderBookV5.sol/IOrderBookV5.json"
+    IOrderBookV5, "lib/rain.orderbook/out/IOrderBookV5.sol/IOrderBookV5.json"
 );
 
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
     IERC20, "lib/forge-std/out/IERC20.sol/IERC20.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    TestERC20, "lib/rain.orderbook/out/ArbTest.sol/Token.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    OrderBook, "lib/rain.orderbook/out/OrderBook.sol/OrderBook.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    TOFUTokenDecimals, "lib/rain.orderbook/out/TOFUTokenDecimals.sol/TOFUTokenDecimals.json"
 );
 
 sol!(
@@ -21,5 +42,5 @@ sol!(
 
 sol!(
     #![sol(all_derives = true)]
-    LibDecimalFloat, "lib/rain.orderbook.interface/out/LibDecimalFloat.sol/LibDecimalFloat.json"
+    LibDecimalFloat, "lib/rain.orderbook/out/LibDecimalFloat.sol/LibDecimalFloat.json"
 );
