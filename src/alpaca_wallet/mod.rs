@@ -5,7 +5,7 @@
 //!
 //! # Authentication
 //!
-//! Authentication uses Alpaca API credentials via `AlpacaAuthEnv` from the broker crate.
+//! Authentication uses Alpaca API credentials (API key and secret).
 //! The client automatically fetches and caches the account ID.
 //!
 //! # Whitelisting
@@ -17,38 +17,6 @@
 //!
 //! Transfers progress through states: Pending → Processing → Complete/Failed.
 //! Use `poll_transfer_until_complete()` to wait for a transfer to reach a terminal state.
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use alloy::primitives::Address;
-//! use rust_decimal::Decimal;
-//! use st0x_broker::alpaca::AlpacaAuthEnv;
-//! use std::str::FromStr;
-//!
-//! let env = AlpacaAuthEnv::from_env().await?;
-//! let service = AlpacaWalletService::new(env, None).await?;
-//!
-//! // Get deposit address
-//! let asset = TokenSymbol::new("USDC");
-//! let network = Network::new("ethereum");
-//! let deposit = service.get_deposit_address(&asset, &network).await?;
-//! println!("Deposit to: {}", deposit.address);
-//!
-//! // Whitelist withdrawal address
-//! let address = Address::from_str("0x...")?;
-//! service.whitelist_address(&address, &asset, &network).await?;
-//!
-//! // Initiate withdrawal (after 24h approval)
-//! let transfer = service.initiate_withdrawal(
-//!     Decimal::new(100, 0),
-//!     &asset,
-//!     &address,
-//! ).await?;
-//!
-//! // Poll until complete
-//! let final_transfer = service.poll_transfer_until_complete(&transfer.id).await?;
-//! ```
 
 mod client;
 mod status;
@@ -57,7 +25,6 @@ mod whitelist;
 
 use alloy::primitives::Address;
 use rust_decimal::Decimal;
-use st0x_broker::alpaca::AlpacaAuthEnv;
 use std::sync::Arc;
 
 use client::AlpacaWalletClient;
@@ -67,14 +34,6 @@ use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
 pub(crate) use transfer::{Network, TokenSymbol, Transfer, TransferId};
-
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
-#[allow(dead_code)]
-/// Configuration for `AlpacaWalletService`.
-pub(crate) struct AlpacaWalletConfig {
-    pub(crate) auth_env: AlpacaAuthEnv,
-    pub(crate) polling_config: Option<PollingConfig>,
-}
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -89,22 +48,12 @@ pub(crate) struct AlpacaWalletService {
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
 impl AlpacaWalletService {
-    /// Creates a new service instance.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if authentication fails or the account ID cannot be fetched.
-    pub async fn new(
-        auth_env: AlpacaAuthEnv,
-        polling_config: Option<PollingConfig>,
-    ) -> Result<Self, AlpacaWalletError> {
-        let client = Arc::new(AlpacaWalletClient::new(auth_env).await?);
-        let polling_config = polling_config.unwrap_or_default();
-
-        Ok(Self {
-            client,
-            polling_config,
-        })
+    #[cfg(test)]
+    fn new_with_client(client: AlpacaWalletClient, polling_config: Option<PollingConfig>) -> Self {
+        Self {
+            client: Arc::new(client),
+            polling_config: polling_config.unwrap_or_default(),
+        }
     }
 
     /// Gets the deposit address for an asset and network.
@@ -207,5 +156,304 @@ impl AlpacaWalletService {
         &self,
     ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
         self.client.get_whitelisted_addresses().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::address;
+    use httpmock::prelude::*;
+    use rust_decimal::Decimal;
+    use serde_json::json;
+    use std::time::Duration;
+
+    use super::*;
+    use client::create_account_mock;
+
+    async fn create_test_service(server: &MockServer) -> AlpacaWalletService {
+        let account_mock = create_account_mock(server, "test-account-id");
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key".to_string(),
+            "test_secret".to_string(),
+        )
+        .await
+        .unwrap();
+
+        account_mock.assert();
+
+        AlpacaWalletService::new_with_client(client, None)
+    }
+
+    #[tokio::test]
+    async fn test_get_deposit_address() {
+        let server = MockServer::start();
+        let service = create_test_service(&server).await;
+
+        let wallet_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/crypto/funding_wallets")
+                .query_param("asset", "USDC")
+                .query_param("network", "ethereum");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "asset": "USDC",
+                    "network": "Ethereum"
+                }]));
+        });
+
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("ethereum");
+
+        let result = service.get_deposit_address(&asset, &network).await.unwrap();
+
+        assert_eq!(
+            result.address,
+            address!("0x1234567890abcdef1234567890abcdef12345678")
+        );
+        wallet_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_initiate_withdrawal_not_whitelisted() {
+        let server = MockServer::start();
+        let service = create_test_service(&server).await;
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account-id/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let asset = TokenSymbol::new("USDC");
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let result = service
+            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaWalletError::AddressNotWhitelisted { .. }
+        ));
+        whitelist_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_initiate_withdrawal_pending_whitelist() {
+        let server = MockServer::start();
+        let service = create_test_service(&server).await;
+
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account-id/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "whitelist-123",
+                    "address": to_address.to_string(),
+                    "asset": "USDC",
+                    "chain": "ethereum",
+                    "status": "PENDING",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }]));
+        });
+
+        let asset = TokenSymbol::new("USDC");
+
+        let result = service
+            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaWalletError::AddressNotWhitelisted { .. }
+        ));
+        whitelist_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_initiate_withdrawal_approved() {
+        let server = MockServer::start();
+        let service = create_test_service(&server).await;
+
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account-id/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": "whitelist-123",
+                    "address": to_address.to_string(),
+                    "asset": "USDC",
+                    "chain": "ethereum",
+                    "status": "APPROVED",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }]));
+        });
+
+        let transfer_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account-id/wallets/transfers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "550e8400-e29b-41d4-a716-446655440000",
+                    "relationship": "OUTGOING",
+                    "amount": "100",
+                    "asset": "USDC",
+                    "from_address": null,
+                    "to_address": to_address.to_string(),
+                    "status": "PENDING",
+                    "tx_hash": null,
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee_amount": null
+                }));
+        });
+
+        let asset = TokenSymbol::new("USDC");
+
+        let result = service
+            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+            .await
+            .unwrap();
+
+        assert_eq!(result.to, to_address);
+        whitelist_mock.assert();
+        transfer_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_whitelist_address() {
+        let server = MockServer::start();
+        let service = create_test_service(&server).await;
+
+        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/accounts/test-account-id/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "whitelist-123",
+                    "address": address,
+                    "asset": "USDC",
+                    "chain": "ethereum",
+                    "status": "PENDING",
+                    "created_at": "2024-01-01T00:00:00Z"
+                }));
+        });
+
+        let asset = TokenSymbol::new("USDC");
+        let network = Network::new("ethereum");
+
+        let result = service
+            .whitelist_address(&address, &asset, &network)
+            .await
+            .unwrap();
+
+        assert_eq!(result.address, address);
+        whitelist_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_whitelisted_addresses() {
+        let server = MockServer::start();
+        let service = create_test_service(&server).await;
+
+        let whitelist_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account-id/wallets/whitelists");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "id": "whitelist-1",
+                        "address": "0x1111111111111111111111111111111111111111",
+                        "asset": "USDC",
+                        "chain": "ethereum",
+                        "status": "APPROVED",
+                        "created_at": "2024-01-01T00:00:00Z"
+                    },
+                    {
+                        "id": "whitelist-2",
+                        "address": "0x2222222222222222222222222222222222222222",
+                        "asset": "USDC",
+                        "chain": "polygon",
+                        "status": "PENDING",
+                        "created_at": "2024-01-02T00:00:00Z"
+                    }
+                ]));
+        });
+
+        let result = service.get_whitelisted_addresses().await.unwrap();
+
+        assert_eq!(result.len(), 2);
+        whitelist_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_transfer_until_complete() {
+        let server = MockServer::start();
+
+        let polling_config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let account_mock = create_account_mock(&server, "test-account-id");
+
+        let client = AlpacaWalletClient::new_with_base_url(
+            server.base_url(),
+            "test_key".to_string(),
+            "test_secret".to_string(),
+        )
+        .await
+        .unwrap();
+
+        account_mock.assert();
+
+        let service = AlpacaWalletService::new_with_client(client, Some(polling_config));
+
+        let transfer_id = "550e8400-e29b-41d4-a716-446655440000";
+
+        let status_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/accounts/test-account-id/wallets/transfers")
+                .query_param("transfer_id", transfer_id);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "id": transfer_id,
+                    "relationship": "OUTGOING",
+                    "amount": "100",
+                    "asset": "USDC",
+                    "from_address": null,
+                    "to_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "status": "COMPLETE",
+                    "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                    "created_at": "2024-01-01T00:00:00Z",
+                    "network_fee_amount": "0.5"
+                }]));
+        });
+
+        let tid = TransferId::from(uuid::Uuid::parse_str(transfer_id).unwrap());
+        let result = service.poll_transfer_until_complete(&tid).await.unwrap();
+
+        assert_eq!(result.status, transfer::TransferStatus::Complete);
+        status_mock.assert();
     }
 }

@@ -171,7 +171,11 @@ pub(super) async fn get_deposit_address(
     asset: &str,
     network: &str,
 ) -> Result<DepositAddress, AlpacaWalletError> {
-    let path = format!("/v1/crypto/funding_wallets?asset={asset}&network={network}");
+    let path = format!(
+        "/v1/crypto/funding_wallets?asset={}&network={}",
+        urlencoding::encode(asset),
+        urlencoding::encode(network)
+    );
 
     let response = client.get(&path).await?;
 
@@ -241,10 +245,11 @@ pub(super) async fn get_transfer_status(
 
     let response = client.get(&path).await?;
 
-    let mut transfers: Vec<Transfer> = response.json().await?;
+    let transfers: Vec<Transfer> = response.json().await?;
 
     transfers
-        .pop()
+        .into_iter()
+        .next()
         .ok_or_else(|| AlpacaWalletError::TransferNotFound {
             transfer_id: *transfer_id,
         })
@@ -252,50 +257,12 @@ pub(super) async fn get_transfer_status(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use httpmock::prelude::*;
     use serde_json::json;
     use std::str::FromStr;
 
-    fn create_account_mock<'a>(server: &'a MockServer, account_id: &str) -> httpmock::Mock<'a> {
-        server.mock(|when, then| {
-            when.method(GET).path("/v2/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": account_id,
-                    "account_number": "PA1234567890",
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "buying_power": "100000.00",
-                    "regt_buying_power": "100000.00",
-                    "daytrading_buying_power": "400000.00",
-                    "non_marginable_buying_power": "100000.00",
-                    "cash": "100000.00",
-                    "accrued_fees": "0",
-                    "pending_transfer_out": "0",
-                    "pending_transfer_in": "0",
-                    "portfolio_value": "100000.00",
-                    "pattern_day_trader": false,
-                    "trading_blocked": false,
-                    "transfers_blocked": false,
-                    "account_blocked": false,
-                    "created_at": "2020-01-01T00:00:00Z",
-                    "trade_suspended_by_user": false,
-                    "multiplier": "4",
-                    "shorting_enabled": true,
-                    "equity": "100000.00",
-                    "last_equity": "100000.00",
-                    "long_market_value": "0",
-                    "short_market_value": "0",
-                    "initial_margin": "0",
-                    "maintenance_margin": "0",
-                    "last_maintenance_margin": "0",
-                    "sma": "0",
-                    "daytrade_count": 0
-                }));
-        })
-    }
+    use super::super::client::create_account_mock;
+    use super::*;
 
     #[tokio::test]
     async fn test_get_deposit_address_successful() {

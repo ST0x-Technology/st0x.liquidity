@@ -1,0 +1,117 @@
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct FractionalShares(pub(crate) Decimal);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[error("arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
+pub(crate) struct ArithmeticError {
+    pub(crate) operation: String,
+    pub(crate) lhs: FractionalShares,
+    pub(crate) rhs: FractionalShares,
+}
+
+impl FractionalShares {
+    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
+    pub(crate) const ONE: Self = Self(Decimal::ONE);
+
+    pub(crate) fn abs(self) -> Self {
+        Self(self.0.abs())
+    }
+
+    pub(crate) fn is_negative(self) -> bool {
+        self.0.is_sign_negative()
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+}
+
+impl std::ops::Add for FractionalShares {
+    type Output = Result<Self, ArithmeticError>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        self.0
+            .checked_add(rhs.0)
+            .map(Self)
+            .ok_or_else(|| ArithmeticError {
+                operation: "+".to_string(),
+                lhs: self,
+                rhs,
+            })
+    }
+}
+
+impl std::ops::Sub for FractionalShares {
+    type Output = Result<Self, ArithmeticError>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.0
+            .checked_sub(rhs.0)
+            .map(Self)
+            .ok_or_else(|| ArithmeticError {
+                operation: "-".to_string(),
+                lhs: self,
+                rhs,
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_succeeds() {
+        let a = FractionalShares(Decimal::ONE);
+        let b = FractionalShares(Decimal::TWO);
+
+        let result = (a + b).unwrap();
+
+        assert_eq!(result.0, Decimal::from(3));
+    }
+
+    #[test]
+    fn sub_succeeds() {
+        let a = FractionalShares(Decimal::from(5));
+        let b = FractionalShares(Decimal::TWO);
+
+        let result = (a - b).unwrap();
+
+        assert_eq!(result.0, Decimal::from(3));
+    }
+
+    #[test]
+    fn add_overflow_returns_error() {
+        let max = FractionalShares(Decimal::MAX);
+        let one = FractionalShares(Decimal::ONE);
+
+        let result = max + one;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.operation, "+");
+        assert_eq!(err.lhs, max);
+        assert_eq!(err.rhs, one);
+    }
+
+    #[test]
+    fn sub_overflow_returns_error() {
+        let min = FractionalShares(Decimal::MIN);
+        let one = FractionalShares(Decimal::ONE);
+
+        let result = min - one;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.operation, "-");
+        assert_eq!(err.lhs, min);
+        assert_eq!(err.rhs, one);
+    }
+
+    #[test]
+    fn abs_returns_absolute_value() {
+        let negative = FractionalShares(Decimal::NEGATIVE_ONE);
+        assert_eq!(negative.abs().0, Decimal::ONE);
+    }
+}

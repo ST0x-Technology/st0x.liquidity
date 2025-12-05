@@ -3,7 +3,7 @@ use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
 use tracing::{debug, info};
 
-use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange, ClearV2};
+use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::{
     EvmEnv,
@@ -13,24 +13,24 @@ use crate::onchain::{
 use crate::symbol::cache::SymbolCache;
 
 impl OnchainTrade {
-    /// Creates OnchainTrade directly from ClearV2 blockchain events
+    /// Creates OnchainTrade directly from ClearV3 blockchain events
     #[tracing::instrument(skip_all, fields(tx_hash = ?log.transaction_hash, log_index = ?log.log_index), level = tracing::Level::DEBUG)]
-    pub async fn try_from_clear_v2<P: Provider>(
+    pub async fn try_from_clear_v3<P: Provider>(
         env: &EvmEnv,
         cache: &SymbolCache,
         provider: P,
-        event: ClearV2,
+        event: ClearV3,
         log: Log,
         feed_id_cache: &FeedIdCache,
     ) -> Result<Option<Self>, OnChainError> {
-        let ClearV2 {
+        let ClearV3 {
             sender: _,
             alice: alice_order,
             bob: bob_order,
             clearConfig: clear_config,
         } = event;
 
-        let ClearConfig {
+        let ClearConfigV2 {
             aliceInputIOIndex,
             aliceOutputIOIndex,
             bobInputIOIndex,
@@ -42,7 +42,7 @@ impl OnchainTrade {
         let bob_owner_matches = bob_order.owner == env.order_owner;
 
         debug!(
-            "ClearV2 owner comparison: alice.owner={:?}, bob.owner={:?}, env.order_owner={:?}, alice_matches={}, bob_matches={}",
+            "ClearV3 owner comparison: alice.owner={:?}, bob.owner={:?}, env.order_owner={:?}, alice_matches={}, bob_matches={}",
             alice_order.owner,
             bob_order.owner,
             env.order_owner,
@@ -52,7 +52,7 @@ impl OnchainTrade {
 
         if !(alice_owner_matches || bob_owner_matches) {
             info!(
-                "ClearV2 event filtered (no owner match): tx_hash={:?}, log_index={}, alice.owner={:?}, bob.owner={:?}, target={:?}",
+                "ClearV3 event filtered (no owner match): tx_hash={:?}, log_index={}, alice.owner={:?}, bob.owner={:?}, target={:?}",
                 log.transaction_hash,
                 log.log_index.unwrap_or(0),
                 alice_order.owner,
@@ -64,7 +64,7 @@ impl OnchainTrade {
 
         let after_clear = fetch_after_clear_event(&provider, env, &log).await?;
 
-        let ClearStateChange {
+        let ClearStateChangeV2 {
             aliceOutput,
             bobOutput,
             aliceInput,
@@ -101,7 +101,7 @@ impl OnchainTrade {
 
         if let Ok(Some(ref trade)) = result {
             info!(
-                "ClearV2 trade created successfully: tx_hash={tx_hash:?}, log_index={log_index}, symbol={symbol}, amount={amount}, direction={direction:?}",
+                "ClearV3 trade created successfully: tx_hash={tx_hash:?}, log_index={log_index}, symbol={symbol}, amount={amount}, direction={direction:?}",
                 tx_hash = trade.tx_hash,
                 log_index = trade.log_index,
                 symbol = trade.symbol,
@@ -118,7 +118,7 @@ async fn fetch_after_clear_event<P: Provider>(
     provider: &P,
     env: &EvmEnv,
     log: &Log,
-) -> Result<AfterClear, OnChainError> {
+) -> Result<AfterClearV2, OnChainError> {
     let block_number = log
         .block_number
         .ok_or(TradeValidationError::NoBlockNumber)?;
@@ -126,7 +126,7 @@ async fn fetch_after_clear_event<P: Provider>(
     let filter = Filter::new()
         .select(block_number)
         .address(env.orderbook)
-        .event_signature(AfterClear::SIGNATURE_HASH);
+        .event_signature(AfterClearV2::SIGNATURE_HASH);
 
     let after_clear_logs = provider.get_logs(&filter).await?;
     let after_clear_log = after_clear_logs
@@ -137,25 +137,29 @@ async fn fetch_after_clear_event<P: Provider>(
         })
         .ok_or(TradeValidationError::NoAfterClearLog)?;
 
-    Ok(after_clear_log.log_decode::<AfterClear>()?.data().clone())
+    Ok(after_clear_log.log_decode::<AfterClearV2>()?.data().clone())
 }
 
 #[cfg(test)]
 mod tests {
+    use alloy::hex;
+    use alloy::primitives::{
+        Address, B256, IntoLogData, LogData, U256, address, fixed_bytes, uint,
+    };
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::rpc::types::Log;
+    use alloy::sol_types::SolCall;
+    use rain_math_float::Float;
+    use serde_json::json;
+
     use super::*;
-    use crate::bindings::IERC20::symbolCall;
-    use crate::bindings::IOrderBookV4::{AfterClear, ClearConfig, ClearStateChange};
+    use crate::bindings::IERC20::{decimalsCall, symbolCall};
+    use crate::bindings::IOrderBookV5;
+    use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2};
     use crate::onchain::pyth::FeedIdCache;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::{get_test_log, get_test_order};
     use crate::tokenized_symbol;
-    use alloy::hex;
-    use alloy::primitives::{IntoLogData, U256, address, fixed_bytes};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
-    use alloy::rpc::types::Log;
-    use alloy::sol_types::SolCall;
-    use serde_json::json;
-    use std::str::FromStr;
 
     fn create_test_env() -> EvmEnv {
         EvmEnv {
@@ -167,32 +171,40 @@ mod tests {
     }
 
     fn create_clear_event(
-        alice_order: crate::bindings::IOrderBookV4::OrderV3,
-        bob_order: crate::bindings::IOrderBookV4::OrderV3,
-    ) -> ClearV2 {
-        ClearV2 {
+        alice_order: IOrderBookV5::OrderV4,
+        bob_order: IOrderBookV5::OrderV4,
+    ) -> ClearV3 {
+        ClearV3 {
             sender: address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
             alice: alice_order,
             bob: bob_order,
-            clearConfig: ClearConfig {
+            clearConfig: ClearConfigV2 {
                 aliceInputIOIndex: U256::from(0),
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: U256::ZERO,
-                bobBountyVaultId: U256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         }
     }
 
-    fn create_after_clear_event() -> AfterClear {
-        AfterClear {
+    fn create_after_clear_event() -> AfterClearV2 {
+        AfterClearV2 {
             sender: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-            clearStateChange: ClearStateChange {
-                aliceOutput: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 dps)
-                bobOutput: U256::from(100_000_000u64),                       // 100 USDC (6 dps)
-                aliceInput: U256::from(100_000_000u64),                      // 100 USDC (6 dps)
-                bobInput: U256::from_str("9000000000000000000").unwrap(),    // 9 shares (18 dps)
+            clearStateChange: ClearStateChangeV2 {
+                aliceOutput: Float::from_fixed_decimal(uint!(9_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+                bobOutput: Float::from_fixed_decimal(uint!(100_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+                aliceInput: Float::from_fixed_decimal(uint!(100_U256), 0)
+                    .unwrap()
+                    .get_inner(),
+                bobInput: Float::from_fixed_decimal(uint!(9_U256), 0)
+                    .unwrap()
+                    .get_inner(),
             },
         }
     }
@@ -216,7 +228,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_alice_order_match() {
+    async fn test_try_from_clear_v3_alice_order_match() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -265,16 +277,20 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -293,7 +309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_bob_order_match() {
+    async fn test_try_from_clear_v3_bob_order_match() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -341,16 +357,20 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -369,7 +389,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_no_order_match() {
+    async fn test_try_from_clear_v3_no_order_match() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -391,7 +411,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -406,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_missing_block_number() {
+    async fn test_try_from_clear_v3_missing_block_number() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -426,7 +446,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -443,7 +463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_missing_after_clear_log() {
+    async fn test_try_from_clear_v3_missing_after_clear_log() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -477,7 +497,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -489,12 +509,12 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
         ));
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_after_clear_wrong_transaction() {
+    async fn test_try_from_clear_v3_after_clear_wrong_transaction() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -547,7 +567,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -559,12 +579,12 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
         ));
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_after_clear_wrong_log_index() {
+    async fn test_try_from_clear_v3_after_clear_wrong_log_index() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -615,7 +635,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -627,12 +647,12 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
         ));
     }
 
     #[tokio::test]
-    async fn test_try_from_clear_v2_alice_and_bob_both_match() {
+    async fn test_try_from_clear_v3_alice_and_bob_both_match() {
         let env = create_test_env();
         let cache = SymbolCache::default();
 
@@ -676,16 +696,20 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&json!([after_clear_log]));
         asserter.push_success(&mocked_receipt_hex(tx_hash));
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -706,24 +730,32 @@ mod tests {
 
     fn create_parameterized_after_clear_event(
         sender_byte: u8,
-        alice_output: &str,
-        bob_output: u64,
-    ) -> AfterClear {
-        AfterClear {
-            sender: alloy::primitives::Address::repeat_byte(sender_byte),
-            clearStateChange: ClearStateChange {
-                aliceOutput: U256::from_str(alice_output).unwrap(),
-                bobOutput: U256::from(bob_output),
-                aliceInput: U256::from(bob_output),
-                bobInput: U256::from_str(alice_output).unwrap(),
+        alice_shares: u64,
+        bob_usdc: u64,
+    ) -> AfterClearV2 {
+        AfterClearV2 {
+            sender: Address::repeat_byte(sender_byte),
+            clearStateChange: ClearStateChangeV2 {
+                aliceOutput: Float::from_fixed_decimal(U256::from(alice_shares), 0)
+                    .unwrap()
+                    .get_inner(),
+                bobOutput: Float::from_fixed_decimal(U256::from(bob_usdc), 0)
+                    .unwrap()
+                    .get_inner(),
+                aliceInput: Float::from_fixed_decimal(U256::from(bob_usdc), 0)
+                    .unwrap()
+                    .get_inner(),
+                bobInput: Float::from_fixed_decimal(U256::from(alice_shares), 0)
+                    .unwrap()
+                    .get_inner(),
             },
         }
     }
 
     fn create_test_log(
-        orderbook: alloy::primitives::Address,
-        tx_hash: alloy::primitives::B256,
-        log_data: alloy::primitives::LogData,
+        orderbook: Address,
+        tx_hash: B256,
+        log_data: LogData,
         log_index: u64,
     ) -> Log {
         Log {
@@ -741,7 +773,7 @@ mod tests {
         }
     }
 
-    fn create_test_receipt_json(tx_hash: alloy::primitives::B256) -> serde_json::Value {
+    fn create_test_receipt_json(tx_hash: B256) -> serde_json::Value {
         json!({
             "transactionHash": tx_hash,
             "transactionIndex": "0x1",
@@ -779,10 +811,8 @@ mod tests {
 
         let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 5);
 
-        let after_clear_event_1 =
-            create_parameterized_after_clear_event(0xaa, "9000000000000000000", 100_000_000);
-        let after_clear_event_2 =
-            create_parameterized_after_clear_event(0xbb, "5000000000000000000", 50_000_000);
+        let after_clear_event_1 = create_parameterized_after_clear_event(0xaa, 9, 100);
+        let after_clear_event_2 = create_parameterized_after_clear_event(0xbb, 5, 50);
 
         let after_clear_log_1 =
             create_test_log(orderbook, tx_hash, after_clear_event_1.to_log_data(), 6);
@@ -793,16 +823,20 @@ mod tests {
         asserter.push_success(&json!([after_clear_log_1, after_clear_log_2]));
         let receipt_json = create_test_receipt_json(tx_hash);
         asserter.push_success(&receipt_json);
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -870,7 +904,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
@@ -909,8 +943,7 @@ mod tests {
         let clear_log = create_test_log(orderbook, target_tx_hash, clear_event.to_log_data(), 3);
 
         let after_clear_event_correct = create_after_clear_event();
-        let after_clear_event_wrong =
-            create_parameterized_after_clear_event(0xcc, "1000000000000000000", 10_000_000);
+        let after_clear_event_wrong = create_parameterized_after_clear_event(0xcc, 1, 10);
 
         let wrong_tx_log = create_test_log(
             orderbook,
@@ -929,16 +962,20 @@ mod tests {
         asserter.push_success(&json!([wrong_tx_log, correct_log]));
         let receipt_json = create_test_receipt_json(target_tx_hash);
         asserter.push_success(&receipt_json);
+        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
-        let result = OnchainTrade::try_from_clear_v2(
+        let result = OnchainTrade::try_from_clear_v3(
             &env,
             &cache,
             provider,
