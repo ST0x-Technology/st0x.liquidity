@@ -180,7 +180,7 @@ Implement NotStarted → WithdrawalInitiated transition with view tracking.
 - All clippy errors fixed using if let instead of match for single patterns and
   explicit enum variants instead of wildcards
 
-## Task 3. Refactor to Lifecycle Pattern
+## Task 3. Refactor to Lifecycle Pattern ✅
 
 Convert the UsdcRebalance aggregate to use `Lifecycle<T, E>` wrapper pattern,
 matching the established patterns in TokenizedEquityMint and EquityRedemption.
@@ -189,47 +189,71 @@ type, and using `Lifecycle::Uninitialized` instead of `NotStarted` variant.
 
 ### Subtasks
 
-- [ ] Convert directory structure to flat file:
-  - [ ] Consolidate `src/usdc_rebalance/mod.rs`, `cmd.rs`, `event.rs`, `view.rs`
+- [x] Convert directory structure to flat file:
+  - [x] Consolidate `src/usdc_rebalance/mod.rs`, `cmd.rs`, `event.rs`, `view.rs`
         into single `src/usdc_rebalance.rs`
-  - [ ] Delete `src/usdc_rebalance/` directory
-  - [ ] Update `src/lib.rs` to import from flat file
-- [ ] Refactor to use `Lifecycle<UsdcRebalance, Never>`:
-  - [ ] Remove `NotStarted` variant from `UsdcRebalance` enum
-  - [ ] Use `Lifecycle::Uninitialized` for uninitialized state
-  - [ ] Implement `Aggregate` for `Lifecycle<UsdcRebalance, Never>`
-  - [ ] Add
+  - [x] Delete `src/usdc_rebalance/` directory
+  - [x] Update `src/lib.rs` to import from flat file
+- [x] Refactor to use `Lifecycle<UsdcRebalance, Never>`:
+  - [x] Remove `NotStarted` variant from `UsdcRebalance` enum
+  - [x] Use `Lifecycle::Uninitialized` for uninitialized state
+  - [x] Implement `Aggregate` for `Lifecycle<UsdcRebalance, Never>`
+  - [x] Add
         `apply_transition(event: &UsdcRebalanceEvent, current: &UsdcRebalance)
         -> Result<UsdcRebalance, LifecycleError<Never>>`
         function
-  - [ ] Add
+  - [x] Add
         `from_event(event: &UsdcRebalanceEvent) -> Result<UsdcRebalance,
         LifecycleError<Never>>`
         function
-  - [ ] Use `LifecycleError::Mismatch` for invalid state transitions instead of
+  - [x] Use `LifecycleError::Mismatch` for invalid state transitions instead of
         custom errors
-- [ ] Remove separate View type:
-  - [ ] Delete `UsdcRebalanceView` enum
-  - [ ] Implement `View<Lifecycle<UsdcRebalance, Never>> for Lifecycle<...>`
-  - [ ] Add
-        `update_from_event(event: &UsdcRebalanceEvent, current:
-        &Lifecycle<...>) -> Lifecycle<...>`
-        function
-- [ ] Update error handling:
-  - [ ] Remove `UsdcRebalanceError::InvalidStateTransition` (use
+- [x] Remove separate View type:
+  - [x] Delete `UsdcRebalanceView` enum
+  - [x] Implement `View<Lifecycle<UsdcRebalance, Never>> for Lifecycle<...>`
+  - [x] Uses `transition()` and `or_initialize()` pattern (no separate function)
+- [x] Update error handling:
+  - [x] Remove `UsdcRebalanceError::InvalidStateTransition` (use
         `LifecycleError::Mismatch` instead)
-  - [ ] Keep domain-specific errors like `AlreadyInitiated` but convert to
-        return `TokenizedEquityMintError`-style error wrapping `LifecycleError`
-- [ ] Update tests:
-  - [ ] Update existing tests to use `Lifecycle<UsdcRebalance, Never>`
-  - [ ] Replace `UsdcRebalance::default()` with `Lifecycle::Uninitialized`
-  - [ ] Update view tests to use `Lifecycle` self-view pattern
+  - [x] Keep domain-specific errors like `AlreadyInitiated` with
+        `#[from] LifecycleError<Never>` conversion
+- [x] Update tests:
+  - [x] Update existing tests to use `Lifecycle<UsdcRebalance, Never>`
+  - [x] Replace `UsdcRebalance::default()` with `Lifecycle::default()`
+  - [x] Update view tests to use `Lifecycle` self-view pattern
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass (6 usdc_rebalance tests)
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
+
+### Implementation Summary
+
+**Files Created:**
+
+- `src/usdc_rebalance.rs`: Consolidated flat file containing all types,
+  commands, events, aggregate implementation, view, and tests
+
+**Files Deleted:**
+
+- `src/usdc_rebalance/mod.rs`
+- `src/usdc_rebalance/cmd.rs`
+- `src/usdc_rebalance/event.rs`
+- `src/usdc_rebalance/view.rs`
+
+**Key Changes:**
+
+- Removed `NotStarted` variant from `UsdcRebalance` enum - now using
+  `Lifecycle::Uninitialized`
+- Removed `UsdcRebalanceView` enum - using `impl View<Self> for Lifecycle<...>`
+  self-view pattern
+- Removed `InvalidStateTransition` error variant - using
+  `LifecycleError::Mismatch` via `#[from]` conversion
+- Added `apply_transition()` and `from_event()` static methods on
+  `UsdcRebalance`
+- Tests use `Lifecycle::<UsdcRebalance, Never>::default()` instead of
+  `UsdcRebalance::default()`
 
 ## Task 4. Withdrawal Confirmation
 
