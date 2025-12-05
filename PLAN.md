@@ -406,39 +406,84 @@ WithdrawalComplete --InitiateBridging--> Bridging
 - Edge case: attempting to bridge twice
 - View tracking: verifying state transitions through event envelope updates
 
-## Task 6. Bridge Attestation Receipt
+## Task 6. Bridge Attestation Receipt ✅
 
-Implement BridgingInitiated → BridgeAttestationReceived transition. (View
-updates are handled by the Lifecycle self-view pattern.)
+Implement Bridging → Attested transition. (View updates are handled by the
+Lifecycle self-view pattern.)
 
 ### Subtasks
 
-- [ ] Add state `BridgeAttestationReceived`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
-  - [ ] `burn_tx_hash: TxHash`
-  - [ ] `cctp_nonce: u64`
-  - [ ] `attestation: Bytes`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `attested_at: DateTime<Utc>`
-- [ ] Add command `ReceiveAttestation { attestation: Bytes }`
-- [ ] Add event `BridgeAttestationReceived { attestation: Bytes, attested_at }`
-- [ ] Update `handle()`:
-  - [ ] `BridgingInitiated` + `ReceiveAttestation` → emit
-        `BridgeAttestationReceived`
-- [ ] Update `apply_transition()` for `BridgeAttestationReceived` event
-- [ ] Add error `BridgingNotInitiated`
+- [x] Add state `Attested`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `burn_tx_hash: TxHash`
+  - [x] `cctp_nonce: u64`
+  - [x] `attestation: Vec<u8>`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `attested_at: DateTime<Utc>`
+- [x] Add command `ReceiveAttestation { attestation: Vec<u8> }` (already
+      defined)
+- [x] Add event `BridgeAttestationReceived { attestation, attested_at }`
+      (already defined)
+- [x] Update `handle()`:
+  - [x] `Bridging` + `ReceiveAttestation` → emit `BridgeAttestationReceived`
+- [x] Update `apply_transition()` for `BridgeAttestationReceived` event
+- [x] Add error `BridgingNotInitiated`
+- [x] Update existing match arms to handle `Attested` state
 
 ### Tests
 
-- [ ] `test_receive_attestation`
-- [ ] `test_cannot_receive_attestation_before_bridging`
+- [x] `test_receive_attestation_after_bridging_initiated`
+- [x] `test_cannot_receive_attestation_before_bridging`
+- [x] `test_cannot_receive_attestation_while_withdrawing`
+- [x] `test_cannot_receive_attestation_after_withdrawal_complete`
+- [x] `test_cannot_receive_attestation_after_withdrawal_failed`
+- [x] `test_cannot_receive_attestation_twice`
+- [x] `test_view_tracks_attestation_receipt`
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass (28 usdc_rebalance tests)
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
+
+### Implementation Summary
+
+**Key Changes:**
+
+- Added `Attested` state variant to `UsdcRebalance` enum with fields: direction,
+  amount, burn_tx_hash, cctp_nonce, attestation, initiated_at, attested_at
+- Added `BridgingNotInitiated` error variant for attempting to receive
+  attestation before bridging is initiated
+- Implemented `handle_receive_attestation()` command handler with proper state
+  validation:
+  - Returns `BridgingNotInitiated` error from Uninitialized, Withdrawing,
+    WithdrawalComplete, or WithdrawalFailed states
+  - Emits `BridgeAttestationReceived` event from `Bridging` state
+  - Returns `InvalidCommand` error from `Attested` state (can't receive
+    attestation twice)
+- Updated `apply_transition()` to handle `BridgeAttestationReceived` event,
+  transitioning from `Bridging` to `Attested` state
+- Updated `handle_confirm_withdrawal`, `handle_fail_withdrawal`, and
+  `handle_initiate_bridging` match arms to properly handle `Attested` state
+
+**State Machine:**
+
+```
+Lifecycle::Uninitialized --Initiate--> Withdrawing
+Withdrawing --ConfirmWithdrawal--> WithdrawalComplete
+Withdrawing --FailWithdrawal--> WithdrawalFailed
+WithdrawalComplete --InitiateBridging--> Bridging
+Bridging --ReceiveAttestation--> Attested
+```
+
+**Tests Added:** 7 new tests covering:
+
+- Happy path: receiving attestation after bridging initiated
+- Error cases: receiving attestation before bridging, during withdrawal, after
+  withdrawal complete, after withdrawal failure
+- Edge case: attempting to receive attestation twice
+- View tracking: verifying state transitions through event envelope updates
 
 ## Task 7. Bridge Mint Confirmation and Failure
 
