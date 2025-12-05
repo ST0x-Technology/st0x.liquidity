@@ -6,21 +6,60 @@
 //!
 //! # State Flow
 //!
-//! The aggregate progresses through the following states:
+//! The aggregate progresses through 10 states grouped into three phases:
 //!
 //! ```text
-//! (start) --Initiate--> Withdrawing --ConfirmWithdrawal--> WithdrawalComplete
-//!                              |                                          |
-//!                              v                                          v
-//!                       WithdrawalFailed                          (future states)
-//! ```
+//! WITHDRAWAL PHASE:
+//!   Uninitialized --Initiate--> Withdrawing --ConfirmWithdrawal--> WithdrawalComplete
+//!                                    |                                     |
+//!                                    +--FailWithdrawal--> WithdrawalFailed |
+//!                                                                          |
+//! BRIDGING PHASE:                                            InitiateBridging
+//!                                                                          |
+//!                                                                          v
+//!   Bridging --ReceiveAttestation--> Attested --ConfirmBridging--> Bridged
+//!       |                                |                             |
+//!       +----------FailBridging----------+--> BridgingFailed           |
+//!                                                                      |
+//! DEPOSIT PHASE:                                             InitiateDeposit
+//!                                                                      |
+//!                                                                      v
+//!   DepositInitiated --ConfirmDeposit--> DepositConfirmed (success)
+//!          |
+//!          +--FailDeposit--> DepositFailed (failure)
 //!
-//! Terminal states: `WithdrawalFailed`, `BridgingFailed`, `DepositFailed`, `DepositConfirmed`
+//! Terminal states: WithdrawalFailed, BridgingFailed, DepositFailed, DepositConfirmed
+//! ```
 //!
 //! # Direction
 //!
-//! - `AlpacaToBase`: Withdraw from Alpaca → CCTP bridge → Deposit to Rain vault on Base
-//! - `BaseToAlpaca`: Withdraw from Rain vault → CCTP bridge → Deposit to Alpaca
+//! The aggregate supports bidirectional rebalancing:
+//!
+//! - **AlpacaToBase**: Withdraw USDC from Alpaca -> CCTP bridge (Ethereum -> Base) ->
+//!   Deposit to Rain orderbook vault on Base
+//! - **BaseToAlpaca**: Withdraw from Rain vault on Base -> CCTP bridge (Base -> Ethereum) ->
+//!   Deposit to Alpaca
+//!
+//! # Integration Points
+//!
+//! - **Alpaca API**: Crypto wallet withdrawals and deposits via [`AlpacaWalletService`]
+//! - **CCTP Bridge**: Circle's Cross-Chain Transfer Protocol for trustless USDC bridging
+//!   - Burn on source chain (Ethereum or Base)
+//!   - Attestation from Circle API (~20-30 seconds)
+//!   - Mint on destination chain
+//! - **Rain Orderbook**: Onchain vault deposits/withdrawals on Base
+//!
+//! # Error Handling
+//!
+//! Each phase has dedicated failure states that preserve context for debugging and retry:
+//! - `WithdrawalFailed`: Preserves `withdrawal_ref` for tracking the failed transfer
+//! - `BridgingFailed`: Preserves `burn_tx_hash` and `cctp_nonce` when available
+//! - `DepositFailed`: Preserves `deposit_ref` for tracking the failed deposit
+//!
+//! Terminal states (`*Failed`, `DepositConfirmed`) reject all commands to prevent
+//! invalid state transitions.
+//!
+//! [`AlpacaWalletService`]: crate::alpaca_wallet::AlpacaWalletService
 
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
@@ -95,81 +134,88 @@ pub(crate) enum UsdcRebalanceError {
 }
 
 /// Commands for the USDC rebalance aggregate.
+///
+/// Commands are validated against the current state before being processed.
+/// Invalid commands return appropriate errors without mutating state.
 #[derive(Debug, Clone)]
 pub(crate) enum UsdcRebalanceCommand {
+    /// Start a new rebalancing operation. Valid only from `Uninitialized` state.
     Initiate {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal: TransferRef,
     },
+    /// Confirm successful withdrawal from source. Valid only from `Withdrawing` state.
     ConfirmWithdrawal,
-    InitiateBridging {
-        burn_tx: TxHash,
-        cctp_nonce: u64,
-    },
-    ReceiveAttestation {
-        attestation: Vec<u8>,
-    },
-    ConfirmBridging {
-        mint_tx: TxHash,
-    },
-    InitiateDeposit {
-        deposit: TransferRef,
-    },
+    /// Record the CCTP burn transaction. Valid only from `WithdrawalComplete` state.
+    InitiateBridging { burn_tx: TxHash, cctp_nonce: u64 },
+    /// Record the Circle attestation. Valid only from `Bridging` state.
+    ReceiveAttestation { attestation: Vec<u8> },
+    /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
+    ConfirmBridging { mint_tx: TxHash },
+    /// Start deposit to destination. Valid only from `Bridged` state.
+    InitiateDeposit { deposit: TransferRef },
+    /// Confirm successful deposit. Valid only from `DepositInitiated` state.
     ConfirmDeposit,
-    FailWithdrawal {
-        reason: String,
-    },
-    FailBridging {
-        reason: String,
-    },
-    FailDeposit {
-        reason: String,
-    },
+    /// Record withdrawal failure. Valid only from `Withdrawing` state.
+    FailWithdrawal { reason: String },
+    /// Record bridging failure. Valid from `Bridging` or `Attested` states.
+    FailBridging { reason: String },
+    /// Record deposit failure. Valid only from `DepositInitiated` state.
+    FailDeposit { reason: String },
 }
 
 /// Events emitted by the USDC rebalance aggregate.
+///
+/// Events represent immutable facts that have occurred and are persisted to the event store.
+/// Each event carries only the data relevant to that state transition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum UsdcRebalanceEvent {
+    /// Rebalancing operation started. Records direction, amount, and withdrawal reference.
     Initiated {
         direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
-    WithdrawalConfirmed {
-        confirmed_at: DateTime<Utc>,
-    },
+    /// Withdrawal from source completed successfully.
+    WithdrawalConfirmed { confirmed_at: DateTime<Utc> },
+    /// Withdrawal from source failed.
     WithdrawalFailed {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// CCTP burn transaction submitted. Records burn hash and nonce for attestation lookup.
     BridgingInitiated {
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         burned_at: DateTime<Utc>,
     },
+    /// Circle attestation received. Enables minting on destination chain.
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         attested_at: DateTime<Utc>,
     },
+    /// CCTP mint transaction confirmed on destination chain.
     Bridged {
         mint_tx_hash: TxHash,
         minted_at: DateTime<Utc>,
     },
+    /// Bridging failed. Preserves burn data when available for debugging.
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<u64>,
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// Deposit to destination initiated.
     DepositInitiated {
         deposit_ref: TransferRef,
         deposit_initiated_at: DateTime<Utc>,
     },
-    DepositConfirmed {
-        deposit_confirmed_at: DateTime<Utc>,
-    },
+    /// Deposit completed successfully. Terminal success state.
+    DepositConfirmed { deposit_confirmed_at: DateTime<Utc> },
+    /// Deposit failed. Preserves deposit reference when available.
     DepositFailed {
         deposit_ref: Option<TransferRef>,
         reason: String,
