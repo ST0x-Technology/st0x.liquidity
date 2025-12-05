@@ -33,7 +33,7 @@ use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
-pub(crate) use transfer::{Network, TokenSymbol, Transfer, TransferId};
+pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -109,7 +109,7 @@ impl AlpacaWalletService {
     /// Returns an error if the transfer is not found or the API call fails.
     pub async fn get_transfer_status(
         &self,
-        transfer_id: &TransferId,
+        transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         transfer::get_transfer_status(&self.client, transfer_id).await
     }
@@ -126,7 +126,7 @@ impl AlpacaWalletService {
     /// - The API call fails persistently
     pub async fn poll_transfer_until_complete(
         &self,
-        transfer_id: &TransferId,
+        transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
     }
@@ -428,12 +428,12 @@ mod tests {
 
         let service = AlpacaWalletService::new_with_client(client, Some(polling_config));
 
-        let transfer_id = "550e8400-e29b-41d4-a716-446655440000";
+        let transfer_id = uuid::Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/accounts/test-account-id/wallets/transfers")
-                .query_param("transfer_id", transfer_id);
+                .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
@@ -450,7 +450,7 @@ mod tests {
                 }]));
         });
 
-        let tid = TransferId::from(uuid::Uuid::parse_str(transfer_id).unwrap());
+        let tid = transfer::AlpacaTransferId::from(transfer_id);
         let result = service.poll_transfer_until_complete(&tid).await.unwrap();
 
         assert_eq!(result.status, transfer::TransferStatus::Complete);
