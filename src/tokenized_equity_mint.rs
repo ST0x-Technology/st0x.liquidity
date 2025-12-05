@@ -220,225 +220,6 @@ pub(crate) enum TokenizedEquityMint {
     },
 }
 
-impl TokenizedEquityMint {
-    /// Apply a transition event to an existing mint state.
-    pub(crate) fn apply_transition(
-        event: &TokenizedEquityMintEvent,
-        current: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
-        match event {
-            TokenizedEquityMintEvent::MintAccepted {
-                issuer_request_id,
-                tokenization_request_id,
-                accepted_at,
-            } => current.apply_accepted(
-                issuer_request_id,
-                tokenization_request_id,
-                *accepted_at,
-                event,
-            ),
-
-            TokenizedEquityMintEvent::TokensReceived {
-                tx_hash,
-                receipt_id,
-                shares_minted,
-                received_at,
-            } => current.apply_tokens_received(
-                *tx_hash,
-                receipt_id,
-                *shares_minted,
-                *received_at,
-                event,
-            ),
-
-            TokenizedEquityMintEvent::MintCompleted { completed_at } => {
-                current.apply_completed(*completed_at, event)
-            }
-
-            TokenizedEquityMintEvent::MintFailed { reason, failed_at } => {
-                current.apply_failed(reason, *failed_at, event)
-            }
-
-            TokenizedEquityMintEvent::MintRequested { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{current:?}"),
-                event: event.event_type(),
-            }),
-        }
-    }
-
-    fn apply_accepted(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        tokenization_request_id: &TokenizationRequestId,
-        accepted_at: DateTime<Utc>,
-        event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::MintRequested {
-            symbol,
-            quantity,
-            wallet,
-            requested_at,
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
-            });
-        };
-
-        Ok(Self::MintAccepted {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            wallet: *wallet,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            requested_at: *requested_at,
-            accepted_at,
-        })
-    }
-
-    fn apply_tokens_received(
-        &self,
-        tx_hash: TxHash,
-        receipt_id: &ReceiptId,
-        shares_minted: U256,
-        received_at: DateTime<Utc>,
-        event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::MintAccepted {
-            symbol,
-            quantity,
-            wallet,
-            issuer_request_id,
-            tokenization_request_id,
-            requested_at,
-            accepted_at,
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
-            });
-        };
-
-        Ok(Self::TokensReceived {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            wallet: *wallet,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            tx_hash,
-            receipt_id: receipt_id.clone(),
-            shares_minted,
-            requested_at: *requested_at,
-            accepted_at: *accepted_at,
-            received_at,
-        })
-    }
-
-    fn apply_completed(
-        &self,
-        completed_at: DateTime<Utc>,
-        event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::TokensReceived {
-            symbol,
-            quantity,
-            wallet,
-            issuer_request_id,
-            tokenization_request_id,
-            tx_hash,
-            receipt_id,
-            shares_minted,
-            requested_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
-            });
-        };
-
-        Ok(Self::Completed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            wallet: *wallet,
-            issuer_request_id: issuer_request_id.clone(),
-            tokenization_request_id: tokenization_request_id.clone(),
-            tx_hash: *tx_hash,
-            receipt_id: receipt_id.clone(),
-            shares_minted: *shares_minted,
-            requested_at: *requested_at,
-            completed_at,
-        })
-    }
-
-    fn apply_failed(
-        &self,
-        reason: &str,
-        failed_at: DateTime<Utc>,
-        event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let (Self::MintRequested {
-            symbol,
-            quantity,
-            requested_at,
-            ..
-        }
-        | Self::MintAccepted {
-            symbol,
-            quantity,
-            requested_at,
-            ..
-        }
-        | Self::TokensReceived {
-            symbol,
-            quantity,
-            requested_at,
-            ..
-        }) = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
-            });
-        };
-
-        Ok(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            reason: reason.to_string(),
-            requested_at: *requested_at,
-            failed_at,
-        })
-    }
-
-    /// Create initial state from an initialization event.
-    pub(crate) fn from_event(
-        event: &TokenizedEquityMintEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        match event {
-            TokenizedEquityMintEvent::MintRequested {
-                symbol,
-                quantity,
-                wallet,
-                requested_at,
-            } => Ok(Self::MintRequested {
-                symbol: symbol.clone(),
-                quantity: *quantity,
-                wallet: *wallet,
-                requested_at: *requested_at,
-            }),
-
-            _ => Err(LifecycleError::Mismatch {
-                state: "Uninitialized".into(),
-                event: format!("{event:?}"),
-            }),
-        }
-    }
-}
-
 #[async_trait]
 impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
     type Command = TokenizedEquityMintCommand;
@@ -590,6 +371,225 @@ impl Lifecycle<TokenizedEquityMint, Never> {
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+impl TokenizedEquityMint {
+    /// Apply a transition event to an existing mint state.
+    pub(crate) fn apply_transition(
+        event: &TokenizedEquityMintEvent,
+        current: &Self,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match event {
+            TokenizedEquityMintEvent::MintAccepted {
+                issuer_request_id,
+                tokenization_request_id,
+                accepted_at,
+            } => current.apply_accepted(
+                issuer_request_id,
+                tokenization_request_id,
+                *accepted_at,
+                event,
+            ),
+
+            TokenizedEquityMintEvent::TokensReceived {
+                tx_hash,
+                receipt_id,
+                shares_minted,
+                received_at,
+            } => current.apply_tokens_received(
+                *tx_hash,
+                receipt_id,
+                *shares_minted,
+                *received_at,
+                event,
+            ),
+
+            TokenizedEquityMintEvent::MintCompleted { completed_at } => {
+                current.apply_completed(*completed_at, event)
+            }
+
+            TokenizedEquityMintEvent::MintFailed { reason, failed_at } => {
+                current.apply_failed(reason, *failed_at, event)
+            }
+
+            TokenizedEquityMintEvent::MintRequested { .. } => Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: event.event_type(),
+            }),
+        }
+    }
+
+    /// Create initial state from an initialization event.
+    pub(crate) fn from_event(
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        match event {
+            TokenizedEquityMintEvent::MintRequested {
+                symbol,
+                quantity,
+                wallet,
+                requested_at,
+            } => Ok(Self::MintRequested {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                wallet: *wallet,
+                requested_at: *requested_at,
+            }),
+
+            _ => Err(LifecycleError::Mismatch {
+                state: "Uninitialized".into(),
+                event: format!("{event:?}"),
+            }),
+        }
+    }
+
+    fn apply_accepted(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        tokenization_request_id: &TokenizationRequestId,
+        accepted_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::MintRequested {
+            symbol,
+            quantity,
+            wallet,
+            requested_at,
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::MintAccepted {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            wallet: *wallet,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            requested_at: *requested_at,
+            accepted_at,
+        })
+    }
+
+    fn apply_tokens_received(
+        &self,
+        tx_hash: TxHash,
+        receipt_id: &ReceiptId,
+        shares_minted: U256,
+        received_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::MintAccepted {
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+            tokenization_request_id,
+            requested_at,
+            accepted_at,
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::TokensReceived {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            wallet: *wallet,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            tx_hash,
+            receipt_id: receipt_id.clone(),
+            shares_minted,
+            requested_at: *requested_at,
+            accepted_at: *accepted_at,
+            received_at,
+        })
+    }
+
+    fn apply_completed(
+        &self,
+        completed_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::TokensReceived {
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+            tokenization_request_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            requested_at,
+            ..
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::Completed {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            wallet: *wallet,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            tx_hash: *tx_hash,
+            receipt_id: receipt_id.clone(),
+            shares_minted: *shares_minted,
+            requested_at: *requested_at,
+            completed_at,
+        })
+    }
+
+    fn apply_failed(
+        &self,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let (Self::MintRequested {
+            symbol,
+            quantity,
+            requested_at,
+            ..
+        }
+        | Self::MintAccepted {
+            symbol,
+            quantity,
+            requested_at,
+            ..
+        }
+        | Self::TokensReceived {
+            symbol,
+            quantity,
+            requested_at,
+            ..
+        }) = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::Failed {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            reason: reason.to_string(),
+            requested_at: *requested_at,
+            failed_at,
+        })
     }
 }
 
