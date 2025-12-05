@@ -25,6 +25,10 @@ pub(crate) struct OnChainTrade {
 }
 
 impl OnChainTrade {
+    pub(crate) fn aggregate_id(tx_hash: TxHash, log_index: u64) -> String {
+        format!("{tx_hash}:{log_index}")
+    }
+
     pub(crate) fn is_enriched(&self) -> bool {
         self.enrichment.is_some()
     }
@@ -142,6 +146,30 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
         match (self.live(), &command) {
             (
                 Err(LifecycleError::Uninitialized),
+                OnChainTradeCommand::Migrate {
+                    symbol,
+                    amount,
+                    direction,
+                    price_usdc,
+                    block_number,
+                    block_timestamp,
+                    gas_used,
+                    pyth_price,
+                },
+            ) => Ok(vec![OnChainTradeEvent::Migrated {
+                symbol: symbol.clone(),
+                amount: *amount,
+                direction: *direction,
+                price_usdc: *price_usdc,
+                block_number: *block_number,
+                block_timestamp: *block_timestamp,
+                gas_used: *gas_used,
+                pyth_price: pyth_price.clone(),
+                migrated_at: Utc::now(),
+            }]),
+
+            (
+                Err(LifecycleError::Uninitialized),
                 OnChainTradeCommand::Witness {
                     symbol,
                     amount,
@@ -160,7 +188,9 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
                 filled_at: Utc::now(),
             }]),
 
-            (Ok(_), OnChainTradeCommand::Witness { .. }) => Err(OnChainTradeError::AlreadyFilled),
+            (Ok(_), OnChainTradeCommand::Migrate { .. } | OnChainTradeCommand::Witness { .. }) => {
+                Err(OnChainTradeError::AlreadyFilled)
+            }
 
             (
                 Ok(trade),
@@ -212,6 +242,16 @@ pub(crate) enum OnChainTradeError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum OnChainTradeCommand {
+    Migrate {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+    },
     Witness {
         symbol: Symbol,
         amount: Decimal,
@@ -801,5 +841,121 @@ mod tests {
         view.update(&make_envelope("0x1234:0", 1, event));
 
         assert!(matches!(view, Lifecycle::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_migrate_command_creates_migrated_event() {
+        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let command = OnChainTradeCommand::Migrate {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            gas_used: None,
+            pyth_price: None,
+        };
+
+        let events = aggregate.handle(command, &()).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OnChainTradeEvent::Migrated {
+                symbol: evt_symbol,
+                amount,
+                direction,
+                price_usdc,
+                block_number,
+                gas_used,
+                pyth_price,
+                ..
+            } => {
+                assert_eq!(evt_symbol, &symbol);
+                assert_eq!(amount, &dec!(10.5));
+                assert_eq!(direction, &Direction::Buy);
+                assert_eq!(price_usdc, &dec!(150.25));
+                assert_eq!(block_number, &12345);
+                assert!(gas_used.is_none());
+                assert!(pyth_price.is_none());
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_migrate_command_with_enrichment() {
+        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let pyth_price = PythPrice {
+            value: "150250000".to_string(),
+            expo: -6,
+            conf: "50000".to_string(),
+            publish_time: now,
+        };
+
+        let command = OnChainTradeCommand::Migrate {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            gas_used: Some(50000),
+            pyth_price: Some(pyth_price.clone()),
+        };
+
+        let events = aggregate.handle(command, &()).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            OnChainTradeEvent::Migrated {
+                gas_used,
+                pyth_price: evt_pyth,
+                ..
+            } => {
+                assert_eq!(gas_used, &Some(50000));
+                assert_eq!(evt_pyth, &Some(pyth_price));
+            }
+            _ => panic!("Expected Migrated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cannot_migrate_when_already_filled() {
+        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+
+        let filled_event = OnChainTradeEvent::Filled {
+            symbol: symbol.clone(),
+            amount: dec!(10.5),
+            direction: Direction::Buy,
+            price_usdc: dec!(150.25),
+            block_number: 12345,
+            block_timestamp: now,
+            filled_at: now,
+        };
+        aggregate.apply(filled_event);
+
+        let command = OnChainTradeCommand::Migrate {
+            symbol,
+            amount: dec!(5.0),
+            direction: Direction::Sell,
+            price_usdc: dec!(160.00),
+            block_number: 12346,
+            block_timestamp: now,
+            gas_used: None,
+            pyth_price: None,
+        };
+
+        let result = aggregate.handle(command, &()).await;
+
+        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
     }
 }
