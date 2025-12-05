@@ -32,12 +32,11 @@ pub(crate) struct TradeProcessingResult {
 /// 1. Checks for duplicate trades (same tx_hash + log_index) and skips if already processed
 /// 2. Saves the trade to the onchain_trades table
 /// 3. Updates the position accumulator for the symbol
-/// 4. Attempts to create a Schwab execution if position thresholds are met
+/// 4. Attempts to create an offchain execution if position thresholds are met
+/// 5. Cleans up any stale pending executions for the symbol
 ///
-/// Returns `Some(OffchainExecution)` if a Schwab order was created, `None` if the trade
-/// was accumulated but didn't trigger an execution (or was a duplicate).
-///
-/// The transaction must be committed by the caller.
+/// Returns `TradeProcessingResult` containing the new execution (if created) and any
+/// cleaned up stale executions. The transaction must be committed by the caller.
 #[tracing::instrument(
     skip(sql_tx, trade),
     fields(symbol = %trade.symbol, amount = %trade.amount, direction = ?trade.direction),
@@ -636,11 +635,12 @@ pub(crate) async fn check_all_accumulated_positions(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{FixedBytes, fixed_bytes};
     use chrono::Utc;
     use st0x_broker::{OrderStatus, Symbol};
 
     use super::*;
+    use crate::dual_write::DualWriteContext;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
     use crate::position::{BrokerOrderId, Position, PositionCommand};
@@ -650,7 +650,94 @@ mod tests {
     use crate::tokenized_symbol;
     use crate::trade_execution_link::TradeExecutionLink;
 
-    // Helper function for tests to handle transaction management
+    fn create_test_onchain_trade(symbol: &str, tx_hash_byte: u8) -> OnchainTrade {
+        OnchainTrade {
+            id: None,
+            tx_hash: FixedBytes([tx_hash_byte; 32]),
+            log_index: 1,
+            symbol: symbol.parse().unwrap(),
+            amount: 1.5,
+            direction: Direction::Buy,
+            price_usdc: 250.0,
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: Some(48000),
+            effective_gas_price: Some(1_400_000_000),
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        }
+    }
+
+    async fn setup_stale_execution(
+        pool: &SqlitePool,
+        dual_write_context: &DualWriteContext,
+        symbol: &Symbol,
+    ) -> i64 {
+        let stale_execution = OffchainExecution {
+            id: None,
+            symbol: symbol.clone(),
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let execution_id = stale_execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+
+        let calculator = PositionCalculator::new();
+        save_within_transaction(&mut sql_tx, symbol, &calculator, Some(execution_id))
+            .await
+            .unwrap();
+
+        let symbol_str = symbol.to_string();
+        sqlx::query!(
+            "UPDATE trade_accumulators \
+            SET last_updated = datetime('now', '-15 minutes') WHERE symbol = ?1",
+            symbol_str
+        )
+        .execute(sql_tx.as_mut())
+        .await
+        .unwrap();
+
+        sql_tx.commit().await.unwrap();
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        crate::dual_write::place_order(dual_write_context, &pending_execution)
+            .await
+            .unwrap();
+
+        crate::dual_write::place_offchain_order(dual_write_context, &pending_execution, symbol)
+            .await
+            .unwrap();
+
+        dual_write_context
+            .offchain_order_framework()
+            .execute(
+                &OffchainOrder::aggregate_id(execution_id),
+                OffchainOrderCommand::ConfirmSubmission {
+                    broker_order_id: BrokerOrderId("ORDER123".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        execution_id
+    }
+
     async fn process_trade_with_tx(
         pool: &SqlitePool,
         trade: OnchainTrade,
@@ -2081,10 +2168,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_stale_execution_cleanup_executes_dual_write_commands() {
         let pool = setup_test_db().await;
-        let dual_write_context = crate::dual_write::DualWriteContext::new(pool.clone());
+        let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
         dual_write_context
@@ -2099,107 +2185,15 @@ mod tests {
             .await
             .unwrap();
 
-        let onchain_trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
-            ),
-            log_index: 1,
-            symbol: tokenized_symbol!("TSLA0x"),
-            amount: 1.5,
-            direction: Direction::Buy,
-            price_usdc: 250.0,
-            block_timestamp: Some(Utc::now()),
-            created_at: None,
-            gas_used: Some(48000),
-            effective_gas_price: Some(1_400_000_000),
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
+        let onchain_trade = create_test_onchain_trade("TSLA0x", 0x11);
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &onchain_trade)
             .await
             .unwrap();
 
-        let stale_execution = OffchainExecution {
-            id: None,
-            symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
-            direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
-            state: OrderState::Pending,
-        };
+        let execution_id = setup_stale_execution(&pool, &dual_write_context, &symbol).await;
 
-        let mut sql_tx = pool.begin().await.unwrap();
-        let execution_id = stale_execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-
-        let calculator = PositionCalculator::new();
-        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id))
-            .await
-            .unwrap();
-
-        sqlx::query!(
-            "UPDATE trade_accumulators SET last_updated = datetime('now', '-15 minutes') WHERE symbol = ?1",
-            "TSLA"
-        )
-        .execute(sql_tx.as_mut())
-        .await
-        .unwrap();
-
-        sql_tx.commit().await.unwrap();
-
-        let pending_execution = OffchainExecution {
-            id: Some(execution_id),
-            symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
-            direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
-            state: OrderState::Pending,
-        };
-
-        crate::dual_write::place_order(&dual_write_context, &pending_execution)
-            .await
-            .unwrap();
-
-        crate::dual_write::place_offchain_order(&dual_write_context, &pending_execution, &symbol)
-            .await
-            .unwrap();
-
-        dual_write_context
-            .offchain_order_framework()
-            .execute(
-                &OffchainOrder::aggregate_id(execution_id),
-                OffchainOrderCommand::ConfirmSubmission {
-                    broker_order_id: BrokerOrderId("ORDER123".to_string()),
-                },
-            )
-            .await
-            .unwrap();
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x9999888877776666555544443333222211110000ffffeeeedddcccbbbaaa9999"
-            ),
-            log_index: 1,
-            symbol: tokenized_symbol!("TSLA0x"),
-            amount: 1.5,
-            direction: Direction::Buy,
-            price_usdc: 250.0,
-            block_timestamp: None,
-            created_at: None,
-            gas_used: Some(48000),
-            effective_gas_price: Some(1_400_000_000),
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
+        let mut trade = create_test_onchain_trade("TSLA0x", 0x99);
+        trade.block_timestamp = None;
 
         let mut sql_tx = pool.begin().await.unwrap();
         let TradeProcessingResult {
@@ -2210,26 +2204,23 @@ mod tests {
             .unwrap();
         sql_tx.commit().await.unwrap();
 
-        assert_eq!(
-            cleaned_up_executions.len(),
-            1,
-            "Expected 1 stale execution to be cleaned up"
-        );
+        assert_eq!(cleaned_up_executions.len(), 1);
         assert_eq!(cleaned_up_executions[0].execution_id, execution_id);
 
         for cleaned_up in cleaned_up_executions {
-            let exec_id = cleaned_up.execution_id;
-            let symbol = cleaned_up.symbol;
-            let error_reason = cleaned_up.error_reason;
-            crate::dual_write::mark_failed(&dual_write_context, exec_id, error_reason.clone())
-                .await
-                .unwrap();
+            crate::dual_write::mark_failed(
+                &dual_write_context,
+                cleaned_up.execution_id,
+                cleaned_up.error_reason.clone(),
+            )
+            .await
+            .unwrap();
 
             crate::dual_write::fail_offchain_order(
                 &dual_write_context,
-                exec_id,
-                &symbol,
-                error_reason,
+                cleaned_up.execution_id,
+                &cleaned_up.symbol,
+                cleaned_up.error_reason,
             )
             .await
             .unwrap();
@@ -2237,25 +2228,22 @@ mod tests {
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
             aggregate_id
         )
         .fetch_all(&pool)
         .await
         .unwrap();
 
-        assert_eq!(
-            offchain_order_events.len(),
-            3,
-            "Expected 3 events (Placed, Submitted, Failed), got {offchain_order_events:?}"
-        );
-
+        assert_eq!(offchain_order_events.len(), 3);
         assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
         assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
         assert_eq!(offchain_order_events[2], "OffchainOrderEvent::Failed");
 
         let position_events: Vec<String> = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'Position' AND aggregate_id = ? ORDER BY sequence",
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'Position' AND aggregate_id = ? ORDER BY sequence",
             "TSLA"
         )
         .fetch_all(&pool)
@@ -2269,7 +2257,8 @@ mod tests {
         assert!(
             position_events
                 .iter()
-                .any(|e| e == "PositionEvent::OffChainOrderFailed")
+                .any(|e| e == "PositionEvent::OffChainOrderFailed"),
+            "Expected PositionEvent::OffChainOrderFailed, got {position_events:?}"
         );
     }
 }
