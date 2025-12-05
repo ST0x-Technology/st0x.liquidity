@@ -94,7 +94,6 @@ mod view;
 
 pub(crate) use cmd::EquityRedemptionCommand;
 pub(crate) use event::EquityRedemptionEvent;
-pub(crate) use view::EquityRedemptionView;
 
 /// Unique identifier for an equity redemption operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
