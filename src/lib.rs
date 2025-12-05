@@ -5,6 +5,7 @@ pub mod api;
 mod bindings;
 pub mod cli;
 mod conductor;
+mod dual_write;
 pub mod env;
 mod error;
 mod lock;

@@ -19,6 +19,8 @@ pub(crate) enum TradeValidationError {
     NoLogIndex,
     #[error("No block number found in log")]
     NoBlockNumber,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
     #[error("Invalid IO index: {0}")]
     InvalidIndex(#[from] FromUintError<usize>),
     #[error("No input found at index: {0}")]
