@@ -74,6 +74,12 @@ pub(crate) enum UsdcRebalanceError {
     /// Bridging has not been initiated yet
     #[error("Bridging has not been initiated")]
     BridgingNotInitiated,
+    /// Attestation has not been received yet
+    #[error("Attestation has not been received")]
+    AttestationNotReceived,
+    /// Bridging has already completed or failed
+    #[error("Bridging has already completed")]
+    BridgingAlreadyCompleted,
     /// Command not valid for current state
     #[error("Command {command} not valid for state {state}")]
     InvalidCommand { command: String, state: String },
@@ -237,6 +243,25 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
+    /// USDC has been minted on destination chain via CCTP
+    Bridged {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        minted_at: DateTime<Utc>,
+    },
+    /// Bridging has failed (terminal state)
+    BridgingFailed {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 #[async_trait]
@@ -282,6 +307,12 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
                 self.handle_receive_attestation(attestation)
             }
 
+            UsdcRebalanceCommand::ConfirmBridging { mint_tx } => {
+                self.handle_confirm_bridging(mint_tx)
+            }
+
+            UsdcRebalanceCommand::FailBridging { reason } => self.handle_fail_bridging(reason),
+
             _ => {
                 // Other commands will be implemented in subsequent tasks
                 Err(UsdcRebalanceError::InvalidCommand {
@@ -324,7 +355,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
                 | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. },
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::Bridged { .. }
+                | UsdcRebalance::BridgingFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
             Err(e) => Err(e.into()),
         }
@@ -346,7 +379,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
                 | UsdcRebalance::Bridging { .. }
-                | UsdcRebalance::Attested { .. },
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::Bridged { .. }
+                | UsdcRebalance::BridgingFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
             Err(e) => Err(e.into()),
         }
@@ -371,12 +406,15 @@ impl Lifecycle<UsdcRebalance, Never> {
                 }])
             }
 
-            Ok(UsdcRebalance::Bridging { .. } | UsdcRebalance::Attested { .. }) => {
-                Err(UsdcRebalanceError::InvalidCommand {
-                    command: "InitiateBridging".to_string(),
-                    state: "Bridging".to_string(),
-                })
-            }
+            Ok(
+                UsdcRebalance::Bridging { .. }
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::Bridged { .. }
+                | UsdcRebalance::BridgingFailed { .. },
+            ) => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateBridging".to_string(),
+                state: "Bridging".to_string(),
+            }),
 
             Err(e) => Err(e.into()),
         }
@@ -406,6 +444,74 @@ impl Lifecycle<UsdcRebalance, Never> {
                 state: "Attested".to_string(),
             }),
 
+            Ok(UsdcRebalance::Bridged { .. } | UsdcRebalance::BridgingFailed { .. }) => {
+                Err(UsdcRebalanceError::BridgingAlreadyCompleted)
+            }
+
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_confirm_bridging(
+        &self,
+        mint_tx: &TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                UsdcRebalance::Withdrawing { .. }
+                | UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::Bridging { .. },
+            ) => Err(UsdcRebalanceError::AttestationNotReceived),
+
+            Ok(UsdcRebalance::Attested { .. }) => Ok(vec![UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: *mint_tx,
+                minted_at: Utc::now(),
+            }]),
+
+            Ok(UsdcRebalance::Bridged { .. } | UsdcRebalance::BridgingFailed { .. }) => {
+                Err(UsdcRebalanceError::BridgingAlreadyCompleted)
+            }
+
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_fail_bridging(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                UsdcRebalance::Withdrawing { .. }
+                | UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. },
+            ) => Err(UsdcRebalanceError::BridgingNotInitiated),
+
+            Ok(
+                UsdcRebalance::Bridging {
+                    burn_tx_hash,
+                    cctp_nonce,
+                    ..
+                }
+                | UsdcRebalance::Attested {
+                    burn_tx_hash,
+                    cctp_nonce,
+                    ..
+                },
+            ) => Ok(vec![UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: Some(*burn_tx_hash),
+                cctp_nonce: Some(*cctp_nonce),
+                reason: reason.to_string(),
+                failed_at: Utc::now(),
+            }]),
+
+            Ok(UsdcRebalance::Bridged { .. } | UsdcRebalance::BridgingFailed { .. }) => {
+                Err(UsdcRebalanceError::BridgingAlreadyCompleted)
+            }
+
             Err(e) => Err(e.into()),
         }
     }
@@ -417,88 +523,221 @@ impl UsdcRebalance {
         event: &UsdcRebalanceEvent,
         current: &Self,
     ) -> Result<Self, LifecycleError<Never>> {
-        match (current, event) {
-            (
-                Self::Withdrawing {
-                    direction,
-                    amount,
-                    initiated_at,
-                    ..
-                },
-                UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
-            ) => Ok(Self::WithdrawalComplete {
-                direction: direction.clone(),
-                amount: *amount,
-                initiated_at: *initiated_at,
-                confirmed_at: *confirmed_at,
-            }),
-
-            (
-                Self::Withdrawing {
-                    direction,
-                    amount,
-                    withdrawal_ref,
-                    initiated_at,
-                },
-                UsdcRebalanceEvent::WithdrawalFailed { reason, failed_at },
-            ) => Ok(Self::WithdrawalFailed {
-                direction: direction.clone(),
-                amount: *amount,
-                withdrawal_ref: withdrawal_ref.clone(),
-                reason: reason.clone(),
-                initiated_at: *initiated_at,
-                failed_at: *failed_at,
-            }),
-
-            (
-                Self::WithdrawalComplete {
-                    direction,
-                    amount,
-                    initiated_at,
-                    ..
-                },
-                UsdcRebalanceEvent::BridgingInitiated {
-                    burn_tx_hash,
-                    cctp_nonce,
-                    burned_at,
-                },
-            ) => Ok(Self::Bridging {
-                direction: direction.clone(),
-                amount: *amount,
-                burn_tx_hash: *burn_tx_hash,
-                cctp_nonce: *cctp_nonce,
-                initiated_at: *initiated_at,
-                burned_at: *burned_at,
-            }),
-
-            (
-                Self::Bridging {
-                    direction,
-                    amount,
-                    burn_tx_hash,
-                    cctp_nonce,
-                    initiated_at,
-                    ..
-                },
-                UsdcRebalanceEvent::BridgeAttestationReceived {
-                    attestation,
-                    attested_at,
-                },
-            ) => Ok(Self::Attested {
-                direction: direction.clone(),
-                amount: *amount,
-                burn_tx_hash: *burn_tx_hash,
-                cctp_nonce: *cctp_nonce,
-                attestation: attestation.clone(),
-                initiated_at: *initiated_at,
-                attested_at: *attested_at,
-            }),
-
-            _ => Err(LifecycleError::Mismatch {
+        match event {
+            UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at } => {
+                Self::apply_withdrawal_confirmed(current, *confirmed_at)
+            }
+            UsdcRebalanceEvent::WithdrawalFailed { reason, failed_at } => {
+                Self::apply_withdrawal_failed(current, reason, *failed_at)
+            }
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash,
+                cctp_nonce,
+                burned_at,
+            } => Self::apply_bridging_initiated(current, *burn_tx_hash, *cctp_nonce, *burned_at),
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation,
+                attested_at,
+            } => Self::apply_attestation_received(current, attestation, *attested_at),
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash,
+                minted_at,
+            } => Self::apply_bridged(current, *mint_tx_hash, *minted_at),
+            UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash,
+                cctp_nonce,
+                reason,
+                failed_at,
+            } => {
+                Self::apply_bridging_failed(current, *burn_tx_hash, *cctp_nonce, reason, *failed_at)
+            }
+            UsdcRebalanceEvent::Initiated { .. }
+            | UsdcRebalanceEvent::DepositInitiated { .. }
+            | UsdcRebalanceEvent::DepositConfirmed { .. }
+            | UsdcRebalanceEvent::DepositFailed { .. } => Err(LifecycleError::Mismatch {
                 state: format!("{current:?}"),
                 event: event.event_type(),
             }),
         }
+    }
+
+    fn apply_withdrawal_confirmed(
+        current: &Self,
+        confirmed_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Withdrawing {
+            direction,
+            amount,
+            initiated_at,
+            ..
+        } = current
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: "WithdrawalConfirmed".to_string(),
+            });
+        };
+
+        Ok(Self::WithdrawalComplete {
+            direction: direction.clone(),
+            amount: *amount,
+            initiated_at: *initiated_at,
+            confirmed_at,
+        })
+    }
+
+    fn apply_withdrawal_failed(
+        current: &Self,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Withdrawing {
+            direction,
+            amount,
+            withdrawal_ref,
+            initiated_at,
+        } = current
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: "WithdrawalFailed".to_string(),
+            });
+        };
+
+        Ok(Self::WithdrawalFailed {
+            direction: direction.clone(),
+            amount: *amount,
+            withdrawal_ref: withdrawal_ref.clone(),
+            reason: reason.to_string(),
+            initiated_at: *initiated_at,
+            failed_at,
+        })
+    }
+
+    fn apply_bridging_initiated(
+        current: &Self,
+        burn_tx_hash: TxHash,
+        cctp_nonce: u64,
+        burned_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::WithdrawalComplete {
+            direction,
+            amount,
+            initiated_at,
+            ..
+        } = current
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: "BridgingInitiated".to_string(),
+            });
+        };
+
+        Ok(Self::Bridging {
+            direction: direction.clone(),
+            amount: *amount,
+            burn_tx_hash,
+            cctp_nonce,
+            initiated_at: *initiated_at,
+            burned_at,
+        })
+    }
+
+    fn apply_attestation_received(
+        current: &Self,
+        attestation: &[u8],
+        attested_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Bridging {
+            direction,
+            amount,
+            burn_tx_hash,
+            cctp_nonce,
+            initiated_at,
+            ..
+        } = current
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: "BridgeAttestationReceived".to_string(),
+            });
+        };
+
+        Ok(Self::Attested {
+            direction: direction.clone(),
+            amount: *amount,
+            burn_tx_hash: *burn_tx_hash,
+            cctp_nonce: *cctp_nonce,
+            attestation: attestation.to_vec(),
+            initiated_at: *initiated_at,
+            attested_at,
+        })
+    }
+
+    fn apply_bridged(
+        current: &Self,
+        mint_tx_hash: TxHash,
+        minted_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Attested {
+            direction,
+            amount,
+            burn_tx_hash,
+            initiated_at,
+            ..
+        } = current
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: "Bridged".to_string(),
+            });
+        };
+
+        Ok(Self::Bridged {
+            direction: direction.clone(),
+            amount: *amount,
+            burn_tx_hash: *burn_tx_hash,
+            mint_tx_hash,
+            initiated_at: *initiated_at,
+            minted_at,
+        })
+    }
+
+    fn apply_bridging_failed(
+        current: &Self,
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let (Self::Bridging {
+            direction,
+            amount,
+            initiated_at,
+            ..
+        }
+        | Self::Attested {
+            direction,
+            amount,
+            initiated_at,
+            ..
+        }) = current
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{current:?}"),
+                event: "BridgingFailed".to_string(),
+            });
+        };
+
+        Ok(Self::BridgingFailed {
+            direction: direction.clone(),
+            amount: *amount,
+            burn_tx_hash,
+            cctp_nonce,
+            reason: reason.to_string(),
+            initiated_at: *initiated_at,
+            failed_at,
+        })
     }
 
     /// Create initial state from an initialization event.
@@ -1560,5 +1799,628 @@ mod tests {
         assert_eq!(view_attestation, attestation);
         assert_eq!(view_initiated_at, initiated_at);
         assert_eq!(view_attested_at, attested_at);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_bridging() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at,
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let cctp_nonce = 12345u64;
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce,
+            burned_at: Utc::now(),
+        });
+
+        let attestation = vec![0x01, 0x02, 0x03, 0x04];
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: attestation.clone(),
+            attested_at: Utc::now(),
+        });
+
+        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint_tx_hash,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: event_mint_tx,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected Bridged event");
+        };
+
+        assert_eq!(*event_mint_tx, mint_tx_hash);
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::Bridged {
+            direction,
+            amount,
+            burn_tx_hash: state_burn_tx,
+            mint_tx_hash: state_mint_tx,
+            initiated_at: state_initiated_at,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected Bridged state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*state_burn_tx, burn_tx_hash);
+        assert_eq!(*state_mint_tx, mint_tx_hash);
+        assert_eq!(*state_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_confirm_bridging_before_attestation() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint_tx_hash,
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::AttestationNotReceived
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fail_bridging_after_initiated() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at,
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let cctp_nonce = 12345u64;
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce,
+            burned_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "CCTP timeout".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: event_burn_tx,
+            cctp_nonce: event_nonce,
+            reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingFailed event");
+        };
+
+        assert_eq!(*event_burn_tx, Some(burn_tx_hash));
+        assert_eq!(*event_nonce, Some(cctp_nonce));
+        assert_eq!(reason, "CCTP timeout");
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::BridgingFailed {
+            direction,
+            amount,
+            burn_tx_hash: state_burn_tx,
+            cctp_nonce: state_nonce,
+            reason: state_reason,
+            initiated_at: state_initiated_at,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected BridgingFailed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*state_burn_tx, Some(burn_tx_hash));
+        assert_eq!(*state_nonce, Some(cctp_nonce));
+        assert_eq!(state_reason, "CCTP timeout");
+        assert_eq!(*state_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_fail_bridging_after_attestation_received() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at,
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        let cctp_nonce = 12345u64;
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "Mint transaction failed".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: event_burn_tx,
+            cctp_nonce: event_nonce,
+            reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingFailed event");
+        };
+
+        assert_eq!(*event_burn_tx, Some(burn_tx_hash));
+        assert_eq!(*event_nonce, Some(cctp_nonce));
+        assert_eq!(reason, "Mint transaction failed");
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::BridgingFailed {
+            direction,
+            amount,
+            burn_tx_hash: state_burn_tx,
+            cctp_nonce: state_nonce,
+            reason: state_reason,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected BridgingFailed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*state_burn_tx, Some(burn_tx_hash));
+        assert_eq!(*state_nonce, Some(cctp_nonce));
+        assert_eq!(state_reason, "Mint transaction failed");
+    }
+
+    #[tokio::test]
+    async fn test_bridging_failed_preserves_burn_data_when_available() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::repeat_byte(0xAB).into_word();
+        let cctp_nonce = 98765u64;
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce,
+            burned_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "Attestation service down".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        let UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: event_burn_tx,
+            cctp_nonce: event_nonce,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected BridgingFailed event");
+        };
+
+        assert_eq!(
+            *event_burn_tx,
+            Some(burn_tx_hash),
+            "Burn tx hash should be preserved in failure event"
+        );
+        assert_eq!(
+            *event_nonce,
+            Some(cctp_nonce),
+            "CCTP nonce should be preserved in failure event"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cannot_confirm_bridging_after_already_completed() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash,
+            minted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: Address::repeat_byte(0x22).into_word(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::BridgingAlreadyCompleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_bridging_after_already_completed() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash,
+            minted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "Late failure".to_string(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::BridgingAlreadyCompleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_bridging_after_already_failed() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash = Address::ZERO.into_word();
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: Some(burn_tx_hash),
+            cctp_nonce: Some(12345),
+            reason: "First failure".to_string(),
+            failed_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "Second failure".to_string(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::BridgingAlreadyCompleted
+        ));
+    }
+
+    #[test]
+    fn test_view_tracks_bridging_completion() {
+        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let confirmed_at = Utc::now();
+        let burned_at = Utc::now();
+        let attested_at = Utc::now();
+        let minted_at = Utc::now();
+        let burn_tx_hash = Address::ZERO.into_word();
+        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let cctp_nonce = 12345u64;
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 1,
+            payload: UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 2,
+            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 3,
+            payload: UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash,
+                cctp_nonce,
+                burned_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 4,
+            payload: UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01, 0x02],
+                attested_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 5,
+            payload: UsdcRebalanceEvent::Bridged {
+                mint_tx_hash,
+                minted_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        let UsdcRebalance::Bridged {
+            direction,
+            amount,
+            burn_tx_hash: view_burn_tx,
+            mint_tx_hash: view_mint_tx,
+            initiated_at: view_initiated_at,
+            minted_at: view_minted_at,
+        } = view.live().unwrap()
+        else {
+            panic!("Expected Bridged state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*view_burn_tx, burn_tx_hash);
+        assert_eq!(*view_mint_tx, mint_tx_hash);
+        assert_eq!(*view_initiated_at, initiated_at);
+        assert_eq!(*view_minted_at, minted_at);
+    }
+
+    #[test]
+    fn test_view_tracks_bridging_failure() {
+        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+        let confirmed_at = Utc::now();
+        let burned_at = Utc::now();
+        let failed_at = Utc::now();
+        let burn_tx_hash = Address::ZERO.into_word();
+        let cctp_nonce = 12345u64;
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 1,
+            payload: UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+                initiated_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 2,
+            payload: UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 3,
+            payload: UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash,
+                cctp_nonce,
+                burned_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 4,
+            payload: UsdcRebalanceEvent::BridgingFailed {
+                burn_tx_hash: Some(burn_tx_hash),
+                cctp_nonce: Some(cctp_nonce),
+                reason: "CCTP service unavailable".to_string(),
+                failed_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        let UsdcRebalance::BridgingFailed {
+            direction,
+            amount,
+            burn_tx_hash: view_burn_tx,
+            cctp_nonce: view_nonce,
+            reason,
+            initiated_at: view_initiated_at,
+            failed_at: view_failed_at,
+        } = view.live().unwrap()
+        else {
+            panic!("Expected BridgingFailed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*view_burn_tx, Some(burn_tx_hash));
+        assert_eq!(*view_nonce, Some(cctp_nonce));
+        assert_eq!(reason, "CCTP service unavailable");
+        assert_eq!(*view_initiated_at, initiated_at);
+        assert_eq!(*view_failed_at, failed_at);
     }
 }

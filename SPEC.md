@@ -1404,19 +1404,19 @@ enum UsdcRebalance {
     NotStarted,
     WithdrawalInitiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalConfirmed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
     WithdrawalFailed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         withdrawal_ref: TransferRef,
         reason: String,
         initiated_at: DateTime<Utc>,
@@ -1424,7 +1424,7 @@ enum UsdcRebalance {
     },
     BridgingInitiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         initiated_at: DateTime<Utc>,
@@ -1432,7 +1432,7 @@ enum UsdcRebalance {
     },
     BridgeAttestationReceived {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         attestation: Bytes,
@@ -1441,7 +1441,7 @@ enum UsdcRebalance {
     },
     Bridged {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -1449,7 +1449,7 @@ enum UsdcRebalance {
     },
     BridgingFailed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<u64>,
         reason: String,
@@ -1458,7 +1458,7 @@ enum UsdcRebalance {
     },
     DepositInitiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         deposit_ref: TransferRef,
@@ -1467,7 +1467,7 @@ enum UsdcRebalance {
     },
     DepositConfirmed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -1475,7 +1475,7 @@ enum UsdcRebalance {
     },
     DepositFailed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         deposit_ref: Option<TransferRef>,
@@ -1492,7 +1492,7 @@ enum UsdcRebalance {
 enum UsdcRebalanceCommand {
     Initiate {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         withdrawal: TransferRef,
     },
     ConfirmWithdrawal,
@@ -1528,7 +1528,7 @@ enum UsdcRebalanceCommand {
 enum UsdcRebalanceEvent {
     Initiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
@@ -1944,7 +1944,7 @@ enum UsdcRebalanceView {
     Rebalancing {
         rebalancing_id: Uuid,
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         status: RebalancingStatus,
         burn_tx_hash: Option<TxHash>,
         mint_tx_hash: Option<TxHash>,

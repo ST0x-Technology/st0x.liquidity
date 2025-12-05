@@ -492,49 +492,86 @@ updates are handled by the Lifecycle self-view pattern.)
 
 ### Subtasks
 
-- [ ] Add state `Bridged`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
-  - [ ] `burn_tx_hash: TxHash`
-  - [ ] `mint_tx_hash: TxHash`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `minted_at: DateTime<Utc>`
-- [ ] Add state `BridgingFailed`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
-  - [ ] `burn_tx_hash: Option<TxHash>`
-  - [ ] `cctp_nonce: Option<u64>`
-  - [ ] `reason: String`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `failed_at: DateTime<Utc>`
-- [ ] Add commands:
-  - [ ] `ConfirmBridging { mint_tx: TxHash }`
-  - [ ] `FailBridging { reason: String }`
-- [ ] Add events:
-  - [ ] `Bridged { mint_tx_hash: TxHash, minted_at }`
-  - [ ] `BridgingFailed { burn_tx_hash: Option<TxHash>, cctp_nonce: Option<u64>, reason, failed_at }`
-- [ ] Update `handle()`:
-  - [ ] `BridgeAttestationReceived` + `ConfirmBridging` → emit `Bridged`
-  - [ ] `BridgingInitiated` + `FailBridging` → emit `BridgingFailed` with burn
+- [x] Add state `Bridged`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `burn_tx_hash: TxHash`
+  - [x] `mint_tx_hash: TxHash`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `minted_at: DateTime<Utc>`
+- [x] Add state `BridgingFailed`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `burn_tx_hash: Option<TxHash>`
+  - [x] `cctp_nonce: Option<u64>`
+  - [x] `reason: String`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `failed_at: DateTime<Utc>`
+- [x] Add commands:
+  - [x] `ConfirmBridging { mint_tx: TxHash }`
+  - [x] `FailBridging { reason: String }`
+- [x] Add events:
+  - [x] `Bridged { mint_tx_hash: TxHash, minted_at }`
+  - [x] `BridgingFailed { burn_tx_hash: Option<TxHash>, cctp_nonce: Option<u64>, reason, failed_at }`
+- [x] Update `handle()`:
+  - [x] `BridgeAttestationReceived` + `ConfirmBridging` → emit `Bridged`
+  - [x] `BridgingInitiated` + `FailBridging` → emit `BridgingFailed` with burn
         data
-  - [ ] `BridgeAttestationReceived` + `FailBridging` → emit `BridgingFailed`
+  - [x] `BridgeAttestationReceived` + `FailBridging` → emit `BridgingFailed`
         with burn data
-- [ ] Update `apply_transition()` for `Bridged` and `BridgingFailed` events
-- [ ] Add error `AttestationNotReceived`
+- [x] Update `apply_transition()` for `Bridged` and `BridgingFailed` events
+- [x] Add error `AttestationNotReceived`
 
 ### Tests
 
-- [ ] `test_confirm_bridging`
-- [ ] `test_cannot_confirm_bridging_before_attestation`
-- [ ] `test_fail_bridging_after_initiated`
-- [ ] `test_fail_bridging_after_attestation_received`
-- [ ] `test_bridging_failed_preserves_burn_data_when_available`
+- [x] `test_confirm_bridging`
+- [x] `test_cannot_confirm_bridging_before_attestation`
+- [x] `test_fail_bridging_after_initiated`
+- [x] `test_fail_bridging_after_attestation_received`
+- [x] `test_bridging_failed_preserves_burn_data_when_available`
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
+
+### Implementation Summary
+
+**States Added:**
+
+- `Bridged`: Terminal success state after CCTP mint confirmation, with
+  `mint_tx_hash` and `minted_at` timestamp
+- `BridgingFailed`: Terminal failure state preserving available CCTP data
+  (`burn_tx_hash`, `cctp_nonce`) for debugging/retry
+
+**Commands and Events:**
+
+- `ConfirmBridging { mint_tx }` → `Bridged` event (only from `Attested` state)
+- `FailBridging { reason }` → `BridgingFailed` event (from `Bridging` or
+  `Attested` states)
+
+**Error Handling:**
+
+- `AttestationNotReceived`: Returned when attempting to confirm bridging before
+  attestation is received (i.e., from `Bridging` state instead of `Attested`)
+
+**Refactoring:**
+
+- Extracted `apply_transition()` into 6 helper methods
+  (`apply_withdrawal_confirmed`, `apply_withdrawal_failed`,
+  `apply_bridging_initiated`, `apply_attestation_received`, `apply_bridged`,
+  `apply_bridging_failed`) to comply with clippy's `too_many_lines` lint
+- Used `let...else` pattern with multi-variant destructuring for
+  `apply_bridging_failed` to handle both `Bridging` and `Attested` source states
+
+**Tests Added:** 5 new tests covering:
+
+- Happy path: confirming bridging after attestation received
+- Error case: attempting to confirm bridging before attestation
+- Failure paths: failing bridging from both `Bridging` and `Attested` states
+- Data preservation: verifying `burn_tx_hash` and `cctp_nonce` are preserved in
+  failure state
 
 ## Task 8. Deposit Initiation
 
@@ -545,7 +582,7 @@ the Lifecycle self-view pattern.)
 
 - [ ] Add state `DepositInitiated`:
   - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
+  - [ ] `amount: Usdc`
   - [ ] `burn_tx_hash: TxHash`
   - [ ] `mint_tx_hash: TxHash`
   - [ ] `deposit_ref: TransferRef`
@@ -580,14 +617,14 @@ updates are handled by the Lifecycle self-view pattern.)
 
 - [ ] Add state `DepositConfirmed`:
   - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
+  - [ ] `amount: Usdc`
   - [ ] `burn_tx_hash: TxHash`
   - [ ] `mint_tx_hash: TxHash`
   - [ ] `initiated_at: DateTime<Utc>`
   - [ ] `deposit_confirmed_at: DateTime<Utc>`
 - [ ] Add state `DepositFailed`:
   - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
+  - [ ] `amount: Usdc`
   - [ ] `burn_tx_hash: TxHash`
   - [ ] `mint_tx_hash: TxHash`
   - [ ] `deposit_ref: Option<TransferRef>`
