@@ -9,12 +9,15 @@ from source → CCTP bridge (burn/attestation/mint) → deposit to destination.
 
 ## Architecture
 
-The aggregate uses the typestate pattern via enum variants to represent the
-complete rebalancing lifecycle with 11 distinct states grouped by phase:
+The aggregate uses the `Lifecycle<T, E>` wrapper pattern (matching
+TokenizedEquityMint and EquityRedemption) with enum variants to represent the
+complete rebalancing lifecycle with 10 distinct live states grouped by phase.
+The `Lifecycle::Uninitialized` state represents "not started".
 
 **Withdrawal Phase:**
 
-1. **NotStarted**: Initial state before rebalancing begins
+1. ~~**NotStarted**: Initial state before rebalancing begins~~ → Use
+   `Lifecycle::Uninitialized`
 2. **WithdrawalInitiated**: Withdrawal from source requested
 3. **WithdrawalConfirmed**: Withdrawal from source confirmed
 4. **WithdrawalFailed**: Withdrawal failed (terminal state)
@@ -96,8 +99,8 @@ for common query patterns (direction, state, amount).
 - Supporting types: `UsdcRebalanceId`, `TransferRef` enum (AlpacaId/OnchainTx),
   `RebalanceDirection` enum (AlpacaToBase/BaseToAlpaca), `UsdcRebalanceError`
 
-**Integration**: Module already present in `src/lib.rs` with `#[allow(dead_code)]`
-attribute (line 38-39).
+**Integration**: Module already present in `src/lib.rs` with
+`#[allow(dead_code)]` attribute (line 38-39).
 
 **AGENTS.md Update**: Added critical guidelines about never manually creating
 migrations or editing Cargo.toml - must use `sqlx migrate add` and `cargo add`
@@ -156,17 +159,19 @@ Implement NotStarted → WithdrawalInitiated transition with view tracking.
 ### Implementation Summary
 
 **Files Modified:**
+
 - `src/usdc_rebalance/mod.rs`: Extended UsdcRebalance enum with
   WithdrawalInitiated state, implemented Aggregate::handle() with pattern
   matching for NotStarted + Initiate command, implemented Aggregate::apply()
   using if let, added UsdcRebalanceError with AlreadyInitiated and
   InvalidStateTransition variants, added 4 comprehensive tests
 - `src/usdc_rebalance/view.rs`: Created new file with UsdcRebalanceView enum
-  (Unavailable, NotStarted, WithdrawalInitiated), implemented View trait with
-  if let pattern, added handle_initiated() helper with error logging for invalid
+  (Unavailable, NotStarted, WithdrawalInitiated), implemented View trait with if
+  let pattern, added handle_initiated() helper with error logging for invalid
   state transitions, added 3 comprehensive tests
 
 **Key Design Decisions:**
+
 - UsdcRebalanceView uses enum variants matching aggregate states rather than a
   struct, following the same pattern as PositionView
 - View includes Unavailable variant for initial state before any events
@@ -175,10 +180,62 @@ Implement NotStarted → WithdrawalInitiated transition with view tracking.
 - All clippy errors fixed using if let instead of match for single patterns and
   explicit enum variants instead of wildcards
 
-## Task 3. Withdrawal Confirmation and View Updates
+## Task 3. Refactor to Lifecycle Pattern
 
-Implement WithdrawalInitiated → WithdrawalConfirmed/WithdrawalFailed with view
-updates.
+Convert the UsdcRebalance aggregate to use `Lifecycle<T, E>` wrapper pattern,
+matching the established patterns in TokenizedEquityMint and EquityRedemption.
+This involves converting to a flat file structure, removing the separate View
+type, and using `Lifecycle::Uninitialized` instead of `NotStarted` variant.
+
+### Subtasks
+
+- [ ] Convert directory structure to flat file:
+  - [ ] Consolidate `src/usdc_rebalance/mod.rs`, `cmd.rs`, `event.rs`, `view.rs`
+        into single `src/usdc_rebalance.rs`
+  - [ ] Delete `src/usdc_rebalance/` directory
+  - [ ] Update `src/lib.rs` to import from flat file
+- [ ] Refactor to use `Lifecycle<UsdcRebalance, Never>`:
+  - [ ] Remove `NotStarted` variant from `UsdcRebalance` enum
+  - [ ] Use `Lifecycle::Uninitialized` for uninitialized state
+  - [ ] Implement `Aggregate` for `Lifecycle<UsdcRebalance, Never>`
+  - [ ] Add
+        `apply_transition(event: &UsdcRebalanceEvent, current: &UsdcRebalance)
+        -> Result<UsdcRebalance, LifecycleError<Never>>`
+        function
+  - [ ] Add
+        `from_event(event: &UsdcRebalanceEvent) -> Result<UsdcRebalance,
+        LifecycleError<Never>>`
+        function
+  - [ ] Use `LifecycleError::Mismatch` for invalid state transitions instead of
+        custom errors
+- [ ] Remove separate View type:
+  - [ ] Delete `UsdcRebalanceView` enum
+  - [ ] Implement `View<Lifecycle<UsdcRebalance, Never>> for Lifecycle<...>`
+  - [ ] Add
+        `update_from_event(event: &UsdcRebalanceEvent, current:
+        &Lifecycle<...>) -> Lifecycle<...>`
+        function
+- [ ] Update error handling:
+  - [ ] Remove `UsdcRebalanceError::InvalidStateTransition` (use
+        `LifecycleError::Mismatch` instead)
+  - [ ] Keep domain-specific errors like `AlreadyInitiated` but convert to
+        return `TokenizedEquityMintError`-style error wrapping `LifecycleError`
+- [ ] Update tests:
+  - [ ] Update existing tests to use `Lifecycle<UsdcRebalance, Never>`
+  - [ ] Replace `UsdcRebalance::default()` with `Lifecycle::Uninitialized`
+  - [ ] Update view tests to use `Lifecycle` self-view pattern
+
+### Validation
+
+- [ ] Run `cargo test -q` - all tests pass
+- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
+- [ ] Run `cargo fmt`
+
+## Task 4. Withdrawal Confirmation
+
+Implement WithdrawalInitiated → WithdrawalConfirmed/WithdrawalFailed
+transitions. (View updates are now handled by the Lifecycle self-view pattern
+from Task 3.)
 
 ### Subtasks
 
@@ -201,13 +258,10 @@ updates.
   - [ ] `WithdrawalConfirmed { confirmed_at }`
   - [ ] `WithdrawalFailed { reason, failed_at }`
 - [ ] Update `handle()`:
-  - [ ] `WithdrawalInitiated` + `ConfirmWithdrawal` → emit
-        `WithdrawalConfirmed`
+  - [ ] `WithdrawalInitiated` + `ConfirmWithdrawal` → emit `WithdrawalConfirmed`
   - [ ] `WithdrawalInitiated` + `FailWithdrawal` → emit `WithdrawalFailed`
-- [ ] Update `apply()` for withdrawal events
-- [ ] Update view:
-  - [ ] Add `handle_withdrawal_confirmed()` method
-  - [ ] Add `handle_withdrawal_failed()` method
+- [ ] Update `apply_transition()` for withdrawal events
+- [ ] Update `from_event()` if these events can initialize (unlikely)
 - [ ] Add errors:
   - [ ] `WithdrawalNotInitiated`
   - [ ] `AlreadyCompleted`
@@ -219,8 +273,6 @@ updates.
 - [ ] `test_cannot_confirm_withdrawal_before_initiating`
 - [ ] `test_cannot_confirm_withdrawal_twice`
 - [ ] `test_fail_withdrawal_after_initiation`
-- [ ] `test_view_tracks_withdrawal_confirmation`
-- [ ] `test_view_tracks_withdrawal_failure`
 
 ### Validation
 
@@ -228,9 +280,10 @@ updates.
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 4. Bridge Burn Initiation and View Updates
+## Task 5. Bridge Burn Initiation
 
-Implement WithdrawalConfirmed → BridgingInitiated with view updates.
+Implement WithdrawalConfirmed → BridgingInitiated transition. (View updates are
+handled by the Lifecycle self-view pattern.)
 
 ### Subtasks
 
@@ -242,19 +295,17 @@ Implement WithdrawalConfirmed → BridgingInitiated with view updates.
   - [ ] `initiated_at: DateTime<Utc>`
   - [ ] `burned_at: DateTime<Utc>`
 - [ ] Add command `InitiateBridging { burn_tx: TxHash, cctp_nonce: u64 }`
-- [ ] Add event `BridgingInitiated { burn_tx_hash: TxHash, cctp_nonce: u64, burned_at }`
+- [ ] Add event
+      `BridgingInitiated { burn_tx_hash: TxHash, cctp_nonce: u64, burned_at }`
 - [ ] Update `handle()`:
   - [ ] `WithdrawalConfirmed` + `InitiateBridging` → emit `BridgingInitiated`
-- [ ] Update `apply()` for `BridgingInitiated` event
-- [ ] Update view:
-  - [ ] Add `handle_bridging_initiated()` method
+- [ ] Update `apply_transition()` for `BridgingInitiated` event
 - [ ] Add error `WithdrawalNotConfirmed`
 
 ### Tests
 
 - [ ] `test_initiate_bridging`
 - [ ] `test_cannot_bridge_before_withdrawal_confirmed`
-- [ ] `test_view_tracks_bridging_initiation`
 
 ### Validation
 
@@ -262,9 +313,10 @@ Implement WithdrawalConfirmed → BridgingInitiated with view updates.
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 5. Bridge Attestation Receipt and View Updates
+## Task 6. Bridge Attestation Receipt
 
-Implement BridgingInitiated → BridgeAttestationReceived with view updates.
+Implement BridgingInitiated → BridgeAttestationReceived transition. (View
+updates are handled by the Lifecycle self-view pattern.)
 
 ### Subtasks
 
@@ -281,16 +333,13 @@ Implement BridgingInitiated → BridgeAttestationReceived with view updates.
 - [ ] Update `handle()`:
   - [ ] `BridgingInitiated` + `ReceiveAttestation` → emit
         `BridgeAttestationReceived`
-- [ ] Update `apply()` for `BridgeAttestationReceived` event
-- [ ] Update view:
-  - [ ] Add `handle_bridge_attestation_received()` method
+- [ ] Update `apply_transition()` for `BridgeAttestationReceived` event
 - [ ] Add error `BridgingNotInitiated`
 
 ### Tests
 
 - [ ] `test_receive_attestation`
 - [ ] `test_cannot_receive_attestation_before_bridging`
-- [ ] `test_view_tracks_attestation_receipt`
 
 ### Validation
 
@@ -298,9 +347,10 @@ Implement BridgingInitiated → BridgeAttestationReceived with view updates.
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 6. Bridge Mint Confirmation and Failure with View Updates
+## Task 7. Bridge Mint Confirmation and Failure
 
-Implement BridgeAttestationReceived → Bridged/BridgingFailed with view updates.
+Implement BridgeAttestationReceived → Bridged/BridgingFailed transitions. (View
+updates are handled by the Lifecycle self-view pattern.)
 
 ### Subtasks
 
@@ -331,10 +381,7 @@ Implement BridgeAttestationReceived → Bridged/BridgingFailed with view updates
         data
   - [ ] `BridgeAttestationReceived` + `FailBridging` → emit `BridgingFailed`
         with burn data
-- [ ] Update `apply()` for `Bridged` and `BridgingFailed` events
-- [ ] Update view:
-  - [ ] Add `handle_bridged()` method
-  - [ ] Add `handle_bridging_failed()` method
+- [ ] Update `apply_transition()` for `Bridged` and `BridgingFailed` events
 - [ ] Add error `AttestationNotReceived`
 
 ### Tests
@@ -344,8 +391,6 @@ Implement BridgeAttestationReceived → Bridged/BridgingFailed with view updates
 - [ ] `test_fail_bridging_after_initiated`
 - [ ] `test_fail_bridging_after_attestation_received`
 - [ ] `test_bridging_failed_preserves_burn_data_when_available`
-- [ ] `test_view_tracks_bridging_completion`
-- [ ] `test_view_tracks_bridging_failure`
 
 ### Validation
 
@@ -353,9 +398,10 @@ Implement BridgeAttestationReceived → Bridged/BridgingFailed with view updates
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 7. Deposit Initiation and View Updates
+## Task 8. Deposit Initiation
 
-Implement Bridged → DepositInitiated with view updates.
+Implement Bridged → DepositInitiated transition. (View updates are handled by
+the Lifecycle self-view pattern.)
 
 ### Subtasks
 
@@ -368,12 +414,11 @@ Implement Bridged → DepositInitiated with view updates.
   - [ ] `initiated_at: DateTime<Utc>`
   - [ ] `deposit_initiated_at: DateTime<Utc>`
 - [ ] Add command `InitiateDeposit { deposit: TransferRef }`
-- [ ] Add event `DepositInitiated { deposit_ref: TransferRef, deposit_initiated_at }`
+- [ ] Add event
+      `DepositInitiated { deposit_ref: TransferRef, deposit_initiated_at }`
 - [ ] Update `handle()`:
   - [ ] `Bridged` + `InitiateDeposit` → emit `DepositInitiated`
-- [ ] Update `apply()` for `DepositInitiated` event
-- [ ] Update view:
-  - [ ] Add `handle_deposit_initiated()` method
+- [ ] Update `apply_transition()` for `DepositInitiated` event
 - [ ] Add error `BridgingNotCompleted`
 
 ### Tests
@@ -381,7 +426,6 @@ Implement Bridged → DepositInitiated with view updates.
 - [ ] `test_initiate_deposit_with_alpaca_transfer`
 - [ ] `test_initiate_deposit_with_onchain_tx`
 - [ ] `test_cannot_deposit_before_bridging_complete`
-- [ ] `test_view_tracks_deposit_initiation`
 
 ### Validation
 
@@ -389,9 +433,10 @@ Implement Bridged → DepositInitiated with view updates.
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 8. Deposit Confirmation and Failure with View Updates
+## Task 9. Deposit Confirmation and Failure
 
-Implement DepositInitiated → DepositConfirmed/DepositFailed with view updates.
+Implement DepositInitiated → DepositConfirmed/DepositFailed transitions. (View
+updates are handled by the Lifecycle self-view pattern.)
 
 ### Subtasks
 
@@ -420,10 +465,8 @@ Implement DepositInitiated → DepositConfirmed/DepositFailed with view updates.
 - [ ] Update `handle()`:
   - [ ] `DepositInitiated` + `ConfirmDeposit` → emit `DepositConfirmed`
   - [ ] `DepositInitiated` + `FailDeposit` → emit `DepositFailed`
-- [ ] Update `apply()` for `DepositConfirmed` and `DepositFailed` events
-- [ ] Update view:
-  - [ ] Add `handle_deposit_confirmed()` method
-  - [ ] Add `handle_deposit_failed()` method
+- [ ] Update `apply_transition()` for `DepositConfirmed` and `DepositFailed`
+      events
 - [ ] Add error `DepositNotInitiated`
 
 ### Tests
@@ -432,8 +475,6 @@ Implement DepositInitiated → DepositConfirmed/DepositFailed with view updates.
 - [ ] `test_cannot_confirm_deposit_before_initiating`
 - [ ] `test_fail_deposit_after_initiated`
 - [ ] `test_deposit_failed_preserves_deposit_ref_when_available`
-- [ ] `test_view_tracks_deposit_confirmation`
-- [ ] `test_view_tracks_deposit_failure`
 
 ### Validation
 
@@ -441,7 +482,7 @@ Implement DepositInitiated → DepositConfirmed/DepositFailed with view updates.
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 9. End-to-End Flow Tests
+## Task 10. End-to-End Flow Tests
 
 Add comprehensive end-to-end tests covering full rebalancing flows.
 
@@ -479,7 +520,7 @@ Add comprehensive end-to-end tests covering full rebalancing flows.
 - [ ] Run `cargo clippy -- -D clippy::all` - no warnings
 - [ ] Run `cargo fmt`
 
-## Task 10. Add Comprehensive Documentation
+## Task 11. Add Comprehensive Documentation
 
 Document the aggregate's purpose, usage, and architecture.
 
@@ -511,7 +552,7 @@ Document the aggregate's purpose, usage, and architecture.
 - [ ] Verify all public types have documentation
 - [ ] Ensure examples in docs are syntactically valid
 
-## Task 11. Final Validation and Cleanup
+## Task 12. Final Validation and Cleanup
 
 Ensure production readiness across all quality metrics.
 
@@ -545,10 +586,12 @@ Ensure production readiness across all quality metrics.
 
 Upon completion, the implementation provides:
 
-1. **Complete 11-state aggregate lifecycle**: NotStarted → WithdrawalInitiated →
-   WithdrawalConfirmed/WithdrawalFailed → BridgingInitiated →
-   BridgeAttestationReceived → Bridged/BridgingFailed → DepositInitiated →
-   DepositConfirmed/DepositFailed
+1. **Complete 10-state aggregate lifecycle** wrapped in `Lifecycle<T, E>`:
+   `Uninitialized` → `Live(WithdrawalInitiated)` →
+   `Live(WithdrawalConfirmed)`/`Live(WithdrawalFailed)` →
+   `Live(BridgingInitiated)` → `Live(BridgeAttestationReceived)` →
+   `Live(Bridged)`/`Live(BridgingFailed)` → `Live(DepositInitiated)` →
+   `Live(DepositConfirmed)`/`Live(DepositFailed)`
 2. **Bidirectional support**: AlpacaToBase (Ethereum → Base) and BaseToAlpaca
    (Base → Ethereum) directions
 3. **Comprehensive tracking**:
@@ -559,10 +602,11 @@ Upon completion, the implementation provides:
    - Deposit: TransferRef (AlpacaTransferId or TxHash)
 4. **Rich failure events**: Stage-specific failure states (WithdrawalFailed,
    BridgingFailed, DepositFailed) that preserve all available context
-5. **View projection**: Queryable state via database-backed read model with all
-   timestamps and references, updated incrementally throughout implementation
-6. **Type-safe state machine**: 11 distinct enum variants prevent invalid
-   transitions at compile time
+5. **Self-view projection**: `impl View<Lifecycle<...>> for Lifecycle<...>`
+   pattern - no separate View type, queryable state via database-backed read
+   model with all timestamps and references
+6. **Type-safe state machine**: 10 distinct live states (plus Uninitialized)
+   wrapped in `Lifecycle<T, E>` prevent invalid transitions at compile time
 7. **Full test coverage**: Unit tests for all transitions, edge cases, and
    failure scenarios at each stage, plus end-to-end tests
 8. **Database persistence**: Migration-backed view table created upfront and
