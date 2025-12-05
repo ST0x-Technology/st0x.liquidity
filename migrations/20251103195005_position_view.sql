@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS position_view (
 
     -- STORED generated columns for efficient querying
     symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Position.symbol')) STORED,
-    net_position TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Position.net_position')) STORED,
+    net_position TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Position.net')) STORED,
     last_updated TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Position.last_updated')) STORED
 );
 

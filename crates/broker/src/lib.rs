@@ -71,7 +71,7 @@ pub trait Broker: Send + Sync + 'static {
 ///
 /// Ensures symbols are non-empty and provides type safety to prevent
 /// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct Symbol(String);
 
 impl Symbol {
@@ -90,6 +90,16 @@ impl Symbol {
     }
 }
 
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
 impl Display for Symbol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -100,7 +110,7 @@ impl Display for Symbol {
 ///
 /// Represents whole share quantities with bounds checking.
 /// Values are constrained to 1..=u32::MAX for practical trading limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct Shares(u32);
 
 impl Shares {
@@ -123,6 +133,16 @@ impl Shares {
 
     pub fn value(&self) -> u32 {
         self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Shares {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let shares = u64::deserialize(deserializer)?;
+        Self::new(shares).map_err(serde::de::Error::custom)
     }
 }
 

@@ -78,9 +78,10 @@ This project uses a Cargo workspace with:
 - `sqlx migrate add <migration_name>` - Create a new migration file
 - Database URL configured via `DATABASE_URL` environment variable
 
-**CRITICAL: NEVER manually create migration files.** Always use `sqlx migrate add
-<migration_name>` to create migrations. This ensures proper timestamping and
-sequencing.
+**CRITICAL: NEVER manually create migration files.** Always use
+`sqlx migrate add
+<migration_name>` to create migrations. This ensures proper
+timestamping and sequencing.
 
 ### Dependency Management
 
@@ -91,7 +92,8 @@ resolution and feature selection.
 - `cargo add <crate_name>` - Add a dependency to the current crate
 - `cargo add <crate_name> --dev` - Add a dev-dependency
 - `cargo add <crate_name> --build` - Add a build-dependency
-- `cargo add <crate_name> -F <feature>` - Add a dependency with specific features
+- `cargo add <crate_name> -F <feature>` - Add a dependency with specific
+  features
 
 ### Development Tools
 
@@ -271,6 +273,23 @@ Environment variables (can be set via `.env` file):
 
 ### Code Quality & Best Practices
 
+- **CRITICAL: Package by Feature, Not by Layer**: NEVER organize code by
+  language primitives or technical layers. ALWAYS organize by business
+  feature/domain.
+  - **FORBIDDEN**: `types.rs`, `error.rs`, `models.rs`, `utils.rs`,
+    `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`, `services.rs` (when used
+    as catch-all technical layer modules)
+  - **CORRECT**: `account.rs`, `trade.rs`, `position.rs` (organized by business
+    domain), with submodules like `position/cmd.rs`, `position/event.rs` if
+    needed
+  - Each feature module should contain ALL related code: types, errors,
+    commands, events, aggregates, views, and endpoints
+  - This makes it easy to understand and modify a feature without jumping
+    between unrelated files
+  - Example: `src/position/` contains everything related to positions - newtypes
+    (FractionalShares, ExecutionId), commands (Initialize, PlaceOffChainOrder),
+    events (OnChainOrderFilled, OffChainOrderPlaced), aggregate (Position), view
+    (PositionView), errors (PositionError)
 - **Event-Driven Architecture**: Each trade spawns independent async task for
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and

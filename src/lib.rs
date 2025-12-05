@@ -11,6 +11,7 @@ pub mod cli;
 mod conductor;
 pub mod env;
 mod error;
+mod lifecycle;
 mod lock;
 mod offchain;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
@@ -25,9 +26,13 @@ mod onchain_trade;
 mod position;
 mod queue;
 pub mod reporter;
+mod shares;
 mod symbol;
 mod telemetry;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses TokenizedEquityMint aggregate
+// TODO(#130): Remove dead_code allow when dual-write is implemented
+#[allow(dead_code)]
+mod threshold;
+// TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
 #[allow(dead_code)]
 mod tokenized_equity_mint;
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses EquityRedemption aggregate

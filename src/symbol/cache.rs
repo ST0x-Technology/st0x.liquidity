@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::bindings::{IERC20::IERC20Instance, IOrderBookV4::IO};
+use crate::bindings::{IERC20::IERC20Instance, IOrderBookV5::IOV2};
 use crate::error::OnChainError;
 
 #[derive(Debug, Default, Clone)]
@@ -17,7 +17,7 @@ impl SymbolCache {
     pub async fn get_io_symbol<P: Provider>(
         &self,
         provider: P,
-        io: &IO,
+        io: &IOV2,
     ) -> Result<String, OnChainError> {
         let maybe_symbol = {
             let read_guard = match self.map.read() {
@@ -50,7 +50,7 @@ impl SymbolCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::{U256, address};
+    use alloy::primitives::address;
     use alloy::providers::{ProviderBuilder, mock::Asserter};
 
     #[tokio::test]
@@ -64,10 +64,9 @@ mod tests {
             .expect("Test cache lock poisoned")
             .insert(address, "TEST".to_string());
 
-        let io = IO {
+        let io = IOV2 {
             token: address,
-            decimals: 18,
-            vaultId: U256::from(0),
+            vaultId: alloy::primitives::B256::ZERO,
         };
 
         let asserter = Asserter::new();
@@ -81,10 +80,9 @@ mod tests {
         let cache = SymbolCache::default();
         let address = address!("0x1234567890123456789012345678901234567890");
 
-        let io = IO {
+        let io = IOV2 {
             token: address,
-            decimals: 18,
-            vaultId: U256::from(0),
+            vaultId: alloy::primitives::B256::ZERO,
         };
 
         let asserter = Asserter::new();

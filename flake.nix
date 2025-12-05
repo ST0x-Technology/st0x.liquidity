@@ -3,7 +3,7 @@
 
   inputs = {
     rainix.url =
-      "github:rainprotocol/rainix?rev=a4cd2a027110a6e4bffa46ea75bc970936b38931";
+      "github:rainprotocol/rainix?rev=560ee6ec35b72a2e6c669745b4af33997b2979fb";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -21,6 +21,7 @@
               set -euxo pipefail
               npm install
               (cd lib/rain.orderbook/ && forge build)
+              (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd node_modules/@pythnetwork/pyth-sdk-solidity/ && forge build)
               (cd lib/evm-cctp-contracts/ && forge build)

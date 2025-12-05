@@ -1,12 +1,19 @@
 use alloy::primitives::{Address, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use st0x_broker::alpaca::AlpacaAuthEnv;
+use serde::Serialize;
+
+#[cfg(test)]
+use serde::Deserialize;
 use thiserror::Error;
 
 use super::transfer::{AlpacaTransferId, Network, TokenSymbol, TransferStatus};
 use super::whitelist::{WhitelistEntry, WhitelistStatus};
+
+#[cfg(test)]
+use httpmock::prelude::GET;
+#[cfg(test)]
+use serde_json::json;
 
 #[derive(Debug, Error)]
 pub enum AlpacaWalletError {
@@ -66,6 +73,7 @@ pub enum AlpacaWalletError {
     },
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct AccountResponse {
     id: String,
@@ -80,27 +88,6 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    pub async fn new(env: AlpacaAuthEnv) -> Result<Self, AlpacaWalletError> {
-        let base_url = env.base_url();
-        let client = Client::new();
-
-        let account_id = Self::fetch_account_id(
-            &client,
-            &base_url,
-            &env.alpaca_api_key,
-            &env.alpaca_api_secret,
-        )
-        .await?;
-
-        Ok(Self {
-            client,
-            account_id,
-            base_url,
-            api_key: env.alpaca_api_key,
-            api_secret: env.alpaca_api_secret,
-        })
-    }
-
     #[cfg(test)]
     pub(super) async fn new_with_base_url(
         base_url: String,
@@ -120,6 +107,7 @@ impl AlpacaWalletClient {
         })
     }
 
+    #[cfg(test)]
     async fn fetch_account_id(
         client: &Client,
         base_url: &str,
@@ -263,50 +251,54 @@ impl AlpacaWalletClient {
 }
 
 #[cfg(test)]
+pub(super) fn create_account_mock<'a>(
+    server: &'a httpmock::MockServer,
+    account_id: &str,
+) -> httpmock::Mock<'a> {
+    server.mock(|when, then| {
+        when.method(GET).path("/v2/account");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": account_id,
+                "account_number": "PA1234567890",
+                "status": "ACTIVE",
+                "currency": "USD",
+                "buying_power": "100000.00",
+                "regt_buying_power": "100000.00",
+                "daytrading_buying_power": "400000.00",
+                "non_marginable_buying_power": "100000.00",
+                "cash": "100000.00",
+                "accrued_fees": "0",
+                "pending_transfer_out": "0",
+                "pending_transfer_in": "0",
+                "portfolio_value": "100000.00",
+                "pattern_day_trader": false,
+                "trading_blocked": false,
+                "transfers_blocked": false,
+                "account_blocked": false,
+                "created_at": "2020-01-01T00:00:00Z",
+                "trade_suspended_by_user": false,
+                "multiplier": "4",
+                "shorting_enabled": true,
+                "equity": "100000.00",
+                "last_equity": "100000.00",
+                "long_market_value": "0",
+                "short_market_value": "0",
+                "initial_margin": "0",
+                "maintenance_margin": "0",
+                "last_maintenance_margin": "0",
+                "sma": "0",
+                "daytrade_count": 0
+            }));
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use httpmock::prelude::*;
     use serde_json::json;
-
-    fn create_account_mock<'a>(server: &'a MockServer, account_id: &str) -> httpmock::Mock<'a> {
-        server.mock(|when, then| {
-            when.method(GET).path("/v2/account");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": account_id,
-                    "account_number": "PA1234567890",
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "buying_power": "100000.00",
-                    "regt_buying_power": "100000.00",
-                    "daytrading_buying_power": "400000.00",
-                    "non_marginable_buying_power": "100000.00",
-                    "cash": "100000.00",
-                    "accrued_fees": "0",
-                    "pending_transfer_out": "0",
-                    "pending_transfer_in": "0",
-                    "portfolio_value": "100000.00",
-                    "pattern_day_trader": false,
-                    "trading_blocked": false,
-                    "transfers_blocked": false,
-                    "account_blocked": false,
-                    "created_at": "2020-01-01T00:00:00Z",
-                    "trade_suspended_by_user": false,
-                    "multiplier": "4",
-                    "shorting_enabled": true,
-                    "equity": "100000.00",
-                    "last_equity": "100000.00",
-                    "long_market_value": "0",
-                    "short_market_value": "0",
-                    "initial_margin": "0",
-                    "maintenance_margin": "0",
-                    "last_maintenance_margin": "0",
-                    "sma": "0",
-                    "daytrade_count": 0
-                }));
-        })
-    }
 
     #[tokio::test]
     async fn test_client_construction() {

@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(
             OrderState::Failed {
                 failed_at: Utc::now(),
-                error_reason: None,
+                error_reason: None
             }
             .status(),
             OrderStatus::Failed
