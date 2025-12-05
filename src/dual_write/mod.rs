@@ -3,9 +3,11 @@ use cqrs_es::AggregateError;
 use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
 
-use crate::offchain_order::{OffchainOrder, OffchainOrderError};
+use crate::lifecycle::{Lifecycle, Never};
+use crate::offchain_order::{NegativePriceCents, OffchainOrder, OffchainOrderError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
-use crate::position::{NegativePriceCents, Position, PositionError};
+use crate::position::{Position, PositionError};
+use crate::shares::ArithmeticError;
 
 mod offchain_order;
 mod onchain_trade;
@@ -46,9 +48,9 @@ pub(crate) enum DualWriteError {
 }
 
 pub(crate) struct DualWriteContext {
-    onchain_trade: SqliteCqrs<OnChainTrade>,
-    position: SqliteCqrs<Position>,
-    offchain_order: SqliteCqrs<OffchainOrder>,
+    onchain_trade: SqliteCqrs<Lifecycle<OnChainTrade, Never>>,
+    position: SqliteCqrs<Lifecycle<Position, ArithmeticError>>,
+    offchain_order: SqliteCqrs<Lifecycle<OffchainOrder, Never>>,
 }
 
 impl DualWriteContext {
@@ -60,15 +62,15 @@ impl DualWriteContext {
         }
     }
 
-    pub(crate) fn onchain_trade_framework(&self) -> &SqliteCqrs<OnChainTrade> {
+    pub(crate) fn onchain_trade_framework(&self) -> &SqliteCqrs<Lifecycle<OnChainTrade, Never>> {
         &self.onchain_trade
     }
 
-    pub(crate) fn position_framework(&self) -> &SqliteCqrs<Position> {
+    pub(crate) fn position_framework(&self) -> &SqliteCqrs<Lifecycle<Position, ArithmeticError>> {
         &self.position
     }
 
-    pub(crate) fn offchain_order_framework(&self) -> &SqliteCqrs<OffchainOrder> {
+    pub(crate) fn offchain_order_framework(&self) -> &SqliteCqrs<Lifecycle<OffchainOrder, Never>> {
         &self.offchain_order
     }
 }

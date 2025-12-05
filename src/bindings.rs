@@ -3,7 +3,7 @@ use alloy::sol;
 sol!(
     #![sol(all_derives = true, rpc)]
     #[derive(serde::Serialize, serde::Deserialize)]
-    IOrderBookV5, "lib/rain.orderbook/out/IOrderBookV5.sol/IOrderBookV5.json"
+    IOrderBookV5, "lib/rain.orderbook.interface/out/IOrderBookV5.sol/IOrderBookV5.json"
 );
 
 sol!(
@@ -21,12 +21,5 @@ sol!(
 
 sol!(
     #![sol(all_derives = true)]
-    LibDecimalFloat, "lib/rain.orderbook/out/LibDecimalFloat.sol/LibDecimalFloat.json"
-);
-
-#[cfg(test)]
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    TOFUTokenDecimals, "lib/rain.orderbook/out/TOFUTokenDecimals.sol/TOFUTokenDecimals.json"
+    LibDecimalFloat, "lib/rain.orderbook.interface/out/LibDecimalFloat.sol/LibDecimalFloat.json"
 );
