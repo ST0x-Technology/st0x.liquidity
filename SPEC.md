@@ -2510,7 +2510,7 @@ when natural business logic boundaries emerge (e.g., `schwab/auth/` uses CQRS
 submodules because auth is a complex domain with distinct commands, events, and
 views).
 
-```
+```text
 Cargo.toml                        - Workspace definition (st0x-hedge + crates/broker)
 src/                              - Main st0x-hedge library crate
   lib.rs                          - Library exports, CQRS setup
