@@ -573,40 +573,52 @@ updates are handled by the Lifecycle self-view pattern.)
 - Data preservation: verifying `burn_tx_hash` and `cctp_nonce` are preserved in
   failure state
 
-## Task 8. Deposit Initiation
+## Task 8. Deposit Initiation ✅
 
 Implement Bridged → DepositInitiated transition. (View updates are handled by
 the Lifecycle self-view pattern.)
 
 ### Subtasks
 
-- [ ] Add state `DepositInitiated`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Usdc`
-  - [ ] `burn_tx_hash: TxHash`
-  - [ ] `mint_tx_hash: TxHash`
-  - [ ] `deposit_ref: TransferRef`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `deposit_initiated_at: DateTime<Utc>`
-- [ ] Add command `InitiateDeposit { deposit: TransferRef }`
-- [ ] Add event
+- [x] Add state `DepositInitiated`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `burn_tx_hash: TxHash`
+  - [x] `mint_tx_hash: TxHash`
+  - [x] `deposit_ref: TransferRef`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `deposit_initiated_at: DateTime<Utc>`
+- [x] Add command `InitiateDeposit { deposit: TransferRef }`
+- [x] Add event
       `DepositInitiated { deposit_ref: TransferRef, deposit_initiated_at }`
-- [ ] Update `handle()`:
-  - [ ] `Bridged` + `InitiateDeposit` → emit `DepositInitiated`
-- [ ] Update `apply_transition()` for `DepositInitiated` event
-- [ ] Add error `BridgingNotCompleted`
+- [x] Update `handle()`:
+  - [x] `Bridged` + `InitiateDeposit` → emit `DepositInitiated`
+- [x] Update `apply_transition()` for `DepositInitiated` event
+- [x] Add error `BridgingNotCompleted`
 
 ### Tests
 
-- [ ] `test_initiate_deposit_with_alpaca_transfer`
-- [ ] `test_initiate_deposit_with_onchain_tx`
-- [ ] `test_cannot_deposit_before_bridging_complete`
+- [x] `test_initiate_deposit_with_alpaca_transfer`
+- [x] `test_initiate_deposit_with_onchain_tx`
+- [x] `test_cannot_deposit_before_bridging_complete`
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Added `DepositInitiated` state variant with all required fields
+- Added `BridgingNotCompleted` error variant
+- Added `handle_initiate_deposit` command handler that validates `Bridged` state
+- Updated `handle()` to route `InitiateDeposit` command
+- Added `apply_deposit_initiated` helper method using `&self` pattern
+- Updated all existing command handlers to include `DepositInitiated` in match
+  arms
+- Refactored all `apply_*` helper methods from `current: &Self` to `&self` for
+  idiomatic Rust
 
 ## Task 9. Deposit Confirmation and Failure
 
