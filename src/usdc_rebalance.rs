@@ -83,6 +83,9 @@ pub(crate) enum UsdcRebalanceError {
     /// Bridging has not been completed yet
     #[error("Bridging has not been completed")]
     BridgingNotCompleted,
+    /// Deposit has not been initiated yet
+    #[error("Deposit has not been initiated")]
+    DepositNotInitiated,
     /// Command not valid for current state
     #[error("Command {command} not valid for state {state}")]
     InvalidCommand { command: String, state: String },
@@ -275,6 +278,26 @@ pub(crate) enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         deposit_initiated_at: DateTime<Utc>,
     },
+    /// Deposit has been confirmed (terminal state)
+    DepositConfirmed {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        initiated_at: DateTime<Utc>,
+        deposit_confirmed_at: DateTime<Utc>,
+    },
+    /// Deposit has failed (terminal state)
+    DepositFailed {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        burn_tx_hash: TxHash,
+        mint_tx_hash: TxHash,
+        deposit_ref: Option<TransferRef>,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 #[async_trait]
@@ -330,13 +353,9 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
                 self.handle_initiate_deposit(deposit)
             }
 
-            _ => {
-                // Other commands will be implemented in subsequent tasks
-                Err(UsdcRebalanceError::InvalidCommand {
-                    command: format!("{command:?}"),
-                    state: format!("{self:?}"),
-                })
-            }
+            UsdcRebalanceCommand::ConfirmDeposit => self.handle_confirm_deposit(),
+
+            UsdcRebalanceCommand::FailDeposit { reason } => self.handle_fail_deposit(reason),
         }
     }
 }
@@ -375,7 +394,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::Attested { .. }
                 | UsdcRebalance::Bridged { .. }
                 | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. },
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
             Err(e) => Err(e.into()),
         }
@@ -400,7 +421,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::Attested { .. }
                 | UsdcRebalance::Bridged { .. }
                 | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. },
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
             Err(e) => Err(e.into()),
         }
@@ -430,7 +453,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::Attested { .. }
                 | UsdcRebalance::Bridged { .. }
                 | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. },
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::InvalidCommand {
                 command: "InitiateBridging".to_string(),
                 state: "Bridging".to_string(),
@@ -467,7 +492,9 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(
                 UsdcRebalance::Bridged { .. }
                 | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. },
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
 
             Err(e) => Err(e.into()),
@@ -495,7 +522,9 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(
                 UsdcRebalance::Bridged { .. }
                 | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. },
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
 
             Err(e) => Err(e.into()),
@@ -535,7 +564,9 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(
                 UsdcRebalance::Bridged { .. }
                 | UsdcRebalance::BridgingFailed { .. }
-                | UsdcRebalance::DepositInitiated { .. },
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingAlreadyCompleted),
 
             Err(e) => Err(e.into()),
@@ -562,10 +593,79 @@ impl Lifecycle<UsdcRebalance, Never> {
                 deposit_initiated_at: Utc::now(),
             }]),
 
-            Ok(UsdcRebalance::DepositInitiated { .. }) => Err(UsdcRebalanceError::InvalidCommand {
+            Ok(
+                UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. },
+            ) => Err(UsdcRebalanceError::InvalidCommand {
                 command: "InitiateDeposit".to_string(),
-                state: "DepositInitiated".to_string(),
+                state: format!("{:?}", self.live()),
             }),
+
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_confirm_deposit(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                UsdcRebalance::Withdrawing { .. }
+                | UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::Bridging { .. }
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::BridgingFailed { .. }
+                | UsdcRebalance::Bridged { .. },
+            ) => Err(UsdcRebalanceError::DepositNotInitiated),
+
+            Ok(UsdcRebalance::DepositInitiated { .. }) => {
+                Ok(vec![UsdcRebalanceEvent::DepositConfirmed {
+                    deposit_confirmed_at: Utc::now(),
+                }])
+            }
+
+            Ok(UsdcRebalance::DepositConfirmed { .. } | UsdcRebalance::DepositFailed { .. }) => {
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: "ConfirmDeposit".to_string(),
+                    state: format!("{:?}", self.live()),
+                })
+            }
+
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_fail_deposit(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                UsdcRebalance::Withdrawing { .. }
+                | UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::Bridging { .. }
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::BridgingFailed { .. }
+                | UsdcRebalance::Bridged { .. },
+            ) => Err(UsdcRebalanceError::DepositNotInitiated),
+
+            Ok(UsdcRebalance::DepositInitiated { deposit_ref, .. }) => {
+                Ok(vec![UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: Some(deposit_ref.clone()),
+                    reason: reason.to_string(),
+                    failed_at: Utc::now(),
+                }])
+            }
+
+            Ok(UsdcRebalance::DepositConfirmed { .. } | UsdcRebalance::DepositFailed { .. }) => {
+                Err(UsdcRebalanceError::InvalidCommand {
+                    command: "FailDeposit".to_string(),
+                    state: format!("{:?}", self.live()),
+                })
+            }
 
             Err(e) => Err(e.into()),
         }
@@ -608,9 +708,15 @@ impl UsdcRebalance {
                 deposit_ref,
                 deposit_initiated_at,
             } => current.apply_deposit_initiated(deposit_ref, *deposit_initiated_at),
-            UsdcRebalanceEvent::Initiated { .. }
-            | UsdcRebalanceEvent::DepositConfirmed { .. }
-            | UsdcRebalanceEvent::DepositFailed { .. } => Err(LifecycleError::Mismatch {
+            UsdcRebalanceEvent::DepositConfirmed {
+                deposit_confirmed_at,
+            } => current.apply_deposit_confirmed(*deposit_confirmed_at),
+            UsdcRebalanceEvent::DepositFailed {
+                deposit_ref,
+                reason,
+                failed_at,
+            } => current.apply_deposit_failed(deposit_ref.as_ref(), reason, *failed_at),
+            UsdcRebalanceEvent::Initiated { .. } => Err(LifecycleError::Mismatch {
                 state: format!("{current:?}"),
                 event: event.event_type(),
             }),
@@ -827,6 +933,68 @@ impl UsdcRebalance {
         })
     }
 
+    fn apply_deposit_confirmed(
+        &self,
+        deposit_confirmed_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::DepositInitiated {
+            direction,
+            amount,
+            burn_tx_hash,
+            mint_tx_hash,
+            initiated_at,
+            ..
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: "DepositConfirmed".to_string(),
+            });
+        };
+
+        Ok(Self::DepositConfirmed {
+            direction: direction.clone(),
+            amount: *amount,
+            burn_tx_hash: *burn_tx_hash,
+            mint_tx_hash: *mint_tx_hash,
+            initiated_at: *initiated_at,
+            deposit_confirmed_at,
+        })
+    }
+
+    fn apply_deposit_failed(
+        &self,
+        deposit_ref: Option<&TransferRef>,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::DepositInitiated {
+            direction,
+            amount,
+            burn_tx_hash,
+            mint_tx_hash,
+            initiated_at,
+            ..
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: "DepositFailed".to_string(),
+            });
+        };
+
+        Ok(Self::DepositFailed {
+            direction: direction.clone(),
+            amount: *amount,
+            burn_tx_hash: *burn_tx_hash,
+            mint_tx_hash: *mint_tx_hash,
+            deposit_ref: deposit_ref.cloned(),
+            reason: reason.to_string(),
+            initiated_at: *initiated_at,
+            failed_at,
+        })
+    }
+
     /// Create initial state from an initialization event.
     pub(crate) fn from_event(event: &UsdcRebalanceEvent) -> Result<Self, LifecycleError<Never>> {
         match event {
@@ -862,7 +1030,7 @@ impl View<Self> for Lifecycle<UsdcRebalance, Never> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::Address;
+    use alloy::primitives::fixed_bytes;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -905,7 +1073,8 @@ mod tests {
     #[tokio::test]
     async fn test_initiate_base_to_alpaca() {
         let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
-        let tx_hash = Address::ZERO.into_word();
+        let tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
 
         let events = aggregate
             .handle(
@@ -1030,7 +1199,9 @@ mod tests {
         let event = UsdcRebalanceEvent::Initiated {
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc(dec!(500.00)),
-            withdrawal_ref: TransferRef::OnchainTx(Address::ZERO.into_word()),
+            withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
+                "0x0000000000000000000000000000000000000000000000000000000000000001"
+            )),
             initiated_at: Utc::now(),
         };
 
@@ -1359,7 +1530,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         let events = aggregate
@@ -1411,7 +1583,8 @@ mod tests {
     async fn test_cannot_initiate_bridging_before_withdrawal() {
         let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let result = aggregate
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
@@ -1440,7 +1613,8 @@ mod tests {
             initiated_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let result = aggregate
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
@@ -1474,7 +1648,8 @@ mod tests {
             failed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let result = aggregate
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
@@ -1507,7 +1682,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
@@ -1537,7 +1713,8 @@ mod tests {
         let initiated_at = Utc::now();
         let confirmed_at = Utc::now();
         let burned_at = Utc::now();
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         view.update(&EventEnvelope {
@@ -1607,7 +1784,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
@@ -1787,7 +1965,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
@@ -1822,7 +2001,8 @@ mod tests {
         let confirmed_at = Utc::now();
         let burned_at = Utc::now();
         let attested_at = Utc::now();
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
         let attestation = vec![0x01, 0x02, 0x03, 0x04];
 
@@ -1905,7 +2085,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
@@ -1920,7 +2101,8 @@ mod tests {
             attested_at: Utc::now(),
         });
 
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         let events = aggregate
             .handle(
@@ -1980,14 +2162,16 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let result = aggregate
             .handle(
                 UsdcRebalanceCommand::ConfirmBridging {
@@ -2020,7 +2204,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
@@ -2094,7 +2279,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
@@ -2170,7 +2356,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::repeat_byte(0xAB).into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0xabababababababababababababababababababababababababababababababab");
         let cctp_nonce = 98765u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
@@ -2226,7 +2413,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
@@ -2238,7 +2426,8 @@ mod tests {
             attested_at: Utc::now(),
         });
 
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
             minted_at: Utc::now(),
@@ -2247,7 +2436,9 @@ mod tests {
         let result = aggregate
             .handle(
                 UsdcRebalanceCommand::ConfirmBridging {
-                    mint_tx: Address::repeat_byte(0x22).into_word(),
+                    mint_tx: fixed_bytes!(
+                        "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    ),
                 },
                 &(),
             )
@@ -2275,7 +2466,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
@@ -2287,7 +2479,8 @@ mod tests {
             attested_at: Utc::now(),
         });
 
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
             minted_at: Utc::now(),
@@ -2324,7 +2517,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
@@ -2362,8 +2556,10 @@ mod tests {
         let burned_at = Utc::now();
         let attested_at = Utc::now();
         let minted_at = Utc::now();
-        let burn_tx_hash = Address::ZERO.into_word();
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         let cctp_nonce = 12345u64;
 
         view.update(&EventEnvelope {
@@ -2444,7 +2640,8 @@ mod tests {
         let confirmed_at = Utc::now();
         let burned_at = Utc::now();
         let failed_at = Utc::now();
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let cctp_nonce = 12345u64;
 
         view.update(&EventEnvelope {
@@ -2528,8 +2725,10 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
@@ -2611,8 +2810,10 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
-        let mint_tx_hash = Address::repeat_byte(0x11).into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
@@ -2630,7 +2831,8 @@ mod tests {
             minted_at: Utc::now(),
         });
 
-        let deposit_tx_hash = Address::repeat_byte(0x22).into_word();
+        let deposit_tx_hash =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
         let deposit_ref = TransferRef::OnchainTx(deposit_tx_hash);
 
         let events = aggregate
@@ -2687,7 +2889,8 @@ mod tests {
             confirmed_at: Utc::now(),
         });
 
-        let burn_tx_hash = Address::ZERO.into_word();
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
             cctp_nonce: 12345,
@@ -2713,5 +2916,298 @@ mod tests {
             result.unwrap_err(),
             UsdcRebalanceError::BridgingNotCompleted
         ));
+    }
+
+    #[tokio::test]
+    async fn test_confirm_deposit() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at,
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash,
+            minted_at: Utc::now(),
+        });
+
+        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
+
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref,
+            deposit_initiated_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            UsdcRebalanceEvent::DepositConfirmed { .. }
+        ));
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::DepositConfirmed {
+            direction,
+            amount,
+            burn_tx_hash: state_burn_tx,
+            mint_tx_hash: state_mint_tx,
+            initiated_at: state_initiated_at,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected DepositConfirmed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*state_burn_tx, burn_tx_hash);
+        assert_eq!(*state_mint_tx, mint_tx_hash);
+        assert_eq!(*state_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_confirm_deposit_before_initiating() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash,
+            minted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmDeposit, &())
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::DepositNotInitiated
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fail_deposit_after_initiated() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc(dec!(500.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at,
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash,
+            minted_at: Utc::now(),
+        });
+
+        let deposit_transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let deposit_ref = TransferRef::AlpacaId(deposit_transfer_id);
+
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: deposit_ref.clone(),
+            deposit_initiated_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "Test failure reason".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::DepositFailed {
+            deposit_ref: event_deposit_ref,
+            reason,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected DepositFailed event");
+        };
+
+        assert_eq!(*event_deposit_ref, Some(deposit_ref.clone()));
+        assert_eq!(reason, "Test failure reason");
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::DepositFailed {
+            direction,
+            amount,
+            deposit_ref: state_deposit_ref,
+            reason: state_reason,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected DepositFailed state");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(*amount, Usdc(dec!(500.00)));
+        assert_eq!(*state_deposit_ref, Some(deposit_ref));
+        assert_eq!(state_reason, "Test failure reason");
+    }
+
+    #[tokio::test]
+    async fn test_deposit_failed_preserves_deposit_ref_when_available() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(transfer_id),
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+
+        let burn_tx_hash =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash,
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01, 0x02],
+            attested_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash,
+            minted_at: Utc::now(),
+        });
+
+        let onchain_tx =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let deposit_ref = TransferRef::OnchainTx(onchain_tx);
+
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: deposit_ref.clone(),
+            deposit_initiated_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: "Onchain deposit failed".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::DepositFailed {
+            deposit_ref: event_deposit_ref,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected DepositFailed event");
+        };
+
+        assert_eq!(*event_deposit_ref, Some(deposit_ref.clone()));
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let UsdcRebalance::DepositFailed {
+            deposit_ref: state_deposit_ref,
+            ..
+        } = aggregate.live().unwrap()
+        else {
+            panic!("Expected DepositFailed state");
+        };
+
+        assert_eq!(*state_deposit_ref, Some(deposit_ref));
     }
 }
