@@ -255,54 +255,83 @@ type, and using `Lifecycle::Uninitialized` instead of `NotStarted` variant.
 - Tests use `Lifecycle::<UsdcRebalance, Never>::default()` instead of
   `UsdcRebalance::default()`
 
-## Task 4. Withdrawal Confirmation
+## Task 4. Withdrawal Confirmation ✅
 
-Implement WithdrawalInitiated → WithdrawalConfirmed/WithdrawalFailed
-transitions. (View updates are now handled by the Lifecycle self-view pattern
-from Task 3.)
+Implement Withdrawing → WithdrawalComplete/WithdrawalFailed transitions. (View
+updates are now handled by the Lifecycle self-view pattern from Task 3.)
 
 ### Subtasks
 
-- [ ] Add state `WithdrawalConfirmed`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `confirmed_at: DateTime<Utc>`
-- [ ] Add state `WithdrawalFailed`:
-  - [ ] `direction: RebalanceDirection`
-  - [ ] `amount: Decimal`
-  - [ ] `withdrawal_ref: TransferRef`
-  - [ ] `reason: String`
-  - [ ] `initiated_at: DateTime<Utc>`
-  - [ ] `failed_at: DateTime<Utc>`
-- [ ] Add commands:
-  - [ ] `ConfirmWithdrawal`
-  - [ ] `FailWithdrawal { reason }`
-- [ ] Add events:
-  - [ ] `WithdrawalConfirmed { confirmed_at }`
-  - [ ] `WithdrawalFailed { reason, failed_at }`
-- [ ] Update `handle()`:
-  - [ ] `WithdrawalInitiated` + `ConfirmWithdrawal` → emit `WithdrawalConfirmed`
-  - [ ] `WithdrawalInitiated` + `FailWithdrawal` → emit `WithdrawalFailed`
-- [ ] Update `apply_transition()` for withdrawal events
-- [ ] Update `from_event()` if these events can initialize (unlikely)
-- [ ] Add errors:
-  - [ ] `WithdrawalNotInitiated`
-  - [ ] `AlreadyCompleted`
-  - [ ] `AlreadyFailed`
+- [x] Add state `WithdrawalComplete`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `confirmed_at: DateTime<Utc>`
+- [x] Add state `WithdrawalFailed`:
+  - [x] `direction: RebalanceDirection`
+  - [x] `amount: Usdc`
+  - [x] `withdrawal_ref: TransferRef`
+  - [x] `reason: String`
+  - [x] `initiated_at: DateTime<Utc>`
+  - [x] `failed_at: DateTime<Utc>`
+- [x] Add commands:
+  - [x] `ConfirmWithdrawal`
+  - [x] `FailWithdrawal { reason }`
+- [x] Add events:
+  - [x] `WithdrawalConfirmed { confirmed_at }`
+  - [x] `WithdrawalFailed { reason, failed_at }`
+- [x] Update `handle()`:
+  - [x] `Withdrawing` + `ConfirmWithdrawal` → emit `WithdrawalConfirmed`
+  - [x] `Withdrawing` + `FailWithdrawal` → emit `WithdrawalFailed`
+- [x] Update `apply_transition()` for withdrawal events
+- [x] Update `from_event()` if these events can initialize (N/A - not
+      initialization events)
+- [x] Add errors:
+  - [x] `WithdrawalNotInitiated`
+  - [x] `WithdrawalAlreadyCompleted`
 
 ### Tests
 
-- [ ] `test_confirm_withdrawal`
-- [ ] `test_cannot_confirm_withdrawal_before_initiating`
-- [ ] `test_cannot_confirm_withdrawal_twice`
-- [ ] `test_fail_withdrawal_after_initiation`
+- [x] `test_confirm_withdrawal`
+- [x] `test_cannot_confirm_withdrawal_before_initiating`
+- [x] `test_cannot_confirm_withdrawal_twice`
+- [x] `test_fail_withdrawal_after_initiation`
+- [x] `test_cannot_fail_withdrawal_before_initiating`
+- [x] `test_cannot_fail_already_confirmed_withdrawal`
+- [x] `test_cannot_fail_already_failed_withdrawal`
+- [x] `test_view_tracks_withdrawal_confirmation`
+- [x] `test_view_tracks_withdrawal_failure`
 
 ### Validation
 
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `cargo clippy -- -D clippy::all` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q` - all tests pass (15 usdc_rebalance tests)
+- [x] Run `cargo clippy -- -D clippy::all` - no warnings
+- [x] Run `cargo fmt`
+
+### Implementation Summary
+
+**Key Changes:**
+
+- Renamed `WithdrawalInitiated` to `Withdrawing` and `WithdrawalConfirmed` to
+  `WithdrawalComplete` to avoid clippy `enum_variant_names` lint (all variants
+  had the same "Withdrawal" prefix)
+- Changed `amount: Decimal` to `amount: Usdc` throughout (using proper newtype
+  from `threshold.rs`)
+- Added `InvalidCommand { command, state }` error for unhandled command/state
+  combinations (instead of misusing `LifecycleError::Mismatch` with commands)
+- Consolidated error variants: `WithdrawalAlreadyCompleted` covers both
+  already-confirmed and already-failed cases
+
+**State Machine:**
+
+```
+Lifecycle::Uninitialized --Initiate--> Withdrawing
+Withdrawing --ConfirmWithdrawal--> WithdrawalComplete
+Withdrawing --FailWithdrawal--> WithdrawalFailed
+```
+
+**Tests Added:** 9 new tests covering all withdrawal confirmation/failure
+scenarios including edge cases for attempting operations on terminal states.
 
 ## Task 5. Bridge Burn Initiation
 
