@@ -308,6 +308,7 @@ mod tests {
     use st0x_broker::{Direction, Shares, SupportedBroker};
 
     use super::*;
+    use crate::position::BrokerOrderId;
     use crate::test_utils::setup_test_db;
 
     #[tokio::test]
@@ -352,7 +353,7 @@ mod tests {
         crate::dual_write::confirm_submission(
             &dual_write_context,
             execution_id,
-            "ORD123".to_string(),
+            BrokerOrderId::new("ORD123"),
         )
         .await
         .unwrap();
@@ -432,7 +433,7 @@ mod tests {
         crate::dual_write::confirm_submission(
             &dual_write_context,
             execution_id,
-            "ORD456".to_string(),
+            BrokerOrderId::new("ORD456"),
         )
         .await
         .unwrap();

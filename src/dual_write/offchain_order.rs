@@ -4,6 +4,7 @@ use st0x_broker::OrderState;
 use crate::offchain::execution::OffchainExecution;
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
 use crate::position::{BrokerOrderId, PriceCents};
+use crate::shares::FractionalShares;
 
 use super::{DualWriteContext, DualWriteError};
 
@@ -19,7 +20,7 @@ pub(crate) async fn place_order(
 
     let command = OffchainOrderCommand::Place {
         symbol: execution.symbol.clone(),
-        shares: Decimal::from(execution.shares.value()),
+        shares: FractionalShares(Decimal::from(execution.shares.value())),
         direction: execution.direction,
         broker: execution.broker,
     };
@@ -35,13 +36,11 @@ pub(crate) async fn place_order(
 pub(crate) async fn confirm_submission(
     context: &DualWriteContext,
     execution_id: i64,
-    broker_order_id: String,
+    broker_order_id: BrokerOrderId,
 ) -> Result<(), DualWriteError> {
     let aggregate_id = OffchainOrder::aggregate_id(execution_id);
 
-    let command = OffchainOrderCommand::ConfirmSubmission {
-        broker_order_id: BrokerOrderId(broker_order_id),
-    };
+    let command = OffchainOrderCommand::ConfirmSubmission { broker_order_id };
 
     context
         .offchain_order_framework()
@@ -184,7 +183,7 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        let result = confirm_submission(&context, 2, "ORD123".to_string()).await;
+        let result = confirm_submission(&context, 2, BrokerOrderId::new("ORD123")).await;
         assert!(result.is_ok());
 
         let event_count = sqlx::query_scalar!(
@@ -227,7 +226,7 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        confirm_submission(&context, 3, "ORD456".to_string())
+        confirm_submission(&context, 3, BrokerOrderId::new("ORD456"))
             .await
             .unwrap();
 
@@ -319,7 +318,7 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        confirm_submission(&context, 6, "ORD789".to_string())
+        confirm_submission(&context, 6, BrokerOrderId::new("ORD789"))
             .await
             .unwrap();
 

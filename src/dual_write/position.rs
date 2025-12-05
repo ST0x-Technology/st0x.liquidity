@@ -3,11 +3,31 @@ use st0x_broker::{OrderState, Symbol};
 
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
-use crate::position::{
-    BrokerOrderId, ExecutionId, FractionalShares, Position, PositionCommand, PriceCents, TradeId,
-};
+use crate::position::{BrokerOrderId, ExecutionId, Position, PositionCommand, PriceCents, TradeId};
+use crate::shares::FractionalShares;
+use crate::threshold::ExecutionThreshold;
 
 use super::{DualWriteContext, DualWriteError};
+
+pub(crate) async fn initialize_position(
+    context: &DualWriteContext,
+    symbol: &Symbol,
+    threshold: ExecutionThreshold,
+) -> Result<(), DualWriteError> {
+    let aggregate_id = Position::aggregate_id(symbol);
+
+    let command = PositionCommand::Initialize {
+        symbol: symbol.clone(),
+        threshold,
+    };
+
+    context
+        .position_framework()
+        .execute(&aggregate_id, command)
+        .await?;
+
+    Ok(())
+}
 
 pub(crate) async fn acknowledge_onchain_fill(
     context: &DualWriteContext,
@@ -164,6 +184,11 @@ mod tests {
         let pool = setup_test_db().await;
         let context = DualWriteContext::new(pool.clone());
 
+        let symbol = Symbol::new("AAPL").unwrap();
+        initialize_position(&context, &symbol, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
         let trade = OnchainTrade {
             id: None,
             tx_hash: fixed_bytes!(
@@ -194,10 +219,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(event_count, 1);
+        assert_eq!(event_count, 2);
 
         let event_type = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL'"
+            "SELECT event_type FROM events
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL'
+            ORDER BY sequence DESC LIMIT 1"
         )
         .fetch_one(&pool)
         .await
@@ -246,6 +273,10 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
+        initialize_position(&context, &symbol, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
@@ -287,7 +318,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(event_count, 2);
+        assert_eq!(event_count, 3);
     }
 
     #[tokio::test]
@@ -296,6 +327,10 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
+        initialize_position(&context, &symbol, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
@@ -339,7 +374,9 @@ mod tests {
         assert!(result.is_ok());
 
         let event_type = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence DESC LIMIT 1"
+            "SELECT event_type FROM events
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL'
+            ORDER BY sequence DESC LIMIT 1"
         )
         .fetch_one(&pool)
         .await
@@ -354,6 +391,10 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
+        initialize_position(&context, &symbol, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
@@ -394,7 +435,9 @@ mod tests {
         assert!(result.is_ok());
 
         let event_type = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL' ORDER BY sequence DESC LIMIT 1"
+            "SELECT event_type FROM events
+            WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL'
+            ORDER BY sequence DESC LIMIT 1"
         )
         .fetch_one(&pool)
         .await

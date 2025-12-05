@@ -636,14 +636,19 @@ pub(crate) async fn check_all_accumulated_positions(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::fixed_bytes;
+    use chrono::Utc;
+    use st0x_broker::{OrderStatus, Symbol};
+
     use super::*;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
+    use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
+    use crate::position::{BrokerOrderId, Position, PositionCommand};
     use crate::symbol;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
     use crate::trade_execution_link::TradeExecutionLink;
-    use alloy::primitives::fixed_bytes;
-    use st0x_broker::{OrderStatus, Symbol};
 
     // Helper function for tests to handle transaction management
     async fn process_trade_with_tx(
@@ -2078,13 +2083,21 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_stale_execution_cleanup_executes_dual_write_commands() {
-        use alloy::primitives::fixed_bytes;
-        use chrono::Utc;
-
         let pool = setup_test_db().await;
         let dual_write_context = crate::dual_write::DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
+        dual_write_context
+            .position_framework()
+            .execute(
+                &Position::aggregate_id(&symbol),
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
 
         let onchain_trade = OnchainTrade {
             id: None,
@@ -2157,13 +2170,16 @@ mod tests {
             .await
             .unwrap();
 
-        crate::dual_write::confirm_submission(
-            &dual_write_context,
-            execution_id,
-            "ORDER123".to_string(),
-        )
-        .await
-        .unwrap();
+        dual_write_context
+            .offchain_order_framework()
+            .execute(
+                &OffchainOrder::aggregate_id(execution_id),
+                OffchainOrderCommand::ConfirmSubmission {
+                    broker_order_id: BrokerOrderId("ORDER123".to_string()),
+                },
+            )
+            .await
+            .unwrap();
 
         let trade = OnchainTrade {
             id: None,

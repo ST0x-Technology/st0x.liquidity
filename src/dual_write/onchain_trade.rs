@@ -10,7 +10,7 @@ pub(crate) async fn witness_trade(
     trade: &OnchainTrade,
     block_number: u64,
 ) -> Result<(), DualWriteError> {
-    let aggregate_id = OnChainTrade::aggregate_id(trade.tx_hash, trade.log_index.try_into()?);
+    let aggregate_id = OnChainTrade::aggregate_id(trade.tx_hash, trade.log_index);
 
     let symbol = trade.symbol.base().clone();
     let amount = Decimal::try_from(trade.amount)?;

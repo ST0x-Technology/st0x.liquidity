@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy::primitives::TxHash;
 use cqrs_es::AggregateError;
 use sqlite_es::{SqliteCqrs, sqlite_cqrs};
@@ -16,7 +18,8 @@ mod position;
 pub(crate) use offchain_order::{confirm_submission, mark_failed, place_order, record_fill};
 pub(crate) use onchain_trade::witness_trade;
 pub(crate) use position::{
-    acknowledge_onchain_fill, complete_offchain_order, fail_offchain_order, place_offchain_order,
+    acknowledge_onchain_fill, complete_offchain_order, fail_offchain_order, initialize_position,
+    place_offchain_order,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -47,18 +50,19 @@ pub(crate) enum DualWriteError {
     NegativePriceCents(#[from] NegativePriceCents),
 }
 
+#[derive(Clone)]
 pub(crate) struct DualWriteContext {
-    onchain_trade: SqliteCqrs<Lifecycle<OnChainTrade, Never>>,
-    position: SqliteCqrs<Lifecycle<Position, ArithmeticError>>,
-    offchain_order: SqliteCqrs<Lifecycle<OffchainOrder, Never>>,
+    onchain_trade: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
+    position: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError>>>,
+    offchain_order: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
 }
 
 impl DualWriteContext {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self {
-            onchain_trade: sqlite_cqrs(pool.clone(), vec![], ()),
-            position: sqlite_cqrs(pool.clone(), vec![], ()),
-            offchain_order: sqlite_cqrs(pool, vec![], ()),
+            onchain_trade: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            position: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            offchain_order: Arc::new(sqlite_cqrs(pool, vec![], ())),
         }
     }
 

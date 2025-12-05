@@ -2,6 +2,14 @@
 
 This file provides guidance to AI agents working with code in this repository.
 
+## Communication
+
+- **Do not run commands to "show" output to the user.** The CLI interface
+  truncates output and the user cannot see full command results. If you need the
+  user to review something, stop and explicitly ask them to look at it (e.g.,
+  "please review the changes in src/foo.rs"). Do not run `git diff` or similar
+  commands expecting the user to see the output - they won't.
+
 ## Plan & Review
 
 ### Before starting work
