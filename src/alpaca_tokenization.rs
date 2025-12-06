@@ -338,13 +338,39 @@ where
 
         Ok(receipt.transaction_hash)
     }
+
+    /// Find a redemption request by its onchain transaction hash.
+    ///
+    /// This polls the Alpaca API to check if they have detected a token transfer
+    /// that initiates a redemption. Returns `None` if Alpaca hasn't detected
+    /// the transfer yet.
+    ///
+    /// # Errors
+    ///
+    /// - `ApiError` for API errors
+    /// - `Reqwest` for network errors
+    async fn find_redemption_by_tx(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Option<TokenizationRequest>, AlpacaTokenizationError> {
+        let params = ListRequestsParams {
+            request_type: Some(TokenizationRequestType::Redeem),
+            ..Default::default()
+        };
+
+        let requests = self.list_requests(params).await?;
+
+        Ok(requests
+            .into_iter()
+            .find(|r| r.tx_hash.as_ref() == Some(tx_hash)))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, address};
+    use alloy::primitives::{B256, address, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::signers::local::PrivateKeySigner;
     use httpmock::prelude::*;
@@ -767,5 +793,89 @@ mod tests {
             ),
             "expected RedemptionTransferFailed with insufficient balance, got: {result:?}"
         );
+    }
+
+    fn sample_redemption_request_json_with_tx(
+        id: &str,
+        symbol: &str,
+        tx_hash: TxHash,
+    ) -> serde_json::Value {
+        json!({
+            "tokenization_request_id": id,
+            "type": "redeem",
+            "status": "pending",
+            "underlying_symbol": symbol,
+            "token_symbol": format!("t{symbol}"),
+            "qty": "50.0",
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "tx_hash": tx_hash,
+            "created_at": "2024-01-15T10:30:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn test_find_redemption_by_tx_found() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    sample_redemption_request_json_with_tx("redeem_1", "AAPL", hash),
+                    sample_redemption_request_json_with_tx(
+                        "redeem_2",
+                        "TSLA",
+                        fixed_bytes!(
+                            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                        )
+                    )
+                ]));
+        });
+
+        let result = client.find_redemption_by_tx(&hash).await.unwrap();
+
+        assert!(result.is_some(), "expected to find redemption request");
+        let request = result.unwrap();
+        assert_eq!(request.id, TokenizationRequestId("redeem_1".to_string()));
+        assert_eq!(request.tx_hash, Some(hash));
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_find_redemption_by_tx_not_detected() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let hash: TxHash =
+            fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let result = client.find_redemption_by_tx(&hash).await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "expected None when redemption not yet detected"
+        );
+
+        list_mock.assert();
     }
 }

@@ -171,19 +171,29 @@ Add methods to detect when Alpaca recognizes a redemption transfer.
 
 ### Subtasks
 
-- [ ] Implement
+- [x] Implement
       `find_redemption_by_tx(&self, tx_hash: &TxHash) -> Result<Option<TokenizationRequest>>`:
   - List requests filtered by type=redeem
   - Find matching tx_hash field
   - Return None if not yet detected
-- [ ] Add test: find redemption by tx hash
-- [ ] Add test: redemption not yet detected returns None
+- [x] Add test: find redemption by tx hash
+- [x] Add test: redemption not yet detected returns None
 
 ### Validation
 
-- [ ] Run `cargo test -q`
-- [ ] Run `cargo clippy -- -D clippy::all`
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q`
+- [x] Run `cargo clippy -- -D clippy::all`
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Implemented `find_redemption_by_tx` which lists redeem requests and finds one
+  matching the given tx_hash
+- Returns `Option<TokenizationRequest>` - `None` if Alpaca hasn't detected the
+  transfer yet
+- Added helper `sample_redemption_request_json_with_tx` taking `TxHash` directly
+- Used `fixed_bytes!` macro with `0x` prefix for test tx hashes
+- All 12 tests pass
 
 ## Task 5. Status Polling
 
