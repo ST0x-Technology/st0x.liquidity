@@ -8,12 +8,14 @@ use crate::shares::{ArithmeticError, HasZero};
 
 /// Error type for inventory operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-enum InventoryError<T> {
+pub(super) enum InventoryError<T> {
     #[error(
-        "insufficient available balance: requested {requested}, but only {available} available"
+        "insufficient available balance: requested {requested:?}, but only {available:?} available"
     )]
     InsufficientAvailable { requested: T, available: T },
-    #[error("insufficient inflight balance: requested {requested}, but only {inflight} inflight")]
+    #[error(
+        "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
+    )]
     InsufficientInflight { requested: T, inflight: T },
     #[error(transparent)]
     Arithmetic(#[from] ArithmeticError<T>),
@@ -123,7 +125,7 @@ where
     }
 
     /// Add amount to available (assets arriving at this venue).
-    fn add_available(self, amount: T) -> Result<Self, InventoryError<T>> {
+    pub(super) fn add_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_available = (self.available + amount)?;
 
         Ok(Self {
@@ -133,7 +135,7 @@ where
     }
 
     /// Remove amount from available.
-    fn remove_available(self, amount: T) -> Result<Self, InventoryError<T>> {
+    pub(super) fn remove_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_available = (self.available - amount)?;
 
         if new_available.is_negative() {

@@ -6,10 +6,20 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
-use super::venue_balance::VenueBalance;
+use super::venue_balance::{InventoryError, VenueBalance};
+use crate::position::PositionEvent;
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
-use st0x_broker::Symbol;
+use st0x_broker::{Direction, Symbol};
+
+/// Error type for inventory view operations.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum InventoryViewError {
+    #[error("unknown symbol: {0}")]
+    UnknownSymbol(Symbol),
+    #[error(transparent)]
+    Equity(#[from] InventoryError<FractionalShares>),
+}
 
 /// Imbalance requiring rebalancing action.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +107,42 @@ where
     }
 }
 
+impl<T> Inventory<T>
+where
+    T: Add<Output = Result<T, ArithmeticError<T>>>
+        + Sub<Output = Result<T, ArithmeticError<T>>>
+        + Copy
+        + HasZero,
+{
+    fn add_onchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            onchain: self.onchain.add_available(amount)?,
+            ..self
+        })
+    }
+
+    fn remove_onchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            onchain: self.onchain.remove_available(amount)?,
+            ..self
+        })
+    }
+
+    fn add_offchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.add_available(amount)?,
+            ..self
+        })
+    }
+
+    fn remove_offchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.remove_available(amount)?,
+            ..self
+        })
+    }
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InventoryView {
@@ -105,11 +151,96 @@ struct InventoryView {
     last_updated: DateTime<Utc>,
 }
 
+impl InventoryView {
+    fn update_equity(
+        self,
+        symbol: &Symbol,
+        f: impl FnOnce(
+            Inventory<FractionalShares>,
+        ) -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let inventory = self
+            .equities
+            .get(symbol)
+            .ok_or_else(|| InventoryViewError::UnknownSymbol(symbol.clone()))?;
+
+        let updated = f(inventory.clone())?;
+
+        let mut equities = self.equities;
+        equities.insert(symbol.clone(), updated);
+
+        Ok(Self {
+            equities,
+            last_updated: now,
+            usdc: self.usdc,
+        })
+    }
+
+    /// Applies a position event to update equity inventory.
+    ///
+    /// - `OnChainOrderFilled`: Buy adds to onchain available, Sell removes.
+    /// - `OffChainOrderFilled`: Buy adds to offchain available, Sell removes.
+    /// - Other events: Update `last_updated` only.
+    pub(crate) fn apply_position_event(
+        self,
+        symbol: &Symbol,
+        event: &PositionEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        match event {
+            PositionEvent::OnChainOrderFilled {
+                amount, direction, ..
+            } => {
+                let amount = *amount;
+                self.update_equity(
+                    symbol,
+                    |inv| match direction {
+                        Direction::Buy => inv.add_onchain_available(amount),
+                        Direction::Sell => inv.remove_onchain_available(amount),
+                    },
+                    now,
+                )
+            }
+
+            PositionEvent::OffChainOrderFilled {
+                shares_filled,
+                direction,
+                ..
+            } => {
+                let shares = *shares_filled;
+                self.update_equity(
+                    symbol,
+                    |inv| match direction {
+                        Direction::Buy => inv.add_offchain_available(shares),
+                        Direction::Sell => inv.remove_offchain_available(shares),
+                    },
+                    now,
+                )
+            }
+
+            PositionEvent::Initialized { .. }
+            | PositionEvent::Migrated { .. }
+            | PositionEvent::OffChainOrderPlaced { .. }
+            | PositionEvent::OffChainOrderFailed { .. }
+            | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
+                last_updated: now,
+                ..self
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::TxHash;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use crate::position::TradeId;
+    use crate::threshold::ExecutionThreshold;
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares(Decimal::from(n))
@@ -257,5 +388,180 @@ mod tests {
         let thresh = threshold("0.5", "0.2");
 
         assert!(inv.detect_imbalance(&thresh).is_none());
+    }
+
+    fn usdc_venue(available: i64, inflight: i64) -> VenueBalance<Usdc> {
+        VenueBalance::new(
+            Usdc(Decimal::from(available)),
+            Usdc(Decimal::from(inflight)),
+        )
+    }
+
+    fn usdc_inventory(
+        onchain_available: i64,
+        onchain_inflight: i64,
+        offchain_available: i64,
+        offchain_inflight: i64,
+    ) -> Inventory<Usdc> {
+        Inventory {
+            onchain: usdc_venue(onchain_available, onchain_inflight),
+            offchain: usdc_venue(offchain_available, offchain_inflight),
+            last_rebalancing: None,
+        }
+    }
+
+    fn make_view(equities: Vec<(Symbol, Inventory<FractionalShares>)>) -> InventoryView {
+        InventoryView {
+            usdc: usdc_inventory(1000, 0, 1000, 0),
+            equities: equities.into_iter().collect(),
+            last_updated: Utc::now(),
+        }
+    }
+
+    fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
+        PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount,
+            direction,
+            price_usdc: dec!(150.0),
+            block_timestamp: Utc::now(),
+            seen_at: Utc::now(),
+        }
+    }
+
+    fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
+        PositionEvent::OffChainOrderFilled {
+            execution_id: ExecutionId(1),
+            shares_filled,
+            direction,
+            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            price_cents: PriceCents(15000),
+            broker_timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn apply_onchain_buy_increases_onchain_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+
+        let updated = view
+            .apply_position_event(&symbol, &event, Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+    }
+
+    #[test]
+    fn apply_onchain_sell_decreases_onchain_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_onchain_fill(shares(10), Direction::Sell);
+
+        let updated = view
+            .apply_position_event(&symbol, &event, Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(90));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+    }
+
+    #[test]
+    fn apply_offchain_buy_increases_offchain_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_offchain_fill(shares(10), Direction::Buy);
+
+        let updated = view
+            .apply_position_event(&symbol, &event, Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(110));
+    }
+
+    #[test]
+    fn apply_offchain_sell_decreases_offchain_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_offchain_fill(shares(10), Direction::Sell);
+
+        let updated = view
+            .apply_position_event(&symbol, &event, Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(90));
+    }
+
+    #[test]
+    fn apply_position_event_tracks_symbols_independently() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+        let view = make_view(vec![
+            (aapl.clone(), inventory(100, 0, 100, 0)),
+            (msft.clone(), inventory(50, 0, 50, 0)),
+        ]);
+
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+        let updated = view
+            .apply_position_event(&aapl, &event, Utc::now())
+            .unwrap();
+
+        let aapl_inv = updated.equities.get(&aapl).unwrap();
+        assert_eq!(aapl_inv.onchain.total().unwrap().0, Decimal::from(110));
+
+        let msft_inv = updated.equities.get(&msft).unwrap();
+        assert_eq!(msft_inv.onchain.total().unwrap().0, Decimal::from(50));
+    }
+
+    #[test]
+    fn apply_position_event_unknown_symbol_returns_error() {
+        let view = make_view(vec![]);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let event = make_onchain_fill(shares(10), Direction::Buy);
+
+        let result = view.apply_position_event(&symbol, &event, Utc::now());
+
+        assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
+    }
+
+    #[test]
+    fn apply_position_event_other_events_only_update_last_updated() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let original_time = Utc::now();
+        let view = InventoryView {
+            usdc: usdc_inventory(1000, 0, 1000, 0),
+            equities: vec![(symbol.clone(), inventory(100, 0, 100, 0))]
+                .into_iter()
+                .collect(),
+            last_updated: original_time,
+        };
+
+        let new_time = original_time + chrono::Duration::hours(1);
+        let event = PositionEvent::Initialized {
+            symbol: symbol.clone(),
+            threshold: ExecutionThreshold::whole_share(),
+            initialized_at: new_time,
+        };
+
+        let updated = view
+            .apply_position_event(&symbol, &event, new_time)
+            .unwrap();
+
+        assert_eq!(updated.last_updated, new_time);
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
     }
 }

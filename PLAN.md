@@ -220,18 +220,37 @@ Implement ratio calculation and imbalance detection logic on `Inventory<T>`.
 Handle trading fills that update available balances using functional
 transformations.
 
-- [ ] Implement
+- [x] Implement
       `InventoryView::apply_position_event(self, event: &PositionEvent) -> Result<Self, InventoryError>`:
   - `OnChainOrderFilled`: Add to `onchain.available` on Buy, remove on Sell
   - `OffChainOrderFilled`: Add to `offchain.available` on Buy, remove on Sell
   - Other events: Update `last_updated` only
-- [ ] Add tests:
+- [x] Add tests:
   - Onchain buy increases onchain available
   - Onchain sell decreases onchain available
   - Offchain buy increases offchain available
   - Offchain sell decreases offchain available
   - Multiple symbols tracked independently
-- [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
+- [x] Run `cargo test -q --lib inventory` and `cargo clippy`
+
+**Changes made:**
+
+- Added `InventoryViewError` enum in `src/inventory/view.rs:17-22` with
+  `UnknownSymbol` and `Equity` (from `InventoryError<FractionalShares>`)
+  variants
+- Added helper methods on `Inventory<T>` for venue operations:
+  `add_onchain_available`, `remove_onchain_available`, `add_offchain_available`,
+  `remove_offchain_available` in `src/inventory/view.rs:110-143`
+- Implemented `InventoryView::update_equity` helper method that takes a closure
+  to transform the inventory for a given symbol
+- Implemented `InventoryView::apply_position_event` in
+  `src/inventory/view.rs:185-231` handling `OnChainOrderFilled`,
+  `OffChainOrderFilled`, and other events
+- Made `InventoryError<T>` and `add_available`/`remove_available` methods
+  `pub(super)` in `venue_balance.rs` for use in view module
+- Updated `InventoryError<T>` error messages to use `{:?}` formatting since
+  `FractionalShares` doesn't implement `Display`
+- Added 7 tests covering all position event scenarios including error cases
 
 ---
 
