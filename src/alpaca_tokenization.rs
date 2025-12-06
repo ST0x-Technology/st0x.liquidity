@@ -106,6 +106,14 @@ struct MintRequest {
     wallet: Address,
 }
 
+/// Parameters for filtering tokenization requests.
+#[derive(Debug, Clone, Default)]
+struct ListRequestsParams {
+    request_type: Option<TokenizationRequestType>,
+    status: Option<TokenizationRequestStatus>,
+    underlying_symbol: Option<Symbol>,
+}
+
 /// Errors that can occur when interacting with the Alpaca tokenization API.
 #[derive(Debug, Error)]
 enum AlpacaTokenizationError {
@@ -123,6 +131,9 @@ enum AlpacaTokenizationError {
 
     #[error("Invalid parameters: {details}")]
     InvalidParameters { details: String },
+
+    #[error("Request not found: {id}")]
+    RequestNotFound { id: TokenizationRequestId },
 }
 
 /// Client for Alpaca's tokenization API.
@@ -192,6 +203,83 @@ impl AlpacaTokenizationClient {
             }
             _ => Err(AlpacaTokenizationError::ApiError { status, message }),
         }
+    }
+
+    /// List tokenization requests with optional filtering.
+    ///
+    /// # Errors
+    ///
+    /// - `ApiError` for API errors
+    /// - `Reqwest` for network errors
+    async fn list_requests(
+        &self,
+        params: ListRequestsParams,
+    ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
+        let mut url = format!("{}/v2/tokenization/requests", self.base_url);
+        let mut query_params = Vec::new();
+
+        if let Some(ref request_type) = params.request_type {
+            let type_str = match request_type {
+                TokenizationRequestType::Mint => "mint",
+                TokenizationRequestType::Redeem => "redeem",
+            };
+            query_params.push(format!("type={type_str}"));
+        }
+
+        if let Some(ref status) = params.status {
+            let status_str = match status {
+                TokenizationRequestStatus::Pending => "pending",
+                TokenizationRequestStatus::Completed => "completed",
+                TokenizationRequestStatus::Rejected => "rejected",
+            };
+            query_params.push(format!("status={status_str}"));
+        }
+
+        if let Some(ref symbol) = params.underlying_symbol {
+            query_params.push(format!("underlying_symbol={symbol}"));
+        }
+
+        if !query_params.is_empty() {
+            url.push('?');
+            url.push_str(&query_params.join("&"));
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .header("APCA-API-KEY-ID", &self.api_key)
+            .header("APCA-API-SECRET-KEY", &self.api_secret)
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            let requests: Vec<TokenizationRequest> = response.json().await?;
+            return Ok(requests);
+        }
+
+        let message = response.text().await?;
+        Err(AlpacaTokenizationError::ApiError { status, message })
+    }
+
+    /// Get a single tokenization request by ID.
+    ///
+    /// # Errors
+    ///
+    /// - `RequestNotFound` if the request doesn't exist
+    /// - `ApiError` for API errors
+    /// - `Reqwest` for network errors
+    async fn get_request(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        let requests = self.list_requests(ListRequestsParams::default()).await?;
+
+        requests
+            .into_iter()
+            .find(|r| r.id == *id)
+            .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
 }
 
@@ -329,5 +417,163 @@ mod tests {
         );
 
         mint_mock.assert();
+    }
+
+    fn sample_tokenization_request_json(
+        id: &str,
+        request_type: &str,
+        symbol: &str,
+    ) -> serde_json::Value {
+        json!({
+            "tokenization_request_id": id,
+            "type": request_type,
+            "status": "pending",
+            "underlying_symbol": symbol,
+            "token_symbol": format!("t{symbol}"),
+            "qty": "50.0",
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "created_at": "2024-01-15T10:30:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn test_list_requests_all() {
+        let server = MockServer::start();
+        let client = create_test_client(&server);
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .header("APCA-API-KEY-ID", "test_api_key")
+                .header("APCA-API-SECRET-KEY", "test_api_secret");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    sample_tokenization_request_json("req_1", "mint", "AAPL"),
+                    sample_tokenization_request_json("req_2", "redeem", "TSLA")
+                ]));
+        });
+
+        let result = client
+            .list_requests(ListRequestsParams::default())
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
+        assert_eq!(result[0].r#type, TokenizationRequestType::Mint);
+        assert_eq!(result[1].id, TokenizationRequestId("req_2".to_string()));
+        assert_eq!(result[1].r#type, TokenizationRequestType::Redeem);
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_list_requests_filter_by_type_mint() {
+        let server = MockServer::start();
+        let client = create_test_client(&server);
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .query_param("type", "mint");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_tokenization_request_json(
+                    "req_1", "mint", "AAPL"
+                )]));
+        });
+
+        let params = ListRequestsParams {
+            request_type: Some(TokenizationRequestType::Mint),
+            ..Default::default()
+        };
+        let result = client.list_requests(params).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].r#type, TokenizationRequestType::Mint);
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_list_requests_filter_by_type_redeem() {
+        let server = MockServer::start();
+        let client = create_test_client(&server);
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_tokenization_request_json(
+                    "req_2", "redeem", "TSLA"
+                )]));
+        });
+
+        let params = ListRequestsParams {
+            request_type: Some(TokenizationRequestType::Redeem),
+            ..Default::default()
+        };
+        let result = client.list_requests(params).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].r#type, TokenizationRequestType::Redeem);
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_request_found() {
+        let server = MockServer::start();
+        let client = create_test_client(&server);
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    sample_tokenization_request_json("req_1", "mint", "AAPL"),
+                    sample_tokenization_request_json("req_2", "redeem", "TSLA")
+                ]));
+        });
+
+        let id = TokenizationRequestId("req_2".to_string());
+        let result = client.get_request(&id).await.unwrap();
+
+        assert_eq!(result.id, id);
+        assert_eq!(result.r#type, TokenizationRequestType::Redeem);
+        assert_eq!(result.underlying_symbol.to_string(), "TSLA");
+
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_get_request_not_found() {
+        let server = MockServer::start();
+        let client = create_test_client(&server);
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_tokenization_request_json(
+                    "req_1", "mint", "AAPL"
+                )]));
+        });
+
+        let id = TokenizationRequestId("nonexistent".to_string());
+        let result = client.get_request(&id).await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, AlpacaTokenizationError::RequestNotFound { id: found_id } if found_id.0 == "nonexistent"),
+            "expected RequestNotFound, got: {err:?}"
+        );
+
+        list_mock.assert();
     }
 }

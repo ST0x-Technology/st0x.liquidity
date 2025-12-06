@@ -95,29 +95,40 @@ Add request listing with filtering by type/status.
 
 ### Subtasks
 
-- [ ] Define `ListRequestsParams` struct:
+- [x] Define `ListRequestsParams` struct:
   - `request_type: Option<TokenizationRequestType>`
   - `status: Option<TokenizationRequestStatus>`
   - `underlying_symbol: Option<Symbol>`
-- [ ] Implement
+- [x] Implement
       `list_requests(&self, params: ListRequestsParams) -> Result<Vec<TokenizationRequest>>`:
   - GET `/v2/tokenization/requests` with query params
-- [ ] Add `RequestNotFound { request_id }` error variant
-- [ ] Implement
+- [x] Add `RequestNotFound { id }` error variant
+- [x] Implement
       `get_request(&self, id: &TokenizationRequestId) -> Result<TokenizationRequest>`:
   - Filter list by ID
   - Return `RequestNotFound` if absent
-- [ ] Add test: list all requests
-- [ ] Add test: list filtered by type (mint only)
-- [ ] Add test: list filtered by type (redeem only)
-- [ ] Add test: get single request by ID
-- [ ] Add test: get request not found
+- [x] Add test: list all requests
+- [x] Add test: list filtered by type (mint only)
+- [x] Add test: list filtered by type (redeem only)
+- [x] Add test: get single request by ID
+- [x] Add test: get request not found
 
 ### Validation
 
-- [ ] Run `cargo test -q`
-- [ ] Run `cargo clippy -- -D clippy::all`
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q`
+- [x] Run `cargo clippy -- -D clippy::all`
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Added `ListRequestsParams` struct with optional filters for type, status, and
+  symbol
+- Implemented `list_requests` method with query parameter building
+- Added `RequestNotFound { id }` error variant
+- Added `Display` impl for `TokenizationRequestId` in tokenized_equity_mint.rs
+- Implemented `get_request` which fetches all requests and filters by ID
+- Added helper function `sample_tokenization_request_json` for tests
+- All 8 tests pass
 
 ## Task 3. Send Tokens to Redemption Wallet
 
