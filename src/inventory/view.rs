@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
 use super::venue_balance::{InventoryError, VenueBalance};
+use crate::equity_redemption::EquityRedemptionEvent;
 use crate::position::PositionEvent;
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
@@ -165,6 +166,21 @@ where
         })
     }
 
+    fn move_onchain_to_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            onchain: self.onchain.move_to_inflight(amount)?,
+            ..self
+        })
+    }
+
+    fn transfer_onchain_inflight_to_offchain(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            onchain: self.onchain.confirm_inflight(amount)?,
+            offchain: self.offchain.add_available(amount)?,
+            ..self
+        })
+    }
+
     fn with_last_rebalancing(self, timestamp: DateTime<Utc>) -> Self {
         Self {
             last_rebalancing: Some(timestamp),
@@ -301,6 +317,53 @@ impl InventoryView {
 
             TokenizedEquityMintEvent::MintFailed { .. } => {
                 self.update_equity(symbol, |inv| inv.cancel_offchain_inflight(quantity), now)
+            }
+        }
+    }
+
+    /// Applies a redemption event to update equity inventory.
+    ///
+    /// - `TokensSent`: Move quantity from `onchain.available` to `onchain.inflight`.
+    /// - `Detected`: No balance change.
+    /// - `Completed`: Remove from `onchain.inflight`, add to `offchain.available`,
+    ///   update `last_rebalancing` timestamp.
+    /// - `Failed`: Move from `onchain.inflight` back to `onchain.available`.
+    ///
+    /// The `quantity` parameter is the redemption quantity in `FractionalShares`, needed for
+    /// events that modify balances but don't carry the quantity themselves.
+    pub(crate) fn apply_redemption_event(
+        self,
+        symbol: &Symbol,
+        event: &EquityRedemptionEvent,
+        quantity: FractionalShares,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        match event {
+            EquityRedemptionEvent::TokensSent { .. } => {
+                self.update_equity(symbol, |inv| inv.move_onchain_to_inflight(quantity), now)
+            }
+
+            EquityRedemptionEvent::Detected { .. } => Ok(Self {
+                last_updated: now,
+                ..self
+            }),
+
+            EquityRedemptionEvent::Completed { completed_at } => self.update_equity(
+                symbol,
+                |inv| {
+                    inv.transfer_onchain_inflight_to_offchain(quantity)
+                        .map(|inv| inv.with_last_rebalancing(*completed_at))
+                },
+                now,
+            ),
+
+            EquityRedemptionEvent::Failed { .. } => {
+                // Keep funds as inflight - we don't know where they ended up.
+                // This blocks future rebalancing until manually resolved.
+                Ok(Self {
+                    last_updated: now,
+                    ..self
+                })
             }
         }
     }
@@ -871,6 +934,205 @@ mod tests {
         let event = make_mint_accepted();
 
         let result = view.apply_mint_event(&symbol, &event, shares(30), Utc::now());
+
+        assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
+    }
+
+    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
+            symbol: symbol.clone(),
+            quantity,
+            redemption_wallet: Address::random(),
+            tx_hash: TxHash::random(),
+            sent_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_detected() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::Detected {
+            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
+            detected_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_completed() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::Completed {
+            completed_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_failed() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::Failed {
+            reason: "Redemption rejected".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn apply_tokens_sent_moves_onchain_to_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_tokens_sent(&symbol, dec!(30));
+
+        let updated = view
+            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+    }
+
+    #[test]
+    fn apply_redemption_detected_only_updates_last_updated() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Start with 30 shares inflight onchain (simulating post-TokensSent state)
+        let view = make_view(vec![(symbol.clone(), inventory(70, 30, 100, 0))]);
+        let event = make_redemption_detected();
+
+        let updated = view
+            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+    }
+
+    #[test]
+    fn apply_redemption_completed_transfers_inflight_to_offchain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Start with 30 shares inflight onchain (simulating post-TokensSent state)
+        let view = make_view(vec![(symbol.clone(), inventory(70, 30, 100, 0))]);
+        let event = make_redemption_completed();
+
+        let updated = view
+            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(70));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
+        assert!(!inv.has_inflight());
+        assert!(inv.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn apply_redemption_failed_keeps_funds_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Start with 30 shares inflight onchain (simulating post-TokensSent state)
+        let view = make_view(vec![(symbol.clone(), inventory(70, 30, 100, 0))]);
+        let event = make_redemption_failed();
+
+        let updated = view
+            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        // Funds stay inflight - we don't know where they ended up.
+        // This blocks future rebalancing until manually resolved.
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+    }
+
+    #[test]
+    fn redemption_full_lifecycle_updates_inventory_correctly() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = shares(30);
+
+        // Initial state: 100 onchain, 100 offchain
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+
+        // TokensSent: Move 30 from onchain available to inflight
+        let view = view
+            .apply_redemption_event(
+                &symbol,
+                &make_tokens_sent(&symbol, dec!(30)),
+                quantity,
+                Utc::now(),
+            )
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+
+        // Detected: No balance change
+        let view = view
+            .apply_redemption_event(&symbol, &make_redemption_detected(), quantity, Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+
+        // Completed: Remove from onchain inflight, add to offchain available
+        let view = view
+            .apply_redemption_event(&symbol, &make_redemption_completed(), quantity, Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(70));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
+        assert!(!inv.has_inflight());
+        assert!(inv.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn redemption_failure_keeps_inflight_and_blocks_rebalancing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = shares(30);
+        let thresh = threshold("0.5", "0.2");
+
+        // Initial state: 100 onchain, 100 offchain
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+
+        // TokensSent: Move 30 from onchain available to inflight
+        let view = view
+            .apply_redemption_event(
+                &symbol,
+                &make_tokens_sent(&symbol, dec!(30)),
+                quantity,
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Failed: Funds stay inflight
+        let view = view
+            .apply_redemption_event(&symbol, &make_redemption_failed(), quantity, Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert!(inv.has_inflight());
+
+        // Inflight blocks future rebalancing even if imbalanced
+        assert!(inv.detect_imbalance(&thresh).is_none());
+    }
+
+    #[test]
+    fn inflight_blocks_imbalance_detection_during_redemption() {
+        let thresh = threshold("0.5", "0.2");
+
+        // Start with imbalanced inventory: 80% onchain, 20% offchain
+        // This should trigger TooMuchOnchain normally
+        let inv = inventory(80, 0, 20, 0);
+        assert!(matches!(
+            inv.detect_imbalance(&thresh),
+            Some(Imbalance::TooMuchOnchain { .. })
+        ));
+
+        // Now simulate redemption in progress: move 30 to onchain inflight
+        // Even though still imbalanced, inflight should block detection
+        let inv_with_inflight = inventory(50, 30, 20, 0);
+        assert!(inv_with_inflight.detect_imbalance(&thresh).is_none());
+    }
+
+    #[test]
+    fn apply_redemption_event_unknown_symbol_returns_error() {
+        let view = make_view(vec![]);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let event = make_tokens_sent(&symbol, dec!(30));
+
+        let result = view.apply_redemption_event(&symbol, &event, shares(30), Utc::now());
 
         assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
     }

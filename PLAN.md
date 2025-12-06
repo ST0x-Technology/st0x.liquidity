@@ -306,24 +306,66 @@ Handle shares to tokens conversion lifecycle using functional transformations.
 
 Handle tokens to shares conversion lifecycle using functional transformations.
 
-- [ ] Implement
+- [x] Implement
       `InventoryView::apply_redemption_event(self, event: &EquityRedemptionEvent) -> Result<Self, InventoryError>`:
   - `TokensSent`: Move quantity from `onchain.available` to `onchain.inflight`
   - `Detected`: No balance change
-  - `Completed`: Remove from `onchain.inflight`, add to `offchain.available`
-  - `Failed`: Move from `onchain.inflight` back to `onchain.available`
-- [ ] Add tests:
+  - `Completed`: Remove from `onchain.inflight`, add to `offchain.available`,
+    update `last_rebalancing`
+  - `Failed`: Keep inflight (we don't know where funds ended up; blocks future
+    rebalancing until manually resolved)
+- [x] Add tests:
   - Full redemption lifecycle (send -> detect -> complete)
-  - Redemption failure at TokensSent stage
-  - Redemption failure at Pending stage
+  - Failure keeps funds inflight (blocks rebalancing)
   - Inflight blocks imbalance detection during redemption
-- [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
+- [x] Run `cargo test -q --lib inventory` and `cargo clippy`
+
+**Changes made:**
+
+- Added helper methods on `Inventory<T>` for redemption operations in
+  `src/inventory/view.rs`:
+  - `move_onchain_to_inflight`: Moves amount from onchain available to inflight
+  - `transfer_onchain_inflight_to_offchain`: Confirms onchain inflight and adds
+    to offchain available
+- Implemented `InventoryView::apply_redemption_event` in `src/inventory/view.rs`
+  - Takes `quantity: FractionalShares` as parameter since not all events carry
+    the quantity
+  - `Failed` keeps funds inflight - we don't know where they are, and blocking
+    future rebalancing is the safe behavior
+- Added tests for redemption event handlers
 
 ---
 
-## Task 8. USDC Rebalance Event Handlers with Tests
+## Task 8. Granular Failure Events for Mint and Redemption Aggregates
+
+The current `MintFailed` and `Failed` events are too coarse. Following the
+pattern established in `UsdcRebalanceEvent` (which has `WithdrawalFailed`,
+`BridgingFailed`, `DepositFailed`), add granular failure events to capture where
+in the flow the failure occurred. This enables future recovery logic based on
+real-world failure patterns.
+
+- [ ] Update `TokenizedEquityMintEvent` with granular failure variants:
+  - `MintRejected`: Alpaca rejected the mint request (before acceptance)
+  - `MintAcceptanceFailed`: Failed after acceptance but before tokens received
+  - `TokenReceiptFailed`: Failed after tokens were supposedly sent
+- [ ] Update `EquityRedemptionEvent` with granular failure variants:
+  - `TokenSendFailed`: Failed to send tokens (before they left)
+  - `DetectionFailed`: Alpaca didn't detect the transfer
+  - `RedemptionRejected`: Alpaca rejected after detection
+- [ ] Update aggregate state machines to handle new failure variants
+- [ ] Update `InventoryView` to handle granular failures appropriately (some may
+      allow restoring funds, others keep inflight)
+- [ ] Add tests for each failure scenario
+
+---
+
+## Task 9. USDC Rebalance Event Handlers with Tests
 
 Handle USDC transfers between venues via CCTP using functional transformations.
+
+Note: USDC rebalance already has granular failure events (`WithdrawalFailed`,
+`BridgingFailed`, `DepositFailed`). Failure handling follows the same principle
+as redemption - keep inflight unless we know funds can be restored.
 
 - [ ] Implement
       `InventoryView::apply_usdc_rebalance_event(self, event: &UsdcRebalanceEvent, direction: &RebalanceDirection) -> Result<Self, InventoryError>`:
@@ -333,24 +375,23 @@ Handle USDC transfers between venues via CCTP using functional transformations.
     - BaseToAlpaca: Move from `usdc.onchain.available` to
       `usdc.onchain.inflight`
   - `WithdrawalConfirmed`: No change
-  - `WithdrawalFailed`: Cancel inflight back to source available
+  - `WithdrawalFailed`: Keep inflight (funds location unknown)
   - `BridgingInitiated`, `BridgeAttestationReceived`: No change
-  - `Bridged`: Move from source inflight to destination available
-  - `BridgingFailed`: Cancel inflight back to source available
+  - `Bridged`: Remove from source inflight, add to destination available
+  - `BridgingFailed`: Keep inflight (funds location unknown)
   - `DepositInitiated`: No change
   - `DepositConfirmed`: Update `usdc.last_rebalancing` timestamp
-  - `DepositFailed`: Log warning (USDC on destination but not deposited)
+  - `DepositFailed`: Keep inflight (USDC on destination but not deposited)
 - [ ] Add tests:
   - AlpacaToBase full lifecycle
   - BaseToAlpaca full lifecycle
-  - Withdrawal failure recovery
-  - Bridging failure recovery
+  - Failures keep funds inflight
   - Inflight blocks imbalance detection during USDC rebalance
 - [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
 
 ---
 
-## Task 9. InventoryView Query Methods and Final Validation
+## Task 10. InventoryView Query Methods and Final Validation
 
 Add query methods and run final validation.
 
