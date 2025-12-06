@@ -11,16 +11,18 @@
 //! ```text
 //! (start) --RequestMint--> MintRequested --AcknowledgeAcceptance--> MintAccepted
 //!                                |                                       |
-//!                                |                                       |
+//!                                | RejectMint                            | FailAcceptance
 //!                                v                                       v
-//!                             Failed <-------Fail------- TokensReceived
-//!                                                              |
-//!                                                              | Finalize
-//!                                                              v
-//!                                                          Completed
+//!                             Failed <--FailTokenReceipt-- TokensReceived
+//!                                                                |
+//!                                                                | Finalize
+//!                                                                v
+//!                                                            Completed
 //! ```
 //!
-//! - `MintRequested`, `MintAccepted`, and `TokensReceived` can transition to `Failed`
+//! - `MintRequested` can be rejected via `RejectMint`
+//! - `MintAccepted` can fail via `FailAcceptance`
+//! - `TokensReceived` can fail via `FailTokenReceipt`
 //! - `Completed` and `Failed` are terminal states
 //!
 //! # Alpaca API Integration
