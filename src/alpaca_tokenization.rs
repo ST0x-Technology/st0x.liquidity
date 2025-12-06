@@ -36,7 +36,101 @@ use tokio::time::{Instant, MissedTickBehavior};
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::onchain::io::TokenizedEquitySymbol;
+use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
+
+/// High-level service for Alpaca tokenization operations.
+///
+/// Wraps `AlpacaTokenizationClient` with default polling configuration.
+struct AlpacaTokenizationService<P, S>
+where
+    P: Provider + Clone,
+    S: Signer + Clone + Sync,
+{
+    client: AlpacaTokenizationClient<P, S>,
+    polling_config: PollingConfig,
+}
+
+impl<P, S> AlpacaTokenizationService<P, S>
+where
+    P: Provider + Clone,
+    S: Signer + Clone + Sync,
+{
+    /// Request a mint operation to convert offchain shares to onchain tokens.
+    async fn request_mint(
+        &self,
+        underlying_symbol: Symbol,
+        quantity: FractionalShares,
+        wallet: Address,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        let request = MintRequest {
+            underlying_symbol,
+            quantity,
+            issuer: Issuer::new("st0x"),
+            network: Network::new("base"),
+            wallet,
+        };
+        self.client.request_mint(request).await
+    }
+
+    /// Get the current status of a tokenization request.
+    async fn get_request_status(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        self.client.get_request(id).await
+    }
+
+    /// Poll a mint request until it reaches a terminal state.
+    async fn poll_mint_until_complete(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        self.client
+            .poll_until_terminal(id, &self.polling_config)
+            .await
+    }
+
+    /// Send tokens to the redemption wallet to initiate a redemption.
+    async fn send_for_redemption(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<TxHash, AlpacaTokenizationError> {
+        self.client.send_tokens_for_redemption(token, amount).await
+    }
+
+    /// Poll until Alpaca detects a redemption transfer.
+    async fn poll_for_redemption(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        self.client
+            .poll_for_redemption_detection(tx_hash, &self.polling_config)
+            .await
+    }
+
+    /// Poll a redemption request until it reaches a terminal state.
+    async fn poll_redemption_until_complete(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        self.client
+            .poll_until_terminal(id, &self.polling_config)
+            .await
+    }
+
+    #[cfg(test)]
+    fn new_with_client(
+        client: AlpacaTokenizationClient<P, S>,
+        polling_config: PollingConfig,
+    ) -> Self {
+        Self {
+            client,
+            polling_config,
+        }
+    }
+}
 
 fn deserialize_tokenized_symbol<'de, D>(
     deserializer: D,
@@ -87,7 +181,7 @@ struct TokenizationRequest {
     #[serde(deserialize_with = "deserialize_tokenized_symbol")]
     token_symbol: Option<TokenizedEquitySymbol>,
     #[serde(rename = "qty")]
-    quantity: Decimal,
+    quantity: FractionalShares,
     issuer: Issuer,
     network: Network,
     #[serde(rename = "wallet_address")]
@@ -104,7 +198,7 @@ struct TokenizationRequest {
 struct MintRequest {
     underlying_symbol: Symbol,
     #[serde(rename = "qty")]
-    quantity: Decimal,
+    quantity: FractionalShares,
     issuer: Issuer,
     network: Network,
     #[serde(rename = "wallet_address")]
@@ -490,7 +584,7 @@ mod tests {
     fn create_mint_request() -> MintRequest {
         MintRequest {
             underlying_symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
+            quantity: FractionalShares(dec!(100.5)),
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -543,7 +637,7 @@ mod tests {
             result.token_symbol.as_ref().map(ToString::to_string),
             Some("tAAPL".to_string())
         );
-        assert_eq!(result.quantity, dec!(100.5));
+        assert_eq!(result.quantity, FractionalShares(dec!(100.5)));
         assert_eq!(result.issuer, Issuer::new("st0x"));
         assert_eq!(result.network, Network::new("base"));
         assert_eq!(
@@ -1089,5 +1183,135 @@ mod tests {
             matches!(result, Err(AlpacaTokenizationError::PollTimeout { .. })),
             "expected PollTimeout, got: {result:?}"
         );
+    }
+
+    fn create_test_service<P, S>(
+        client: AlpacaTokenizationClient<P, S>,
+    ) -> AlpacaTokenizationService<P, S>
+    where
+        P: Provider + Clone,
+        S: Signer + Clone + Sync,
+    {
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+        AlpacaTokenizationService::new_with_client(client, config)
+    }
+
+    #[tokio::test]
+    async fn test_service_mint_poll_completed() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let service = create_test_service(client);
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path("/v2/tokenization/mint");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_request_with_status("mint_123", "pending"));
+        });
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_request_with_status("mint_123", "completed")]));
+        });
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares(dec!(100.0));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let mint_result = service
+            .request_mint(symbol, quantity, wallet)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mint_result.id,
+            TokenizationRequestId("mint_123".to_string())
+        );
+        assert_eq!(mint_result.status, TokenizationRequestStatus::Pending);
+
+        let poll_result = service
+            .poll_mint_until_complete(&mint_result.id)
+            .await
+            .unwrap();
+
+        assert_eq!(poll_result.status, TokenizationRequestStatus::Completed);
+
+        mint_mock.assert();
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_service_redemption_detected_poll_completed() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+        let service = create_test_service(client);
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+
+        let detection_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "tokenization_request_id": "redeem_456",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "50.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": hash,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
+        });
+
+        let complete_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "tokenization_request_id": "redeem_456",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "50.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "tx_hash": hash,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
+        });
+
+        let detected = service.poll_for_redemption(&hash).await.unwrap();
+
+        assert_eq!(detected.id, TokenizationRequestId("redeem_456".to_string()));
+        assert_eq!(detected.status, TokenizationRequestStatus::Pending);
+
+        let completed = service
+            .poll_redemption_until_complete(&detected.id)
+            .await
+            .unwrap();
+
+        assert_eq!(completed.status, TokenizationRequestStatus::Completed);
+
+        detection_mock.assert();
+        complete_mock.assert();
     }
 }

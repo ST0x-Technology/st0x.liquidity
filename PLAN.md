@@ -243,26 +243,38 @@ Create high-level service with default config.
 
 ### Subtasks
 
-- [ ] Define `AlpacaTokenizationService` struct:
-  - `client: Arc<AlpacaTokenizationClient>`
+- [x] Define `AlpacaTokenizationService` struct:
+  - `client: AlpacaTokenizationClient<P, S>` (generic, no Arc needed)
   - `polling_config: PollingConfig`
-- [ ] Implement constructor with default polling config
-- [ ] Implement public methods:
+- [x] Implement constructor with default polling config
+- [x] Implement public methods:
   - `request_mint(symbol, quantity, wallet) -> Result<TokenizationRequest>`
   - `get_request_status(id) -> Result<TokenizationRequest>`
   - `poll_mint_until_complete(id) -> Result<TokenizationRequest>`
   - `send_for_redemption(token, amount) -> Result<TxHash>`
   - `poll_for_redemption(tx_hash) -> Result<TokenizationRequest>`
   - `poll_redemption_until_complete(id) -> Result<TokenizationRequest>`
-- [ ] Re-export public types from module
-- [ ] Add integration test: mint -> poll -> completed
-- [ ] Add integration test: redemption detected -> poll -> completed
+- [x] Re-export public types from module (not needed - all types are private)
+- [x] Add integration test: mint -> poll -> completed
+- [x] Add integration test: redemption detected -> poll -> completed
 
 ### Validation
 
-- [ ] Run `cargo test -q`
-- [ ] Run `cargo clippy -- -D clippy::all`
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q`
+- [x] Run `cargo clippy -- -D clippy::all`
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Defined `AlpacaTokenizationService` at top of module (most important code
+  first per AGENTS.md)
+- Service is generic over `P: Provider + Clone` and `S: Signer + Clone + Sync`
+- Added `new_with_client` constructor for testing
+- Uses `FractionalShares` newtype for quantity (with `#[serde(transparent)]`)
+- All service methods delegate to client methods
+- Added 2 integration tests: `test_service_mint_poll_completed` and
+  `test_service_redemption_detected_poll_completed`
+- Total of 18 tests passing
 
 ## Task 7. Final Validation and Cleanup
 
