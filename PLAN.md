@@ -25,9 +25,9 @@ Using existing newtypes for amounts:
 Both implement checked arithmetic via `Add<Output = Result<Self, E>>` and
 `Sub<Output = Result<Self, E>>`.
 
-### Generic VenueBalance
+### Generic Types
 
-A single generic `VenueBalance<T>` type parameterized by amount type:
+All inventory types are generic over the amount type to avoid code duplication:
 
 ```rust
 struct VenueBalance<T> {
@@ -35,11 +35,22 @@ struct VenueBalance<T> {
     inflight: T,
 }
 
-type EquityVenueBalance = VenueBalance<FractionalShares>;
-type UsdcVenueBalance = VenueBalance<Usdc>;
+struct Inventory<T> {
+    onchain: VenueBalance<T>,
+    offchain: VenueBalance<T>,
+    last_rebalancing: Option<DateTime<Utc>>,
+}
+
+enum Imbalance<T> {
+    TooMuchOnchain { excess: T },
+    TooMuchOffchain { excess: T },
+}
 ```
 
-Operations use standard `+`/`-` operators - no custom trait needed.
+Concrete types are created via type parameters: `Inventory<FractionalShares>`,
+`Inventory<Usdc>`, `Imbalance<FractionalShares>`, `Imbalance<Usdc>`.
+
+Operations use standard `+`/`-` operators with `HasZero` trait for zero checks.
 
 ### Functional Transformations
 
@@ -92,74 +103,95 @@ Extend `Usdc` in `src/threshold.rs` with checked arithmetic matching
 
 Create `src/inventory/` module and implement generic `VenueBalance<T>`.
 
-- [ ] Create `src/inventory/mod.rs`
-- [ ] Create `src/inventory/venue_balance.rs`
-- [ ] Add `mod inventory;` to `src/lib.rs`
-- [ ] Create `InventoryError` enum:
-  - `InsufficientAvailable`
-  - `InsufficientInflight`
-  - `EquityArithmetic(ArithmeticError)`
-  - `UsdcArithmetic(UsdcArithmeticError)`
-- [ ] Create generic `VenueBalance<T>` struct with `available: T`, `inflight: T`
-- [ ] Implement `total(self) -> Result<T, E>`
-- [ ] Implement `move_to_inflight(self, amount) -> Result<Self, InventoryError>`
-- [ ] Implement `confirm_inflight(self, amount) -> Result<Self, InventoryError>`
-- [ ] Implement `cancel_inflight(self, amount) -> Result<Self, InventoryError>`
-- [ ] Implement `add_available(self, amount) -> Result<Self, InventoryError>`
-- [ ] Implement `remove_available(self, amount) -> Result<Self, InventoryError>`
-- [ ] Add type aliases: `EquityVenueBalance`, `UsdcVenueBalance`
-- [ ] Add unit tests for both type aliases (happy paths and error cases)
-- [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
+- [x] Create `src/inventory/mod.rs`
+- [x] Create `src/inventory/venue_balance.rs`
+- [x] Add `mod inventory;` to `src/lib.rs`
+- [x] Create generic `InventoryError<T>` enum with `#[from]` for arithmetic
+- [x] Create generic `VenueBalance<T>` struct with `available: T`, `inflight: T`
+- [x] Implement `total(self) -> Result<T, ArithmeticError<T>>`
+- [x] Implement
+      `move_to_inflight(self, amount) -> Result<Self, InventoryError<T>>`
+- [x] Implement
+      `confirm_inflight(self, amount) -> Result<Self, InventoryError<T>>`
+- [x] Implement
+      `cancel_inflight(self, amount) -> Result<Self, InventoryError<T>>`
+- [x] Implement `add_available(self, amount) -> Result<Self, InventoryError<T>>`
+- [x] Implement
+      `remove_available(self, amount) -> Result<Self, InventoryError<T>>`
+- [x] Add type aliases: `EquityVenueBalance`, `UsdcVenueBalance`
+- [x] Add unit tests for both type aliases (happy paths and error cases)
+- [x] Run `cargo test -q --lib inventory` and `cargo clippy`
+
+**Changes made:**
+
+- Created `src/inventory/mod.rs` with module declaration
+- Created `src/inventory/venue_balance.rs` with:
+  - Generic `InventoryError<T>` with `InsufficientAvailable`,
+    `InsufficientInflight`, and `Arithmetic(#[from] ArithmeticError<T>)`
+    variants
+  - Generic `VenueBalance<T>` with field-level docstrings
+  - All required methods using functional transformation pattern
+  - Type aliases `EquityVenueBalance` and `UsdcVenueBalance`
+  - 13 unit tests covering all operations and error cases
+- Added `mod inventory;` to `src/lib.rs`
+- Made `ArithmeticError<T>` generic in `src/shares.rs` (was non-generic)
+- Added `HasZero` trait to `src/shares.rs` with default `is_zero`/`is_negative`
+  impls
+- Implemented `HasZero` for `FractionalShares` and `Usdc`
+- Removed duplicate `UsdcArithmeticError` from `src/threshold.rs` (now uses
+  generic)
+- Updated `position.rs` to use `ArithmeticError<FractionalShares>`
 
 ---
 
 ## Task 3. Inventory Structs and Imbalance Types
 
-Add remaining core types needed for the view.
+Add remaining core types needed for the view using generics.
 
-- [ ] Create `SymbolInventory` struct:
-  - `symbol: Symbol`
-  - `onchain: EquityVenueBalance`
-  - `offchain: EquityVenueBalance`
-  - `last_rebalancing: Option<DateTime<Utc>>`
-- [ ] Create `UsdcInventory` struct:
-  - `onchain: UsdcVenueBalance`
-  - `offchain: UsdcVenueBalance`
-  - `last_rebalancing: Option<DateTime<Utc>>`
-- [ ] Create `ImbalanceThreshold` struct with `target: Decimal`,
+- [x] Create generic `Imbalance<T>` enum with `TooMuchOnchain { excess: T }` and
+      `TooMuchOffchain { excess: T }` variants
+- [x] Create `ImbalanceThreshold` struct with `target: Decimal`,
       `deviation: Decimal`
-- [ ] Create `EquityImbalance` enum:
-  - `TooMuchOnchain { excess: FractionalShares }` - triggers redemption
-  - `TooMuchOffchain { excess: FractionalShares }` - triggers mint
-- [ ] Create `UsdcImbalance` enum:
-  - `TooMuchOnchain { excess: Usdc }` - triggers BaseToAlpaca
-  - `TooMuchOffchain { excess: Usdc }` - triggers AlpacaToBase
-- [ ] Create `InventoryView` struct:
-  - `per_symbol: HashMap<Symbol, SymbolInventory>`
-  - `usdc: UsdcInventory`
-  - `last_updated: DateTime<Utc>`
-- [ ] Derive `Debug`, `Clone`, `Serialize`, `Deserialize`, `PartialEq` as
-      appropriate
-- [ ] Run `cargo check` and `cargo clippy`
+- [x] Create generic `Inventory<T>` struct with `onchain: VenueBalance<T>`,
+      `offchain: VenueBalance<T>`, `last_rebalancing: Option<DateTime<Utc>>`
+- [x] Create `InventoryView` struct with
+      `equity: HashMap<Symbol,
+      Inventory<FractionalShares>>`,
+      `usdc: Inventory<Usdc>`, `last_updated:
+      DateTime<Utc>`
+- [x] Derive appropriate traits
+- [x] Run `cargo check` and `cargo clippy` (passes with expected dead code
+      warnings)
+
+**Changes made:**
+
+- Created `src/inventory/view.rs` with:
+  - Generic `Imbalance<T>` enum (replaces separate
+    `EquityImbalance`/`UsdcImbalance`)
+  - `ImbalanceThreshold` struct for configuring rebalancing triggers
+  - Generic `Inventory<T>` struct (replaces separate
+    `SymbolInventory`/`UsdcInventory`)
+  - `InventoryView` struct using `HashMap<Symbol, Inventory<FractionalShares>>`
+    for equity and `Inventory<Usdc>` for USDC
+- Updated `src/inventory/mod.rs` to include `view` module
+- Removed unused type aliases from `venue_balance.rs`
 
 ---
 
 ## Task 4. Imbalance Detection with Tests
 
-Implement ratio calculation and imbalance detection logic.
+Implement ratio calculation and imbalance detection logic on `Inventory<T>`.
 
-- [ ] Implement `SymbolInventory::ratio(&self) -> Option<Decimal>`:
+- [ ] Implement `Inventory<T>::ratio(&self) -> Option<Decimal>`:
   - Returns `onchain.total() / (onchain.total() + offchain.total())`
   - Returns `None` if total is zero
-- [ ] Implement `SymbolInventory::has_inflight(&self) -> bool`
+- [ ] Implement `Inventory<T>::has_inflight(&self) -> bool`
 - [ ] Implement
-      `SymbolInventory::detect_imbalance(&self, threshold: &ImbalanceThreshold) -> Option<EquityImbalance>`:
+      `Inventory<T>::detect_imbalance(&self, threshold: &ImbalanceThreshold) -> Option<Imbalance<T>>`:
   - Returns `None` if `has_inflight()` is true
   - Returns `None` if ratio is within `target ± deviation`
   - Returns `TooMuchOnchain` if ratio > target + deviation
   - Returns `TooMuchOffchain` if ratio < target - deviation
-- [ ] Implement same methods for `UsdcInventory` returning
-      `Option<UsdcImbalance>`
 - [ ] Add tests for ratio calculation edge cases (zero inventory, equal split)
 - [ ] Add tests for imbalance detection (balanced, imbalanced, inflight
       blocking)
@@ -172,7 +204,7 @@ Implement ratio calculation and imbalance detection logic.
 Handle trading fills that update available balances.
 
 - [ ] Add
-      `InventoryView::get_or_create_symbol(&mut self, symbol: &Symbol) -> &mut SymbolInventory`
+      `InventoryView::get_or_create_equity(&mut self, symbol: &Symbol) -> &mut Inventory<FractionalShares>`
 - [ ] Implement
       `InventoryView::apply_position_event(&mut self, event: &PositionEvent) -> Result<(), InventoryError>`:
   - `OnChainOrderFilled`: Add to `onchain.available` on Buy, remove on Sell
@@ -262,12 +294,12 @@ Handle USDC transfers between venues via CCTP.
 Add query methods and run final validation.
 
 - [ ] Implement
-      `InventoryView::check_equity_imbalances(&self, thresholds: &HashMap<Symbol, ImbalanceThreshold>) -> Vec<(Symbol, EquityImbalance)>`
+      `InventoryView::check_equity_imbalances(&self, thresholds: &HashMap<Symbol, ImbalanceThreshold>) -> Vec<(Symbol, Imbalance<FractionalShares>)>`
 - [ ] Implement
-      `InventoryView::check_usdc_imbalance(&self, threshold: &ImbalanceThreshold) -> Option<UsdcImbalance>`
+      `InventoryView::check_usdc_imbalance(&self, threshold: &ImbalanceThreshold) -> Option<Imbalance<Usdc>>`
 - [ ] Implement
-      `InventoryView::get_symbol_inventory(&self, symbol: &Symbol) -> Option<&SymbolInventory>`
-- [ ] Implement `InventoryView::usdc_inventory(&self) -> &UsdcInventory`
+      `InventoryView::get_equity(&self, symbol: &Symbol) -> Option<&Inventory<FractionalShares>>`
+- [ ] Implement `InventoryView::usdc(&self) -> &Inventory<Usdc>`
 - [ ] Add integration tests:
   - View correctly identifies multiple imbalanced symbols
   - View correctly reports USDC imbalance

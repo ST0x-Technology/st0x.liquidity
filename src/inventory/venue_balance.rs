@@ -4,8 +4,7 @@ use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
 
-use crate::shares::{ArithmeticError, FractionalShares, HasZero};
-use crate::threshold::Usdc;
+use crate::shares::{ArithmeticError, HasZero};
 
 /// Error type for inventory operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -22,7 +21,7 @@ enum InventoryError<T> {
 
 /// Balance at a single venue, tracking available and inflight amounts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-struct VenueBalance<T> {
+pub(super) struct VenueBalance<T> {
     /// Assets ready for use at this venue.
     available: T,
     /// Assets that have left this venue but haven't yet arrived at the
@@ -30,9 +29,6 @@ struct VenueBalance<T> {
     /// redeemed into shares, or USDC being bridged).
     inflight: T,
 }
-
-type EquityVenueBalance = VenueBalance<FractionalShares>;
-type UsdcVenueBalance = VenueBalance<Usdc>;
 
 impl<T> VenueBalance<T>
 where
@@ -159,15 +155,17 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
+    use crate::shares::FractionalShares;
+    use crate::threshold::Usdc;
 
-    fn equity_balance(available: i64, inflight: i64) -> EquityVenueBalance {
+    fn equity_balance(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
         VenueBalance::new(
             FractionalShares(Decimal::from(available)),
             FractionalShares(Decimal::from(inflight)),
         )
     }
 
-    fn usdc_balance(available: i64, inflight: i64) -> UsdcVenueBalance {
+    fn usdc_balance(available: i64, inflight: i64) -> VenueBalance<Usdc> {
         VenueBalance::new(
             Usdc(Decimal::from(available)),
             Usdc(Decimal::from(inflight)),
