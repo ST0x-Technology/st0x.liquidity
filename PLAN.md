@@ -69,12 +69,22 @@ Default values from SPEC.md:
 Extend `Usdc` in `src/threshold.rs` with checked arithmetic matching
 `FractionalShares` pattern.
 
-- [ ] Add `UsdcArithmeticError` struct (similar to `ArithmeticError`)
-- [ ] Implement `Add<Output = Result<Self, UsdcArithmeticError>>` for `Usdc`
-- [ ] Implement `Sub<Output = Result<Self, UsdcArithmeticError>>` for `Usdc`
-- [ ] Add `Usdc::ZERO` constant
-- [ ] Add unit tests for Usdc arithmetic
-- [ ] Run `cargo test -q --lib threshold` and `cargo clippy`
+- [x] Add `UsdcArithmeticError` struct (similar to `ArithmeticError`)
+- [x] Implement `Add<Output = Result<Self, UsdcArithmeticError>>` for `Usdc`
+- [x] Implement `Sub<Output = Result<Self, UsdcArithmeticError>>` for `Usdc`
+- [x] Add `Usdc::ZERO` constant
+- [x] Add unit tests for Usdc arithmetic
+- [x] Run `cargo test -q --lib threshold` and `cargo clippy`
+
+**Changes made:**
+
+- Added `UsdcArithmeticError` struct in `src/threshold.rs:12-18`
+- Implemented `Add` for `Usdc` in `src/threshold.rs:32-44`
+- Implemented `Sub` for `Usdc` in `src/threshold.rs:46-59`
+- Added `Usdc::ZERO` constant in `src/threshold.rs:21`
+- Added 5 unit tests for Usdc arithmetic (`usdc_add_succeeds`,
+  `usdc_sub_succeeds`, `usdc_add_overflow_returns_error`,
+  `usdc_sub_overflow_returns_error`, `usdc_zero_constant`)
 
 ---
 
