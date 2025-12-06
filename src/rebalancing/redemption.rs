@@ -65,7 +65,7 @@ where
     /// 5. Poll Alpaca until terminal status
     /// 6. Send `Complete` when Alpaca reports completion
     ///
-    /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
+    /// On errors, sends appropriate failure commands (`FailDetection`, `RejectRedemption`).
     #[instrument(skip(self), fields(%symbol, ?quantity, %token, %amount))]
     pub(crate) async fn execute_redemption(
         &self,
@@ -106,7 +106,7 @@ where
                 self.cqrs
                     .execute(
                         aggregate_id,
-                        EquityRedemptionCommand::Fail {
+                        EquityRedemptionCommand::FailDetection {
                             reason: format!("Detection polling failed: {e}"),
                         },
                     )
@@ -140,7 +140,7 @@ where
                 self.cqrs
                     .execute(
                         aggregate_id,
-                        EquityRedemptionCommand::Fail {
+                        EquityRedemptionCommand::RejectRedemption {
                             reason: format!("Completion polling failed: {e}"),
                         },
                     )
@@ -162,7 +162,7 @@ where
                 self.cqrs
                     .execute(
                         aggregate_id,
-                        EquityRedemptionCommand::Fail {
+                        EquityRedemptionCommand::RejectRedemption {
                             reason: "Redemption rejected by Alpaca".to_string(),
                         },
                     )
