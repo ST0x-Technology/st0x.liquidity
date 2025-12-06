@@ -34,7 +34,7 @@ The codebase already has:
 
 Managers coordinate between aggregates and external services by:
 
-1. Receiving triggers (CLI command or future InventoryView events)
+1. Receiving triggers (programmatic calls, future InventoryView events)
 2. Calling external services (Alpaca, CCTP, vault)
 3. Sending commands to aggregates based on service results
 4. Handling polling for async operations
@@ -60,14 +60,13 @@ its own error types, config, and retry logic. Shared types live in the parent
 
 ---
 
-## Task 1. MintManager - Complete Vertical Slice
+## Task 1. MintManager
 
-Implements TokenizedEquityMint orchestration from CLI trigger through
-completion.
+Implements TokenizedEquityMint orchestration with full workflow.
 
 **Workflow**:
 
-1. CLI command: `mint <symbol> <quantity> <wallet>`
+1. Caller invokes `execute_mint(symbol, quantity, wallet)`
 2. Manager sends `RequestMint` command to aggregate
 3. Manager calls `AlpacaTokenizationService::request_mint()`
 4. Manager sends `AcknowledgeAcceptance` with request IDs
@@ -85,37 +84,58 @@ src/rebalancing/
 
 ### Subtasks
 
-- [ ] Create `src/rebalancing/mod.rs` with common error types
-- [ ] Create `src/rebalancing/mint.rs` with `MintManager` struct
-- [ ] Add service dependencies: `AlpacaTokenizationService`
-- [ ] Implement `execute_mint()` async method for full workflow
-- [ ] Use existing `PollingConfig` for Alpaca status polling
-- [ ] Use `backon` for retry on transient Alpaca API errors
-- [ ] Send `Fail` command on permanent errors (rejected, timeout)
-- [ ] Add CLI command in `src/cli/mod.rs`: `mint <symbol> <qty> <wallet>`
-- [ ] Write unit tests with mocked `AlpacaTokenizationService`
-- [ ] Write integration test: happy path with mock HTTP server
-- [ ] Update `src/lib.rs` to export `rebalancing` module
+- [x] Create `src/rebalancing/mod.rs` with common error types
+- [x] Create `src/rebalancing/mint.rs` with `MintManager` struct
+- [x] Add service dependencies: `AlpacaTokenizationService`
+- [x] Implement `execute_mint()` async method for full workflow
+- [x] Use existing `PollingConfig` for Alpaca status polling
+- [x] Use `backon` for retry on transient Alpaca API errors (via service)
+- [x] Send `Fail` command on permanent errors (rejected, timeout)
+- [x] Write unit tests with mocked `AlpacaTokenizationService`
+- [x] Write integration test: happy path with mock HTTP server
+- [x] Update `src/lib.rs` to export `rebalancing` module
 - [ ] Remove `#[allow(dead_code)]` from `tokenized_equity_mint` and
-      `alpaca_tokenization`
+      `alpaca_tokenization` (deferred to #139 - will be removed when wired up)
 
 ### Completion Criteria
 
-- [ ] `cargo test -q` passes
-- [ ] `cargo clippy --all-targets -- -D clippy::all` passes
-- [ ] `cargo fmt` produces no changes
-- [ ] CLI command `cargo run --bin cli -- mint AAPL 1.0 0x123...` compiles and
-      executes (will fail at API call but proves wiring works)
+- [x] `cargo test -q` passes
+- [x] `cargo clippy --all-targets -- -D clippy::all` passes
+- [x] `cargo fmt` produces no changes
+
+### Implementation Notes
+
+**Files created:**
+
+- `src/rebalancing/mod.rs` - Module entry point with manager pattern
+  documentation
+- `src/rebalancing/mint.rs` - `MintManager<P, S>` generic over Provider and
+  Signer
+
+**Key design decisions:**
+
+- Manager is stateless, holds `Arc<AlpacaTokenizationService>` reference
+- Uses `Lifecycle<TokenizedEquityMint, Never>` wrapper for aggregate operations
+- `decimal_to_u256_18_decimals()` helper converts Decimal quantities to onchain
+  U256
+- Test helpers (`setup_anvil`, `create_test_service_from_mock`,
+  `TEST_REDEMPTION_WALLET`) consolidated in `pub(crate) mod tests` within
+  `alpaca_tokenization.rs`
+
+**Tests (6 total):**
+
+- 3 unit tests for `decimal_to_u256_18_decimals` conversion
+- 3 integration tests: happy path, rejected status, API error handling
 
 ---
 
-## Task 2. RedemptionManager - Complete Vertical Slice
+## Task 2. RedemptionManager
 
-Implements EquityRedemption orchestration from CLI trigger through completion.
+Implements EquityRedemption orchestration with full workflow.
 
 **Workflow**:
 
-1. CLI command: `redeem <symbol> <quantity>`
+1. Caller invokes `execute_redemption(symbol, quantity, token_address)`
 2. Manager calls `AlpacaTokenizationService::send_for_redemption()`
 3. Manager sends `SendTokens` command with tx_hash
 4. Manager polls Alpaca for redemption detection
@@ -139,7 +159,6 @@ src/rebalancing/
 - [ ] Poll for redemption detection using `poll_for_redemption()`
 - [ ] Poll for completion using `poll_until_terminal()`
 - [ ] Send `Fail` command on permanent errors
-- [ ] Add CLI command: `redeem <symbol> <quantity>`
 - [ ] Write unit tests with mocked service
 - [ ] Write integration test: happy path
 - [ ] Remove `#[allow(dead_code)]` from `equity_redemption`
@@ -149,24 +168,23 @@ src/rebalancing/
 - [ ] `cargo test -q` passes
 - [ ] `cargo clippy --all-targets -- -D clippy::all` passes
 - [ ] `cargo fmt` produces no changes
-- [ ] CLI command `cargo run --bin cli -- redeem AAPL 1.0` compiles
 
 ---
 
-## Task 3. UsdcRebalanceManager - AlpacaToBase Direction
+## Task 3. UsdcRebalanceManager (AlpacaToBase)
 
 Implements USDC rebalancing from Alpaca to Base (first direction).
 
 **Workflow (AlpacaToBase)**:
 
-1. CLI command: `rebalance-usdc alpaca-to-base <amount>`
-2. Initiate Alpaca withdrawal → `Initiate` command
-3. Poll Alpaca until complete → `ConfirmWithdrawal` command
-4. Execute CCTP burn on Ethereum → `InitiateBridging` command
-5. Poll Circle API for attestation → `ReceiveAttestation` command
-6. Execute CCTP mint on Base → `ConfirmBridging` command
-7. Deposit to Rain vault → `InitiateDeposit` command
-8. Confirm deposit → `ConfirmDeposit` command
+1. Caller invokes `execute_alpaca_to_base(amount)`
+2. Initiate Alpaca withdrawal -> `Initiate` command
+3. Poll Alpaca until complete -> `ConfirmWithdrawal` command
+4. Execute CCTP burn on Ethereum -> `InitiateBridging` command
+5. Poll Circle API for attestation -> `ReceiveAttestation` command
+6. Execute CCTP mint on Base -> `ConfirmBridging` command
+7. Deposit to Rain vault -> `InitiateDeposit` command
+8. Confirm deposit -> `ConfirmDeposit` command
 
 **Implementation**:
 
@@ -185,7 +203,6 @@ src/rebalancing/
 - [ ] Implement bridging phase: burn + attestation poll + mint via `CctpBridge`
 - [ ] Implement deposit phase: vault deposit via `VaultService`
 - [ ] Send appropriate `Fail*` command on errors at each phase
-- [ ] Add CLI command: `rebalance-usdc alpaca-to-base <amount>`
 - [ ] Write unit tests with mocked services
 - [ ] Write integration test: happy path
 - [ ] Remove `#[allow(dead_code)]` from `usdc_rebalance`, `alpaca_wallet`,
@@ -196,7 +213,6 @@ src/rebalancing/
 - [ ] `cargo test -q` passes
 - [ ] `cargo clippy --all-targets -- -D clippy::all` passes
 - [ ] `cargo fmt` produces no changes
-- [ ] CLI command compiles and reaches first service call
 
 ---
 
@@ -206,14 +222,14 @@ Adds reverse direction to UsdcRebalanceManager.
 
 **Workflow (BaseToAlpaca)**:
 
-1. CLI command: `rebalance-usdc base-to-alpaca <amount>`
-2. Withdraw from Rain vault → `Initiate` command (with OnchainTx ref)
-3. Confirm withdrawal → `ConfirmWithdrawal` command
-4. Execute CCTP burn on Base → `InitiateBridging` command
-5. Poll Circle API for attestation → `ReceiveAttestation` command
-6. Execute CCTP mint on Ethereum → `ConfirmBridging` command
-7. Initiate Alpaca deposit → `InitiateDeposit` command
-8. Poll Alpaca until complete → `ConfirmDeposit` command
+1. Caller invokes `execute_base_to_alpaca(amount)`
+2. Withdraw from Rain vault -> `Initiate` command (with OnchainTx ref)
+3. Confirm withdrawal -> `ConfirmWithdrawal` command
+4. Execute CCTP burn on Base -> `InitiateBridging` command
+5. Poll Circle API for attestation -> `ReceiveAttestation` command
+6. Execute CCTP mint on Ethereum -> `ConfirmBridging` command
+7. Initiate Alpaca deposit -> `InitiateDeposit` command
+8. Poll Alpaca until complete -> `ConfirmDeposit` command
 
 ### Subtasks
 
@@ -221,7 +237,6 @@ Adds reverse direction to UsdcRebalanceManager.
 - [ ] Implement vault withdrawal phase via `VaultService::withdraw()`
 - [ ] Implement bridging phase (Base -> Ethereum direction)
 - [ ] Implement Alpaca deposit phase: initiate + poll
-- [ ] Add CLI subcommand: `rebalance-usdc base-to-alpaca <amount>`
 - [ ] Write unit tests for reverse direction
 - [ ] Write integration test: happy path
 
@@ -230,7 +245,6 @@ Adds reverse direction to UsdcRebalanceManager.
 - [ ] `cargo test -q` passes
 - [ ] `cargo clippy --all-targets -- -D clippy::all` passes
 - [ ] `cargo fmt` produces no changes
-- [ ] Both direction CLI commands work
 
 ---
 
@@ -245,9 +259,9 @@ Hardens all managers with comprehensive error handling and recovery.
   - Query aggregate state on startup
   - Resume at appropriate workflow step
 - [ ] Add structured logging with `tracing::instrument` for all manager methods
-- [ ] Write tests: transient failure → retry succeeds
-- [ ] Write tests: permanent failure → aggregate transitions to Failed
-- [ ] Write tests: timeout → aggregate transitions to Failed
+- [ ] Write tests: transient failure -> retry succeeds
+- [ ] Write tests: permanent failure -> aggregate transitions to Failed
+- [ ] Write tests: timeout -> aggregate transitions to Failed
 - [ ] Write tests: resume from MintAccepted state
 - [ ] Write tests: resume from Bridging state
 
@@ -264,8 +278,7 @@ Hardens all managers with comprehensive error handling and recovery.
 
 - **InventoryView and imbalance detection** - Separate issue for automatic
   trigger based on inventory ratios
-- **Automatic rebalancing triggers** - This issue provides CLI-triggered
-  rebalancing only
+- **CLI commands** - Managers are programmatic; CLI integration is separate
 - **View materializers** - Event projection handled separately
 - **Event store persistence** - Aggregates use in-memory state; persistence is
   separate issue
@@ -281,8 +294,6 @@ src/
     mint.rs             # MintManager + tests
     redemption.rs       # RedemptionManager + tests
     usdc.rs             # UsdcRebalanceManager + tests
-  cli/
-    mod.rs              # Updated with rebalancing commands
   lib.rs                # Exports rebalancing module
 ```
 

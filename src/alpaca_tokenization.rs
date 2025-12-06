@@ -42,7 +42,7 @@ use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 /// High-level service for Alpaca tokenization operations.
 ///
 /// Wraps `AlpacaTokenizationClient` with default polling configuration.
-struct AlpacaTokenizationService<P, S>
+pub(crate) struct AlpacaTokenizationService<P, S>
 where
     P: Provider + Clone,
     S: Signer + Clone + Sync,
@@ -57,7 +57,7 @@ where
     S: Signer + Clone + Sync,
 {
     /// Request a mint operation to convert offchain shares to onchain tokens.
-    async fn request_mint(
+    pub(crate) async fn request_mint(
         &self,
         underlying_symbol: Symbol,
         quantity: FractionalShares,
@@ -82,7 +82,7 @@ where
     }
 
     /// Poll a mint request until it reaches a terminal state.
-    async fn poll_mint_until_complete(
+    pub(crate) async fn poll_mint_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
@@ -154,7 +154,7 @@ enum TokenizationRequestType {
 /// Status of a tokenization request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum TokenizationRequestStatus {
+pub(crate) enum TokenizationRequestStatus {
     Pending,
     Completed,
     Rejected,
@@ -172,22 +172,22 @@ impl Issuer {
 
 /// A tokenization request returned by the Alpaca API.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-struct TokenizationRequest {
+pub(crate) struct TokenizationRequest {
     #[serde(rename = "tokenization_request_id")]
-    id: TokenizationRequestId,
+    pub(crate) id: TokenizationRequestId,
     r#type: TokenizationRequestType,
-    status: TokenizationRequestStatus,
+    pub(crate) status: TokenizationRequestStatus,
     underlying_symbol: Symbol,
     #[serde(deserialize_with = "deserialize_tokenized_symbol")]
     token_symbol: Option<TokenizedEquitySymbol>,
     #[serde(rename = "qty")]
-    quantity: FractionalShares,
+    pub(crate) quantity: FractionalShares,
     issuer: Issuer,
     network: Network,
     #[serde(rename = "wallet_address")]
     wallet: Address,
-    issuer_request_id: Option<IssuerRequestId>,
-    tx_hash: Option<TxHash>,
+    pub(crate) issuer_request_id: Option<IssuerRequestId>,
+    pub(crate) tx_hash: Option<TxHash>,
     fees: Option<Decimal>,
     created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,
@@ -215,7 +215,7 @@ struct ListRequestsParams {
 
 /// Errors that can occur when interacting with the Alpaca tokenization API.
 #[derive(Debug, Error)]
-enum AlpacaTokenizationError {
+pub(crate) enum AlpacaTokenizationError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
 
@@ -534,20 +534,25 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, address, fixed_bytes};
-    use alloy::providers::ProviderBuilder;
+    use alloy::primitives::{Address, B256, address, fixed_bytes};
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
+    use httpmock::MockServer;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::time::Duration;
 
     use super::*;
     use crate::bindings::TestERC20;
 
-    fn setup_anvil() -> (AnvilInstance, String, B256) {
+    pub(crate) const TEST_REDEMPTION_WALLET: Address =
+        address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+    pub(crate) fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
         let endpoint = anvil.endpoint();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
@@ -559,7 +564,7 @@ mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationClient<impl Provider + Clone, PrivateKeySigner> {
+    ) -> AlpacaTokenizationClient<impl Provider + Clone + use<>, PrivateKeySigner> {
         let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
         let wallet = EthereumWallet::from(signer.clone());
 
@@ -579,7 +584,33 @@ mod tests {
         )
     }
 
-    const TEST_REDEMPTION_WALLET: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+    fn create_test_service<P, S>(
+        client: AlpacaTokenizationClient<P, S>,
+    ) -> AlpacaTokenizationService<P, S>
+    where
+        P: Provider + Clone,
+        S: Signer + Clone + Sync,
+    {
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+        AlpacaTokenizationService::new_with_client(client, config)
+    }
+
+    pub(crate) async fn create_test_service_from_mock(
+        server: &MockServer,
+        anvil_endpoint: &str,
+        private_key: &B256,
+        redemption_wallet: Address,
+    ) -> AlpacaTokenizationService<impl Provider + Clone + use<>, PrivateKeySigner> {
+        let client =
+            create_test_client(server, anvil_endpoint, private_key, redemption_wallet).await;
+        create_test_service(client)
+    }
 
     fn create_mint_request() -> MintRequest {
         MintRequest {
@@ -1183,23 +1214,6 @@ mod tests {
             matches!(result, Err(AlpacaTokenizationError::PollTimeout { .. })),
             "expected PollTimeout, got: {result:?}"
         );
-    }
-
-    fn create_test_service<P, S>(
-        client: AlpacaTokenizationClient<P, S>,
-    ) -> AlpacaTokenizationService<P, S>
-    where
-        P: Provider + Clone,
-        S: Signer + Clone + Sync,
-    {
-        let config = PollingConfig {
-            interval: Duration::from_millis(10),
-            timeout: Duration::from_secs(5),
-            max_retries: 3,
-            min_retry_delay: Duration::from_millis(10),
-            max_retry_delay: Duration::from_millis(100),
-        };
-        AlpacaTokenizationService::new_with_client(client, config)
     }
 
     #[tokio::test]

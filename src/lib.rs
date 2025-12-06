@@ -46,6 +46,10 @@ mod trade_execution_link;
 #[allow(dead_code)]
 mod usdc_rebalance;
 
+// TODO(#139): Remove dead_code allow when rebalancing is triggered from InventoryView
+#[allow(dead_code)]
+mod rebalancing;
+
 pub use telemetry::{TelemetryError, TelemetryGuard};
 
 #[cfg(test)]
