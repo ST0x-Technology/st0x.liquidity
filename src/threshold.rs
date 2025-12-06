@@ -9,13 +9,53 @@ use crate::shares::FractionalShares;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Usdc(pub(crate) Decimal);
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[error("USDC arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
+pub(crate) struct UsdcArithmeticError {
+    pub(crate) operation: String,
+    pub(crate) lhs: Usdc,
+    pub(crate) rhs: Usdc,
+}
+
 impl Usdc {
+    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
+
     pub(crate) fn is_negative(self) -> bool {
         self.0.is_sign_negative()
     }
 
     pub(crate) fn is_zero(self) -> bool {
         self.0.is_zero()
+    }
+}
+
+impl std::ops::Add for Usdc {
+    type Output = Result<Self, UsdcArithmeticError>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        self.0
+            .checked_add(rhs.0)
+            .map(Self)
+            .ok_or_else(|| UsdcArithmeticError {
+                operation: "+".to_string(),
+                lhs: self,
+                rhs,
+            })
+    }
+}
+
+impl std::ops::Sub for Usdc {
+    type Output = Result<Self, UsdcArithmeticError>;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        self.0
+            .checked_sub(rhs.0)
+            .map(Self)
+            .ok_or_else(|| UsdcArithmeticError {
+                operation: "-".to_string(),
+                lhs: self,
+                rhs,
+            })
     }
 }
 
@@ -122,5 +162,56 @@ mod tests {
     fn dollar_threshold_accepts_positive() {
         let result = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn usdc_add_succeeds() {
+        let a = Usdc(Decimal::ONE);
+        let b = Usdc(Decimal::TWO);
+
+        let result = (a + b).unwrap();
+
+        assert_eq!(result.0, Decimal::from(3));
+    }
+
+    #[test]
+    fn usdc_sub_succeeds() {
+        let a = Usdc(Decimal::from(5));
+        let b = Usdc(Decimal::TWO);
+
+        let result = (a - b).unwrap();
+
+        assert_eq!(result.0, Decimal::from(3));
+    }
+
+    #[test]
+    fn usdc_add_overflow_returns_error() {
+        let max = Usdc(Decimal::MAX);
+        let one = Usdc(Decimal::ONE);
+
+        let result = max + one;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.operation, "+");
+        assert_eq!(err.lhs, max);
+        assert_eq!(err.rhs, one);
+    }
+
+    #[test]
+    fn usdc_sub_overflow_returns_error() {
+        let min = Usdc(Decimal::MIN);
+        let one = Usdc(Decimal::ONE);
+
+        let result = min - one;
+
+        let err = result.unwrap_err();
+        assert_eq!(err.operation, "-");
+        assert_eq!(err.lhs, min);
+        assert_eq!(err.rhs, one);
+    }
+
+    #[test]
+    fn usdc_zero_constant() {
+        assert!(Usdc::ZERO.is_zero());
     }
 }
