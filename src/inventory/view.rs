@@ -201,6 +201,43 @@ struct InventoryView {
 }
 
 impl InventoryView {
+    /// Returns the USDC inventory.
+    pub(crate) fn usdc(&self) -> &Inventory<Usdc> {
+        &self.usdc
+    }
+
+    /// Returns the equity inventory for a specific symbol, if tracked.
+    pub(crate) fn get_equity(&self, symbol: &Symbol) -> Option<&Inventory<FractionalShares>> {
+        self.equities.get(symbol)
+    }
+
+    /// Checks all tracked equities for imbalances against their thresholds.
+    /// Returns a list of (symbol, imbalance) pairs for symbols that are imbalanced.
+    pub(crate) fn check_equity_imbalances(
+        &self,
+        thresholds: &HashMap<Symbol, ImbalanceThreshold>,
+    ) -> Vec<(Symbol, Imbalance<FractionalShares>)> {
+        self.equities
+            .iter()
+            .filter_map(|(symbol, inventory)| {
+                let threshold = thresholds.get(symbol)?;
+                let imbalance = inventory.detect_imbalance(threshold)?;
+                Some((symbol.clone(), imbalance))
+            })
+            .collect()
+    }
+
+    /// Checks USDC inventory for imbalance against the threshold.
+    /// Returns the imbalance if one exists.
+    pub(crate) fn check_usdc_imbalance(
+        &self,
+        threshold: &ImbalanceThreshold,
+    ) -> Option<Imbalance<Usdc>> {
+        self.usdc.detect_imbalance(threshold)
+    }
+}
+
+impl InventoryView {
     fn update_equity(
         self,
         symbol: &Symbol,
@@ -1639,5 +1676,167 @@ mod tests {
 
         let inv_with_inflight = usdc_inventory(700, 100, 200, 0);
         assert!(inv_with_inflight.detect_imbalance(&thresh).is_none());
+    }
+
+    #[test]
+    fn usdc_accessor_returns_usdc_inventory() {
+        let view = make_usdc_view(1000, 50, 800, 0);
+
+        let usdc_inv = view.usdc();
+
+        assert_eq!(usdc_inv.onchain.total().unwrap().0, Decimal::from(1050));
+        assert_eq!(usdc_inv.offchain.total().unwrap().0, Decimal::from(800));
+    }
+
+    #[test]
+    fn get_equity_returns_none_for_unknown_symbol() {
+        let view = make_view(vec![]);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        assert!(view.get_equity(&symbol).is_none());
+    }
+
+    #[test]
+    fn get_equity_returns_inventory_for_tracked_symbol() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 10, 90, 0))]);
+
+        let inv = view.get_equity(&symbol).unwrap();
+
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(90));
+    }
+
+    #[test]
+    fn check_equity_imbalances_returns_empty_when_all_balanced() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+        let view = make_view(vec![
+            (aapl.clone(), inventory(50, 0, 50, 0)),
+            (msft.clone(), inventory(50, 0, 50, 0)),
+        ]);
+        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
+            (aapl, threshold("0.5", "0.2")),
+            (msft, threshold("0.5", "0.2")),
+        ]
+        .into_iter()
+        .collect();
+
+        let imbalances = view.check_equity_imbalances(&thresholds);
+
+        assert!(imbalances.is_empty());
+    }
+
+    #[test]
+    fn check_equity_imbalances_identifies_multiple_imbalanced_symbols() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+        let googl = Symbol::new("GOOGL").unwrap();
+        let view = make_view(vec![
+            (aapl.clone(), inventory(80, 0, 20, 0)),
+            (msft.clone(), inventory(50, 0, 50, 0)),
+            (googl.clone(), inventory(20, 0, 80, 0)),
+        ]);
+        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
+            (aapl.clone(), threshold("0.5", "0.2")),
+            (msft, threshold("0.5", "0.2")),
+            (googl.clone(), threshold("0.5", "0.2")),
+        ]
+        .into_iter()
+        .collect();
+
+        let imbalances = view.check_equity_imbalances(&thresholds);
+
+        assert_eq!(imbalances.len(), 2);
+
+        let aapl_imbalance = imbalances.iter().find(|(s, _)| s == &aapl);
+        assert!(matches!(
+            aapl_imbalance,
+            Some((_, Imbalance::TooMuchOnchain { .. }))
+        ));
+
+        let googl_imbalance = imbalances.iter().find(|(s, _)| s == &googl);
+        assert!(matches!(
+            googl_imbalance,
+            Some((_, Imbalance::TooMuchOffchain { .. }))
+        ));
+    }
+
+    #[test]
+    fn check_equity_imbalances_skips_symbols_without_thresholds() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+        let view = make_view(vec![
+            (aapl.clone(), inventory(80, 0, 20, 0)),
+            (msft, inventory(80, 0, 20, 0)),
+        ]);
+        let thresholds: HashMap<Symbol, ImbalanceThreshold> =
+            vec![(aapl.clone(), threshold("0.5", "0.2"))]
+                .into_iter()
+                .collect();
+
+        let imbalances = view.check_equity_imbalances(&thresholds);
+
+        assert_eq!(imbalances.len(), 1);
+        assert_eq!(imbalances[0].0, aapl);
+    }
+
+    #[test]
+    fn check_equity_imbalances_skips_symbols_with_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+        let view = make_view(vec![
+            (aapl.clone(), inventory(80, 0, 20, 0)),
+            (msft.clone(), inventory(60, 20, 20, 0)),
+        ]);
+        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
+            (aapl.clone(), threshold("0.5", "0.2")),
+            (msft, threshold("0.5", "0.2")),
+        ]
+        .into_iter()
+        .collect();
+
+        let imbalances = view.check_equity_imbalances(&thresholds);
+
+        assert_eq!(imbalances.len(), 1);
+        assert_eq!(imbalances[0].0, aapl);
+    }
+
+    #[test]
+    fn check_usdc_imbalance_returns_none_when_balanced() {
+        let view = make_usdc_view(500, 0, 500, 0);
+
+        assert!(
+            view.check_usdc_imbalance(&threshold("0.5", "0.3"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn check_usdc_imbalance_returns_too_much_onchain() {
+        let view = make_usdc_view(900, 0, 100, 0);
+
+        let imbalance = view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap();
+
+        assert!(matches!(imbalance, Imbalance::TooMuchOnchain { .. }));
+    }
+
+    #[test]
+    fn check_usdc_imbalance_returns_too_much_offchain() {
+        let view = make_usdc_view(100, 0, 900, 0);
+
+        let imbalance = view.check_usdc_imbalance(&threshold("0.5", "0.3")).unwrap();
+
+        assert!(matches!(imbalance, Imbalance::TooMuchOffchain { .. }));
+    }
+
+    #[test]
+    fn check_usdc_imbalance_returns_none_when_inflight() {
+        let view = make_usdc_view(700, 200, 100, 0);
+
+        assert!(
+            view.check_usdc_imbalance(&threshold("0.5", "0.3"))
+                .is_none()
+        );
     }
 }
