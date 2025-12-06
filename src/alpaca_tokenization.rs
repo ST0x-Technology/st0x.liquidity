@@ -21,7 +21,9 @@
 //! 2. Poll `list_requests` for Alpaca's detection
 //! 3. Poll until status is `Completed` or `Rejected`
 
-use alloy::primitives::{Address, TxHash};
+use alloy::primitives::{Address, TxHash, U256};
+use alloy::providers::Provider;
+use alloy::signers::Signer;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
@@ -30,6 +32,7 @@ use st0x_broker::Symbol;
 use thiserror::Error;
 
 use crate::alpaca_wallet::Network;
+use crate::bindings::IERC20;
 use crate::onchain::io::TokenizedEquitySymbol;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
@@ -134,24 +137,51 @@ enum AlpacaTokenizationError {
 
     #[error("Request not found: {id}")]
     RequestNotFound { id: TokenizationRequestId },
+
+    #[error("Redemption transfer failed: {0}")]
+    RedemptionTransferFailed(#[from] alloy::contract::Error),
+
+    #[error("Transaction error: {0}")]
+    Transaction(#[from] alloy::providers::PendingTransactionError),
 }
 
-/// Client for Alpaca's tokenization API.
-struct AlpacaTokenizationClient {
-    client: Client,
+/// Client for Alpaca's tokenization API and redemption transfers.
+struct AlpacaTokenizationClient<P, S>
+where
+    P: Provider + Clone,
+    S: Signer + Clone + Sync,
+{
+    http_client: Client,
     base_url: String,
     api_key: String,
     api_secret: String,
+    provider: P,
+    signer: S,
+    redemption_wallet: Address,
 }
 
-impl AlpacaTokenizationClient {
+impl<P, S> AlpacaTokenizationClient<P, S>
+where
+    P: Provider + Clone,
+    S: Signer + Clone + Sync,
+{
     #[cfg(test)]
-    fn new_with_base_url(base_url: String, api_key: String, api_secret: String) -> Self {
+    fn new_with_base_url(
+        base_url: String,
+        api_key: String,
+        api_secret: String,
+        provider: P,
+        signer: S,
+        redemption_wallet: Address,
+    ) -> Self {
         Self {
-            client: Client::new(),
+            http_client: Client::new(),
             base_url,
             api_key,
             api_secret,
+            provider,
+            signer,
+            redemption_wallet,
         }
     }
 
@@ -171,7 +201,7 @@ impl AlpacaTokenizationClient {
         let url = format!("{}/v2/tokenization/mint", self.base_url);
 
         let response = self
-            .client
+            .http_client
             .post(&url)
             .header("APCA-API-KEY-ID", &self.api_key)
             .header("APCA-API-SECRET-KEY", &self.api_secret)
@@ -245,7 +275,7 @@ impl AlpacaTokenizationClient {
         }
 
         let response = self
-            .client
+            .http_client
             .get(&url)
             .header("APCA-API-KEY-ID", &self.api_key)
             .header("APCA-API-SECRET-KEY", &self.api_secret)
@@ -281,23 +311,82 @@ impl AlpacaTokenizationClient {
             .find(|r| r.id == *id)
             .ok_or_else(|| AlpacaTokenizationError::RequestNotFound { id: id.clone() })
     }
+
+    /// Send tokens to the redemption wallet to initiate a redemption.
+    ///
+    /// This transfers ERC20 tokens from the signer's address to the configured
+    /// redemption wallet. Once Alpaca detects this transfer, a redemption request
+    /// will appear in `list_requests`.
+    ///
+    /// # Errors
+    ///
+    /// - `RedemptionTransferFailed` if the contract call fails
+    /// - `Transaction` if the transaction fails to confirm
+    async fn send_tokens_for_redemption(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<TxHash, AlpacaTokenizationError> {
+        let erc20 = IERC20::new(token, self.provider.clone());
+
+        let receipt = erc20
+            .transfer(self.redemption_wallet, amount)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(receipt.transaction_hash)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloy::primitives::address;
+    use alloy::network::EthereumWallet;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, address};
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::local::PrivateKeySigner;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    fn create_test_client(server: &MockServer) -> AlpacaTokenizationClient {
+    use super::*;
+    use crate::bindings::TestERC20;
+
+    fn setup_anvil() -> (AnvilInstance, String, B256) {
+        let anvil = Anvil::new().spawn();
+        let endpoint = anvil.endpoint();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        (anvil, endpoint, private_key)
+    }
+
+    async fn create_test_client(
+        server: &MockServer,
+        anvil_endpoint: &str,
+        private_key: &B256,
+        redemption_wallet: Address,
+    ) -> AlpacaTokenizationClient<impl Provider + Clone, PrivateKeySigner> {
+        let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
+        let wallet = EthereumWallet::from(signer.clone());
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(anvil_endpoint)
+            .await
+            .unwrap();
+
         AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
+            provider,
+            signer,
+            redemption_wallet,
         )
     }
+
+    const TEST_REDEMPTION_WALLET: Address = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
     fn create_mint_request() -> MintRequest {
         MintRequest {
@@ -312,7 +401,8 @@ mod tests {
     #[tokio::test]
     async fn test_request_mint_success() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST)
@@ -368,7 +458,8 @@ mod tests {
     #[tokio::test]
     async fn test_request_mint_insufficient_position() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path("/v2/tokenization/mint");
@@ -395,7 +486,8 @@ mod tests {
     #[tokio::test]
     async fn test_request_mint_invalid_parameters() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path("/v2/tokenization/mint");
@@ -441,7 +533,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_requests_all() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
@@ -473,7 +566,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_requests_filter_by_type_mint() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
@@ -501,7 +595,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_requests_filter_by_type_redeem() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
@@ -529,7 +624,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_request_found() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
             when.method(GET).path("/v2/tokenization/requests");
@@ -554,7 +650,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_request_not_found() {
         let server = MockServer::start();
-        let client = create_test_client(&server);
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
             when.method(GET).path("/v2/tokenization/requests");
@@ -575,5 +672,100 @@ mod tests {
         );
 
         list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_send_tokens_for_redemption_success() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer.clone());
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token_address = *token.address();
+
+        let mint_amount = U256::from(1_000_000_000u64);
+        token
+            .mint(signer.address(), mint_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let client = AlpacaTokenizationClient::new_with_base_url(
+            server.base_url(),
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            provider.clone(),
+            signer,
+            TEST_REDEMPTION_WALLET,
+        );
+
+        let transfer_amount = U256::from(100_000u64);
+        let result = client
+            .send_tokens_for_redemption(token_address, transfer_amount)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "expected successful transfer, got: {result:?}"
+        );
+
+        let balance = token
+            .balanceOf(TEST_REDEMPTION_WALLET)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            balance, transfer_amount,
+            "redemption wallet should have received tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_tokens_for_redemption_insufficient_balance() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer.clone());
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token_address = *token.address();
+
+        let client = AlpacaTokenizationClient::new_with_base_url(
+            server.base_url(),
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            provider,
+            signer,
+            TEST_REDEMPTION_WALLET,
+        );
+
+        let transfer_amount = U256::from(100_000u64);
+        let result = client
+            .send_tokens_for_redemption(token_address, transfer_amount)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AlpacaTokenizationError::RedemptionTransferFailed(_))
+            ),
+            "expected RedemptionTransferFailed with insufficient balance, got: {result:?}"
+        );
     }
 }

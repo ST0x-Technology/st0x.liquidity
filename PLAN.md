@@ -136,20 +136,34 @@ Implement onchain token transfer to initiate redemption.
 
 ### Subtasks
 
-- [ ] Add `redemption_wallet: Address` field to `AlpacaTokenizationClient`
-- [ ] Implement
+- [x] Add `redemption_wallet: Address` field to `AlpacaTokenizationClient`
+- [x] Implement
       `send_tokens_for_redemption(&self, token: Address, amount: U256) -> Result<TxHash>`:
   - Transfer ERC20 tokens to redemption wallet
   - Return tx hash for tracking
-- [ ] Add `RedemptionTransferFailed { reason }` error variant
-- [ ] Add test: successful token transfer to redemption wallet
-- [ ] Add test: transfer fails with insufficient balance
+- [x] Add `RedemptionTransferFailed` and `Transaction` error variants (using
+      `#[from]` for automatic error wrapping)
+- [x] Add test: successful token transfer to redemption wallet
+- [x] Add test: transfer fails with insufficient balance
 
 ### Validation
 
-- [ ] Run `cargo test -q`
-- [ ] Run `cargo clippy -- -D clippy::all`
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q`
+- [x] Run `cargo clippy -- -D clippy::all`
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Made `AlpacaTokenizationClient` generic over `P: Provider + Clone` and
+  `S: Signer + Clone + Sync` to support blockchain operations
+- Renamed `client` field to `http_client` and added `provider`, `signer`, and
+  `redemption_wallet` fields
+- Added `RedemptionTransferFailed(#[from] alloy::contract::Error)` error variant
+- Added `Transaction(#[from] alloy::providers::PendingTransactionError)` error
+  variant
+- Implemented `send_tokens_for_redemption` using `IERC20::transfer`
+- Updated all tests to use Anvil for provider/signer setup
+- All 10 tests pass
 
 ## Task 4. Redemption Detection
 
