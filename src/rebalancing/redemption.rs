@@ -10,7 +10,7 @@ use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use st0x_broker::Symbol;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use crate::alpaca_tokenization::{
     AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequestStatus,
@@ -66,6 +66,7 @@ where
     /// 6. Send `Complete` when Alpaca reports completion
     ///
     /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
+    #[instrument(skip(self), fields(%symbol, ?quantity, %token, %amount))]
     pub(crate) async fn execute_redemption(
         &self,
         aggregate_id: &str,

@@ -11,7 +11,7 @@ use rust_decimal::Decimal;
 use st0x_broker::Symbol;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use crate::alpaca_tokenization::{
     AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
@@ -77,6 +77,7 @@ where
     /// 6. Send `Finalize` to complete
     ///
     /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
+    #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
     pub(crate) async fn execute_mint(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -142,6 +143,7 @@ where
             .await
     }
 
+    #[instrument(skip(self))]
     async fn fail(
         &self,
         issuer_request_id: &IssuerRequestId,
@@ -156,6 +158,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self, completed_request), fields(status = ?completed_request.status))]
     async fn handle_completed_request(
         &self,
         issuer_request_id: &IssuerRequestId,

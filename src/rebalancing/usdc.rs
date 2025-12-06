@@ -9,7 +9,7 @@ use alloy::signers::Signer;
 use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{info, instrument, warn};
 
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
@@ -102,6 +102,7 @@ where
     /// 7. Confirm deposit -> `ConfirmDeposit` command
     ///
     /// On errors, sends appropriate `Fail*` command to transition aggregate to failed state.
+    #[instrument(skip(self), fields(?id, ?amount))]
     pub(crate) async fn execute_alpaca_to_base(
         &self,
         id: &UsdcRebalanceId,
@@ -128,6 +129,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self), fields(?id, ?amount))]
     async fn initiate_alpaca_withdrawal(
         &self,
         id: &UsdcRebalanceId,
@@ -163,6 +165,7 @@ where
         Ok(transfer)
     }
 
+    #[instrument(skip(self), fields(?id, %transfer_id))]
     async fn poll_and_confirm_withdrawal(
         &self,
         id: &UsdcRebalanceId,
@@ -209,6 +212,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self), fields(?id))]
     async fn execute_cctp_burn(
         &self,
         id: &UsdcRebalanceId,
@@ -250,6 +254,7 @@ where
         Ok(burn_receipt)
     }
 
+    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx))]
     async fn poll_attestation(
         &self,
         id: &UsdcRebalanceId,
@@ -284,6 +289,7 @@ where
         Ok(attestation)
     }
 
+    #[instrument(skip(self, burn_receipt, attestation), fields(?id, burn_tx = %burn_receipt.tx))]
     async fn execute_cctp_mint(
         &self,
         id: &UsdcRebalanceId,
@@ -318,6 +324,7 @@ where
         Ok(mint_tx)
     }
 
+    #[instrument(skip(self), fields(?id, ?amount))]
     async fn deposit_to_vault(
         &self,
         id: &UsdcRebalanceId,
@@ -352,6 +359,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self), fields(?id))]
     async fn confirm_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcRebalanceManagerError> {
         self.cqrs
             .execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
@@ -374,6 +382,7 @@ where
     /// 7. Poll Alpaca until deposit credited -> `ConfirmDeposit` command
     ///
     /// On errors, sends appropriate `Fail*` command to transition aggregate to failed state.
+    #[instrument(skip(self), fields(?id, ?amount))]
     pub(crate) async fn execute_base_to_alpaca(
         &self,
         id: &UsdcRebalanceId,
@@ -401,6 +410,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self), fields(?id, ?amount))]
     async fn withdraw_from_vault(
         &self,
         id: &UsdcRebalanceId,
@@ -435,6 +445,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip(self), fields(?id, ?amount))]
     async fn execute_cctp_burn_on_base(
         &self,
         id: &UsdcRebalanceId,
@@ -477,6 +488,7 @@ where
         Ok(burn_receipt)
     }
 
+    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx))]
     async fn poll_attestation_for_base_burn(
         &self,
         id: &UsdcRebalanceId,
@@ -511,6 +523,7 @@ where
         Ok(attestation)
     }
 
+    #[instrument(skip(self, burn_receipt, attestation), fields(?id, burn_tx = %burn_receipt.tx))]
     async fn execute_cctp_mint_on_ethereum(
         &self,
         id: &UsdcRebalanceId,
@@ -545,6 +558,7 @@ where
         Ok(mint_tx)
     }
 
+    #[instrument(skip(self), fields(?id, %mint_tx))]
     async fn poll_and_confirm_alpaca_deposit(
         &self,
         id: &UsdcRebalanceId,
