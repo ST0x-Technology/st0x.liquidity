@@ -13,6 +13,27 @@ impl HasZero for Usdc {
     const ZERO: Self = Self(Decimal::ZERO);
 }
 
+impl From<Usdc> for Decimal {
+    fn from(value: Usdc) -> Self {
+        value.0
+    }
+}
+
+impl std::ops::Mul<Decimal> for Usdc {
+    type Output = Result<Self, ArithmeticError<Self>>;
+
+    fn mul(self, rhs: Decimal) -> Self::Output {
+        self.0
+            .checked_mul(rhs)
+            .map(Self)
+            .ok_or_else(|| ArithmeticError {
+                operation: "*".to_string(),
+                lhs: self,
+                rhs: Self(rhs),
+            })
+    }
+}
+
 impl std::ops::Add for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
@@ -197,5 +218,34 @@ mod tests {
     #[test]
     fn usdc_zero_constant() {
         assert!(Usdc::ZERO.is_zero());
+    }
+
+    #[test]
+    fn usdc_into_decimal_extracts_inner_value() {
+        let usdc = Usdc(Decimal::from(42));
+        let decimal: Decimal = usdc.into();
+        assert_eq!(decimal, Decimal::from(42));
+    }
+
+    #[test]
+    fn usdc_mul_decimal_succeeds() {
+        let usdc = Usdc(Decimal::from(100));
+        let ratio = Decimal::new(5, 1); // 0.5
+
+        let result = (usdc * ratio).unwrap();
+
+        assert_eq!(result.0, Decimal::from(50));
+    }
+
+    #[test]
+    fn usdc_mul_decimal_overflow_returns_error() {
+        let max = Usdc(Decimal::MAX);
+        let two = Decimal::TWO;
+
+        let err = (max * two).unwrap_err();
+
+        assert_eq!(err.operation, "*");
+        assert_eq!(err.lhs, max);
+        assert_eq!(err.rhs, Usdc(two));
     }
 }

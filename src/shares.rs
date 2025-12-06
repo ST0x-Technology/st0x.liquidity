@@ -29,6 +29,27 @@ impl HasZero for FractionalShares {
     const ZERO: Self = Self(Decimal::ZERO);
 }
 
+impl From<FractionalShares> for Decimal {
+    fn from(value: FractionalShares) -> Self {
+        value.0
+    }
+}
+
+impl std::ops::Mul<Decimal> for FractionalShares {
+    type Output = Result<Self, ArithmeticError<Self>>;
+
+    fn mul(self, rhs: Decimal) -> Self::Output {
+        self.0
+            .checked_mul(rhs)
+            .map(Self)
+            .ok_or_else(|| ArithmeticError {
+                operation: "*".to_string(),
+                lhs: self,
+                rhs: Self(rhs),
+            })
+    }
+}
+
 impl FractionalShares {
     pub(crate) const ONE: Self = Self(Decimal::ONE);
 
@@ -121,5 +142,34 @@ mod tests {
     fn abs_returns_absolute_value() {
         let negative = FractionalShares(Decimal::NEGATIVE_ONE);
         assert_eq!(negative.abs().0, Decimal::ONE);
+    }
+
+    #[test]
+    fn into_decimal_extracts_inner_value() {
+        let shares = FractionalShares(Decimal::from(42));
+        let decimal: Decimal = shares.into();
+        assert_eq!(decimal, Decimal::from(42));
+    }
+
+    #[test]
+    fn mul_decimal_succeeds() {
+        let shares = FractionalShares(Decimal::from(100));
+        let ratio = Decimal::new(5, 1); // 0.5
+
+        let result = (shares * ratio).unwrap();
+
+        assert_eq!(result.0, Decimal::from(50));
+    }
+
+    #[test]
+    fn mul_decimal_overflow_returns_error() {
+        let max = FractionalShares(Decimal::MAX);
+        let two = Decimal::TWO;
+
+        let err = (max * two).unwrap_err();
+
+        assert_eq!(err.operation, "*");
+        assert_eq!(err.lhs, max);
+        assert_eq!(err.rhs, FractionalShares(two));
     }
 }

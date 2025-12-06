@@ -36,14 +36,14 @@ where
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy,
 {
-    fn new(available: T, inflight: T) -> Self {
+    pub(super) fn new(available: T, inflight: T) -> Self {
         Self {
             available,
             inflight,
         }
     }
 
-    fn total(self) -> Result<T, ArithmeticError<T>> {
+    pub(super) fn total(self) -> Result<T, ArithmeticError<T>> {
         self.available + self.inflight
     }
 
@@ -63,7 +63,7 @@ where
         + Copy
         + HasZero,
 {
-    fn has_inflight(self) -> bool {
+    pub(super) fn has_inflight(self) -> bool {
         !self.inflight.is_zero()
     }
 

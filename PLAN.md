@@ -182,20 +182,36 @@ Add remaining core types needed for the view using generics.
 
 Implement ratio calculation and imbalance detection logic on `Inventory<T>`.
 
-- [ ] Implement `Inventory<T>::ratio(&self) -> Option<Decimal>`:
+- [x] Implement `Inventory<T>::ratio(&self) -> Option<Decimal>`:
   - Returns `onchain.total() / (onchain.total() + offchain.total())`
   - Returns `None` if total is zero
-- [ ] Implement `Inventory<T>::has_inflight(&self) -> bool`
-- [ ] Implement
+- [x] Implement `Inventory<T>::has_inflight(&self) -> bool`
+- [x] Implement
       `Inventory<T>::detect_imbalance(&self, threshold: &ImbalanceThreshold) -> Option<Imbalance<T>>`:
   - Returns `None` if `has_inflight()` is true
-  - Returns `None` if ratio is within `target ± deviation`
+  - Returns `None` if ratio is within `target +- deviation`
   - Returns `TooMuchOnchain` if ratio > target + deviation
   - Returns `TooMuchOffchain` if ratio < target - deviation
-- [ ] Add tests for ratio calculation edge cases (zero inventory, equal split)
-- [ ] Add tests for imbalance detection (balanced, imbalanced, inflight
+- [x] Add tests for ratio calculation edge cases (zero inventory, equal split)
+- [x] Add tests for imbalance detection (balanced, imbalanced, inflight
       blocking)
-- [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
+- [x] Run `cargo test -q --lib inventory` and `cargo clippy`
+
+**Changes made:**
+
+- Added `From<FractionalShares> for Decimal` in `src/shares.rs`
+- Added `From<Usdc> for Decimal` in `src/threshold.rs`
+- Added `Mul<Decimal>` for `FractionalShares` with checked arithmetic
+- Added `Mul<Decimal>` for `Usdc` with checked arithmetic
+- Made `VenueBalance::new`, `total`, `has_inflight` `pub(super)` for use in view
+- Implemented `Inventory<T>::ratio()`, `has_inflight()`, `detect_imbalance()`
+- Added 16 tests in `view.rs` covering:
+  - `ratio()`: zero total, equal split, all onchain, all offchain, inflight
+  - `has_inflight()`: no inflight, onchain inflight, offchain inflight, both
+  - `detect_imbalance()`: balanced, inflight blocking, zero total, too much
+    onchain, too much offchain, boundary cases
+- Added 3 tests in `shares.rs`: `into_decimal`, `mul_decimal`, overflow
+- Added 3 tests in `threshold.rs`: `into_decimal`, `mul_decimal`, overflow
 
 ---
 
