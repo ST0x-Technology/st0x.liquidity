@@ -218,24 +218,54 @@ src/rebalancing/
 
 ### Subtasks
 
-- [ ] Create `src/rebalancing/usdc.rs` with `UsdcRebalanceManager` struct
-- [ ] Add service dependencies: `AlpacaWalletService`, `CctpBridge`,
+- [x] Create `src/rebalancing/usdc.rs` with `UsdcRebalanceManager` struct
+- [x] Add service dependencies: `AlpacaWalletService`, `CctpBridge`,
       `VaultService`
-- [ ] Implement `execute_alpaca_to_base()` async method
-- [ ] Implement withdrawal phase: initiate + poll via `AlpacaWalletService`
-- [ ] Implement bridging phase: burn + attestation poll + mint via `CctpBridge`
-- [ ] Implement deposit phase: vault deposit via `VaultService`
-- [ ] Send appropriate `Fail*` command on errors at each phase
-- [ ] Write unit tests with mocked services
-- [ ] Write integration test: happy path
+- [x] Implement `execute_alpaca_to_base()` async method
+- [x] Implement withdrawal phase: initiate + poll via `AlpacaWalletService`
+- [x] Implement bridging phase: burn + attestation poll + mint via `CctpBridge`
+- [x] Implement deposit phase: vault deposit via `VaultService`
+- [x] Send appropriate `Fail*` command on errors at each phase
+- [x] Write unit tests with mocked services
+- [ ] Write integration test: happy path (deferred - requires significant
+      mocking infrastructure for CCTP and vault)
 - [ ] Remove `#[allow(dead_code)]` from `usdc_rebalance`, `alpaca_wallet`,
-      `cctp`
+      `cctp` (deferred to #139 - will be removed when wired up)
 
 ### Completion Criteria
 
-- [ ] `cargo test -q` passes
-- [ ] `cargo clippy --all-targets -- -D clippy::all` passes
-- [ ] `cargo fmt` produces no changes
+- [x] `cargo test -q` passes
+- [x] `cargo clippy --all-targets -- -D clippy::all` passes
+- [x] `cargo fmt` produces no changes
+
+### Implementation Notes
+
+**Files created:**
+
+- `src/rebalancing/usdc.rs` - `UsdcRebalanceManager<P, S, ES>` generic over
+  Provider, Signer, and EventStore
+
+**Key design decisions:**
+
+- Manager is stateless, holds `Arc<>` references to all services
+- Uses `Lifecycle<UsdcRebalance, Never>` wrapper for aggregate operations
+- Uses `UsdcRebalanceId` type parameter (not raw `&str`) for type safety
+- Error type `UsdcRebalanceManagerError` includes `status` field in
+  `WithdrawalFailed` and `DepositFailed` variants for meaningful error context
+- Workflow decomposed into private helper methods to keep main workflow method
+  readable
+- Added `TransferStatus` export from `alpaca_wallet` module
+
+**Tests (5 total):**
+
+- 2 unit tests for error display verification (`WithdrawalFailed`,
+  `DepositFailed`)
+- 3 integration tests for workflow failures:
+  - `test_execute_alpaca_to_base_withdrawal_not_whitelisted` - address not in
+    whitelist
+  - `test_execute_alpaca_to_base_withdrawal_pending_whitelist` - address pending
+    approval
+  - `test_execute_alpaca_to_base_api_error` - Alpaca API returns 500 error
 
 ---
 

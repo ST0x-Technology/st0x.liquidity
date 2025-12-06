@@ -27,13 +27,15 @@ use alloy::primitives::Address;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
-use client::AlpacaWalletClient;
 use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
 pub(crate) use status::PollingConfig;
-pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
+pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
+
+#[cfg(test)]
+pub(crate) use client::{AlpacaWalletClient, create_account_mock};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -41,7 +43,7 @@ pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
 ///
 /// Provides a high-level API for deposits, withdrawals, and transfer polling.
 pub(crate) struct AlpacaWalletService {
-    client: Arc<AlpacaWalletClient>,
+    client: Arc<client::AlpacaWalletClient>,
     polling_config: PollingConfig,
 }
 
@@ -49,7 +51,10 @@ pub(crate) struct AlpacaWalletService {
 #[allow(dead_code)]
 impl AlpacaWalletService {
     #[cfg(test)]
-    fn new_with_client(client: AlpacaWalletClient, polling_config: Option<PollingConfig>) -> Self {
+    pub(crate) fn new_with_client(
+        client: client::AlpacaWalletClient,
+        polling_config: Option<PollingConfig>,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             polling_config: polling_config.unwrap_or_default(),

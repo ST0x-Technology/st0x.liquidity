@@ -17,3 +17,4 @@
 
 mod mint;
 mod redemption;
+mod usdc;
