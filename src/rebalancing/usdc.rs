@@ -37,6 +37,12 @@ pub(crate) enum UsdcRebalanceManagerError {
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
     DepositFailed { status: String },
+    #[error("Invalid amount: {0}")]
+    InvalidAmount(String),
+    #[error("Arithmetic overflow: {0}")]
+    ArithmeticOverflow(String),
+    #[error("U256 parse error: {0}")]
+    U256Parse(#[from] alloy::primitives::ruint::ParseError),
 }
 
 pub(crate) struct UsdcRebalanceManager<P, S, ES>
@@ -354,6 +360,274 @@ where
         info!("Vault deposit confirmed");
         Ok(())
     }
+
+    /// Executes the full Base to Alpaca rebalancing workflow.
+    ///
+    /// # Workflow
+    ///
+    /// 1. Withdraw from Rain vault on Base -> `Initiate` command
+    /// 2. Confirm vault withdrawal -> `ConfirmWithdrawal` command
+    /// 3. Execute CCTP burn on Base -> `InitiateBridging` command
+    /// 4. Poll Circle API for attestation -> `ReceiveAttestation` command
+    /// 5. Execute CCTP mint on Ethereum -> `ConfirmBridging` command
+    /// 6. Initiate Alpaca deposit (mint directly to Alpaca address) -> `InitiateDeposit` command
+    /// 7. Poll Alpaca until deposit credited -> `ConfirmDeposit` command
+    ///
+    /// On errors, sends appropriate `Fail*` command to transition aggregate to failed state.
+    pub(crate) async fn execute_base_to_alpaca(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        info!(?amount, "Starting Base to Alpaca rebalance");
+
+        let amount_u256 = usdc_to_u256(amount)?;
+
+        self.withdraw_from_vault(id, amount, amount_u256).await?;
+
+        let burn_receipt = self.execute_cctp_burn_on_base(id, amount_u256).await?;
+
+        let attestation = self
+            .poll_attestation_for_base_burn(id, &burn_receipt)
+            .await?;
+
+        let mint_tx = self
+            .execute_cctp_mint_on_ethereum(id, &burn_receipt, attestation)
+            .await?;
+
+        self.poll_and_confirm_alpaca_deposit(id, mint_tx).await?;
+
+        info!("Base to Alpaca rebalance completed successfully");
+        Ok(())
+    }
+
+    async fn withdraw_from_vault(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        amount_u256: U256,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        let withdraw_tx = match self.vault.withdraw_usdc(self.vault_id, amount_u256).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("Vault withdrawal failed: {e}");
+                return Err(UsdcRebalanceManagerError::Vault(e));
+            }
+        };
+
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(withdraw_tx),
+                },
+            )
+            .await?;
+
+        // Vault withdrawal function already waits for block inclusion, so confirming immediately
+        self.cqrs
+            .execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await?;
+
+        info!(%withdraw_tx, "Vault withdrawal completed");
+        Ok(())
+    }
+
+    async fn execute_cctp_burn_on_base(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: U256,
+    ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
+        let burn_receipt = match self
+            .cctp_bridge
+            .burn_on_base(amount, self.ethereum_recipient)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("CCTP burn on Base failed: {e}");
+                self.cqrs
+                    .execute(
+                        &id.0,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("Burn on Base failed: {e}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcRebalanceManagerError::Cctp(e));
+            }
+        };
+
+        let nonce_bytes = burn_receipt.nonce.as_slice();
+        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
+
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiateBridging {
+                    burn_tx: burn_receipt.tx,
+                    cctp_nonce,
+                },
+            )
+            .await?;
+
+        info!(burn_tx = %burn_receipt.tx, "CCTP burn on Base executed");
+        Ok(burn_receipt)
+    }
+
+    async fn poll_attestation_for_base_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        burn_receipt: &BurnReceipt,
+    ) -> Result<Bytes, UsdcRebalanceManagerError> {
+        let attestation = match self.cctp_bridge.poll_attestation(burn_receipt.hash).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Attestation polling failed: {e}");
+                self.cqrs
+                    .execute(
+                        &id.0,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("Attestation polling failed: {e}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcRebalanceManagerError::Cctp(e));
+            }
+        };
+
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation: attestation.to_vec(),
+                },
+            )
+            .await?;
+
+        info!("Circle attestation received for Base burn");
+        Ok(attestation)
+    }
+
+    async fn execute_cctp_mint_on_ethereum(
+        &self,
+        id: &UsdcRebalanceId,
+        burn_receipt: &BurnReceipt,
+        attestation: Bytes,
+    ) -> Result<TxHash, UsdcRebalanceManagerError> {
+        let mint_tx = match self
+            .cctp_bridge
+            .mint_on_ethereum(burn_receipt.message.clone(), attestation)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(e) => {
+                warn!("CCTP mint on Ethereum failed: {e}");
+                self.cqrs
+                    .execute(
+                        &id.0,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!("Mint on Ethereum failed: {e}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcRebalanceManagerError::Cctp(e));
+            }
+        };
+
+        self.cqrs
+            .execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
+            .await?;
+
+        info!(%mint_tx, "CCTP mint on Ethereum executed");
+        Ok(mint_tx)
+    }
+
+    async fn poll_and_confirm_alpaca_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_tx: TxHash,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        // Record the deposit initiation with the mint tx
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(mint_tx),
+                },
+            )
+            .await?;
+
+        info!(%mint_tx, "Polling Alpaca for deposit detection");
+
+        let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&mint_tx).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Alpaca deposit polling failed: {e}");
+                self.cqrs
+                    .execute(
+                        &id.0,
+                        UsdcRebalanceCommand::FailDeposit {
+                            reason: format!("Deposit polling failed: {e}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcRebalanceManagerError::AlpacaWallet(e));
+            }
+        };
+
+        if transfer.status != TransferStatus::Complete {
+            let status = format!("{:?}", transfer.status);
+            self.cqrs
+                .execute(
+                    &id.0,
+                    UsdcRebalanceCommand::FailDeposit {
+                        reason: format!("Deposit ended in status: {status}"),
+                    },
+                )
+                .await?;
+            return Err(UsdcRebalanceManagerError::DepositFailed { status });
+        }
+
+        self.cqrs
+            .execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+            .await?;
+
+        info!("Alpaca deposit confirmed");
+        Ok(())
+    }
+}
+
+/// Converts a USDC decimal amount to U256 with 6 decimals.
+///
+/// # Errors
+///
+/// Returns an error if the decimal cannot be represented as U256 (e.g., negative values
+/// or values exceeding U256::MAX).
+fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
+    if usdc.0.is_sign_negative() {
+        return Err(UsdcRebalanceManagerError::InvalidAmount(format!(
+            "USDC amount cannot be negative: {}",
+            usdc.0
+        )));
+    }
+
+    // USDC has 6 decimals
+    let scaled = usdc
+        .0
+        .checked_mul(rust_decimal::Decimal::from(1_000_000u64))
+        .ok_or_else(|| {
+            UsdcRebalanceManagerError::ArithmeticOverflow(format!(
+                "USDC amount overflow during scaling: {}",
+                usdc.0
+            ))
+        })?;
+
+    let integer = scaled.trunc().to_string();
+
+    Ok(U256::from_str_radix(&integer, 10)?)
 }
 
 #[cfg(test)]
@@ -369,13 +643,15 @@ mod tests {
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
     use httpmock::prelude::*;
+    use reqwest::StatusCode;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaWalletClient, create_account_mock};
+    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, create_account_mock};
     use crate::cctp::{CctpBridge, Evm};
     use crate::onchain::vault::VaultService;
+    use crate::usdc_rebalance::UsdcRebalanceError;
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
     const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
@@ -539,8 +815,13 @@ mod tests {
         let result = manager.execute_alpaca_to_base(&id, amount).await;
 
         assert!(
-            matches!(result, Err(UsdcRebalanceManagerError::AlpacaWallet(_))),
-            "Expected AlpacaWallet error, got: {result:?}"
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::AlpacaWallet(
+                    AlpacaWalletError::AddressNotWhitelisted { .. }
+                ))
+            ),
+            "Expected AddressNotWhitelisted error, got: {result:?}"
         );
         whitelist_mock.assert();
     }
@@ -589,8 +870,13 @@ mod tests {
         let result = manager.execute_alpaca_to_base(&id, amount).await;
 
         assert!(
-            matches!(result, Err(UsdcRebalanceManagerError::AlpacaWallet(_))),
-            "Expected AlpacaWallet error for pending whitelist, got: {result:?}"
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::AlpacaWallet(
+                    AlpacaWalletError::AddressNotWhitelisted { .. }
+                ))
+            ),
+            "Expected AddressNotWhitelisted error for pending whitelist, got: {result:?}"
         );
         whitelist_mock.assert();
     }
@@ -630,9 +916,127 @@ mod tests {
         let result = manager.execute_alpaca_to_base(&id, amount).await;
 
         assert!(
-            matches!(result, Err(UsdcRebalanceManagerError::AlpacaWallet(_))),
-            "Expected AlpacaWallet error for API failure, got: {result:?}"
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::AlpacaWallet(
+                    AlpacaWalletError::ApiError {
+                        status: StatusCode::INTERNAL_SERVER_ERROR,
+                        ..
+                    }
+                ))
+            ),
+            "Expected ApiError with INTERNAL_SERVER_ERROR, got: {result:?}"
         );
         whitelist_mock.assert();
+    }
+
+    #[test]
+    fn test_usdc_to_u256_positive_amount() {
+        let amount = Usdc(dec!(1000.50));
+        let result = usdc_to_u256(amount).unwrap();
+        assert_eq!(result, U256::from(1_000_500_000u64));
+    }
+
+    #[test]
+    fn test_usdc_to_u256_negative_amount() {
+        let amount = Usdc(dec!(-100));
+        let result = usdc_to_u256(amount);
+        assert!(
+            matches!(
+                &result,
+                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-100")
+            ),
+            "Expected InvalidAmount error mentioning -100, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_usdc_to_u256_zero_amount() {
+        let amount = Usdc(dec!(0));
+        let result = usdc_to_u256(amount).unwrap();
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn test_usdc_to_u256_fractional_truncation() {
+        let amount = Usdc(dec!(100.1234567));
+        let result = usdc_to_u256(amount).unwrap();
+        assert_eq!(result, U256::from(100_123_456u64));
+    }
+
+    #[tokio::test]
+    async fn test_execute_base_to_alpaca_negative_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
+        let cqrs = create_test_cqrs();
+
+        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
+        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            ethereum_recipient,
+            base_recipient,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId::new("rebalance-base-001");
+        let amount = Usdc(dec!(-500));
+
+        let result = manager.execute_base_to_alpaca(&id, amount).await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-500")
+            ),
+            "Expected InvalidAmount error mentioning -500, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_base_to_alpaca_cctp_burn_fails_with_contract_error() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
+        let cqrs = create_test_cqrs();
+
+        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
+        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            ethereum_recipient,
+            base_recipient,
+            TEST_VAULT_ID,
+        );
+
+        let id = UsdcRebalanceId::new("rebalance-base-002");
+        let amount = Usdc(dec!(1000));
+
+        let result = manager.execute_base_to_alpaca(&id, amount).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::Aggregate(
+                    AggregateError::UserError(UsdcRebalanceError::BridgingNotInitiated)
+                ))
+            ),
+            "Expected Aggregate(UserError(BridgingNotInitiated)) error, got: {result:?}"
+        );
     }
 }

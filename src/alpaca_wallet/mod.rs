@@ -23,7 +23,7 @@ mod status;
 mod transfer;
 mod whitelist;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
@@ -134,6 +134,23 @@ impl AlpacaWalletService {
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
+    }
+
+    /// Polls for an incoming deposit by its on-chain transaction hash.
+    ///
+    /// Alpaca auto-detects incoming transfers to their funding wallet addresses.
+    /// This method polls until the deposit is detected and reaches a terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The deposit times out (not detected within timeout)
+    /// - The API call fails persistently
+    pub async fn poll_deposit_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Transfer, AlpacaWalletError> {
+        status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
     }
 
     /// Whitelists an address for withdrawals.

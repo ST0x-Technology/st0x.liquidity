@@ -316,18 +316,70 @@ Adds reverse direction to UsdcRebalanceManager.
 
 ### Subtasks
 
-- [ ] Implement `execute_base_to_alpaca()` async method
-- [ ] Implement vault withdrawal phase via `VaultService::withdraw()`
-- [ ] Implement bridging phase (Base -> Ethereum direction)
-- [ ] Implement Alpaca deposit phase: initiate + poll
-- [ ] Write unit tests for reverse direction
-- [ ] Write integration test: happy path
+- [x] Implement `execute_base_to_alpaca()` async method
+- [x] Implement vault withdrawal phase via `VaultService::withdraw()`
+- [x] Implement bridging phase (Base -> Ethereum direction)
+- [x] Implement Alpaca deposit phase: initiate + poll
+- [x] Write unit tests for reverse direction
+- [ ] Write integration test: happy path (deferred - requires full LocalCctp +
+      vault setup)
 
 ### Completion Criteria
 
-- [ ] `cargo test -q` passes
-- [ ] `cargo clippy --all-targets -- -D clippy::all` passes
-- [ ] `cargo fmt` produces no changes
+- [x] `cargo test -q` passes
+- [x] `cargo clippy --all-targets -- -D clippy::all` passes
+- [x] `cargo fmt` produces no changes
+
+### Implementation Notes
+
+**Files modified:**
+
+- `src/rebalancing/usdc.rs` - Added `execute_base_to_alpaca()` with helper
+  methods:
+  - `withdraw_from_vault()` - Withdraws from Rain vault, sends Initiate +
+    ConfirmWithdrawal
+  - `execute_cctp_burn_on_base()` - Burns USDC on Base, sends InitiateBridging
+  - `poll_attestation_for_base_burn()` - Polls Circle attestation, sends
+    ReceiveAttestation
+  - `execute_cctp_mint_on_ethereum()` - Mints on Ethereum, sends ConfirmBridging
+  - `poll_and_confirm_alpaca_deposit()` - Polls Alpaca deposit, sends
+    InitiateDeposit + ConfirmDeposit
+
+- `src/alpaca_wallet/status.rs` - Added `poll_deposit_by_tx_hash()` for
+  detecting incoming deposits by transaction hash
+
+- `src/alpaca_wallet/transfer.rs` - Added `find_transfer_by_tx_hash()` helper
+
+- `src/alpaca_wallet/client.rs` - Added `DepositTimeout` error variant
+
+- `src/alpaca_wallet/mod.rs` - Exposed `poll_deposit_by_tx_hash` on service
+
+**Key design decisions:**
+
+- Vault withdrawal is synchronous (waits for block inclusion), so Initiate and
+  ConfirmWithdrawal are sent back-to-back
+- Alpaca auto-detects incoming deposits by tx hash - we poll transfers API until
+  the deposit appears
+- `usdc_to_u256()` uses proper error handling (no `.unwrap_or()` on financial
+  data)
+
+**Tests (6 new in usdc.rs):**
+
+- `test_usdc_to_u256_positive_amount` - Verifies conversion with decimals
+- `test_usdc_to_u256_negative_amount` - Verifies rejection of negative amounts
+- `test_usdc_to_u256_zero_amount` - Verifies zero handling
+- `test_usdc_to_u256_fractional_truncation` - Verifies truncation to 6 decimals
+- `test_execute_base_to_alpaca_negative_amount` - Verifies InvalidAmount error
+- `test_execute_base_to_alpaca_cctp_burn_fails_with_contract_error` - Verifies
+  CCTP failure triggers aggregate error
+
+**Tests (4 new in alpaca_wallet):**
+
+- `test_find_transfer_by_tx_hash_found` - Transfer exists in list
+- `test_find_transfer_by_tx_hash_not_found` - Empty list
+- `test_find_transfer_by_tx_hash_multiple_transfers` - Multiple transfers,
+  correct match
+- `test_poll_deposit_by_tx_hash_*` (4 tests) - Polling scenarios
 
 ---
 

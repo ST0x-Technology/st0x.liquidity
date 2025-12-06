@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, hex::FromHexError};
+use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -70,6 +70,12 @@ pub enum AlpacaWalletError {
         address: Address,
         asset: TokenSymbol,
         network: Network,
+    },
+
+    #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
+    DepositTimeout {
+        tx_hash: TxHash,
+        elapsed: std::time::Duration,
     },
 }
 
