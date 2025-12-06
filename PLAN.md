@@ -227,8 +227,7 @@ src/rebalancing/
 - [x] Implement deposit phase: vault deposit via `VaultService`
 - [x] Send appropriate `Fail*` command on errors at each phase
 - [x] Write unit tests with mocked services
-- [ ] Write integration test: happy path (deferred - requires significant
-      mocking infrastructure for CCTP and vault)
+- [x] Write integration tests: happy path with LocalCctp infrastructure
 - [ ] Remove `#[allow(dead_code)]` from `usdc_rebalance`, `alpaca_wallet`,
       `cctp` (deferred to #139 - will be removed when wired up)
 
@@ -256,7 +255,7 @@ src/rebalancing/
   readable
 - Added `TransferStatus` export from `alpaca_wallet` module
 
-**Tests (5 total):**
+**Tests (5 total in usdc.rs):**
 
 - 2 unit tests for error display verification (`WithdrawalFailed`,
   `DepositFailed`)
@@ -266,6 +265,37 @@ src/rebalancing/
   - `test_execute_alpaca_to_base_withdrawal_pending_whitelist` - address pending
     approval
   - `test_execute_alpaca_to_base_api_error` - Alpaca API returns 500 error
+
+**CCTP Test Infrastructure (cctp.rs):**
+
+Created `LocalCctp` struct that deploys full CCTP V2 infrastructure to Anvil:
+
+- `MockMintBurnToken` (USDC) on both chains
+- `TokenMinterV2` on both chains
+- `MessageTransmitterV2` with `AdminUpgradableProxy` on both chains
+- `TokenMessengerV2` with `AdminUpgradableProxy` on both chains
+- Links remote token messengers between chains
+- Links token pairs for cross-chain transfers
+- Mints initial USDC balance to deployer
+- Mocks Circle fee API for test isolation
+
+Key implementation detail: The `sign_message()` method simulates Circle's
+attester by:
+
+1. Generating a random nonce (position 12-44)
+2. Setting `finalityThresholdExecuted` to 2000 (FINALITY_THRESHOLD_FINALIZED)
+3. Signing the modified message with the attester key
+
+**CCTP Tests (14 total in cctp.rs):**
+
+- `test_attestation_succeeds_with_retry_logic` - HTTP retry with backoff
+- `test_ensure_usdc_approval_*` (4 tests) - Approval scenarios for both chains
+- `test_burn_on_ethereum_with_deployed_contracts` - Full burn on Ethereum
+- `test_burn_on_base_with_deployed_contracts` - Full burn on Base
+- `test_full_bridge_ethereum_to_base` - Complete E2E Ethereum→Base bridge
+- `test_full_bridge_base_to_ethereum` - Complete E2E Base→Ethereum bridge
+- `test_mint_on_ethereum_with_invalid_attestation` - Invalid signature error
+- `test_mint_on_base_with_invalid_attestation` - Invalid signature error
 
 ---
 
