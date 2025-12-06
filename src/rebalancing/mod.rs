@@ -16,3 +16,4 @@
 //! managers can resume by querying aggregate state.
 
 mod mint;
+mod redemption;

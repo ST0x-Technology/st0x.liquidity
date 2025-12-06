@@ -91,8 +91,13 @@ where
             .await
     }
 
+    /// Returns the redemption wallet address.
+    pub(crate) fn redemption_wallet(&self) -> Address {
+        self.client.redemption_wallet
+    }
+
     /// Send tokens to the redemption wallet to initiate a redemption.
-    async fn send_for_redemption(
+    pub(crate) async fn send_for_redemption(
         &self,
         token: Address,
         amount: U256,
@@ -101,7 +106,7 @@ where
     }
 
     /// Poll until Alpaca detects a redemption transfer.
-    async fn poll_for_redemption(
+    pub(crate) async fn poll_for_redemption(
         &self,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
@@ -111,7 +116,7 @@ where
     }
 
     /// Poll a redemption request until it reaches a terminal state.
-    async fn poll_redemption_until_complete(
+    pub(crate) async fn poll_redemption_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {

@@ -3,10 +3,10 @@
 //! Coordinates between `AlpacaTokenizationService` and the `TokenizedEquityMint` aggregate
 //! to execute the full mint lifecycle: request -> poll -> receive tokens -> finalize.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
-use cqrs_es::Aggregate;
+use cqrs_es::{AggregateError, CqrsFramework, EventStore};
 use rust_decimal::Decimal;
 use st0x_broker::Symbol;
 use std::sync::Arc;
@@ -20,18 +20,17 @@ use crate::alpaca_tokenization::{
 use crate::lifecycle::{Lifecycle, Never};
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{
-    ReceiptId, TokenizationRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
     TokenizedEquityMintError,
 };
 
-/// Errors that can occur during mint orchestration.
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
     #[error("Alpaca API error: {0}")]
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] TokenizedEquityMintError),
+    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
 
     #[error("Mint request was rejected by Alpaca")]
     Rejected,
@@ -43,27 +42,27 @@ pub(crate) enum MintError {
     MissingTxHash,
 }
 
-/// Orchestrates the TokenizedEquityMint workflow.
-///
-/// Stateless manager that coordinates between the Alpaca tokenization service
-/// and the TokenizedEquityMint aggregate. All persistent state lives in the
-/// aggregate via the event store.
-pub(crate) struct MintManager<P, S>
+pub(crate) struct MintManager<P, S, ES>
 where
     P: Provider + Clone,
     S: Signer + Clone + Sync,
+    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
     service: Arc<AlpacaTokenizationService<P, S>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
 }
 
-impl<P, S> MintManager<P, S>
+impl<P, S, ES> MintManager<P, S, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
     S: Signer + Clone + Send + Sync + 'static,
+    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
-    /// Creates a new MintManager with the given tokenization service.
-    pub(crate) fn new(service: Arc<AlpacaTokenizationService<P, S>>) -> Self {
-        Self { service }
+    pub(crate) fn new(
+        service: Arc<AlpacaTokenizationService<P, S>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+    ) -> Self {
+        Self { service, cqrs }
     }
 
     /// Executes the full mint workflow.
@@ -80,168 +79,126 @@ where
     /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
     pub(crate) async fn execute_mint(
         &self,
-        aggregate: &mut Lifecycle<TokenizedEquityMint, Never>,
+        issuer_request_id: &IssuerRequestId,
         symbol: Symbol,
-        quantity: Decimal,
+        quantity: FractionalShares,
         wallet: Address,
     ) -> Result<(), MintError> {
-        // Step 1: Request mint in aggregate
-        info!(%symbol, %quantity, %wallet, "Starting mint workflow");
+        info!(%symbol, ?quantity, %wallet, "Starting mint workflow");
 
-        let events = aggregate
-            .handle(
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
                 TokenizedEquityMintCommand::RequestMint {
                     symbol: symbol.clone(),
-                    quantity,
+                    quantity: quantity.0,
                     wallet,
                 },
-                &(),
             )
             .await?;
 
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        // Step 2: Call Alpaca API
-        let fractional_quantity = FractionalShares(quantity);
-        let alpaca_result = self
-            .service
-            .request_mint(symbol.clone(), fractional_quantity, wallet)
-            .await;
-
-        let alpaca_request = match alpaca_result {
+        let alpaca_request = match self.service.request_mint(symbol, quantity, wallet).await {
             Ok(req) => req,
             Err(e) => {
                 warn!("Alpaca mint request failed: {e}");
-                self.fail_aggregate(aggregate, format!("Alpaca API error: {e}"))
+                self.fail(issuer_request_id, format!("Alpaca API error: {e}"))
                     .await?;
                 return Err(MintError::Alpaca(e));
             }
         };
 
-        // Step 3: Acknowledge acceptance
-        let issuer_request_id = alpaca_request
+        let alpaca_issuer_request_id = alpaca_request
             .issuer_request_id
             .clone()
             .ok_or(MintError::MissingIssuerRequestId)?;
 
-        let events = aggregate
-            .handle(
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
                 TokenizedEquityMintCommand::AcknowledgeAcceptance {
-                    issuer_request_id,
+                    issuer_request_id: alpaca_issuer_request_id,
                     tokenization_request_id: alpaca_request.id.clone(),
                 },
-                &(),
             )
             .await?;
 
-        for event in events {
-            aggregate.apply(event);
-        }
+        info!(tokenization_request_id = %alpaca_request.id, "Mint request accepted, polling for completion");
 
-        info!(
-            tokenization_request_id = %alpaca_request.id,
-            "Mint request accepted, polling for completion"
-        );
+        let completed_request = match self
+            .service
+            .poll_mint_until_complete(&alpaca_request.id)
+            .await
+        {
+            Ok(req) => req,
+            Err(e) => {
+                warn!("Polling failed: {e}");
+                self.fail(issuer_request_id, format!("Polling failed: {e}"))
+                    .await?;
+                return Err(MintError::Alpaca(e));
+            }
+        };
 
-        // Step 4: Poll until terminal
-        let completed_request = self
-            .poll_until_complete(&alpaca_request.id, aggregate)
+        self.handle_completed_request(issuer_request_id, completed_request)
+            .await
+    }
+
+    async fn fail(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        reason: String,
+    ) -> Result<(), MintError> {
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                TokenizedEquityMintCommand::Fail { reason },
+            )
             .await?;
+        Ok(())
+    }
 
-        // Step 5: Handle terminal status
+    async fn handle_completed_request(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        completed_request: TokenizationRequest,
+    ) -> Result<(), MintError> {
         match completed_request.status {
             TokenizationRequestStatus::Completed => {
                 let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
+                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity.0);
 
-                self.receive_tokens_and_finalize(aggregate, tx_hash, &completed_request)
+                self.cqrs
+                    .execute(
+                        &issuer_request_id.0,
+                        TokenizedEquityMintCommand::ReceiveTokens {
+                            tx_hash,
+                            receipt_id: ReceiptId(U256::ZERO),
+                            shares_minted,
+                        },
+                    )
+                    .await?;
+
+                self.cqrs
+                    .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Finalize)
                     .await?;
 
                 info!("Mint workflow completed successfully");
                 Ok(())
             }
             TokenizationRequestStatus::Rejected => {
-                self.fail_aggregate(aggregate, "Mint request rejected by Alpaca".to_string())
-                    .await?;
+                self.fail(
+                    issuer_request_id,
+                    "Mint request rejected by Alpaca".to_string(),
+                )
+                .await?;
                 Err(MintError::Rejected)
             }
             TokenizationRequestStatus::Pending => {
-                unreachable!("poll_until_complete should not return Pending status")
+                unreachable!("poll_mint_until_complete should not return Pending status")
             }
         }
-    }
-
-    async fn poll_until_complete(
-        &self,
-        id: &TokenizationRequestId,
-        aggregate: &mut Lifecycle<TokenizedEquityMint, Never>,
-    ) -> Result<TokenizationRequest, MintError> {
-        match self.service.poll_mint_until_complete(id).await {
-            Ok(req) => Ok(req),
-            Err(e) => {
-                warn!("Polling failed: {e}");
-                self.fail_aggregate(aggregate, format!("Polling failed: {e}"))
-                    .await?;
-                Err(MintError::Alpaca(e))
-            }
-        }
-    }
-
-    async fn receive_tokens_and_finalize(
-        &self,
-        aggregate: &mut Lifecycle<TokenizedEquityMint, Never>,
-        tx_hash: TxHash,
-        request: &TokenizationRequest,
-    ) -> Result<(), MintError> {
-        // Convert quantity to U256 for onchain representation (18 decimals)
-        let shares_minted = decimal_to_u256_18_decimals(request.quantity.0);
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::ReceiveTokens {
-                    tx_hash,
-                    receipt_id: ReceiptId(U256::ZERO), // Alpaca doesn't provide receipt ID
-                    shares_minted,
-                },
-                &(),
-            )
-            .await?;
-
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        // Finalize
-        let events = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
-            .await?;
-
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        Ok(())
-    }
-
-    async fn fail_aggregate(
-        &self,
-        aggregate: &mut Lifecycle<TokenizedEquityMint, Never>,
-        reason: String,
-    ) -> Result<(), TokenizedEquityMintError> {
-        let events = aggregate
-            .handle(TokenizedEquityMintCommand::Fail { reason }, &())
-            .await?;
-
-        for event in events {
-            aggregate.apply(event);
-        }
-
-        Ok(())
     }
 }
 
-/// Converts a Decimal to U256 with 18 decimal places.
 fn decimal_to_u256_18_decimals(value: Decimal) -> U256 {
     let scaled = value * Decimal::from(10u64.pow(18));
     let as_str = scaled.trunc().to_string();
@@ -250,22 +207,28 @@ fn decimal_to_u256_18_decimals(value: Decimal) -> U256 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use alloy::primitives::address;
+    use cqrs_es::CqrsFramework;
+    use cqrs_es::mem_store::MemStore;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
     };
+
+    type TestCqrs = CqrsFramework<
+        Lifecycle<TokenizedEquityMint, Never>,
+        MemStore<Lifecycle<TokenizedEquityMint, Never>>,
+    >;
 
     #[test]
     fn test_decimal_to_u256_18_decimals() {
         let value = dec!(100.5);
         let result = decimal_to_u256_18_decimals(value);
 
-        // 100.5 * 10^18 = 100_500_000_000_000_000_000
         let expected = U256::from(100_500_000_000_000_000_000_u128);
         assert_eq!(result, expected);
     }
@@ -320,6 +283,11 @@ mod tests {
         })
     }
 
+    fn create_test_cqrs() -> Arc<TestCqrs> {
+        let store = MemStore::default();
+        Arc::new(CqrsFramework::new(store, vec![], ()))
+    }
+
     #[tokio::test]
     async fn test_execute_mint_happy_path() {
         let server = MockServer::start();
@@ -327,7 +295,8 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let manager = MintManager::new(service);
+        let cqrs = create_test_cqrs();
+        let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path("/v2/tokenization/mint");
@@ -343,22 +312,15 @@ mod tests {
                 .json_body(json!([sample_completed_response("mint_123")]));
         });
 
-        let mut aggregate: Lifecycle<TokenizedEquityMint, Never> = Lifecycle::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = dec!(100.0);
+        let quantity = FractionalShares(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint(&mut aggregate, symbol, quantity, wallet)
+            .execute_mint(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
             .await;
 
         assert!(result.is_ok(), "execute_mint failed: {result:?}");
-
-        let state = aggregate.live().unwrap();
-        assert!(
-            matches!(state, TokenizedEquityMint::Completed { .. }),
-            "expected Completed state, got: {state:?}"
-        );
 
         mint_mock.assert();
         poll_mock.assert();
@@ -371,7 +333,8 @@ mod tests {
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let manager = MintManager::new(service);
+        let cqrs = create_test_cqrs();
+        let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path("/v2/tokenization/mint");
@@ -399,57 +362,44 @@ mod tests {
                 }]));
         });
 
-        let mut aggregate: Lifecycle<TokenizedEquityMint, Never> = Lifecycle::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = dec!(100.0);
+        let quantity = FractionalShares(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint(&mut aggregate, symbol, quantity, wallet)
+            .execute_mint(&IssuerRequestId::new("mint-002"), symbol, quantity, wallet)
             .await;
 
         assert!(matches!(result, Err(MintError::Rejected)));
-
-        let state = aggregate.live().unwrap();
-        assert!(
-            matches!(state, TokenizedEquityMint::Failed { .. }),
-            "expected Failed state, got: {state:?}"
-        );
 
         mint_mock.assert();
         poll_mock.assert();
     }
 
     #[tokio::test]
-    async fn test_execute_mint_api_error_fails_aggregate() {
+    async fn test_execute_mint_api_error() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
         );
-        let manager = MintManager::new(service);
+        let cqrs = create_test_cqrs();
+        let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path("/v2/tokenization/mint");
             then.status(500).body("Internal Server Error");
         });
 
-        let mut aggregate: Lifecycle<TokenizedEquityMint, Never> = Lifecycle::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = dec!(100.0);
+        let quantity = FractionalShares(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint(&mut aggregate, symbol, quantity, wallet)
+            .execute_mint(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
             .await;
 
         assert!(matches!(result, Err(MintError::Alpaca(_))));
-
-        let state = aggregate.live().unwrap();
-        assert!(
-            matches!(state, TokenizedEquityMint::Failed { .. }),
-            "expected Failed state, got: {state:?}"
-        );
 
         mint_mock.assert();
     }

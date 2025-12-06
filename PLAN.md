@@ -152,22 +152,45 @@ src/rebalancing/
 
 ### Subtasks
 
-- [ ] Create `src/rebalancing/redemption.rs` with `RedemptionManager` struct
-- [ ] Add service dependencies: `AlpacaTokenizationService`
-- [ ] Implement `execute_redemption()` async method for full workflow
-- [ ] Implement token transfer via service's `send_for_redemption()`
-- [ ] Poll for redemption detection using `poll_for_redemption()`
-- [ ] Poll for completion using `poll_until_terminal()`
-- [ ] Send `Fail` command on permanent errors
-- [ ] Write unit tests with mocked service
-- [ ] Write integration test: happy path
-- [ ] Remove `#[allow(dead_code)]` from `equity_redemption`
+- [x] Create `src/rebalancing/redemption.rs` with `RedemptionManager` struct
+- [x] Add service dependencies: `AlpacaTokenizationService`, `CqrsFramework`
+- [x] Implement `execute_redemption()` async method for full workflow
+- [x] Implement token transfer via service's `send_for_redemption()`
+- [x] Poll for redemption detection using `poll_for_redemption()`
+- [x] Poll for completion using `poll_redemption_until_complete()`
+- [x] Send `Fail` command on permanent errors
+- [x] Write unit tests with mocked service
+- [ ] Remove `#[allow(dead_code)]` from `equity_redemption` (deferred to #139)
 
 ### Completion Criteria
 
-- [ ] `cargo test -q` passes
-- [ ] `cargo clippy --all-targets -- -D clippy::all` passes
-- [ ] `cargo fmt` produces no changes
+- [x] `cargo test -q` passes
+- [x] `cargo clippy --all-targets -- -D clippy::all` passes
+- [x] `cargo fmt` produces no changes
+
+### Implementation Notes
+
+**Files modified:**
+
+- `src/rebalancing/redemption.rs` - `RedemptionManager<P, S, ES>` generic over
+  Provider, Signer, and EventStore
+- `src/alpaca_tokenization.rs` - Made `send_for_redemption()`,
+  `poll_for_redemption()`, `poll_redemption_until_complete()`, and
+  `redemption_wallet()` public
+
+**Key design decisions:**
+
+- Uses `CqrsFramework` with `cqrs.execute(&aggregate_id, command)` pattern
+  (consistent with MintManager)
+- Manager takes `Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>`
+- Uses `FractionalShares` type for quantity parameter
+- Error type uses `AggregateError<EquityRedemptionError>` to properly wrap CQRS
+  errors
+
+**Tests:**
+
+- 1 integration test: send failure scenario (token transfer fails before any
+  aggregate commands)
 
 ---
 
@@ -216,7 +239,7 @@ src/rebalancing/
 
 ---
 
-## Task 4. UsdcRebalanceManager - BaseToAlpaca Direction
+## Task 4. UsdcRebalanceManager (BaseToAlpaca)
 
 Adds reverse direction to UsdcRebalanceManager.
 
