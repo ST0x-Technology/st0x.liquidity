@@ -7,31 +7,38 @@ pub(crate) struct FractionalShares(pub(crate) Decimal);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 #[error("arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
-pub(crate) struct ArithmeticError {
+pub(crate) struct ArithmeticError<T> {
     pub(crate) operation: String,
-    pub(crate) lhs: FractionalShares,
-    pub(crate) rhs: FractionalShares,
+    pub(crate) lhs: T,
+    pub(crate) rhs: T,
+}
+
+pub(crate) trait HasZero: PartialOrd + Sized {
+    const ZERO: Self;
+
+    fn is_zero(&self) -> bool {
+        self == &Self::ZERO
+    }
+
+    fn is_negative(&self) -> bool {
+        self < &Self::ZERO
+    }
+}
+
+impl HasZero for FractionalShares {
+    const ZERO: Self = Self(Decimal::ZERO);
 }
 
 impl FractionalShares {
-    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
     pub(crate) const ONE: Self = Self(Decimal::ONE);
 
     pub(crate) fn abs(self) -> Self {
         Self(self.0.abs())
     }
-
-    pub(crate) fn is_negative(self) -> bool {
-        self.0.is_sign_negative()
-    }
-
-    pub(crate) fn is_zero(self) -> bool {
-        self.0.is_zero()
-    }
 }
 
 impl std::ops::Add for FractionalShares {
-    type Output = Result<Self, ArithmeticError>;
+    type Output = Result<Self, ArithmeticError<Self>>;
 
     fn add(self, rhs: Self) -> Self::Output {
         self.0
@@ -46,7 +53,7 @@ impl std::ops::Add for FractionalShares {
 }
 
 impl std::ops::Sub for FractionalShares {
-    type Output = Result<Self, ArithmeticError>;
+    type Output = Result<Self, ArithmeticError<Self>>;
 
     fn sub(self, rhs: Self) -> Self::Output {
         self.0

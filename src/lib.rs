@@ -50,6 +50,8 @@ mod usdc_rebalance;
 #[allow(dead_code)]
 mod rebalancing;
 
+mod inventory;
+
 pub use telemetry::{TelemetryError, TelemetryGuard};
 
 #[cfg(test)]

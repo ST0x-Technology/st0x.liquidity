@@ -10,7 +10,7 @@ use st0x_broker::{Direction, SupportedBroker, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
-use crate::shares::{ArithmeticError, FractionalShares};
+use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,7 +28,7 @@ impl Position {
     pub(crate) fn apply_transition(
         event: &PositionEvent,
         position: &Self,
-    ) -> Result<Self, LifecycleError<ArithmeticError>> {
+    ) -> Result<Self, LifecycleError<ArithmeticError<FractionalShares>>> {
         match event {
             PositionEvent::OnChainOrderFilled {
                 amount,
@@ -141,7 +141,7 @@ impl Position {
 
     pub(crate) fn from_event(
         event: &PositionEvent,
-    ) -> Result<Self, LifecycleError<ArithmeticError>> {
+    ) -> Result<Self, LifecycleError<ArithmeticError<FractionalShares>>> {
         match event {
             PositionEvent::Initialized {
                 symbol,
@@ -241,7 +241,7 @@ impl Position {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<Position, ArithmeticError> {
+impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
     type Command = PositionCommand;
     type Event = PositionEvent;
     type Error = PositionError;
@@ -356,7 +356,7 @@ impl Aggregate for Lifecycle<Position, ArithmeticError> {
     }
 }
 
-impl View<Self> for Lifecycle<Position, ArithmeticError> {
+impl View<Self> for Lifecycle<Position, ArithmeticError<FractionalShares>> {
     fn update(&mut self, event: &EventEnvelope<Self>) {
         *self = self
             .clone()
@@ -384,7 +384,7 @@ pub(crate) enum PositionError {
         actual: ExecutionId,
     },
     #[error(transparent)]
-    State(#[from] LifecycleError<ArithmeticError>),
+    State(#[from] LifecycleError<ArithmeticError<FractionalShares>>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,7 +536,7 @@ mod tests {
         aggregate_id: &str,
         sequence: usize,
         event: PositionEvent,
-    ) -> EventEnvelope<Lifecycle<Position, ArithmeticError>> {
+    ) -> EventEnvelope<Lifecycle<Position, ArithmeticError<FractionalShares>>> {
         EventEnvelope {
             aggregate_id: aggregate_id.to_string(),
             sequence,
@@ -549,13 +549,14 @@ mod tests {
     fn initialize_sets_threshold() {
         let threshold = one_share_threshold();
 
-        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
-            .given_no_previous_events()
-            .when(PositionCommand::Initialize {
-                symbol: Symbol::new("AAPL").unwrap(),
-                threshold,
-            })
-            .inspect_result();
+        let result =
+            TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
+                .given_no_previous_events()
+                .when(PositionCommand::Initialize {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                })
+                .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -571,20 +572,21 @@ mod tests {
         let price_usdc = dec!(150.0);
         let block_timestamp = Utc::now();
 
-        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
-            .given(vec![PositionEvent::Initialized {
-                symbol: Symbol::new("AAPL").unwrap(),
-                threshold,
-                initialized_at: Utc::now(),
-            }])
-            .when(PositionCommand::AcknowledgeOnChainFill {
-                trade_id,
-                amount,
-                direction: Direction::Buy,
-                price_usdc,
-                block_timestamp,
-            })
-            .inspect_result();
+        let result =
+            TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
+                .given(vec![PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                }])
+                .when(PositionCommand::AcknowledgeOnChainFill {
+                    trade_id,
+                    amount,
+                    direction: Direction::Buy,
+                    price_usdc,
+                    block_timestamp,
+                })
+                .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -604,37 +606,38 @@ mod tests {
         let execution_id = ExecutionId(1);
         let shares = FractionalShares::ONE;
 
-        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
-            .given(vec![
-                PositionEvent::Initialized {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    threshold,
-                    initialized_at: Utc::now(),
-                },
-                PositionEvent::OnChainOrderFilled {
-                    trade_id: trade_id1,
-                    amount: FractionalShares(dec!(0.6)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: Utc::now(),
-                    seen_at: Utc::now(),
-                },
-                PositionEvent::OnChainOrderFilled {
-                    trade_id: trade_id2,
-                    amount: FractionalShares(dec!(0.5)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(151.0),
-                    block_timestamp: Utc::now(),
-                    seen_at: Utc::now(),
-                },
-            ])
-            .when(PositionCommand::PlaceOffChainOrder {
-                execution_id,
-                shares,
-                direction: Direction::Sell,
-                broker: SupportedBroker::Schwab,
-            })
-            .inspect_result();
+        let result =
+            TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
+                .given(vec![
+                    PositionEvent::Initialized {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        threshold,
+                        initialized_at: Utc::now(),
+                    },
+                    PositionEvent::OnChainOrderFilled {
+                        trade_id: trade_id1,
+                        amount: FractionalShares(dec!(0.6)),
+                        direction: Direction::Buy,
+                        price_usdc: dec!(150.0),
+                        block_timestamp: Utc::now(),
+                        seen_at: Utc::now(),
+                    },
+                    PositionEvent::OnChainOrderFilled {
+                        trade_id: trade_id2,
+                        amount: FractionalShares(dec!(0.5)),
+                        direction: Direction::Buy,
+                        price_usdc: dec!(151.0),
+                        block_timestamp: Utc::now(),
+                        seen_at: Utc::now(),
+                    },
+                ])
+                .when(PositionCommand::PlaceOffChainOrder {
+                    execution_id,
+                    shares,
+                    direction: Direction::Sell,
+                    broker: SupportedBroker::Schwab,
+                })
+                .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -648,7 +651,7 @@ mod tests {
         };
         let execution_id = ExecutionId(1);
 
-        TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
+        TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -685,7 +688,7 @@ mod tests {
         };
         let execution_id = ExecutionId(1);
 
-        TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
+        TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
             .given(vec![
                 PositionEvent::Initialized {
                     symbol: Symbol::new("AAPL").unwrap(),
@@ -732,42 +735,43 @@ mod tests {
         let broker_order_id = BrokerOrderId("ORDER123".to_string());
         let price_cents = PriceCents(15050);
 
-        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
-            .given(vec![
-                PositionEvent::Initialized {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    threshold,
-                    initialized_at: Utc::now(),
-                },
-                PositionEvent::OnChainOrderFilled {
-                    trade_id,
-                    amount: FractionalShares(dec!(1.5)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: Utc::now(),
-                    seen_at: Utc::now(),
-                },
-                PositionEvent::OffChainOrderPlaced {
-                    execution_id,
-                    shares: FractionalShares::ONE,
-                    direction: Direction::Sell,
-                    broker: SupportedBroker::Schwab,
-                    trigger_reason: TriggerReason::SharesThreshold {
-                        net_position_shares: dec!(1.5),
-                        threshold_shares: dec!(1.0),
+        let result =
+            TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
+                .given(vec![
+                    PositionEvent::Initialized {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        threshold,
+                        initialized_at: Utc::now(),
                     },
-                    placed_at: Utc::now(),
-                },
-            ])
-            .when(PositionCommand::CompleteOffChainOrder {
-                execution_id,
-                shares_filled: FractionalShares::ONE,
-                direction: Direction::Sell,
-                broker_order_id,
-                price_cents,
-                broker_timestamp: Utc::now(),
-            })
-            .inspect_result();
+                    PositionEvent::OnChainOrderFilled {
+                        trade_id,
+                        amount: FractionalShares(dec!(1.5)),
+                        direction: Direction::Buy,
+                        price_usdc: dec!(150.0),
+                        block_timestamp: Utc::now(),
+                        seen_at: Utc::now(),
+                    },
+                    PositionEvent::OffChainOrderPlaced {
+                        execution_id,
+                        shares: FractionalShares::ONE,
+                        direction: Direction::Sell,
+                        broker: SupportedBroker::Schwab,
+                        trigger_reason: TriggerReason::SharesThreshold {
+                            net_position_shares: dec!(1.5),
+                            threshold_shares: dec!(1.0),
+                        },
+                        placed_at: Utc::now(),
+                    },
+                ])
+                .when(PositionCommand::CompleteOffChainOrder {
+                    execution_id,
+                    shares_filled: FractionalShares::ONE,
+                    direction: Direction::Sell,
+                    broker_order_id,
+                    price_cents,
+                    broker_timestamp: Utc::now(),
+                })
+                .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -781,38 +785,39 @@ mod tests {
         };
         let execution_id = ExecutionId(1);
 
-        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
-            .given(vec![
-                PositionEvent::Initialized {
-                    symbol: Symbol::new("AAPL").unwrap(),
-                    threshold,
-                    initialized_at: Utc::now(),
-                },
-                PositionEvent::OnChainOrderFilled {
-                    trade_id,
-                    amount: FractionalShares(dec!(1.5)),
-                    direction: Direction::Buy,
-                    price_usdc: dec!(150.0),
-                    block_timestamp: Utc::now(),
-                    seen_at: Utc::now(),
-                },
-                PositionEvent::OffChainOrderPlaced {
-                    execution_id,
-                    shares: FractionalShares::ONE,
-                    direction: Direction::Sell,
-                    broker: SupportedBroker::Schwab,
-                    trigger_reason: TriggerReason::SharesThreshold {
-                        net_position_shares: dec!(1.5),
-                        threshold_shares: dec!(1.0),
+        let result =
+            TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
+                .given(vec![
+                    PositionEvent::Initialized {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        threshold,
+                        initialized_at: Utc::now(),
                     },
-                    placed_at: Utc::now(),
-                },
-            ])
-            .when(PositionCommand::FailOffChainOrder {
-                execution_id,
-                error: "Broker API timeout".to_string(),
-            })
-            .inspect_result();
+                    PositionEvent::OnChainOrderFilled {
+                        trade_id,
+                        amount: FractionalShares(dec!(1.5)),
+                        direction: Direction::Buy,
+                        price_usdc: dec!(150.0),
+                        block_timestamp: Utc::now(),
+                        seen_at: Utc::now(),
+                    },
+                    PositionEvent::OffChainOrderPlaced {
+                        execution_id,
+                        shares: FractionalShares::ONE,
+                        direction: Direction::Sell,
+                        broker: SupportedBroker::Schwab,
+                        trigger_reason: TriggerReason::SharesThreshold {
+                            net_position_shares: dec!(1.5),
+                            threshold_shares: dec!(1.0),
+                        },
+                        placed_at: Utc::now(),
+                    },
+                ])
+                .when(PositionCommand::FailOffChainOrder {
+                    execution_id,
+                    error: "Broker API timeout".to_string(),
+                })
+                .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -862,7 +867,7 @@ mod tests {
             },
         ];
 
-        let mut aggregate = Lifecycle::<Position, ArithmeticError>::default();
+        let mut aggregate = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         for event in events {
             aggregate.apply(event);
         }
@@ -924,7 +929,7 @@ mod tests {
             },
         ];
 
-        let mut aggregate = Lifecycle::<Position, ArithmeticError>::default();
+        let mut aggregate = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         for event in events {
             aggregate.apply(event);
         }
@@ -946,16 +951,17 @@ mod tests {
         let old_threshold = one_share_threshold();
         let new_threshold = ExecutionThreshold::shares(FractionalShares(dec!(5.0))).unwrap();
 
-        let result = TestFramework::<Lifecycle<Position, ArithmeticError>>::with(())
-            .given(vec![PositionEvent::Initialized {
-                symbol: Symbol::new("AAPL").unwrap(),
-                threshold: old_threshold,
-                initialized_at: Utc::now(),
-            }])
-            .when(PositionCommand::UpdateThreshold {
-                threshold: new_threshold,
-            })
-            .inspect_result();
+        let result =
+            TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
+                .given(vec![PositionEvent::Initialized {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    threshold: old_threshold,
+                    initialized_at: Utc::now(),
+                }])
+                .when(PositionCommand::UpdateThreshold {
+                    threshold: new_threshold,
+                })
+                .inspect_result();
 
         assert_eq!(result.unwrap().len(), 1);
     }
@@ -971,7 +977,7 @@ mod tests {
             initialized_at,
         };
 
-        let mut view = Lifecycle::<Position, ArithmeticError>::default();
+        let mut view = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         assert!(matches!(view, Lifecycle::Uninitialized));
 
         view.update(&make_envelope(&symbol.to_string(), 1, event));
@@ -1266,7 +1272,7 @@ mod tests {
             migrated_at,
         };
 
-        let mut view = Lifecycle::<Position, ArithmeticError>::default();
+        let mut view = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         assert!(matches!(view, Lifecycle::Uninitialized));
 
         view.update(&make_envelope(&symbol.to_string(), 1, event));
@@ -1285,7 +1291,7 @@ mod tests {
 
     #[test]
     fn transition_on_uninitialized_corrupts_state() {
-        let mut view = Lifecycle::<Position, ArithmeticError>::default();
+        let mut view = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
 
         let event = PositionEvent::OnChainOrderFilled {
             trade_id: TradeId {

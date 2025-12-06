@@ -3,40 +3,24 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::shares::FractionalShares;
+use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Usdc(pub(crate) Decimal);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
-#[error("USDC arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
-pub(crate) struct UsdcArithmeticError {
-    pub(crate) operation: String,
-    pub(crate) lhs: Usdc,
-    pub(crate) rhs: Usdc,
-}
-
-impl Usdc {
-    pub(crate) const ZERO: Self = Self(Decimal::ZERO);
-
-    pub(crate) fn is_negative(self) -> bool {
-        self.0.is_sign_negative()
-    }
-
-    pub(crate) fn is_zero(self) -> bool {
-        self.0.is_zero()
-    }
+impl HasZero for Usdc {
+    const ZERO: Self = Self(Decimal::ZERO);
 }
 
 impl std::ops::Add for Usdc {
-    type Output = Result<Self, UsdcArithmeticError>;
+    type Output = Result<Self, ArithmeticError<Self>>;
 
     fn add(self, rhs: Self) -> Self::Output {
         self.0
             .checked_add(rhs.0)
             .map(Self)
-            .ok_or_else(|| UsdcArithmeticError {
+            .ok_or_else(|| ArithmeticError {
                 operation: "+".to_string(),
                 lhs: self,
                 rhs,
@@ -45,13 +29,13 @@ impl std::ops::Add for Usdc {
 }
 
 impl std::ops::Sub for Usdc {
-    type Output = Result<Self, UsdcArithmeticError>;
+    type Output = Result<Self, ArithmeticError<Self>>;
 
     fn sub(self, rhs: Self) -> Self::Output {
         self.0
             .checked_sub(rhs.0)
             .map(Self)
-            .ok_or_else(|| UsdcArithmeticError {
+            .ok_or_else(|| ArithmeticError {
                 operation: "-".to_string(),
                 lhs: self,
                 rhs,
