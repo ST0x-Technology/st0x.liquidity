@@ -42,35 +42,52 @@ Create module with working mint request.
 
 ### Subtasks
 
-- [ ] Create `src/alpaca_tokenization.rs`
-- [ ] Define core types:
-  - `TokenizationRequestId(String)` newtype
+- [x] Create `src/alpaca_tokenization.rs`
+- [x] Define core types:
+  - Reuse `TokenizationRequestId` from `tokenized_equity_mint` module
+  - Reuse `IssuerRequestId` from `tokenized_equity_mint` module
+  - Reuse `Network` from `alpaca_wallet` module
+  - Reuse `TokenizedEquitySymbol` from `onchain::io` module for token_symbol
   - `TokenizationRequestType` enum: `Mint`, `Redeem`
   - `TokenizationRequestStatus` enum: `Pending`, `Completed`, `Rejected`
-  - `Issuer` enum: `St0x`
+  - `Issuer(String)` newtype (API accepts string values like "st0x")
   - `TokenizationRequest` struct with API response fields
   - `MintRequest` struct for POST body
-- [ ] Define `AlpacaTokenizationError` enum:
+- [x] Define `AlpacaTokenizationError` enum:
   - `Reqwest(reqwest::Error)`
   - `ApiError { status, message }`
   - `InsufficientPosition { symbol }`
   - `UnsupportedAccount`
   - `InvalidParameters { details }`
-- [ ] Define `AlpacaTokenizationClient` struct with reqwest client and auth
-- [ ] Implement
+- [x] Define `AlpacaTokenizationClient` struct with reqwest client and auth
+- [x] Implement
       `request_mint(&self, request: MintRequest) -> Result<TokenizationRequest>`:
   - POST to `/v2/tokenization/mint`
   - Handle 200, 403, 422 responses
-- [ ] Add module to lib.rs
-- [ ] Add test: successful mint request
-- [ ] Add test: mint returns 403 insufficient position
-- [ ] Add test: mint returns 422 invalid parameters
+- [x] Add module to lib.rs
+- [x] Add test: successful mint request
+- [x] Add test: mint returns 403 insufficient position
+- [x] Add test: mint returns 422 invalid parameters
 
 ### Validation
 
-- [ ] Run `cargo test -q`
-- [ ] Run `cargo clippy -- -D clippy::all`
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q`
+- [x] Run `cargo clippy -- -D clippy::all`
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Created `src/alpaca_tokenization.rs` with Alpaca tokenization API client
+- Reused existing types: `TokenizationRequestId`, `IssuerRequestId` from
+  `tokenized_equity_mint`, `Network` from `alpaca_wallet`,
+  `TokenizedEquitySymbol` from `onchain::io`
+- Added custom deserializer for `TokenizedEquitySymbol` to handle optional field
+- All types are private by default, visibility will be increased as needed
+- Uses `r#type` raw identifier syntax for the `type` field
+- Uses `serde(rename)` for field name mappings (qty -> quantity, wallet_address
+  -> wallet)
+- Authentication uses `APCA-API-KEY-ID` and `APCA-API-SECRET-KEY` headers per
+  Alpaca docs
 
 ## Task 2. List and Get Requests
 
