@@ -217,12 +217,11 @@ Implement ratio calculation and imbalance detection logic on `Inventory<T>`.
 
 ## Task 5. Position Event Handlers with Tests
 
-Handle trading fills that update available balances.
+Handle trading fills that update available balances using functional
+transformations.
 
-- [ ] Add
-      `InventoryView::get_or_create_equity(&mut self, symbol: &Symbol) -> &mut Inventory<FractionalShares>`
 - [ ] Implement
-      `InventoryView::apply_position_event(&mut self, event: &PositionEvent) -> Result<(), InventoryError>`:
+      `InventoryView::apply_position_event(self, event: &PositionEvent) -> Result<Self, InventoryError>`:
   - `OnChainOrderFilled`: Add to `onchain.available` on Buy, remove on Sell
   - `OffChainOrderFilled`: Add to `offchain.available` on Buy, remove on Sell
   - Other events: Update `last_updated` only
@@ -238,11 +237,11 @@ Handle trading fills that update available balances.
 
 ## Task 6. Mint Event Handlers with Tests
 
-Handle shares to tokens conversion lifecycle.
+Handle shares to tokens conversion lifecycle using functional transformations.
 
 - [ ] Implement
-      `InventoryView::apply_mint_event(&mut self, event: &TokenizedEquityMintEvent) -> Result<(), InventoryError>`:
-  - `MintRequested`: No balance change (extract symbol for get_or_create)
+      `InventoryView::apply_mint_event(self, event: &TokenizedEquityMintEvent) -> Result<Self, InventoryError>`:
+  - `MintRequested`: No balance change
   - `MintAccepted`: Move quantity from `offchain.available` to
     `offchain.inflight`
   - `TokensReceived`: Remove from `offchain.inflight`, add to
@@ -250,8 +249,8 @@ Handle shares to tokens conversion lifecycle.
   - `MintCompleted`: Update `last_rebalancing` timestamp
   - `MintFailed`: Move from `offchain.inflight` back to `offchain.available`
 - [ ] Add tests:
-  - Full mint lifecycle (request → accept → receive → complete)
-  - Mint failure recovery (request → accept → fail)
+  - Full mint lifecycle (request -> accept -> receive -> complete)
+  - Mint failure recovery (request -> accept -> fail)
   - Inflight blocks imbalance detection during mint
 - [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
 
@@ -259,16 +258,16 @@ Handle shares to tokens conversion lifecycle.
 
 ## Task 7. Redemption Event Handlers with Tests
 
-Handle tokens to shares conversion lifecycle.
+Handle tokens to shares conversion lifecycle using functional transformations.
 
 - [ ] Implement
-      `InventoryView::apply_redemption_event(&mut self, event: &EquityRedemptionEvent) -> Result<(), InventoryError>`:
+      `InventoryView::apply_redemption_event(self, event: &EquityRedemptionEvent) -> Result<Self, InventoryError>`:
   - `TokensSent`: Move quantity from `onchain.available` to `onchain.inflight`
   - `Detected`: No balance change
   - `Completed`: Remove from `onchain.inflight`, add to `offchain.available`
   - `Failed`: Move from `onchain.inflight` back to `onchain.available`
 - [ ] Add tests:
-  - Full redemption lifecycle (send → detect → complete)
+  - Full redemption lifecycle (send -> detect -> complete)
   - Redemption failure at TokensSent stage
   - Redemption failure at Pending stage
   - Inflight blocks imbalance detection during redemption
@@ -278,10 +277,10 @@ Handle tokens to shares conversion lifecycle.
 
 ## Task 8. USDC Rebalance Event Handlers with Tests
 
-Handle USDC transfers between venues via CCTP.
+Handle USDC transfers between venues via CCTP using functional transformations.
 
 - [ ] Implement
-      `InventoryView::apply_usdc_rebalance_event(&mut self, event: &UsdcRebalanceEvent, direction: &RebalanceDirection) -> Result<(), InventoryError>`:
+      `InventoryView::apply_usdc_rebalance_event(self, event: &UsdcRebalanceEvent, direction: &RebalanceDirection) -> Result<Self, InventoryError>`:
   - `Initiated`:
     - AlpacaToBase: Move from `usdc.offchain.available` to
       `usdc.offchain.inflight`
