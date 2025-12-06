@@ -10,6 +10,7 @@ use super::venue_balance::{InventoryError, VenueBalance};
 use crate::position::PositionEvent;
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
+use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use st0x_broker::{Direction, Symbol};
 
 /// Error type for inventory view operations.
@@ -141,6 +142,35 @@ where
             ..self
         })
     }
+
+    fn move_offchain_to_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.move_to_inflight(amount)?,
+            ..self
+        })
+    }
+
+    fn transfer_offchain_inflight_to_onchain(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.confirm_inflight(amount)?,
+            onchain: self.onchain.add_available(amount)?,
+            ..self
+        })
+    }
+
+    fn cancel_offchain_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.cancel_inflight(amount)?,
+            ..self
+        })
+    }
+
+    fn with_last_rebalancing(self, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            last_rebalancing: Some(timestamp),
+            ..self
+        }
+    }
 }
 
 /// Cross-aggregate projection tracking inventory across venues.
@@ -229,11 +259,56 @@ impl InventoryView {
             }),
         }
     }
+
+    /// Applies a mint event to update equity inventory.
+    ///
+    /// - `MintRequested`: No balance change.
+    /// - `MintAccepted`: Move quantity from `offchain.available` to `offchain.inflight`.
+    /// - `TokensReceived`: Remove from `offchain.inflight`, add to `onchain.available`.
+    /// - `MintCompleted`: Update `last_rebalancing` timestamp.
+    /// - `MintFailed`: Move from `offchain.inflight` back to `offchain.available`.
+    ///
+    /// The `quantity` parameter is the mint quantity in `FractionalShares`, needed for
+    /// events that modify balances but don't carry the quantity themselves.
+    pub(crate) fn apply_mint_event(
+        self,
+        symbol: &Symbol,
+        event: &TokenizedEquityMintEvent,
+        quantity: FractionalShares,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        match event {
+            TokenizedEquityMintEvent::MintRequested { .. } => Ok(Self {
+                last_updated: now,
+                ..self
+            }),
+
+            TokenizedEquityMintEvent::MintAccepted { .. } => {
+                self.update_equity(symbol, |inv| inv.move_offchain_to_inflight(quantity), now)
+            }
+
+            TokenizedEquityMintEvent::TokensReceived { .. } => self.update_equity(
+                symbol,
+                |inv| inv.transfer_offchain_inflight_to_onchain(quantity),
+                now,
+            ),
+
+            TokenizedEquityMintEvent::MintCompleted { completed_at } => self.update_equity(
+                symbol,
+                |inv| Ok(inv.with_last_rebalancing(*completed_at)),
+                now,
+            ),
+
+            TokenizedEquityMintEvent::MintFailed { .. } => {
+                self.update_equity(symbol, |inv| inv.cancel_offchain_inflight(quantity), now)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{Address, TxHash, U256};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
@@ -241,6 +316,7 @@ mod tests {
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::ExecutionThreshold;
+    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares(Decimal::from(n))
@@ -563,5 +639,239 @@ mod tests {
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
         assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+    }
+
+    fn make_mint_requested(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintRequested {
+            symbol: symbol.clone(),
+            quantity,
+            wallet: Address::random(),
+            requested_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_accepted() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: IssuerRequestId::new("ISS123"),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            accepted_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_received(shares_minted: U256) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::TokensReceived {
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted,
+            received_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_completed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintCompleted {
+            completed_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_failed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintFailed {
+            reason: "API timeout".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn apply_mint_requested_only_updates_last_updated() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_mint_requested(&symbol, dec!(50));
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(50), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+    }
+
+    #[test]
+    fn apply_mint_accepted_moves_offchain_to_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+        let event = make_mint_accepted();
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+    }
+
+    #[test]
+    fn apply_tokens_received_transfers_inflight_to_onchain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Start with 30 shares inflight offchain (simulating post-MintAccepted state)
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 70, 30))]);
+        let event = make_tokens_received(U256::from(30_000_000_000_000_000_000_u128));
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(130));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(70));
+        assert!(!inv.has_inflight());
+    }
+
+    #[test]
+    fn apply_mint_completed_updates_last_rebalancing() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(symbol.clone(), inventory(130, 0, 70, 0))]);
+        let event = make_mint_completed();
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(0), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert!(inv.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn apply_mint_failed_cancels_inflight_back_to_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Start with 30 shares inflight offchain (simulating post-MintAccepted state)
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 70, 30))]);
+        let event = make_mint_failed();
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inv = updated.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(!inv.has_inflight());
+    }
+
+    #[test]
+    fn mint_full_lifecycle_updates_inventory_correctly() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = shares(30);
+
+        // Initial state: 100 onchain, 100 offchain
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+
+        // MintRequested: No balance change
+        let view = view
+            .apply_mint_event(
+                &symbol,
+                &make_mint_requested(&symbol, dec!(30)),
+                quantity,
+                Utc::now(),
+            )
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+
+        // MintAccepted: Move 30 from offchain available to inflight
+        let view = view
+            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(inv.has_inflight());
+
+        // TokensReceived: Remove from offchain inflight, add to onchain available
+        let view = view
+            .apply_mint_event(
+                &symbol,
+                &make_tokens_received(U256::from(30_000_000_000_000_000_000_u128)),
+                quantity,
+                Utc::now(),
+            )
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(130));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(70));
+        assert!(!inv.has_inflight());
+
+        // MintCompleted: Update last_rebalancing
+        let view = view
+            .apply_mint_event(&symbol, &make_mint_completed(), shares(0), Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert!(inv.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn mint_failure_recovery_restores_available() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = shares(30);
+
+        // Initial state: 100 onchain, 100 offchain
+        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
+
+        // MintRequested: No balance change
+        let view = view
+            .apply_mint_event(
+                &symbol,
+                &make_mint_requested(&symbol, dec!(30)),
+                quantity,
+                Utc::now(),
+            )
+            .unwrap();
+
+        // MintAccepted: Move 30 from offchain available to inflight
+        let view = view
+            .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert!(inv.has_inflight());
+
+        // MintFailed: Cancel inflight back to available
+        let view = view
+            .apply_mint_event(&symbol, &make_mint_failed(), quantity, Utc::now())
+            .unwrap();
+        let inv = view.equities.get(&symbol).unwrap();
+        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert!(!inv.has_inflight());
+    }
+
+    #[test]
+    fn inflight_blocks_imbalance_detection_during_mint() {
+        let thresh = threshold("0.5", "0.2");
+
+        // Start with imbalanced inventory: 20% onchain, 80% offchain
+        // This should trigger TooMuchOffchain normally
+        let inv = inventory(20, 0, 80, 0);
+        assert!(matches!(
+            inv.detect_imbalance(&thresh),
+            Some(Imbalance::TooMuchOffchain { .. })
+        ));
+
+        // Now simulate mint in progress: move 30 to inflight
+        // Even though still imbalanced, inflight should block detection
+        let inv_with_inflight = inventory(20, 0, 50, 30);
+        assert!(inv_with_inflight.detect_imbalance(&thresh).is_none());
+    }
+
+    #[test]
+    fn apply_mint_event_unknown_symbol_returns_error() {
+        let view = make_view(vec![]);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let event = make_mint_accepted();
+
+        let result = view.apply_mint_event(&symbol, &event, shares(30), Utc::now());
+
+        assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
     }
 }

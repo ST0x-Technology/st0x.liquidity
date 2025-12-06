@@ -70,7 +70,7 @@ where
     }
 
     /// Move amount from available to inflight (assets leaving this venue).
-    fn move_to_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
+    pub(super) fn move_to_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_available = (self.available - amount)?;
 
         if new_available.is_negative() {
@@ -89,7 +89,7 @@ where
     }
 
     /// Remove amount from inflight (transfer completed or assets arrived at destination).
-    fn confirm_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
+    pub(super) fn confirm_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_inflight = (self.inflight - amount)?;
 
         if new_inflight.is_negative() {
@@ -106,7 +106,7 @@ where
     }
 
     /// Move amount from inflight back to available (transfer failed/cancelled).
-    fn cancel_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
+    pub(super) fn cancel_inflight(self, amount: T) -> Result<Self, InventoryError<T>> {
         let new_inflight = (self.inflight - amount)?;
 
         if new_inflight.is_negative() {

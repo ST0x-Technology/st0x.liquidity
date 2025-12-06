@@ -258,7 +258,7 @@ transformations.
 
 Handle shares to tokens conversion lifecycle using functional transformations.
 
-- [ ] Implement
+- [x] Implement
       `InventoryView::apply_mint_event(self, event: &TokenizedEquityMintEvent) -> Result<Self, InventoryError>`:
   - `MintRequested`: No balance change
   - `MintAccepted`: Move quantity from `offchain.available` to
@@ -267,11 +267,38 @@ Handle shares to tokens conversion lifecycle using functional transformations.
     `onchain.available`
   - `MintCompleted`: Update `last_rebalancing` timestamp
   - `MintFailed`: Move from `offchain.inflight` back to `offchain.available`
-- [ ] Add tests:
+- [x] Add tests:
   - Full mint lifecycle (request -> accept -> receive -> complete)
   - Mint failure recovery (request -> accept -> fail)
   - Inflight blocks imbalance detection during mint
-- [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
+- [x] Run `cargo test -q --lib inventory` and `cargo clippy`
+
+**Changes made:**
+
+- Added helper methods on `Inventory<T>` for mint operations in
+  `src/inventory/view.rs:146-173`:
+  - `move_offchain_to_inflight`: Moves amount from offchain available to
+    inflight
+  - `transfer_offchain_inflight_to_onchain`: Confirms offchain inflight and adds
+    to onchain available
+  - `cancel_offchain_inflight`: Cancels offchain inflight back to available
+  - `with_last_rebalancing`: Sets the last_rebalancing timestamp
+- Implemented `InventoryView::apply_mint_event` in
+  `src/inventory/view.rs:273-306`
+  - Takes `quantity: FractionalShares` as parameter since not all events carry
+    the quantity
+  - Handles all five event variants with appropriate balance transformations
+- Added 10 tests for mint event handlers:
+  - `apply_mint_requested_only_updates_last_updated`
+  - `apply_mint_accepted_moves_offchain_to_inflight`
+  - `apply_tokens_received_transfers_inflight_to_onchain`
+  - `apply_mint_completed_updates_last_rebalancing`
+  - `apply_mint_failed_cancels_inflight_back_to_available`
+  - `mint_full_lifecycle_updates_inventory_correctly`
+  - `mint_failure_recovery_restores_available`
+  - `inflight_blocks_imbalance_detection_during_mint`
+  - `apply_mint_event_unknown_symbol_returns_error`
+- All 45 inventory tests pass
 
 ---
 
