@@ -40,6 +40,9 @@ pub(crate) enum MintError {
 
     #[error("Missing tx_hash in completed Alpaca response")]
     MissingTxHash,
+
+    #[error("U256 parse error: {0}")]
+    U256Parse(#[from] alloy::primitives::ruint::ParseError),
 }
 
 pub(crate) struct MintManager<P, S, ES>
@@ -167,7 +170,7 @@ where
         match completed_request.status {
             TokenizationRequestStatus::Completed => {
                 let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
-                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity.0);
+                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity.0)?;
 
                 self.cqrs
                     .execute(
@@ -202,10 +205,10 @@ where
     }
 }
 
-fn decimal_to_u256_18_decimals(value: Decimal) -> U256 {
+fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, MintError> {
     let scaled = value * Decimal::from(10u64.pow(18));
     let as_str = scaled.trunc().to_string();
-    U256::from_str_radix(&as_str, 10).unwrap_or(U256::ZERO)
+    Ok(U256::from_str_radix(&as_str, 10)?)
 }
 
 #[cfg(test)]
@@ -230,7 +233,7 @@ mod tests {
     #[test]
     fn test_decimal_to_u256_18_decimals() {
         let value = dec!(100.5);
-        let result = decimal_to_u256_18_decimals(value);
+        let result = decimal_to_u256_18_decimals(value).unwrap();
 
         let expected = U256::from(100_500_000_000_000_000_000_u128);
         assert_eq!(result, expected);
@@ -239,7 +242,7 @@ mod tests {
     #[test]
     fn test_decimal_to_u256_whole_number() {
         let value = dec!(42);
-        let result = decimal_to_u256_18_decimals(value);
+        let result = decimal_to_u256_18_decimals(value).unwrap();
 
         let expected = U256::from(42_000_000_000_000_000_000_u128);
         assert_eq!(result, expected);
@@ -248,7 +251,7 @@ mod tests {
     #[test]
     fn test_decimal_to_u256_zero() {
         let value = dec!(0);
-        let result = decimal_to_u256_18_decimals(value);
+        let result = decimal_to_u256_18_decimals(value).unwrap();
 
         assert_eq!(result, U256::ZERO);
     }

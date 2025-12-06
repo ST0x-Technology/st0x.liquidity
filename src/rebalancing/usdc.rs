@@ -114,7 +114,8 @@ where
 
         self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
 
-        let burn_receipt = self.execute_cctp_burn(id).await?;
+        let burn_amount = usdc_to_u256(amount)?;
+        let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
         let attestation = self.poll_attestation(id, &burn_receipt).await?;
 
@@ -212,14 +213,15 @@ where
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id))]
+    #[instrument(skip(self), fields(?id, %amount))]
     async fn execute_cctp_burn(
         &self,
         id: &UsdcRebalanceId,
+        amount: U256,
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_ethereum(U256::ZERO, self.base_recipient)
+            .burn_on_ethereum(amount, self.base_recipient)
             .await
         {
             Ok(r) => r,
