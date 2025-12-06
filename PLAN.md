@@ -344,18 +344,64 @@ pattern established in `UsdcRebalanceEvent` (which has `WithdrawalFailed`,
 in the flow the failure occurred. This enables future recovery logic based on
 real-world failure patterns.
 
-- [ ] Update `TokenizedEquityMintEvent` with granular failure variants:
+- [x] Update `TokenizedEquityMintEvent` with granular failure variants:
   - `MintRejected`: Alpaca rejected the mint request (before acceptance)
   - `MintAcceptanceFailed`: Failed after acceptance but before tokens received
   - `TokenReceiptFailed`: Failed after tokens were supposedly sent
-- [ ] Update `EquityRedemptionEvent` with granular failure variants:
+- [x] Update `EquityRedemptionEvent` with granular failure variants:
   - `TokenSendFailed`: Failed to send tokens (before they left)
   - `DetectionFailed`: Alpaca didn't detect the transfer
   - `RedemptionRejected`: Alpaca rejected after detection
-- [ ] Update aggregate state machines to handle new failure variants
-- [ ] Update `InventoryView` to handle granular failures appropriately (some may
+- [x] Update aggregate state machines to handle new failure variants
+- [x] Update `InventoryView` to handle granular failures appropriately (some may
       allow restoring funds, others keep inflight)
-- [ ] Add tests for each failure scenario
+- [x] Add tests for each failure scenario
+
+**Changes made (TokenizedEquityMint):**
+
+- Replaced single `MintFailed` event with three granular variants ordered by
+  phase in `src/tokenized_equity_mint.rs`:
+  - `MintRejected { reason, rejected_at }`: Before acceptance - shares remain in
+    offchain available, no funds moved
+  - `MintAcceptanceFailed { reason, failed_at }`: After acceptance, before
+    tokens - safe to restore from inflight to offchain available
+  - `TokenReceiptFailed { reason, failed_at }`: After tokens sent - funds
+    location unknown, keep inflight
+- Replaced single `Fail { reason }` command with three granular commands:
+  - `RejectMint { reason }`: Only valid from MintRequested state
+  - `FailAcceptance { reason }`: Only valid from MintAccepted state
+  - `FailTokenReceipt { reason }`: Only valid from TokensReceived state
+- Updated `src/rebalancing/mint.rs` to use `reject_mint()` and
+  `fail_acceptance()` methods
+- Updated `src/inventory/view.rs` event handling:
+  - `MintRejected`: No balance change (rejection before acceptance)
+  - `MintAcceptanceFailed`: Cancel inflight back to available (safe to restore)
+  - `TokenReceiptFailed`: Keep inflight (funds location unknown)
+- Added comprehensive tests with stricter assertions using `unwrap_err()` and
+  pattern matching on actual error values
+
+**Changes made (EquityRedemption):**
+
+- Replaced single `Failed` event with three granular variants ordered by phase
+  in `src/equity_redemption.rs`:
+  - `TokenSendFailed { reason, failed_at }`: Failed to send tokens onchain
+  - `DetectionFailed { reason, failed_at }`: Alpaca didn't detect the transfer
+  - `RedemptionRejected { reason, rejected_at }`: Alpaca rejected after
+    detection
+- Replaced single `Fail { reason }` command with three granular commands:
+  - `FailTokenSend { reason }`: Only valid from TokensSent state
+  - `FailDetection { reason }`: Only valid from TokensSent state
+  - `RejectRedemption { reason }`: Only valid from Pending state
+- Added `NotPendingForRejection` error variant for invalid rejection attempts
+- Updated `src/rebalancing/redemption.rs` to use granular failure commands:
+  - Detection polling failure uses `FailDetection`
+  - Completion polling failure and Alpaca rejection use `RejectRedemption`
+- Updated `src/inventory/view.rs` event handling with conservative approach:
+  - All three failure events (`TokenSendFailed`, `DetectionFailed`,
+    `RedemptionRejected`) keep funds inflight until manually resolved
+  - This is the most conservative approach since we cannot verify onchain state
+    without additional checks
+- Added comprehensive tests for each failure scenario in both aggregate and view
 
 ---
 
