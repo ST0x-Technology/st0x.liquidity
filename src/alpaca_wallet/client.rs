@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, hex::FromHexError};
+use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -71,6 +71,12 @@ pub enum AlpacaWalletError {
         asset: TokenSymbol,
         network: Network,
     },
+
+    #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
+    DepositTimeout {
+        tx_hash: TxHash,
+        elapsed: std::time::Duration,
+    },
 }
 
 #[cfg(test)]
@@ -89,7 +95,7 @@ pub struct AlpacaWalletClient {
 
 impl AlpacaWalletClient {
     #[cfg(test)]
-    pub(super) async fn new_with_base_url(
+    pub(crate) async fn new_with_base_url(
         base_url: String,
         api_key: String,
         api_secret: String,
@@ -251,7 +257,7 @@ impl AlpacaWalletClient {
 }
 
 #[cfg(test)]
-pub(super) fn create_account_mock<'a>(
+pub(crate) fn create_account_mock<'a>(
     server: &'a httpmock::MockServer,
     account_id: &str,
 ) -> httpmock::Mock<'a> {
