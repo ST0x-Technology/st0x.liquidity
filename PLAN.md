@@ -413,7 +413,7 @@ Note: USDC rebalance already has granular failure events (`WithdrawalFailed`,
 `BridgingFailed`, `DepositFailed`). Failure handling follows the same principle
 as redemption - keep inflight unless we know funds can be restored.
 
-- [ ] Implement
+- [x] Implement
       `InventoryView::apply_usdc_rebalance_event(self, event: &UsdcRebalanceEvent, direction: &RebalanceDirection) -> Result<Self, InventoryError>`:
   - `Initiated`:
     - AlpacaToBase: Move from `usdc.offchain.available` to
@@ -428,12 +428,36 @@ as redemption - keep inflight unless we know funds can be restored.
   - `DepositInitiated`: No change
   - `DepositConfirmed`: Update `usdc.last_rebalancing` timestamp
   - `DepositFailed`: Keep inflight (USDC on destination but not deposited)
-- [ ] Add tests:
+- [x] Add tests:
   - AlpacaToBase full lifecycle
   - BaseToAlpaca full lifecycle
   - Failures keep funds inflight
   - Inflight blocks imbalance detection during USDC rebalance
-- [ ] Run `cargo test -q --lib inventory` and `cargo clippy`
+- [x] Run `cargo test -q --lib inventory` and `cargo clippy`
+
+**Changes made:**
+
+- Added `Usdc` error variant to `InventoryViewError` with `#[from]` for
+  automatic conversion
+- Added `update_usdc` helper method on `InventoryView` for USDC inventory
+  updates
+- Implemented `apply_usdc_rebalance_event` using tuple pattern matching on
+  `(event, direction)`:
+  - `Initiated` + `AlpacaToBase`: Move offchain to inflight
+  - `Initiated` + `BaseToAlpaca`: Move onchain to inflight
+  - `Bridged` + `AlpacaToBase`: Transfer offchain inflight to onchain available
+  - `Bridged` + `BaseToAlpaca`: Transfer onchain inflight to offchain available
+  - `DepositConfirmed`: Update `last_rebalancing` timestamp
+  - All other events (failures, intermediate states): No balance change, keep
+    inflight
+- Added 9 tests covering:
+  - `Initiated` events for both directions
+  - `Bridged` events for both directions
+  - `DepositConfirmed` updating `last_rebalancing`
+  - Full lifecycle tests for both `AlpacaToBase` and `BaseToAlpaca`
+  - Failure events keeping funds inflight
+  - Inflight blocking imbalance detection
+- All 669 tests pass, clippy shows only expected dead code warnings
 
 ---
 

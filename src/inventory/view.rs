@@ -12,6 +12,7 @@ use crate::position::PositionEvent;
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 use st0x_broker::{Direction, Symbol};
 
 /// Error type for inventory view operations.
@@ -21,6 +22,8 @@ pub(crate) enum InventoryViewError {
     UnknownSymbol(Symbol),
     #[error(transparent)]
     Equity(#[from] InventoryError<FractionalShares>),
+    #[error(transparent)]
+    Usdc(#[from] InventoryError<Usdc>),
 }
 
 /// Imbalance requiring rebalancing action.
@@ -223,6 +226,20 @@ impl InventoryView {
         })
     }
 
+    fn update_usdc(
+        self,
+        f: impl FnOnce(Inventory<Usdc>) -> Result<Inventory<Usdc>, InventoryError<Usdc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let updated = f(self.usdc)?;
+
+        Ok(Self {
+            usdc: updated,
+            last_updated: now,
+            equities: self.equities,
+        })
+    }
+
     /// Applies a position event to update equity inventory.
     ///
     /// - `OnChainOrderFilled`: Buy adds to onchain available, Sell removes.
@@ -385,6 +402,70 @@ impl InventoryView {
                     ..self
                 })
             }
+        }
+    }
+
+    /// Applies a USDC rebalance event to update USDC inventory.
+    ///
+    /// - `Initiated`: Move amount from source venue's available to inflight.
+    ///   - `AlpacaToBase`: offchain → onchain (move offchain to inflight)
+    ///   - `BaseToAlpaca`: onchain → offchain (move onchain to inflight)
+    /// - `WithdrawalConfirmed`: No balance change (awaiting bridge).
+    /// - `WithdrawalFailed`: Keep inflight until manually resolved.
+    /// - `BridgingInitiated`, `BridgeAttestationReceived`: No balance change.
+    /// - `Bridged`: Remove from source inflight, add to destination available.
+    /// - `BridgingFailed`: Keep inflight until manually resolved.
+    /// - `DepositInitiated`: No balance change.
+    /// - `DepositConfirmed`: Update `last_rebalancing` timestamp.
+    /// - `DepositFailed`: Keep inflight until manually resolved.
+    ///
+    /// The `amount` parameter is the rebalance amount, needed for events that
+    /// don't carry the amount themselves.
+    pub(crate) fn apply_usdc_rebalance_event(
+        self,
+        event: &UsdcRebalanceEvent,
+        direction: &RebalanceDirection,
+        amount: Usdc,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        match (event, direction) {
+            (UsdcRebalanceEvent::Initiated { .. }, RebalanceDirection::AlpacaToBase) => {
+                self.update_usdc(|inv| inv.move_offchain_to_inflight(amount), now)
+            }
+            (UsdcRebalanceEvent::Initiated { .. }, RebalanceDirection::BaseToAlpaca) => {
+                self.update_usdc(|inv| inv.move_onchain_to_inflight(amount), now)
+            }
+
+            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::AlpacaToBase) => {
+                self.update_usdc(|inv| inv.transfer_offchain_inflight_to_onchain(amount), now)
+            }
+            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::BaseToAlpaca) => {
+                self.update_usdc(|inv| inv.transfer_onchain_inflight_to_offchain(amount), now)
+            }
+
+            (
+                UsdcRebalanceEvent::DepositConfirmed {
+                    deposit_confirmed_at,
+                },
+                _,
+            ) => self.update_usdc(
+                |inv| Ok(inv.with_last_rebalancing(*deposit_confirmed_at)),
+                now,
+            ),
+
+            (
+                UsdcRebalanceEvent::WithdrawalConfirmed { .. }
+                | UsdcRebalanceEvent::WithdrawalFailed { .. }
+                | UsdcRebalanceEvent::BridgingInitiated { .. }
+                | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
+                | UsdcRebalanceEvent::BridgingFailed { .. }
+                | UsdcRebalanceEvent::DepositInitiated { .. }
+                | UsdcRebalanceEvent::DepositFailed { .. },
+                _,
+            ) => Ok(Self {
+                last_updated: now,
+                ..self
+            }),
         }
     }
 }
@@ -1283,5 +1364,280 @@ mod tests {
         let result = view.apply_redemption_event(&symbol, &event, shares(30), Utc::now());
 
         assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
+    }
+
+    fn usdc(n: i64) -> Usdc {
+        Usdc(Decimal::from(n))
+    }
+
+    fn make_usdc_view(
+        onchain_available: i64,
+        onchain_inflight: i64,
+        offchain_available: i64,
+        offchain_inflight: i64,
+    ) -> InventoryView {
+        InventoryView {
+            usdc: usdc_inventory(
+                onchain_available,
+                onchain_inflight,
+                offchain_available,
+                offchain_inflight,
+            ),
+            equities: HashMap::new(),
+            last_updated: Utc::now(),
+        }
+    }
+
+    fn make_initiated_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: usdc(100),
+            withdrawal_ref: crate::usdc_rebalance::TransferRef::OnchainTx(TxHash::random()),
+            initiated_at: Utc::now(),
+        }
+    }
+
+    fn make_bridged_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: TxHash::random(),
+            minted_at: Utc::now(),
+        }
+    }
+
+    fn make_deposit_confirmed_event() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositConfirmed {
+            deposit_confirmed_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn apply_usdc_initiated_alpaca_to_base_moves_offchain_to_inflight() {
+        let view = make_usdc_view(1000, 0, 1000, 0);
+        let event = make_initiated_event();
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                usdc(100),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().0,
+            Decimal::from(1000)
+        );
+        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1000));
+        assert!(updated.usdc.offchain.has_inflight());
+        assert!(!updated.usdc.onchain.has_inflight());
+    }
+
+    #[test]
+    fn apply_usdc_initiated_base_to_alpaca_moves_onchain_to_inflight() {
+        let view = make_usdc_view(1000, 0, 1000, 0);
+        let event = make_initiated_event();
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::BaseToAlpaca,
+                usdc(100),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1000));
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().0,
+            Decimal::from(1000)
+        );
+        assert!(updated.usdc.onchain.has_inflight());
+        assert!(!updated.usdc.offchain.has_inflight());
+    }
+
+    #[test]
+    fn apply_usdc_bridged_alpaca_to_base_transfers_to_onchain() {
+        let view = make_usdc_view(1000, 0, 900, 100);
+        let event = make_bridged_event();
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                usdc(100),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1100));
+        assert_eq!(updated.usdc.offchain.total().unwrap().0, Decimal::from(900));
+        assert!(!updated.usdc.offchain.has_inflight());
+    }
+
+    #[test]
+    fn apply_usdc_bridged_base_to_alpaca_transfers_to_offchain() {
+        let view = make_usdc_view(900, 100, 1000, 0);
+        let event = make_bridged_event();
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::BaseToAlpaca,
+                usdc(100),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().0,
+            Decimal::from(1100)
+        );
+        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(900));
+        assert!(!updated.usdc.onchain.has_inflight());
+    }
+
+    #[test]
+    fn apply_usdc_deposit_confirmed_updates_last_rebalancing() {
+        let view = make_usdc_view(1100, 0, 900, 0);
+        let event = make_deposit_confirmed_event();
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                usdc(100),
+                Utc::now(),
+            )
+            .unwrap();
+
+        assert!(updated.usdc.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn usdc_alpaca_to_base_full_lifecycle() {
+        let view = make_usdc_view(1000, 0, 1000, 0);
+        let amount = usdc(200);
+        let direction = RebalanceDirection::AlpacaToBase;
+
+        let after_initiated = view
+            .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
+            .unwrap();
+        assert_eq!(
+            after_initiated.usdc.offchain.total().unwrap().0,
+            Decimal::from(1000)
+        );
+        assert!(after_initiated.usdc.has_inflight());
+
+        let after_bridged = after_initiated
+            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .unwrap();
+        assert_eq!(
+            after_bridged.usdc.onchain.total().unwrap().0,
+            Decimal::from(1200)
+        );
+        assert_eq!(
+            after_bridged.usdc.offchain.total().unwrap().0,
+            Decimal::from(800)
+        );
+        assert!(!after_bridged.usdc.has_inflight());
+
+        let after_confirmed = after_bridged
+            .apply_usdc_rebalance_event(
+                &make_deposit_confirmed_event(),
+                &direction,
+                amount,
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(after_confirmed.usdc.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn usdc_base_to_alpaca_full_lifecycle() {
+        let view = make_usdc_view(1000, 0, 1000, 0);
+        let amount = usdc(200);
+        let direction = RebalanceDirection::BaseToAlpaca;
+
+        let after_initiated = view
+            .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
+            .unwrap();
+        assert_eq!(
+            after_initiated.usdc.onchain.total().unwrap().0,
+            Decimal::from(1000)
+        );
+        assert!(after_initiated.usdc.has_inflight());
+
+        let after_bridged = after_initiated
+            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .unwrap();
+        assert_eq!(
+            after_bridged.usdc.offchain.total().unwrap().0,
+            Decimal::from(1200)
+        );
+        assert_eq!(
+            after_bridged.usdc.onchain.total().unwrap().0,
+            Decimal::from(800)
+        );
+        assert!(!after_bridged.usdc.has_inflight());
+
+        let after_confirmed = after_bridged
+            .apply_usdc_rebalance_event(
+                &make_deposit_confirmed_event(),
+                &direction,
+                amount,
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(after_confirmed.usdc.last_rebalancing.is_some());
+    }
+
+    #[test]
+    fn usdc_failure_events_keep_inflight() {
+        let view = make_usdc_view(1000, 0, 800, 200);
+        let amount = usdc(200);
+        let direction = RebalanceDirection::AlpacaToBase;
+
+        let withdrawal_failed = UsdcRebalanceEvent::WithdrawalFailed {
+            reason: "timeout".to_string(),
+            failed_at: Utc::now(),
+        };
+        let after_withdrawal_failed = view
+            .clone()
+            .apply_usdc_rebalance_event(&withdrawal_failed, &direction, amount, Utc::now())
+            .unwrap();
+        assert!(after_withdrawal_failed.usdc.offchain.has_inflight());
+
+        let bridging_failed = UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: Some(TxHash::random()),
+            cctp_nonce: Some(123),
+            reason: "attestation timeout".to_string(),
+            failed_at: Utc::now(),
+        };
+        let after_bridging_failed = view
+            .clone()
+            .apply_usdc_rebalance_event(&bridging_failed, &direction, amount, Utc::now())
+            .unwrap();
+        assert!(after_bridging_failed.usdc.offchain.has_inflight());
+
+        let deposit_failed = UsdcRebalanceEvent::DepositFailed {
+            deposit_ref: None,
+            reason: "rejected".to_string(),
+            failed_at: Utc::now(),
+        };
+        let after_deposit_failed = view
+            .apply_usdc_rebalance_event(&deposit_failed, &direction, amount, Utc::now())
+            .unwrap();
+        assert!(after_deposit_failed.usdc.offchain.has_inflight());
+    }
+
+    #[test]
+    fn usdc_inflight_blocks_imbalance_detection() {
+        let inv = usdc_inventory(800, 0, 200, 0);
+        let thresh = threshold("0.5", "0.2");
+        assert!(inv.detect_imbalance(&thresh).is_some());
+
+        let inv_with_inflight = usdc_inventory(700, 100, 200, 0);
+        assert!(inv_with_inflight.detect_imbalance(&thresh).is_none());
     }
 }
