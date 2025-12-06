@@ -29,9 +29,11 @@ use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_broker::Symbol;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::time::{Instant, MissedTickBehavior};
 
-use crate::alpaca_wallet::Network;
+use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::onchain::io::TokenizedEquitySymbol;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
@@ -143,6 +145,9 @@ enum AlpacaTokenizationError {
 
     #[error("Transaction error: {0}")]
     Transaction(#[from] alloy::providers::PendingTransactionError),
+
+    #[error("Poll timeout after {elapsed:?}")]
+    PollTimeout { elapsed: Duration },
 }
 
 /// Client for Alpaca's tokenization API and redemption transfers.
@@ -363,6 +368,74 @@ where
         Ok(requests
             .into_iter()
             .find(|r| r.tx_hash.as_ref() == Some(tx_hash)))
+    }
+
+    /// Poll until a tokenization request reaches a terminal state (Completed or Rejected).
+    ///
+    /// # Errors
+    ///
+    /// - `PollTimeout` if the timeout is exceeded
+    /// - `RequestNotFound` if the request doesn't exist
+    /// - `ApiError` for API errors
+    /// - `Reqwest` for network errors
+    async fn poll_until_terminal(
+        &self,
+        id: &TokenizationRequestId,
+        config: &PollingConfig,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        let start = Instant::now();
+        let mut interval = tokio::time::interval(config.interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            if start.elapsed() >= config.timeout {
+                return Err(AlpacaTokenizationError::PollTimeout {
+                    elapsed: start.elapsed(),
+                });
+            }
+
+            let request = self.get_request(id).await?;
+
+            match request.status {
+                TokenizationRequestStatus::Completed | TokenizationRequestStatus::Rejected => {
+                    return Ok(request);
+                }
+                TokenizationRequestStatus::Pending => {}
+            }
+        }
+    }
+
+    /// Poll until Alpaca detects a redemption transfer.
+    ///
+    /// # Errors
+    ///
+    /// - `PollTimeout` if the timeout is exceeded before detection
+    /// - `ApiError` for API errors
+    /// - `Reqwest` for network errors
+    async fn poll_for_redemption_detection(
+        &self,
+        tx_hash: &TxHash,
+        config: &PollingConfig,
+    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
+        let start = Instant::now();
+        let mut interval = tokio::time::interval(config.interval);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+
+            if start.elapsed() >= config.timeout {
+                return Err(AlpacaTokenizationError::PollTimeout {
+                    elapsed: start.elapsed(),
+                });
+            }
+
+            if let Some(request) = self.find_redemption_by_tx(tx_hash).await? {
+                return Ok(request);
+            }
+        }
     }
 }
 
@@ -877,5 +950,144 @@ mod tests {
         );
 
         list_mock.assert();
+    }
+
+    fn sample_request_with_status(id: &str, status: &str) -> serde_json::Value {
+        json!({
+            "tokenization_request_id": id,
+            "type": "mint",
+            "status": status,
+            "underlying_symbol": "AAPL",
+            "token_symbol": "tAAPL",
+            "qty": "100.0",
+            "issuer": "st0x",
+            "network": "base",
+            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+            "created_at": "2024-01-15T10:30:00Z"
+        })
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_terminal_completed() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_request_with_status("req_1", "completed")]));
+        });
+
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let id = TokenizationRequestId("req_1".to_string());
+        let result = client.poll_until_terminal(&id, &config).await.unwrap();
+
+        assert_eq!(result.status, TokenizationRequestStatus::Completed);
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_until_terminal_rejected() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_request_with_status("req_1", "rejected")]));
+        });
+
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let id = TokenizationRequestId("req_1".to_string());
+        let result = client.poll_until_terminal(&id, &config).await.unwrap();
+
+        assert_eq!(result.status, TokenizationRequestStatus::Rejected);
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_for_redemption_detection_success() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let hash: TxHash =
+            fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+
+        let list_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v2/tokenization/requests")
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_redemption_request_json_with_tx(
+                    "redeem_1", "AAPL", hash
+                )]));
+        });
+
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_secs(5),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let result = client
+            .poll_for_redemption_detection(&hash, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(result.id, TokenizationRequestId("redeem_1".to_string()));
+        assert_eq!(result.tx_hash, Some(hash));
+        list_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_poll_timeout() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let _list_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_request_with_status("req_1", "pending")]));
+        });
+
+        let config = PollingConfig {
+            interval: Duration::from_millis(10),
+            timeout: Duration::from_millis(50),
+            max_retries: 3,
+            min_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+        };
+
+        let id = TokenizationRequestId("req_1".to_string());
+        let result = client.poll_until_terminal(&id, &config).await;
+
+        assert!(
+            matches!(result, Err(AlpacaTokenizationError::PollTimeout { .. })),
+            "expected PollTimeout, got: {result:?}"
+        );
     }
 }

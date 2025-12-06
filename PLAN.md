@@ -201,31 +201,41 @@ Add polling for terminal states with timeout.
 
 ### Subtasks
 
-- [ ] Define `PollingConfig` struct:
-  - `interval: Duration`
-  - `timeout: Duration`
-- [ ] Add `PollTimeout { elapsed }` error variant
-- [ ] Implement
+- [x] Reuse `PollingConfig` from `alpaca_wallet` module (exported as
+      `pub(crate)`)
+- [x] Add `PollTimeout { elapsed }` error variant
+- [x] Implement
       `poll_until_terminal(&self, id: &TokenizationRequestId, config: &PollingConfig) -> Result<TokenizationRequest>`:
   - Use `tokio::time::interval()` with `MissedTickBehavior::Skip`
   - Poll `get_request()` each tick
   - Return when status is `Completed` or `Rejected`
   - Return `PollTimeout` if exceeded
-- [ ] Implement
+- [x] Implement
       `poll_for_redemption_detection(&self, tx_hash: &TxHash, config: &PollingConfig) -> Result<TokenizationRequest>`:
   - Poll `find_redemption_by_tx()` each tick
   - Return when request appears (Alpaca detected the transfer)
   - Return `PollTimeout` if exceeded
-- [ ] Add test: poll mint until completed
-- [ ] Add test: poll mint until rejected
-- [ ] Add test: poll redemption detection success
-- [ ] Add test: poll timeout
+- [x] Add test: poll mint until completed
+- [x] Add test: poll mint until rejected
+- [x] Add test: poll redemption detection success
+- [x] Add test: poll timeout
 
 ### Validation
 
-- [ ] Run `cargo test -q`
-- [ ] Run `cargo clippy -- -D clippy::all`
-- [ ] Run `cargo fmt`
+- [x] Run `cargo test -q`
+- [x] Run `cargo clippy -- -D clippy::all`
+- [x] Run `cargo fmt`
+
+### Changes Made
+
+- Reused `PollingConfig` from `alpaca_wallet::status` module (now exported as
+  `pub(crate)`)
+- Added `PollTimeout { elapsed: Duration }` error variant
+- Implemented `poll_until_terminal` using `tokio::time::interval` with
+  `MissedTickBehavior::Skip`
+- Implemented `poll_for_redemption_detection` with same approach
+- Added 4 tests for polling (completed, rejected, redemption detection, timeout)
+- All 16 tests pass
 
 ## Task 6. Service Facade
 
@@ -238,7 +248,7 @@ Create high-level service with default config.
   - `polling_config: PollingConfig`
 - [ ] Implement constructor with default polling config
 - [ ] Implement public methods:
-  - `request_mint(symbol, qty, wallet) -> Result<TokenizationRequest>`
+  - `request_mint(symbol, quantity, wallet) -> Result<TokenizationRequest>`
   - `get_request_status(id) -> Result<TokenizationRequest>`
   - `poll_mint_until_complete(id) -> Result<TokenizationRequest>`
   - `send_for_redemption(token, amount) -> Result<TxHash>`

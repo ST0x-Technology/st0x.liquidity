@@ -28,11 +28,11 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 
 use client::AlpacaWalletClient;
-use status::PollingConfig;
 use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
+pub(crate) use status::PollingConfig;
 pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
