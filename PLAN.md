@@ -30,16 +30,27 @@ redemptions.
 
 ### Subtasks
 
-- [ ] Add `get_address_by_symbol()` method to `SymbolCache`:
+- [x] Add `get_address()` method to `SymbolCache`:
   - Iterate through cached `Address -> symbol` mappings
   - Return `Option<Address>` for reverse lookup
 
-- [ ] Write tests:
+- [x] Write tests:
   - Reverse lookup returns correct address for cached symbol
   - Reverse lookup returns None for unknown symbol
-  - Reverse lookup works after cache population
+  - Reverse lookup works after cache population (multiple entries)
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- Added `get_address(&self, symbol: &str) -> Option<Address>` method to
+  `SymbolCache` in `src/symbol/cache.rs:50-60`
+- Added 3 new tests:
+  - `test_get_address_returns_correct_address` - verifies lookup works
+  - `test_get_address_returns_none_for_unknown_symbol` - verifies None for
+    unknown
+  - `test_get_address_works_with_multiple_entries` - verifies correct address
+    returned when cache has multiple symbols
 
 ---
 
@@ -49,7 +60,8 @@ Create `src/rebalancing/trigger.rs` with core types and trigger logic.
 
 ### Subtasks
 
-- [ ] Make `Imbalance<T>` and `ImbalanceThreshold` pub(crate) in view.rs
+- [ ] Make `Imbalance<T>` and `ImbalanceThreshold` pub(crate) in
+      `src/inventory/view.rs` and re-export from `src/inventory/mod.rs`
 
 - [ ] Define `RebalancingTriggerConfig`:
   - `equity_threshold: ImbalanceThreshold` (target 0.5, deviation 0.2)

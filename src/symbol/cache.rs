@@ -45,6 +45,19 @@ impl SymbolCache {
 
         Ok(symbol)
     }
+
+    /// Reverse lookup: find token address by symbol.
+    pub(crate) fn get_address(&self, symbol: &str) -> Option<Address> {
+        let read_guard = match self.map.read() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+
+        read_guard
+            .iter()
+            .find(|(_, s)| s.as_str() == symbol)
+            .map(|(addr, _)| *addr)
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +106,55 @@ mod tests {
             result.unwrap_err(),
             OnChainError::Alloy(crate::error::AlloyError::GetSymbol(_))
         ));
+    }
+
+    #[test]
+    fn test_get_address_returns_correct_address() {
+        let cache = SymbolCache::default();
+        let addr = address!("0x1234567890123456789012345678901234567890");
+
+        cache
+            .map
+            .write()
+            .expect("Test cache lock poisoned")
+            .insert(addr, "AAPL".to_string());
+
+        let result = cache.get_address("AAPL");
+        assert_eq!(result, Some(addr));
+    }
+
+    #[test]
+    fn test_get_address_returns_none_for_unknown_symbol() {
+        let cache = SymbolCache::default();
+        let addr = address!("0x1234567890123456789012345678901234567890");
+
+        cache
+            .map
+            .write()
+            .expect("Test cache lock poisoned")
+            .insert(addr, "AAPL".to_string());
+
+        let result = cache.get_address("UNKNOWN");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_get_address_works_with_multiple_entries() {
+        let cache = SymbolCache::default();
+        let aapl_addr = address!("0x1111111111111111111111111111111111111111");
+        let msft_addr = address!("0x2222222222222222222222222222222222222222");
+        let goog_addr = address!("0x3333333333333333333333333333333333333333");
+
+        {
+            let mut guard = cache.map.write().expect("Test cache lock poisoned");
+            guard.insert(aapl_addr, "AAPL".to_string());
+            guard.insert(msft_addr, "MSFT".to_string());
+            guard.insert(goog_addr, "GOOG".to_string());
+        }
+
+        assert_eq!(cache.get_address("AAPL"), Some(aapl_addr));
+        assert_eq!(cache.get_address("MSFT"), Some(msft_addr));
+        assert_eq!(cache.get_address("GOOG"), Some(goog_addr));
+        assert_eq!(cache.get_address("TSLA"), None);
     }
 }
