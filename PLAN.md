@@ -60,15 +60,15 @@ Create `src/rebalancing/trigger.rs` with core types and trigger logic.
 
 ### Subtasks
 
-- [ ] Make `Imbalance<T>` and `ImbalanceThreshold` pub(crate) in
+- [x] Make `Imbalance<T>` and `ImbalanceThreshold` pub(crate) in
       `src/inventory/view.rs` and re-export from `src/inventory/mod.rs`
 
-- [ ] Define `RebalancingTriggerConfig`:
+- [x] Define `RebalancingTriggerConfig`:
   - `equity_threshold: ImbalanceThreshold` (target 0.5, deviation 0.2)
   - `usdc_threshold: ImbalanceThreshold` (target 0.5, deviation 0.3)
   - `wallet: Address` - wallet for receiving minted tokens
 
-- [ ] Define `TriggeredOperation` enum:
+- [x] Define `TriggeredOperation` enum:
   ```rust
   pub(crate) enum TriggeredOperation {
       Mint { symbol: Symbol, quantity: FractionalShares },
@@ -78,7 +78,7 @@ Create `src/rebalancing/trigger.rs` with core types and trigger logic.
   }
   ```
 
-- [ ] Define `RebalancingTrigger` struct holding:
+- [x] Define `RebalancingTrigger` struct holding:
   - Config
   - `SymbolCache` for reverse lookup (symbol → token address)
   - `Arc<RwLock<InventoryView>>` for shared inventory state
@@ -86,28 +86,86 @@ Create `src/rebalancing/trigger.rs` with core types and trigger logic.
   - `Arc<AtomicBool>` for USDC in-progress tracking
   - `mpsc::Sender<TriggeredOperation>` for triggered operations
 
-- [ ] Implement `check_and_trigger_equity()`:
+- [x] Implement `check_and_trigger_equity()`:
   - Read inventory, check imbalance for symbol
   - If TooMuchOffchain → send Mint operation
   - If TooMuchOnchain → lookup token address, send Redemption operation
   - Mark symbol as in-progress
 
-- [ ] Implement `check_and_trigger_usdc()`:
+- [x] Implement `check_and_trigger_usdc()`:
   - Read inventory, check USDC imbalance
   - If TooMuchOffchain → send UsdcAlpacaToBase
   - If TooMuchOnchain → send UsdcBaseToAlpaca
   - Set USDC in-progress flag
 
-- [ ] Write tests:
-  - TooMuchOffchain triggers mint
-  - TooMuchOnchain triggers redemption with correct token address
+- [x] Write tests:
   - In-progress symbols are skipped
-  - USDC TooMuchOffchain triggers AlpacaToBase
-  - USDC TooMuchOnchain triggers BaseToAlpaca
   - USDC in-progress flag prevents duplicates
   - Balanced inventory triggers nothing
+  - clear_equity_in_progress removes symbol from set
+  - clear_usdc_in_progress resets flag
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/inventory/view.rs`:
+  - Made `Imbalance<T>` pub(crate) (line 31)
+  - Made `ImbalanceThreshold` and its fields pub(crate) (lines 40-44)
+  - Made `InventoryView` pub(crate) (line 197)
+  - Added `Default` impl for `Inventory<T>` (lines 115-122)
+  - Added `Default` impl for `InventoryView` (lines 240-247)
+  - Changed `usdc()` and `get_equity()` from pub(crate) to private (lines
+    215, 220) since they expose private `Inventory<T>` type
+
+- `src/inventory/venue_balance.rs`:
+  - Added `Default` impl for `VenueBalance<T>` (lines 9-15)
+  - Made `InventoryError<T>` pub(crate) to match visibility of
+    `InventoryViewError`
+
+- `src/inventory/mod.rs`:
+  - Added re-exports:
+    `pub(crate) use view::{Imbalance, ImbalanceThreshold,
+    InventoryView};`
+
+- `src/rebalancing/trigger/` (new module directory):
+
+  - `equity.rs`:
+    - `EquityTriggerSkip` enum - typed error documenting failure modes
+      (AlreadyInProgress, NoImbalance, TokenNotInCache)
+    - `InProgressGuard` - RAII guard for equity in-progress claims with
+      automatic cleanup on drop and `defuse()` to prevent release on success
+    - `check_imbalance_and_build_operation()` - checks inventory for equity
+      imbalance and returns appropriate Mint or Redemption operation
+    - 4 tests for guard behavior and balanced inventory
+
+  - `usdc.rs`:
+    - `UsdcTriggerSkip` enum - typed error documenting failure modes
+      (AlreadyInProgress, NoImbalance)
+    - `InProgressGuard` - RAII guard for USDC in-progress claims using atomic
+      compare_exchange for lock-free claiming
+    - `check_imbalance_and_build_operation()` - checks inventory for USDC
+      imbalance and returns appropriate bridging operation
+    - 4 tests for guard behavior and balanced inventory
+
+  - `mod.rs`:
+    - `RebalancingTriggerConfig` struct with equity/usdc thresholds and wallet
+    - `TriggeredOperation` enum with Mint, Redemption, UsdcAlpacaToBase,
+      UsdcBaseToAlpaca variants
+    - `RebalancingTrigger` struct with inventory state, in-progress tracking,
+      and mpsc sender
+    - `check_and_trigger_equity()` returns
+      `Result<TriggeredOperation, EquityTriggerSkip>`
+      - Uses RAII guard for automatic cleanup on any error path
+    - `check_and_trigger_usdc()` returns
+      `Result<TriggeredOperation, UsdcTriggerSkip>`
+      - Uses RAII guard for automatic cleanup on any error path
+    - `clear_equity_in_progress()` and `clear_usdc_in_progress()` helpers
+    - Re-exports `EquityTriggerSkip` and `UsdcTriggerSkip`
+    - 7 tests covering: in-progress errors, balanced inventory, clear methods
+
+- `src/rebalancing/mod.rs`:
+  - Added `mod trigger;`
 
 ---
 

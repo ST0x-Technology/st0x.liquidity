@@ -6,9 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::shares::{ArithmeticError, HasZero};
 
+impl<T: HasZero> Default for VenueBalance<T> {
+    fn default() -> Self {
+        Self {
+            available: T::ZERO,
+            inflight: T::ZERO,
+        }
+    }
+}
+
 /// Error type for inventory operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
-pub(super) enum InventoryError<T> {
+pub(crate) enum InventoryError<T> {
     #[error(
         "insufficient available balance: requested {requested:?}, but only {available:?} available"
     )]

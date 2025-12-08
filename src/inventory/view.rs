@@ -28,7 +28,7 @@ pub(crate) enum InventoryViewError {
 
 /// Imbalance requiring rebalancing action.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Imbalance<T> {
+pub(crate) enum Imbalance<T> {
     /// Too much onchain - triggers movement to offchain.
     TooMuchOnchain { excess: T },
     /// Too much offchain - triggers movement to onchain.
@@ -37,11 +37,11 @@ enum Imbalance<T> {
 
 /// Threshold configuration for imbalance detection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-struct ImbalanceThreshold {
+pub(crate) struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
-    target: Decimal,
+    pub(crate) target: Decimal,
     /// Deviation from target that triggers rebalancing.
-    deviation: Decimal,
+    pub(crate) deviation: Decimal,
 }
 
 /// Inventory at a pair of venues (onchain/offchain).
@@ -108,6 +108,16 @@ where
             Some(Imbalance::TooMuchOnchain { excess })
         } else {
             None
+        }
+    }
+}
+
+impl<T: HasZero> Default for Inventory<T> {
+    fn default() -> Self {
+        Self {
+            onchain: VenueBalance::default(),
+            offchain: VenueBalance::default(),
+            last_rebalancing: None,
         }
     }
 }
@@ -194,7 +204,7 @@ where
 
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InventoryView {
+pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
@@ -202,12 +212,12 @@ struct InventoryView {
 
 impl InventoryView {
     /// Returns the USDC inventory.
-    pub(crate) fn usdc(&self) -> &Inventory<Usdc> {
+    fn usdc(&self) -> &Inventory<Usdc> {
         &self.usdc
     }
 
     /// Returns the equity inventory for a specific symbol, if tracked.
-    pub(crate) fn get_equity(&self, symbol: &Symbol) -> Option<&Inventory<FractionalShares>> {
+    fn get_equity(&self, symbol: &Symbol) -> Option<&Inventory<FractionalShares>> {
         self.equities.get(symbol)
     }
 
@@ -234,6 +244,16 @@ impl InventoryView {
         threshold: &ImbalanceThreshold,
     ) -> Option<Imbalance<Usdc>> {
         self.usdc.detect_imbalance(threshold)
+    }
+}
+
+impl Default for InventoryView {
+    fn default() -> Self {
+        Self {
+            usdc: Inventory::default(),
+            equities: HashMap::new(),
+            last_updated: Utc::now(),
+        }
     }
 }
 
