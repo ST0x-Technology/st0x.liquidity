@@ -20,6 +20,7 @@ use crate::shares::{ArithmeticError, FractionalShares};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use chrono::Utc;
 use st0x_broker::Symbol;
 
@@ -142,6 +143,29 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
         if Self::has_terminal_redemption_event(events) {
             self.clear_equity_in_progress(&symbol);
             debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
+        }
+    }
+}
+
+#[async_trait]
+impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
+    async fn dispatch(
+        &self,
+        aggregate_id: &str,
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+    ) {
+        let Some((direction, amount)) = Self::extract_usdc_rebalance_info(events) else {
+            warn!(aggregate_id = %aggregate_id, "No Initiated event found in USDC rebalance dispatch");
+            return;
+        };
+
+        for envelope in events {
+            self.apply_usdc_rebalance_event_to_inventory(&envelope.payload, &direction, amount);
+        }
+
+        if Self::has_terminal_usdc_rebalance_event(events) {
+            self.clear_usdc_in_progress();
+            debug!("Cleared USDC in-progress flag after rebalance terminal event");
         }
     }
 }
@@ -366,6 +390,62 @@ impl RebalancingTrigger {
 
         drop(inventory);
     }
+
+    fn extract_usdc_rebalance_info(
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+    ) -> Option<(RebalanceDirection, Usdc)> {
+        for envelope in events {
+            if let UsdcRebalanceEvent::Initiated {
+                direction, amount, ..
+            } = &envelope.payload
+            {
+                return Some((direction.clone(), *amount));
+            }
+        }
+        None
+    }
+
+    fn has_terminal_usdc_rebalance_event(
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+    ) -> bool {
+        events.iter().any(|envelope| {
+            matches!(
+                envelope.payload,
+                UsdcRebalanceEvent::DepositConfirmed { .. }
+                    | UsdcRebalanceEvent::WithdrawalFailed { .. }
+                    | UsdcRebalanceEvent::BridgingFailed { .. }
+                    | UsdcRebalanceEvent::DepositFailed { .. }
+            )
+        })
+    }
+
+    fn apply_usdc_rebalance_event_to_inventory(
+        &self,
+        event: &UsdcRebalanceEvent,
+        direction: &RebalanceDirection,
+        amount: Usdc,
+    ) {
+        let mut inventory = match self.inventory.write() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+
+        let result =
+            inventory
+                .clone()
+                .apply_usdc_rebalance_event(event, direction, amount, Utc::now());
+
+        match result {
+            Ok(new_inventory) => {
+                *inventory = new_inventory;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to apply USDC rebalance event to inventory");
+            }
+        }
+
+        drop(inventory);
+    }
 }
 
 #[cfg(test)]
@@ -382,6 +462,7 @@ mod tests {
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::usdc_rebalance::TransferRef;
     use alloy::primitives::{Address, U256};
 
     fn make_trigger() -> RebalancingTrigger {
@@ -1004,5 +1085,192 @@ mod tests {
         ];
 
         assert!(!RebalancingTrigger::has_terminal_redemption_event(&events));
+    }
+
+    fn usdc(n: i64) -> Usdc {
+        Usdc(Decimal::from(n))
+    }
+
+    fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::Initiated {
+            direction,
+            amount,
+            withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
+            initiated_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_withdrawal_confirmed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_withdrawal_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::WithdrawalFailed {
+            reason: "Insufficient funds".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_bridging_initiated() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: TxHash::random(),
+            cctp_nonce: 12345,
+            burned_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_bridged() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: TxHash::random(),
+            minted_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_bridging_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::BridgingFailed {
+            burn_tx_hash: Some(TxHash::random()),
+            cctp_nonce: Some(12345),
+            reason: "Attestation timeout".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_deposit_confirmed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositConfirmed {
+            deposit_confirmed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_deposit_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositFailed {
+            deposit_ref: Some(TransferRef::OnchainTx(TxHash::random())),
+            reason: "Deposit rejected".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_rebalance_envelope(
+        event: UsdcRebalanceEvent,
+    ) -> EventEnvelope<Lifecycle<UsdcRebalance, Never>> {
+        EventEnvelope {
+            aggregate_id: "usdc-rebalance-123".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn usdc_rebalance_completion_clears_in_progress_flag() {
+        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default());
+
+        // Mark USDC as in-progress.
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        // Create event batch with Initiated and DepositConfirmed.
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_confirmed()),
+        ];
+
+        // Check that terminal event is detected.
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+
+        // Simulate what dispatch does - clear in-progress on terminal.
+        trigger.clear_usdc_in_progress();
+        assert!(!trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn usdc_withdrawal_failure_clears_in_progress_flag() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_withdrawal_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn usdc_bridging_failure_clears_in_progress_flag() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_bridging_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn usdc_deposit_failure_clears_in_progress_flag() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn extract_usdc_rebalance_info_returns_direction_and_amount() {
+        let events = vec![make_usdc_rebalance_envelope(make_usdc_initiated(
+            RebalanceDirection::BaseToAlpaca,
+            usdc(5000),
+        ))];
+
+        let result = RebalancingTrigger::extract_usdc_rebalance_info(&events);
+
+        let (extracted_direction, extracted_amount) = result.unwrap();
+        assert_eq!(extracted_direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(extracted_amount, usdc(5000));
+    }
+
+    #[test]
+    fn extract_usdc_rebalance_info_returns_none_without_initiated() {
+        let events = vec![make_usdc_rebalance_envelope(make_usdc_deposit_confirmed())];
+
+        let result = RebalancingTrigger::extract_usdc_rebalance_info(&events);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn has_terminal_usdc_rebalance_event_returns_false_for_non_terminal() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_withdrawal_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_bridging_initiated()),
+            make_usdc_rebalance_envelope(make_usdc_bridged()),
+        ];
+
+        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
     }
 }

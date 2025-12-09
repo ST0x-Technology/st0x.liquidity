@@ -342,17 +342,47 @@ Implement `Query<Lifecycle<UsdcRebalance, Never>>` for RebalancingTrigger.
 
 ### Subtasks
 
-- [ ] Implement `Query<Lifecycle<UsdcRebalance, Never>>`:
+- [x] Implement `Query<Lifecycle<UsdcRebalance, Never>>`:
   - `dispatch()` receives USDC rebalance events
   - Apply to inventory via `apply_usdc_rebalance_event()`
   - On completion/failure events, clear USDC in-progress flag
 
-- [ ] Write tests:
+- [x] Write tests:
   - USDC rebalance initiation event updates inventory
   - USDC completion clears in-progress flag
   - USDC failure clears in-progress flag
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/rebalancing/trigger/mod.rs`:
+  - Added import for `RebalanceDirection`, `UsdcRebalance`, `UsdcRebalanceEvent`
+  - Added `impl Query<Lifecycle<UsdcRebalance, Never>>` with async `dispatch()`
+    method
+  - `dispatch()` extracts direction/amount from `Initiated` event, applies all
+    events to inventory, and clears USDC in-progress flag on terminal events
+  - Added `extract_usdc_rebalance_info()` helper to find direction and amount
+    from `Initiated` event
+  - Added `has_terminal_usdc_rebalance_event()` helper to detect terminal events
+    (DepositConfirmed, WithdrawalFailed, BridgingFailed, DepositFailed)
+  - Added `apply_usdc_rebalance_event_to_inventory()` helper to apply USDC
+    rebalance events to inventory
+  - Added 7 tests:
+    - `usdc_rebalance_completion_clears_in_progress_flag` - verifies
+      DepositConfirmed is terminal
+    - `usdc_withdrawal_failure_clears_in_progress_flag` - verifies
+      WithdrawalFailed is terminal
+    - `usdc_bridging_failure_clears_in_progress_flag` - verifies BridgingFailed
+      is terminal
+    - `usdc_deposit_failure_clears_in_progress_flag` - verifies DepositFailed is
+      terminal
+    - `extract_usdc_rebalance_info_returns_direction_and_amount` - verifies
+      extraction from Initiated
+    - `extract_usdc_rebalance_info_returns_none_without_initiated` - verifies
+      None when no Initiated
+    - `has_terminal_usdc_rebalance_event_returns_false_for_non_terminal` -
+      verifies non-terminal events
 
 ---
 
