@@ -171,22 +171,63 @@ Create `src/rebalancing/trigger.rs` with core types and trigger logic.
 
 ## Task 3. Implement Position Event Query with Tests
 
-Implement `Query<Lifecycle<Position, Never>>` for RebalancingTrigger.
+Implement `Query<Lifecycle<Position, ArithmeticError<FractionalShares>>>` for
+RebalancingTrigger.
 
 ### Subtasks
 
-- [ ] Implement `Query<Lifecycle<Position, Never>>` for RebalancingTrigger:
+- [x] Implement `Query<Lifecycle<Position, ArithmeticError<FractionalShares>>>`
+      for RebalancingTrigger:
   - `dispatch()` receives position events
   - Extract symbol from aggregate_id
   - Apply event to inventory via `apply_position_event()`
   - Call `check_and_trigger_equity()` for that symbol
 
-- [ ] Write tests:
+- [x] Write tests:
   - Position event updates inventory
   - Position event causing imbalance triggers rebalancing
   - Position event maintaining balance triggers nothing
+  - Position event for unknown symbol logs error without panic
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/rebalancing/trigger/mod.rs`:
+  - Added `impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>>`
+    with async `dispatch()` method
+  - `dispatch()` parses aggregate_id as Symbol, applies each event to inventory,
+    and checks for equity imbalance
+  - Added `apply_position_event_and_check()` - coordinates inventory update and
+    trigger check
+  - Added `apply_position_event_to_inventory()` - handles RwLock acquisition,
+    applies event, returns `Result<(), InventoryViewError>`
+  - Added 4 tests:
+    - `position_event_for_unknown_symbol_logs_error_without_panic`
+    - `position_event_updates_inventory`
+    - `position_event_maintaining_balance_triggers_nothing`
+    - `position_event_causing_imbalance_triggers_mint`
+
+- `src/inventory/view.rs`:
+  - Added `#[cfg(test)] with_equity(symbol)` builder method for test setup
+  - Fixed `apply_position_event()` to extract timestamp from the event itself
+    instead of taking a `now` parameter - this ensures replay consistency per
+    ES/CQRS principles
+
+- `src/inventory/mod.rs`:
+  - Added `InventoryViewError` to re-exports
+
+- `src/position.rs`:
+  - Added `PositionEvent::timestamp()` method to extract the timestamp from any
+    event variant
+  - Added 7 tests for timestamp extraction (one per event variant):
+    - `timestamp_returns_migrated_at_for_migrated_event`
+    - `timestamp_returns_initialized_at_for_initialized_event`
+    - `timestamp_returns_seen_at_for_onchain_order_filled_event`
+    - `timestamp_returns_placed_at_for_offchain_order_placed_event`
+    - `timestamp_returns_broker_timestamp_for_offchain_order_filled_event`
+    - `timestamp_returns_failed_at_for_offchain_order_failed_event`
+    - `timestamp_returns_updated_at_for_threshold_updated_event`
 
 ---
 

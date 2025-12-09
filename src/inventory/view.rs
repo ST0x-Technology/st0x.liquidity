@@ -258,6 +258,13 @@ impl Default for InventoryView {
 }
 
 impl InventoryView {
+    /// Registers a symbol with zeroed inventory.
+    #[cfg(test)]
+    pub(crate) fn with_equity(mut self, symbol: Symbol) -> Self {
+        self.equities.insert(symbol, Inventory::default());
+        self
+    }
+
     fn update_equity(
         self,
         symbol: &Symbol,
@@ -306,8 +313,9 @@ impl InventoryView {
         self,
         symbol: &Symbol,
         event: &PositionEvent,
-        now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        let timestamp = event.timestamp();
+
         match event {
             PositionEvent::OnChainOrderFilled {
                 amount, direction, ..
@@ -319,7 +327,7 @@ impl InventoryView {
                         Direction::Buy => inv.add_onchain_available(amount),
                         Direction::Sell => inv.remove_onchain_available(amount),
                     },
-                    now,
+                    timestamp,
                 )
             }
 
@@ -335,7 +343,7 @@ impl InventoryView {
                         Direction::Buy => inv.add_offchain_available(shares),
                         Direction::Sell => inv.remove_offchain_available(shares),
                     },
-                    now,
+                    timestamp,
                 )
             }
 
@@ -344,7 +352,7 @@ impl InventoryView {
             | PositionEvent::OffChainOrderPlaced { .. }
             | PositionEvent::OffChainOrderFailed { .. }
             | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
-                last_updated: now,
+                last_updated: timestamp,
                 ..self
             }),
         }
@@ -746,9 +754,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
@@ -761,9 +767,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_onchain_fill(shares(10), Direction::Sell);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(90));
@@ -776,9 +780,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_offchain_fill(shares(10), Direction::Buy);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
@@ -791,9 +793,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_offchain_fill(shares(10), Direction::Sell);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
@@ -810,9 +810,7 @@ mod tests {
         ]);
 
         let event = make_onchain_fill(shares(10), Direction::Buy);
-        let updated = view
-            .apply_position_event(&aapl, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&aapl, &event).unwrap();
 
         let aapl_inv = updated.equities.get(&aapl).unwrap();
         assert_eq!(aapl_inv.onchain.total().unwrap().0, Decimal::from(110));
@@ -827,7 +825,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let result = view.apply_position_event(&symbol, &event, Utc::now());
+        let result = view.apply_position_event(&symbol, &event);
 
         assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
     }
@@ -844,18 +842,17 @@ mod tests {
             last_updated: original_time,
         };
 
-        let new_time = original_time + chrono::Duration::hours(1);
+        let event_time = original_time + chrono::Duration::hours(1);
         let event = PositionEvent::Initialized {
             symbol: symbol.clone(),
             threshold: ExecutionThreshold::whole_share(),
-            initialized_at: new_time,
+            initialized_at: event_time,
         };
 
-        let updated = view
-            .apply_position_event(&symbol, &event, new_time)
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
-        assert_eq!(updated.last_updated, new_time);
+        // Timestamp should come from the event, not Utc::now()
+        assert_eq!(updated.last_updated, event_time);
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
