@@ -13,11 +13,13 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
 use crate::shares::{ArithmeticError, FractionalShares};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
+use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
+use chrono::Utc;
 use st0x_broker::Symbol;
 
 pub(crate) use equity::EquityTriggerSkip;
@@ -77,7 +79,50 @@ impl RebalancingTrigger {
             sender,
         }
     }
+}
 
+#[async_trait]
+impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for RebalancingTrigger {
+    async fn dispatch(
+        &self,
+        aggregate_id: &str,
+        events: &[EventEnvelope<Lifecycle<Position, ArithmeticError<FractionalShares>>>],
+    ) {
+        let Ok(symbol) = Symbol::new(aggregate_id) else {
+            warn!(aggregate_id = %aggregate_id, "Invalid symbol in position aggregate_id");
+            return;
+        };
+
+        for envelope in events {
+            self.apply_position_event_and_check(&symbol, &envelope.payload);
+        }
+    }
+}
+
+#[async_trait]
+impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
+    async fn dispatch(
+        &self,
+        aggregate_id: &str,
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+    ) {
+        let Some((symbol, quantity)) = Self::extract_mint_info(events) else {
+            warn!(aggregate_id = %aggregate_id, "No MintRequested event found in mint dispatch");
+            return;
+        };
+
+        for envelope in events {
+            self.apply_mint_event_to_inventory(&symbol, &envelope.payload, quantity);
+        }
+
+        if Self::has_terminal_mint_event(events) {
+            self.clear_equity_in_progress(&symbol);
+            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+        }
+    }
+}
+
+impl RebalancingTrigger {
     /// Checks inventory for equity imbalance and triggers operation if needed.
     /// Returns the triggered operation on success, or the reason it was skipped.
     pub(crate) fn check_and_trigger_equity(
@@ -101,7 +146,6 @@ impl RebalancingTrigger {
             .try_send(operation.clone())
             .map_err(|e| {
                 warn!(error = %e, "Failed to send triggered operation");
-                // Guard drops here, releasing the claim
             })
             .ok();
 
@@ -124,7 +168,6 @@ impl RebalancingTrigger {
             .try_send(operation.clone())
             .map_err(|e| {
                 warn!(error = %e, "Failed to send USDC triggered operation");
-                // Guard drops here, releasing the claim
             })
             .ok();
 
@@ -146,7 +189,6 @@ impl RebalancingTrigger {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
     }
 
-    /// Applies a position event to inventory and checks for rebalancing trigger.
     fn apply_position_event_and_check(&self, symbol: &Symbol, event: &PositionEvent) {
         if let Err(e) = self.apply_position_event_to_inventory(symbol, event) {
             warn!(symbol = %symbol, error = %e, "Failed to apply position event to inventory");
@@ -188,23 +230,61 @@ impl RebalancingTrigger {
 
         Ok(())
     }
-}
 
-#[async_trait]
-impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for RebalancingTrigger {
-    async fn dispatch(
+    fn extract_mint_info(
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+    ) -> Option<(Symbol, FractionalShares)> {
+        for envelope in events {
+            if let TokenizedEquityMintEvent::MintRequested {
+                symbol, quantity, ..
+            } = &envelope.payload
+            {
+                let shares = FractionalShares(*quantity);
+                return Some((symbol.clone(), shares));
+            }
+        }
+        None
+    }
+
+    fn has_terminal_mint_event(
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+    ) -> bool {
+        events.iter().any(|envelope| {
+            matches!(
+                envelope.payload,
+                TokenizedEquityMintEvent::MintCompleted { .. }
+                    | TokenizedEquityMintEvent::MintRejected { .. }
+                    | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+                    | TokenizedEquityMintEvent::TokenReceiptFailed { .. }
+            )
+        })
+    }
+
+    fn apply_mint_event_to_inventory(
         &self,
-        aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<Position, ArithmeticError<FractionalShares>>>],
+        symbol: &Symbol,
+        event: &TokenizedEquityMintEvent,
+        quantity: FractionalShares,
     ) {
-        let Ok(symbol) = Symbol::new(aggregate_id) else {
-            warn!(aggregate_id = %aggregate_id, "Invalid symbol in position aggregate_id");
-            return;
+        let mut inventory = match self.inventory.write() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
         };
 
-        for envelope in events {
-            self.apply_position_event_and_check(&symbol, &envelope.payload);
+        let result = inventory
+            .clone()
+            .apply_mint_event(symbol, event, quantity, Utc::now());
+
+        match result {
+            Ok(new_inventory) => {
+                *inventory = new_inventory;
+            }
+            Err(e) => {
+                warn!(symbol = %symbol, error = %e, "Failed to apply mint event to inventory");
+            }
         }
+
+        drop(inventory);
     }
 }
 
@@ -216,10 +296,13 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use st0x_broker::Direction;
+    use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
+    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use alloy::primitives::{Address, U256};
 
     fn make_trigger() -> RebalancingTrigger {
         let (sender, _receiver) = mpsc::channel(10);
@@ -442,5 +525,217 @@ mod tests {
             matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
             "Expected Mint operation, got {triggered:?}"
         );
+    }
+
+    fn make_mint_requested(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintRequested {
+            symbol: symbol.clone(),
+            quantity,
+            wallet: Address::random(),
+            requested_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_accepted() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: IssuerRequestId::new("ISS123"),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            accepted_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_completed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintCompleted {
+            completed_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_rejected() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintRejected {
+            reason: "API timeout".to_string(),
+            rejected_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintAcceptanceFailed {
+            reason: "Transaction reverted".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_token_receipt_failed() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::TokenReceiptFailed {
+            reason: "Verification failed".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_received() -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::TokensReceived {
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted: U256::from(30_000_000_000_000_000_000_u128),
+            received_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_envelope(
+        event: TokenizedEquityMintEvent,
+    ) -> EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> {
+        EventEnvelope {
+            aggregate_id: "mint-123".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn mint_event_updates_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        // Start with 20 onchain and 80 offchain - imbalanced (20% onchain).
+        // Threshold: target 50%, deviation 20%, so lower bound is 30%.
+        // 20% < 30% triggers TooMuchOffchain.
+        let inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
+            .unwrap()
+            .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
+            .unwrap();
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+
+        // Initially, trigger should detect imbalance (too much offchain).
+        let initial_check = trigger.check_and_trigger_equity(&symbol);
+        assert!(
+            matches!(initial_check, Ok(TriggeredOperation::Mint { .. })),
+            "Expected initial imbalance to trigger Mint, got {initial_check:?}"
+        );
+
+        // Clear in-progress so we can test again.
+        trigger.clear_equity_in_progress(&symbol);
+
+        // Apply MintAccepted - this moves shares to inflight.
+        // Inflight should now block imbalance detection.
+        trigger.apply_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30));
+
+        // With inflight, imbalance detection should return NoImbalance.
+        let after_accepted = trigger.check_and_trigger_equity(&symbol);
+        assert_eq!(
+            after_accepted,
+            Err(EquityTriggerSkip::NoImbalance),
+            "Expected NoImbalance due to inflight"
+        );
+    }
+
+    #[test]
+    fn mint_completion_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+
+        // Mark symbol as in-progress.
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+
+        // Create event batch with MintRequested and MintCompleted.
+        let events = vec![
+            make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
+            make_mint_envelope(make_mint_completed()),
+        ];
+
+        // Check that terminal event is detected.
+        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+
+        // Simulate what dispatch does - clear in-progress on terminal.
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[test]
+    fn mint_rejection_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+
+        // Mark symbol as in-progress.
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+
+        let events = vec![
+            make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
+            make_mint_envelope(make_mint_rejected()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[test]
+    fn mint_acceptance_failure_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let events = vec![
+            make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
+            make_mint_envelope(make_mint_acceptance_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+    }
+
+    #[test]
+    fn mint_token_receipt_failure_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let events = vec![
+            make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
+            make_mint_envelope(make_token_receipt_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+    }
+
+    #[test]
+    fn extract_mint_info_returns_symbol_and_quantity() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let events = vec![make_mint_envelope(make_mint_requested(&symbol, dec!(42.5)))];
+
+        let result = RebalancingTrigger::extract_mint_info(&events);
+
+        let (extracted_symbol, extracted_quantity) = result.unwrap();
+        assert_eq!(extracted_symbol, symbol);
+        assert_eq!(extracted_quantity.0, dec!(42.5));
+    }
+
+    #[test]
+    fn extract_mint_info_returns_none_without_mint_requested() {
+        let events = vec![make_mint_envelope(make_mint_completed())];
+
+        let result = RebalancingTrigger::extract_mint_info(&events);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn has_terminal_mint_event_returns_false_for_non_terminal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let events = vec![
+            make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
+            make_mint_envelope(make_mint_accepted()),
+            make_mint_envelope(make_tokens_received()),
+        ];
+
+        assert!(!RebalancingTrigger::has_terminal_mint_event(&events));
     }
 }

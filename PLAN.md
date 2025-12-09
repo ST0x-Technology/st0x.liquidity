@@ -237,17 +237,50 @@ Implement `Query<Lifecycle<TokenizedEquityMint, Never>>` for RebalancingTrigger.
 
 ### Subtasks
 
-- [ ] Implement `Query<Lifecycle<TokenizedEquityMint, Never>>`:
+- [x] Implement `Query<Lifecycle<TokenizedEquityMint, Never>>`:
   - `dispatch()` receives mint events
   - Apply to inventory via `apply_mint_event()`
   - On completion/failure events, clear in-progress flag for symbol
 
-- [ ] Write tests:
+- [x] Write tests:
   - Mint initiation event updates inventory
   - Mint completion clears in-progress flag
   - Mint failure clears in-progress flag
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/rebalancing/trigger/mod.rs`:
+  - Added import for `Lifecycle`, `Never`, `TokenizedEquityMint`,
+    `TokenizedEquityMintEvent`, and `chrono::Utc`
+  - Added `impl Query<Lifecycle<TokenizedEquityMint, Never>>` with async
+    `dispatch()` method
+  - `dispatch()` extracts symbol/quantity from `MintRequested` event, applies
+    all events to inventory, and clears in-progress flag on terminal events
+  - Added `extract_mint_info()` helper to find symbol and quantity from
+    `MintRequested` event
+  - Added `has_terminal_mint_event()` helper to detect terminal events
+    (MintCompleted, MintRejected, MintAcceptanceFailed, TokenReceiptFailed)
+  - Added `apply_mint_event_to_inventory()` helper to apply mint events to
+    inventory
+  - Added 8 tests:
+    - `mint_event_updates_inventory` - verifies MintAccepted moves shares to
+      inflight
+    - `mint_completion_clears_in_progress_flag` - verifies MintCompleted is
+      terminal
+    - `mint_rejection_clears_in_progress_flag` - verifies MintRejected is
+      terminal
+    - `mint_acceptance_failure_clears_in_progress_flag` - verifies
+      MintAcceptanceFailed is terminal
+    - `mint_token_receipt_failure_clears_in_progress_flag` - verifies
+      TokenReceiptFailed is terminal
+    - `extract_mint_info_returns_symbol_and_quantity` - verifies extraction from
+      MintRequested
+    - `extract_mint_info_returns_none_without_mint_requested` - verifies None
+      when no MintRequested
+    - `has_terminal_mint_event_returns_false_for_non_terminal` - verifies
+      non-terminal events
 
 ---
 
