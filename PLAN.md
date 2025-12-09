@@ -672,10 +672,11 @@ compiles.
 - [x] Remove from `mod rebalancing` in lib.rs
 - [x] Remove from `mod threshold` in lib.rs (not explicitly listed but was also
       unused)
-- [ ] Keep `mod cctp` dead_code allow - TODO(#137) still applies until CCTP
-      bridge is integrated
+- [ ] Remove `mod cctp` dead_code allow - CCTP bridge must be integrated in Task
+      12
 - [ ] Keep `mod offchain_order`, `mod onchain_trade`, `mod position` dead_code
       allows - TODO(#130) still applies until dual-write is implemented
+      (separate issue)
 
 - [x] Run `cargo build` - succeeds (expected warnings for USDC/CCTP code that's
       wired but not fully called)
@@ -695,17 +696,12 @@ compiles.
     - `mod usdc_rebalance` - used for Lifecycle type parameter in CQRS
     - `mod rebalancing` - used for RebalancingTrigger, Rebalancer, managers
     - `mod threshold` - used for ImbalanceThreshold in trigger config
-  - Kept `#[allow(dead_code)]` for modules that are still genuinely unused:
-    - `mod cctp` - TODO(#137): CCTP bridge service not yet integrated
+  - Kept `#[allow(dead_code)]` for modules still genuinely unused:
     - `mod offchain_order`, `mod onchain_trade`, `mod position` - TODO(#130):
-      Dual-write not yet implemented
+      Dual-write not yet implemented (separate issue)
 
-- Expected dead_code warnings remain for:
-  - USDC rebalancing code (check_and_trigger_usdc, UsdcRebalanceManager, etc.)
-    - These are wired but not called because CCTP bridge is not yet integrated
-  - Fail command variants (FailTokenSend, FailTokenReceipt, etc.)
-    - These are defined but error handling paths not yet wired
-  - Some helper functions/fields for future use
+- Note: Task 12 will integrate CCTP and USDC rebalancing, eliminating remaining
+  dead code warnings for those modules.
 
 ---
 
@@ -797,6 +793,20 @@ constructed in production. We need to add production constructors.
 - [ ] Run `cargo build` - no dead code warnings
 - [ ] Run `cargo test -q` - all tests pass
 - [ ] Run `rainix-rs-static` - linting passes
+
+---
+
+## Task 13. Share Resources Between Conductor and Rebalancer
+
+Currently `spawn_rebalancer` creates its own `SymbolCache` and `InventoryView`
+which duplicates resources created by the conductor. These should be shared.
+
+### Subtasks
+
+- [ ] Pass shared `SymbolCache` into `spawn_rebalancer` from caller
+- [ ] Pass shared `InventoryView` into `spawn_rebalancer` from caller
+- [ ] Ensure conductor and rebalancer use the same instances
+- [ ] Update tests accordingly
 
 ---
 

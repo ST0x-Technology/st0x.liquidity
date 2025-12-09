@@ -569,6 +569,8 @@ pub mod tests {
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "--ethereum-rpc-url",
                     "https://mainnet.infura.io",
+                    "--ethereum-private-key",
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
@@ -616,6 +618,8 @@ pub mod tests {
                     "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "--ethereum-rpc-url",
                     "https://mainnet.infura.io",
+                    "--ethereum-private-key",
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
@@ -667,6 +671,8 @@ pub mod tests {
                     "0.4",
                     "--usdc-deviation",
                     "0.25",
+                    "--ethereum-private-key",
+                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();

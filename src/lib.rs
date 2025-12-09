@@ -1,56 +1,60 @@
+use std::sync::{Arc, RwLock};
+
+use alloy::hex;
+use alloy::network::EthereumWallet;
+use alloy::primitives::B256;
+use alloy::providers::ProviderBuilder;
+use alloy::signers::local::PrivateKeySigner;
+use cqrs_es::CqrsFramework;
+use cqrs_es::mem_store::MemStore;
 use sqlx::SqlitePool;
+use st0x_broker::alpaca::AlpacaAuthEnv;
+use tokio::sync::mpsc;
 use tracing::{error, info, info_span, warn};
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses AlpacaTokenization client
-#[allow(dead_code)]
+use alpaca_tokenization::AlpacaTokenizationService;
+use alpaca_wallet::AlpacaWalletService;
+use cctp::{CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM};
+use equity_redemption::EquityRedemption;
+use inventory::InventoryView;
+use lifecycle::{Lifecycle, Never};
+use onchain::vault::{VaultId, VaultService};
+use rebalancing::usdc::UsdcRebalanceManager;
+use rebalancing::{
+    MintManager, Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, RedemptionManager,
+};
+use symbol::cache::SymbolCache;
+use tokenized_equity_mint::TokenizedEquityMint;
+use usdc_rebalance::UsdcRebalance;
+
 mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses CCTP service
-#[allow(dead_code)]
 mod cctp;
 pub mod cli;
 mod conductor;
 pub mod env;
+mod equity_redemption;
 mod error;
+mod inventory;
 mod lifecycle;
 mod lock;
 mod offchain;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
 mod offchain_order;
 mod onchain;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
 mod onchain_trade;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
 mod position;
 mod queue;
+mod rebalancing;
 pub mod reporter;
 mod shares;
 mod symbol;
 mod telemetry;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
 mod threshold;
-// TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
-#[allow(dead_code)]
 mod tokenized_equity_mint;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses EquityRedemption aggregate
-#[allow(dead_code)]
-mod equity_redemption;
 mod trade_execution_link;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses UsdcRebalance aggregate
-#[allow(dead_code)]
 mod usdc_rebalance;
-
-#[allow(dead_code)]
-// TODO(#139): Remove dead_code allow when rebalancing is triggered from InventoryView
-mod rebalancing;
-
-mod inventory;
 
 pub use telemetry::{TelemetryError, TelemetryGuard};
 
@@ -155,7 +159,7 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
         BrokerConfig::DryRun => {
             info!("Initializing test broker for dry-run mode");
             let broker = MockBrokerConfig.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
         }
         BrokerConfig::Schwab(schwab_auth) => {
             info!("Initializing Schwab broker");
@@ -164,12 +168,27 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
                 pool: pool.clone(),
             };
             let broker = schwab_config.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
         }
         BrokerConfig::Alpaca(alpaca_auth) => {
             info!("Initializing Alpaca broker");
             let broker = alpaca_auth.clone().try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
+
+            let rebalancer = if let Some(rebalancing_config) = &config.rebalancing {
+                info!("Initializing rebalancing infrastructure");
+                Some(spawn_rebalancer(rebalancing_config, alpaca_auth).await?)
+            } else {
+                info!("Rebalancing not configured");
+                None
+            };
+
+            Box::pin(run_with_broker(
+                config.clone(),
+                pool.clone(),
+                broker,
+                rebalancer,
+            ))
+            .await
         }
     }
 }

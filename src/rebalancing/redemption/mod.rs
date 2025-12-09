@@ -3,7 +3,7 @@
 //! This module provides the trait and implementations for redeeming tokenized equities
 //! through the Alpaca tokenization API.
 
-mod manager;
+pub(crate) mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
 

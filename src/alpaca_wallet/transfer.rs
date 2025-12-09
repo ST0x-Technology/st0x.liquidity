@@ -28,8 +28,6 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this type
-#[allow(dead_code)]
 impl TokenSymbol {
     pub(crate) fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -306,7 +304,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -347,7 +345,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -384,7 +382,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -414,7 +412,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -446,7 +444,7 @@ mod tests {
                 .body("not valid json");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -476,7 +474,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -528,7 +526,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -567,7 +565,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -598,7 +596,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -640,7 +638,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -682,7 +680,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -715,7 +713,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -769,7 +767,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -817,7 +815,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -865,7 +863,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -912,7 +910,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -948,7 +946,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -983,7 +981,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1020,7 +1018,7 @@ mod tests {
                 .body("not valid json");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1093,7 +1091,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1145,7 +1143,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1179,7 +1177,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1211,7 +1209,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),

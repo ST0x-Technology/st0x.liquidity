@@ -710,7 +710,7 @@ mod tests {
     async fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
         let account_mock = create_account_mock(server, "test-account-id");
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key".to_string(),
             "test_secret".to_string(),

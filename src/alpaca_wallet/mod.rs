@@ -30,29 +30,43 @@ use std::sync::Arc;
 use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
-pub(crate) use client::AlpacaWalletError;
+pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
 pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
 
 #[cfg(test)]
-pub(crate) use client::{AlpacaWalletClient, create_account_mock};
+pub(crate) use client::create_account_mock;
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
-#[allow(dead_code)]
 /// Service facade for Alpaca crypto wallet operations.
 ///
 /// Provides a high-level API for deposits, withdrawals, and transfer polling.
 pub(crate) struct AlpacaWalletService {
-    client: Arc<client::AlpacaWalletClient>,
+    client: Arc<AlpacaWalletClient>,
     polling_config: PollingConfig,
 }
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
-#[allow(dead_code)]
 impl AlpacaWalletService {
+    /// Creates a new Alpaca wallet service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client fails to initialize (e.g., invalid credentials).
+    pub(crate) async fn new(
+        base_url: String,
+        api_key: String,
+        api_secret: String,
+    ) -> Result<Self, AlpacaWalletError> {
+        let client = AlpacaWalletClient::new(base_url, api_key, api_secret).await?;
+
+        Ok(Self {
+            client: Arc::new(client),
+            polling_config: PollingConfig::default(),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_client(
-        client: client::AlpacaWalletClient,
+        client: AlpacaWalletClient,
         polling_config: Option<PollingConfig>,
     ) -> Self {
         Self {
@@ -195,7 +209,7 @@ mod tests {
     async fn create_test_service(server: &MockServer) -> AlpacaWalletService {
         let account_mock = create_account_mock(server, "test-account-id");
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key".to_string(),
             "test_secret".to_string(),
@@ -438,7 +452,7 @@ mod tests {
 
         let account_mock = create_account_mock(&server, "test-account-id");
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key".to_string(),
             "test_secret".to_string(),

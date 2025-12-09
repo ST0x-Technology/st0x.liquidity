@@ -7,6 +7,8 @@ mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
 
+pub(crate) use manager::UsdcRebalanceManager;
+
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use thiserror::Error;

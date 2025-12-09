@@ -78,11 +78,13 @@ const ETHEREUM_DOMAIN: u32 = 0;
 /// CCTP domain identifier for Base
 const BASE_DOMAIN: u32 = 6;
 
-const USDC_ETHEREUM: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-const USDC_BASE: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
-const TOKEN_MESSENGER_V2: Address = address!("28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
-const MESSAGE_TRANSMITTER_V2: Address = address!("81D40F21F12A8F0E3252Bccb954D722d4c464B64");
+pub(crate) const TOKEN_MESSENGER_V2: Address =
+    address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
+pub(crate) const MESSAGE_TRANSMITTER_V2: Address =
+    address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 
 const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
 

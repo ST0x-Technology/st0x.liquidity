@@ -3,7 +3,6 @@ use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-#[cfg(test)]
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -23,8 +22,6 @@ pub enum AlpacaWalletError {
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
 
-    // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this error variant
-    #[allow(dead_code)]
     #[error("Invalid decimal value '{value}': {source}")]
     InvalidDecimal {
         value: String,
@@ -50,8 +47,6 @@ pub enum AlpacaWalletError {
         elapsed: std::time::Duration,
     },
 
-    // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this error variant
-    #[allow(dead_code)]
     #[error("Max retries ({retries}) exceeded for transfer {transfer_id}")]
     MaxRetriesExceeded {
         transfer_id: AlpacaTransferId,
@@ -79,7 +74,6 @@ pub enum AlpacaWalletError {
     },
 }
 
-#[cfg(test)]
 #[derive(Deserialize)]
 struct AccountResponse {
     id: String,
@@ -94,8 +88,10 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    #[cfg(test)]
-    pub(crate) async fn new_with_base_url(
+    /// Creates a new Alpaca wallet client.
+    ///
+    /// Fetches the account ID from the Alpaca API during construction.
+    pub(crate) async fn new(
         base_url: String,
         api_key: String,
         api_secret: String,
@@ -113,7 +109,6 @@ impl AlpacaWalletClient {
         })
     }
 
-    #[cfg(test)]
     async fn fetch_account_id(
         client: &Client,
         base_url: &str,
@@ -312,7 +307,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -342,7 +337,7 @@ mod tests {
                 .json_body(json!({"success": true}));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -370,7 +365,7 @@ mod tests {
             }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -400,7 +395,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -436,7 +431,7 @@ mod tests {
                 .json_body(json!({"success": true}));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -465,7 +460,7 @@ mod tests {
             }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
