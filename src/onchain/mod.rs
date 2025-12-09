@@ -9,6 +9,9 @@ pub(crate) mod position_calculator;
 pub(crate) mod pyth;
 mod take_order;
 pub(crate) mod trade;
+// TODO(#137): Remove dead_code allow when rebalancing orchestration is implemented
+#[allow(dead_code)]
+pub(crate) mod vault;
 
 pub use trade::OnchainTrade;
 

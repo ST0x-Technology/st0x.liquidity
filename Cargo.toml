@@ -47,7 +47,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
 flate2 = "1.0"
 httpmock = "0.7.0"
-rain-math-float = { path = "lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
+rain-math-float = { path = "lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
 reqwest = { version = "0.12.4", features = [
   "json",
   "rustls-tls",

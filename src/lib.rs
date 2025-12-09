@@ -11,6 +11,7 @@ pub mod cli;
 mod conductor;
 pub mod env;
 mod error;
+mod lifecycle;
 mod lock;
 pub mod migration;
 mod offchain;
@@ -22,7 +23,6 @@ mod onchain;
 #[allow(dead_code)]
 pub(crate) mod onchain_trade;
 // TODO(#130): Remove dead_code allow when dual-write is implemented
-mod lifecycle;
 #[allow(dead_code)]
 mod position;
 mod queue;
@@ -30,6 +30,7 @@ pub mod reporter;
 mod shares;
 mod symbol;
 mod telemetry;
+// TODO(#130): Remove dead_code allow when dual-write is implemented
 #[allow(dead_code)]
 mod threshold;
 mod trade_execution_link;
