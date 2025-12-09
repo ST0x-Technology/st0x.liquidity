@@ -5,12 +5,15 @@ mod usdc;
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use clap::Parser;
 use cqrs_es::{EventEnvelope, Query};
+use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use url::Url;
 
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
@@ -27,7 +30,82 @@ use st0x_broker::Symbol;
 pub(crate) use equity::EquityTriggerSkip;
 pub(crate) use usdc::UsdcTriggerSkip;
 
-/// Configuration for the rebalancing trigger.
+/// Environment configuration for rebalancing (parsed via clap).
+#[derive(Parser, Debug, Clone)]
+pub struct RebalancingEnv {
+    /// Enable rebalancing operations (requires Alpaca broker)
+    #[clap(long, env, default_value = "false", action = clap::ArgAction::Set)]
+    rebalancing_enabled: bool,
+    /// Target ratio of onchain to total for equity (0.0-1.0)
+    #[clap(long, env, default_value = "0.5")]
+    equity_target_ratio: Decimal,
+    /// Deviation from equity target that triggers rebalancing (0.0-1.0)
+    #[clap(long, env, default_value = "0.2")]
+    equity_deviation: Decimal,
+    /// Target ratio of onchain to total for USDC (0.0-1.0)
+    #[clap(long, env, default_value = "0.5")]
+    usdc_target_ratio: Decimal,
+    /// Deviation from USDC target that triggers rebalancing (0.0-1.0)
+    #[clap(long, env, default_value = "0.3")]
+    usdc_deviation: Decimal,
+    /// Wallet address for receiving minted tokens (required when rebalancing enabled)
+    #[clap(long, env)]
+    redemption_wallet: Option<Address>,
+    /// Ethereum RPC URL for CCTP operations (required when rebalancing enabled)
+    #[clap(long, env)]
+    ethereum_rpc_url: Option<Url>,
+}
+
+/// Error type for rebalancing configuration validation.
+#[derive(Debug, thiserror::Error)]
+pub enum RebalancingConfigError {
+    #[error("rebalancing requires Alpaca broker")]
+    NotAlpacaBroker,
+    #[error("rebalancing requires redemption_wallet when enabled")]
+    MissingRedemptionWallet,
+    #[error("rebalancing requires ethereum_rpc_url when enabled")]
+    MissingEthereumRpcUrl,
+}
+
+impl RebalancingEnv {
+    pub fn is_enabled(&self) -> bool {
+        self.rebalancing_enabled
+    }
+
+    pub fn into_config(self) -> Result<RebalancingConfig, RebalancingConfigError> {
+        let redemption_wallet = self
+            .redemption_wallet
+            .ok_or(RebalancingConfigError::MissingRedemptionWallet)?;
+
+        let ethereum_rpc_url = self
+            .ethereum_rpc_url
+            .ok_or(RebalancingConfigError::MissingEthereumRpcUrl)?;
+
+        Ok(RebalancingConfig {
+            equity_threshold: ImbalanceThreshold {
+                target: self.equity_target_ratio,
+                deviation: self.equity_deviation,
+            },
+            usdc_threshold: ImbalanceThreshold {
+                target: self.usdc_target_ratio,
+                deviation: self.usdc_deviation,
+            },
+            redemption_wallet,
+            ethereum_rpc_url,
+        })
+    }
+}
+
+/// Configuration for rebalancing operations.
+#[derive(Debug, Clone)]
+pub(crate) struct RebalancingConfig {
+    pub(crate) equity_threshold: ImbalanceThreshold,
+    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) redemption_wallet: Address,
+    pub(crate) ethereum_rpc_url: Url,
+}
+
+/// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,

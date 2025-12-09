@@ -444,7 +444,7 @@ Extend `Env` and `Config` with rebalancing configuration.
 
 ### Subtasks
 
-- [ ] Add optional `RebalancingConfig` to `Config`:
+- [x] Add optional `RebalancingConfig` to `Config`:
   ```rust
   pub struct RebalancingConfig {
       pub(crate) equity_threshold: ImbalanceThreshold,
@@ -454,7 +454,7 @@ Extend `Env` and `Config` with rebalancing configuration.
   }
   ```
 
-- [ ] Add `RebalancingEnv` that gets converted into RebalancingConfig following
+- [x] Add `RebalancingEnv` that gets converted into RebalancingConfig following
       the `into_config()` pattern. Use clap's flatten annotation to include this
       in the overall Env
   - `rebalancing_enabled: bool` (default false)
@@ -465,16 +465,56 @@ Extend `Env` and `Config` with rebalancing configuration.
   - `redemption_wallet: Option<Address>`
   - `ethereum_rpc_url: Option<Url>` (for CCTP on Ethereum)
 
-- [ ] Parse rebalancing config in `into_config()` when `rebalancing_enabled` and
+- [x] Parse rebalancing config in `into_config()` when `rebalancing_enabled` and
       broker is Alpaca
 
-- [ ] Write tests:
+- [x] Write tests:
   - Rebalancing disabled by default
   - Rebalancing enabled parses all fields
   - Missing required fields errors when enabled
   - Default values applied correctly
+  - Any other new added logic
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/env.rs`:
+  - Added `RebalancingConfig` struct with `equity_threshold`, `usdc_threshold`,
+    `redemption_wallet`, and `ethereum_rpc_url` fields
+  - Added `ConfigError` enum with variants: `RebalancingNotAlpacaBroker`,
+    `RebalancingMissingRedemptionWallet`, `RebalancingMissingEthereumRpcUrl`,
+    and `Clap` for wrapping clap errors
+  - Added optional `rebalancing: Option<RebalancingConfig>` field to `Config`
+  - Added `RebalancingEnv` struct with clap annotations:
+    - `rebalancing_enabled: bool` with `ArgAction::Set` for explicit true/false
+    - `equity_target_ratio: Decimal` (default 0.5)
+    - `equity_deviation: Decimal` (default 0.2)
+    - `usdc_target_ratio: Decimal` (default 0.5)
+    - `usdc_deviation: Decimal` (default 0.3)
+    - `redemption_wallet: Option<Address>`
+    - `ethereum_rpc_url: Option<Url>`
+  - Added `RebalancingEnv::into_config()` method that validates:
+    - Returns `None` if `rebalancing_enabled` is false
+    - Returns `RebalancingNotAlpacaBroker` if broker is not Alpaca
+    - Returns `RebalancingMissingRedemptionWallet` if wallet not provided
+    - Returns `RebalancingMissingEthereumRpcUrl` if URL not provided
+  - Changed `Env::into_config()` return type from `Result<Config, clap::Error>`
+    to `Result<Config, ConfigError>`
+  - Updated all test `Config` struct literals to include `rebalancing: None`
+- `src/api.rs`: Updated test `Config` struct literals to include
+  `rebalancing: None`
+- `src/cli.rs`: Updated test `Config` struct literals to include
+  `rebalancing: None`
+- Added `temp-env` as dev dependency for environment variable testing
+- Added 6 new tests:
+  - `rebalancing_disabled_by_default`
+  - `rebalancing_enabled_with_schwab_fails`
+  - `rebalancing_enabled_missing_redemption_wallet_fails`
+  - `rebalancing_enabled_missing_ethereum_rpc_url_fails`
+  - `rebalancing_enabled_with_alpaca_and_all_fields_succeeds`
+  - `rebalancing_uses_default_threshold_values`
+  - `rebalancing_custom_threshold_values`
 
 ---
 

@@ -121,6 +121,7 @@ httpmock.workspace = true
 serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest.workspace = true
+temp-env = "0.3.6"
 
 [lints]
 workspace = true
