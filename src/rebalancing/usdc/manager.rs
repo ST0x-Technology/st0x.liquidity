@@ -6,44 +6,22 @@
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use async_trait::async_trait;
+use cqrs_es::{CqrsFramework, EventStore};
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::{info, instrument, warn};
 
+use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
-    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
+    AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{BurnReceipt, CctpBridge, CctpError};
+use crate::cctp::{BurnReceipt, CctpBridge};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultError, VaultId, VaultService};
+use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
-    RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceError,
-    UsdcRebalanceId,
+    RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
-
-#[derive(Debug, Error)]
-pub(crate) enum UsdcRebalanceManagerError {
-    #[error("Alpaca wallet error: {0}")]
-    AlpacaWallet(#[from] AlpacaWalletError),
-    #[error("CCTP bridge error: {0}")]
-    Cctp(#[from] CctpError),
-    #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<UsdcRebalanceError>),
-    #[error("Withdrawal failed with terminal status: {status}")]
-    WithdrawalFailed { status: String },
-    #[error("Deposit failed with terminal status: {status}")]
-    DepositFailed { status: String },
-    #[error("Invalid amount: {0}")]
-    InvalidAmount(String),
-    #[error("Arithmetic overflow: {0}")]
-    ArithmeticOverflow(String),
-    #[error("U256 parse error: {0}")]
-    U256Parse(#[from] alloy::primitives::ruint::ParseError),
-}
 
 pub(crate) struct UsdcRebalanceManager<P, S, ES>
 where
@@ -646,6 +624,31 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     Ok(U256::from_str_radix(&integer, 10)?)
 }
 
+#[async_trait]
+impl<P, S, ES> UsdcRebalanceTrait for UsdcRebalanceManager<P, S, ES>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+    S: Signer + Clone + Send + Sync + 'static,
+    ES: EventStore<Lifecycle<UsdcRebalance, Never>> + Send + Sync,
+    ES::AC: Send,
+{
+    async fn execute_alpaca_to_base(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        Self::execute_alpaca_to_base(self, id, amount).await
+    }
+
+    async fn execute_base_to_alpaca(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        Self::execute_base_to_alpaca(self, id, amount).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::network::{Ethereum, EthereumWallet};
@@ -656,8 +659,8 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
+    use cqrs_es::{AggregateError, CqrsFramework};
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;

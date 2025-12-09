@@ -15,7 +15,8 @@
 //! All persistent state lives in aggregates via the event store. On restart,
 //! managers can resume by querying aggregate state.
 
-mod mint;
-mod redemption;
+pub(crate) mod mint;
+mod rebalancer;
+pub(crate) mod redemption;
 mod trigger;
-mod usdc;
+pub(crate) mod usdc;

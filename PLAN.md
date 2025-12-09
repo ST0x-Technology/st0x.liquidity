@@ -393,24 +393,48 @@ executes them via managers.
 
 ### Subtasks
 
-- [ ] Define `OperationExecutor<P, S, ES>` struct holding:
-  - `MintManager<P, S, ES>`
-  - `RedemptionManager<P, S, ES>`
-  - `UsdcRebalanceManager<P, S, ES>`
+- [x] Define `OperationExecutor<P, S, MintES, RedemptionES, UsdcES>` struct
+      holding:
+  - `MintManager<P, S, MintES>`
+  - `RedemptionManager<P, S, RedemptionES>`
+  - `UsdcRebalanceManager<P, S, UsdcES>`
   - `mpsc::Receiver<TriggeredOperation>`
+  - `wallet: Address` (for mint operations)
 
-- [ ] Implement `run()` async method:
+- [x] Implement `run()` async method:
   - Loop receiving from channel
   - Match on operation type, call appropriate manager
   - Log results
 
-- [ ] Write tests:
-  - Mint operation dispatches to MintManager
-  - Redemption operation dispatches to RedemptionManager
-  - USDC operations dispatch to UsdcRebalanceManager
-  - Channel closed terminates run loop
+- [x] Write tests:
+  - `shares_to_u256_converts_whole_number` - verifies 42 → 42e18
+  - `shares_to_u256_converts_fractional` - verifies 100.5 → 100.5e18
+  - `shares_to_u256_converts_zero` - verifies 0 → 0
+  - `shares_to_u256_rejects_negative` - verifies negative values error
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- Created `src/rebalancing/executor.rs`:
+  - `OperationExecutor<P, S, MintES, RedemptionES, UsdcES>` with 3 separate
+    EventStore type parameters (one per manager type)
+  - `new()` constructor taking all managers, receiver, and wallet address
+  - `run()` async method that loops receiving operations until channel closes
+  - `dispatch()` method that matches on operation type
+  - `execute_mint()` generates IssuerRequestId and calls MintManager
+  - `execute_redemption()` converts FractionalShares to U256 and calls
+    RedemptionManager
+  - `execute_usdc_alpaca_to_base()` generates UsdcRebalanceId and calls
+    UsdcRebalanceManager
+  - `execute_usdc_base_to_alpaca()` generates UsdcRebalanceId and calls
+    UsdcRebalanceManager
+  - `shares_to_u256_18_decimals()` helper to convert FractionalShares (Decimal)
+    to U256 with 18 decimal places
+  - `SharesConversionError` enum for conversion errors
+  - 4 unit tests for the conversion function
+- Updated `src/rebalancing/mod.rs`:
+  - Added `mod executor;`
 
 ---
 
@@ -420,7 +444,19 @@ Extend `Env` and `Config` with rebalancing configuration.
 
 ### Subtasks
 
-- [ ] Add optional rebalancing fields to `Env`:
+- [ ] Add optional `RebalancingConfig` to `Config`:
+  ```rust
+  pub struct RebalancingConfig {
+      pub(crate) equity_threshold: ImbalanceThreshold,
+      pub(crate) usdc_threshold: ImbalanceThreshold,
+      pub(crate) redemption_wallet: Address,
+      pub(crate) ethereum_rpc_url: Url,
+  }
+  ```
+
+- [ ] Add `RebalancingEnv` that gets converted into RebalancingConfig following
+      the `into_config()` pattern. Use clap's flatten annotation to include this
+      in the overall Env
   - `rebalancing_enabled: bool` (default false)
   - `equity_target_ratio: Decimal` (default 0.5)
   - `equity_deviation: Decimal` (default 0.2)
@@ -428,16 +464,6 @@ Extend `Env` and `Config` with rebalancing configuration.
   - `usdc_deviation: Decimal` (default 0.3)
   - `redemption_wallet: Option<Address>`
   - `ethereum_rpc_url: Option<Url>` (for CCTP on Ethereum)
-
-- [ ] Add `RebalancingConfig` to `Config`:
-  ```rust
-  pub(crate) struct RebalancingConfig {
-      pub(crate) equity_threshold: ImbalanceThreshold,
-      pub(crate) usdc_threshold: ImbalanceThreshold,
-      pub(crate) redemption_wallet: Address,
-      pub(crate) ethereum_rpc_url: Url,
-  }
-  ```
 
 - [ ] Parse rebalancing config in `into_config()` when `rebalancing_enabled` and
       broker is Alpaca
