@@ -56,6 +56,30 @@ where
     P: Provider + Clone,
     S: Signer + Clone + Sync,
 {
+    /// Create a new tokenization service.
+    pub(crate) fn new(
+        base_url: String,
+        api_key: String,
+        api_secret: String,
+        provider: P,
+        signer: S,
+        redemption_wallet: Address,
+    ) -> Self {
+        let client = AlpacaTokenizationClient::new(
+            base_url,
+            api_key,
+            api_secret,
+            provider,
+            signer,
+            redemption_wallet,
+        );
+
+        Self {
+            client,
+            polling_config: PollingConfig::default(),
+        }
+    }
+
     /// Request a mint operation to convert offchain shares to onchain tokens.
     pub(crate) async fn request_mint(
         &self,
@@ -269,6 +293,25 @@ where
     P: Provider + Clone,
     S: Signer + Clone + Sync,
 {
+    fn new(
+        base_url: String,
+        api_key: String,
+        api_secret: String,
+        provider: P,
+        signer: S,
+        redemption_wallet: Address,
+    ) -> Self {
+        Self {
+            http_client: Client::new(),
+            base_url,
+            api_key,
+            api_secret,
+            provider,
+            signer,
+            redemption_wallet,
+        }
+    }
+
     #[cfg(test)]
     fn new_with_base_url(
         base_url: String,

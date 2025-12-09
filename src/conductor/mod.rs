@@ -42,6 +42,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
     config: Config,
     pool: SqlitePool,
     broker_maintenance: Option<JoinHandle<()>>,
+    rebalancer: Option<JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
 
@@ -57,8 +58,14 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
         info!("Starting conductor (no market hours restrictions)");
     }
 
-    let mut conductor = match Conductor::start(&config, &pool, broker.clone(), broker_maintenance)
-        .await
+    let mut conductor = match Conductor::start(
+        &config,
+        &pool,
+        broker.clone(),
+        broker_maintenance,
+        rebalancer,
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -71,7 +78,14 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
 
             let new_maintenance = broker.run_broker_maintenance().await;
 
-            return Box::pin(run_market_hours_loop(broker, config, pool, new_maintenance)).await;
+            return Box::pin(run_market_hours_loop(
+                broker,
+                config,
+                pool,
+                new_maintenance,
+                None,
+            ))
+            .await;
         }
     };
 
@@ -90,7 +104,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
             conductor.abort_trading_tasks();
             let next_maintenance = conductor.broker_maintenance;
             info!("Trading tasks shutdown, DEX events buffering");
-            Box::pin(run_market_hours_loop(broker, config, pool, next_maintenance)).await
+            Box::pin(run_market_hours_loop(broker, config, pool, next_maintenance, None)).await
         }
     }
 }
@@ -101,6 +115,7 @@ impl Conductor {
         pool: &SqlitePool,
         broker: B,
         broker_maintenance: Option<JoinHandle<()>>,
+        rebalancer: Option<JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
         let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
@@ -115,12 +130,16 @@ impl Conductor {
 
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
 
-        Ok(
+        let mut builder =
             ConductorBuilder::new(config.clone(), pool.clone(), cache, provider, broker)
                 .with_broker_maintenance(broker_maintenance)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn(),
-        )
+                .with_dex_event_streams(clear_stream, take_stream);
+
+        if let Some(rebalancer_handle) = rebalancer {
+            builder = builder.with_rebalancer(rebalancer_handle);
+        }
+
+        Ok(builder.spawn())
     }
 
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {

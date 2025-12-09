@@ -498,6 +498,49 @@ pub mod tests {
     }
 
     #[test]
+    fn rebalancing_enabled_missing_ethereum_private_key_fails() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_API_KEY", Some("test_key")),
+                ("ALPACA_API_SECRET", Some("test_secret")),
+                ("ALPACA_PAPER", Some("true")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--broker",
+                    "alpaca",
+                    "--rebalancing-enabled",
+                    "true",
+                    "--redemption-wallet",
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "--ethereum-rpc-url",
+                    "https://mainnet.infura.io",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let result = env.into_config();
+                assert!(matches!(
+                    result,
+                    Err(ConfigError::Rebalancing(
+                        RebalancingConfigError::MissingEthereumPrivateKey
+                    ))
+                ));
+            },
+        );
+    }
+
+    #[test]
     fn rebalancing_enabled_with_alpaca_and_all_fields_succeeds() {
         temp_env::with_vars(
             [
