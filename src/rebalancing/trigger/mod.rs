@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
@@ -118,6 +119,29 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
         if Self::has_terminal_mint_event(events) {
             self.clear_equity_in_progress(&symbol);
             debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+        }
+    }
+}
+
+#[async_trait]
+impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
+    async fn dispatch(
+        &self,
+        aggregate_id: &str,
+        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+    ) {
+        let Some((symbol, quantity)) = Self::extract_redemption_info(events) else {
+            warn!(aggregate_id = %aggregate_id, "No TokensSent event found in redemption dispatch");
+            return;
+        };
+
+        for envelope in events {
+            self.apply_redemption_event_to_inventory(&symbol, &envelope.payload, quantity);
+        }
+
+        if Self::has_terminal_redemption_event(events) {
+            self.clear_equity_in_progress(&symbol);
+            debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
         }
     }
 }
@@ -281,6 +305,62 @@ impl RebalancingTrigger {
             }
             Err(e) => {
                 warn!(symbol = %symbol, error = %e, "Failed to apply mint event to inventory");
+            }
+        }
+
+        drop(inventory);
+    }
+
+    fn extract_redemption_info(
+        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+    ) -> Option<(Symbol, FractionalShares)> {
+        for envelope in events {
+            if let EquityRedemptionEvent::TokensSent {
+                symbol, quantity, ..
+            } = &envelope.payload
+            {
+                let shares = FractionalShares(*quantity);
+                return Some((symbol.clone(), shares));
+            }
+        }
+        None
+    }
+
+    fn has_terminal_redemption_event(
+        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+    ) -> bool {
+        events.iter().any(|envelope| {
+            matches!(
+                envelope.payload,
+                EquityRedemptionEvent::Completed { .. }
+                    | EquityRedemptionEvent::TokenSendFailed { .. }
+                    | EquityRedemptionEvent::DetectionFailed { .. }
+                    | EquityRedemptionEvent::RedemptionRejected { .. }
+            )
+        })
+    }
+
+    fn apply_redemption_event_to_inventory(
+        &self,
+        symbol: &Symbol,
+        event: &EquityRedemptionEvent,
+        quantity: FractionalShares,
+    ) {
+        let mut inventory = match self.inventory.write() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        };
+
+        let result = inventory
+            .clone()
+            .apply_redemption_event(symbol, event, quantity, Utc::now());
+
+        match result {
+            Ok(new_inventory) => {
+                *inventory = new_inventory;
+            }
+            Err(e) => {
+                warn!(symbol = %symbol, error = %e, "Failed to apply redemption event to inventory");
             }
         }
 
@@ -737,5 +817,192 @@ mod tests {
         ];
 
         assert!(!RebalancingTrigger::has_terminal_mint_event(&events));
+    }
+
+    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
+            symbol: symbol.clone(),
+            quantity,
+            redemption_wallet: Address::random(),
+            tx_hash: TxHash::random(),
+            sent_at: Utc::now(),
+        }
+    }
+
+    fn make_token_send_failed() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokenSendFailed {
+            reason: "Transaction reverted".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_detected() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::Detected {
+            tokenization_request_id: TokenizationRequestId("REQ123".to_string()),
+            detected_at: Utc::now(),
+        }
+    }
+
+    fn make_detection_failed() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::DetectionFailed {
+            reason: "Alpaca timeout".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_completed() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::Completed {
+            completed_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_rejected() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::RedemptionRejected {
+            reason: "Insufficient balance".to_string(),
+            rejected_at: Utc::now(),
+        }
+    }
+
+    fn make_redemption_envelope(
+        event: EquityRedemptionEvent,
+    ) -> EventEnvelope<Lifecycle<EquityRedemption, Never>> {
+        EventEnvelope {
+            aggregate_id: "redemption-123".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::default(),
+        }
+    }
+
+    #[test]
+    fn redemption_event_updates_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        // Start with 80 onchain and 20 offchain - imbalanced (80% onchain).
+        // Threshold: target 50%, deviation 20%, so upper bound is 70%.
+        // 80% > 70% triggers TooMuchOnchain.
+        let inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
+            .unwrap()
+            .apply_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
+            .unwrap();
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+
+        // Apply TokensSent - this moves shares from onchain available to inflight.
+        trigger.apply_redemption_event_to_inventory(
+            &symbol,
+            &make_tokens_sent(&symbol, dec!(30)),
+            shares(30),
+        );
+
+        // With inflight, imbalance detection should return NoImbalance.
+        let after_sent = trigger.check_and_trigger_equity(&symbol);
+        assert_eq!(
+            after_sent,
+            Err(EquityTriggerSkip::NoImbalance),
+            "Expected NoImbalance due to inflight"
+        );
+    }
+
+    #[test]
+    fn redemption_completion_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+
+        // Mark symbol as in-progress.
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+
+        // Create event batch with TokensSent and Completed.
+        let events = vec![
+            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_redemption_completed()),
+        ];
+
+        // Check that terminal event is detected.
+        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+
+        // Simulate what dispatch does - clear in-progress on terminal.
+        trigger.clear_equity_in_progress(&symbol);
+        assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
+    }
+
+    #[test]
+    fn redemption_token_send_failure_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let events = vec![
+            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_token_send_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+    }
+
+    #[test]
+    fn redemption_detection_failure_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let events = vec![
+            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_detection_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+    }
+
+    #[test]
+    fn redemption_rejection_clears_in_progress_flag() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let events = vec![
+            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_redemption_detected()),
+            make_redemption_envelope(make_redemption_rejected()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+    }
+
+    #[test]
+    fn extract_redemption_info_returns_symbol_and_quantity() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let events = vec![make_redemption_envelope(make_tokens_sent(
+            &symbol,
+            dec!(42.5),
+        ))];
+
+        let result = RebalancingTrigger::extract_redemption_info(&events);
+
+        let (extracted_symbol, extracted_quantity) = result.unwrap();
+        assert_eq!(extracted_symbol, symbol);
+        assert_eq!(extracted_quantity.0, dec!(42.5));
+    }
+
+    #[test]
+    fn extract_redemption_info_returns_none_without_tokens_sent() {
+        let events = vec![make_redemption_envelope(make_redemption_completed())];
+
+        let result = RebalancingTrigger::extract_redemption_info(&events);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn has_terminal_redemption_event_returns_false_for_non_terminal() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let events = vec![
+            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_redemption_detected()),
+        ];
+
+        assert!(!RebalancingTrigger::has_terminal_redemption_event(&events));
     }
 }

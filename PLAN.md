@@ -290,17 +290,49 @@ Implement `Query<Lifecycle<EquityRedemption, Never>>` for RebalancingTrigger.
 
 ### Subtasks
 
-- [ ] Implement `Query<Lifecycle<EquityRedemption, Never>>`:
+- [x] Implement `Query<Lifecycle<EquityRedemption, Never>>`:
   - `dispatch()` receives redemption events
   - Apply to inventory via `apply_redemption_event()`
   - On completion/failure events, clear in-progress flag for symbol
 
-- [ ] Write tests:
+- [x] Write tests:
   - Redemption initiation event updates inventory
   - Redemption completion clears in-progress flag
   - Redemption failure clears in-progress flag
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/rebalancing/trigger/mod.rs`:
+  - Added import for `EquityRedemption` and `EquityRedemptionEvent`
+  - Added `impl Query<Lifecycle<EquityRedemption, Never>>` with async
+    `dispatch()` method
+  - `dispatch()` extracts symbol/quantity from `TokensSent` event, applies all
+    events to inventory, and clears in-progress flag on terminal events
+  - Added `extract_redemption_info()` helper to find symbol and quantity from
+    `TokensSent` event
+  - Added `has_terminal_redemption_event()` helper to detect terminal events
+    (Completed, TokenSendFailed, DetectionFailed, RedemptionRejected)
+  - Added `apply_redemption_event_to_inventory()` helper to apply redemption
+    events to inventory
+  - Added 8 tests:
+    - `redemption_event_updates_inventory` - verifies TokensSent moves shares to
+      inflight
+    - `redemption_completion_clears_in_progress_flag` - verifies Completed is
+      terminal
+    - `redemption_token_send_failure_clears_in_progress_flag` - verifies
+      TokenSendFailed is terminal
+    - `redemption_detection_failure_clears_in_progress_flag` - verifies
+      DetectionFailed is terminal
+    - `redemption_rejection_clears_in_progress_flag` - verifies
+      RedemptionRejected is terminal
+    - `extract_redemption_info_returns_symbol_and_quantity` - verifies
+      extraction from TokensSent
+    - `extract_redemption_info_returns_none_without_tokens_sent` - verifies None
+      when no TokensSent
+    - `has_terminal_redemption_event_returns_false_for_non_terminal` - verifies
+      non-terminal events
 
 ---
 
