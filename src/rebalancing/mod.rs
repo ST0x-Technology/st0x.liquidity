@@ -21,4 +21,5 @@ pub(crate) mod redemption;
 mod trigger;
 pub(crate) mod usdc;
 
-pub use trigger::{RebalancingConfig, RebalancingConfigError, RebalancingEnv};
+pub(crate) use trigger::RebalancingConfig;
+pub use trigger::{RebalancingConfigError, RebalancingEnv};

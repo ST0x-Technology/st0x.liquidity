@@ -479,14 +479,8 @@ Extend `Env` and `Config` with rebalancing configuration.
 
 ### Changes Made
 
-- `src/env.rs`:
-  - Added `RebalancingConfig` struct with `equity_threshold`, `usdc_threshold`,
-    `redemption_wallet`, and `ethereum_rpc_url` fields
-  - Added `ConfigError` enum with variants: `RebalancingNotAlpacaBroker`,
-    `RebalancingMissingRedemptionWallet`, `RebalancingMissingEthereumRpcUrl`,
-    and `Clap` for wrapping clap errors
-  - Added optional `rebalancing: Option<RebalancingConfig>` field to `Config`
-  - Added `RebalancingEnv` struct with clap annotations:
+- `src/rebalancing/trigger/mod.rs`:
+  - Added `RebalancingEnv` struct with clap annotations (lines 33-57):
     - `rebalancing_enabled: bool` with `ArgAction::Set` for explicit true/false
     - `equity_target_ratio: Decimal` (default 0.5)
     - `equity_deviation: Decimal` (default 0.2)
@@ -494,20 +488,45 @@ Extend `Env` and `Config` with rebalancing configuration.
     - `usdc_deviation: Decimal` (default 0.3)
     - `redemption_wallet: Option<Address>`
     - `ethereum_rpc_url: Option<Url>`
-  - Added `RebalancingEnv::into_config()` method that validates:
-    - Returns `None` if `rebalancing_enabled` is false
-    - Returns `RebalancingNotAlpacaBroker` if broker is not Alpaca
-    - Returns `RebalancingMissingRedemptionWallet` if wallet not provided
-    - Returns `RebalancingMissingEthereumRpcUrl` if URL not provided
-  - Changed `Env::into_config()` return type from `Result<Config, clap::Error>`
-    to `Result<Config, ConfigError>`
+  - Added `RebalancingConfigError` enum (lines 60-68):
+    - `NotAlpacaBroker` - rebalancing requires Alpaca broker
+    - `MissingRedemptionWallet` - redemption wallet required when enabled
+    - `MissingEthereumRpcUrl` - Ethereum RPC URL required when enabled
+  - Added `RebalancingEnv::is_enabled()` method
+  - Added `RebalancingEnv::into_config()` method that returns
+    `Result<RebalancingConfig, RebalancingConfigError>`
+  - Added `RebalancingConfig` struct (lines 100-106) with `equity_threshold`,
+    `usdc_threshold`, `redemption_wallet`, and `ethereum_rpc_url` fields
+
+- `src/rebalancing/mod.rs`:
+  - Added re-exports:
+    - `pub(crate) use trigger::RebalancingConfig;`
+    - `pub use trigger::{RebalancingConfigError, RebalancingEnv};`
+
+- `src/env.rs`:
+  - Added import:
+    `use crate::rebalancing::{RebalancingConfig,
+    RebalancingConfigError, RebalancingEnv};`
+  - Added `ConfigError` enum with variants:
+    - `Rebalancing(#[from] RebalancingConfigError)` - wraps rebalancing errors
+    - `Clap(#[from] clap::Error)` - wraps clap errors
+  - Added optional `rebalancing: Option<RebalancingConfig>` field to `Config`
+  - Updated `Env` struct to include
+    `#[clap(flatten)] rebalancing: RebalancingEnv`
+  - Updated `Env::into_config()`:
+    - Checks `rebalancing.is_enabled()`
+    - Validates broker is Alpaca when enabled
+    - Calls `rebalancing.into_config()` and wraps in Some
+    - Returns `Result<Config, ConfigError>`
   - Updated all test `Config` struct literals to include `rebalancing: None`
+  - Added `Decimal` import in test module
+
 - `src/api.rs`: Updated test `Config` struct literals to include
   `rebalancing: None`
 - `src/cli.rs`: Updated test `Config` struct literals to include
   `rebalancing: None`
 - Added `temp-env` as dev dependency for environment variable testing
-- Added 6 new tests:
+- Added 7 new tests:
   - `rebalancing_disabled_by_default`
   - `rebalancing_enabled_with_schwab_fails`
   - `rebalancing_enabled_missing_redemption_wallet_fails`
@@ -524,28 +543,49 @@ Wire the rebalancing executor into ConductorBuilder.
 
 ### Subtasks
 
-- [ ] Add `rebalancing_executor: Option<JoinHandle<()>>` to `Conductor`
+- [x] Add `rebalancing_executor: Option<JoinHandle<()>>` to `Conductor`
 
-- [ ] Add `WithRebalancing` typestate to ConductorBuilder with method:
+- [x] Add `with_rebalancer` method to ConductorBuilder:
   ```rust
-  pub(crate) fn with_rebalancing(
-      self,
-      executor: OperationExecutor<P, S, ES>,
-  ) -> ConductorBuilder<P, B, WithRebalancing>
+  pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self
   ```
 
-- [ ] Update `spawn()` to spawn executor task if configured
+- [x] Update `spawn()` to include rebalancer task if configured
 
-- [ ] Update `wait_for_completion()` to await executor task
+- [x] Update `wait_for_completion()` to await rebalancer task
 
-- [ ] Update `abort_trading_tasks()` and `abort_all()` to abort executor
+- [x] Update `abort_trading_tasks()` and `abort_all()` to abort rebalancer
 
-- [ ] Write tests:
+- [x] Write tests:
   - Conductor starts without rebalancing when not configured
   - Conductor starts with rebalancing when configured
   - Executor task properly aborted on shutdown
 
-- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+- [x] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt`
+
+### Changes Made
+
+- `src/conductor/mod.rs`:
+  - Added `rebalancer: Option<JoinHandle<()>>` field to `Conductor` struct
+  - Updated `wait_for_completion()` to join on rebalancer task with proper error
+    handling
+  - Updated `abort_trading_tasks()` to abort rebalancer task
+  - Updated `abort_all()` to abort rebalancer task
+  - Added 4 new tests:
+    - `test_conductor_without_rebalancer` - verifies conductor works without
+      rebalancer
+    - `test_conductor_with_rebalancer` - verifies conductor starts with
+      rebalancer task
+    - `test_conductor_rebalancer_aborted_on_abort_all` - verifies abort_all
+      aborts rebalancer
+    - `test_conductor_rebalancer_aborted_on_abort_trading_tasks` - verifies
+      abort_trading_tasks aborts rebalancer
+
+- `src/conductor/builder.rs`:
+  - Added `rebalancer: Option<JoinHandle<()>>` field to `WithDexStreams` state
+  - Added `with_rebalancer()` method to set rebalancer task
+  - Updated `spawn()` to include rebalancer in returned Conductor
+  - Extracted `log_optional_task_status()` helper to reduce cognitive complexity
 
 ---
 
