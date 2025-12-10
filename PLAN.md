@@ -626,8 +626,7 @@ Connect rebalancing to the main startup flow for Alpaca broker.
   - Custom `Debug` impl for `RebalancingConfig` to redact private key
 
 - `src/rebalancing/usdc/mod.rs`:
-  - Added `NoOpUsdcRebalance` struct implementing `UsdcRebalance` trait
-  - This is a placeholder for when CCTP/vault services are not configured
+  - `UsdcRebalanceManager` implements the `UsdcRebalance` trait
 
 - `src/env.rs`:
   - Added `--ethereum-private-key` to 3 existing tests
@@ -645,11 +644,11 @@ Connect rebalancing to the main startup flow for Alpaca broker.
     - Parses ethereum private key and creates signer/wallet
     - Creates HTTP provider with wallet
     - Creates AlpacaTokenizationService
-    - Creates CQRS frameworks (mint, redemption, usdc) with MemStore
+    - Creates CQRS frameworks (mint, redemption, usdc) with
+      SqliteEventRepository
     - Creates operation channel
     - Creates RebalancingTrigger with inventory and symbol cache
-    - Creates MintManager, RedemptionManager
-    - Uses NoOpUsdcRebalance as placeholder for USDC operations
+    - Creates MintManager, RedemptionManager, UsdcRebalanceManager
     - Creates Rebalancer and spawns it as background task
   - Created query adapter structs to wrap Arc<RebalancingTrigger>:
     - TriggerQueryAdapter (for TokenizedEquityMint)
@@ -704,12 +703,64 @@ compiles.
     - `mod offchain_order`, `mod onchain_trade`, `mod position` - TODO(#130):
       Dual-write not yet implemented (separate issue)
 
-- Note: Task 12 will integrate CCTP and USDC rebalancing, eliminating remaining
-  dead code warnings for those modules.
+- Note: Task 12 will switch to SQLite event stores, Task 13 will integrate CCTP
+  and USDC rebalancing, eliminating remaining dead code warnings for those
+  modules.
 
 ---
 
-## Task 12. Complete USDC Auto-Rebalancing Integration
+## Task 12. SQLite Persistence and Dead Code Cleanup
+
+The rebalancing infrastructure currently uses `MemStore` (in-memory event
+storage) which loses all state on restart. This is unacceptable for production.
+We must use `SqliteEventRepository` from the `sqlite-es` crate (already a
+workspace dependency from `st0x.issuance-a/crates/sqlite-es`).
+
+Additionally, there are several dead code warnings that need to be addressed:
+
+- Unused failure command variants that need wiring or removal
+- Unused `FractionalShares::ONE` constant
+
+### Subtasks
+
+- [x] Define event store type aliases in their respective event modules:
+  - `src/tokenized_equity_mint.rs`: Add `MintEventStore` using
+    `PersistedEventStore`
+  - `src/equity_redemption.rs`: Add `RedemptionEventStore` using
+    `PersistedEventStore`
+  - `src/usdc_rebalance.rs`: Add `UsdcEventStore` using `PersistedEventStore`
+
+- [x] Update `spawn_rebalancer` signature to accept `SqlitePool`:
+  - Add `pool: SqlitePool` parameter
+  - Create
+    `PersistedEventStore::new_event_store(SqliteEventRepository::new(pool))` for
+    each store
+  - Remove `MemStore` imports and usages from spawn.rs
+
+- [x] Update callers of `spawn_rebalancer` to pass the pool
+
+- [x] Ensure migrations exist for events/snapshots tables (verified in
+      `migrations/20251103151738_event_store.sql`)
+
+- [x] Manager test modules already use `MemStore` only in `#[cfg(test)]`
+      contexts
+
+- [ ] Remove unused `FractionalShares::ONE` constant from `src/shares.rs`
+
+- [ ] Remove unused failure command variants (these represent failure scenarios
+      that don't exist in the current implementation - can be re-added when
+      recovery logic is implemented):
+  - `EquityRedemptionCommand::FailTokenSend` - remove (the current manager uses
+    `FailDetection` for failures after `TokensSent` state)
+  - `TokenizedEquityMintCommand::FailTokenReceipt` - remove (no failure path
+    exists after token receipt)
+
+- [ ] Run `cargo build`, `cargo test -q`, `rainix-rs-static`, `cargo fmt` - zero
+      warnings
+
+---
+
+## Task 13. Complete USDC Auto-Rebalancing Integration
 
 The equity rebalancing flow (mint/redemption) is fully wired in Task 10. The
 USDC rebalancing flow needs to be completed to achieve full end-to-end
@@ -729,8 +780,8 @@ auto-rebalancing.
 3. **VaultService** - Deposit/withdraw USDC from the Raindex vault on Base
 4. **UsdcRebalanceManager** - Orchestrates the above three services
 
-Currently we use `NoOpUsdcRebalance` as a placeholder. This task wires the real
-implementation.
+The `UsdcRebalanceManager` exists but is not fully wired up for production use.
+This task completes the integration.
 
 ### Configuration Requirements
 
@@ -776,12 +827,17 @@ constructed in production. We need to add production constructors.
   - Create HTTP provider for Base
   - Create `CctpBridge` with Ethereum and Base Evm instances
   - Create `VaultService` for the Raindex vault on Base
-  - Create `UsdcRebalanceManager` with all services
-  - Replace `NoOpUsdcRebalance` with the real manager
+  - Ensure `UsdcRebalanceManager` is properly instantiated with all services
 
 - [ ] Clean up unused code that emerged from incomplete wiring:
   - Remove unused `get_request_status` from AlpacaTokenizationService
   - Remove unused `signer` field from AlpacaTokenizationClient
+
+- [ ] This task will resolve the following dead code warnings:
+  - `VenueBalance::new`, `available`, `inflight` - inventory tracking for USDC
+    flow
+  - `InventoryView::usdc`, `get_equity` - reading inventory state for triggers
+  - `VaultError::InsufficientBalance` - vault error handling
 
 - [ ] Add comprehensive test coverage for all added/changed logic:
   - `AlpacaWalletClient::new()` - test client construction with valid
@@ -800,7 +856,7 @@ constructed in production. We need to add production constructors.
 
 ---
 
-## Task 13. Share Resources Between Conductor and Rebalancer
+## Task 14. Share Resources Between Conductor and Rebalancer
 
 Currently `spawn_rebalancer` creates its own `SymbolCache` and `InventoryView`
 which duplicates resources created by the conductor. These should be shared.
@@ -811,6 +867,13 @@ which duplicates resources created by the conductor. These should be shared.
 - [ ] Pass shared `InventoryView` into `spawn_rebalancer` from caller
 - [ ] Ensure conductor and rebalancer use the same instances
 - [ ] Update tests accordingly
+
+- [ ] This task will resolve the following dead code warnings:
+  - `RebalancingTriggerConfig::wallet` - used when wiring shared state
+  - `EquityTriggerSkip::AlreadyInProgress` - in-flight tracking for equity
+    operations
+  - `UsdcTriggerSkip::AlreadyInProgress` - in-flight tracking for USDC
+    operations
 
 ---
 
