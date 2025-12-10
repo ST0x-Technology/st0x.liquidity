@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::env::Config;
+use crate::env::{BrokerConfig, Config};
 use crate::error::EventProcessingError;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -22,6 +22,7 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 pub(crate) use builder::ConductorBuilder;
@@ -129,6 +130,15 @@ impl Conductor {
             get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
 
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
+
+        // Spawn rebalancer with the provider if configured
+        let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
+            (Some(rebalancing_config), BrokerConfig::Alpaca(alpaca_auth), None) => {
+                info!("Initializing rebalancing infrastructure");
+                Some(spawn_rebalancer(rebalancing_config, alpaca_auth, provider.clone()).await?)
+            }
+            (_, _, existing) => existing,
+        };
 
         let mut builder =
             ConductorBuilder::new(config.clone(), pool.clone(), cache, provider, broker)

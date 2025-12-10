@@ -4,7 +4,7 @@ use tracing::Level;
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
-use crate::rebalancing::{RebalancingConfig, RebalancingConfigError, RebalancingEnv};
+use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
 use crate::telemetry::HyperDxConfig;
 use st0x_broker::SupportedBroker;
 use st0x_broker::alpaca::AlpacaAuthEnv;
@@ -144,8 +144,9 @@ pub struct Env {
     /// Service name for HyperDX traces (only used when hyperdx_api_key is set)
     #[clap(long, env, default_value = "st0x-hedge")]
     hyperdx_service_name: String,
-    #[clap(flatten)]
-    rebalancing: RebalancingEnv,
+    /// Enable rebalancing operations (requires Alpaca broker)
+    #[clap(long, env, default_value = "false", action = clap::ArgAction::Set)]
+    rebalancing_enabled: bool,
 }
 
 impl Env {
@@ -169,13 +170,11 @@ impl Env {
             log_level: log_level_tracing,
         });
 
-        let rebalancing = if self.rebalancing.is_enabled() {
+        let rebalancing = if self.rebalancing_enabled {
             if !matches!(broker, BrokerConfig::Alpaca(_)) {
-                return Err(ConfigError::Rebalancing(
-                    RebalancingConfigError::NotAlpacaBroker,
-                ));
+                return Err(RebalancingConfigError::NotAlpacaBroker.into());
             }
-            Some(self.rebalancing.into_config()?)
+            Some(RebalancingConfig::from_env()?)
         } else {
             None
         };
@@ -397,10 +396,6 @@ pub mod tests {
                     "schwab",
                     "--rebalancing-enabled",
                     "true",
-                    "--redemption-wallet",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "--ethereum-rpc-url",
-                    "https://mainnet.infura.io",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
@@ -421,7 +416,21 @@ pub mod tests {
             [
                 ("ALPACA_API_KEY", Some("test_key")),
                 ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_PAPER", Some("true")),
+                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "ETHEREUM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
             ],
             || {
                 let args = vec![
@@ -440,18 +449,17 @@ pub mod tests {
                     "alpaca",
                     "--rebalancing-enabled",
                     "true",
-                    "--ethereum-rpc-url",
-                    "https://mainnet.infura.io",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
                 let result = env.into_config();
-                assert!(matches!(
-                    result,
-                    Err(ConfigError::Rebalancing(
-                        RebalancingConfigError::MissingRedemptionWallet
-                    ))
-                ));
+                assert!(
+                    matches!(
+                        result,
+                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                    ),
+                    "Expected clap error for missing redemption_wallet, got {result:?}"
+                );
             },
         );
     }
@@ -462,7 +470,24 @@ pub mod tests {
             [
                 ("ALPACA_API_KEY", Some("test_key")),
                 ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_PAPER", Some("true")),
+                ("ALPACA_TRADING_MODE", Some("paper")),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                (
+                    "ETHEREUM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
             ],
             || {
                 let args = vec![
@@ -481,18 +506,17 @@ pub mod tests {
                     "alpaca",
                     "--rebalancing-enabled",
                     "true",
-                    "--redemption-wallet",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
                 let result = env.into_config();
-                assert!(matches!(
-                    result,
-                    Err(ConfigError::Rebalancing(
-                        RebalancingConfigError::MissingEthereumRpcUrl
-                    ))
-                ));
+                assert!(
+                    matches!(
+                        result,
+                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                    ),
+                    "Expected clap error for missing ethereum_rpc_url, got {result:?}"
+                );
             },
         );
     }
@@ -503,7 +527,21 @@ pub mod tests {
             [
                 ("ALPACA_API_KEY", Some("test_key")),
                 ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_PAPER", Some("true")),
+                ("ALPACA_TRADING_MODE", Some("paper")),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
             ],
             || {
                 let args = vec![
@@ -522,20 +560,17 @@ pub mod tests {
                     "alpaca",
                     "--rebalancing-enabled",
                     "true",
-                    "--redemption-wallet",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "--ethereum-rpc-url",
-                    "https://mainnet.infura.io",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
                 let result = env.into_config();
-                assert!(matches!(
-                    result,
-                    Err(ConfigError::Rebalancing(
-                        RebalancingConfigError::MissingEthereumPrivateKey
-                    ))
-                ));
+                assert!(
+                    matches!(
+                        result,
+                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                    ),
+                    "Expected clap error for missing ethereum_private_key, got {result:?}"
+                );
             },
         );
     }
@@ -546,7 +581,25 @@ pub mod tests {
             [
                 ("ALPACA_API_KEY", Some("test_key")),
                 ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_PAPER", Some("true")),
+                ("ALPACA_TRADING_MODE", Some("paper")),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "ETHEREUM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
             ],
             || {
                 let args = vec![
@@ -565,12 +618,6 @@ pub mod tests {
                     "alpaca",
                     "--rebalancing-enabled",
                     "true",
-                    "--redemption-wallet",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "--ethereum-rpc-url",
-                    "https://mainnet.infura.io",
-                    "--ethereum-private-key",
-                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
@@ -595,7 +642,25 @@ pub mod tests {
             [
                 ("ALPACA_API_KEY", Some("test_key")),
                 ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_PAPER", Some("true")),
+                ("ALPACA_TRADING_MODE", Some("paper")),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "ETHEREUM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
             ],
             || {
                 let args = vec![
@@ -614,12 +679,6 @@ pub mod tests {
                     "alpaca",
                     "--rebalancing-enabled",
                     "true",
-                    "--redemption-wallet",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "--ethereum-rpc-url",
-                    "https://mainnet.infura.io",
-                    "--ethereum-private-key",
-                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
@@ -640,7 +699,29 @@ pub mod tests {
             [
                 ("ALPACA_API_KEY", Some("test_key")),
                 ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_PAPER", Some("true")),
+                ("ALPACA_TRADING_MODE", Some("paper")),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "ETHEREUM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("EQUITY_TARGET_RATIO", Some("0.6")),
+                ("EQUITY_DEVIATION", Some("0.15")),
+                ("USDC_TARGET_RATIO", Some("0.4")),
+                ("USDC_DEVIATION", Some("0.25")),
             ],
             || {
                 let args = vec![
@@ -659,20 +740,6 @@ pub mod tests {
                     "alpaca",
                     "--rebalancing-enabled",
                     "true",
-                    "--redemption-wallet",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "--ethereum-rpc-url",
-                    "https://mainnet.infura.io",
-                    "--equity-target-ratio",
-                    "0.6",
-                    "--equity-deviation",
-                    "0.15",
-                    "--usdc-target-ratio",
-                    "0.4",
-                    "--usdc-deviation",
-                    "0.25",
-                    "--ethereum-private-key",
-                    "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();

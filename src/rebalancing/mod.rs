@@ -18,12 +18,14 @@
 pub(crate) mod mint;
 mod rebalancer;
 pub(crate) mod redemption;
+mod spawn;
 mod trigger;
 pub(crate) mod usdc;
 
 pub(crate) use mint::manager::MintManager;
 pub(crate) use rebalancer::Rebalancer;
 pub(crate) use redemption::manager::RedemptionManager;
-pub(crate) use trigger::{RebalancingConfig, RebalancingTrigger, RebalancingTriggerConfig};
-
-pub use trigger::{RebalancingConfigError, RebalancingEnv};
+pub(crate) use spawn::spawn_rebalancer;
+pub(crate) use trigger::{
+    RebalancingConfig, RebalancingConfigError, RebalancingTrigger, RebalancingTriggerConfig,
+};

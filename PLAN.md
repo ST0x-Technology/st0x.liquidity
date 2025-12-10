@@ -2,6 +2,10 @@
 
 ## Goal
 
+**PRODUCTION-GRADE FULL AUTO-REBALANCING.** This system will manage millions in
+assets. There are NO half-measures, NO "out of scope", NO "fix later". Every
+component must be production-ready before this issue is closed.
+
 Connect inventory imbalance detection to rebalancing managers using an
 event-driven architecture. When aggregate events update the InventoryView and
 create an imbalance, automatically trigger the appropriate rebalancing

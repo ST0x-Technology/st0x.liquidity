@@ -1,8 +1,6 @@
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
-use serde::Serialize;
-
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -18,55 +16,31 @@ use serde_json::json;
 pub enum AlpacaWalletError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
-
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
-
-    #[error("Invalid decimal value '{value}': {source}")]
-    InvalidDecimal {
-        value: String,
-        #[source]
-        source: rust_decimal::Error,
-    },
-
     #[error(transparent)]
     FromHex(#[from] FromHexError),
-
     #[error("Amount must be positive and non-zero, got: {amount}")]
     InvalidAmount { amount: Decimal },
-
-    #[error("Empty wallet list for asset '{asset}' on network '{network}'")]
-    NoWalletFound { asset: String, network: String },
-
     #[error("Transfer not found: {transfer_id}")]
     TransferNotFound { transfer_id: AlpacaTransferId },
-
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
     TransferTimeout {
         transfer_id: AlpacaTransferId,
         elapsed: std::time::Duration,
     },
-
-    #[error("Max retries ({retries}) exceeded for transfer {transfer_id}")]
-    MaxRetriesExceeded {
-        transfer_id: AlpacaTransferId,
-        retries: u32,
-    },
-
     #[error("Invalid status transition for transfer {transfer_id}: {previous:?} -> {next:?}")]
     InvalidStatusTransition {
         transfer_id: AlpacaTransferId,
         previous: TransferStatus,
         next: TransferStatus,
     },
-
     #[error("Address {address} is not whitelisted for {asset} on {network}")]
     AddressNotWhitelisted {
         address: Address,
         asset: TokenSymbol,
         network: Network,
     },
-
     #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
     DepositTimeout {
         tx_hash: TxHash,
@@ -194,33 +168,6 @@ impl AlpacaWalletClient {
 
     pub(super) fn account_id(&self) -> &str {
         &self.account_id
-    }
-
-    pub(super) async fn whitelist_address(
-        &self,
-        address: &Address,
-        asset: &TokenSymbol,
-        network: &Network,
-    ) -> Result<WhitelistEntry, AlpacaWalletError> {
-        #[derive(Serialize)]
-        struct WhitelistRequest<'a> {
-            address: &'a Address,
-            asset: String,
-            chain: String,
-        }
-
-        let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
-
-        let request = WhitelistRequest {
-            address,
-            asset: asset.0.clone(),
-            chain: network.0.clone(),
-        };
-
-        let response = self.post(&path, &request).await?;
-        let entry: WhitelistEntry = response.json().await?;
-
-        Ok(entry)
     }
 
     pub(super) async fn get_whitelisted_addresses(

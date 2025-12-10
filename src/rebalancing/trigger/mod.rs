@@ -3,7 +3,7 @@
 mod equity;
 mod usdc;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use clap::Parser;
 use cqrs_es::{EventEnvelope, Query};
@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
@@ -30,12 +30,18 @@ use st0x_broker::Symbol;
 pub(crate) use equity::EquityTriggerSkip;
 pub(crate) use usdc::UsdcTriggerSkip;
 
+/// Error type for rebalancing configuration validation.
+#[derive(Debug, thiserror::Error)]
+pub enum RebalancingConfigError {
+    #[error("rebalancing requires Alpaca broker")]
+    NotAlpacaBroker,
+    #[error(transparent)]
+    Clap(#[from] clap::Error),
+}
+
 /// Environment configuration for rebalancing (parsed via clap).
 #[derive(Parser, Debug, Clone)]
 pub struct RebalancingEnv {
-    /// Enable rebalancing operations (requires Alpaca broker)
-    #[clap(long, env, default_value = "false", action = clap::ArgAction::Set)]
-    rebalancing_enabled: bool,
     /// Target ratio of onchain to total for equity (0.0-1.0)
     #[clap(long, env, default_value = "0.5")]
     equity_target_ratio: Decimal,
@@ -48,61 +54,73 @@ pub struct RebalancingEnv {
     /// Deviation from USDC target that triggers rebalancing (0.0-1.0)
     #[clap(long, env, default_value = "0.3")]
     usdc_deviation: Decimal,
-    /// Wallet address for receiving minted tokens (required when rebalancing enabled)
+    /// Wallet address for receiving minted tokens
     #[clap(long, env)]
-    redemption_wallet: Option<Address>,
-    /// Ethereum RPC URL for CCTP operations (required when rebalancing enabled)
+    redemption_wallet: Address,
+    /// Ethereum RPC URL for CCTP operations
     #[clap(long, env)]
-    ethereum_rpc_url: Option<Url>,
+    ethereum_rpc_url: Url,
+    /// Private key for signing Ethereum transactions
+    #[clap(long, env)]
+    ethereum_private_key: B256,
+    /// Raindex OrderBook address on Base for vault operations
+    #[clap(long, env)]
+    base_orderbook: Address,
+    /// Vault ID for USDC deposits to the Raindex vault
+    #[clap(long, env)]
+    usdc_vault_id: B256,
 }
 
-/// Error type for rebalancing configuration validation.
-#[derive(Debug, thiserror::Error)]
-pub enum RebalancingConfigError {
-    #[error("rebalancing requires Alpaca broker")]
-    NotAlpacaBroker,
-    #[error("rebalancing requires redemption_wallet when enabled")]
-    MissingRedemptionWallet,
-    #[error("rebalancing requires ethereum_rpc_url when enabled")]
-    MissingEthereumRpcUrl,
-}
+impl RebalancingConfig {
+    /// Parse rebalancing configuration from environment variables.
+    pub(crate) fn from_env() -> Result<Self, RebalancingConfigError> {
+        // clap's try_parse_from expects argv[0] to be the program name, but we only
+        // care about environment variables, so this is just a placeholder.
+        const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
 
-impl RebalancingEnv {
-    pub fn is_enabled(&self) -> bool {
-        self.rebalancing_enabled
-    }
-
-    pub fn into_config(self) -> Result<RebalancingConfig, RebalancingConfigError> {
-        let redemption_wallet = self
-            .redemption_wallet
-            .ok_or(RebalancingConfigError::MissingRedemptionWallet)?;
-
-        let ethereum_rpc_url = self
-            .ethereum_rpc_url
-            .ok_or(RebalancingConfigError::MissingEthereumRpcUrl)?;
-
-        Ok(RebalancingConfig {
+        let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+        Ok(Self {
             equity_threshold: ImbalanceThreshold {
-                target: self.equity_target_ratio,
-                deviation: self.equity_deviation,
+                target: env.equity_target_ratio,
+                deviation: env.equity_deviation,
             },
             usdc_threshold: ImbalanceThreshold {
-                target: self.usdc_target_ratio,
-                deviation: self.usdc_deviation,
+                target: env.usdc_target_ratio,
+                deviation: env.usdc_deviation,
             },
-            redemption_wallet,
-            ethereum_rpc_url,
+            redemption_wallet: env.redemption_wallet,
+            ethereum_rpc_url: env.ethereum_rpc_url,
+            ethereum_private_key: env.ethereum_private_key,
+            base_orderbook: env.base_orderbook,
+            usdc_vault_id: env.usdc_vault_id,
         })
     }
 }
 
 /// Configuration for rebalancing operations.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
+    pub(crate) ethereum_private_key: B256,
+    pub(crate) base_orderbook: Address,
+    pub(crate) usdc_vault_id: B256,
+}
+
+impl std::fmt::Debug for RebalancingConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebalancingConfig")
+            .field("equity_threshold", &self.equity_threshold)
+            .field("usdc_threshold", &self.usdc_threshold)
+            .field("redemption_wallet", &self.redemption_wallet)
+            .field("ethereum_rpc_url", &"[REDACTED]")
+            .field("ethereum_private_key", &"[REDACTED]")
+            .field("base_orderbook", &self.base_orderbook)
+            .field("usdc_vault_id", &self.usdc_vault_id)
+            .finish()
+    }
 }
 
 /// Configuration for the rebalancing trigger (runtime).
@@ -198,6 +216,9 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
         if Self::has_terminal_mint_event(events) {
             self.clear_equity_in_progress(&symbol);
             debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
+
+            // After mint completes, USDC balances may have changed - check for USDC rebalancing
+            self.check_and_trigger_usdc();
         }
     }
 }
@@ -221,6 +242,9 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
         if Self::has_terminal_redemption_event(events) {
             self.clear_equity_in_progress(&symbol);
             debug!(symbol = %symbol, "Cleared equity in-progress flag after redemption terminal event");
+
+            // After redemption completes, USDC balances may have changed - check for USDC rebalancing
+            self.check_and_trigger_usdc();
         }
     }
 }
@@ -244,61 +268,83 @@ impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
         if Self::has_terminal_usdc_rebalance_event(events) {
             self.clear_usdc_in_progress();
             debug!("Cleared USDC in-progress flag after rebalance terminal event");
+
+            // After USDC rebalance completes, check if more rebalancing is needed
+            self.check_and_trigger_usdc();
         }
     }
 }
 
 impl RebalancingTrigger {
     /// Checks inventory for equity imbalance and triggers operation if needed.
-    /// Returns the triggered operation on success, or the reason it was skipped.
-    pub(crate) fn check_and_trigger_equity(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<TriggeredOperation, EquityTriggerSkip> {
-        let guard = equity::InProgressGuard::try_claim(
+    fn check_and_trigger_equity(&self, symbol: &Symbol) {
+        let guard = match equity::InProgressGuard::try_claim(
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
-        )
-        .ok_or(EquityTriggerSkip::AlreadyInProgress)?;
+        ) {
+            Some(g) => g,
+            None => {
+                debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
+                return;
+            }
+        };
 
-        let operation = equity::check_imbalance_and_build_operation(
+        let operation = match equity::check_imbalance_and_build_operation(
             symbol,
             self.config.equity_threshold,
             &self.inventory,
             &self.symbol_cache,
-        )?;
+        ) {
+            Ok(op) => op,
+            Err(EquityTriggerSkip::NoImbalance) => return,
+            Err(EquityTriggerSkip::AlreadyInProgress) => {
+                debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
+                return;
+            }
+            Err(EquityTriggerSkip::TokenNotInCache) => {
+                error!(symbol = %symbol, "Skipped equity trigger: token not in cache");
+                return;
+            }
+        };
 
-        self.sender
-            .try_send(operation.clone())
-            .map_err(|e| {
-                warn!(error = %e, "Failed to send triggered operation");
-            })
-            .ok();
+        if let Err(e) = self.sender.try_send(operation.clone()) {
+            warn!(error = %e, "Failed to send triggered operation");
+            return;
+        }
 
+        debug!(symbol = %symbol, operation = ?operation, "Triggered equity rebalancing");
         guard.defuse();
-        Ok(operation)
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
-    /// Returns the triggered operation on success, or the reason it was skipped.
-    pub(crate) fn check_and_trigger_usdc(&self) -> Result<TriggeredOperation, UsdcTriggerSkip> {
-        let guard = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
-            .ok_or(UsdcTriggerSkip::AlreadyInProgress)?;
+    fn check_and_trigger_usdc(&self) {
+        let guard = match usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress)) {
+            Some(g) => g,
+            None => {
+                debug!("Skipped USDC trigger: already in progress");
+                return;
+            }
+        };
 
-        let operation = usdc::check_imbalance_and_build_operation(
+        let operation = match usdc::check_imbalance_and_build_operation(
             &self.config.usdc_threshold,
             &self.inventory,
-        )?;
+        ) {
+            Ok(op) => op,
+            Err(UsdcTriggerSkip::NoImbalance) => return,
+            Err(UsdcTriggerSkip::AlreadyInProgress) => {
+                debug!("Skipped USDC trigger: already in progress");
+                return;
+            }
+        };
 
-        self.sender
-            .try_send(operation.clone())
-            .map_err(|e| {
-                warn!(error = %e, "Failed to send USDC triggered operation");
-            })
-            .ok();
+        if let Err(e) = self.sender.try_send(operation.clone()) {
+            warn!(error = %e, "Failed to send USDC triggered operation");
+            return;
+        }
 
+        debug!(operation = ?operation, "Triggered USDC rebalancing");
         guard.defuse();
-        Ok(operation)
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -321,22 +367,7 @@ impl RebalancingTrigger {
             return;
         }
 
-        self.log_equity_trigger_result(symbol);
-    }
-
-    fn log_equity_trigger_result(&self, symbol: &Symbol) {
-        match self.check_and_trigger_equity(symbol) {
-            Ok(op) => {
-                debug!(symbol = %symbol, operation = ?op, "Triggered rebalancing from position event");
-            }
-            Err(EquityTriggerSkip::AlreadyInProgress) => {
-                debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
-            }
-            Err(EquityTriggerSkip::NoImbalance) => {}
-            Err(EquityTriggerSkip::TokenNotInCache) => {
-                warn!(symbol = %symbol, "Skipped equity trigger: token not in cache");
-            }
-        }
+        self.check_and_trigger_equity(symbol);
     }
 
     fn apply_position_event_to_inventory(
@@ -543,8 +574,8 @@ mod tests {
     use crate::usdc_rebalance::TransferRef;
     use alloy::primitives::{Address, U256};
 
-    fn make_trigger() -> RebalancingTrigger {
-        let (sender, _receiver) = mpsc::channel(10);
+    fn make_trigger() -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+        let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let symbol_cache = SymbolCache::default();
         let config = RebalancingTriggerConfig {
@@ -559,12 +590,15 @@ mod tests {
             wallet: address!("0x1234567890123456789012345678901234567890"),
         };
 
-        RebalancingTrigger::new(config, symbol_cache, inventory, sender)
+        (
+            RebalancingTrigger::new(config, symbol_cache, inventory, sender),
+            receiver,
+        )
     }
 
     #[test]
-    fn test_in_progress_symbol_returns_error() {
-        let trigger = make_trigger();
+    fn test_in_progress_symbol_does_not_send() {
+        let (trigger, mut receiver) = make_trigger();
         let symbol = Symbol::new("AAPL").unwrap();
 
         {
@@ -572,23 +606,23 @@ mod tests {
             guard.insert(symbol.clone());
         }
 
-        let result = trigger.check_and_trigger_equity(&symbol);
-        assert_eq!(result, Err(EquityTriggerSkip::AlreadyInProgress));
+        trigger.check_and_trigger_equity(&symbol);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
-    fn test_usdc_in_progress_returns_error() {
-        let trigger = make_trigger();
+    fn test_usdc_in_progress_does_not_send() {
+        let (trigger, mut receiver) = make_trigger();
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
-        let result = trigger.check_and_trigger_usdc();
-        assert_eq!(result, Err(UsdcTriggerSkip::AlreadyInProgress));
+        trigger.check_and_trigger_usdc();
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
     fn test_clear_equity_in_progress() {
-        let trigger = make_trigger();
+        let (trigger, _receiver) = make_trigger();
         let symbol = Symbol::new("AAPL").unwrap();
 
         {
@@ -605,7 +639,7 @@ mod tests {
 
     #[test]
     fn test_clear_usdc_in_progress() {
-        let trigger = make_trigger();
+        let (trigger, _receiver) = make_trigger();
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
         assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
@@ -616,15 +650,14 @@ mod tests {
     }
 
     #[test]
-    fn test_balanced_inventory_returns_no_imbalance() {
-        let trigger = make_trigger();
+    fn test_balanced_inventory_does_not_trigger() {
+        let (trigger, mut receiver) = make_trigger();
         let symbol = Symbol::new("AAPL").unwrap();
 
-        let equity_result = trigger.check_and_trigger_equity(&symbol);
-        assert_eq!(equity_result, Err(EquityTriggerSkip::NoImbalance));
+        trigger.check_and_trigger_equity(&symbol);
+        trigger.check_and_trigger_usdc();
 
-        let usdc_result = trigger.check_and_trigger_usdc();
-        assert_eq!(usdc_result, Err(UsdcTriggerSkip::NoImbalance));
+        assert!(receiver.try_recv().is_err());
     }
 
     fn shares(n: i64) -> FractionalShares {
@@ -682,7 +715,7 @@ mod tests {
 
     #[test]
     fn position_event_for_unknown_symbol_logs_error_without_panic() {
-        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default());
+        let (trigger, mut receiver) = make_trigger_with_inventory(InventoryView::default());
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
@@ -690,8 +723,8 @@ mod tests {
         trigger.apply_position_event_and_check(&symbol, &event);
 
         // Verify no operation was triggered.
-        let result = trigger.check_and_trigger_equity(&symbol);
-        assert_eq!(result, Err(EquityTriggerSkip::NoImbalance));
+        trigger.check_and_trigger_equity(&symbol);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -699,7 +732,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
 
         // Apply onchain buy - should add to onchain available.
         let event = make_onchain_fill(shares(50), Direction::Buy);
@@ -710,8 +743,11 @@ mod tests {
         trigger.apply_position_event_and_check(&symbol, &event);
 
         // Now inventory has 50 onchain, 50 offchain = balanced at 50%.
-        let result = trigger.check_and_trigger_equity(&symbol);
-        assert_eq!(result, Err(EquityTriggerSkip::NoImbalance));
+        // Drain any previous triggered operations (from apply_position_event_and_check).
+        while receiver.try_recv().is_ok() {}
+
+        trigger.check_and_trigger_equity(&symbol);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -844,10 +880,11 @@ mod tests {
             .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
 
         // Initially, trigger should detect imbalance (too much offchain).
-        let initial_check = trigger.check_and_trigger_equity(&symbol);
+        trigger.check_and_trigger_equity(&symbol);
+        let initial_check = receiver.try_recv();
         assert!(
             matches!(initial_check, Ok(TriggeredOperation::Mint { .. })),
             "Expected initial imbalance to trigger Mint, got {initial_check:?}"
@@ -860,12 +897,11 @@ mod tests {
         // Inflight should now block imbalance detection.
         trigger.apply_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30));
 
-        // With inflight, imbalance detection should return NoImbalance.
-        let after_accepted = trigger.check_and_trigger_equity(&symbol);
-        assert_eq!(
-            after_accepted,
-            Err(EquityTriggerSkip::NoImbalance),
-            "Expected NoImbalance due to inflight"
+        // With inflight, imbalance detection should not trigger anything.
+        trigger.check_and_trigger_equity(&symbol);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Expected no operation due to inflight"
         );
     }
 
@@ -1047,7 +1083,7 @@ mod tests {
             .apply_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
             .unwrap();
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger.apply_redemption_event_to_inventory(
@@ -1056,12 +1092,11 @@ mod tests {
             shares(30),
         );
 
-        // With inflight, imbalance detection should return NoImbalance.
-        let after_sent = trigger.check_and_trigger_equity(&symbol);
-        assert_eq!(
-            after_sent,
-            Err(EquityTriggerSkip::NoImbalance),
-            "Expected NoImbalance due to inflight"
+        // With inflight, imbalance detection should not trigger anything.
+        trigger.check_and_trigger_equity(&symbol);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Expected no operation due to inflight"
         );
     }
 
@@ -1350,5 +1385,197 @@ mod tests {
         assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
             &events
         ));
+    }
+
+    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 6] {
+        [
+            (
+                "REDEMPTION_WALLET",
+                Some("0x1234567890123456789012345678901234567890"),
+            ),
+            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
+            (
+                "ETHEREUM_PRIVATE_KEY",
+                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ),
+            ("BASE_RPC_URL", Some("https://base.example.com")),
+            (
+                "BASE_ORDERBOOK",
+                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            ),
+            (
+                "USDC_VAULT_ID",
+                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn from_env_with_all_required_fields_succeeds() {
+        temp_env::with_vars(all_rebalancing_env_vars(), || {
+            let config = RebalancingConfig::from_env().unwrap();
+
+            assert_eq!(config.equity_threshold.target, dec!(0.5));
+            assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+            assert_eq!(config.usdc_threshold.target, dec!(0.5));
+            assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
+            assert_eq!(
+                config.redemption_wallet,
+                address!("1234567890123456789012345678901234567890")
+            );
+        });
+    }
+
+    #[test]
+    fn from_env_with_custom_thresholds() {
+        let vars = [
+            (
+                "REDEMPTION_WALLET",
+                Some("0x1234567890123456789012345678901234567890"),
+            ),
+            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
+            (
+                "ETHEREUM_PRIVATE_KEY",
+                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ),
+            ("BASE_RPC_URL", Some("https://base.example.com")),
+            (
+                "BASE_ORDERBOOK",
+                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            ),
+            (
+                "USDC_VAULT_ID",
+                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+            ("EQUITY_TARGET_RATIO", Some("0.6")),
+            ("EQUITY_DEVIATION", Some("0.1")),
+            ("USDC_TARGET_RATIO", Some("0.4")),
+            ("USDC_DEVIATION", Some("0.15")),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let config = RebalancingConfig::from_env().unwrap();
+
+            assert_eq!(config.equity_threshold.target, dec!(0.6));
+            assert_eq!(config.equity_threshold.deviation, dec!(0.1));
+            assert_eq!(config.usdc_threshold.target, dec!(0.4));
+            assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
+        });
+    }
+
+    #[test]
+    fn from_env_missing_redemption_wallet_fails() {
+        let vars = [
+            ("REDEMPTION_WALLET", None),
+            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
+            (
+                "ETHEREUM_PRIVATE_KEY",
+                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ),
+            ("BASE_RPC_URL", Some("https://base.example.com")),
+            (
+                "BASE_ORDERBOOK",
+                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            ),
+            (
+                "USDC_VAULT_ID",
+                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let result = RebalancingConfig::from_env();
+            assert!(
+                matches!(result, Err(RebalancingConfigError::Clap(_))),
+                "Expected Clap error, got {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn from_env_missing_ethereum_private_key_fails() {
+        let vars = [
+            (
+                "REDEMPTION_WALLET",
+                Some("0x1234567890123456789012345678901234567890"),
+            ),
+            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
+            ("ETHEREUM_PRIVATE_KEY", None),
+            ("BASE_RPC_URL", Some("https://base.example.com")),
+            (
+                "BASE_ORDERBOOK",
+                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            ),
+            (
+                "USDC_VAULT_ID",
+                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let result = RebalancingConfig::from_env();
+            assert!(
+                matches!(result, Err(RebalancingConfigError::Clap(_))),
+                "Expected Clap error, got {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn from_env_invalid_address_format_fails() {
+        let vars = [
+            ("REDEMPTION_WALLET", Some("not-an-address")),
+            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
+            (
+                "ETHEREUM_PRIVATE_KEY",
+                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            ),
+            ("BASE_RPC_URL", Some("https://base.example.com")),
+            (
+                "BASE_ORDERBOOK",
+                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            ),
+            (
+                "USDC_VAULT_ID",
+                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let result = RebalancingConfig::from_env();
+            assert!(
+                matches!(result, Err(RebalancingConfigError::Clap(_))),
+                "Expected Clap error, got {result:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn from_env_invalid_private_key_format_fails() {
+        let vars = [
+            (
+                "REDEMPTION_WALLET",
+                Some("0x1234567890123456789012345678901234567890"),
+            ),
+            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
+            ("ETHEREUM_PRIVATE_KEY", Some("not-a-valid-key")),
+            ("BASE_RPC_URL", Some("https://base.example.com")),
+            (
+                "BASE_ORDERBOOK",
+                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
+            ),
+            (
+                "USDC_VAULT_ID",
+                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let result = RebalancingConfig::from_env();
+            assert!(
+                matches!(result, Err(RebalancingConfigError::Clap(_))),
+                "Expected Clap error, got {result:?}"
+            );
+        });
     }
 }

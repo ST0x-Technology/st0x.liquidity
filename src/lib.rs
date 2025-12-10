@@ -1,31 +1,6 @@
-use std::sync::{Arc, RwLock};
-
-use alloy::hex;
-use alloy::network::EthereumWallet;
-use alloy::primitives::B256;
-use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::CqrsFramework;
-use cqrs_es::mem_store::MemStore;
 use sqlx::SqlitePool;
-use st0x_broker::alpaca::AlpacaAuthEnv;
-use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tracing::{error, info, info_span, warn};
-
-use alpaca_tokenization::AlpacaTokenizationService;
-use alpaca_wallet::AlpacaWalletService;
-use cctp::{CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM};
-use equity_redemption::EquityRedemption;
-use inventory::InventoryView;
-use lifecycle::{Lifecycle, Never};
-use onchain::vault::{VaultId, VaultService};
-use rebalancing::usdc::UsdcRebalanceManager;
-use rebalancing::{
-    MintManager, Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, RedemptionManager,
-};
-use symbol::cache::SymbolCache;
-use tokenized_equity_mint::TokenizedEquityMint;
-use usdc_rebalance::UsdcRebalance;
 
 mod alpaca_tokenization;
 mod alpaca_wallet;
@@ -174,21 +149,7 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
             info!("Initializing Alpaca broker");
             let broker = alpaca_auth.clone().try_into_broker().await?;
 
-            let rebalancer = if let Some(rebalancing_config) = &config.rebalancing {
-                info!("Initializing rebalancing infrastructure");
-                Some(spawn_rebalancer(rebalancing_config, alpaca_auth).await?)
-            } else {
-                info!("Rebalancing not configured");
-                None
-            };
-
-            Box::pin(run_with_broker(
-                config.clone(),
-                pool.clone(),
-                broker,
-                rebalancer,
-            ))
-            .await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
         }
     }
 }
@@ -197,10 +158,11 @@ async fn run_with_broker<B: Broker + Clone + Send + 'static>(
     config: Config,
     pool: SqlitePool,
     broker: B,
+    rebalancer: Option<JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let broker_maintenance = broker.run_broker_maintenance().await;
 
-    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance).await
+    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance, rebalancer).await
 }
 
 #[cfg(test)]

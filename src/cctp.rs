@@ -156,7 +156,8 @@ where
 ///
 /// # Type Parameters
 ///
-/// * `P` - Provider type implementing [`Provider`] + [`Clone`]
+/// * `EP` - Ethereum provider type implementing [`Provider`] + [`Clone`]
+/// * `BP` - Base provider type implementing [`Provider`] + [`Clone`]
 /// * `S` - Signer type implementing [`Signer`] + [`Clone`] + [`Sync`]
 ///
 /// # Example
@@ -169,13 +170,14 @@ where
 /// let amount = U256::from(1_000_000); // 1 USDC
 /// let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
 /// ```
-pub(crate) struct CctpBridge<P, S>
+pub(crate) struct CctpBridge<EP, BP, S>
 where
-    P: Provider + Clone,
+    EP: Provider + Clone,
+    BP: Provider + Clone,
     S: Signer + Clone + Sync,
 {
-    ethereum: Evm<P, S>,
-    base: Evm<P, S>,
+    ethereum: Evm<EP, S>,
+    base: Evm<BP, S>,
     http_client: reqwest::Client,
     circle_api_base: String,
 }
@@ -221,12 +223,13 @@ struct FeeResponse {
     min_fee: String,
 }
 
-impl<P, S> CctpBridge<P, S>
+impl<EP, BP, S> CctpBridge<EP, BP, S>
 where
-    P: Provider + Clone,
+    EP: Provider + Clone,
+    BP: Provider + Clone,
     S: Signer + Clone + Sync,
 {
-    pub(crate) fn new(ethereum: Evm<P, S>, base: Evm<P, S>) -> Self {
+    pub(crate) fn new(ethereum: Evm<EP, S>, base: Evm<BP, S>) -> Self {
         Self {
             ethereum,
             base,
@@ -498,8 +501,10 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, PrivateKeySigner>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner>,
+        Box<dyn std::error::Error>,
+    > {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
         let wallet = EthereumWallet::from(signer.clone());
 
@@ -878,8 +883,10 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         base_usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, PrivateKeySigner>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner>,
+        Box<dyn std::error::Error>,
+    > {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
         let wallet = EthereumWallet::from(signer.clone());
 
@@ -1433,8 +1440,10 @@ mod tests {
 
         async fn create_bridge(
             &self,
-        ) -> Result<CctpBridge<impl Provider + Clone, PrivateKeySigner>, Box<dyn std::error::Error>>
-        {
+        ) -> Result<
+            CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner>,
+            Box<dyn std::error::Error>,
+        > {
             let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
             let wallet = EthereumWallet::from(signer.clone());
 
