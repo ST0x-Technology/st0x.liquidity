@@ -28,7 +28,6 @@ use chrono::Utc;
 use st0x_broker::Symbol;
 
 pub(crate) use equity::EquityTriggerSkip;
-pub(crate) use usdc::UsdcTriggerSkip;
 
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
@@ -128,7 +127,6 @@ impl std::fmt::Debug for RebalancingConfig {
 pub(crate) struct RebalancingTriggerConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
-    pub(crate) wallet: Address,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -278,33 +276,16 @@ impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
 impl RebalancingTrigger {
     /// Checks inventory for equity imbalance and triggers operation if needed.
     fn check_and_trigger_equity(&self, symbol: &Symbol) {
-        let guard = match equity::InProgressGuard::try_claim(
+        let Some(guard) = equity::InProgressGuard::try_claim(
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
-        ) {
-            Some(g) => g,
-            None => {
-                debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
-                return;
-            }
+        ) else {
+            debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
+            return;
         };
 
-        let operation = match equity::check_imbalance_and_build_operation(
-            symbol,
-            self.config.equity_threshold,
-            &self.inventory,
-            &self.symbol_cache,
-        ) {
-            Ok(op) => op,
-            Err(EquityTriggerSkip::NoImbalance) => return,
-            Err(EquityTriggerSkip::AlreadyInProgress) => {
-                debug!(symbol = %symbol, "Skipped equity trigger: already in progress");
-                return;
-            }
-            Err(EquityTriggerSkip::TokenNotInCache) => {
-                error!(symbol = %symbol, "Skipped equity trigger: token not in cache");
-                return;
-            }
+        let Some(operation) = self.try_build_equity_operation(symbol) else {
+            return;
         };
 
         if let Err(e) = self.sender.try_send(operation.clone()) {
@@ -316,26 +297,32 @@ impl RebalancingTrigger {
         guard.defuse();
     }
 
+    fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
+        match equity::check_imbalance_and_build_operation(
+            symbol,
+            self.config.equity_threshold,
+            &self.inventory,
+            &self.symbol_cache,
+        ) {
+            Ok(op) => Some(op),
+            Err(EquityTriggerSkip::NoImbalance) => None,
+            Err(EquityTriggerSkip::TokenNotInCache) => {
+                error!(symbol = %symbol, "Skipped equity trigger: token not in cache");
+                None
+            }
+        }
+    }
+
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     fn check_and_trigger_usdc(&self) {
-        let guard = match usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress)) {
-            Some(g) => g,
-            None => {
-                debug!("Skipped USDC trigger: already in progress");
-                return;
-            }
+        let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
+        else {
+            debug!("Skipped USDC trigger: already in progress");
+            return;
         };
 
-        let operation = match usdc::check_imbalance_and_build_operation(
-            &self.config.usdc_threshold,
-            &self.inventory,
-        ) {
-            Ok(op) => op,
-            Err(UsdcTriggerSkip::NoImbalance) => return,
-            Err(UsdcTriggerSkip::AlreadyInProgress) => {
-                debug!("Skipped USDC trigger: already in progress");
-                return;
-            }
+        let Some(operation) = self.try_build_usdc_operation() else {
+            return;
         };
 
         if let Err(e) = self.sender.try_send(operation.clone()) {
@@ -345,6 +332,10 @@ impl RebalancingTrigger {
 
         debug!(operation = ?operation, "Triggered USDC rebalancing");
         guard.defuse();
+    }
+
+    fn try_build_usdc_operation(&self) -> Option<TriggeredOperation> {
+        usdc::check_imbalance_and_build_operation(&self.config.usdc_threshold, &self.inventory).ok()
     }
 
     /// Clears the in-progress flag for an equity symbol.
@@ -412,7 +403,6 @@ impl RebalancingTrigger {
                 TokenizedEquityMintEvent::MintCompleted { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
-                    | TokenizedEquityMintEvent::TokenReceiptFailed { .. }
             )
         })
     }
@@ -466,7 +456,6 @@ impl RebalancingTrigger {
             matches!(
                 envelope.payload,
                 EquityRedemptionEvent::Completed { .. }
-                    | EquityRedemptionEvent::TokenSendFailed { .. }
                     | EquityRedemptionEvent::DetectionFailed { .. }
                     | EquityRedemptionEvent::RedemptionRejected { .. }
             )
@@ -587,7 +576,6 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            wallet: address!("0x1234567890123456789012345678901234567890"),
         };
 
         (
@@ -704,7 +692,6 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            wallet: address!("0x1234567890123456789012345678901234567890"),
         };
 
         (
@@ -839,13 +826,6 @@ mod tests {
         }
     }
 
-    fn make_token_receipt_failed() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::TokenReceiptFailed {
-            reason: "Verification failed".to_string(),
-            failed_at: Utc::now(),
-        }
-    }
-
     fn make_tokens_received() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
             tx_hash: TxHash::random(),
@@ -970,18 +950,6 @@ mod tests {
     }
 
     #[test]
-    fn mint_token_receipt_failure_clears_in_progress_flag() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        let events = vec![
-            make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_token_receipt_failed()),
-        ];
-
-        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
-    }
-
-    #[test]
     fn extract_mint_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
         let events = vec![make_mint_envelope(make_mint_requested(&symbol, dec!(42.5)))];
@@ -1021,13 +989,6 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
-        }
-    }
-
-    fn make_token_send_failed() -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokenSendFailed {
-            reason: "Transaction reverted".to_string(),
-            failed_at: Utc::now(),
         }
     }
 
@@ -1126,18 +1087,6 @@ mod tests {
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
         assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
-    }
-
-    #[test]
-    fn redemption_token_send_failure_clears_in_progress_flag() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
-            make_redemption_envelope(make_token_send_failed()),
-        ];
-
-        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
     }
 
     #[test]

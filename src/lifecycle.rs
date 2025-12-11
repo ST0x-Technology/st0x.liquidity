@@ -41,8 +41,12 @@
 //! - `or_initialize()` handles genesis events if the entity doesn't exist yet
 //! - Failures transition to `Failed` instead of panicking
 
-use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use cqrs_es::{EventEnvelope, Query};
+use serde::{Deserialize, Serialize};
 use tracing::error;
 
 /// An uninhabited type for entities with no fallible operations.
@@ -213,6 +217,21 @@ impl<T, E: Display> Lifecycle<T, E> {
                 ..
             } => self,
         }
+    }
+}
+
+/// Blanket impl allowing `Arc<Q>` to be used as a `Query` when `Q: Query`.
+///
+/// This enables sharing a single query instance across multiple CQRS frameworks
+/// (e.g., mint, redemption, USDC) without needing adapter wrappers.
+#[async_trait]
+impl<Q, T, E> Query<Lifecycle<T, E>> for Arc<Q>
+where
+    Q: Query<Lifecycle<T, E>> + Send + Sync,
+    Lifecycle<T, E>: cqrs_es::Aggregate,
+{
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<T, E>>]) {
+        Q::dispatch(self, aggregate_id, events).await;
     }
 }
 

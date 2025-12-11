@@ -23,15 +23,22 @@ use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
 
-pub(crate) struct UsdcRebalanceManager<P, S, ES>
+/// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
+///
+/// # Type Parameters
+///
+/// * `BP` - Base provider type
+/// * `S` - Signer type
+/// * `ES` - Event store type for the USDC rebalance aggregate
+pub(crate) struct UsdcRebalanceManager<BP, S, ES>
 where
-    P: Provider + Clone,
+    BP: Provider + Clone,
     S: Signer + Clone + Sync,
     ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<CctpBridge<P, S>>,
-    vault: Arc<VaultService<P, S>>,
+    cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP, S>>,
+    vault: Arc<VaultService<BP, S>>,
     cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
     /// Ethereum address to receive USDC after Alpaca withdrawal
     ethereum_recipient: Address,
@@ -41,16 +48,35 @@ where
     vault_id: VaultId,
 }
 
-impl<P, S, ES> UsdcRebalanceManager<P, S, ES>
+use alloy::network::{Ethereum, EthereumWallet};
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+};
+use alloy::providers::{Identity, RootProvider};
+
+/// Provider type for Ethereum HTTP connections (used for CCTP Ethereum side).
+type EthereumHttpProvider = FillProvider<
+    JoinFill<
+        JoinFill<
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+        >,
+        WalletFiller<EthereumWallet>,
+    >,
+    RootProvider<Ethereum>,
+    Ethereum,
+>;
+
+impl<BP, S, ES> UsdcRebalanceManager<BP, S, ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
+    BP: Provider + Clone + Send + Sync + 'static,
     S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     pub(crate) fn new(
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<CctpBridge<P, S>>,
-        vault: Arc<VaultService<P, S>>,
+        cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP, S>>,
+        vault: Arc<VaultService<BP, S>>,
         cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
         ethereum_recipient: Address,
         base_recipient: Address,
@@ -625,9 +651,9 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
 }
 
 #[async_trait]
-impl<P, S, ES> UsdcRebalanceTrait for UsdcRebalanceManager<P, S, ES>
+impl<BP, S, ES> UsdcRebalanceTrait for UsdcRebalanceManager<BP, S, ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
+    BP: Provider + Clone + Send + Sync + 'static,
     S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<UsdcRebalance, Never>> + Send + Sync,
     ES::AC: Send,
@@ -741,7 +767,7 @@ mod tests {
         provider: TestProvider,
         signer: PrivateKeySigner,
     ) -> (
-        CctpBridge<TestProvider, PrivateKeySigner>,
+        CctpBridge<TestProvider, TestProvider, PrivateKeySigner>,
         VaultService<TestProvider, PrivateKeySigner>,
     ) {
         let ethereum = Evm::new(

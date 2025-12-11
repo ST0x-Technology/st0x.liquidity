@@ -9,8 +9,6 @@ use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 /// Why a USDC trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UsdcTriggerSkip {
-    /// Another USDC operation is already in progress.
-    AlreadyInProgress,
     /// No USDC imbalance detected.
     NoImbalance,
 }

@@ -5,7 +5,6 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use rust_decimal::Decimal;
@@ -23,24 +22,22 @@ use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 
-pub(crate) struct MintManager<P, S, ES>
+pub(crate) struct MintManager<P, ES>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
-    service: Arc<AlpacaTokenizationService<P, S>>,
+    service: Arc<AlpacaTokenizationService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
 }
 
-impl<P, S, ES> MintManager<P, S, ES>
+impl<P, ES> MintManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
     pub(crate) fn new(
-        service: Arc<AlpacaTokenizationService<P, S>>,
+        service: Arc<AlpacaTokenizationService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
     ) -> Self {
         Self { service, cqrs }
@@ -205,10 +202,9 @@ fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, MintError> {
 }
 
 #[async_trait]
-impl<P, S, ES> Mint for MintManager<P, S, ES>
+impl<P, ES> Mint for MintManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>> + Send + Sync,
     ES::AC: Send,
 {

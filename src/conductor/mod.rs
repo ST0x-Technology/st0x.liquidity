@@ -135,7 +135,15 @@ impl Conductor {
         let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
             (Some(rebalancing_config), BrokerConfig::Alpaca(alpaca_auth), None) => {
                 info!("Initializing rebalancing infrastructure");
-                Some(spawn_rebalancer(rebalancing_config, alpaca_auth, provider.clone()).await?)
+                Some(
+                    spawn_rebalancer(
+                        pool.clone(),
+                        rebalancing_config,
+                        alpaca_auth,
+                        provider.clone(),
+                    )
+                    .await?,
+                )
             }
             (_, _, existing) => existing,
         };

@@ -12,8 +12,6 @@ use super::TriggeredOperation;
 /// Why an equity trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EquityTriggerSkip {
-    /// Another operation for this symbol is already in progress.
-    AlreadyInProgress,
     /// No imbalance detected for this symbol.
     NoImbalance,
     /// Token address not found in cache (required for redemption).

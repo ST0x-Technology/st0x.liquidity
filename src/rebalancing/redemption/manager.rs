@@ -5,7 +5,6 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use st0x_broker::Symbol;
@@ -18,24 +17,22 @@ use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::shares::FractionalShares;
 
-pub(crate) struct RedemptionManager<P, S, ES>
+pub(crate) struct RedemptionManager<P, ES>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
-    service: Arc<AlpacaTokenizationService<P, S>>,
+    service: Arc<AlpacaTokenizationService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
 }
 
-impl<P, S, ES> RedemptionManager<P, S, ES>
+impl<P, ES> RedemptionManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     pub(crate) fn new(
-        service: Arc<AlpacaTokenizationService<P, S>>,
+        service: Arc<AlpacaTokenizationService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
     ) -> Self {
         Self { service, cqrs }
@@ -164,10 +161,9 @@ where
 }
 
 #[async_trait]
-impl<P, S, ES> Redeem for RedemptionManager<P, S, ES>
+impl<P, ES> Redeem for RedemptionManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<EquityRedemption, Never>> + Send + Sync,
     ES::AC: Send,
 {
