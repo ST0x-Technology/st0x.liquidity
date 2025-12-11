@@ -211,16 +211,6 @@ pub(crate) struct InventoryView {
 }
 
 impl InventoryView {
-    /// Returns the USDC inventory.
-    fn usdc(&self) -> &Inventory<Usdc> {
-        &self.usdc
-    }
-
-    /// Returns the equity inventory for a specific symbol, if tracked.
-    fn get_equity(&self, symbol: &Symbol) -> Option<&Inventory<FractionalShares>> {
-        self.equities.get(symbol)
-    }
-
     /// Checks all tracked equities for imbalances against their thresholds.
     /// Returns a list of (symbol, imbalance) pairs for symbols that are imbalanced.
     pub(crate) fn check_equity_imbalances(
@@ -1629,35 +1619,6 @@ mod tests {
 
         let inv_with_inflight = usdc_inventory(700, 100, 200, 0);
         assert!(inv_with_inflight.detect_imbalance(&thresh).is_none());
-    }
-
-    #[test]
-    fn usdc_accessor_returns_usdc_inventory() {
-        let view = make_usdc_view(1000, 50, 800, 0);
-
-        let usdc_inv = view.usdc();
-
-        assert_eq!(usdc_inv.onchain.total().unwrap().0, Decimal::from(1050));
-        assert_eq!(usdc_inv.offchain.total().unwrap().0, Decimal::from(800));
-    }
-
-    #[test]
-    fn get_equity_returns_none_for_unknown_symbol() {
-        let view = make_view(vec![]);
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        assert!(view.get_equity(&symbol).is_none());
-    }
-
-    #[test]
-    fn get_equity_returns_inventory_for_tracked_symbol() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(symbol.clone(), inventory(100, 10, 90, 0))]);
-
-        let inv = view.get_equity(&symbol).unwrap();
-
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(90));
     }
 
     #[test]

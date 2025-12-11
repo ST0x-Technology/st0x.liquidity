@@ -819,99 +819,53 @@ Additionally, there are several dead code warnings that need to be addressed:
 
 ---
 
-## Task 13. Complete USDC Auto-Rebalancing Integration
+## Task 13. Resolve Dead Code in Inventory and Vault Modules
 
-The equity rebalancing flow (mint/redemption) is fully wired in Task 10. The
-USDC rebalancing flow needs to be completed to achieve full end-to-end
-auto-rebalancing.
+Three dead code warnings remain:
 
-### What's Missing for USDC Rebalancing
+1. `VenueBalance::new`, `available`, `inflight` - used by tests to verify
+   internal state changes in production methods like `move_to_inflight`,
+   `confirm_inflight`, etc. These provide real test value.
 
-**USDC rebalancing moves USDC between:**
+2. `InventoryView::usdc()`, `get_equity()` - accessors that are only tested for
+   their own sake. Production code uses `check_usdc_imbalance()` and
+   `check_equity_imbalances()` instead.
 
-- Alpaca brokerage account (offchain)
-- Raindex vault contract on Base (onchain)
-
-**The flow requires:**
-
-1. **AlpacaWalletService** - Withdraw/deposit USDC from/to Alpaca
-2. **CctpBridge** - Bridge USDC between Ethereum ↔ Base via Circle's CCTP
-3. **VaultService** - Deposit/withdraw USDC from the Raindex vault on Base
-4. **UsdcRebalanceManager** - Orchestrates the above three services
-
-The `UsdcRebalanceManager` exists but is not fully wired up for production use.
-This task completes the integration.
-
-### Configuration Requirements
-
-New environment variables needed:
-
-- `BASE_RPC_URL` - RPC endpoint for Base network
-- `VAULT_ADDRESS` - Address of the Raindex USDC vault contract on Base
-- `ETHEREUM_CCTP_TOKEN_MESSENGER` - Circle's TokenMessenger on Ethereum
-- `BASE_CCTP_MESSAGE_TRANSMITTER` - Circle's MessageTransmitter on Base
-
-### Key Finding: Missing Production Constructors
-
-The `AlpacaWalletClient` and `AlpacaWalletService` only have `#[cfg(test)]`
-constructors:
-
-- `AlpacaWalletClient::new_with_base_url()` - test-only
-- `AlpacaWalletService::new_with_client()` - test-only
-
-This is why the USDC infrastructure appears as "dead code" - it cannot be
-constructed in production. We need to add production constructors.
+3. `VaultError::InsufficientBalance` - intended for pre-flight balance checking
+   but never implemented; the contract rejects invalid withdrawals instead.
 
 ### Subtasks
 
-- [ ] Add production constructor to `AlpacaWalletClient`:
-  - Remove `#[cfg(test)]` from `new_with_base_url()` OR
-  - Add `new(base_url, api_key, api_secret)` production method
-  - The `AccountResponse` struct also needs `#[cfg(test)]` removed for
-    deserialization
+- [x] Move `VenueBalance::new`, `available`, `inflight` behind `#[cfg(test)]` in
+      `src/inventory/venue_balance.rs` - they're test helpers for verifying
+      internal state
 
-- [ ] Add production constructor to `AlpacaWalletService`:
-  - Remove `#[cfg(test)]` from `new_with_client()` OR
-  - Add `new(base_url, api_key, api_secret)` that creates the client internally
+- [x] Remove `InventoryView::usdc()` and `get_equity()` along with their tests
+      (`usdc_accessor_returns_usdc_inventory`, `get_equity_returns_none_*`,
+      `get_equity_returns_inventory_*`) in `src/inventory/view.rs` - these test
+      accessors that aren't used
 
-- [ ] Add USDC rebalancing configuration to `RebalancingEnv`:
-  - `base_rpc_url: Option<Url>`
-  - `vault_address: Option<Address>`
-  - (CCTP addresses are constants in cctp.rs, no need to configure)
+- [x] Remove `VaultError::InsufficientBalance` variant from
+      `src/onchain/vault.rs` - never constructed
 
-- [ ] Update `RebalancingConfig` with the new fields
+- [x] Run `cargo build` - no dead code warnings
+- [x] Run `cargo test -q` - all 782 tests pass
+- [x] Run `rainix-rs-static` - linting passes
+- [x] Run `cargo fmt`
 
-- [ ] Wire the USDC infrastructure in `spawn_rebalancer`:
-  - Create `AlpacaWalletService` using alpaca credentials
-  - Create HTTP provider for Base
-  - Create `CctpBridge` with Ethereum and Base Evm instances
-  - Create `VaultService` for the Raindex vault on Base
-  - Ensure `UsdcRebalanceManager` is properly instantiated with all services
+### Changes Made
 
-- [ ] Clean up unused code that emerged from incomplete wiring:
-  - Remove unused `get_request_status` from AlpacaTokenizationService
-  - Remove unused `signer` field from AlpacaTokenizationClient
+- `src/inventory/venue_balance.rs`:
+  - Moved `new()`, `available()`, `inflight()` behind `#[cfg(test)]`
 
-- [ ] This task will resolve the following dead code warnings:
-  - `VenueBalance::new`, `available`, `inflight` - inventory tracking for USDC
-    flow
-  - `InventoryView::usdc`, `get_equity` - reading inventory state for triggers
-  - `VaultError::InsufficientBalance` - vault error handling
+- `src/inventory/view.rs`:
+  - Removed `usdc()` and `get_equity()` methods
+  - Removed 3 tests: `usdc_accessor_returns_usdc_inventory`,
+    `get_equity_returns_none_for_unknown_symbol`,
+    `get_equity_returns_inventory_for_tracked_symbol`
 
-- [ ] Add comprehensive test coverage for all added/changed logic:
-  - `AlpacaWalletClient::new()` - test client construction with valid
-    credentials
-  - `AlpacaWalletService::new()` - test service construction
-  - `RebalancingEnv` new fields - test parsing and validation of `base_rpc_url`,
-    `vault_address`
-  - `RebalancingConfig` - test new fields are correctly populated from env
-  - Any new error variants for missing USDC config fields
-  - Integration of `UsdcRebalanceManager` in spawn_rebalancer (if testable
-    without live services)
-
-- [ ] Run `cargo build` - no dead code warnings
-- [ ] Run `cargo test -q` - all tests pass
-- [ ] Run `rainix-rs-static` - linting passes
+- `src/onchain/vault.rs`:
+  - Removed `VaultError::InsufficientBalance` variant
 
 ---
 

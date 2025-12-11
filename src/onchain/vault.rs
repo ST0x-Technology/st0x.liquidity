@@ -34,8 +34,6 @@ pub(crate) enum VaultError {
     Contract(#[from] alloy::contract::Error),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
-    #[error("Insufficient balance: requested {requested}, available {available}")]
-    InsufficientBalance { requested: U256, available: U256 },
     #[error("Amount cannot be zero")]
     ZeroAmount,
 }

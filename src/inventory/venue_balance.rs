@@ -47,6 +47,11 @@ where
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy,
 {
+    pub(super) fn total(self) -> Result<T, ArithmeticError<T>> {
+        self.available + self.inflight
+    }
+
+    #[cfg(test)]
     pub(super) fn new(available: T, inflight: T) -> Self {
         Self {
             available,
@@ -54,14 +59,12 @@ where
         }
     }
 
-    pub(super) fn total(self) -> Result<T, ArithmeticError<T>> {
-        self.available + self.inflight
-    }
-
+    #[cfg(test)]
     fn available(self) -> T {
         self.available
     }
 
+    #[cfg(test)]
     fn inflight(self) -> T {
         self.inflight
     }
