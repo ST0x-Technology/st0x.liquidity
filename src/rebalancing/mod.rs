@@ -15,6 +15,17 @@
 //! All persistent state lives in aggregates via the event store. On restart,
 //! managers can resume by querying aggregate state.
 
-mod mint;
-mod redemption;
-mod usdc;
+pub(crate) mod mint;
+mod rebalancer;
+pub(crate) mod redemption;
+mod spawn;
+mod trigger;
+pub(crate) mod usdc;
+
+pub(crate) use mint::manager::MintManager;
+pub(crate) use rebalancer::Rebalancer;
+pub(crate) use redemption::manager::RedemptionManager;
+pub(crate) use spawn::spawn_rebalancer;
+pub(crate) use trigger::{
+    RebalancingConfig, RebalancingConfigError, RebalancingTrigger, RebalancingTriggerConfig,
+};

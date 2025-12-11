@@ -257,7 +257,6 @@ impl TradeExecutionLink {
 }
 
 /// Represents an execution that a trade contributed to, with execution details
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionContribution {
     pub link_id: i64,
@@ -271,7 +270,6 @@ pub struct ExecutionContribution {
 }
 
 /// Represents a trade that contributed to an execution, with trade details
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TradeContribution {
     pub link_id: i64,
@@ -287,7 +285,6 @@ pub struct TradeContribution {
 }
 
 /// Complete audit trail entry linking trade and execution with all relevant details
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct AuditTrailEntry {
     pub link_id: i64,

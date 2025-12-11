@@ -28,8 +28,6 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this type
-#[allow(dead_code)]
 impl TokenSymbol {
     pub(crate) fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -152,49 +150,6 @@ impl std::fmt::Display for Network {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DepositAddress {
-    pub(crate) address: Address,
-    pub(crate) asset: TokenSymbol,
-    pub(crate) network: Network,
-}
-
-#[derive(Deserialize)]
-struct FundingWallet {
-    address: Address,
-    asset: TokenSymbol,
-    network: Network,
-}
-
-pub(super) async fn get_deposit_address(
-    client: &AlpacaWalletClient,
-    asset: &str,
-    network: &str,
-) -> Result<DepositAddress, AlpacaWalletError> {
-    let path = format!(
-        "/v1/crypto/funding_wallets?asset={}&network={}",
-        urlencoding::encode(asset),
-        urlencoding::encode(network)
-    );
-
-    let response = client.get(&path).await?;
-
-    let wallets: Vec<FundingWallet> = response.json().await?;
-
-    let wallet = wallets
-        .first()
-        .ok_or_else(|| AlpacaWalletError::NoWalletFound {
-            asset: asset.to_string(),
-            network: network.to_string(),
-        })?;
-
-    Ok(DepositAddress {
-        address: wallet.address,
-        asset: wallet.asset.clone(),
-        network: wallet.network.clone(),
-    })
-}
-
 fn validate_amount(amount: Decimal) -> Result<(), AlpacaWalletError> {
     if amount <= Decimal::ZERO {
         return Err(AlpacaWalletError::InvalidAmount { amount });
@@ -285,217 +240,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_get_deposit_address_successful() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let wallet_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/crypto/funding_wallets")
-                .query_param("asset", "USDC")
-                .query_param("network", "Ethereum");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "address": "0x1234567890abcdef1234567890abcdef12345678",
-                        "asset": "USDC",
-                        "network": "Ethereum"
-                    }
-                ]));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let deposit_address = get_deposit_address(&client, "USDC", "Ethereum")
-            .await
-            .unwrap();
-
-        let expected_address =
-            Address::from_str("0x1234567890abcdef1234567890abcdef12345678").unwrap();
-
-        assert_eq!(deposit_address.address, expected_address);
-        assert_eq!(deposit_address.asset.as_ref(), "USDC");
-        assert_eq!(deposit_address.network.as_ref(), "ethereum");
-
-        account_mock.assert();
-        wallet_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_deposit_address_invalid_asset() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let wallet_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/crypto/funding_wallets")
-                .query_param("asset", "INVALID")
-                .query_param("network", "Ethereum");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "message": "Invalid asset"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let result = get_deposit_address(&client, "INVALID", "Ethereum").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { status, .. } if status == 400
-        ));
-
-        account_mock.assert();
-        wallet_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_deposit_address_invalid_network() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let wallet_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/crypto/funding_wallets")
-                .query_param("asset", "USDC")
-                .query_param("network", "InvalidNetwork");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "message": "Invalid network"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let result = get_deposit_address(&client, "USDC", "InvalidNetwork").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { status, .. } if status == 400
-        ));
-
-        account_mock.assert();
-        wallet_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_deposit_address_api_error() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let wallet_mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/crypto/funding_wallets");
-            then.status(500).body("Internal Server Error");
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let result = get_deposit_address(&client, "USDC", "Ethereum").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { status, .. } if status == 500
-        ));
-
-        account_mock.assert();
-        wallet_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_deposit_address_malformed_json() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let wallet_mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/crypto/funding_wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .body("not valid json");
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let result = get_deposit_address(&client, "USDC", "Ethereum").await;
-
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AlpacaWalletError::Reqwest(_)));
-
-        account_mock.assert();
-        wallet_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_get_deposit_address_empty_response() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let wallet_mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/crypto/funding_wallets");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([]));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let result = get_deposit_address(&client, "USDC", "Ethereum").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::NoWalletFound { .. }
-        ));
-
-        account_mock.assert();
-        wallet_mock.assert();
-    }
-
-    #[tokio::test]
     async fn test_initiate_withdrawal_successful() {
         let server = MockServer::start();
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
@@ -528,7 +272,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -567,7 +311,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -598,7 +342,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -640,7 +384,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -682,7 +426,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -715,7 +459,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -769,7 +513,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -817,7 +561,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -865,7 +609,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -912,7 +656,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -948,7 +692,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -983,7 +727,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1020,7 +764,7 @@ mod tests {
                 .body("not valid json");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1093,7 +837,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1145,7 +889,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1179,7 +923,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -1211,7 +955,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),

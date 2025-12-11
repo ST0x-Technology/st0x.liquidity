@@ -41,8 +41,12 @@
 //! - `or_initialize()` handles genesis events if the entity doesn't exist yet
 //! - Failures transition to `Failed` instead of panicking
 
-use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use cqrs_es::{EventEnvelope, Query};
+use serde::{Deserialize, Serialize};
 use tracing::error;
 
 /// An uninhabited type for entities with no fallible operations.
@@ -216,11 +220,29 @@ impl<T, E: Display> Lifecycle<T, E> {
     }
 }
 
+/// Blanket impl allowing `Arc<Q>` to be used as a `Query` when `Q: Query`.
+///
+/// This enables sharing a single query instance across multiple CQRS frameworks
+/// (e.g., mint, redemption, USDC) without needing adapter wrappers.
+#[async_trait]
+impl<Q, T, E> Query<Lifecycle<T, E>> for Arc<Q>
+where
+    Q: Query<Lifecycle<T, E>> + Send + Sync,
+    Lifecycle<T, E>: cqrs_es::Aggregate,
+{
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<T, E>>]) {
+        Q::dispatch(self, aggregate_id, events).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use cqrs_es::{Aggregate, DomainEvent};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
     struct TestState {
         value: i32,
     }
@@ -234,6 +256,55 @@ mod tests {
         Initialize { value: i32 },
         Migrate { value: i32 },
         Increment { amount: i32 },
+    }
+
+    impl DomainEvent for TestEvent {
+        fn event_type(&self) -> String {
+            match self {
+                Self::Initialize { .. } => "TestEvent::Initialize".to_string(),
+                Self::Migrate { .. } => "TestEvent::Migrate".to_string(),
+                Self::Increment { .. } => "TestEvent::Increment".to_string(),
+            }
+        }
+
+        fn event_version(&self) -> String {
+            "1.0".to_string()
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, thiserror::Error)]
+    #[error("test command error")]
+    struct TestCommandError;
+
+    #[async_trait]
+    impl Aggregate for Lifecycle<TestState, TestError> {
+        type Command = ();
+        type Event = TestEvent;
+        type Error = TestCommandError;
+        type Services = ();
+
+        fn aggregate_type() -> String {
+            "TestState".to_string()
+        }
+
+        fn apply(&mut self, event: Self::Event) {
+            *self = self.clone().transition(&event, |ev, cur| match ev {
+                TestEvent::Initialize { .. } | TestEvent::Migrate { .. } => {
+                    Err(LifecycleError::AlreadyInitialized)
+                }
+                TestEvent::Increment { amount } => Ok(TestState {
+                    value: cur.value + amount,
+                }),
+            });
+        }
+
+        async fn handle(
+            &self,
+            _command: Self::Command,
+            _services: &Self::Services,
+        ) -> Result<Vec<Self::Event>, Self::Error> {
+            Ok(vec![])
+        }
     }
 
     #[test]
@@ -446,5 +517,36 @@ mod tests {
             panic!("Expected Active state after transition");
         };
         assert_eq!(inner.value, 15);
+    }
+
+    struct MockQuery {
+        dispatch_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Query<Lifecycle<TestState, TestError>> for MockQuery {
+        async fn dispatch(
+            &self,
+            _aggregate_id: &str,
+            _events: &[EventEnvelope<Lifecycle<TestState, TestError>>],
+        ) {
+            self.dispatch_called.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_query_delegates_to_inner() {
+        let dispatch_called = Arc::new(AtomicBool::new(false));
+
+        let mock_query = Arc::new(MockQuery {
+            dispatch_called: Arc::clone(&dispatch_called),
+        });
+
+        Query::<Lifecycle<TestState, TestError>>::dispatch(&mock_query, "test-id", &[]).await;
+
+        assert!(
+            dispatch_called.load(Ordering::SeqCst),
+            "Expected dispatch to be called on inner query"
+        );
     }
 }

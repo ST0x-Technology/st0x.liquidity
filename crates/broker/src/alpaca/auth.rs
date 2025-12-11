@@ -53,7 +53,7 @@ impl std::fmt::Debug for AlpacaAuthEnv {
 }
 
 impl AlpacaAuthEnv {
-    pub(crate) fn base_url(&self) -> String {
+    pub fn base_url(&self) -> String {
         self.alpaca_trading_mode.base_url()
     }
 }

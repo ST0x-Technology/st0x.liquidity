@@ -6,76 +6,78 @@
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use async_trait::async_trait;
+use cqrs_es::{CqrsFramework, EventStore};
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::{info, instrument, warn};
 
+use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
-    AlpacaTransferId, AlpacaWalletError, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
+    AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{BurnReceipt, CctpBridge, CctpError};
+use crate::cctp::{BurnReceipt, CctpBridge};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultError, VaultId, VaultService};
+use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
-    RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceError,
-    UsdcRebalanceId,
+    RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
 
-#[derive(Debug, Error)]
-pub(crate) enum UsdcRebalanceManagerError {
-    #[error("Alpaca wallet error: {0}")]
-    AlpacaWallet(#[from] AlpacaWalletError),
-    #[error("CCTP bridge error: {0}")]
-    Cctp(#[from] CctpError),
-    #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<UsdcRebalanceError>),
-    #[error("Withdrawal failed with terminal status: {status}")]
-    WithdrawalFailed { status: String },
-    #[error("Deposit failed with terminal status: {status}")]
-    DepositFailed { status: String },
-    #[error("Invalid amount: {0}")]
-    InvalidAmount(String),
-    #[error("Arithmetic overflow: {0}")]
-    ArithmeticOverflow(String),
-    #[error("U256 parse error: {0}")]
-    U256Parse(#[from] alloy::primitives::ruint::ParseError),
-}
-
-pub(crate) struct UsdcRebalanceManager<P, S, ES>
+/// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
+///
+/// # Type Parameters
+///
+/// * `BP` - Base provider type
+/// * `S` - Signer type
+/// * `ES` - Event store type for the USDC rebalance aggregate
+pub(crate) struct UsdcRebalanceManager<BP, S, ES>
 where
-    P: Provider + Clone,
+    BP: Provider + Clone,
     S: Signer + Clone + Sync,
     ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<CctpBridge<P, S>>,
-    vault: Arc<VaultService<P, S>>,
+    cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP, S>>,
+    vault: Arc<VaultService<BP, S>>,
     cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
-    /// Ethereum address to receive USDC after Alpaca withdrawal
-    ethereum_recipient: Address,
-    /// Base address to receive USDC after CCTP mint
-    base_recipient: Address,
+    /// Market maker's (our) wallet address
+    /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
+    market_maker_wallet: Address,
     /// Vault ID for Rain OrderBook deposits
     vault_id: VaultId,
 }
 
-impl<P, S, ES> UsdcRebalanceManager<P, S, ES>
+use alloy::network::{Ethereum, EthereumWallet};
+use alloy::providers::fillers::{
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+};
+use alloy::providers::{Identity, RootProvider};
+
+/// Provider type for Ethereum HTTP connections (used for CCTP Ethereum side).
+type EthereumHttpProvider = FillProvider<
+    JoinFill<
+        JoinFill<
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+        >,
+        WalletFiller<EthereumWallet>,
+    >,
+    RootProvider<Ethereum>,
+    Ethereum,
+>;
+
+impl<BP, S, ES> UsdcRebalanceManager<BP, S, ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
+    BP: Provider + Clone + Send + Sync + 'static,
     S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     pub(crate) fn new(
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<CctpBridge<P, S>>,
-        vault: Arc<VaultService<P, S>>,
+        cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP, S>>,
+        vault: Arc<VaultService<BP, S>>,
         cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
-        ethereum_recipient: Address,
-        base_recipient: Address,
+        market_maker_wallet: Address,
         vault_id: VaultId,
     ) -> Self {
         Self {
@@ -83,8 +85,7 @@ where
             cctp_bridge,
             vault,
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             vault_id,
         }
     }
@@ -141,7 +142,7 @@ where
 
         let transfer = match self
             .alpaca_wallet
-            .initiate_withdrawal(decimal_amount, &usdc, &self.ethereum_recipient)
+            .initiate_withdrawal(decimal_amount, &usdc, &self.market_maker_wallet)
             .await
         {
             Ok(t) => t,
@@ -221,7 +222,7 @@ where
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_ethereum(amount, self.base_recipient)
+            .burn_on_ethereum(amount, self.market_maker_wallet)
             .await
         {
             Ok(r) => r,
@@ -455,7 +456,7 @@ where
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_base(amount, self.ethereum_recipient)
+            .burn_on_base(amount, self.market_maker_wallet)
             .await
         {
             Ok(r) => r,
@@ -646,6 +647,31 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     Ok(U256::from_str_radix(&integer, 10)?)
 }
 
+#[async_trait]
+impl<BP, S, ES> UsdcRebalanceTrait for UsdcRebalanceManager<BP, S, ES>
+where
+    BP: Provider + Clone + Send + Sync + 'static,
+    S: Signer + Clone + Send + Sync + 'static,
+    ES: EventStore<Lifecycle<UsdcRebalance, Never>> + Send + Sync,
+    ES::AC: Send,
+{
+    async fn execute_alpaca_to_base(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        Self::execute_alpaca_to_base(self, id, amount).await
+    }
+
+    async fn execute_base_to_alpaca(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        Self::execute_base_to_alpaca(self, id, amount).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::network::{Ethereum, EthereumWallet};
@@ -656,8 +682,8 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
-    use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
+    use cqrs_es::{AggregateError, CqrsFramework};
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;
@@ -707,7 +733,7 @@ mod tests {
     async fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
         let account_mock = create_account_mock(server, "test-account-id");
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key".to_string(),
             "test_secret".to_string(),
@@ -738,7 +764,7 @@ mod tests {
         provider: TestProvider,
         signer: PrivateKeySigner,
     ) -> (
-        CctpBridge<TestProvider, PrivateKeySigner>,
+        CctpBridge<TestProvider, TestProvider, PrivateKeySigner>,
         VaultService<TestProvider, PrivateKeySigner>,
     ) {
         let ethereum = Evm::new(
@@ -804,16 +830,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -852,16 +876,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -907,16 +929,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -990,16 +1010,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -1027,16 +1045,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 

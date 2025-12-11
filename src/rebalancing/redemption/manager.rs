@@ -5,50 +5,34 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use async_trait::async_trait;
+use cqrs_es::{CqrsFramework, EventStore};
 use st0x_broker::Symbol;
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::{info, instrument, warn};
 
-use crate::alpaca_tokenization::{
-    AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequestStatus,
-};
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, EquityRedemptionError};
+use super::{Redeem, RedemptionError};
+use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::shares::FractionalShares;
 
-#[derive(Debug, Error)]
-pub(crate) enum RedemptionError {
-    #[error("Alpaca API error: {0}")]
-    Alpaca(#[from] AlpacaTokenizationError),
-
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<EquityRedemptionError>),
-
-    #[error("Redemption was rejected by Alpaca")]
-    Rejected,
-}
-
-pub(crate) struct RedemptionManager<P, S, ES>
+pub(crate) struct RedemptionManager<P, ES>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
-    service: Arc<AlpacaTokenizationService<P, S>>,
+    service: Arc<AlpacaTokenizationService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
 }
 
-impl<P, S, ES> RedemptionManager<P, S, ES>
+impl<P, ES> RedemptionManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     pub(crate) fn new(
-        service: Arc<AlpacaTokenizationService<P, S>>,
+        service: Arc<AlpacaTokenizationService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
     ) -> Self {
         Self { service, cqrs }
@@ -67,9 +51,9 @@ where
     ///
     /// On errors, sends appropriate failure commands (`FailDetection`, `RejectRedemption`).
     #[instrument(skip(self), fields(%symbol, ?quantity, %token, %amount))]
-    pub(crate) async fn execute_redemption(
+    async fn execute_redemption_impl(
         &self,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
@@ -87,7 +71,7 @@ where
 
         self.cqrs
             .execute(
-                aggregate_id,
+                &aggregate_id.0,
                 EquityRedemptionCommand::SendTokens {
                     symbol,
                     quantity: quantity.0,
@@ -105,7 +89,7 @@ where
                 warn!("Polling for redemption detection failed: {e}");
                 self.cqrs
                     .execute(
-                        aggregate_id,
+                        &aggregate_id.0,
                         EquityRedemptionCommand::FailDetection {
                             reason: format!("Detection polling failed: {e}"),
                         },
@@ -117,7 +101,7 @@ where
 
         self.cqrs
             .execute(
-                aggregate_id,
+                &aggregate_id.0,
                 EquityRedemptionCommand::Detect {
                     tokenization_request_id: detected.id.clone(),
                 },
@@ -139,7 +123,7 @@ where
                 warn!("Polling for completion failed: {e}");
                 self.cqrs
                     .execute(
-                        aggregate_id,
+                        &aggregate_id.0,
                         EquityRedemptionCommand::RejectRedemption {
                             reason: format!("Completion polling failed: {e}"),
                         },
@@ -152,7 +136,7 @@ where
         match completed.status {
             TokenizationRequestStatus::Completed => {
                 self.cqrs
-                    .execute(aggregate_id, EquityRedemptionCommand::Complete)
+                    .execute(&aggregate_id.0, EquityRedemptionCommand::Complete)
                     .await?;
 
                 info!("Redemption workflow completed successfully");
@@ -161,7 +145,7 @@ where
             TokenizationRequestStatus::Rejected => {
                 self.cqrs
                     .execute(
-                        aggregate_id,
+                        &aggregate_id.0,
                         EquityRedemptionCommand::RejectRedemption {
                             reason: "Redemption rejected by Alpaca".to_string(),
                         },
@@ -176,12 +160,31 @@ where
     }
 }
 
+#[async_trait]
+impl<P, ES> Redeem for RedemptionManager<P, ES>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+    ES: EventStore<Lifecycle<EquityRedemption, Never>> + Send + Sync,
+    ES::AC: Send,
+{
+    async fn execute_redemption(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        token: Address,
+        amount: U256,
+    ) -> Result<(), RedemptionError> {
+        self.execute_redemption_impl(aggregate_id, symbol, quantity, token, amount)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, address};
+    use alloy::primitives::address;
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
-    use httpmock::prelude::*;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -200,8 +203,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_redemption_send_failure() {
-        let server = MockServer::start();
+    async fn execute_redemption_send_failure() {
+        let server = httpmock::MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let service = Arc::new(
             create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
@@ -215,9 +218,41 @@ mod tests {
         let amount = U256::from(100_000_000_000_000_000_000_u128);
 
         let result = manager
-            .execute_redemption("redemption-001", symbol, quantity, token, amount)
+            .execute_redemption_impl(
+                &RedemptionAggregateId::new("redemption-001"),
+                symbol,
+                quantity,
+                token,
+                amount,
+            )
             .await;
 
+        assert!(matches!(result, Err(RedemptionError::Alpaca(_))));
+    }
+
+    #[tokio::test]
+    async fn trait_impl_delegates_to_execute_redemption_impl() {
+        let server = httpmock::MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service = Arc::new(
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+        );
+        let cqrs = create_test_cqrs();
+        let manager = RedemptionManager::new(service, cqrs);
+
+        let redeem_trait: &dyn Redeem = &manager;
+
+        let result = redeem_trait
+            .execute_redemption(
+                &RedemptionAggregateId::new("trait-test"),
+                Symbol::new("AAPL").unwrap(),
+                FractionalShares(dec!(50.0)),
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+                U256::from(50_000_000_000_000_000_000_u128),
+            )
+            .await;
+
+        // Without mocked token contract, this will fail at send_for_redemption
         assert!(matches!(result, Err(RedemptionError::Alpaca(_))));
     }
 }

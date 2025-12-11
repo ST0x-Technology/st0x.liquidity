@@ -1,9 +1,6 @@
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
-use serde::Serialize;
-
-#[cfg(test)]
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -19,59 +16,31 @@ use serde_json::json;
 pub enum AlpacaWalletError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
-
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
-
-    // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this error variant
-    #[allow(dead_code)]
-    #[error("Invalid decimal value '{value}': {source}")]
-    InvalidDecimal {
-        value: String,
-        #[source]
-        source: rust_decimal::Error,
-    },
-
     #[error(transparent)]
     FromHex(#[from] FromHexError),
-
     #[error("Amount must be positive and non-zero, got: {amount}")]
     InvalidAmount { amount: Decimal },
-
-    #[error("Empty wallet list for asset '{asset}' on network '{network}'")]
-    NoWalletFound { asset: String, network: String },
-
     #[error("Transfer not found: {transfer_id}")]
     TransferNotFound { transfer_id: AlpacaTransferId },
-
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]
     TransferTimeout {
         transfer_id: AlpacaTransferId,
         elapsed: std::time::Duration,
     },
-
-    // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this error variant
-    #[allow(dead_code)]
-    #[error("Max retries ({retries}) exceeded for transfer {transfer_id}")]
-    MaxRetriesExceeded {
-        transfer_id: AlpacaTransferId,
-        retries: u32,
-    },
-
     #[error("Invalid status transition for transfer {transfer_id}: {previous:?} -> {next:?}")]
     InvalidStatusTransition {
         transfer_id: AlpacaTransferId,
         previous: TransferStatus,
         next: TransferStatus,
     },
-
     #[error("Address {address} is not whitelisted for {asset} on {network}")]
     AddressNotWhitelisted {
         address: Address,
         asset: TokenSymbol,
         network: Network,
     },
-
     #[error("Deposit with tx hash {tx_hash} not detected after {elapsed:?}")]
     DepositTimeout {
         tx_hash: TxHash,
@@ -79,7 +48,6 @@ pub enum AlpacaWalletError {
     },
 }
 
-#[cfg(test)]
 #[derive(Deserialize)]
 struct AccountResponse {
     id: String,
@@ -94,8 +62,10 @@ pub struct AlpacaWalletClient {
 }
 
 impl AlpacaWalletClient {
-    #[cfg(test)]
-    pub(crate) async fn new_with_base_url(
+    /// Creates a new Alpaca wallet client.
+    ///
+    /// Fetches the account ID from the Alpaca API during construction.
+    pub(crate) async fn new(
         base_url: String,
         api_key: String,
         api_secret: String,
@@ -113,7 +83,6 @@ impl AlpacaWalletClient {
         })
     }
 
-    #[cfg(test)]
     async fn fetch_account_id(
         client: &Client,
         base_url: &str,
@@ -201,33 +170,6 @@ impl AlpacaWalletClient {
         &self.account_id
     }
 
-    pub(super) async fn whitelist_address(
-        &self,
-        address: &Address,
-        asset: &TokenSymbol,
-        network: &Network,
-    ) -> Result<WhitelistEntry, AlpacaWalletError> {
-        #[derive(Serialize)]
-        struct WhitelistRequest<'a> {
-            address: &'a Address,
-            asset: String,
-            chain: String,
-        }
-
-        let path = format!("/v1/accounts/{}/wallets/whitelists", self.account_id);
-
-        let request = WhitelistRequest {
-            address,
-            asset: asset.0.clone(),
-            chain: network.0.clone(),
-        };
-
-        let response = self.post(&path, &request).await?;
-        let entry: WhitelistEntry = response.json().await?;
-
-        Ok(entry)
-    }
-
     pub(super) async fn get_whitelisted_addresses(
         &self,
     ) -> Result<Vec<WhitelistEntry>, AlpacaWalletError> {
@@ -312,7 +254,7 @@ mod tests {
         let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
         let account_mock = create_account_mock(&server, expected_account_id);
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -342,7 +284,7 @@ mod tests {
                 .json_body(json!({"success": true}));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -370,7 +312,7 @@ mod tests {
             }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -400,7 +342,7 @@ mod tests {
             then.status(500).body("Internal Server Error");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -436,7 +378,7 @@ mod tests {
                 .json_body(json!({"success": true}));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -465,7 +407,7 @@ mod tests {
             }));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),

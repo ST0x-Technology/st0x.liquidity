@@ -1,13 +1,8 @@
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use super::transfer::{Network, TokenSymbol};
-
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses this constant
-#[allow(dead_code)]
-pub(super) const APPROVAL_WAIT_TIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -33,65 +28,9 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    use super::super::client::{AlpacaWalletClient, AlpacaWalletError, create_account_mock};
+    use super::super::client::{AlpacaWalletClient, create_account_mock};
     use super::super::transfer::{Network, TokenSymbol};
     use super::*;
-
-    #[tokio::test]
-    async fn test_whitelist_address_success() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/whitelists"
-                ))
-                .json_body(json!({
-                    "address": address,
-                    "asset": "USDC",
-                    "chain": "ethereum"
-                }));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "id": "whitelist-123",
-                    "address": address,
-                    "asset": "USDC",
-                    "chain": "Ethereum",
-                    "status": "PENDING",
-                    "created_at": "2024-01-01T00:00:00Z"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let asset = TokenSymbol::new("USDC");
-        let network = Network::new("Ethereum");
-
-        let result = client
-            .whitelist_address(&address, &asset, &network)
-            .await
-            .unwrap();
-
-        assert_eq!(result.id, "whitelist-123");
-        assert_eq!(result.address, address);
-        assert_eq!(result.asset, asset);
-        assert_eq!(result.chain, network);
-        assert_eq!(result.status, WhitelistStatus::Pending);
-
-        account_mock.assert();
-        whitelist_mock.assert();
-    }
 
     #[tokio::test]
     async fn test_get_whitelisted_addresses() {
@@ -128,7 +67,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -174,7 +113,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -221,7 +160,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -269,7 +208,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -317,7 +256,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -335,82 +274,6 @@ mod tests {
             .unwrap();
 
         assert!(!result);
-
-        account_mock.assert();
-        whitelist_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_whitelist_address_api_error() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
-            then.status(400).json_body(json!({
-                "message": "Invalid address format"
-            }));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let asset = TokenSymbol::new("USDC");
-        let network = Network::new("Ethereum");
-
-        let result = client.whitelist_address(&address, &asset, &network).await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { .. }
-        ));
-
-        account_mock.assert();
-        whitelist_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_whitelist_duplicate_address() {
-        let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
-        let whitelist_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
-            then.status(409).json_body(json!({
-                "message": "Address already whitelisted"
-            }));
-        });
-
-        let client = AlpacaWalletClient::new_with_base_url(
-            server.base_url(),
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
-
-        let address = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let asset = TokenSymbol::new("USDC");
-        let network = Network::new("Ethereum");
-
-        let result = client.whitelist_address(&address, &asset, &network).await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { .. }
-        ));
 
         account_mock.assert();
         whitelist_mock.assert();

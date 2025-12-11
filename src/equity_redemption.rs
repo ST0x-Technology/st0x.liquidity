@@ -40,13 +40,29 @@
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteEventRepository;
 use st0x_broker::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::tokenized_equity_mint::TokenizationRequestId;
+
+/// SQLite-backed event store for EquityRedemption aggregates.
+pub(crate) type RedemptionEventStore =
+    PersistedEventStore<SqliteEventRepository, Lifecycle<EquityRedemption, Never>>;
+
+/// Unique identifier for a redemption aggregate instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedemptionAggregateId(pub(crate) String);
+
+impl RedemptionAggregateId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
 
 /// Errors that can occur during equity redemption operations.
 ///
@@ -81,9 +97,6 @@ pub(crate) enum EquityRedemptionCommand {
         redemption_wallet: Address,
         tx_hash: TxHash,
     },
-    FailTokenSend {
-        reason: String,
-    },
     Detect {
         tokenization_request_id: TokenizationRequestId,
     },
@@ -104,12 +117,6 @@ pub(crate) enum EquityRedemptionEvent {
         redemption_wallet: Address,
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
-    },
-    /// Failed to send tokens onchain (tokens never left the wallet).
-    /// Tokens remain in onchain available - safe to restore.
-    TokenSendFailed {
-        reason: String,
-        failed_at: DateTime<Utc>,
     },
 
     Detected {
@@ -138,7 +145,6 @@ impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
-            Self::TokenSendFailed { .. } => "EquityRedemptionEvent::TokenSendFailed".to_string(),
             Self::Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
             Self::DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
             Self::Completed { .. } => "EquityRedemptionEvent::Completed".to_string(),
@@ -235,10 +241,6 @@ impl Aggregate for Lifecycle<EquityRedemption, Never> {
                 tx_hash,
             } => self.handle_send_tokens(symbol, *quantity, *redemption_wallet, *tx_hash),
 
-            EquityRedemptionCommand::FailTokenSend { reason } => {
-                self.handle_fail_token_send(reason)
-            }
-
             EquityRedemptionCommand::Detect {
                 tokenization_request_id,
             } => self.handle_detect(tokenization_request_id),
@@ -306,26 +308,6 @@ impl Lifecycle<EquityRedemption, Never> {
         }
     }
 
-    fn handle_fail_token_send(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(EquityRedemptionError::TokensNotSent),
-            Ok(EquityRedemption::TokensSent { .. }) => {
-                Ok(vec![EquityRedemptionEvent::TokenSendFailed {
-                    reason: reason.to_string(),
-                    failed_at: Utc::now(),
-                }])
-            }
-            Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Ok(EquityRedemption::Pending { .. } | EquityRedemption::Completed { .. }) => {
-                Err(EquityRedemptionError::AlreadyCompleted)
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
     fn handle_fail_detection(
         &self,
         reason: &str,
@@ -378,10 +360,6 @@ impl EquityRedemption {
                 state: format!("{current:?}"),
                 event: event.event_type(),
             }),
-
-            EquityRedemptionEvent::TokenSendFailed { reason, failed_at } => {
-                current.apply_token_send_failed(reason, *failed_at, event)
-            }
 
             EquityRedemptionEvent::Detected {
                 tokenization_request_id,
@@ -482,37 +460,6 @@ impl EquityRedemption {
             tx_hash: *tx_hash,
             tokenization_request_id: tokenization_request_id.clone(),
             completed_at,
-        })
-    }
-
-    fn apply_token_send_failed(
-        &self,
-        reason: &str,
-        failed_at: DateTime<Utc>,
-        event: &EquityRedemptionEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
-        let Self::TokensSent {
-            symbol,
-            quantity,
-            tx_hash,
-            sent_at,
-            ..
-        } = self
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: format!("{self:?}"),
-                event: event.event_type(),
-            });
-        };
-
-        Ok(Self::Failed {
-            symbol: symbol.clone(),
-            quantity: *quantity,
-            tx_hash: *tx_hash,
-            tokenization_request_id: None,
-            reason: reason.to_string(),
-            sent_at: *sent_at,
-            failed_at,
         })
     }
 
@@ -757,39 +704,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fail_token_send_from_tokens_sent_state() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let sent_event = EquityRedemptionEvent::TokensSent {
-            symbol,
-            quantity: dec!(50.25),
-            redemption_wallet,
-            tx_hash,
-            sent_at: Utc::now(),
-        };
-        aggregate.apply(sent_event);
-
-        let events = aggregate
-            .handle(
-                EquityRedemptionCommand::FailTokenSend {
-                    reason: "Transaction reverted".to_string(),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::TokenSendFailed { .. }
-        ));
-    }
-
-    #[tokio::test]
     async fn test_fail_detection_from_tokens_sent_state() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
@@ -893,125 +807,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_fail_token_send_when_completed() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let sent_event = EquityRedemptionEvent::TokensSent {
-            symbol,
-            quantity: dec!(50.25),
-            redemption_wallet,
-            tx_hash,
-            sent_at: Utc::now(),
-        };
-        aggregate.apply(sent_event);
-
-        let detected_event = EquityRedemptionEvent::Detected {
-            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
-            detected_at: Utc::now(),
-        };
-        aggregate.apply(detected_event);
-
-        let completed_event = EquityRedemptionEvent::Completed {
-            completed_at: Utc::now(),
-        };
-        aggregate.apply(completed_event);
-
-        let result = aggregate
-            .handle(
-                EquityRedemptionCommand::FailTokenSend {
-                    reason: "Cannot fail".to_string(),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(EquityRedemptionError::AlreadyCompleted)
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_fail_token_send_when_already_failed() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let sent_event = EquityRedemptionEvent::TokensSent {
-            symbol,
-            quantity: dec!(50.25),
-            redemption_wallet,
-            tx_hash,
-            sent_at: Utc::now(),
-        };
-        aggregate.apply(sent_event);
-
-        let failed_event = EquityRedemptionEvent::TokenSendFailed {
-            reason: "First failure".to_string(),
-            failed_at: Utc::now(),
-        };
-        aggregate.apply(failed_event);
-
-        let result = aggregate
-            .handle(
-                EquityRedemptionCommand::FailTokenSend {
-                    reason: "Second failure".to_string(),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(result, Err(EquityRedemptionError::AlreadyFailed)));
-    }
-
-    #[tokio::test]
-    async fn test_token_send_failed_preserves_context_without_tokenization_id() {
-        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let sent_event = EquityRedemptionEvent::TokensSent {
-            symbol: symbol.clone(),
-            quantity: dec!(50.25),
-            redemption_wallet,
-            tx_hash,
-            sent_at: Utc::now(),
-        };
-        aggregate.apply(sent_event);
-
-        let failed_event = EquityRedemptionEvent::TokenSendFailed {
-            reason: "Transaction reverted".to_string(),
-            failed_at: Utc::now(),
-        };
-        aggregate.apply(failed_event);
-
-        let Lifecycle::Live(EquityRedemption::Failed {
-            symbol: failed_symbol,
-            quantity,
-            tx_hash: failed_tx_hash,
-            tokenization_request_id,
-            sent_at,
-            reason,
-            ..
-        }) = aggregate
-        else {
-            panic!("Expected Failed state, got {aggregate:?}");
-        };
-
-        assert_eq!(failed_symbol, symbol);
-        assert_eq!(quantity, dec!(50.25));
-        assert_eq!(failed_tx_hash, tx_hash);
-        assert_eq!(tokenization_request_id, None);
-        assert_eq!(reason, "Transaction reverted");
-        assert!(sent_at > DateTime::UNIX_EPOCH);
-    }
-
-    #[tokio::test]
     async fn test_redemption_rejected_preserves_context_with_tokenization_id() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
@@ -1061,22 +856,6 @@ mod tests {
         );
         assert_eq!(reason, "Insufficient balance");
         assert!(sent_at > DateTime::UNIX_EPOCH);
-    }
-
-    #[tokio::test]
-    async fn test_cannot_fail_token_send_before_sending() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
-
-        let result = aggregate
-            .handle(
-                EquityRedemptionCommand::FailTokenSend {
-                    reason: "Cannot fail".to_string(),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(result, Err(EquityRedemptionError::TokensNotSent)));
     }
 
     #[tokio::test]
@@ -1159,31 +938,6 @@ mod tests {
         };
         assert!(state.contains("TokensSent"));
         assert_eq!(evt, "EquityRedemptionEvent::Completed");
-    }
-
-    #[test]
-    fn test_apply_token_send_failed_rejects_non_tokens_sent_states() {
-        let pending = EquityRedemption::Pending {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(50.25),
-            tx_hash: TxHash::random(),
-            tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
-            sent_at: Utc::now(),
-            detected_at: Utc::now(),
-        };
-
-        let event = EquityRedemptionEvent::TokenSendFailed {
-            reason: "Should not apply".to_string(),
-            failed_at: Utc::now(),
-        };
-
-        let err = EquityRedemption::apply_transition(&event, &pending).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("Pending"));
-        assert_eq!(evt, "EquityRedemptionEvent::TokenSendFailed");
     }
 
     #[test]
