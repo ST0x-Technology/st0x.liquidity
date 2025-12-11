@@ -40,10 +40,9 @@ where
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP, S>>,
     vault: Arc<VaultService<BP, S>>,
     cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
-    /// Ethereum address to receive USDC after Alpaca withdrawal
-    ethereum_recipient: Address,
-    /// Base address to receive USDC after CCTP mint
-    base_recipient: Address,
+    /// Market maker's (our) wallet address
+    /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
+    market_maker_wallet: Address,
     /// Vault ID for Rain OrderBook deposits
     vault_id: VaultId,
 }
@@ -78,8 +77,7 @@ where
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP, S>>,
         vault: Arc<VaultService<BP, S>>,
         cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
-        ethereum_recipient: Address,
-        base_recipient: Address,
+        market_maker_wallet: Address,
         vault_id: VaultId,
     ) -> Self {
         Self {
@@ -87,8 +85,7 @@ where
             cctp_bridge,
             vault,
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             vault_id,
         }
     }
@@ -145,7 +142,7 @@ where
 
         let transfer = match self
             .alpaca_wallet
-            .initiate_withdrawal(decimal_amount, &usdc, &self.ethereum_recipient)
+            .initiate_withdrawal(decimal_amount, &usdc, &self.market_maker_wallet)
             .await
         {
             Ok(t) => t,
@@ -225,7 +222,7 @@ where
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_ethereum(amount, self.base_recipient)
+            .burn_on_ethereum(amount, self.market_maker_wallet)
             .await
         {
             Ok(r) => r,
@@ -459,7 +456,7 @@ where
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_base(amount, self.ethereum_recipient)
+            .burn_on_base(amount, self.market_maker_wallet)
             .await
         {
             Ok(r) => r,
@@ -833,16 +830,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -881,16 +876,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -936,16 +929,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -1019,16 +1010,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 
@@ -1056,16 +1045,14 @@ mod tests {
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
 
-        let ethereum_recipient = address!("0x1111111111111111111111111111111111111111");
-        let base_recipient = address!("0x2222222222222222222222222222222222222222");
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            ethereum_recipient,
-            base_recipient,
+            market_maker_wallet,
             TEST_VAULT_ID,
         );
 

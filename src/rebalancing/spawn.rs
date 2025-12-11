@@ -232,7 +232,6 @@ where
             self.vault,
             usdc_cqrs,
             config.market_maker_wallet,
-            config.market_maker_wallet,
             VaultId(config.usdc_vault_id),
         ));
 
