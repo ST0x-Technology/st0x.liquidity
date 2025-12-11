@@ -54,6 +54,16 @@ use crate::tokenized_equity_mint::TokenizationRequestId;
 pub(crate) type RedemptionEventStore =
     PersistedEventStore<SqliteEventRepository, Lifecycle<EquityRedemption, Never>>;
 
+/// Unique identifier for a redemption aggregate instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedemptionAggregateId(pub(crate) String);
+
+impl RedemptionAggregateId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
 /// Errors that can occur during equity redemption operations.
 ///
 /// These errors enforce state machine constraints and prevent invalid transitions.

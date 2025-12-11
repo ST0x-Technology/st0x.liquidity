@@ -7,12 +7,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{Redeem, RedemptionError};
+use crate::equity_redemption::RedemptionAggregateId;
 use crate::shares::FractionalShares;
 
 /// Parameters captured from the last `execute_redemption` call.
 #[derive(Debug, Clone)]
 pub(crate) struct RedeemCall {
-    pub(crate) aggregate_id: String,
+    pub(crate) aggregate_id: RedemptionAggregateId,
     pub(crate) symbol: Symbol,
     pub(crate) quantity: FractionalShares,
     pub(crate) token: Address,
@@ -62,7 +63,7 @@ impl MockRedeem {
 impl Redeem for MockRedeem {
     async fn execute_redemption(
         &self,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
@@ -71,7 +72,7 @@ impl Redeem for MockRedeem {
         self.call_count.fetch_add(1, Ordering::SeqCst);
 
         *self.last_call.lock().unwrap() = Some(RedeemCall {
-            aggregate_id: aggregate_id.to_string(),
+            aggregate_id: aggregate_id.clone(),
             symbol,
             quantity,
             token,
@@ -110,7 +111,7 @@ mod tests {
         let mock = MockRedeem::new();
 
         mock.execute_redemption(
-            "agg-1",
+            &RedemptionAggregateId::new("agg-1"),
             Symbol::new("AAPL").unwrap(),
             FractionalShares(dec!(10)),
             Address::ZERO,
@@ -122,7 +123,7 @@ mod tests {
         assert_eq!(mock.calls(), 1);
 
         mock.execute_redemption(
-            "agg-2",
+            &RedemptionAggregateId::new("agg-2"),
             Symbol::new("TSLA").unwrap(),
             FractionalShares(dec!(20)),
             Address::ZERO,
@@ -139,9 +140,10 @@ mod tests {
         let mock = MockRedeem::new();
         let token = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
         let amount = U256::from(999_000_000u64);
+        let aggregate_id = RedemptionAggregateId::new("my-agg-id");
 
         mock.execute_redemption(
-            "my-agg-id",
+            &aggregate_id,
             Symbol::new("GOOG").unwrap(),
             FractionalShares(dec!(123.456)),
             token,
@@ -151,7 +153,7 @@ mod tests {
         .unwrap();
 
         let call = mock.last_call().unwrap();
-        assert_eq!(call.aggregate_id, "my-agg-id");
+        assert_eq!(call.aggregate_id, aggregate_id);
         assert_eq!(call.symbol, Symbol::new("GOOG").unwrap());
         assert_eq!(call.quantity, FractionalShares(dec!(123.456)));
         assert_eq!(call.token, token);
@@ -164,7 +166,7 @@ mod tests {
 
         let result = mock
             .execute_redemption(
-                "fail-test",
+                &RedemptionAggregateId::new("fail-test"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares(dec!(1)),
                 Address::ZERO,
@@ -181,7 +183,7 @@ mod tests {
 
         let _ = mock
             .execute_redemption(
-                "x",
+                &RedemptionAggregateId::new("x"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares(dec!(1)),
                 Address::ZERO,
@@ -195,10 +197,11 @@ mod tests {
     #[tokio::test]
     async fn failing_mock_still_captures_last_call() {
         let mock = MockRedeem::failing();
+        let aggregate_id = RedemptionAggregateId::new("captured-agg");
 
         let _ = mock
             .execute_redemption(
-                "captured-agg",
+                &aggregate_id,
                 Symbol::new("NVDA").unwrap(),
                 FractionalShares(dec!(50)),
                 Address::ZERO,
@@ -207,7 +210,7 @@ mod tests {
             .await;
 
         let call = mock.last_call().unwrap();
-        assert_eq!(call.aggregate_id, "captured-agg");
+        assert_eq!(call.aggregate_id, aggregate_id);
         assert_eq!(call.symbol, Symbol::new("NVDA").unwrap());
         assert_eq!(call.amount, U256::from(12345u64));
     }

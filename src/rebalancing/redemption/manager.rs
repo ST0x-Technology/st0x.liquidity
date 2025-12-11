@@ -13,7 +13,7 @@ use tracing::{info, instrument, warn};
 
 use super::{Redeem, RedemptionError};
 use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::shares::FractionalShares;
 
@@ -53,7 +53,7 @@ where
     #[instrument(skip(self), fields(%symbol, ?quantity, %token, %amount))]
     async fn execute_redemption_impl(
         &self,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
@@ -71,7 +71,7 @@ where
 
         self.cqrs
             .execute(
-                aggregate_id,
+                &aggregate_id.0,
                 EquityRedemptionCommand::SendTokens {
                     symbol,
                     quantity: quantity.0,
@@ -89,7 +89,7 @@ where
                 warn!("Polling for redemption detection failed: {e}");
                 self.cqrs
                     .execute(
-                        aggregate_id,
+                        &aggregate_id.0,
                         EquityRedemptionCommand::FailDetection {
                             reason: format!("Detection polling failed: {e}"),
                         },
@@ -101,7 +101,7 @@ where
 
         self.cqrs
             .execute(
-                aggregate_id,
+                &aggregate_id.0,
                 EquityRedemptionCommand::Detect {
                     tokenization_request_id: detected.id.clone(),
                 },
@@ -123,7 +123,7 @@ where
                 warn!("Polling for completion failed: {e}");
                 self.cqrs
                     .execute(
-                        aggregate_id,
+                        &aggregate_id.0,
                         EquityRedemptionCommand::RejectRedemption {
                             reason: format!("Completion polling failed: {e}"),
                         },
@@ -136,7 +136,7 @@ where
         match completed.status {
             TokenizationRequestStatus::Completed => {
                 self.cqrs
-                    .execute(aggregate_id, EquityRedemptionCommand::Complete)
+                    .execute(&aggregate_id.0, EquityRedemptionCommand::Complete)
                     .await?;
 
                 info!("Redemption workflow completed successfully");
@@ -145,7 +145,7 @@ where
             TokenizationRequestStatus::Rejected => {
                 self.cqrs
                     .execute(
-                        aggregate_id,
+                        &aggregate_id.0,
                         EquityRedemptionCommand::RejectRedemption {
                             reason: "Redemption rejected by Alpaca".to_string(),
                         },
@@ -169,7 +169,7 @@ where
 {
     async fn execute_redemption(
         &self,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
@@ -218,7 +218,13 @@ mod tests {
         let amount = U256::from(100_000_000_000_000_000_000_u128);
 
         let result = manager
-            .execute_redemption_impl("redemption-001", symbol, quantity, token, amount)
+            .execute_redemption_impl(
+                &RedemptionAggregateId::new("redemption-001"),
+                symbol,
+                quantity,
+                token,
+                amount,
+            )
             .await;
 
         assert!(matches!(result, Err(RedemptionError::Alpaca(_))));
@@ -238,7 +244,7 @@ mod tests {
 
         let result = redeem_trait
             .execute_redemption(
-                "trait-test",
+                &RedemptionAggregateId::new("trait-test"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares(dec!(50.0)),
                 address!("0x1234567890abcdef1234567890abcdef12345678"),

@@ -14,7 +14,7 @@ use st0x_broker::Symbol;
 use thiserror::Error;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::equity_redemption::EquityRedemptionError;
+use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
 use crate::shares::FractionalShares;
 
 #[derive(Debug, Error)]
@@ -34,7 +34,7 @@ pub(crate) enum RedemptionError {
 pub(crate) trait Redeem: Send + Sync {
     async fn execute_redemption(
         &self,
-        aggregate_id: &str,
+        aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
@@ -62,7 +62,7 @@ mod tests {
         let mock = Arc::new(MockRedeem::new());
 
         mock.execute_redemption(
-            "agg-1",
+            &RedemptionAggregateId::new("agg-1"),
             Symbol::new("AAPL").unwrap(),
             FractionalShares(dec!(100)),
             address!("0x1234567890123456789012345678901234567890"),
@@ -81,13 +81,14 @@ mod tests {
         let quantity = FractionalShares(dec!(50.5));
         let token = address!("0xabcdef0123456789abcdef0123456789abcdef01");
         let amount = U256::from(50_500_000_000_000_000_000_u128);
+        let aggregate_id = RedemptionAggregateId::new("agg-123");
 
-        mock.execute_redemption("agg-123", symbol.clone(), quantity, token, amount)
+        mock.execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
             .await
             .unwrap();
 
         let last = mock.last_call().unwrap();
-        assert_eq!(last.aggregate_id, "agg-123");
+        assert_eq!(last.aggregate_id, aggregate_id);
         assert_eq!(last.symbol, symbol);
         assert_eq!(last.quantity, quantity);
         assert_eq!(last.token, token);
@@ -100,7 +101,7 @@ mod tests {
 
         let result = mock
             .execute_redemption(
-                "agg-fail",
+                &RedemptionAggregateId::new("agg-fail"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares(dec!(10)),
                 Address::ZERO,

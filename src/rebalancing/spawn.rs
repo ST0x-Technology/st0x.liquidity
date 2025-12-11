@@ -424,20 +424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_rebalancer_creates_working_rebalancer() {
-        let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server).await;
-
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-
-        let rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default());
-
-        drop(rebalancer);
-    }
-
-    #[tokio::test]
-    async fn into_rebalancer_wires_services_to_managers() {
+    async fn into_rebalancer_constructs_without_panic() {
         let server = MockServer::start();
         let (services, config) = make_services_with_mock_wallet(&server).await;
 

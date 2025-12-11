@@ -11,6 +11,7 @@ use super::mint::Mint;
 use super::redemption::Redeem;
 use super::trigger::TriggeredOperation;
 use super::usdc::UsdcRebalance;
+use crate::equity_redemption::RedemptionAggregateId;
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
@@ -113,7 +114,7 @@ where
     }
 
     async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
-        let aggregate_id = Uuid::new_v4().to_string();
+        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
         let amount = match shares_to_u256_18_decimals(quantity) {
             Ok(a) => a,
@@ -128,7 +129,7 @@ where
             ?quantity,
             %token,
             %amount,
-            %aggregate_id,
+            aggregate_id = %aggregate_id.0,
             "Executing redemption operation"
         );
 
