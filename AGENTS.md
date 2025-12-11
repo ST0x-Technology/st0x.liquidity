@@ -565,6 +565,10 @@ explicit permission.**
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
+- **No ad-hoc debugging scripts**: Never write ad-hoc scripts, code snippets, or
+  temporary files outside the project for debugging. If you need to debug an
+  issue, write a proper test function within the project's test suite and remove
+  it once you've obtained the information you need.
 - **Test Quality**: Never write tests that only exercise language features
   without testing our application logic. Tests should verify actual business
   logic, not just struct field assignments or basic language operations

@@ -211,20 +211,15 @@ pub(crate) struct InventoryView {
 }
 
 impl InventoryView {
-    /// Checks all tracked equities for imbalances against their thresholds.
-    /// Returns a list of (symbol, imbalance) pairs for symbols that are imbalanced.
-    pub(crate) fn check_equity_imbalances(
+    /// Checks a single equity for imbalance against the threshold.
+    /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
+    pub(crate) fn check_equity_imbalance(
         &self,
-        thresholds: &HashMap<Symbol, ImbalanceThreshold>,
-    ) -> Vec<(Symbol, Imbalance<FractionalShares>)> {
-        self.equities
-            .iter()
-            .filter_map(|(symbol, inventory)| {
-                let threshold = thresholds.get(symbol)?;
-                let imbalance = inventory.detect_imbalance(threshold)?;
-                Some((symbol.clone(), imbalance))
-            })
-            .collect()
+        symbol: &Symbol,
+        threshold: &ImbalanceThreshold,
+    ) -> Option<Imbalance<FractionalShares>> {
+        let inventory = self.equities.get(symbol)?;
+        inventory.detect_imbalance(threshold)
     }
 
     /// Checks USDC inventory for imbalance against the threshold.
@@ -1622,98 +1617,53 @@ mod tests {
     }
 
     #[test]
-    fn check_equity_imbalances_returns_empty_when_all_balanced() {
+    fn check_equity_imbalance_returns_none_when_balanced() {
         let aapl = Symbol::new("AAPL").unwrap();
-        let msft = Symbol::new("MSFT").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(50, 0, 50, 0)),
-            (msft.clone(), inventory(50, 0, 50, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
-            (aapl, threshold("0.5", "0.2")),
-            (msft, threshold("0.5", "0.2")),
-        ]
-        .into_iter()
-        .collect();
+        let view = make_view(vec![(aapl.clone(), inventory(50, 0, 50, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalances = view.check_equity_imbalances(&thresholds);
-
-        assert!(imbalances.is_empty());
+        assert!(view.check_equity_imbalance(&aapl, &thresh).is_none());
     }
 
     #[test]
-    fn check_equity_imbalances_identifies_multiple_imbalanced_symbols() {
+    fn check_equity_imbalance_detects_too_much_onchain() {
         let aapl = Symbol::new("AAPL").unwrap();
-        let msft = Symbol::new("MSFT").unwrap();
-        let googl = Symbol::new("GOOGL").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(80, 0, 20, 0)),
-            (msft.clone(), inventory(50, 0, 50, 0)),
-            (googl.clone(), inventory(20, 0, 80, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
-            (aapl.clone(), threshold("0.5", "0.2")),
-            (msft, threshold("0.5", "0.2")),
-            (googl.clone(), threshold("0.5", "0.2")),
-        ]
-        .into_iter()
-        .collect();
+        let view = make_view(vec![(aapl.clone(), inventory(80, 0, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalances = view.check_equity_imbalances(&thresholds);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh);
 
-        assert_eq!(imbalances.len(), 2);
-
-        let aapl_imbalance = imbalances.iter().find(|(s, _)| s == &aapl);
-        assert!(matches!(
-            aapl_imbalance,
-            Some((_, Imbalance::TooMuchOnchain { .. }))
-        ));
-
-        let googl_imbalance = imbalances.iter().find(|(s, _)| s == &googl);
-        assert!(matches!(
-            googl_imbalance,
-            Some((_, Imbalance::TooMuchOffchain { .. }))
-        ));
+        assert!(matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })));
     }
 
     #[test]
-    fn check_equity_imbalances_skips_symbols_without_thresholds() {
+    fn check_equity_imbalance_detects_too_much_offchain() {
         let aapl = Symbol::new("AAPL").unwrap();
-        let msft = Symbol::new("MSFT").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(80, 0, 20, 0)),
-            (msft, inventory(80, 0, 20, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> =
-            vec![(aapl.clone(), threshold("0.5", "0.2"))]
-                .into_iter()
-                .collect();
+        let view = make_view(vec![(aapl.clone(), inventory(20, 0, 80, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalances = view.check_equity_imbalances(&thresholds);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh);
 
-        assert_eq!(imbalances.len(), 1);
-        assert_eq!(imbalances[0].0, aapl);
+        assert!(matches!(imbalance, Some(Imbalance::TooMuchOffchain { .. })));
     }
 
     #[test]
-    fn check_equity_imbalances_skips_symbols_with_inflight() {
+    fn check_equity_imbalance_returns_none_for_unknown_symbol() {
         let aapl = Symbol::new("AAPL").unwrap();
         let msft = Symbol::new("MSFT").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(80, 0, 20, 0)),
-            (msft.clone(), inventory(60, 20, 20, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
-            (aapl.clone(), threshold("0.5", "0.2")),
-            (msft, threshold("0.5", "0.2")),
-        ]
-        .into_iter()
-        .collect();
+        let view = make_view(vec![(aapl, inventory(80, 0, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalances = view.check_equity_imbalances(&thresholds);
+        assert!(view.check_equity_imbalance(&msft, &thresh).is_none());
+    }
 
-        assert_eq!(imbalances.len(), 1);
-        assert_eq!(imbalances[0].0, aapl);
+    #[test]
+    fn check_equity_imbalance_returns_none_when_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(aapl.clone(), inventory(60, 20, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
+
+        assert!(view.check_equity_imbalance(&aapl, &thresh).is_none());
     }
 
     #[test]

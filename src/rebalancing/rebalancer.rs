@@ -177,7 +177,15 @@ where
     }
 }
 
+/// 10^18 - scale factor for converting shares to 18-decimal token amounts.
+/// Constructed via from_parts(lo, mid, hi, negative, scale) where lo/mid/hi
+/// form a 96-bit integer: 10^18 = 0x0DE0B6B3A7640000 = (mid=232830643 << 32) | lo=2808348672
+const ERC20_DECIMAL_SCALE: Decimal = Decimal::from_parts(2_808_348_672, 232_830_643, 0, false, 0);
+
 /// Converts FractionalShares (Decimal) to U256 with 18 decimal places.
+///
+/// Underflow policy: values that scale to less than 1 (i.e., < 1e-18 shares)
+/// return an error rather than silently becoming zero.
 fn shares_to_u256_18_decimals(shares: FractionalShares) -> Result<U256, SharesConversionError> {
     let value = shares.0;
 
@@ -185,8 +193,21 @@ fn shares_to_u256_18_decimals(shares: FractionalShares) -> Result<U256, SharesCo
         return Err(SharesConversionError::NegativeValue(value));
     }
 
-    let scaled = value * Decimal::from(10u64.pow(18));
-    let as_str = scaled.trunc().to_string();
+    if value.is_zero() {
+        return Ok(U256::ZERO);
+    }
+
+    let scaled = value
+        .checked_mul(ERC20_DECIMAL_SCALE)
+        .ok_or(SharesConversionError::Overflow)?;
+
+    let truncated = scaled.trunc();
+
+    if truncated.is_zero() {
+        return Err(SharesConversionError::Underflow(value));
+    }
+
+    let as_str = truncated.to_string();
 
     U256::from_str_radix(&as_str, 10).map_err(SharesConversionError::ParseError)
 }
@@ -195,6 +216,10 @@ fn shares_to_u256_18_decimals(shares: FractionalShares) -> Result<U256, SharesCo
 enum SharesConversionError {
     #[error("shares value cannot be negative: {0}")]
     NegativeValue(Decimal),
+    #[error("shares value too small to represent with 18 decimals: {0}")]
+    Underflow(Decimal),
+    #[error("overflow when scaling shares to 18 decimals")]
+    Overflow,
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
@@ -209,6 +234,12 @@ mod tests {
     use crate::rebalancing::redemption::mock::MockRedeem;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::threshold::Usdc;
+
+    #[test]
+    fn erc20_decimal_scale_equals_1e18() {
+        let expected = dec!(1_000_000_000_000_000_000);
+        assert_eq!(ERC20_DECIMAL_SCALE, expected);
+    }
 
     #[test]
     fn shares_to_u256_converts_whole_number() {
@@ -245,6 +276,24 @@ mod tests {
             result,
             Err(SharesConversionError::NegativeValue(_))
         ));
+    }
+
+    #[test]
+    fn shares_to_u256_rejects_underflow() {
+        // Value smaller than 1e-18 should error
+        let shares = FractionalShares(Decimal::from_parts(1, 0, 0, false, 28));
+        let result = shares_to_u256_18_decimals(shares);
+
+        assert!(matches!(result, Err(SharesConversionError::Underflow(_))));
+    }
+
+    #[test]
+    fn shares_to_u256_rejects_overflow() {
+        // Decimal::MAX * 10^18 would overflow
+        let shares = FractionalShares(Decimal::MAX);
+        let result = shares_to_u256_18_decimals(shares);
+
+        assert!(matches!(result, Err(SharesConversionError::Overflow)));
     }
 
     #[tokio::test]

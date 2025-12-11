@@ -10,8 +10,8 @@ use cqrs_es::CqrsFramework;
 use cqrs_es::persist::PersistedEventStore;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
-use std::sync::{Arc, RwLock};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{RwLock, mpsc};
 use tracing::info;
 
 use st0x_broker::alpaca::AlpacaAuthEnv;
@@ -149,6 +149,8 @@ where
             MESSAGE_TRANSMITTER_V2,
         );
 
+        // CctpBridge and VaultService each need their own Evm instance because
+        // Evm holds contract instances that borrow the provider, preventing Clone.
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
             signer.clone(),
@@ -182,7 +184,9 @@ where
         config: &RebalancingConfig,
         symbol_cache: SymbolCache,
     ) -> ConfiguredRebalancer<BP> {
-        let (operation_sender, operation_receiver) = mpsc::channel(100);
+        const OPERATION_CHANNEL_CAPACITY: usize = 100;
+
+        let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
@@ -254,8 +258,6 @@ mod tests {
 
     use crate::alpaca_wallet::{AlpacaWalletService, create_account_mock};
     use crate::inventory::ImbalanceThreshold;
-    use crate::rebalancing::trigger::TriggeredOperation;
-    use crate::shares::FractionalShares;
 
     fn make_config() -> RebalancingConfig {
         RebalancingConfig {
@@ -431,28 +433,6 @@ mod tests {
         let rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default());
 
         drop(rebalancer);
-    }
-
-    #[tokio::test]
-    async fn into_rebalancer_channel_capacity_is_100() {
-        let (sender, _receiver) = mpsc::channel::<TriggeredOperation>(100);
-
-        for i in 0..100 {
-            let result = sender.try_send(TriggeredOperation::Mint {
-                symbol: st0x_broker::Symbol::new("AAPL").unwrap(),
-                quantity: FractionalShares(rust_decimal::Decimal::from(i)),
-            });
-            assert!(
-                result.is_ok(),
-                "Should be able to send message {i} without blocking"
-            );
-        }
-
-        let result = sender.try_send(TriggeredOperation::Mint {
-            symbol: st0x_broker::Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares(rust_decimal::Decimal::from(100)),
-        });
-        assert!(result.is_err(), "Channel should be full after 100 messages");
     }
 
     #[tokio::test]

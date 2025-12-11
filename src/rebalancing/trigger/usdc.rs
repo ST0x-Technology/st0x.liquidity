@@ -1,7 +1,9 @@
 //! USDC-specific trigger types and logic.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+
+use tokio::sync::RwLock;
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
@@ -58,15 +60,12 @@ impl Drop for InProgressGuard {
 ///
 /// Returns `UsdcAlpacaToBase` if there's too much USDC in Alpaca that needs to be bridged to Base,
 /// or `UsdcBaseToAlpaca` if there's too much USDC on Base that needs to be bridged to Alpaca.
-pub(super) fn check_imbalance_and_build_operation(
+pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
 ) -> Result<TriggeredOperation, UsdcTriggerSkip> {
     let imbalance = {
-        let inventory = match inventory.read() {
-            Ok(g) => g,
-            Err(poison) => poison.into_inner(),
-        };
+        let inventory = inventory.read().await;
         inventory.check_usdc_imbalance(threshold)
     };
 
@@ -124,15 +123,16 @@ mod tests {
         assert!(second_claim.is_none());
     }
 
-    #[test]
-    fn test_balanced_inventory_returns_no_imbalance() {
+    #[tokio::test]
+    async fn test_balanced_inventory_returns_no_imbalance() {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory);
+        let result = check_imbalance_and_build_operation(&threshold, &inventory).await;
+
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
     }
 }

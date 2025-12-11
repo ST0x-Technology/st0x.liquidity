@@ -10,7 +10,7 @@ use crate::error::OnChainError;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SymbolCache {
-    map: Arc<RwLock<BTreeMap<Address, String>>>,
+    pub(crate) map: Arc<RwLock<BTreeMap<Address, String>>>,
 }
 
 impl SymbolCache {
