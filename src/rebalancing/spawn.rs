@@ -63,15 +63,13 @@ type ConfiguredRebalancer<BP> = Rebalancer<
     UsdcRebalanceManager<BP, PrivateKeySigner, UsdcEventStore>,
 >;
 
-/// Spawns the rebalancing infrastructure with the given Base provider.
-///
-/// The Base provider is passed in to reuse the existing WebSocket connection
-/// from the main bot's orderbook monitoring.
+/// Spawns the rebalancing infrastructure.
 pub(crate) async fn spawn_rebalancer<BP>(
     pool: SqlitePool,
     config: &RebalancingConfig,
     alpaca_auth: &AlpacaAuthEnv,
     base_provider: BP,
+    symbol_cache: SymbolCache,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -82,7 +80,7 @@ where
     let services =
         Services::new(config, alpaca_auth, &ethereum_wallet, signer, base_provider).await?;
 
-    let rebalancer = services.into_rebalancer(pool, config);
+    let rebalancer = services.into_rebalancer(pool, config, symbol_cache);
 
     let handle = tokio::spawn(async move {
         rebalancer.run().await;
@@ -178,18 +176,15 @@ where
         })
     }
 
-    /// Converts the services into a configured `Rebalancer`.
-    ///
-    /// This wires up the CQRS event stores, managers, and trigger infrastructure.
     fn into_rebalancer(
         self,
         pool: SqlitePool,
         config: &RebalancingConfig,
+        symbol_cache: SymbolCache,
     ) -> ConfiguredRebalancer<BP> {
         let (operation_sender, operation_receiver) = mpsc::channel(100);
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let symbol_cache = SymbolCache::default();
 
         let trigger_config = RebalancingTriggerConfig {
             equity_threshold: config.equity_threshold,
@@ -433,7 +428,7 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        let rebalancer = services.into_rebalancer(pool, &config);
+        let rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default());
 
         drop(rebalancer);
     }
@@ -468,8 +463,6 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        // Exercises the full wiring: Services -> managers -> rebalancer.
-        // Type mismatches or missing clones would cause compile or runtime errors.
-        let _rebalancer = services.into_rebalancer(pool, &config);
+        let _rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default());
     }
 }

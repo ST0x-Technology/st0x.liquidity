@@ -141,6 +141,7 @@ impl Conductor {
                         rebalancing_config,
                         alpaca_auth,
                         provider.clone(),
+                        cache.clone(),
                     )
                     .await?,
                 )
