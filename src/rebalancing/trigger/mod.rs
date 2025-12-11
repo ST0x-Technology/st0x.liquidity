@@ -53,9 +53,12 @@ pub struct RebalancingEnv {
     /// Deviation from USDC target that triggers rebalancing (0.0-1.0)
     #[clap(long, env, default_value = "0.3")]
     usdc_deviation: Decimal,
-    /// Wallet address for receiving minted tokens
+    /// Issuer's wallet for tokenized equity redemptions
     #[clap(long, env)]
     redemption_wallet: Address,
+    /// Our wallet for USDC operations (Alpaca withdrawals, CCTP bridging, vault deposits)
+    #[clap(long, env)]
+    market_maker_wallet: Address,
     /// Ethereum RPC URL for CCTP operations
     #[clap(long, env)]
     ethereum_rpc_url: Url,
@@ -88,6 +91,7 @@ impl RebalancingConfig {
                 deviation: env.usdc_deviation,
             },
             redemption_wallet: env.redemption_wallet,
+            market_maker_wallet: env.market_maker_wallet,
             ethereum_rpc_url: env.ethereum_rpc_url,
             ethereum_private_key: env.ethereum_private_key,
             base_orderbook: env.base_orderbook,
@@ -101,7 +105,10 @@ impl RebalancingConfig {
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
+    /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
+    /// Our wallet for USDC operations (Alpaca withdrawals, CCTP bridging, vault deposits).
+    pub(crate) market_maker_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) ethereum_private_key: B256,
     pub(crate) base_orderbook: Address,
@@ -114,6 +121,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("equity_threshold", &self.equity_threshold)
             .field("usdc_threshold", &self.usdc_threshold)
             .field("redemption_wallet", &self.redemption_wallet)
+            .field("market_maker_wallet", &self.market_maker_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("ethereum_private_key", &"[REDACTED]")
             .field("base_orderbook", &self.base_orderbook)
@@ -1340,11 +1348,15 @@ mod tests {
         ));
     }
 
-    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 6] {
+    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 7] {
         [
             (
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
+            ),
+            (
+                "MARKET_MAKER_WALLET",
+                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
             ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
@@ -1385,6 +1397,10 @@ mod tests {
             (
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
+            ),
+            (
+                "MARKET_MAKER_WALLET",
+                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
             ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (

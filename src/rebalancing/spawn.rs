@@ -231,8 +231,8 @@ where
             self.cctp,
             self.vault,
             usdc_cqrs,
-            config.redemption_wallet,
-            config.redemption_wallet,
+            config.market_maker_wallet,
+            config.market_maker_wallet,
             VaultId(config.usdc_vault_id),
         ));
 
@@ -270,6 +270,7 @@ mod tests {
                 deviation: dec!(0.15),
             },
             redemption_wallet: address!("1234567890123456789012345678901234567890"),
+            market_maker_wallet: address!("aabbccddaabbccddaabbccddaabbccddaabbccdd"),
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
             ethereum_private_key: b256!(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

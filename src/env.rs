@@ -586,6 +586,10 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
+                (
+                    "MARKET_MAKER_WALLET",
+                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
+                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
                     "ETHEREUM_PRIVATE_KEY",
@@ -647,6 +651,10 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
+                (
+                    "MARKET_MAKER_WALLET",
+                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
+                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
                     "ETHEREUM_PRIVATE_KEY",
@@ -703,6 +711,10 @@ pub mod tests {
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                (
+                    "MARKET_MAKER_WALLET",
+                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
                 ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
