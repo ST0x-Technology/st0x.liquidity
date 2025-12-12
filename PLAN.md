@@ -9,18 +9,40 @@ Issue: #177
 Initialize the SvelteKit project with all dependencies, configuration, and FP
 helpers module.
 
-- [ ] Create `dashboard/` directory and initialize SvelteKit project with
+- [x] Create `dashboard/` directory and initialize SvelteKit project with
       TypeScript and Vite
-- [ ] Install dependencies: `@tanstack/svelte-query`, `bits-ui`, `tailwindcss`,
+- [x] Install dependencies: `@tanstack/svelte-query`, `bits-ui`, `tailwindcss`,
       `lightweight-charts`
-- [ ] Configure shadcn-svelte
-- [ ] Configure ESLint and Prettier (no semicolons, arrow functions preferred)
-- [ ] Create `lib/fp.ts` with Result type, `ok()`, `err()`, `match()`, `pipe()`,
+- [x] Configure shadcn-svelte
+- [x] Configure ESLint and Prettier (no semicolons, arrow functions preferred)
+- [x] Create `lib/fp.ts` with Result type, `ok()`, `err()`, `match()`, `pipe()`,
       `map`, `flatMap`, `mapErr`
-- [ ] Write unit tests for FP helpers
-- [ ] Set up environment variables for broker WebSocket URLs
-- [ ] Verify: `npm run build` succeeds, `npm run check` passes, FP helper tests
+- [x] Write unit tests for FP helpers
+- [x] Set up environment variables for broker WebSocket URLs
+- [x] Verify: `npm run build` succeeds, `npm run check` passes, FP helper tests
       pass
+
+### Changes Made
+
+- `dashboard/` - SvelteKit project with TypeScript, Vite, Svelte 5
+- `dashboard/package.json` - Dependencies: `@tanstack/svelte-query`, `bits-ui`,
+  `tailwindcss`, `lightweight-charts`, plus dev tooling
+- `dashboard/eslint.config.js` - Strict TypeScript rules with
+  `strict-type-checked`, switch exhaustiveness, strict boolean expressions
+- `dashboard/.prettierrc` - No semicolons, single quotes, trailing comma none
+- `dashboard/src/lib/fp.ts` - FP helpers module:
+  - `Result<T, E>` type with `tag: 'ok' | 'err'` discriminant
+  - `ok()`, `err()`, `isOk()`, `isErr()` constructors and guards
+  - `matchResult()` for pattern matching on Results
+  - `matcher<T>()('discriminant')` for generic discriminated union matching
+  - `map`, `mapErr`, `flatMap` for Result transformations
+  - `unwrap`, `unwrapOr` for extraction
+  - `tryCatch`, `tryCatchAsync` for exception handling
+  - `pipe()` for left-to-right composition
+- `dashboard/src/lib/fp.test.ts` - 25 unit tests covering all FP helpers
+- `dashboard/src/lib/env.ts` - `Broker` type and `getWebSocketUrl()` using
+  `PUBLIC_SCHWAB_WS_URL` and `PUBLIC_ALPACA_WS_URL` env vars
+- shadcn-svelte components: `button`, `badge`, `card`, `select`, `separator`
 
 ---
 
@@ -101,14 +123,27 @@ connected clients.
 
 ---
 
-## Task 6. End-to-End Verification and Cleanup
+## Task 6. CI Configuration for Dashboard
+
+Add dashboard checks to CI pipeline.
+
+- [ ] Update CI workflow to install bun
+- [ ] Add dashboard build step: `bun run --cwd dashboard build`
+- [ ] Add dashboard type check step: `bun run --cwd dashboard check`
+- [ ] Add dashboard lint step: `bun run --cwd dashboard lint`
+- [ ] Add dashboard test step: `bun run --cwd dashboard test:run`
+- [ ] Verify CI passes on a test push
+
+---
+
+## Task 7. End-to-End Verification and Cleanup
 
 Final integration testing and cleanup before PR.
 
 - [ ] Manual end-to-end test: run backend, open dashboard, trigger domain event,
       see it appear in Live Events panel
 - [ ] Verify broker selector switches between URLs correctly
-- [ ] Run full test suite: `cargo test -q`, `npm test`
+- [ ] Run full test suite: `cargo test -q`, `bun run --cwd dashboard test:run`
 - [ ] Run linters: `cargo clippy --all-targets -- -D warnings`, `cargo fmt`,
-      `npm run lint`
+      `bun run --cwd dashboard lint`
 - [ ] Delete PLAN.md before creating PR

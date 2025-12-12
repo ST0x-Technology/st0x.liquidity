@@ -639,70 +639,44 @@ expected bounds.
 
 #### CRITICAL: Lint Policy
 
-**NEVER add `#[allow(clippy::*)]` attributes or disable any lints without
-explicit permission.** This is strictly forbidden. When clippy reports issues,
-you MUST fix the underlying code problems, not suppress the warnings.
+**This policy applies to ALL linters across ALL languages in the repository**
+(clippy, eslint, etc.). NEVER disable or bypass any lint rules without explicit
+user permission.
 
-**Required approach for clippy issues:**
+**FORBIDDEN without explicit permission:**
+
+- `#[allow(clippy::*)]` attributes in Rust
+- `// eslint-disable` comments in TypeScript/JavaScript
+- Any other lint suppression mechanism in any language
+
+**Required approach for lint issues:**
 
 1. **Refactor the code** to address the root cause of the lint violation
 2. **Break down large functions** into smaller, more focused functions
-3. **Improve code structure** to meet clippy's standards
+3. **Improve code structure** to meet the linter's standards
 4. **Use proper error handling** instead of suppressing warnings
 
-**Examples of FORBIDDEN practices:**
+**If you encounter a lint issue you cannot fix:**
 
-```rust
-// ❌ NEVER DO THIS - Suppressing lints is forbidden
-#[allow(clippy::too_many_lines)]
-fn large_function() { /* ... */ }
+1. Understand WHY the linter is flagging the code
+2. Attempt to refactor the code to address the underlying problem
+3. If the lint cannot be fixed (e.g., type system limitations), ask for explicit
+   permission before suppressing it
+4. Document your reasoning in a comment if given permission
 
-#[allow(clippy::needless_continue)]
-// ❌ NEVER DO THIS - Fix the code structure instead
-```
+**Exception for third-party generated code:**
 
-**Required approach:**
+Lint suppression is acceptable for issues originating from code we cannot
+control, such as:
 
-```rust
-// ✅ CORRECT - Refactor to address the issue
-fn process_data() -> Result<(), Error> {
-    let data = get_data()?;
-    validate_data(&data)?;
-    save_data(&data)?;
-    Ok(())
-}
-
-fn validate_data(data: &Data) -> Result<(), Error> {
-    // Extracted validation logic
-}
-
-fn save_data(data: &Data) -> Result<(), Error> {
-    // Extracted saving logic
-}
-```
-
-**If you encounter a clippy issue:**
-
-1. Understand WHY clippy is flagging the code
-2. Refactor the code to address the underlying problem
-3. If you believe a lint is incorrect, ask for permission before suppressing it
-4. Document your reasoning if given permission to suppress a specific lint
-
-**Exception for third-party macro-generated code:**
-
-When using third-party macros, such as `sol!` to generate Rust code , lint
-suppression is acceptable for issues that originate from the contract's function
-signatures, which we cannot control.
-
-For example, to deal with a function generated from a smart contract's ABI, we
-can add `allow` inside the `sol!` macro invocation.
+- Rust: `sol!` macro generating code from smart contract ABIs
+- TypeScript: Auto-generated types from external schemas
 
 ```rust
 // ✅ CORRECT - Suppressing lint for third-party ABI generated code
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
-    #[derive(serde::Serialize, serde::Deserialize)]
     IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
 );
 ```

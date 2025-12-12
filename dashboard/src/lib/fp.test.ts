@@ -6,7 +6,8 @@ import {
   isOk,
   map,
   mapErr,
-  match,
+  matcher,
+  matchResult,
   ok,
   pipe,
   type Result,
@@ -19,12 +20,12 @@ import {
 describe('Result constructors', () => {
   it('ok creates a success result', () => {
     const result = ok(42)
-    expect(result).toEqual({ ok: true, value: 42 })
+    expect(result).toEqual({ tag: 'ok', value: 42 })
   })
 
   it('err creates a failure result', () => {
     const result = err('failed')
-    expect(result).toEqual({ ok: false, error: 'failed' })
+    expect(result).toEqual({ tag: 'err', error: 'failed' })
   })
 })
 
@@ -40,21 +41,86 @@ describe('type guards', () => {
   })
 })
 
-describe('match', () => {
-  it('calls ok handler for success', () => {
-    const result = match(ok(10), {
-      ok: (v) => v * 2,
+describe('matchResult', () => {
+  it('calls ok handler for success Result', () => {
+    const result = matchResult(ok(10), {
+      ok: (r) => r.value * 2,
       err: () => 0
     })
     expect(result).toBe(20)
   })
 
-  it('calls err handler for failure', () => {
-    const result = match(err('oops') as Result<number, string>, {
-      ok: (v) => v * 2,
-      err: (e) => e.length
+  it('calls err handler for failure Result', () => {
+    const result = matchResult(err('oops') as Result<number, string>, {
+      ok: (r) => r.value * 2,
+      err: (r) => r.error.length
     })
     expect(result).toBe(4)
+  })
+})
+
+describe('matcher', () => {
+  it('works with custom discriminated unions', () => {
+    type State =
+      | { kind: 'loading' }
+      | { kind: 'ready'; data: string }
+      | { kind: 'error'; message: string }
+
+    const matchState = matcher<State>()('kind')
+
+    const loading: State = { kind: 'loading' }
+    const ready: State = { kind: 'ready', data: 'hello' }
+    const error: State = { kind: 'error', message: 'failed' }
+
+    expect(
+      matchState(loading, {
+        loading: () => 'loading...',
+        ready: (s) => s.data,
+        error: (s) => s.message
+      })
+    ).toBe('loading...')
+
+    expect(
+      matchState(ready, {
+        loading: () => 'loading...',
+        ready: (s) => s.data,
+        error: (s) => s.message
+      })
+    ).toBe('hello')
+
+    expect(
+      matchState(error, {
+        loading: () => 'loading...',
+        ready: (s) => s.data,
+        error: (s) => s.message
+      })
+    ).toBe('failed')
+  })
+
+  it('provides correctly typed values to handlers', () => {
+    type Event =
+      | { type: 'click'; x: number; y: number }
+      | { type: 'keypress'; key: string }
+      | { type: 'scroll'; delta: number }
+
+    const matchEvent = matcher<Event>()('type')
+
+    const click: Event = { type: 'click', x: 10, y: 20 }
+    const keypress: Event = { type: 'keypress', key: 'Enter' }
+
+    const clickResult = matchEvent(click, {
+      click: (e) => `clicked at ${String(e.x)},${String(e.y)}`,
+      keypress: (e) => `pressed ${e.key}`,
+      scroll: (e) => `scrolled ${String(e.delta)}`
+    })
+    expect(clickResult).toBe('clicked at 10,20')
+
+    const keypressResult = matchEvent(keypress, {
+      click: (e) => `clicked at ${String(e.x)},${String(e.y)}`,
+      keypress: (e) => `pressed ${e.key}`,
+      scroll: (e) => `scrolled ${String(e.delta)}`
+    })
+    expect(keypressResult).toBe('pressed Enter')
   })
 })
 
@@ -128,7 +194,7 @@ describe('tryCatch', () => {
       throw new Error('kaboom')
     })
     expect(isErr(result)).toBe(true)
-    if (!result.ok) {
+    if (result.tag === 'err') {
       expect(result.error).toBeInstanceOf(Error)
     }
   })
