@@ -23,17 +23,19 @@ mod status;
 mod transfer;
 mod whitelist;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, TxHash};
 use rust_decimal::Decimal;
 use std::sync::Arc;
 
-use client::AlpacaWalletClient;
 use transfer::DepositAddress;
 use whitelist::WhitelistEntry;
 
 pub(crate) use client::AlpacaWalletError;
 pub(crate) use status::PollingConfig;
-pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
+pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
+
+#[cfg(test)]
+pub(crate) use client::{AlpacaWalletClient, create_account_mock};
 
 // TODO(#137): Remove dead_code allow when rebalancing orchestration uses this service
 #[allow(dead_code)]
@@ -41,7 +43,7 @@ pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer};
 ///
 /// Provides a high-level API for deposits, withdrawals, and transfer polling.
 pub(crate) struct AlpacaWalletService {
-    client: Arc<AlpacaWalletClient>,
+    client: Arc<client::AlpacaWalletClient>,
     polling_config: PollingConfig,
 }
 
@@ -49,7 +51,10 @@ pub(crate) struct AlpacaWalletService {
 #[allow(dead_code)]
 impl AlpacaWalletService {
     #[cfg(test)]
-    fn new_with_client(client: AlpacaWalletClient, polling_config: Option<PollingConfig>) -> Self {
+    pub(crate) fn new_with_client(
+        client: client::AlpacaWalletClient,
+        polling_config: Option<PollingConfig>,
+    ) -> Self {
         Self {
             client: Arc::new(client),
             polling_config: polling_config.unwrap_or_default(),
@@ -129,6 +134,23 @@ impl AlpacaWalletService {
         transfer_id: &AlpacaTransferId,
     ) -> Result<Transfer, AlpacaWalletError> {
         status::poll_transfer_status(&self.client, transfer_id, &self.polling_config).await
+    }
+
+    /// Polls for an incoming deposit by its on-chain transaction hash.
+    ///
+    /// Alpaca auto-detects incoming transfers to their funding wallet addresses.
+    /// This method polls until the deposit is detected and reaches a terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The deposit times out (not detected within timeout)
+    /// - The API call fails persistently
+    pub async fn poll_deposit_by_tx_hash(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<Transfer, AlpacaWalletError> {
+        status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
     }
 
     /// Whitelists an address for withdrawals.

@@ -54,6 +54,12 @@ use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IssuerRequestId(pub(crate) String);
 
+impl IssuerRequestId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
 /// Alpaca tokenization request identifier used to track the mint operation through their API.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TokenizationRequestId(pub(crate) String);
