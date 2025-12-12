@@ -26,6 +26,10 @@ export const matcher =
   <R>(value: T, handlers: { [V in T[K] & string]: (value: Extract<T, Record<K, V>>) => R }): R => {
     const tag = value[discriminant] as T[K] & string
 
+    if (!Object.prototype.hasOwnProperty.call(handlers, tag)) {
+      throw new Error(`Unknown tag "${String(tag)}" for discriminant "${String(discriminant)}"`)
+    }
+
     // Type safety is enforced at call sites via the mapped type constraint on handlers.
     // TypeScript can't prove the dynamic lookup is safe, but the type signature guarantees:
     // 1. handlers has a key for every possible discriminant value

@@ -9,6 +9,7 @@ mod bindings;
 mod cctp;
 pub mod cli;
 mod conductor;
+pub mod dashboard;
 pub mod env;
 mod equity_redemption;
 mod error;
