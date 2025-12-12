@@ -1,6 +1,9 @@
 use sqlx::SqlitePool;
 use tracing::{error, info, info_span, warn};
 
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses AlpacaTokenization client
+#[allow(dead_code)]
+mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;

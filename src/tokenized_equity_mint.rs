@@ -58,6 +58,12 @@ pub(crate) struct IssuerRequestId(pub(crate) String);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct TokenizationRequestId(pub(crate) String);
 
+impl std::fmt::Display for TokenizationRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Onchain receipt identifier (U256) for the token transfer transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReceiptId(pub(crate) U256);
