@@ -105,7 +105,7 @@ where
             Ok(req) => req,
             Err(e) => {
                 warn!("Alpaca mint request failed: {e}");
-                self.fail(issuer_request_id, format!("Alpaca API error: {e}"))
+                self.reject_mint(issuer_request_id, format!("Alpaca API error: {e}"))
                     .await?;
                 return Err(MintError::Alpaca(e));
             }
@@ -136,7 +136,7 @@ where
             Ok(req) => req,
             Err(e) => {
                 warn!("Polling failed: {e}");
-                self.fail(issuer_request_id, format!("Polling failed: {e}"))
+                self.fail_acceptance(issuer_request_id, format!("Polling failed: {e}"))
                     .await?;
                 return Err(MintError::Alpaca(e));
             }
@@ -147,7 +147,7 @@ where
     }
 
     #[instrument(skip(self))]
-    async fn fail(
+    async fn reject_mint(
         &self,
         issuer_request_id: &IssuerRequestId,
         reason: String,
@@ -155,7 +155,22 @@ where
         self.cqrs
             .execute(
                 &issuer_request_id.0,
-                TokenizedEquityMintCommand::Fail { reason },
+                TokenizedEquityMintCommand::RejectMint { reason },
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn fail_acceptance(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        reason: String,
+    ) -> Result<(), MintError> {
+        self.cqrs
+            .execute(
+                &issuer_request_id.0,
+                TokenizedEquityMintCommand::FailAcceptance { reason },
             )
             .await?;
         Ok(())
@@ -191,7 +206,7 @@ where
                 Ok(())
             }
             TokenizationRequestStatus::Rejected => {
-                self.fail(
+                self.fail_acceptance(
                     issuer_request_id,
                     "Mint request rejected by Alpaca".to_string(),
                 )
