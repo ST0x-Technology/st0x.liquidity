@@ -2835,7 +2835,7 @@ Emergency control to halt all trading activity:
 - Bot checks flag before placing any broker orders
 - API endpoints for trigger/reset/status
 
-```
+```text
 GET  /api/circuit-breaker/status
 POST /api/circuit-breaker/trigger  { reason: string }
 POST /api/circuit-breaker/reset
@@ -2902,7 +2902,7 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
 
 Dashboard lives in `dashboard/` directory at repository root:
 
-```
+```text
 dashboard/
 ├── src/
 │   ├── lib/
@@ -2929,7 +2929,7 @@ Extend existing Rocket server (`src/api.rs`):
 
 **WebSocket (all read data):**
 
-```
+```text
 WS /api/ws
 ```
 
@@ -2938,7 +2938,7 @@ Flow section above.
 
 **Mutations (HTTP, require auth):**
 
-```
+```text
 POST /api/circuit-breaker/trigger  { reason: string }
 POST /api/circuit-breaker/reset
 GET  /api/auth/url                 (generates Schwab OAuth URL)
