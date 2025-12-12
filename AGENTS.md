@@ -139,6 +139,24 @@ resolution and feature selection.
   interface
 - `nix run .#checkTestCoverage` - Generate test coverage report
 
+### Dashboard Development
+
+The `dashboard/` directory contains a SvelteKit frontend application.
+
+**Package Manager**: Use `bun` (not npm/yarn/pnpm) for all JavaScript/TypeScript
+operations. Run commands from the repo root using `--cwd`:
+
+- `bun install --cwd dashboard` - Install dependencies
+- `bun run --cwd dashboard dev` - Start development server
+- `bun run --cwd dashboard build` - Build for production
+- `bun run --cwd dashboard check` - Run svelte-check
+- `bun run --cwd dashboard test:run` - Run tests
+
+**Adding shadcn-svelte components** (requires subshell due to config discovery):
+
+- `(cd dashboard && bunx shadcn-svelte@latest add <component>)` - Add a
+  component
+
 ## Development Workflow Notes
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
@@ -215,7 +233,6 @@ new brokers, see @crates/broker/AGENTS.md
 **SQLite Tables:**
 
 - `onchain_trades`: Immutable blockchain trade records
-
   - `id`: Primary key (auto-increment)
   - `tx_hash`: Transaction hash (66 chars, 0x-prefixed)
   - `log_index`: Event log index (non-negative)
@@ -227,7 +244,6 @@ new brokers, see @crates/broker/AGENTS.md
   - Unique constraint: `(tx_hash, log_index)`
 
 - `schwab_executions`: Schwab order execution tracking
-
   - `id`: Primary key (auto-increment)
   - `symbol`: Asset symbol (non-empty string)
   - `shares`: Whole shares executed (positive integer)
@@ -239,7 +255,6 @@ new brokers, see @crates/broker/AGENTS.md
   - Check constraints ensure consistent status transitions
 
 - `trade_accumulators`: Unified position tracking per symbol
-
   - `symbol`: Primary key (non-empty string)
   - `net_position`: Running net position (real number)
   - `accumulated_long`: Fractional shares for buying (non-negative)
@@ -248,7 +263,6 @@ new brokers, see @crates/broker/AGENTS.md
   - `last_updated`: Last update timestamp (default CURRENT_TIMESTAMP)
 
 - `trade_execution_links`: Many-to-many audit trail
-
   - `id`: Primary key (auto-increment)
   - `trade_id`: Foreign key to onchain_trades
   - `execution_id`: Foreign key to schwab_executions
@@ -257,7 +271,6 @@ new brokers, see @crates/broker/AGENTS.md
   - Unique constraint: `(trade_id, execution_id)`
 
 - `schwab_auth`: OAuth token storage (sensitive data)
-
   - `id`: Primary key (constrained to 1 for singleton)
   - `access_token`: Current access token
   - `access_token_fetched_at`: Access token timestamp
@@ -265,7 +278,6 @@ new brokers, see @crates/broker/AGENTS.md
   - `refresh_token_fetched_at`: Refresh token timestamp
 
 - `event_queue`: Idempotent event processing queue
-
   - `id`: Primary key (auto-increment)
   - `tx_hash`: Transaction hash (66 chars, 0x-prefixed)
   - `log_index`: Event log index (non-negative)
@@ -277,7 +289,6 @@ new brokers, see @crates/broker/AGENTS.md
   - Unique constraint: `(tx_hash, log_index)`
 
 - `symbol_locks`: Per-symbol execution concurrency control
-
   - `symbol`: Primary key (non-empty string)
   - `locked_at`: Lock acquisition timestamp
 
@@ -606,9 +617,9 @@ fn test_order_poller_respects_jitter_bounds() {
         polling_interval: Duration::from_secs(60),
         max_jitter: Duration::from_secs(10),
     };
-    
+
     let actual_delay = config.calculate_next_poll_delay();
-    
+
     assert!(actual_delay >= Duration::from_secs(60));
     assert!(actual_delay <= Duration::from_secs(70));
 }
@@ -732,10 +743,10 @@ that cannot be expressed through code structure alone.
 
 ```rust
 // If the on-chain order has USDC as input and an 0x tokenized stock as
-// output then it means the order received USDC and gave away an 0x  
+// output then it means the order received USDC and gave away an 0x
 // tokenized stock, i.e. sold, which means that to take the opposite
 // trade in schwab we need to buy and vice versa.
-let (schwab_ticker, schwab_instruction) = 
+let (schwab_ticker, schwab_instruction) =
     if onchain_input_symbol == "USDC" && onchain_output_symbol.ends_with("0x") {
         // ... complex mapping logic
     }
@@ -802,7 +813,7 @@ Use Rust doc comments (`///`) for public APIs:
 
 ```rust
 /// Validates Schwab authentication tokens and refreshes if needed.
-/// 
+///
 /// Returns `SchwabError::RefreshTokenExpired` if the refresh token
 /// has expired and manual re-authentication is required.
 pub async fn refresh_if_needed(pool: &SqlitePool) -> Result<bool, SchwabError> {
@@ -1022,15 +1033,15 @@ Write
 ```rust
 fn process_data(data: Option<&str>) -> Result<String, Error> {
     let data = data.ok_or(Error::None)?;
-    
+
     if data.is_empty() {
         return Err(Error::Empty);
     }
-    
+
     if data.len() <= 5 {
         return Err(Error::TooShort);
     }
-    
+
     Ok(data.to_uppercase())
 }
 ```
@@ -1121,7 +1132,7 @@ println!("Token: {}", tokens.access_token);
 impl SchwabTokens {
     // Unnecessary - just sets fields without additional logic
     pub fn new(access_token: String, /* ... */) -> Self { /* ... */ }
-    
+
     // Unnecessary - just returns field value
     pub fn access_token(&self) -> &str { &self.access_token }
 }
