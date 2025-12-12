@@ -2,9 +2,21 @@
   import './layout.css'
   import favicon from '$lib/assets/favicon.svg'
   import type { Snippet } from 'svelte'
+  import { QueryClient, QueryClientProvider } from '@tanstack/svelte-query'
 
   const { children }: { children: Snippet } = $props()
+
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: {
+        staleTime: Infinity
+      }
+    }
+  })
 </script>
 
 <svelte:head><link rel="icon" href={favicon} /></svelte:head>
-{@render children()}
+
+<QueryClientProvider client={queryClient}>
+  {@render children()}
+</QueryClientProvider>

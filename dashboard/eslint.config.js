@@ -30,7 +30,14 @@ export default [
       },
       globals: {
         ...globals.browser,
-        ...globals.node
+        ...globals.node,
+        $state: 'readonly',
+        $derived: 'readonly',
+        $effect: 'readonly',
+        $props: 'readonly',
+        $bindable: 'readonly',
+        $inspect: 'readonly',
+        $host: 'readonly'
       }
     },
     plugins: {

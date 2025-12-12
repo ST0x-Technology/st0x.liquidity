@@ -46,13 +46,33 @@ helpers module.
 
 ---
 
-## Task 2. Frontend App Shell with Mock WebSocket
+## Task 2. Shared Types with ts-rs
+
+Generate TypeScript types from Rust structs using ts-rs to maintain a single
+source of truth for WebSocket message types.
+
+- [ ] Add `ts-rs` dependency to main crate: `cargo add ts-rs -F serde-compat`
+- [ ] Create `src/dashboard/mod.rs` module for dashboard-related types
+- [ ] Create `src/dashboard/messages.rs` with WebSocket message types: -
+      `ServerMessage` enum (tagged union with `type` discriminant) -
+      `InitialState`, `EventStoreEntry`, `Trade`, `Position`, `Inventory` -
+      `PerformanceMetrics`, `SpreadSummary`, `RebalanceOperation` -
+      `CircuitBreakerStatus`, `AuthStatus`
+- [ ] Derive `TS` and `Serialize` on all types with `#[ts(export)]`
+- [ ] Configure ts-rs export path to `dashboard/src/lib/api/` via
+      `#[ts(export_to = "dashboard/src/lib/api/")]`
+- [ ] Run `cargo test` to generate TypeScript bindings
+- [ ] Delete manually written `dashboard/src/lib/api/messages.ts`
+- [ ] Verify: Generated types match SPEC.md, `bun run --cwd dashboard check`
+      passes
+
+---
+
+## Task 3. Frontend App Shell with WebSocket
 
 Build the complete dashboard layout with broker selector and WebSocket
 infrastructure using mock data.
 
-- [ ] Create `lib/api/messages.ts` with TypeScript types for ServerMessage,
-      InitialState, EventStoreEntry matching SPEC.md
 - [ ] Create `lib/websocket.svelte.ts` wrapper with connection state ($state),
       reconnection logic, and TanStack Query cache integration
 - [ ] Create `lib/stores/broker.svelte.ts` for broker selection state (persisted
@@ -71,7 +91,7 @@ infrastructure using mock data.
 
 ---
 
-## Task 3. Live Events Panel (Frontend)
+## Task 4. Live Events Panel (Frontend)
 
 Implement the Live Events panel component that displays events from TanStack
 Query cache.
@@ -86,7 +106,7 @@ Query cache.
 
 ---
 
-## Task 4. Backend WebSocket Endpoint
+## Task 5. Backend WebSocket Endpoint
 
 Add WebSocket support to Rocket server that broadcasts domain events to
 connected clients.
@@ -107,7 +127,7 @@ connected clients.
 
 ---
 
-## Task 5. Event Broadcasting Integration
+## Task 6. Event Broadcasting Integration
 
 Hook the WebSocket broadcast into the event store so new events are pushed to
 connected clients.
