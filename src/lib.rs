@@ -4,7 +4,7 @@ use tracing::{error, info, info_span, warn};
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
-// TODO(#136): Remove dead_code allow when UsdcRebalance aggregate is implemented
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses CCTP service
 #[allow(dead_code)]
 mod cctp;
 pub mod cli;
@@ -36,10 +36,13 @@ mod threshold;
 // TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
 #[allow(dead_code)]
 mod tokenized_equity_mint;
-// TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses EquityRedemption aggregate
 #[allow(dead_code)]
 mod equity_redemption;
 mod trade_execution_link;
+// TODO(#137): Remove dead_code allow when rebalancing orchestration uses UsdcRebalance aggregate
+#[allow(dead_code)]
+mod usdc_rebalance;
 
 pub use telemetry::{TelemetryError, TelemetryGuard};
 

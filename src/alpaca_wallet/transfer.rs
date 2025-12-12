@@ -54,23 +54,23 @@ impl std::fmt::Display for TokenSymbol {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub(crate) struct TransferId(Uuid);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AlpacaTransferId(Uuid);
 
-impl TransferId {
+impl AlpacaTransferId {
     #[cfg(test)]
     fn new(uuid: Uuid) -> Self {
         Self(uuid)
     }
 }
 
-impl From<Uuid> for TransferId {
+impl From<Uuid> for AlpacaTransferId {
     fn from(uuid: Uuid) -> Self {
         Self(uuid)
     }
 }
 
-impl std::fmt::Display for TransferId {
+impl std::fmt::Display for AlpacaTransferId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -94,7 +94,7 @@ pub(crate) enum TransferStatus {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct Transfer {
-    pub(crate) id: TransferId,
+    pub(crate) id: AlpacaTransferId,
     #[serde(rename = "relationship")]
     pub(crate) direction: TransferDirection,
     #[serde(deserialize_with = "deserialize_decimal_from_string")]
@@ -235,7 +235,7 @@ pub(super) async fn initiate_withdrawal(
 
 pub(super) async fn get_transfer_status(
     client: &AlpacaWalletClient,
-    transfer_id: &TransferId,
+    transfer_id: &AlpacaTransferId,
 ) -> Result<Transfer, AlpacaWalletError> {
     let path = format!(
         "/v1/accounts/{}/wallets/transfers?transfer_id={}",
@@ -337,7 +337,6 @@ mod tests {
 
         let result = get_deposit_address(&client, "INVALID", "Ethereum").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 400
@@ -375,7 +374,6 @@ mod tests {
 
         let result = get_deposit_address(&client, "USDC", "InvalidNetwork").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 400
@@ -406,7 +404,6 @@ mod tests {
 
         let result = get_deposit_address(&client, "USDC", "Ethereum").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 500
@@ -469,7 +466,6 @@ mod tests {
 
         let result = get_deposit_address(&client, "USDC", "Ethereum").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::NoWalletFound { .. }
@@ -533,7 +529,7 @@ mod tests {
         let expected_address =
             Address::from_str("0x1234567890abcdef1234567890abcdef12345678").unwrap();
 
-        assert_eq!(transfer.id, TransferId::new(transfer_id));
+        assert_eq!(transfer.id, AlpacaTransferId::new(transfer_id));
         assert_eq!(transfer.direction, TransferDirection::Outgoing);
         assert_eq!(transfer.amount, Decimal::new(1005, 1));
         assert_eq!(transfer.asset.as_ref(), "USDC");
@@ -640,7 +636,6 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 400
@@ -678,7 +673,6 @@ mod tests {
         let result =
             initiate_withdrawal(&client, Decimal::new(100, 0), "USDC", "invalid_address").await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 400
@@ -717,7 +711,6 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 500
@@ -764,12 +757,12 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id))
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
             .unwrap();
 
         assert_eq!(result.status, TransferStatus::Pending);
-        assert_eq!(result.id, TransferId::from(transfer_id));
+        assert_eq!(result.id, AlpacaTransferId::from(transfer_id));
 
         account_mock.assert();
         status_mock.assert();
@@ -812,7 +805,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id))
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
             .unwrap();
 
@@ -860,7 +853,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id))
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
             .unwrap();
 
@@ -907,7 +900,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id))
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
             .unwrap();
 
@@ -943,9 +936,8 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id)).await;
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::TransferNotFound { .. }
@@ -979,9 +971,8 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id)).await;
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == 500
@@ -1017,7 +1008,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = get_transfer_status(&client, &TransferId::from(transfer_id)).await;
+        let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AlpacaWalletError::Reqwest(_)));
