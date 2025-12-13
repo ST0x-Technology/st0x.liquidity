@@ -6,12 +6,14 @@ use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
+use crate::dashboard::ServerMessage;
 use crate::env::{BrokerConfig, Config};
 use crate::error::EventProcessingError;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
@@ -44,6 +46,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
     pool: SqlitePool,
     broker_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
 
@@ -54,15 +57,27 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
 
     log_market_status(timeout);
 
-    let mut conductor =
-        match start_conductor(&config, &pool, &broker, broker_maintenance, rebalancer).await {
-            Ok(c) => c,
-            Err(e) => return retry_after_failure(broker, config, pool, e, RERUN_DELAY_SECS).await,
-        };
+    let mut conductor = match start_conductor(
+        &config,
+        &pool,
+        &broker,
+        broker_maintenance,
+        rebalancer,
+        event_sender.clone(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return retry_after_failure(broker, config, pool, e, RERUN_DELAY_SECS, event_sender)
+                .await;
+        }
+    };
 
     info!("Market opened, conductor running");
 
-    run_conductor_until_market_close(&mut conductor, broker, config, pool, timeout).await
+    run_conductor_until_market_close(&mut conductor, broker, config, pool, timeout, event_sender)
+        .await
 }
 
 fn log_market_status(timeout: Duration) {
@@ -80,8 +95,17 @@ async fn start_conductor<B: Broker + Clone + Send + 'static>(
     broker: &B,
     broker_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<Conductor> {
-    Conductor::start(config, pool, broker.clone(), broker_maintenance, rebalancer).await
+    Conductor::start(
+        config,
+        pool,
+        broker.clone(),
+        broker_maintenance,
+        rebalancer,
+        event_sender,
+    )
+    .await
 }
 
 async fn retry_after_failure<B: Broker + Clone + Send + 'static>(
@@ -90,6 +114,7 @@ async fn retry_after_failure<B: Broker + Clone + Send + 'static>(
     pool: SqlitePool,
     error: anyhow::Error,
     delay_secs: u64,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     error!("Failed to start conductor: {error}, retrying in {delay_secs} seconds");
     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
@@ -101,6 +126,7 @@ async fn retry_after_failure<B: Broker + Clone + Send + 'static>(
         pool,
         new_maintenance,
         None,
+        event_sender,
     ))
     .await
 }
@@ -111,13 +137,14 @@ async fn run_conductor_until_market_close<B: Broker + Clone + Send + 'static>(
     config: Config,
     pool: SqlitePool,
     timeout: Duration,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     tokio::select! {
         result = conductor.wait_for_completion() => {
             handle_conductor_completion(conductor, result)
         }
         () = tokio::time::sleep(timeout) => {
-            handle_market_close(conductor, broker, config, pool).await
+            handle_market_close(conductor, broker, config, pool, event_sender).await
         }
     }
 }
@@ -148,6 +175,7 @@ async fn handle_market_close<B: Broker + Clone + Send + 'static>(
     broker: B,
     config: Config,
     pool: SqlitePool,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     info!("Market closed, shutting down trading tasks");
     conductor.abort_trading_tasks();
@@ -159,6 +187,7 @@ async fn handle_market_close<B: Broker + Clone + Send + 'static>(
         pool,
         next_maintenance,
         None,
+        event_sender,
     ))
     .await
 }
@@ -170,6 +199,7 @@ impl Conductor {
         broker: B,
         broker_maintenance: Option<JoinHandle<()>>,
         rebalancer: Option<JoinHandle<()>>,
+        event_sender: broadcast::Sender<ServerMessage>,
     ) -> anyhow::Result<Self> {
         let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
@@ -195,6 +225,7 @@ impl Conductor {
                         alpaca_auth,
                         provider.clone(),
                         cache.clone(),
+                        Some(event_sender),
                     )
                     .await?,
                 )
@@ -251,26 +282,6 @@ impl Conductor {
         }
 
         info!("Trading tasks aborted successfully (DEX events will continue buffering)");
-    }
-
-    pub(crate) fn abort_all(self) {
-        info!("Aborting all background tasks");
-
-        if let Some(handle) = self.broker_maintenance {
-            handle.abort();
-        }
-
-        if let Some(handle) = self.rebalancer {
-            handle.abort();
-        }
-
-        self.order_poller.abort();
-        self.dex_event_receiver.abort();
-        self.event_processor.abort();
-        self.position_checker.abort();
-        self.queue_processor.abort();
-
-        info!("All background tasks aborted successfully");
     }
 }
 
@@ -976,6 +987,22 @@ mod tests {
     use crate::tokenized_symbol;
     use st0x_broker::{Direction, MockBrokerConfig, TryIntoBroker};
 
+    fn abort_all_conductor_tasks(conductor: Conductor) {
+        if let Some(handle) = conductor.broker_maintenance {
+            handle.abort();
+        }
+
+        if let Some(handle) = conductor.rebalancer {
+            handle.abort();
+        }
+
+        conductor.order_poller.abort();
+        conductor.dex_event_receiver.abort();
+        conductor.event_processor.abort();
+        conductor.position_checker.abort();
+        conductor.queue_processor.abort();
+    }
+
     #[tokio::test]
     async fn test_event_enqueued_when_trade_conversion_returns_none() {
         let pool = setup_test_db().await;
@@ -1630,7 +1657,7 @@ mod tests {
         assert!(!conductor.position_checker.is_finished());
         assert!(!conductor.queue_processor.is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -1703,7 +1730,7 @@ mod tests {
             "ConductorBuilder should return quickly, took: {elapsed:?}"
         );
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
@@ -1725,7 +1752,7 @@ mod tests {
             .spawn();
 
         assert!(conductor.rebalancer.is_none());
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
@@ -1757,7 +1784,7 @@ mod tests {
         assert!(conductor.rebalancer.is_some());
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
@@ -1788,7 +1815,7 @@ mod tests {
         let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_ref.is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -1826,6 +1853,6 @@ mod tests {
 
         assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 }

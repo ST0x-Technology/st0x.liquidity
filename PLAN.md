@@ -139,13 +139,39 @@ connected clients.
 Hook the WebSocket broadcast into the event store so new events are pushed to
 connected clients.
 
-- [ ] Identify where events are persisted (sqlite-es crate integration point)
-- [ ] Add broadcast channel sender to the persistence path
-- [ ] When event is persisted, broadcast EventStoreEntry (excluding payload) to
+- [x] Identify where events are persisted (sqlite-es crate integration point)
+- [x] Add broadcast channel sender to the persistence path
+- [x] When event is persisted, broadcast EventStoreEntry (excluding payload) to
       all connected clients
-- [ ] Write integration test: persist event, verify connected WebSocket receives
+- [x] Write integration test: persist event, verify connected WebSocket receives
       broadcast
-- [ ] Verify: Backend broadcasts events when they are persisted
+- [x] Verify: Backend broadcasts events when they are persisted
+
+### Changes Made
+
+- `src/dashboard/event.rs` - Created `EventBroadcaster` implementing cqrs-es
+  `Query` trait:
+  - Implements `Query` for `Lifecycle<TokenizedEquityMint, Never>`,
+    `Lifecycle<EquityRedemption, Never>`, and `Lifecycle<UsdcRebalance, Never>`
+  - Broadcasts `EventStoreEntry` (aggregate_type, aggregate_id, sequence,
+    event_type, timestamp) to WebSocket clients when events are dispatched
+  - Unit tests for broadcaster functionality
+- `src/rebalancing/spawn.rs` - Wired `EventBroadcaster` into CQRS framework:
+  - Updated `spawn_rebalancer` to accept optional broadcast sender
+  - Added `build_mint_queries`, `build_redemption_queries`, `build_usdc_queries`
+    helper functions that create query vectors including the broadcaster
+  - Updated `into_rebalancer` to pass broadcast sender through
+- `src/lib.rs` - Threaded broadcast sender from launch through bot:
+  - Create broadcast channel in `launch()` and share between server and bot
+  - Pass sender through `spawn_bot_task`, `run`, `run_bot_session`,
+    `run_with_broker`
+- `src/conductor/mod.rs` - Threaded broadcast sender through conductor:
+  - Updated `run_market_hours_loop`, `start_conductor`, `retry_after_failure`,
+    `run_conductor_until_market_close`, `handle_market_close`, and
+    `Conductor::start` to accept and forward the sender
+  - `spawn_rebalancer` now receives `Some(event_sender)` when called
+- Dashboard types simplified to only include currently-used variants (full API
+  contract types will be added as features are implemented)
 
 ---
 

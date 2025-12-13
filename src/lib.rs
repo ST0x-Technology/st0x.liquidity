@@ -1,7 +1,10 @@
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
+use tokio::sync::broadcast;
 use tokio::task::{JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
+
+use crate::dashboard::ServerMessage;
 
 mod alpaca_tokenization;
 mod alpaca_wallet;
@@ -49,8 +52,10 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
     let pool = config.get_sqlite_pool().await?;
     sqlx::migrate!().run(&pool).await?;
 
-    let server_task = spawn_server_task(&config, &pool);
-    let bot_task = spawn_bot_task(config, pool);
+    let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
+
+    let server_task = spawn_server_task(&config, &pool, event_sender.clone());
+    let bot_task = spawn_bot_task(config, pool, event_sender);
 
     await_shutdown(server_task, bot_task).await;
 
@@ -61,6 +66,7 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
 fn spawn_server_task(
     config: &Config,
     pool: &SqlitePool,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
         .merge(("port", config.server_port))
@@ -71,17 +77,23 @@ fn spawn_server_task(
         .mount("/api", dashboard::routes())
         .manage(pool.clone())
         .manage(config.clone())
-        .manage(dashboard::Broadcast::new());
+        .manage(dashboard::Broadcast {
+            sender: event_sender,
+        });
 
     tokio::spawn(rocket.launch())
 }
 
-fn spawn_bot_task(config: Config, pool: SqlitePool) -> JoinHandle<()> {
+fn spawn_bot_task(
+    config: Config,
+    pool: SqlitePool,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let bot_span = info_span!("bot_task");
         let _enter = bot_span.enter();
 
-        if let Err(e) = Box::pin(run(config, pool)).await {
+        if let Err(e) = Box::pin(run(config, pool, event_sender)).await {
             error!("Bot failed: {e}");
         }
     })
@@ -120,11 +132,15 @@ fn log_bot_result(result: Result<(), JoinError>) {
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
+async fn run(
+    config: Config,
+    pool: SqlitePool,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = Box::pin(run_bot_session(&config, &pool)).await;
+        let result = Box::pin(run_bot_session(&config, &pool, event_sender.clone())).await;
 
         match result {
             Ok(()) => {
@@ -151,12 +167,24 @@ async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
-async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<()> {
+async fn run_bot_session(
+    config: &Config,
+    pool: &SqlitePool,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()> {
     match &config.broker {
         BrokerConfig::DryRun => {
             info!("Initializing test broker for dry-run mode");
             let broker = MockBrokerConfig.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
+
+            Box::pin(run_with_broker(
+                config.clone(),
+                pool.clone(),
+                broker,
+                None,
+                event_sender,
+            ))
+            .await
         }
         BrokerConfig::Schwab(schwab_auth) => {
             info!("Initializing Schwab broker");
@@ -165,13 +193,28 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
                 pool: pool.clone(),
             };
             let broker = schwab_config.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
+
+            Box::pin(run_with_broker(
+                config.clone(),
+                pool.clone(),
+                broker,
+                None,
+                event_sender,
+            ))
+            .await
         }
         BrokerConfig::Alpaca(alpaca_auth) => {
             info!("Initializing Alpaca broker");
             let broker = alpaca_auth.clone().try_into_broker().await?;
 
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
+            Box::pin(run_with_broker(
+                config.clone(),
+                pool.clone(),
+                broker,
+                None,
+                event_sender,
+            ))
+            .await
         }
     }
 }
@@ -181,10 +224,19 @@ async fn run_with_broker<B: Broker + Clone + Send + 'static>(
     pool: SqlitePool,
     broker: B,
     rebalancer: Option<JoinHandle<()>>,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     let broker_maintenance = broker.run_broker_maintenance().await;
 
-    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance, rebalancer).await
+    conductor::run_market_hours_loop(
+        broker,
+        config,
+        pool,
+        broker_maintenance,
+        rebalancer,
+        event_sender,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -198,12 +250,19 @@ mod tests {
         pool
     }
 
+    fn create_test_event_sender() -> broadcast::Sender<ServerMessage> {
+        let (sender, _) = broadcast::channel(16);
+        sender
+    }
+
     #[tokio::test]
     async fn test_run_function_websocket_connection_error() {
         let mut config = create_test_config();
         let pool = create_test_pool().await;
         config.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        Box::pin(run(config, pool)).await.unwrap_err();
+        Box::pin(run(config, pool, create_test_event_sender()))
+            .await
+            .unwrap_err();
     }
 
     #[tokio::test]
@@ -212,7 +271,9 @@ mod tests {
         let pool = create_test_pool().await;
         config.evm.orderbook = alloy::primitives::Address::ZERO;
         config.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        Box::pin(run(config, pool)).await.unwrap_err();
+        Box::pin(run(config, pool, create_test_event_sender()))
+            .await
+            .unwrap_err();
     }
 
     #[tokio::test]
@@ -220,6 +281,8 @@ mod tests {
         let mut config = create_test_config();
         config.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        Box::pin(run(config, pool)).await.unwrap_err();
+        Box::pin(run(config, pool, create_test_event_sender()))
+            .await
+            .unwrap_err();
     }
 }

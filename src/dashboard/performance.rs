@@ -4,21 +4,6 @@ use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "../dashboard/src/lib/api/")]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Timeframe {
-    #[serde(rename = "1h")]
-    OneHour,
-    #[serde(rename = "1d")]
-    OneDay,
-    #[serde(rename = "1w")]
-    OneWeek,
-    #[serde(rename = "1m")]
-    OneMonth,
-    All,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
 pub(crate) struct PnL {
     #[ts(type = "string")]
     pub(super) absolute: Decimal,

@@ -2,13 +2,14 @@ mod auth;
 mod circuit_breaker;
 mod event;
 mod inventory;
-mod metrics;
+mod performance;
 mod position;
 mod rebalance;
 mod spread;
 mod trade;
 mod ts;
 
+pub(crate) use event::EventBroadcaster;
 pub use ts::export_bindings;
 
 use auth::AuthStatus;
@@ -16,42 +17,27 @@ use circuit_breaker::CircuitBreakerStatus;
 use event::EventStoreEntry;
 use futures_util::SinkExt;
 use inventory::Inventory;
-use metrics::PerformanceMetrics;
-use position::Position;
+use performance::PerformanceMetrics;
 use rebalance::RebalanceOperation;
 use rocket::{Route, State, get, routes};
 use rocket_ws::{Channel, WebSocket};
 use serde::Serialize;
-use spread::{SpreadSummary, SpreadUpdate};
+use spread::SpreadSummary;
 use tokio::sync::broadcast;
 use tracing::warn;
-use trade::{OffchainTrade, OnchainTrade, Trade};
+use trade::Trade;
 use ts_rs::TS;
 
+/// Messages sent from the server to WebSocket clients.
+///
+/// Note: Variants for future message types (trades, positions, metrics, etc.)
+/// will be added as their respective dashboard panels are implemented.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../dashboard/src/lib/api/")]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub(crate) enum ServerMessage {
     Initial(Box<InitialState>),
     Event(EventStoreEntry),
-    #[serde(rename = "trade:onchain")]
-    TradeOnchain(OnchainTrade),
-    #[serde(rename = "trade:offchain")]
-    TradeOffchain(OffchainTrade),
-    #[serde(rename = "position:updated")]
-    PositionUpdated(Position),
-    #[serde(rename = "inventory:updated")]
-    InventoryUpdated(Inventory),
-    #[serde(rename = "metrics:updated")]
-    MetricsUpdated(Box<PerformanceMetrics>),
-    #[serde(rename = "spread:updated")]
-    SpreadUpdated(SpreadUpdate),
-    #[serde(rename = "rebalance:updated")]
-    RebalanceUpdated(RebalanceOperation),
-    #[serde(rename = "circuit_breaker:changed")]
-    CircuitBreakerChanged(CircuitBreakerStatus),
-    #[serde(rename = "auth:status")]
-    AuthStatus(AuthStatus),
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -85,13 +71,6 @@ impl InitialState {
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
-}
-
-impl Broadcast {
-    pub(crate) fn new() -> Self {
-        let (sender, _) = broadcast::channel(256);
-        Self { sender }
-    }
 }
 
 #[get("/ws")]
@@ -160,6 +139,11 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
 
+    fn create_test_broadcast() -> Broadcast {
+        let (sender, _) = broadcast::channel(256);
+        Broadcast { sender }
+    }
+
     #[tokio::test]
     async fn initial_state_stub_serializes_correctly() {
         let initial = InitialState::stub();
@@ -181,7 +165,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_channel_delivers_messages_to_subscribers() {
-        let broadcast = Broadcast::new();
+        let broadcast = create_test_broadcast();
         let mut rx = broadcast.sender.subscribe();
 
         let sent_msg = ServerMessage::Initial(Box::new(InitialState::stub()));
@@ -198,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_supports_multiple_subscribers() {
-        let broadcast = Broadcast::new();
+        let broadcast = create_test_broadcast();
         let mut receiver1 = broadcast.sender.subscribe();
         let mut receiver2 = broadcast.sender.subscribe();
 
@@ -223,7 +207,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_endpoint_sends_initial_message() {
-        let broadcast = Broadcast::new();
+        let broadcast = create_test_broadcast();
 
         let config = Config {
             port: 0, // Let OS assign a random available port
@@ -278,7 +262,7 @@ mod tests {
     }
 
     async fn start_test_server() -> (u16, rocket::Shutdown, Broadcast) {
-        let broadcast = Broadcast::new();
+        let broadcast = create_test_broadcast();
         let broadcast_clone = Broadcast {
             sender: broadcast.sender.clone(),
         };
