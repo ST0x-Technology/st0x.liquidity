@@ -21,7 +21,9 @@ const loadBroker = (): Broker => {
 
 const saveBroker = (broker: Broker) => {
   if (browser) {
-    tryCatch(() => localStorage.setItem(STORAGE_KEY, broker))
+    tryCatch(() => {
+      localStorage.setItem(STORAGE_KEY, broker)
+    })
   }
 }
 

@@ -4,15 +4,15 @@
   import PlaceholderPanel from '$lib/components/placeholder-panel.svelte'
   import { brokerStore } from '$lib/stores/broker.svelte'
   import { getWebSocketUrl, type Broker } from '$lib/env'
-  import { createWebSocket } from '$lib/websocket.svelte'
+  import { createWebSocket, type WebSocketConnection } from '$lib/websocket.svelte'
   import { onMount } from 'svelte'
 
   const queryClient = useQueryClient()
 
-  let ws = $state(createWebSocket(getWebSocketUrl(brokerStore.value), queryClient))
+  let ws = $state<WebSocketConnection | null>(null)
 
   const handleBrokerChange = (broker: Broker) => {
-    ws.disconnect()
+    ws?.disconnect()
     queryClient.clear()
     brokerStore.set(broker)
     ws = createWebSocket(getWebSocketUrl(broker), queryClient)
@@ -20,18 +20,21 @@
   }
 
   onMount(() => {
+    ws = createWebSocket(getWebSocketUrl(brokerStore.value), queryClient)
     ws.connect()
     return () => {
-      ws.disconnect()
+      ws?.disconnect()
     }
   })
+
+  const connectionStatus = $derived(ws?.status ?? 'disconnected')
 </script>
 
 <div class="flex min-h-screen flex-col bg-background">
   <HeaderBar
     broker={brokerStore.value}
     onBrokerChange={handleBrokerChange}
-    connectionStatus={ws.status}
+    {connectionStatus}
   />
 
   <main class="flex-1 p-4">

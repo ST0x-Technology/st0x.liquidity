@@ -186,15 +186,38 @@ infrastructure connecting to backend.
       to localStorage)
 - [x] Write tests for WebSocket wrapper (connect, disconnect, reconnect, message
       handling)
-- [ ] Set up TanStack Query provider in `+layout.svelte` with
+- [x] Set up TanStack Query provider in `+layout.svelte` with
       `staleTime: Infinity`
-- [ ] Create header bar component with broker selector dropdown (Schwab/Alpaca),
+- [x] Create header bar component with broker selector dropdown (Schwab/Alpaca),
       circuit breaker placeholder (disabled), WebSocket status indicator
-- [ ] Create panel grid layout in `+page.svelte` with six panel slots
-- [ ] Create placeholder panel component showing "Coming soon..."
-- [ ] Wire broker selector to switch WebSocket URL and clear query cache
-- [ ] Verify: Switching brokers disconnects/reconnects WebSocket, status
+- [x] Create panel grid layout in `+page.svelte` with six panel slots
+- [x] Create placeholder panel component showing "Coming soon..."
+- [x] Wire broker selector to switch WebSocket URL and clear query cache
+- [x] Verify: Switching brokers disconnects/reconnects WebSocket, status
       indicator reflects connection state, layout renders all six panels
+
+### Changes Made
+
+- `dashboard/src/routes/+layout.svelte` - TanStack Query provider with
+  `staleTime: Infinity`, favicon link
+- `dashboard/src/routes/+page.svelte` - Main page with HeaderBar, 6-panel grid
+  layout, WebSocket connection management, broker switching logic
+- `dashboard/src/lib/components/header-bar.svelte` - Header with broker selector
+  (Select component), Circuit Breaker button (disabled placeholder), connection
+  status Badge
+- `dashboard/src/lib/components/placeholder-panel.svelte` - Card component
+  showing "Coming soon..." for unimplemented panels
+- `dashboard/src/lib/websocket.svelte.ts` - WebSocket wrapper with:
+  - Connection state management via Svelte 5 `$state`
+  - Exponential backoff reconnection (1s base, 30s max)
+  - TanStack Query cache integration for `initial` and `event` messages
+  - 100-event cap for events list
+- `dashboard/src/lib/stores/broker.svelte.ts` - Broker selection store with
+  localStorage persistence
+- `dashboard/src/lib/env.ts` - `Broker` type and `getWebSocketUrl()` using
+  `PUBLIC_SCHWAB_WS_URL` and `PUBLIC_ALPACA_WS_URL` env vars
+- `dashboard/src/lib/websocket.svelte.test.ts` - 12 tests covering connection
+  lifecycle, message handling, reconnection logic, and edge cases
 
 ---
 

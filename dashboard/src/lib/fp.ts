@@ -27,7 +27,7 @@ export const matcher =
     const tag = value[discriminant] as T[K] & string
 
     if (!Object.prototype.hasOwnProperty.call(handlers, tag)) {
-      throw new Error(`Unknown tag "${String(tag)}" for discriminant "${String(discriminant)}"`)
+      throw new Error(`Unknown tag "${tag}" for discriminant "${String(discriminant)}"`)
     }
 
     // Type safety is enforced at call sites via the mapped type constraint on handlers.
