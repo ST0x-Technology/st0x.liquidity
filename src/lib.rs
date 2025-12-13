@@ -1,5 +1,6 @@
+use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
 mod alpaca_tokenization;
@@ -46,53 +47,76 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
     let _enter = launch_span.enter();
 
     let pool = config.get_sqlite_pool().await?;
-
     sqlx::migrate!().run(&pool).await?;
 
+    let server_task = spawn_server_task(&config, &pool);
+    let bot_task = spawn_bot_task(config, pool);
+
+    await_shutdown(server_task, bot_task).await;
+
+    info!("Shutdown complete");
+    Ok(())
+}
+
+fn spawn_server_task(
+    config: &Config,
+    pool: &SqlitePool,
+) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
         .merge(("port", config.server_port))
         .merge(("address", "0.0.0.0"));
 
     let rocket = rocket::custom(rocket_config)
         .mount("/", api::routes())
+        .mount("/api", dashboard::routes())
         .manage(pool.clone())
-        .manage(config.clone());
+        .manage(config.clone())
+        .manage(dashboard::Broadcast::new());
 
-    let server_task = tokio::spawn(rocket.launch());
+    tokio::spawn(rocket.launch())
+}
 
-    let bot_pool = pool.clone();
-    let bot_task = tokio::spawn(async move {
+fn spawn_bot_task(config: Config, pool: SqlitePool) -> JoinHandle<()> {
+    tokio::spawn(async move {
         let bot_span = info_span!("bot_task");
         let _enter = bot_span.enter();
 
-        if let Err(e) = Box::pin(run(config, bot_pool)).await {
+        if let Err(e) = Box::pin(run(config, pool)).await {
             error!("Bot failed: {e}");
         }
-    });
+    })
+}
 
+async fn await_shutdown(
+    server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
+    bot_task: JoinHandle<()>,
+) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received shutdown signal, shutting down gracefully...");
         }
-
         result = server_task => {
-            match result {
-                Ok(Ok(_)) => info!("Server completed successfully"),
-                Ok(Err(e)) => error!("Server failed: {e}"),
-                Err(e) => error!("Server task panicked: {e}"),
-            }
+            log_server_result(result);
         }
-
         result = bot_task => {
-            match result {
-                Ok(()) => info!("Bot task completed"),
-                Err(e) => error!("Bot task panicked: {e}"),
-            }
+            log_bot_result(result);
         }
     }
+}
 
-    info!("Shutdown complete");
-    Ok(())
+fn log_server_result(result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>) {
+    match result {
+        Ok(Ok(_)) => info!("Server completed successfully"),
+        Ok(Err(e)) => error!("Server failed: {e}"),
+        Err(e) => error!("Server task panicked: {e}"),
+    }
+}
+
+fn log_bot_result(result: Result<(), JoinError>) {
+    match result {
+        Ok(()) => info!("Bot task completed"),
+        Err(e) => error!("Bot task panicked: {e}"),
+    }
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
@@ -108,18 +132,15 @@ async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
                 break Ok(());
             }
             Err(e) => {
-                if let Some(broker_error) = e.downcast_ref::<BrokerError>() {
-                    if matches!(
+                if let Some(broker_error) = e.downcast_ref::<BrokerError>()
+                    && matches!(
                         broker_error,
                         BrokerError::Schwab(SchwabError::RefreshTokenExpired)
-                    ) {
-                        warn!(
-                            "Refresh token expired, retrying in {} seconds",
-                            RERUN_DELAY_SECS
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-                        continue;
-                    }
+                    )
+                {
+                    warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
+                    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
+                    continue;
                 }
 
                 error!("Bot session failed: {e}");

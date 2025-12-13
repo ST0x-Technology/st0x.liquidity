@@ -6,6 +6,7 @@ use clap::Parser;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use std::io::Read;
 use tracing::{debug, info};
 
 use super::super::{SchwabError, tokens::SchwabTokens};
@@ -145,26 +146,7 @@ impl SchwabAuthEnv {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = if response
-                .headers()
-                .get("content-encoding")
-                .map(reqwest::header::HeaderValue::as_bytes)
-                == Some(b"gzip")
-            {
-                use std::io::Read;
-                let bytes = response.bytes().await.unwrap_or_default();
-                let mut decoder = flate2::read::GzDecoder::new(bytes.as_ref());
-                let mut decompressed = String::new();
-                match decoder.read_to_string(&mut decompressed) {
-                    Ok(_) => decompressed,
-                    Err(_) => "Failed to decode gzipped response".to_string(),
-                }
-            } else {
-                response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Failed to read response body".to_string())
-            };
+            let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
                 action: "get tokens".to_string(),
                 status,
@@ -234,6 +216,29 @@ impl SchwabAuthEnv {
             refresh_token: response.refresh_token,
             refresh_token_fetched_at: Utc::now(),
         })
+    }
+}
+
+async fn extract_error_body(response: reqwest::Response) -> String {
+    let is_gzipped = response
+        .headers()
+        .get("content-encoding")
+        .map(reqwest::header::HeaderValue::as_bytes)
+        == Some(b"gzip");
+
+    if is_gzipped {
+        let bytes = response.bytes().await.unwrap_or_default();
+        let mut decoder = flate2::read::GzDecoder::new(bytes.as_ref());
+        let mut decompressed = String::new();
+        match decoder.read_to_string(&mut decompressed) {
+            Ok(_) => decompressed,
+            Err(_) => "Failed to decode gzipped response".to_string(),
+        }
+    } else {
+        response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Failed to read response body".to_string())
     }
 }
 

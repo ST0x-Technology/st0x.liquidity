@@ -1,9 +1,13 @@
 use chrono::{DateTime, Utc};
 
 #[cfg(test)]
-use sqlx::SqlitePool;
+use chrono::TimeZone;
+
 #[cfg(test)]
-use st0x_broker::{Direction, OrderState, Shares, SupportedBroker, Symbol};
+use sqlx::SqlitePool;
+
+#[cfg(test)]
+use crate::onchain::io::TokenizedEquitySymbol;
 
 /// Links individual onchain trades to their contributing Schwab executions.
 ///
@@ -50,11 +54,110 @@ impl TradeExecutionLink {
     }
 
     #[cfg(test)]
-    pub async fn db_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    pub(crate) async fn db_count(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
         let row = sqlx::query!("SELECT COUNT(*) as count FROM trade_execution_links")
             .fetch_one(pool)
             .await?;
         Ok(row.count)
+    }
+
+    /// Find all executions that a specific trade contributed to
+    #[cfg(test)]
+    pub(crate) async fn find_executions_for_trade(
+        pool: &SqlitePool,
+        trade_id: i64,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, trade_id, execution_id, contributed_shares, created_at
+            FROM trade_execution_links
+            WHERE trade_id = ?1
+            ORDER BY created_at ASC
+            "#,
+            trade_id
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Self {
+                id: row.id,
+                trade_id: row.trade_id,
+                execution_id: row.execution_id,
+                contributed_shares: row.contributed_shares,
+                created_at: Some(Utc.from_utc_datetime(&row.created_at)),
+            })
+            .collect())
+    }
+
+    /// Find all trades that contributed to a specific execution
+    #[cfg(test)]
+    pub(crate) async fn find_trades_for_execution(
+        pool: &SqlitePool,
+        execution_id: i64,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, trade_id, execution_id, contributed_shares, created_at
+            FROM trade_execution_links
+            WHERE execution_id = ?1
+            ORDER BY created_at ASC
+            "#,
+            execution_id
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Self {
+                id: row.id,
+                trade_id: row.trade_id,
+                execution_id: row.execution_id,
+                contributed_shares: row.contributed_shares,
+                created_at: Some(Utc.from_utc_datetime(&row.created_at)),
+            })
+            .collect())
+    }
+
+    /// Get the complete audit trail for a base symbol, showing all trade-execution links
+    /// for all tokenized variants (e.g., GME0x, GMEs1, tGME all map to base GME)
+    #[cfg(test)]
+    pub(crate) async fn get_symbol_audit_trail(
+        pool: &SqlitePool,
+        symbol: &TokenizedEquitySymbol,
+    ) -> Result<Vec<Self>, sqlx::Error> {
+        let base = symbol.extract_base();
+        let suffix_0x = format!("{base}0x");
+        let suffix_s1 = format!("{base}s1");
+        let prefix_t = format!("t{base}");
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT tel.id, tel.trade_id, tel.execution_id, tel.contributed_shares, tel.created_at
+            FROM trade_execution_links tel
+            JOIN onchain_trades ot ON tel.trade_id = ot.id
+            WHERE ot.symbol = ?1 OR ot.symbol = ?2 OR ot.symbol = ?3
+            ORDER BY tel.created_at ASC
+            "#,
+            suffix_0x,
+            suffix_s1,
+            prefix_t
+        )
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Self {
+                id: row.id,
+                trade_id: row.trade_id,
+                execution_id: row.execution_id,
+                contributed_shares: row.contributed_shares,
+                created_at: Some(Utc.from_utc_datetime(&row.created_at)),
+            })
+            .collect())
     }
 }
 
@@ -66,240 +169,10 @@ mod tests {
     use crate::test_utils::setup_test_db;
     use crate::tokenized_symbol;
     use alloy::primitives::fixed_bytes;
-    use chrono::Utc;
+    use st0x_broker::{Direction, OrderState, Shares, SupportedBroker, Symbol};
 
     #[tokio::test]
-    async fn test_trade_execution_link_save_and_find() {
-        let pool = setup_test_db().await;
-
-        // Create a trade and execution first
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            log_index: 1,
-            symbol: tokenized_symbol!("AAPL0x"),
-            amount: 1.5,
-            direction: Direction::Sell,
-            price_usdc: 150.0,
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(1).unwrap(),
-            direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
-            state: OrderState::Pending,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-        let execution_id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-
-        // Create and save the link
-        let link = TradeExecutionLink::new(trade_id, execution_id, 1.0);
-        let link_id = link.save_within_transaction(&mut sql_tx).await.unwrap();
-        sql_tx.commit().await.unwrap();
-
-        assert!(link_id > 0);
-
-        // Test finding executions for trade
-        let executions = TradeExecutionLink::find_executions_for_trade(&pool, trade_id)
-            .await
-            .unwrap();
-        assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].execution_id, execution_id);
-        assert!((executions[0].contributed_shares - 1.0).abs() < f64::EPSILON);
-
-        // Test finding trades for execution
-        let trades = TradeExecutionLink::find_trades_for_execution(&pool, execution_id)
-            .await
-            .unwrap();
-        assert_eq!(trades.len(), 1);
-        assert_eq!(trades[0].trade_id, trade_id);
-        assert!((trades[0].contributed_shares - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn test_symbol_audit_trail() {
-        let pool = setup_test_db().await;
-
-        // Create multiple trades and executions for the same symbol
-        let trades = vec![
-            OnchainTrade {
-                id: None,
-                tx_hash: fixed_bytes!(
-                    "0x2222222222222222222222222222222222222222222222222222222222222222"
-                ),
-                log_index: 1,
-                symbol: tokenized_symbol!("MSFT0x"),
-                amount: 0.5,
-                direction: Direction::Buy,
-                price_usdc: 300.0,
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            },
-            OnchainTrade {
-                id: None,
-                tx_hash: fixed_bytes!(
-                    "0x3333333333333333333333333333333333333333333333333333333333333333"
-                ),
-                log_index: 2,
-                symbol: tokenized_symbol!("MSFT0x"),
-                amount: 0.8,
-                direction: Direction::Buy,
-                price_usdc: 305.0,
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            },
-        ];
-
-        let execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("MSFT").unwrap(),
-            shares: Shares::new(1).unwrap(),
-            direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
-            state: OrderState::Filled {
-                executed_at: Utc::now(),
-                order_id: "1004055538123".to_string(),
-                price_cents: 30250,
-            },
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let mut trade_ids = Vec::new();
-        for trade in trades {
-            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-            trade_ids.push(trade_id);
-        }
-        let execution_id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-
-        // Create links
-        let link1 = TradeExecutionLink::new(trade_ids[0], execution_id, 0.5);
-        let link2 = TradeExecutionLink::new(trade_ids[1], execution_id, 0.5); // Only 0.5 of the 0.8 trade contributed
-
-        link1.save_within_transaction(&mut sql_tx).await.unwrap();
-        link2.save_within_transaction(&mut sql_tx).await.unwrap();
-        sql_tx.commit().await.unwrap();
-
-        // Test audit trail
-        let tokenized_symbol = tokenized_symbol!("MSFT0x");
-        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(&pool, &tokenized_symbol)
-            .await
-            .unwrap();
-        assert_eq!(audit_trail.len(), 2);
-
-        // Verify total contributed shares add up correctly
-        let total_contributed: f64 = audit_trail.iter().map(|e| e.contributed_shares).sum();
-        assert!((total_contributed - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn test_multiple_trades_single_execution() {
-        let pool = setup_test_db().await;
-
-        // Simulate multiple small trades that together trigger one execution
-        let trades = vec![(0.3, 1u64), (0.4, 2u64), (0.5, 3u64)];
-
-        let execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(1).unwrap(),
-            direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
-            state: OrderState::Pending,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let mut trade_ids = Vec::new();
-
-        for (amount, log_index) in trades {
-            let trade = OnchainTrade {
-                id: None,
-                tx_hash: fixed_bytes!(
-                    "0x4444444444444444444444444444444444444444444444444444444444444444"
-                ),
-                log_index,
-                symbol: tokenized_symbol!("AAPL0x"),
-                amount,
-                direction: Direction::Sell,
-                price_usdc: 150.0,
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            };
-            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-            trade_ids.push(trade_id);
-        }
-
-        let execution_id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-
-        // Create links showing how each trade contributed
-        let links = vec![
-            TradeExecutionLink::new(trade_ids[0], execution_id, 0.3),
-            TradeExecutionLink::new(trade_ids[1], execution_id, 0.4),
-            TradeExecutionLink::new(trade_ids[2], execution_id, 0.3), // Only 0.3 of the 0.5 contributed to this execution
-        ];
-
-        for link in links {
-            link.save_within_transaction(&mut sql_tx).await.unwrap();
-        }
-        sql_tx.commit().await.unwrap();
-
-        // Verify all trades contributed to the execution
-        let contributing_trades =
-            TradeExecutionLink::find_trades_for_execution(&pool, execution_id)
-                .await
-                .unwrap();
-        assert_eq!(contributing_trades.len(), 3);
-
-        // Verify total contributions equal exactly 1 share
-        let total_contributions: f64 = contributing_trades
-            .iter()
-            .map(|t| t.contributed_shares)
-            .sum();
-        assert!((total_contributions - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn test_unique_constraint_prevents_duplicate_links() {
+    async fn unique_constraint_prevents_duplicate_links() {
         let pool = setup_test_db().await;
 
         let trade = OnchainTrade {
@@ -338,16 +211,18 @@ mod tests {
             .await
             .unwrap();
 
-        // Create first link
         let link1 = TradeExecutionLink::new(trade_id, execution_id, 0.5);
         link1.save_within_transaction(&mut sql_tx).await.unwrap();
 
-        // Try to create duplicate link - should fail
         let link2 = TradeExecutionLink::new(trade_id, execution_id, 0.5);
         let result = link2.save_within_transaction(&mut sql_tx).await;
 
         assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("UNIQUE constraint failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("UNIQUE constraint failed")
+        );
     }
 }

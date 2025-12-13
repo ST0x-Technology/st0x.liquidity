@@ -115,7 +115,12 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
-ts-rs = { version = "11.1.0", features = ["serde-compat"] }
+ts-rs = { version = "11.1.0", features = [
+  "chrono",
+  "chrono-impl",
+  "serde-compat",
+] }
+rocket_ws = "0.1.1"
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -123,6 +128,7 @@ serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
+tokio-tungstenite = "0.28.0"
 
 [lints]
 workspace = true

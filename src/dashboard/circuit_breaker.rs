@@ -1,0 +1,14 @@
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use ts_rs::TS;
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub(crate) enum CircuitBreakerStatus {
+    Active,
+    Tripped {
+        reason: String,
+        tripped_at: DateTime<Utc>,
+    },
+}

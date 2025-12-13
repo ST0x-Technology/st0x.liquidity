@@ -116,35 +116,18 @@ where
     async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
         let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
-        let amount = match shares_to_u256_18_decimals(quantity) {
-            Ok(a) => a,
-            Err(e) => {
-                error!(%symbol, error = %e, "Failed to convert quantity to U256");
-                return;
-            }
+        let Ok(amount) = convert_shares_for_redemption(&symbol, quantity) else {
+            return;
         };
 
-        info!(
-            %symbol,
-            ?quantity,
-            %token,
-            %amount,
-            aggregate_id = %aggregate_id.0,
-            "Executing redemption operation"
-        );
+        log_redemption_start(&symbol, quantity, token, amount, &aggregate_id);
 
-        match self
+        let result = self
             .redemption_manager
             .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-            .await
-        {
-            Ok(()) => {
-                info!(%symbol, "Redemption operation completed successfully");
-            }
-            Err(e) => {
-                error!(%symbol, error = %e, "Redemption operation failed");
-            }
-        }
+            .await;
+
+        log_redemption_result(&symbol, result);
     }
 
     async fn execute_usdc_alpaca_to_base(&self, amount: crate::threshold::Usdc) {
@@ -175,6 +158,40 @@ where
                 error!(error = %e, "USDC Base to Alpaca rebalance failed");
             }
         }
+    }
+}
+
+fn convert_shares_for_redemption(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+) -> Result<U256, SharesConversionError> {
+    shares_to_u256_18_decimals(quantity).map_err(|e| {
+        error!(%symbol, error = %e, "Failed to convert quantity to U256");
+        e
+    })
+}
+
+fn log_redemption_start(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    token: Address,
+    amount: U256,
+    aggregate_id: &RedemptionAggregateId,
+) {
+    info!(
+        %symbol,
+        ?quantity,
+        %token,
+        %amount,
+        aggregate_id = %aggregate_id.0,
+        "Executing redemption operation"
+    );
+}
+
+fn log_redemption_result<E: std::fmt::Display>(symbol: &Symbol, result: Result<(), E>) {
+    match result {
+        Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
+        Err(e) => error!(%symbol, error = %e, "Redemption operation failed"),
     }
 }
 

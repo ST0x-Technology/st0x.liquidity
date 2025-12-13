@@ -97,17 +97,40 @@ source of truth for WebSocket message types.
 Add WebSocket support to Rocket server that broadcasts domain events to
 connected clients.
 
-- [ ] Add `rocket_ws` dependency via `cargo add`
-- [ ] Create WebSocket endpoint handler in dashboard module
-- [ ] Implement broadcast channel in Rocket managed state for publishing events
-- [ ] WebSocket endpoint `/api/ws` accepts connections and adds to broadcast
+- [x] Add `rocket_ws` dependency via `cargo add`
+- [x] Create WebSocket endpoint handler in dashboard module
+- [x] Implement broadcast channel in Rocket managed state for publishing events
+- [x] WebSocket endpoint `/api/ws` accepts connections and adds to broadcast
       channel
-- [ ] On connect, send `initial` message with stub/empty data for unimplemented
+- [x] On connect, send `initial` message with stub/empty data for unimplemented
       fields
-- [ ] Mount WebSocket route in `src/lib.rs`
-- [ ] Write tests: WebSocket connection, initial message receipt, multiple
+- [x] Mount WebSocket route in `src/lib.rs`
+- [x] Write tests: WebSocket connection, initial message receipt, multiple
       concurrent clients
-- [ ] Verify: `cargo test`, `cargo clippy`, `cargo fmt`
+- [x] Verify: `cargo test`, `cargo clippy`, `cargo fmt`
+
+### Changes Made
+
+- `Cargo.toml` - Added `rocket_ws` dependency
+- `src/dashboard/mod.rs` - Added WebSocket handler `ws_stream()` at `/api/ws`:
+  - Accepts WebSocket connections
+  - Sends initial state message with stub data on connect
+  - Subscribes to broadcast channel for future events
+  - Uses `tokio::select!` to handle incoming messages and broadcasts
+- `src/dashboard/mod.rs` - Added `EventBroadcaster` type wrapping
+  `broadcast::Sender<ServerMessage>` for Rocket managed state
+- `src/lib.rs` - Mounted WebSocket route and added `EventBroadcaster` to Rocket
+  managed state
+- Dashboard types refactored to use `Decimal` instead of `f64` for financial
+  values
+- Fixed `get_symbol_audit_trail` to query by base symbol (strip "0x" suffix)
+- Added WebSocket test using `tokio_tungstenite` client
+- Fixed cognitive complexity in 5 files by extracting helper functions:
+  - `src/rebalancing/rebalancer.rs`
+  - `src/conductor/mod.rs`
+  - `src/cli.rs`
+  - `src/onchain/pyth/mod.rs`
+  - `src/reporter/mod.rs`
 
 ---
 
