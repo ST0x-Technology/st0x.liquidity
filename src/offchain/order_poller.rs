@@ -106,18 +106,8 @@ impl<B: Broker> OrderStatusPoller<B> {
             return Ok(());
         };
 
-        let order_id = match &execution.state {
-            OrderState::Pending => {
-                debug!("Execution {execution_id} is PENDING but no order_id yet");
-                return Ok(());
-            }
-            OrderState::Submitted { order_id } | OrderState::Filled { order_id, .. } => {
-                order_id.clone()
-            }
-            OrderState::Failed { .. } => {
-                debug!("Execution {execution_id} already failed, skipping poll");
-                return Ok(());
-            }
+        let Some(order_id) = extract_order_id(execution_id, &execution.state) else {
+            return Ok(());
         };
 
         let parsed_order_id = self
@@ -131,22 +121,26 @@ impl<B: Broker> OrderStatusPoller<B> {
             .await
             .map_err(|e| OrderPollingError::Broker(Box::new(e)))?;
 
-        match &order_state {
-            OrderState::Filled { .. } => {
-                self.handle_filled_order(execution_id, &order_state).await?;
-            }
-            OrderState::Failed { .. } => {
-                self.handle_failed_order(execution_id, &order_state).await?;
-            }
+        self.process_order_state(execution_id, &order_id, &order_state)
+            .await
+    }
+
+    async fn process_order_state(
+        &self,
+        execution_id: i64,
+        order_id: &str,
+        order_state: &OrderState,
+    ) -> Result<(), OrderPollingError> {
+        match order_state {
+            OrderState::Filled { .. } => self.handle_filled_order(execution_id, order_state).await,
+            OrderState::Failed { .. } => self.handle_failed_order(execution_id, order_state).await,
             OrderState::Pending | OrderState::Submitted { .. } => {
                 debug!(
-                    "Order {order_id} (execution {execution_id}) still pending with state: {:?}",
-                    order_state
+                    "Order {order_id} (execution {execution_id}) still pending with state: {order_state:?}"
                 );
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     async fn handle_filled_order(
@@ -154,36 +148,9 @@ impl<B: Broker> OrderStatusPoller<B> {
         execution_id: i64,
         order_state: &OrderState,
     ) -> Result<(), OrderPollingError> {
-        let new_status = order_state.clone();
+        let execution = self.finalize_order(execution_id, order_state).await?;
 
-        let mut tx = self.pool.begin().await?;
-
-        let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
-            error!("Execution {execution_id} not found in database");
-            return Err(OrderPollingError::OnChain(OnChainError::Persistence(
-                PersistenceError::InvalidTradeStatus("Execution not found".to_string()),
-            )));
-        };
-
-        new_status.store_update(&mut tx, execution_id).await?;
-
-        clear_pending_execution_id(&mut tx, &execution.symbol).await?;
-
-        clear_execution_lease(&mut tx, &execution.symbol).await?;
-
-        tx.commit().await?;
-
-        if let OrderState::Filled { price_cents, .. } = order_state {
-            info!(
-                "Updated execution {execution_id} to FILLED with price: {} cents and cleared locks for symbol: {}",
-                price_cents, execution.symbol
-            );
-        } else {
-            info!(
-                "Updated execution {execution_id} to FILLED and cleared locks for symbol: {}",
-                execution.symbol
-            );
-        }
+        log_filled_order(execution_id, order_state, &execution);
 
         Ok(())
     }
@@ -193,10 +160,17 @@ impl<B: Broker> OrderStatusPoller<B> {
         execution_id: i64,
         order_state: &OrderState,
     ) -> Result<(), OrderPollingError> {
-        let new_status = order_state.clone();
+        let execution = self.finalize_order(execution_id, order_state).await?;
+        let symbol = &execution.symbol;
+        info!("Updated execution {execution_id} to FAILED and cleared locks for symbol: {symbol}");
+        Ok(())
+    }
 
-        let mut tx = self.pool.begin().await?;
-
+    async fn finalize_order(
+        &self,
+        execution_id: i64,
+        order_state: &OrderState,
+    ) -> Result<OffchainExecution, OrderPollingError> {
         let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
             error!("Execution {execution_id} not found in database");
             return Err(OrderPollingError::OnChain(OnChainError::Persistence(
@@ -204,20 +178,16 @@ impl<B: Broker> OrderStatusPoller<B> {
             )));
         };
 
-        new_status.store_update(&mut tx, execution_id).await?;
-
+        let mut tx = self.pool.begin().await?;
+        order_state
+            .clone()
+            .store_update(&mut tx, execution_id)
+            .await?;
         clear_pending_execution_id(&mut tx, &execution.symbol).await?;
-
         clear_execution_lease(&mut tx, &execution.symbol).await?;
-
         tx.commit().await?;
 
-        info!(
-            "Updated execution {execution_id} to FAILED and cleared locks for symbol: {}",
-            execution.symbol
-        );
-
-        Ok(())
+        Ok(execution)
     }
 
     async fn add_jittered_delay(&self) {
@@ -228,5 +198,35 @@ impl<B: Broker> OrderStatusPoller<B> {
             let jitter = Duration::from_millis(jitter_millis);
             tokio::time::sleep(jitter).await;
         }
+    }
+}
+
+fn extract_order_id(execution_id: i64, state: &OrderState) -> Option<String> {
+    match state {
+        OrderState::Pending => {
+            debug!("Execution {execution_id} is PENDING but no order_id yet");
+            None
+        }
+        OrderState::Submitted { order_id } | OrderState::Filled { order_id, .. } => {
+            Some(order_id.clone())
+        }
+        OrderState::Failed { .. } => {
+            debug!("Execution {execution_id} already failed, skipping poll");
+            None
+        }
+    }
+}
+
+fn log_filled_order(execution_id: i64, order_state: &OrderState, execution: &OffchainExecution) {
+    let symbol = &execution.symbol;
+    if let OrderState::Filled { price_cents, .. } = order_state {
+        info!(
+            execution_id,
+            price_cents,
+            %symbol,
+            "Updated execution to FILLED and cleared locks"
+        );
+    } else {
+        info!(execution_id, %symbol, "Updated execution to FILLED and cleared locks");
     }
 }
