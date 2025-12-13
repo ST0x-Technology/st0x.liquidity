@@ -226,13 +226,29 @@ infrastructure connecting to backend.
 Implement the Live Events panel component that displays events from TanStack
 Query cache.
 
-- [ ] Create LiveEventsPanel component reading from `['events']` query key
-- [ ] Display columns: aggregate_type, aggregate_id, sequence, event_type,
+- [x] Create LiveEventsPanel component reading from `['events']` query key
+- [x] Display columns: aggregate_type, aggregate_id, sequence, event_type,
       timestamp
-- [ ] Events prepended at top (newest first), capped at 100 entries client-side
-- [ ] Style with shadcn-svelte table components
-- [ ] Write component tests verifying event rendering and 100-entry cap
-- [ ] Verify: Panel displays events from cache, auto-updates when cache changes
+- [x] Events prepended at top (newest first), capped at 100 entries client-side
+- [x] Style with shadcn-svelte table components
+- [x] Write component tests verifying event rendering and 100-entry cap
+- [x] Verify: Panel displays events from cache, auto-updates when cache changes
+
+### Changes Made
+
+- `dashboard/src/lib/components/live-events-panel.svelte` - Live events panel:
+  - Uses TanStack Query `createQuery` to read from `['events']` cache key
+  - Displays events in a table with Time, Type, Aggregate, Seq columns
+  - Truncates long aggregate IDs with ellipsis (hover for full ID)
+  - Shows event count in header
+  - Empty state displays "No events yet"
+- `dashboard/src/lib/components/ui/table/` - Added shadcn table components
+- `dashboard/src/routes/+page.svelte` - Replaced placeholder with
+  LiveEventsPanel
+- `dashboard/src/lib/env.ts` - Changed default WS URL to port 8080
+- `dashboard/src/app.html` - Added `dark` class for dark mode
+- The 100-event cap is enforced in websocket.svelte.ts (already implemented in
+  Task 5)
 
 ---
 
