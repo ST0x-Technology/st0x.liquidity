@@ -1,4 +1,4 @@
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, prelude::One};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use st0x_broker::Symbol;
@@ -21,7 +21,7 @@ struct PositionRow {
 
 pub async fn migrate_positions(
     pool: &SqlitePool,
-    cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError>>,
+    cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, PositionRow>(
@@ -65,7 +65,7 @@ pub async fn migrate_positions(
             net_position: FractionalShares(net_position),
             accumulated_long: FractionalShares(accumulated_long),
             accumulated_short: FractionalShares(accumulated_short),
-            threshold: ExecutionThreshold::whole_share(),
+            threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
         };
 
         match execution {

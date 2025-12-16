@@ -1,57 +1,36 @@
 use sqlx::SqlitePool;
+use tokio::task::JoinHandle;
 use tracing::{error, info, info_span, warn};
 
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses AlpacaTokenization client
-#[allow(dead_code)]
 mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses CCTP service
-#[allow(dead_code)]
 mod cctp;
 pub mod cli;
 mod conductor;
 pub mod env;
+mod equity_redemption;
 mod error;
+mod inventory;
 mod lifecycle;
 mod lock;
 pub mod migration;
 mod offchain;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
 mod offchain_order;
 mod onchain;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
-pub(crate) mod onchain_trade;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
+mod onchain_trade;
 mod position;
 mod queue;
+mod rebalancing;
 pub mod reporter;
 mod shares;
 mod symbol;
 mod telemetry;
-// TODO(#130): Remove dead_code allow when dual-write is implemented
-#[allow(dead_code)]
 mod threshold;
-// TODO(#135): Remove dead_code allow when rebalancing aggregates are integrated
-#[allow(dead_code)]
 mod tokenized_equity_mint;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses EquityRedemption aggregate
-#[allow(dead_code)]
-mod equity_redemption;
 mod trade_execution_link;
-// TODO(#137): Remove dead_code allow when rebalancing orchestration uses UsdcRebalance aggregate
-#[allow(dead_code)]
 mod usdc_rebalance;
-
-#[allow(dead_code)]
-// TODO(#139): Remove dead_code allow when rebalancing is triggered from InventoryView
-mod rebalancing;
-
-mod inventory;
 
 pub use telemetry::{TelemetryError, TelemetryGuard};
 
@@ -156,7 +135,7 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
         BrokerConfig::DryRun => {
             info!("Initializing test broker for dry-run mode");
             let broker = MockBrokerConfig.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
         }
         BrokerConfig::Schwab(schwab_auth) => {
             info!("Initializing Schwab broker");
@@ -165,12 +144,13 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
                 pool: pool.clone(),
             };
             let broker = schwab_config.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
         }
         BrokerConfig::Alpaca(alpaca_auth) => {
             info!("Initializing Alpaca broker");
             let broker = alpaca_auth.clone().try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker)).await
+
+            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
         }
     }
 }
@@ -179,10 +159,11 @@ async fn run_with_broker<B: Broker + Clone + Send + 'static>(
     config: Config,
     pool: SqlitePool,
     broker: B,
+    rebalancer: Option<JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let broker_maintenance = broker.run_broker_maintenance().await;
 
-    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance).await
+    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance, rebalancer).await
 }
 
 #[cfg(test)]

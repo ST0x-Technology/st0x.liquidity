@@ -5,64 +5,39 @@
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
-use cqrs_es::{AggregateError, CqrsFramework, EventStore};
+use async_trait::async_trait;
+use cqrs_es::{CqrsFramework, EventStore};
 use rust_decimal::Decimal;
 use st0x_broker::Symbol;
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::{info, instrument, warn};
 
+use super::{Mint, MintError};
 use crate::alpaca_tokenization::{
-    AlpacaTokenizationError, AlpacaTokenizationService, TokenizationRequest,
-    TokenizationRequestStatus,
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
 use crate::lifecycle::{Lifecycle, Never};
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
-    TokenizedEquityMintError,
 };
 
-#[derive(Debug, Error)]
-pub(crate) enum MintError {
-    #[error("Alpaca API error: {0}")]
-    Alpaca(#[from] AlpacaTokenizationError),
-
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
-
-    #[error("Mint request was rejected by Alpaca")]
-    Rejected,
-
-    #[error("Missing issuer_request_id in Alpaca response")]
-    MissingIssuerRequestId,
-
-    #[error("Missing tx_hash in completed Alpaca response")]
-    MissingTxHash,
-
-    #[error("U256 parse error: {0}")]
-    U256Parse(#[from] alloy::primitives::ruint::ParseError),
-}
-
-pub(crate) struct MintManager<P, S, ES>
+pub(crate) struct MintManager<P, ES>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
-    service: Arc<AlpacaTokenizationService<P, S>>,
+    service: Arc<AlpacaTokenizationService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
 }
 
-impl<P, S, ES> MintManager<P, S, ES>
+impl<P, ES> MintManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    S: Signer + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
     pub(crate) fn new(
-        service: Arc<AlpacaTokenizationService<P, S>>,
+        service: Arc<AlpacaTokenizationService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
     ) -> Self {
         Self { service, cqrs }
@@ -81,7 +56,7 @@ where
     ///
     /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
     #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
-    pub(crate) async fn execute_mint(
+    async fn execute_mint_impl(
         &self,
         issuer_request_id: &IssuerRequestId,
         symbol: Symbol,
@@ -226,16 +201,35 @@ fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, MintError> {
     Ok(U256::from_str_radix(&as_str, 10)?)
 }
 
+#[async_trait]
+impl<P, ES> Mint for MintManager<P, ES>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>> + Send + Sync,
+    ES::AC: Send,
+{
+    async fn execute_mint(
+        &self,
+        issuer_request_id: &IssuerRequestId,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        wallet: Address,
+    ) -> Result<(), MintError> {
+        self.execute_mint_impl(issuer_request_id, symbol, quantity, wallet)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{U256, address};
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
     };
@@ -245,30 +239,9 @@ mod tests {
         MemStore<Lifecycle<TokenizedEquityMint, Never>>,
     >;
 
-    #[test]
-    fn test_decimal_to_u256_18_decimals() {
-        let value = dec!(100.5);
-        let result = decimal_to_u256_18_decimals(value).unwrap();
-
-        let expected = U256::from(100_500_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_decimal_to_u256_whole_number() {
-        let value = dec!(42);
-        let result = decimal_to_u256_18_decimals(value).unwrap();
-
-        let expected = U256::from(42_000_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_decimal_to_u256_zero() {
-        let value = dec!(0);
-        let result = decimal_to_u256_18_decimals(value).unwrap();
-
-        assert_eq!(result, U256::ZERO);
+    fn create_test_cqrs() -> Arc<TestCqrs> {
+        let store = MemStore::default();
+        Arc::new(CqrsFramework::new(store, vec![], ()))
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -304,13 +277,34 @@ mod tests {
         })
     }
 
-    fn create_test_cqrs() -> Arc<TestCqrs> {
-        let store = MemStore::default();
-        Arc::new(CqrsFramework::new(store, vec![], ()))
+    #[test]
+    fn decimal_to_u256_converts_fractional() {
+        let value = dec!(100.5);
+        let result = decimal_to_u256_18_decimals(value).unwrap();
+
+        let expected = U256::from(100_500_000_000_000_000_000_u128);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn decimal_to_u256_converts_whole_number() {
+        let value = dec!(42);
+        let result = decimal_to_u256_18_decimals(value).unwrap();
+
+        let expected = U256::from(42_000_000_000_000_000_000_u128);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn decimal_to_u256_converts_zero() {
+        let value = dec!(0);
+        let result = decimal_to_u256_18_decimals(value).unwrap();
+
+        assert_eq!(result, U256::ZERO);
     }
 
     #[tokio::test]
-    async fn test_execute_mint_happy_path() {
+    async fn execute_mint_happy_path() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let service = Arc::new(
@@ -338,7 +332,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
+            .execute_mint_impl(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
             .await;
 
         assert!(result.is_ok(), "execute_mint failed: {result:?}");
@@ -348,7 +342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_mint_rejected() {
+    async fn execute_mint_rejected_by_alpaca() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let service = Arc::new(
@@ -388,7 +382,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint(&IssuerRequestId::new("mint-002"), symbol, quantity, wallet)
+            .execute_mint_impl(&IssuerRequestId::new("mint-002"), symbol, quantity, wallet)
             .await;
 
         assert!(matches!(result, Err(MintError::Rejected)));
@@ -398,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_mint_api_error() {
+    async fn execute_mint_api_error() {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let service = Arc::new(
@@ -417,11 +411,52 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
+            .execute_mint_impl(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
             .await;
 
         assert!(matches!(result, Err(MintError::Alpaca(_))));
 
         mint_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn trait_impl_delegates_to_execute_mint_impl() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service = Arc::new(
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+        );
+        let cqrs = create_test_cqrs();
+        let manager = MintManager::new(service, cqrs);
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path("/v2/tokenization/mint");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_pending_response("trait_test"));
+        });
+
+        let poll_mock = server.mock(|when, then| {
+            when.method(GET).path("/v2/tokenization/requests");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_completed_response("trait_test")]));
+        });
+
+        let mint_trait: &dyn Mint = &manager;
+
+        let result = mint_trait
+            .execute_mint(
+                &IssuerRequestId::new("trait-001"),
+                Symbol::new("AAPL").unwrap(),
+                FractionalShares(dec!(50.0)),
+                address!("0x1234567890abcdef1234567890abcdef12345678"),
+            )
+            .await;
+
+        assert!(result.is_ok());
+
+        mint_mock.assert();
+        poll_mock.assert();
     }
 }

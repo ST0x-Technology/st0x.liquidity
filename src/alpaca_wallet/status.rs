@@ -210,7 +210,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -266,7 +266,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -322,7 +322,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -367,7 +367,7 @@ mod tests {
             then.status(503).body("Service Unavailable");
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -406,7 +406,7 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let client = Arc::new(
-            AlpacaWalletClient::new_with_base_url(
+            AlpacaWalletClient::new(
                 server.base_url(),
                 "test_key_id".to_string(),
                 "test_secret_key".to_string(),
@@ -588,7 +588,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -626,7 +626,7 @@ mod tests {
         let transfer_id = Uuid::new_v4();
 
         let client = Arc::new(
-            AlpacaWalletClient::new_with_base_url(
+            AlpacaWalletClient::new(
                 server.base_url(),
                 "test_key_id".to_string(),
                 "test_secret_key".to_string(),
@@ -708,7 +708,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
@@ -768,7 +768,7 @@ mod tests {
                 }]));
         });
 
-        let client = AlpacaWalletClient::new_with_base_url(
+        let client = AlpacaWalletClient::new(
             server.base_url(),
             "test_key_id".to_string(),
             "test_secret_key".to_string(),

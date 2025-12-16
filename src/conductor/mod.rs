@@ -12,7 +12,7 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::env::Config;
+use crate::env::{BrokerConfig, Config};
 use crate::error::EventProcessingError;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
@@ -22,6 +22,7 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 pub(crate) use builder::ConductorBuilder;
@@ -34,6 +35,7 @@ pub(crate) struct Conductor {
     pub(crate) event_processor: JoinHandle<()>,
     pub(crate) position_checker: JoinHandle<()>,
     pub(crate) queue_processor: JoinHandle<()>,
+    pub(crate) rebalancer: Option<JoinHandle<()>>,
 }
 
 pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
@@ -41,6 +43,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
     config: Config,
     pool: SqlitePool,
     broker_maintenance: Option<JoinHandle<()>>,
+    rebalancer: Option<JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
 
@@ -56,8 +59,14 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
         info!("Starting conductor (no market hours restrictions)");
     }
 
-    let mut conductor = match Conductor::start(&config, &pool, broker.clone(), broker_maintenance)
-        .await
+    let mut conductor = match Conductor::start(
+        &config,
+        &pool,
+        broker.clone(),
+        broker_maintenance,
+        rebalancer,
+    )
+    .await
     {
         Ok(c) => c,
         Err(e) => {
@@ -70,7 +79,14 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
 
             let new_maintenance = broker.run_broker_maintenance().await;
 
-            return Box::pin(run_market_hours_loop(broker, config, pool, new_maintenance)).await;
+            return Box::pin(run_market_hours_loop(
+                broker,
+                config,
+                pool,
+                new_maintenance,
+                None,
+            ))
+            .await;
         }
     };
 
@@ -89,7 +105,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
             conductor.abort_trading_tasks();
             let next_maintenance = conductor.broker_maintenance;
             info!("Trading tasks shutdown, DEX events buffering");
-            Box::pin(run_market_hours_loop(broker, config, pool, next_maintenance)).await
+            Box::pin(run_market_hours_loop(broker, config, pool, next_maintenance, None)).await
         }
     }
 }
@@ -100,6 +116,7 @@ impl Conductor {
         pool: &SqlitePool,
         broker: B,
         broker_maintenance: Option<JoinHandle<()>>,
+        rebalancer: Option<JoinHandle<()>>,
     ) -> anyhow::Result<Self> {
         let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
@@ -114,12 +131,34 @@ impl Conductor {
 
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
 
-        Ok(
+        // Spawn rebalancer with the provider if configured
+        let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
+            (Some(rebalancing_config), BrokerConfig::Alpaca(alpaca_auth), None) => {
+                info!("Initializing rebalancing infrastructure");
+                Some(
+                    spawn_rebalancer(
+                        pool.clone(),
+                        rebalancing_config,
+                        alpaca_auth,
+                        provider.clone(),
+                        cache.clone(),
+                    )
+                    .await?,
+                )
+            }
+            (_, _, existing) => existing,
+        };
+
+        let mut builder =
             ConductorBuilder::new(config.clone(), pool.clone(), cache, provider, broker)
                 .with_broker_maintenance(broker_maintenance)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn(),
-        )
+                .with_dex_event_streams(clear_stream, take_stream);
+
+        if let Some(rebalancer_handle) = rebalancer {
+            builder = builder.with_rebalancer(rebalancer_handle);
+        }
+
+        Ok(builder.spawn())
     }
 
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
@@ -137,7 +176,22 @@ impl Conductor {
             }
         };
 
+        let rebalancer_task = async {
+            if let Some(handle) = &mut self.rebalancer {
+                match handle.await {
+                    Ok(()) => {
+                        info!("Rebalancer completed successfully");
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        info!("Rebalancer cancelled (expected during shutdown)");
+                    }
+                    Err(e) => error!("Rebalancer task panicked: {e}"),
+                }
+            }
+        };
+
         let (
+            (),
             (),
             poller_result,
             dex_receiver_result,
@@ -146,6 +200,7 @@ impl Conductor {
             queue_result,
         ) = tokio::join!(
             maintenance_task,
+            rebalancer_task,
             &mut self.order_poller,
             &mut self.dex_event_receiver,
             &mut self.event_processor,
@@ -180,6 +235,10 @@ impl Conductor {
         self.position_checker.abort();
         self.queue_processor.abort();
 
+        if let Some(ref handle) = self.rebalancer {
+            handle.abort();
+        }
+
         info!("Trading tasks aborted successfully (DEX events will continue buffering)");
     }
 
@@ -189,6 +248,11 @@ impl Conductor {
         if let Some(handle) = self.broker_maintenance {
             handle.abort();
         }
+
+        if let Some(handle) = self.rebalancer {
+            handle.abort();
+        }
+
         self.order_poller.abort();
         self.dex_event_receiver.abort();
         self.event_processor.abort();
@@ -1497,7 +1561,7 @@ mod tests {
         let config = create_test_config();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
@@ -1525,7 +1589,7 @@ mod tests {
         let config = create_test_config();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
@@ -1566,7 +1630,7 @@ mod tests {
         let config = create_test_config();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
-        let provider = alloy::providers::ProviderBuilder::new().connect_mocked_client(asserter);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
@@ -1586,6 +1650,129 @@ mod tests {
             elapsed < std::time::Duration::from_millis(100),
             "ConductorBuilder should return quickly, took: {elapsed:?}"
         );
+
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_without_rebalancer() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let clear_stream = stream::empty();
+        let take_stream = stream::empty();
+
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
+            .with_broker_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .spawn();
+
+        assert!(conductor.rebalancer.is_none());
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_with_rebalancer() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let clear_stream = stream::empty();
+        let take_stream = stream::empty();
+
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+
+        let rebalancer_handle = tokio::spawn(async {
+            // Simulate rebalancer task that runs until cancelled
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
+            .with_broker_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .with_rebalancer(rebalancer_handle)
+            .spawn();
+
+        assert!(conductor.rebalancer.is_some());
+        assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
+
+        conductor.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_conductor_rebalancer_aborted_on_abort_all() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let clear_stream = stream::empty();
+        let take_stream = stream::empty();
+
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+
+        let rebalancer_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
+            .with_broker_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .with_rebalancer(rebalancer_handle)
+            .spawn();
+
+        let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
+        assert!(!rebalancer_ref.is_finished());
+
+        conductor.abort_all();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    #[tokio::test]
+    async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let clear_stream = stream::empty();
+        let take_stream = stream::empty();
+
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+
+        let rebalancer_handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, broker)
+            .with_broker_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .with_rebalancer(rebalancer_handle)
+            .spawn();
+
+        assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
+
+        conductor.abort_trading_tasks();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
 
         conductor.abort_all();
     }

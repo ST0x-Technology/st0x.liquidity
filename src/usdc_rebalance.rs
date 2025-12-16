@@ -64,12 +64,18 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteEventRepository;
 
 use crate::alpaca_wallet::AlpacaTransferId;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::threshold::Usdc;
+
+/// SQLite-backed event store for UsdcRebalance aggregates.
+pub(crate) type UsdcEventStore =
+    PersistedEventStore<SqliteEventRepository, Lifecycle<UsdcRebalance, Never>>;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

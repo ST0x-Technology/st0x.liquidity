@@ -2,6 +2,10 @@
 
 This file provides guidance to AI agents working with code in this repository.
 
+**CRITICAL: File Size Limit** - AGENTS.md must not exceed 40,000 characters.
+When editing this file, check the character count (`wc -c AGENTS.md`). If over
+the limit, condense explanations without removing any rules.
+
 ## Plan & Review
 
 ### Before starting work
@@ -19,9 +23,34 @@ This file provides guidance to AI agents working with code in this repository.
 
 ### While implementing
 
+- **CRITICAL: All new or modified logic MUST have corresponding test coverage.**
+  Do not move on from a piece of code until tests are written. This is
+  non-negotiable.
 - You should update PLAN.md every time you complete a section
 - Upon completing a planned task, add detailed descriptions of the changes you
   made to ease the review process
+
+### Handling questions and approach changes
+
+When the user asks a question or challenges your approach:
+
+1. **Answer the question first.** Do not immediately assume the question implies
+   you should change your approach. Provide a clear, direct answer.
+
+2. **If you realize your approach was wrong**, do not silently change it. Ask
+   for confirmation: "I see the issue - [explain]. Should I switch to [new
+   approach] instead?"
+
+3. **If you encounter errors while trying a different approach**, do not
+   silently revert to the previous approach. State what went wrong and ask: "The
+   new approach ran into [problem]. Do you want me to continue debugging it or
+   go back to the original approach?"
+
+4. **Never assume silence or a question means approval to change direction.**
+   Explicit confirmation is required before abandoning one approach for another.
+
+This prevents wasted time on undirected exploration and ensures alignment on the
+implementation strategy.
 
 ### Before creating a PR
 
@@ -372,7 +401,10 @@ Environment variables (can be set via `.env` file):
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
-  logic changes might leave panics in the codebase
+  logic changes might leave panics in the codebase. Use `thiserror` with
+  `#[from]` attributes for automatic error conversion, then use the `?` operator
+  for propagation. Do NOT use `.map_err()` when `#[from]` can handle the
+  conversion automatically.
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
@@ -582,6 +614,10 @@ explicit permission.**
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
+- **No ad-hoc debugging scripts**: Never write ad-hoc scripts, code snippets, or
+  temporary files outside the project for debugging. If you need to debug an
+  issue, write a proper test function within the project's test suite and remove
+  it once you've obtained the information you need.
 - **Test Quality**: Never write tests that only exercise language features
   without testing our application logic. Tests should verify actual business
   logic, not just struct field assignments or basic language operations
@@ -993,83 +1029,20 @@ Encodes runtime state in compile-time types, eliminating runtime checks.
 
 ```rust
 // ✅ Good: State transitions enforced at compile time
-struct Start;
-struct InProgress;
-struct Complete;
-
 struct Task<State> { data: TaskData, state: State }
-
-impl Task<Start> {
-    fn begin(self) -> Task<InProgress> {
-        Task { data: self.data, state: InProgress }
-    }
-}
-
-impl Task<InProgress> {
-    fn complete(self) -> Task<Complete> {
-        Task { data: self.data, state: Complete }
-    }
-}
-
-// Operations available in all states
-impl<S> Task<S> {
-    fn description(&self) -> &str { &self.data.description }
-}
+impl Task<Start> { fn begin(self) -> Task<InProgress> { ... } }
+impl Task<InProgress> { fn complete(self) -> Task<Complete> { ... } }
 ```
 
-##### Session Types and Protocol Enforcement:
-
-```rust
-// ✅ Good: Enforce protocol sequences at compile time
-struct Unauthenticated;
-struct Authenticated { token: String };
-struct Active { session_id: u64 };
-
-struct Connection<State> { socket: TcpStream, state: State }
-
-impl Connection<Unauthenticated> {
-    fn authenticate(self, creds: &Credentials) -> Result<Connection<Authenticated>, Error> {
-        let token = perform_auth(&self.socket, creds)?;
-        Ok(Connection { socket: self.socket, state: Authenticated { token } })
-    }
-}
-
-impl Connection<Authenticated> {
-    fn start_session(self) -> Connection<Active> {
-        Connection { socket: self.socket, state: Active { session_id: gen_id() } }
-    }
-}
-```
-
-##### Builder Pattern with Typestate:
-
-```rust
-// ✅ Good: Can't build incomplete objects at compile time
-struct NoUrl;
-struct HasUrl;
-
-struct RequestBuilder<U> {
-    url: Option<String>,
-    _marker: PhantomData<U>,
-}
-
-impl RequestBuilder<NoUrl> {
-    fn url(self, url: String) -> RequestBuilder<HasUrl> {
-        RequestBuilder { url: Some(url), _marker: PhantomData }
-    }
-}
-
-impl RequestBuilder<HasUrl> {
-    fn build(self) -> Request {
-        Request { url: self.url.unwrap() } // Safe due to typestate
-    }
-}
-```
+Use typestate for protocol enforcement (`Connection<Unauthenticated>` →
+`Connection<Authenticated>`) and builder patterns (`RequestBuilder<NoUrl>` →
+`RequestBuilder<HasUrl>`).
 
 #### Avoid deep nesting
 
 Prefer flat code over deeply nested blocks to improve readability and
-maintainability.
+maintainability. This includes test modules - do NOT nest submodules inside
+`mod tests`. Put all tests directly in the `tests` module.
 
 ##### Use early returns:
 
@@ -1113,95 +1086,19 @@ fn process_data(data: Option<&str>) -> Result<String, Error> {
 
 ##### Use let-else pattern for guard clauses:
 
-The let-else pattern (available since Rust 1.65) is excellent for reducing
-nesting when you need to extract a value or return early:
-
-Instead of
-
 ```rust
-fn process_event(event: &QueuedEvent) -> Result<Trade, Error> {
-    if let Some(trade_data) = convert_event_to_trade(event) {
-        if trade_data.is_valid() {
-            if let Some(symbol) = trade_data.extract_symbol() {
-                Ok(Trade::new(symbol, trade_data))
-            } else {
-                Err(Error::NoSymbol)
-            }
-        } else {
-            Err(Error::InvalidTrade)
-        }
-    } else {
-        Err(Error::ConversionFailed)
-    }
-}
+// Use let-else to flatten nested if-let chains
+let Some(trade_data) = convert_event_to_trade(event) else {
+    return Err(Error::ConversionFailed);
+};
+let Some(symbol) = trade_data.extract_symbol() else {
+    return Err(Error::NoSymbol);
+};
 ```
-
-Write
-
-```rust
-fn process_event(event: &QueuedEvent) -> Result<Trade, Error> {
-    let Some(trade_data) = convert_event_to_trade(event) else {
-        return Err(Error::ConversionFailed);
-    };
-    
-    if !trade_data.is_valid() {
-        return Err(Error::InvalidTrade);
-    }
-    
-    let Some(symbol) = trade_data.extract_symbol() else {
-        return Err(Error::NoSymbol);
-    };
-    
-    Ok(Trade::new(symbol, trade_data))
-}
-```
-
-This pattern is particularly useful for:
-
-- Extracting required values from Options
-- Handling pattern matching that should cause early returns
-- Reducing rightward drift in functions with multiple validation steps
 
 ##### Extract functions for complex logic:
 
-Instead of deeply nested event processing:
-
-```rust
-fn process_event(event: &Event) -> Result<(), Error> {
-    if let Some(data) = &event.data {
-        for item in &data.items {
-            if item.valid {
-                if let Some(result) = process_item(item) {
-                    // ... many more nested levels
-                }
-            }
-        }
-    }
-    Ok(())
-}
-```
-
-Write
-
-```rust
-fn process_event(event: &Event) -> Result<(), Error> {
-    let data = event.data.as_ref().ok_or(Error::NoData)?;
-
-    for item in &data.items {
-        if let Some(result) = validate_and_process(item)? {
-            handle_result(result)?;
-        }
-    }
-    Ok(())
-}
-
-fn validate_and_process(item: &Item) -> Result<Option<ProcessResult>, Error> {
-    if !item.valid {
-        return Ok(None);
-    }
-    process_item(item).map(Some)
-}
-```
+Break deeply nested event processing into helper functions with clear names.
 
 ##### Use pattern matching with guards:
 

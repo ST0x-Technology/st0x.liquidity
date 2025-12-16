@@ -28,7 +28,7 @@ pub(crate) enum InventoryViewError {
 
 /// Imbalance requiring rebalancing action.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Imbalance<T> {
+pub(crate) enum Imbalance<T> {
     /// Too much onchain - triggers movement to offchain.
     TooMuchOnchain { excess: T },
     /// Too much offchain - triggers movement to onchain.
@@ -37,11 +37,11 @@ enum Imbalance<T> {
 
 /// Threshold configuration for imbalance detection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-struct ImbalanceThreshold {
+pub(crate) struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
-    target: Decimal,
+    pub(crate) target: Decimal,
     /// Deviation from target that triggers rebalancing.
-    deviation: Decimal,
+    pub(crate) deviation: Decimal,
 }
 
 /// Inventory at a pair of venues (onchain/offchain).
@@ -108,6 +108,16 @@ where
             Some(Imbalance::TooMuchOnchain { excess })
         } else {
             None
+        }
+    }
+}
+
+impl<T: HasZero> Default for Inventory<T> {
+    fn default() -> Self {
+        Self {
+            onchain: VenueBalance::default(),
+            offchain: VenueBalance::default(),
+            last_rebalancing: None,
         }
     }
 }
@@ -194,37 +204,22 @@ where
 
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct InventoryView {
+pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
     last_updated: DateTime<Utc>,
 }
 
 impl InventoryView {
-    /// Returns the USDC inventory.
-    pub(crate) fn usdc(&self) -> &Inventory<Usdc> {
-        &self.usdc
-    }
-
-    /// Returns the equity inventory for a specific symbol, if tracked.
-    pub(crate) fn get_equity(&self, symbol: &Symbol) -> Option<&Inventory<FractionalShares>> {
-        self.equities.get(symbol)
-    }
-
-    /// Checks all tracked equities for imbalances against their thresholds.
-    /// Returns a list of (symbol, imbalance) pairs for symbols that are imbalanced.
-    pub(crate) fn check_equity_imbalances(
+    /// Checks a single equity for imbalance against the threshold.
+    /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
+    pub(crate) fn check_equity_imbalance(
         &self,
-        thresholds: &HashMap<Symbol, ImbalanceThreshold>,
-    ) -> Vec<(Symbol, Imbalance<FractionalShares>)> {
-        self.equities
-            .iter()
-            .filter_map(|(symbol, inventory)| {
-                let threshold = thresholds.get(symbol)?;
-                let imbalance = inventory.detect_imbalance(threshold)?;
-                Some((symbol.clone(), imbalance))
-            })
-            .collect()
+        symbol: &Symbol,
+        threshold: &ImbalanceThreshold,
+    ) -> Option<Imbalance<FractionalShares>> {
+        let inventory = self.equities.get(symbol)?;
+        inventory.detect_imbalance(threshold)
     }
 
     /// Checks USDC inventory for imbalance against the threshold.
@@ -237,7 +232,24 @@ impl InventoryView {
     }
 }
 
+impl Default for InventoryView {
+    fn default() -> Self {
+        Self {
+            usdc: Inventory::default(),
+            equities: HashMap::new(),
+            last_updated: Utc::now(),
+        }
+    }
+}
+
 impl InventoryView {
+    /// Registers a symbol with zeroed inventory.
+    #[cfg(test)]
+    pub(crate) fn with_equity(mut self, symbol: Symbol) -> Self {
+        self.equities.insert(symbol, Inventory::default());
+        self
+    }
+
     fn update_equity(
         self,
         symbol: &Symbol,
@@ -286,8 +298,9 @@ impl InventoryView {
         self,
         symbol: &Symbol,
         event: &PositionEvent,
-        now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
+        let timestamp = event.timestamp();
+
         match event {
             PositionEvent::OnChainOrderFilled {
                 amount, direction, ..
@@ -299,7 +312,7 @@ impl InventoryView {
                         Direction::Buy => inv.add_onchain_available(amount),
                         Direction::Sell => inv.remove_onchain_available(amount),
                     },
-                    now,
+                    timestamp,
                 )
             }
 
@@ -315,7 +328,7 @@ impl InventoryView {
                         Direction::Buy => inv.add_offchain_available(shares),
                         Direction::Sell => inv.remove_offchain_available(shares),
                     },
-                    now,
+                    timestamp,
                 )
             }
 
@@ -324,7 +337,7 @@ impl InventoryView {
             | PositionEvent::OffChainOrderPlaced { .. }
             | PositionEvent::OffChainOrderFailed { .. }
             | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
-                last_updated: now,
+                last_updated: timestamp,
                 ..self
             }),
         }
@@ -337,7 +350,6 @@ impl InventoryView {
     /// - `MintAccepted`: Move quantity from `offchain.available` to `offchain.inflight`.
     /// - `MintAcceptanceFailed`: Cancel inflight back to available (safe to restore).
     /// - `TokensReceived`: Remove from `offchain.inflight`, add to `onchain.available`.
-    /// - `TokenReceiptFailed`: Keep inflight (funds location unknown).
     /// - `MintCompleted`: Update `last_rebalancing` timestamp.
     ///
     /// The `quantity` parameter is the mint quantity in `FractionalShares`, needed for
@@ -352,8 +364,7 @@ impl InventoryView {
         match event {
             // No balance changes for these events.
             TokenizedEquityMintEvent::MintRequested { .. }
-            | TokenizedEquityMintEvent::MintRejected { .. }
-            | TokenizedEquityMintEvent::TokenReceiptFailed { .. } => Ok(Self {
+            | TokenizedEquityMintEvent::MintRejected { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
@@ -382,7 +393,6 @@ impl InventoryView {
     /// Applies a redemption event to update equity inventory.
     ///
     /// - `TokensSent`: Move quantity from `onchain.available` to `onchain.inflight`.
-    /// - `TokenSendFailed`: Keep inflight until manually resolved.
     /// - `Detected`: No balance change.
     /// - `DetectionFailed`: Keep inflight until manually resolved.
     /// - `Completed`: Remove from `onchain.inflight`, add to `offchain.available`.
@@ -400,14 +410,6 @@ impl InventoryView {
         match event {
             EquityRedemptionEvent::TokensSent { .. } => {
                 self.update_equity(symbol, |inv| inv.move_onchain_to_inflight(quantity), now)
-            }
-
-            EquityRedemptionEvent::TokenSendFailed { .. } => {
-                // Keep inflight until manually verified and resolved.
-                Ok(Self {
-                    last_updated: now,
-                    ..self
-                })
             }
 
             EquityRedemptionEvent::Detected { .. } => Ok(Self {
@@ -726,9 +728,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
@@ -741,9 +741,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_onchain_fill(shares(10), Direction::Sell);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(90));
@@ -756,9 +754,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_offchain_fill(shares(10), Direction::Buy);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
@@ -771,9 +767,7 @@ mod tests {
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
         let event = make_offchain_fill(shares(10), Direction::Sell);
 
-        let updated = view
-            .apply_position_event(&symbol, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
@@ -790,9 +784,7 @@ mod tests {
         ]);
 
         let event = make_onchain_fill(shares(10), Direction::Buy);
-        let updated = view
-            .apply_position_event(&aapl, &event, Utc::now())
-            .unwrap();
+        let updated = view.apply_position_event(&aapl, &event).unwrap();
 
         let aapl_inv = updated.equities.get(&aapl).unwrap();
         assert_eq!(aapl_inv.onchain.total().unwrap().0, Decimal::from(110));
@@ -807,7 +799,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let result = view.apply_position_event(&symbol, &event, Utc::now());
+        let result = view.apply_position_event(&symbol, &event);
 
         assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
     }
@@ -824,18 +816,17 @@ mod tests {
             last_updated: original_time,
         };
 
-        let new_time = original_time + chrono::Duration::hours(1);
+        let event_time = original_time + chrono::Duration::hours(1);
         let event = PositionEvent::Initialized {
             symbol: symbol.clone(),
             threshold: ExecutionThreshold::whole_share(),
-            initialized_at: new_time,
+            initialized_at: event_time,
         };
 
-        let updated = view
-            .apply_position_event(&symbol, &event, new_time)
-            .unwrap();
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
-        assert_eq!(updated.last_updated, new_time);
+        // Timestamp should come from the event, not Utc::now()
+        assert_eq!(updated.last_updated, event_time);
 
         let inv = updated.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
@@ -884,13 +875,6 @@ mod tests {
     fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
             reason: "Transaction reverted".to_string(),
-            failed_at: Utc::now(),
-        }
-    }
-
-    fn make_token_receipt_failed() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::TokenReceiptFailed {
-            reason: "Token verification failed".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -987,22 +971,6 @@ mod tests {
         assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
         assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
         assert!(!inv.has_inflight());
-    }
-
-    #[test]
-    fn apply_token_receipt_failed_keeps_inflight() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 70, 30))]);
-        let event = make_token_receipt_failed();
-
-        let updated = view
-            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
-            .unwrap();
-
-        let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
-        assert!(inv.has_inflight());
     }
 
     #[test]
@@ -1123,13 +1091,6 @@ mod tests {
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
         assert!(!inv.has_inflight());
-
-        let view = make_view(vec![(symbol.clone(), inventory(100, 0, 70, 30))]);
-        let view = view
-            .apply_mint_event(&symbol, &make_token_receipt_failed(), quantity, Utc::now())
-            .unwrap();
-        let inv = view.equities.get(&symbol).unwrap();
-        assert!(inv.has_inflight());
     }
 
     #[test]
@@ -1181,13 +1142,6 @@ mod tests {
     fn make_redemption_completed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::Completed {
             completed_at: Utc::now(),
-        }
-    }
-
-    fn make_token_send_failed() -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokenSendFailed {
-            reason: "Transaction reverted".to_string(),
-            failed_at: Utc::now(),
         }
     }
 
@@ -1254,22 +1208,6 @@ mod tests {
         assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
         assert!(!inv.has_inflight());
         assert!(inv.last_rebalancing.is_some());
-    }
-
-    #[test]
-    fn apply_token_send_failed_keeps_funds_inflight() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(symbol.clone(), inventory(70, 30, 100, 0))]);
-        let event = make_token_send_failed();
-
-        let updated = view
-            .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
-            .unwrap();
-
-        let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
-        assert!(inv.has_inflight());
     }
 
     #[test]
@@ -1679,127 +1617,53 @@ mod tests {
     }
 
     #[test]
-    fn usdc_accessor_returns_usdc_inventory() {
-        let view = make_usdc_view(1000, 50, 800, 0);
+    fn check_equity_imbalance_returns_none_when_balanced() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(aapl.clone(), inventory(50, 0, 50, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let usdc_inv = view.usdc();
-
-        assert_eq!(usdc_inv.onchain.total().unwrap().0, Decimal::from(1050));
-        assert_eq!(usdc_inv.offchain.total().unwrap().0, Decimal::from(800));
+        assert!(view.check_equity_imbalance(&aapl, &thresh).is_none());
     }
 
     #[test]
-    fn get_equity_returns_none_for_unknown_symbol() {
-        let view = make_view(vec![]);
-        let symbol = Symbol::new("AAPL").unwrap();
+    fn check_equity_imbalance_detects_too_much_onchain() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(aapl.clone(), inventory(80, 0, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        assert!(view.get_equity(&symbol).is_none());
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh);
+
+        assert!(matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })));
     }
 
     #[test]
-    fn get_equity_returns_inventory_for_tracked_symbol() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(symbol.clone(), inventory(100, 10, 90, 0))]);
+    fn check_equity_imbalance_detects_too_much_offchain() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(aapl.clone(), inventory(20, 0, 80, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let inv = view.get_equity(&symbol).unwrap();
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh);
 
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(90));
+        assert!(matches!(imbalance, Some(Imbalance::TooMuchOffchain { .. })));
     }
 
     #[test]
-    fn check_equity_imbalances_returns_empty_when_all_balanced() {
+    fn check_equity_imbalance_returns_none_for_unknown_symbol() {
         let aapl = Symbol::new("AAPL").unwrap();
         let msft = Symbol::new("MSFT").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(50, 0, 50, 0)),
-            (msft.clone(), inventory(50, 0, 50, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
-            (aapl, threshold("0.5", "0.2")),
-            (msft, threshold("0.5", "0.2")),
-        ]
-        .into_iter()
-        .collect();
+        let view = make_view(vec![(aapl, inventory(80, 0, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalances = view.check_equity_imbalances(&thresholds);
-
-        assert!(imbalances.is_empty());
+        assert!(view.check_equity_imbalance(&msft, &thresh).is_none());
     }
 
     #[test]
-    fn check_equity_imbalances_identifies_multiple_imbalanced_symbols() {
+    fn check_equity_imbalance_returns_none_when_inflight() {
         let aapl = Symbol::new("AAPL").unwrap();
-        let msft = Symbol::new("MSFT").unwrap();
-        let googl = Symbol::new("GOOGL").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(80, 0, 20, 0)),
-            (msft.clone(), inventory(50, 0, 50, 0)),
-            (googl.clone(), inventory(20, 0, 80, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
-            (aapl.clone(), threshold("0.5", "0.2")),
-            (msft, threshold("0.5", "0.2")),
-            (googl.clone(), threshold("0.5", "0.2")),
-        ]
-        .into_iter()
-        .collect();
+        let view = make_view(vec![(aapl.clone(), inventory(60, 20, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalances = view.check_equity_imbalances(&thresholds);
-
-        assert_eq!(imbalances.len(), 2);
-
-        let aapl_imbalance = imbalances.iter().find(|(s, _)| s == &aapl);
-        assert!(matches!(
-            aapl_imbalance,
-            Some((_, Imbalance::TooMuchOnchain { .. }))
-        ));
-
-        let googl_imbalance = imbalances.iter().find(|(s, _)| s == &googl);
-        assert!(matches!(
-            googl_imbalance,
-            Some((_, Imbalance::TooMuchOffchain { .. }))
-        ));
-    }
-
-    #[test]
-    fn check_equity_imbalances_skips_symbols_without_thresholds() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        let msft = Symbol::new("MSFT").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(80, 0, 20, 0)),
-            (msft, inventory(80, 0, 20, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> =
-            vec![(aapl.clone(), threshold("0.5", "0.2"))]
-                .into_iter()
-                .collect();
-
-        let imbalances = view.check_equity_imbalances(&thresholds);
-
-        assert_eq!(imbalances.len(), 1);
-        assert_eq!(imbalances[0].0, aapl);
-    }
-
-    #[test]
-    fn check_equity_imbalances_skips_symbols_with_inflight() {
-        let aapl = Symbol::new("AAPL").unwrap();
-        let msft = Symbol::new("MSFT").unwrap();
-        let view = make_view(vec![
-            (aapl.clone(), inventory(80, 0, 20, 0)),
-            (msft.clone(), inventory(60, 20, 20, 0)),
-        ]);
-        let thresholds: HashMap<Symbol, ImbalanceThreshold> = vec![
-            (aapl.clone(), threshold("0.5", "0.2")),
-            (msft, threshold("0.5", "0.2")),
-        ]
-        .into_iter()
-        .collect();
-
-        let imbalances = view.check_equity_imbalances(&thresholds);
-
-        assert_eq!(imbalances.len(), 1);
-        assert_eq!(imbalances[0].0, aapl);
+        assert!(view.check_equity_imbalance(&aapl, &thresh).is_none());
     }
 
     #[test]

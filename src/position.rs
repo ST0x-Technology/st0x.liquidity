@@ -503,6 +503,22 @@ pub(crate) enum PositionEvent {
     },
 }
 
+impl PositionEvent {
+    pub(crate) fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Self::Migrated { migrated_at, .. } => *migrated_at,
+            Self::Initialized { initialized_at, .. } => *initialized_at,
+            Self::OnChainOrderFilled { seen_at, .. } => *seen_at,
+            Self::OffChainOrderPlaced { placed_at, .. } => *placed_at,
+            Self::OffChainOrderFilled {
+                broker_timestamp, ..
+            } => *broker_timestamp,
+            Self::OffChainOrderFailed { failed_at, .. } => *failed_at,
+            Self::ThresholdUpdated { updated_at, .. } => *updated_at,
+        }
+    }
+}
+
 impl DomainEvent for PositionEvent {
     fn event_type(&self) -> String {
         match self {
@@ -1342,9 +1358,112 @@ mod tests {
         assert!(matches!(view, Lifecycle::Failed { .. }));
     }
 
+    #[test]
+    fn timestamp_returns_migrated_at_for_migrated_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::Migrated {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net_position: FractionalShares::ZERO,
+            accumulated_long: FractionalShares::ZERO,
+            accumulated_short: FractionalShares::ZERO,
+            threshold: ExecutionThreshold::whole_share(),
+            migrated_at: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
+    #[test]
+    fn timestamp_returns_initialized_at_for_initialized_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::Initialized {
+            symbol: Symbol::new("AAPL").unwrap(),
+            threshold: ExecutionThreshold::whole_share(),
+            initialized_at: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
+    #[test]
+    fn timestamp_returns_seen_at_for_onchain_order_filled_event() {
+        let block_timestamp = Utc::now();
+        let seen_at = block_timestamp + chrono::Duration::seconds(5);
+        let event = PositionEvent::OnChainOrderFilled {
+            trade_id: TradeId {
+                tx_hash: TxHash::random(),
+                log_index: 0,
+            },
+            amount: FractionalShares::ONE,
+            direction: Direction::Buy,
+            price_usdc: dec!(150.0),
+            block_timestamp,
+            seen_at,
+        };
+
+        assert_eq!(event.timestamp(), seen_at);
+    }
+
+    #[test]
+    fn timestamp_returns_placed_at_for_offchain_order_placed_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::OffChainOrderPlaced {
+            execution_id: ExecutionId(1),
+            shares: FractionalShares::ONE,
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            trigger_reason: TriggerReason::SharesThreshold {
+                net_position_shares: dec!(1.0),
+                threshold_shares: dec!(1.0),
+            },
+            placed_at: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
+    #[test]
+    fn timestamp_returns_broker_timestamp_for_offchain_order_filled_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::OffChainOrderFilled {
+            execution_id: ExecutionId(1),
+            shares_filled: FractionalShares::ONE,
+            direction: Direction::Sell,
+            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            price_cents: PriceCents(15000),
+            broker_timestamp: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
+    #[test]
+    fn timestamp_returns_failed_at_for_offchain_order_failed_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::OffChainOrderFailed {
+            execution_id: ExecutionId(1),
+            error: "Market closed".to_string(),
+            failed_at: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
+    #[test]
+    fn timestamp_returns_updated_at_for_threshold_updated_event() {
+        let timestamp = Utc::now();
+        let event = PositionEvent::ThresholdUpdated {
+            old_threshold: ExecutionThreshold::whole_share(),
+            new_threshold: ExecutionThreshold::shares(FractionalShares(dec!(5.0))).unwrap(),
+            updated_at: timestamp,
+        };
+
+        assert_eq!(event.timestamp(), timestamp);
+    }
+
     #[tokio::test]
     async fn test_migrate_command_creates_migrated_event() {
-        let position = Lifecycle::<Position, ArithmeticError>::default();
+        let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let net_position = FractionalShares(dec!(5.5));
         let accumulated_long = FractionalShares(dec!(10.0));
@@ -1383,7 +1502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_with_zero_position() {
-        let position = Lifecycle::<Position, ArithmeticError>::default();
+        let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         let symbol = Symbol::new("MSFT").unwrap();
 
         let command = PositionCommand::Migrate {
@@ -1414,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_preserves_negative_position() {
-        let position = Lifecycle::<Position, ArithmeticError>::default();
+        let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         let symbol = Symbol::new("GOOGL").unwrap();
         let net_position = FractionalShares(dec!(-10.5));
 
@@ -1443,7 +1562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_migrate_when_already_initialized() {
-        let mut position = Lifecycle::<Position, ArithmeticError>::default();
+        let mut position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         let symbol = Symbol::new("NVDA").unwrap();
 
         let initialized_event = PositionEvent::Initialized {

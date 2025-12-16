@@ -78,11 +78,13 @@ const ETHEREUM_DOMAIN: u32 = 0;
 /// CCTP domain identifier for Base
 const BASE_DOMAIN: u32 = 6;
 
-const USDC_ETHEREUM: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-const USDC_BASE: Address = address!("833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
-const TOKEN_MESSENGER_V2: Address = address!("28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
-const MESSAGE_TRANSMITTER_V2: Address = address!("81D40F21F12A8F0E3252Bccb954D722d4c464B64");
+pub(crate) const TOKEN_MESSENGER_V2: Address =
+    address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
+pub(crate) const MESSAGE_TRANSMITTER_V2: Address =
+    address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 
 const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
 
@@ -154,7 +156,8 @@ where
 ///
 /// # Type Parameters
 ///
-/// * `P` - Provider type implementing [`Provider`] + [`Clone`]
+/// * `EP` - Ethereum provider type implementing [`Provider`] + [`Clone`]
+/// * `BP` - Base provider type implementing [`Provider`] + [`Clone`]
 /// * `S` - Signer type implementing [`Signer`] + [`Clone`] + [`Sync`]
 ///
 /// # Example
@@ -167,13 +170,14 @@ where
 /// let amount = U256::from(1_000_000); // 1 USDC
 /// let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
 /// ```
-pub(crate) struct CctpBridge<P, S>
+pub(crate) struct CctpBridge<EP, BP, S>
 where
-    P: Provider + Clone,
+    EP: Provider + Clone,
+    BP: Provider + Clone,
     S: Signer + Clone + Sync,
 {
-    ethereum: Evm<P, S>,
-    base: Evm<P, S>,
+    ethereum: Evm<EP, S>,
+    base: Evm<BP, S>,
     http_client: reqwest::Client,
     circle_api_base: String,
 }
@@ -219,12 +223,13 @@ struct FeeResponse {
     min_fee: String,
 }
 
-impl<P, S> CctpBridge<P, S>
+impl<EP, BP, S> CctpBridge<EP, BP, S>
 where
-    P: Provider + Clone,
+    EP: Provider + Clone,
+    BP: Provider + Clone,
     S: Signer + Clone + Sync,
 {
-    pub(crate) fn new(ethereum: Evm<P, S>, base: Evm<P, S>) -> Self {
+    pub(crate) fn new(ethereum: Evm<EP, S>, base: Evm<BP, S>) -> Self {
         Self {
             ethereum,
             base,
@@ -496,8 +501,10 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, PrivateKeySigner>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner>,
+        Box<dyn std::error::Error>,
+    > {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
         let wallet = EthereumWallet::from(signer.clone());
 
@@ -876,8 +883,10 @@ mod tests {
         base_endpoint: &str,
         private_key: &B256,
         base_usdc_address: Address,
-    ) -> Result<CctpBridge<impl Provider + Clone, PrivateKeySigner>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<
+        CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner>,
+        Box<dyn std::error::Error>,
+    > {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
         let wallet = EthereumWallet::from(signer.clone());
 
@@ -1431,8 +1440,10 @@ mod tests {
 
         async fn create_bridge(
             &self,
-        ) -> Result<CctpBridge<impl Provider + Clone, PrivateKeySigner>, Box<dyn std::error::Error>>
-        {
+        ) -> Result<
+            CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner>,
+            Box<dyn std::error::Error>,
+        > {
             let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
             let wallet = EthereumWallet::from(signer.clone());
 

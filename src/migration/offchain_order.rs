@@ -7,8 +7,8 @@ use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
 use crate::lifecycle::{Lifecycle, Never};
+use crate::offchain_order::{BrokerOrderId, PriceCents};
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
-use crate::position::{BrokerOrderId, PriceCents};
 use crate::shares::FractionalShares;
 
 #[derive(sqlx::FromRow)]

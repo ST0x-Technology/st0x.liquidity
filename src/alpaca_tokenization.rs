@@ -23,7 +23,6 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
@@ -42,20 +41,40 @@ use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 /// High-level service for Alpaca tokenization operations.
 ///
 /// Wraps `AlpacaTokenizationClient` with default polling configuration.
-pub(crate) struct AlpacaTokenizationService<P, S>
+pub(crate) struct AlpacaTokenizationService<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    client: AlpacaTokenizationClient<P, S>,
+    client: AlpacaTokenizationClient<P>,
     polling_config: PollingConfig,
 }
 
-impl<P, S> AlpacaTokenizationService<P, S>
+impl<P> AlpacaTokenizationService<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
+    /// Create a new tokenization service.
+    pub(crate) fn new(
+        base_url: String,
+        api_key: String,
+        api_secret: String,
+        provider: P,
+        redemption_wallet: Address,
+    ) -> Self {
+        let client = AlpacaTokenizationClient::new(
+            base_url,
+            api_key,
+            api_secret,
+            provider,
+            redemption_wallet,
+        );
+
+        Self {
+            client,
+            polling_config: PollingConfig::default(),
+        }
+    }
+
     /// Request a mint operation to convert offchain shares to onchain tokens.
     pub(crate) async fn request_mint(
         &self,
@@ -71,14 +90,6 @@ where
             wallet,
         };
         self.client.request_mint(request).await
-    }
-
-    /// Get the current status of a tokenization request.
-    async fn get_request_status(
-        &self,
-        id: &TokenizationRequestId,
-    ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        self.client.get_request(id).await
     }
 
     /// Poll a mint request until it reaches a terminal state.
@@ -126,10 +137,7 @@ where
     }
 
     #[cfg(test)]
-    fn new_with_client(
-        client: AlpacaTokenizationClient<P, S>,
-        polling_config: PollingConfig,
-    ) -> Self {
+    fn new_with_client(client: AlpacaTokenizationClient<P>, polling_config: PollingConfig) -> Self {
         Self {
             client,
             polling_config,
@@ -250,32 +258,27 @@ pub(crate) enum AlpacaTokenizationError {
 }
 
 /// Client for Alpaca's tokenization API and redemption transfers.
-struct AlpacaTokenizationClient<P, S>
+struct AlpacaTokenizationClient<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
     http_client: Client,
     base_url: String,
     api_key: String,
     api_secret: String,
     provider: P,
-    signer: S,
     redemption_wallet: Address,
 }
 
-impl<P, S> AlpacaTokenizationClient<P, S>
+impl<P> AlpacaTokenizationClient<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    #[cfg(test)]
-    fn new_with_base_url(
+    fn new(
         base_url: String,
         api_key: String,
         api_secret: String,
         provider: P,
-        signer: S,
         redemption_wallet: Address,
     ) -> Self {
         Self {
@@ -284,7 +287,24 @@ where
             api_key,
             api_secret,
             provider,
-            signer,
+            redemption_wallet,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_base_url(
+        base_url: String,
+        api_key: String,
+        api_secret: String,
+        provider: P,
+        redemption_wallet: Address,
+    ) -> Self {
+        Self {
+            http_client: Client::new(),
+            base_url,
+            api_key,
+            api_secret,
+            provider,
             redemption_wallet,
         }
     }
@@ -569,9 +589,9 @@ pub(crate) mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationClient<impl Provider + Clone + use<>, PrivateKeySigner> {
+    ) -> AlpacaTokenizationClient<impl Provider + Clone + use<>> {
         let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
-        let wallet = EthereumWallet::from(signer.clone());
+        let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
             .wallet(wallet)
@@ -584,17 +604,13 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             provider,
-            signer,
             redemption_wallet,
         )
     }
 
-    fn create_test_service<P, S>(
-        client: AlpacaTokenizationClient<P, S>,
-    ) -> AlpacaTokenizationService<P, S>
+    fn create_test_service<P>(client: AlpacaTokenizationClient<P>) -> AlpacaTokenizationService<P>
     where
         P: Provider + Clone,
-        S: Signer + Clone + Sync,
     {
         let config = PollingConfig {
             interval: Duration::from_millis(10),
@@ -611,7 +627,7 @@ pub(crate) mod tests {
         anvil_endpoint: &str,
         private_key: &B256,
         redemption_wallet: Address,
-    ) -> AlpacaTokenizationService<impl Provider + Clone + use<>, PrivateKeySigner> {
+    ) -> AlpacaTokenizationService<impl Provider + Clone + use<>> {
         let client =
             create_test_client(server, anvil_endpoint, private_key, redemption_wallet).await;
         create_test_service(client)
@@ -934,7 +950,6 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             provider.clone(),
-            signer,
             TEST_REDEMPTION_WALLET,
         );
 
@@ -964,7 +979,7 @@ pub(crate) mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, key) = setup_anvil();
         let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer.clone());
+        let wallet = EthereumWallet::from(signer);
 
         let provider = ProviderBuilder::new()
             .wallet(wallet)
@@ -980,7 +995,6 @@ pub(crate) mod tests {
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             provider,
-            signer,
             TEST_REDEMPTION_WALLET,
         );
 
