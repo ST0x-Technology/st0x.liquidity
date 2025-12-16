@@ -4,6 +4,7 @@ use ts_rs::TS;
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SymbolInventory {
     pub(super) symbol: String,
     #[ts(type = "string")]
@@ -16,6 +17,7 @@ pub(crate) struct SymbolInventory {
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct UsdcInventory {
     #[ts(type = "string")]
     pub(super) onchain: Decimal,

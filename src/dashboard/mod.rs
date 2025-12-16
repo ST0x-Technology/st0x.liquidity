@@ -81,6 +81,9 @@ fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
         Box::pin(async move {
             use rocket_ws::Message;
 
+            // Stub initial state for dashboard skeleton. Real data will be populated as
+            // each panel is implemented: #178 (metrics), #179 (inventory), #180 (spreads),
+            // #181 (trades), #182 (rebalances), #183 (circuit breaker), #184 (auth).
             let initial = ServerMessage::Initial(Box::new(InitialState::stub()));
             let json = match serde_json::to_string(&initial) {
                 Ok(j) => j,

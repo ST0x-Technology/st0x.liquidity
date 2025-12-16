@@ -62,8 +62,13 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     }
 
     socket.onmessage = (event) => {
-      const msg = JSON.parse(event.data as string) as ServerMessage
-      handleMessage(msg)
+      try {
+        const msg = JSON.parse(event.data as string) as ServerMessage
+        handleMessage(msg)
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data)
+      }
     }
 
     socket.onclose = () => {

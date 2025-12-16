@@ -4,6 +4,9 @@
   import * as Table from '$lib/components/ui/table'
   import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
 
+  // This query doesn't fetch - it's used as a reactive state store. The WebSocket
+  // connection populates it via queryClient.setQueryData(['events'], ...) in
+  // websocket.svelte.ts. staleTime: Infinity prevents refetching.
   const eventsQuery = createQuery<EventStoreEntry[]>(() => ({
     queryKey: ['events'],
     queryFn: () => Promise.resolve([]),

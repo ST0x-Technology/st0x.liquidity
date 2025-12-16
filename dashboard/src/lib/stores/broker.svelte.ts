@@ -1,29 +1,40 @@
 import { browser } from '$app/environment'
 import type { Broker } from '$lib/env'
-import { tryCatch, isOk } from '$lib/fp'
+import { tryCatch, isOk, isErr } from '$lib/fp'
 
 const STORAGE_KEY = 'selected-broker'
 const DEFAULT_BROKER: Broker = 'schwab'
 
+const VALID_BROKERS: readonly Broker[] = ['schwab', 'alpaca'] as const
+
+const isBroker = (value: unknown): value is Broker =>
+  typeof value === 'string' && (VALID_BROKERS as readonly string[]).includes(value)
+
 const loadBroker = (): Broker => {
   if (!browser) return DEFAULT_BROKER
 
-  const result = tryCatch(() => localStorage.getItem(STORAGE_KEY))
+  const result = tryCatch(() => {
+    const raw = localStorage.getItem(STORAGE_KEY)
+    if (raw === null) return null
+
+    return JSON.parse(raw) as unknown
+  })
+
   if (!isOk(result)) return DEFAULT_BROKER
 
-  const stored = result.value
-  if (stored === 'schwab' || stored === 'alpaca') {
-    return stored
-  }
-
-  return DEFAULT_BROKER
+  return isBroker(result.value) ? result.value : DEFAULT_BROKER
 }
 
 const saveBroker = (broker: Broker) => {
-  if (browser) {
-    tryCatch(() => {
-      localStorage.setItem(STORAGE_KEY, broker)
-    })
+  if (!browser) return
+
+  const result = tryCatch(() => {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(broker))
+  })
+
+  if (isErr(result)) {
+    // eslint-disable-next-line no-console
+    console.error(`Failed to save broker to localStorage (key: ${STORAGE_KEY}):`, result.error)
   }
 }
 
