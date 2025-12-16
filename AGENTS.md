@@ -806,41 +806,13 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
 #### Bad Comment Examples
 
 ```rust
-// ❌ Redundant - the function name says this
-// Spawn background token refresh task
+// ❌ Redundant - function name already says this
 spawn_automatic_token_refresh(pool, env);
 
-// ❌ Obvious from context
-// Store test tokens
-let tokens = SchwabTokens { /* ... */ };
-tokens.store(&pool).await.unwrap();
-
 // ❌ Just restating the code
-// Mock account hash endpoint
-let mock = server.mock(|when, then| {
-    when.method(GET).path("/trader/v1/accounts/accountNumbers");
-    // ...
-});
-
-// ❌ Test section markers that add no value
-// 1. Test token refresh integration
-let result = refresh_tokens(&pool).await;
-
-// ❌ Explaining what the code obviously does
-// Execute the order
-execute_schwab_order(env, pool, trade).await;
-
-// ❌ Obvious variable assignments
-// Create a trade
-let trade = Trade { /* ... */ };
-
-// ❌ Test setup that's clear from code structure
-// Verify mocks were called
-mock.assert();
-
-// ❌ Obvious control flow
-// Save trade to DB
-trade.try_save_to_db(&pool).await?;
+let tokens = SchwabTokens { /* ... */ };  // "Store test tokens"
+execute_schwab_order(env, pool, trade).await;  // "Execute the order"
+mock.assert();  // "Verify mocks were called"
 ```
 
 #### Function Documentation
@@ -1042,97 +1014,15 @@ Prefer flat code over deeply nested blocks to improve readability and
 maintainability. This includes test modules - do NOT nest submodules inside
 `mod tests`. Put all tests directly in the `tests` module.
 
-##### Use early returns:
+##### Techniques for flat code:
 
-Instead of
-
-```rust
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    if let Some(data) = data {
-        if !data.is_empty() {
-            if data.len() > 5 {
-                Ok(data.to_uppercase())
-            } else {
-                Err(Error::TooShort)
-            }
-        } else {
-            Err(Error::Empty)
-        }
-    } else {
-        Err(Error::None)
-    }
-}
-```
-
-Write
-
-```rust
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    let data = data.ok_or(Error::None)?;
-    
-    if data.is_empty() {
-        return Err(Error::Empty);
-    }
-    
-    if data.len() <= 5 {
-        return Err(Error::TooShort);
-    }
-    
-    Ok(data.to_uppercase())
-}
-```
-
-##### Use let-else pattern for guard clauses:
-
-```rust
-// Use let-else to flatten nested if-let chains
-let Some(trade_data) = convert_event_to_trade(event) else {
-    return Err(Error::ConversionFailed);
-};
-let Some(symbol) = trade_data.extract_symbol() else {
-    return Err(Error::NoSymbol);
-};
-```
-
-##### Extract functions for complex logic:
-
-Break deeply nested event processing into helper functions with clear names.
-
-##### Use pattern matching with guards:
-
-```rust
-// Instead of nested if-let
-if let Some(data) = input {
-    if state == State::Ready && data.is_valid() {
-        process(data)
-    } else { Err(Error::Invalid) }
-} else { Err(Error::NoData) }
-
-// Write
-match (input, state) {
-    (Some(data), State::Ready) if data.is_valid() => process(data),
-    (Some(_), State::Ready) => Err(Error::InvalidData),
-    _ => Err(Error::NoData),
-}
-```
-
-##### Prefer iterator chains over nested loops:
-
-```rust
-// Instead of imperative loops
-let mut results = Vec::new();
-for trade in &trades {
-    if trade.is_valid() {
-        results.push(process_trade(trade)?);
-    }
-}
-
-// Write functional chains
-trades.iter()
-    .filter(|t| t.is_valid())
-    .map(process_trade)
-    .collect::<Result<Vec<_>, _>>()
-```
+- **Early returns**: Use `?` operator and guard clauses instead of nested if-let
+- **let-else pattern**: `let Some(x) = y else { return Err(...); };`
+- **Extract functions**: Break nested logic into helper functions
+- **Pattern matching with guards**: Use `match` with guards instead of nested
+  if-let
+- **Iterator chains**: Use `.filter().map().collect()` instead of imperative
+  loops
 
 #### Struct field access
 
