@@ -1,16 +1,8 @@
-use clap::{Parser, Subcommand};
+use alloy::primitives::{Address, B256};
+use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
 use std::io::Write;
-use thiserror::Error;
-use tracing::{error, info};
-
-use crate::env::{BrokerConfig, Config, Env};
-use crate::error::OnChainError;
-use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::{OnchainTrade, accumulator};
-use crate::symbol::cache::SymbolCache;
-use alloy::primitives::B256;
-use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use st0x_execution::schwab::{
     SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
 };
@@ -18,6 +10,25 @@ use st0x_execution::{
     Direction, Executor, MarketOrder, MockExecutorConfig, OrderPlacement, OrderState, Shares,
     Symbol, TryIntoExecutor,
 };
+use thiserror::Error;
+use tracing::{error, info};
+
+use crate::env::{BrokerConfig, Config, Env};
+use crate::error::OnChainError;
+use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::{OnchainTrade, accumulator};
+use crate::shares::FractionalShares;
+use crate::symbol::cache::SymbolCache;
+use crate::threshold::Usdc;
+
+/// Direction for transferring assets between trading venues.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TransferDirection {
+    /// Transfer to Raindex (onchain venue)
+    ToRaindex,
+    /// Transfer to Alpaca (offchain venue)
+    ToAlpaca,
+}
 
 #[derive(Debug, Error)]
 pub enum CliError {
@@ -66,6 +77,38 @@ pub enum Commands {
     },
     /// Perform Charles Schwab OAuth authentication flow
     Auth,
+
+    /// Transfer tokenized equity between trading venues (Raindex ↔ Alpaca)
+    ///
+    /// Requires Alpaca broker and rebalancing environment variables.
+    /// Uses existing MintManager (to-raindex) or RedemptionManager (to-alpaca).
+    TransferEquity {
+        /// Direction of transfer
+        #[arg(short = 'd', long = "direction")]
+        direction: TransferDirection,
+        /// Stock ticker symbol (e.g., AAPL, TSLA)
+        #[arg(short = 't', long = "ticker")]
+        ticker: Symbol,
+        /// Number of shares to transfer (supports fractional shares)
+        #[arg(short = 'q', long = "quantity")]
+        quantity: FractionalShares,
+        /// Token contract address (required for to-alpaca direction)
+        #[arg(long = "token-address")]
+        token_address: Option<Address>,
+    },
+
+    /// Transfer USDC between trading venues (Raindex ↔ Alpaca)
+    ///
+    /// Requires Alpaca broker and rebalancing environment variables.
+    /// Uses existing UsdcRebalanceManager.
+    TransferUsdc {
+        /// Direction of transfer
+        #[arg(short = 'd', long = "direction")]
+        direction: TransferDirection,
+        /// Amount of USDC to transfer
+        #[arg(short = 'a', long = "amount")]
+        amount: Usdc,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -196,10 +239,69 @@ async fn run_command_with_writers<W: Write>(
                 }
             }
         }
+
+        Commands::TransferEquity {
+            direction,
+            ticker,
+            quantity,
+            token_address,
+        } => {
+            transfer_equity_command(stdout, direction, &ticker, quantity, token_address)?;
+        }
+
+        Commands::TransferUsdc { direction, amount } => {
+            transfer_usdc_command(stdout, direction, amount)?;
+        }
     }
 
     info!("CLI operation completed successfully");
     Ok(())
+}
+
+fn transfer_equity_command<W: Write>(
+    stdout: &mut W,
+    direction: TransferDirection,
+    ticker: &Symbol,
+    quantity: FractionalShares,
+    token_address: Option<Address>,
+) -> anyhow::Result<()> {
+    let direction_str = match direction {
+        TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
+        TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
+    };
+
+    writeln!(stdout, "🔄 Transferring equity: {direction_str}")?;
+    writeln!(stdout, "   Ticker: {ticker}")?;
+    writeln!(stdout, "   Quantity: {quantity}")?;
+
+    if let Some(addr) = token_address {
+        writeln!(stdout, "   Token Address: {addr}")?;
+    }
+
+    // TODO: Validate token_address is provided for to-alpaca direction
+    // TODO: Construct managers using spawn.rs patterns and call existing methods
+
+    writeln!(stdout, "❌ TransferEquity command not yet implemented")?;
+    anyhow::bail!("TransferEquity command not yet implemented")
+}
+
+fn transfer_usdc_command<W: Write>(
+    stdout: &mut W,
+    direction: TransferDirection,
+    amount: Usdc,
+) -> anyhow::Result<()> {
+    let direction_str = match direction {
+        TransferDirection::ToRaindex => "Alpaca → Raindex",
+        TransferDirection::ToAlpaca => "Raindex → Alpaca",
+    };
+
+    writeln!(stdout, "🔄 Transferring USDC: {direction_str}")?;
+    writeln!(stdout, "   Amount: {amount} USDC")?;
+
+    // TODO: Construct UsdcRebalanceManager using spawn.rs patterns and call existing methods
+
+    writeln!(stdout, "❌ TransferUsdc command not yet implemented")?;
+    anyhow::bail!("TransferUsdc command not yet implemented")
 }
 
 async fn ensure_schwab_authentication<W: Write>(
@@ -1925,6 +2027,132 @@ mod tests {
         assert!(help_output.contains("auth"));
         assert!(help_output.contains("OAuth"));
         assert!(help_output.contains("authentication"));
+    }
+
+    #[test]
+    fn test_transfer_commands_in_help_text() {
+        let mut cmd = Cli::command();
+        let help_output = cmd.render_help().to_string();
+
+        assert!(
+            help_output.contains("transfer-equity"),
+            "Help should contain transfer-equity command"
+        );
+        assert!(
+            help_output.contains("transfer-usdc"),
+            "Help should contain transfer-usdc command"
+        );
+    }
+
+    #[test]
+    fn test_transfer_equity_command_structure() {
+        let cmd = Cli::command();
+
+        // Missing required args should fail
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["cli", "transfer-equity"]);
+        assert!(result.is_err(), "transfer-equity without args should fail");
+
+        // Missing direction should fail
+        let result = cmd.clone().try_get_matches_from(vec![
+            "cli",
+            "transfer-equity",
+            "-t",
+            "AAPL",
+            "-q",
+            "10.5",
+        ]);
+        assert!(
+            result.is_err(),
+            "transfer-equity without direction should fail"
+        );
+
+        // All required args (to-raindex, no token-address needed) should succeed
+        let result = cmd.clone().try_get_matches_from(vec![
+            "cli",
+            "transfer-equity",
+            "-d",
+            "to-raindex",
+            "-t",
+            "AAPL",
+            "-q",
+            "10.5",
+        ]);
+        assert!(
+            result.is_ok(),
+            "transfer-equity to-raindex should succeed: {:?}",
+            result.err()
+        );
+
+        // to-alpaca with optional token-address should succeed
+        let result = cmd.try_get_matches_from(vec![
+            "cli",
+            "transfer-equity",
+            "-d",
+            "to-alpaca",
+            "-t",
+            "AAPL",
+            "-q",
+            "5.0",
+            "--token-address",
+            "0x1234567890123456789012345678901234567890",
+        ]);
+        assert!(
+            result.is_ok(),
+            "transfer-equity to-alpaca with token-address should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_transfer_usdc_command_structure() {
+        let cmd = Cli::command();
+
+        // Missing required args should fail
+        let result = cmd
+            .clone()
+            .try_get_matches_from(vec!["cli", "transfer-usdc"]);
+        assert!(result.is_err(), "transfer-usdc without args should fail");
+
+        // Missing direction should fail
+        let result =
+            cmd.clone()
+                .try_get_matches_from(vec!["cli", "transfer-usdc", "-a", "1000.50"]);
+        assert!(
+            result.is_err(),
+            "transfer-usdc without direction should fail"
+        );
+
+        // All args for to-raindex should succeed
+        let result = cmd.clone().try_get_matches_from(vec![
+            "cli",
+            "transfer-usdc",
+            "-d",
+            "to-raindex",
+            "-a",
+            "1000.50",
+        ]);
+        assert!(
+            result.is_ok(),
+            "transfer-usdc to-raindex should succeed: {:?}",
+            result.err()
+        );
+
+        // All args for to-alpaca should succeed
+        let result = cmd.try_get_matches_from(vec![
+            "cli",
+            "transfer-usdc",
+            "-d",
+            "to-alpaca",
+            "-a",
+            "500.25",
+        ]);
+        assert!(
+            result.is_ok(),
+            "transfer-usdc to-alpaca should succeed: {:?}",
+            result.err()
+        );
     }
 
     #[tokio::test]

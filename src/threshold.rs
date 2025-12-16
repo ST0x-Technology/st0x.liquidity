@@ -2,12 +2,28 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::str::FromStr;
 
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Usdc(pub(crate) Decimal);
+pub struct Usdc(pub(crate) Decimal);
+
+impl FromStr for Usdc {
+    type Err = rust_decimal::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Decimal::from_str(s).map(Self)
+    }
+}
+
+impl Display for Usdc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl HasZero for Usdc {
     const ZERO: Self = Self(Decimal::ZERO);

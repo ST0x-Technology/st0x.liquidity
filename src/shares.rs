@@ -1,16 +1,32 @@
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(transparent)]
-pub(crate) struct FractionalShares(pub(crate) Decimal);
+pub struct FractionalShares(pub(crate) Decimal);
+
+impl FromStr for FractionalShares {
+    type Err = rust_decimal::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Decimal::from_str(s).map(Self)
+    }
+}
+
+impl Display for FractionalShares {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 #[error("arithmetic overflow: {lhs:?} {operation} {rhs:?}")]
-pub(crate) struct ArithmeticError<T> {
-    pub(crate) operation: String,
-    pub(crate) lhs: T,
-    pub(crate) rhs: T,
+pub struct ArithmeticError<T> {
+    pub operation: String,
+    pub lhs: T,
+    pub rhs: T,
 }
 
 pub(crate) trait HasZero: PartialOrd + Sized {
