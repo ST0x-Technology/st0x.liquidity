@@ -229,14 +229,14 @@ pub fn setup_tracing(log_level: &LogLevel) {
 pub mod tests {
     use super::*;
     use crate::onchain::EvmEnv;
-    use alloy::primitives::{FixedBytes, address};
+    use alloy::primitives::{Address, FixedBytes, address};
     use rust_decimal::Decimal;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    pub fn create_test_config_with_order_owner(order_owner: alloy::primitives::Address) -> Config {
+    pub fn create_test_config_with_order_owner(order_owner: Address) -> Config {
         Config {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,

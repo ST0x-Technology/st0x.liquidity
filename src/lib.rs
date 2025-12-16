@@ -199,6 +199,8 @@ async fn run_with_executor<E: Executor + Clone + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Address;
+
     use crate::env::tests::create_test_config;
 
     async fn create_test_pool() -> SqlitePool {
@@ -219,7 +221,7 @@ mod tests {
     async fn test_run_function_invalid_orderbook_address() {
         let mut config = create_test_config();
         let pool = create_test_pool().await;
-        config.evm.orderbook = alloy::primitives::Address::ZERO;
+        config.evm.orderbook = Address::ZERO;
         config.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
         Box::pin(run(config, pool)).await.unwrap_err();
     }

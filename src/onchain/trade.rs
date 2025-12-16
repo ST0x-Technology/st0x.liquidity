@@ -391,7 +391,7 @@ mod tests {
     use crate::onchain::EvmEnv;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{U256, fixed_bytes, uint};
+    use alloy::primitives::{Address, U256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
 
@@ -704,8 +704,8 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
         let env = EvmEnv {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
-            orderbook: alloy::primitives::Address::ZERO,
-            order_owner: alloy::primitives::Address::ZERO,
+            orderbook: Address::ZERO,
+            order_owner: Address::ZERO,
             deployment_block: 0,
         };
 

@@ -1,6 +1,7 @@
 //! Spawns the rebalancing infrastructure.
 
 use alloy::network::{Ethereum, EthereumWallet};
+use alloy::primitives::Address;
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
@@ -70,6 +71,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
     alpaca_auth: &AlpacaTradingApiAuthEnv,
     base_provider: BP,
     symbol_cache: SymbolCache,
+    orderbook: Address,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -77,8 +79,15 @@ where
     let signer = PrivateKeySigner::from_bytes(&config.ethereum_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
 
-    let services =
-        Services::new(config, alpaca_auth, &ethereum_wallet, signer, base_provider).await?;
+    let services = Services::new(
+        config,
+        alpaca_auth,
+        &ethereum_wallet,
+        signer,
+        base_provider,
+        orderbook,
+    )
+    .await?;
 
     let rebalancer = services.into_rebalancer(pool, config, symbol_cache);
 
@@ -117,6 +126,7 @@ where
         ethereum_wallet: &EthereumWallet,
         signer: PrivateKeySigner,
         base_provider: BP,
+        orderbook: Address,
     ) -> Result<Self, AlpacaWalletError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
@@ -168,7 +178,7 @@ where
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-        let vault = Arc::new(VaultService::new(base_evm_for_vault, config.base_orderbook));
+        let vault = Arc::new(VaultService::new(base_evm_for_vault, orderbook));
 
         Ok(Self {
             tokenization,
@@ -249,7 +259,7 @@ where
 mod tests {
     use super::*;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{address, b256};
+    use alloy::primitives::{Address, address, b256};
     use alloy::providers::ProviderBuilder;
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
@@ -257,6 +267,8 @@ mod tests {
 
     use crate::alpaca_wallet::{AlpacaWalletService, create_account_mock};
     use crate::inventory::ImbalanceThreshold;
+
+    const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_config() -> RebalancingConfig {
         RebalancingConfig {
@@ -268,15 +280,14 @@ mod tests {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
-            redemption_wallet: address!("1234567890123456789012345678901234567890"),
-            market_maker_wallet: address!("aabbccddaabbccddaabbccddaabbccddaabbccdd"),
+            redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
+            market_maker_wallet: address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
             ethereum_private_key: b256!(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             ),
-            base_orderbook: address!("abcdefabcdefabcdefabcdefabcdefabcdefabcd"),
             usdc_vault_id: b256!(
-                "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
         }
     }
@@ -348,7 +359,7 @@ mod tests {
 
     #[test]
     fn private_key_signer_from_zero_bytes_fails() {
-        let zero_key = b256!("0000000000000000000000000000000000000000000000000000000000000000");
+        let zero_key = b256!("0x0000000000000000000000000000000000000000000000000000000000000000");
 
         let result = PrivateKeySigner::from_bytes(&zero_key);
 
@@ -410,7 +421,7 @@ mod tests {
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-        let vault = Arc::new(VaultService::new(base_evm_for_vault, config.base_orderbook));
+        let vault = Arc::new(VaultService::new(base_evm_for_vault, TEST_ORDERBOOK));
 
         let services = Services {
             tokenization,

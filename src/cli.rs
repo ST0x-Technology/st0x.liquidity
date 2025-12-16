@@ -224,39 +224,7 @@ async fn run_command_with_writers<W: Write>(
             process_tx_with_provider(tx_hash, &config, pool, stdout, &provider, &cache).await?;
         }
         Commands::Auth => {
-            let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
-                anyhow::bail!("Auth command is only supported for Schwab broker")
-            };
-
-            info!("Starting OAuth authentication flow");
-            writeln!(
-                stdout,
-                "🔄 Starting Charles Schwab OAuth authentication process..."
-            )?;
-            writeln!(
-                stdout,
-                "   You will be guided through the authentication process."
-            )?;
-
-            match run_oauth_flow(pool, schwab_auth).await {
-                Ok(()) => {
-                    info!("OAuth authentication completed successfully");
-                    writeln!(stdout, "✅ Authentication successful!")?;
-                    writeln!(
-                        stdout,
-                        "   Your tokens have been saved and are ready to use."
-                    )?;
-                }
-                Err(oauth_error) => {
-                    error!("OAuth authentication failed: {oauth_error:?}");
-                    writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
-                    writeln!(
-                        stdout,
-                        "   Please ensure you have a valid Charles Schwab account and try again."
-                    )?;
-                    return Err(oauth_error.into());
-                }
-            }
+            auth_command(stdout, &config.broker, pool).await?;
         }
 
         Commands::TransferEquity {
@@ -287,6 +255,48 @@ async fn run_command_with_writers<W: Write>(
     }
 
     info!("CLI operation completed successfully");
+    Ok(())
+}
+
+async fn auth_command<W: Write>(
+    stdout: &mut W,
+    broker: &BrokerConfig,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Schwab(schwab_auth) = broker else {
+        anyhow::bail!("Auth command is only supported for Schwab broker")
+    };
+
+    info!("Starting OAuth authentication flow");
+    writeln!(
+        stdout,
+        "🔄 Starting Charles Schwab OAuth authentication process..."
+    )?;
+    writeln!(
+        stdout,
+        "   You will be guided through the authentication process."
+    )?;
+
+    match run_oauth_flow(pool, schwab_auth).await {
+        Ok(()) => {
+            info!("OAuth authentication completed successfully");
+            writeln!(stdout, "✅ Authentication successful!")?;
+            writeln!(
+                stdout,
+                "   Your tokens have been saved and are ready to use."
+            )?;
+        }
+        Err(oauth_error) => {
+            error!("OAuth authentication failed: {oauth_error:?}");
+            writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
+            writeln!(
+                stdout,
+                "   Please ensure you have a valid Charles Schwab account and try again."
+            )?;
+            return Err(oauth_error.into());
+        }
+    }
+
     Ok(())
 }
 
@@ -485,10 +495,7 @@ where
 
     // Create CCTP bridge and Vault service
     let cctp_bridge = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-    let vault_service = Arc::new(VaultService::new(
-        base_evm_for_vault,
-        rebalancing_config.base_orderbook,
-    ));
+    let vault_service = Arc::new(VaultService::new(base_evm_for_vault, config.evm.orderbook));
 
     // Create CQRS for USDC rebalance aggregate
     let usdc_store = PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
@@ -865,7 +872,7 @@ mod tests {
     use crate::test_utils::setup_test_tokens;
     use crate::tokenized_symbol;
     use alloy::hex;
-    use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{Address, B256, FixedBytes, IntoLogData, U256, address, fixed_bytes};
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
     use chrono::{Duration, Utc};
@@ -1357,14 +1364,14 @@ mod tests {
     }
 
     struct MockBlockchainData {
-        order_owner: alloy::primitives::Address,
+        order_owner: Address,
         receipt_json: serde_json::Value,
         after_clear_log: alloy::rpc::types::Log,
     }
 
     fn create_mock_blockchain_data(
-        orderbook: alloy::primitives::Address,
-        tx_hash: alloy::primitives::B256,
+        orderbook: Address,
+        tx_hash: B256,
         alice_output_shares: &str, // e.g., "9000000000000000000" for 9 shares
         bob_output_usdc: u64,      // e.g., 100_000_000 for 100 USDC
     ) -> MockBlockchainData {

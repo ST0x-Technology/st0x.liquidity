@@ -91,7 +91,6 @@ impl RebalancingConfig {
             market_maker_wallet: env.market_maker_wallet,
             ethereum_rpc_url: env.ethereum_rpc_url,
             ethereum_private_key: env.ethereum_private_key,
-            base_orderbook: env.base_orderbook,
             usdc_vault_id: env.usdc_vault_id,
         })
     }
@@ -108,7 +107,6 @@ pub(crate) struct RebalancingConfig {
     pub(crate) market_maker_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) ethereum_private_key: B256,
-    pub(crate) base_orderbook: Address,
     pub(crate) usdc_vault_id: B256,
 }
 
@@ -121,7 +119,6 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("market_maker_wallet", &self.market_maker_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("ethereum_private_key", &"[REDACTED]")
-            .field("base_orderbook", &self.base_orderbook)
             .field("usdc_vault_id", &self.usdc_vault_id)
             .finish()
     }
