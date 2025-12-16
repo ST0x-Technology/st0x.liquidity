@@ -252,16 +252,46 @@ Query cache.
 
 ---
 
-## Task 7. CI Configuration for Dashboard
+## Task 7. CI/CD Configuration for Dashboard
 
-Add dashboard checks to CI pipeline.
+Add dashboard checks to CI pipeline and deploy dashboard as a separate service.
 
-- [ ] Update CI workflow to install bun
-- [ ] Add dashboard build step: `bun run --cwd dashboard build`
-- [ ] Add dashboard type check step: `bun run --cwd dashboard check`
-- [ ] Add dashboard lint step: `bun run --cwd dashboard lint`
-- [ ] Add dashboard test step: `bun run --cwd dashboard test:run`
-- [ ] Verify CI passes on a test push
+### CI (rainix.yaml)
+
+- [x] Add dashboard CI job to run type checks, lint, tests, and build
+- [x] Generate TypeScript types via codegen before building
+- [x] Use bun (already in Nix dev shell)
+
+### CD (Separate Dockerfile + docker-compose)
+
+- [x] Create `dashboard/Dockerfile` - separate frontend build
+- [x] Create `dashboard/nginx.conf` - serves static files and proxies WebSocket
+- [x] Add dashboard services to docker-compose (dashboard-schwab,
+      dashboard-alpaca)
+- [x] Each dashboard proxies to its respective bot backend
+
+### Changes Made
+
+- `.github/workflows/rainix.yaml` - Added `dashboard` job that runs:
+  - `bun install --cwd dashboard`
+  - `cargo run --bin codegen` (generate TS types)
+  - `bun run --cwd dashboard check` (type check)
+  - `bun run --cwd dashboard lint`
+  - `bun run --cwd dashboard test:run`
+  - `bun run --cwd dashboard build`
+- `dashboard/Dockerfile` - Separate frontend build:
+  - Uses `oven/bun:1` for building
+  - Uses `nginx:alpine` for serving
+  - Supports `BACKEND_HOST` env var for WebSocket proxy
+- `dashboard/nginx.conf` - Nginx config:
+  - Serves static files at root
+  - Proxies `/api/ws` to backend bot
+- `docker-compose.template.yaml` - Added dashboard services:
+  - `dashboard-schwab`: port 8080, proxies to schwarbot
+  - `dashboard-alpaca`: port 8081, proxies to alpacabot
+- `dashboard/svelte.config.js` - Static adapter configuration
+- `dashboard/src/lib/env.ts` - Use relative WebSocket URL in production (derives
+  protocol and host from `window.location`)
 
 ---
 

@@ -59,7 +59,8 @@ export default [
       'no-console': 'warn',
       eqeqeq: ['error', 'always'],
       'prefer-const': 'error',
-      'no-var': 'error'
+      'no-var': 'error',
+      'func-style': ['error', 'expression']
     }
   },
   {
@@ -90,7 +91,8 @@ export default [
       ],
       'svelte/no-at-html-tags': 'error',
       'svelte/require-each-key': 'error',
-      'svelte/valid-each-key': 'error'
+      'svelte/valid-each-key': 'error',
+      'func-style': ['error', 'expression']
     }
   },
   {

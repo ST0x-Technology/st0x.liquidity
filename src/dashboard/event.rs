@@ -172,7 +172,7 @@ mod tests {
                 assert_eq!(entry.sequence, 1);
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            _ => panic!("expected Event message"),
+            ServerMessage::Initial(_) => panic!("expected Event message"),
         }
     }
 
@@ -231,7 +231,7 @@ mod tests {
                 assert_eq!(entry.sequence, 1);
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintRequested");
             }
-            _ => panic!("expected Event message"),
+            ServerMessage::Initial(_) => panic!("expected Event message"),
         }
 
         match msg2 {
@@ -239,7 +239,7 @@ mod tests {
                 assert_eq!(entry.sequence, 2);
                 assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintCompleted");
             }
-            _ => panic!("expected Event message"),
+            ServerMessage::Initial(_) => panic!("expected Event message"),
         }
     }
 
@@ -270,7 +270,7 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "redemption-123");
                 assert_eq!(entry.event_type, "EquityRedemptionEvent::Completed");
             }
-            _ => panic!("expected Event message"),
+            ServerMessage::Initial(_) => panic!("expected Event message"),
         }
     }
 
@@ -296,7 +296,7 @@ mod tests {
                 assert_eq!(entry.aggregate_id, "usdc-456");
                 assert_eq!(entry.event_type, "UsdcRebalanceEvent::WithdrawalConfirmed");
             }
-            _ => panic!("expected Event message"),
+            ServerMessage::Initial(_) => panic!("expected Event message"),
         }
     }
 
@@ -339,7 +339,7 @@ mod tests {
                         i + 1
                     );
                 }
-                _ => panic!("receiver {} expected Event message", i + 1),
+                ServerMessage::Initial(_) => panic!("receiver {} expected Event message", i + 1),
             }
         }
     }

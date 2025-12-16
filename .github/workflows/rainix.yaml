@@ -39,3 +39,36 @@ jobs:
       - run: nix develop -c sqlx migrate run
       - name: Run ${{ matrix.task }}
         run: nix develop -c ${{ matrix.task }}
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
+      - name: Install dependencies
+        run: nix develop -c bun install --cwd dashboard
+      - name: Generate TypeScript types
+        env:
+          DATABASE_URL: "sqlite:schwab.db"
+        run: |
+          nix develop -c sqlx db create
+          nix develop -c sqlx migrate run
+          nix develop -c cargo run --bin codegen
+      - name: Type check
+        run: nix develop -c bun run --cwd dashboard check
+      - name: Lint
+        run: nix develop -c bun run --cwd dashboard lint
+      - name: Test
+        run: nix develop -c bun run --cwd dashboard test:run
+      - name: Build
+        run: nix develop -c bun run --cwd dashboard build
