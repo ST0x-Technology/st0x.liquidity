@@ -26,7 +26,7 @@ use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 pub(crate) use builder::ConductorBuilder;
-use st0x_broker::{Broker, MarketOrder, SupportedBroker};
+use st0x_broker::{Broker, BrokerError, MarketOrder, SupportedBroker, Symbol};
 
 pub(crate) struct Conductor {
     pub(crate) broker_maintenance: Option<JoinHandle<()>>,
@@ -786,6 +786,16 @@ async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'sta
     Ok(())
 }
 
+/// Maps database symbols to current broker-recognized tickers.
+/// Handles corporate actions like SPLG → SPYM rename (Oct 31, 2025).
+/// Remove once proper tSPYM tokens are issued onchain.
+fn to_broker_ticker(symbol: &Symbol) -> Result<Symbol, BrokerError> {
+    match symbol.to_string().as_str() {
+        "SPLG" => Symbol::new("SPYM"),
+        _ => Ok(symbol.clone()),
+    }
+}
+
 #[tracing::instrument(skip(broker, pool), level = tracing::Level::INFO)]
 async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
     broker: &B,
@@ -803,7 +813,7 @@ async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
     info!("Executing offchain order: {execution:?}");
 
     let market_order = MarketOrder {
-        symbol: execution.symbol.clone(),
+        symbol: to_broker_ticker(&execution.symbol)?,
         shares: execution.shares,
         direction: execution.direction,
     };
@@ -1765,5 +1775,19 @@ mod tests {
         assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
 
         conductor.abort_all();
+    }
+
+    #[test]
+    fn test_to_broker_ticker_splg_maps_to_spym() {
+        let splg = Symbol::new("SPLG").unwrap();
+        assert_eq!(to_broker_ticker(&splg).unwrap().to_string(), "SPYM");
+    }
+
+    #[test]
+    fn test_to_broker_ticker_other_symbols_unchanged() {
+        for ticker in ["AAPL", "NVDA", "MSTR", "IAU", "COIN"] {
+            let symbol = Symbol::new(ticker).unwrap();
+            assert_eq!(to_broker_ticker(&symbol).unwrap().to_string(), ticker);
+        }
     }
 }

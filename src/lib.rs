@@ -15,6 +15,7 @@ mod error;
 mod inventory;
 mod lifecycle;
 mod lock;
+pub mod migration;
 mod offchain;
 mod offchain_order;
 mod onchain;

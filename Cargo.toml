@@ -123,5 +123,9 @@ rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
 
+[[bin]]
+name = "migrate_to_events"
+path = "src/bin/migrate_to_events.rs"
+
 [lints]
 workspace = true

@@ -307,17 +307,30 @@ Environment variables (can be set via `.env` file):
   feature/domain.
   - **FORBIDDEN**: `types.rs`, `error.rs`, `models.rs`, `utils.rs`,
     `helpers.rs`, `http.rs`, `dto.rs`, `entities.rs`, `services.rs`, `domain.rs`
-  - **CORRECT**: `position.rs`, `offchain_order.rs`, `onchain_trade.rs` with
-    submodules like `position/cmd.rs`, `position/event.rs` if needed
-  - Each feature module contains ALL related code: types, errors, commands,
-    events, aggregates, views, endpoints
-  - Value objects/newtypes live in their primary feature module; shared types
-    are imported from the owning feature
-- **Event-Driven Architecture**: Each trade spawns independent async task
-- **SQLite Persistence**: Embedded database for trade tracking and auth tokens
-- **Symbol Suffix Convention**: Tokenized equities use "0x" suffix
-- **Price Direction Logic**: Onchain buy = offchain sell (hedge exposure)
-- **Comprehensive Error Handling**: Custom error types with proper propagation
+    (when used as catch-all technical layer modules)
+  - **CORRECT**: `position.rs`, `offchain_order.rs`, `onchain_trade.rs`
+    (organized by business domain)
+  - Each feature module should contain ALL related code: types, errors,
+    commands, events, aggregates, views, and endpoints
+  - This makes it easy to understand and modify a feature without jumping
+    between unrelated files
+  - Value objects and newtypes should live in the feature module where they're
+    primarily defined/used
+  - When types are shared across features, import from the owning feature (e.g.,
+    `offchain_order` can import `FractionalShares` from `position` module)
+  - **Flat by default**: Start with a single file per feature (e.g.,
+    `position.rs`). Only split into a directory with submodules when natural
+    business logic boundaries emerge and the split provides clear value
+- **Event-Driven Architecture**: Each trade spawns independent async task for
+  maximum throughput
+- **SQLite Persistence**: Embedded database for trade tracking and
+  authentication tokens
+- **Symbol Suffix Convention**: Tokenized equities use "0x" suffix to
+  distinguish from base assets
+- **Price Direction Logic**: Onchain buy = offchain sell (and vice versa) to
+  hedge directional exposure
+- **Comprehensive Error Handling**: Custom error types (`OnChainError`,
+  `SchwabError`) with proper propagation
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -344,11 +357,47 @@ Environment variables (can be set via `.env` file):
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
+- **CRITICAL: Import Organization**: Follow a consistent two-group import
+  pattern throughout the codebase:
+  - **Group 1 - External imports**: All imports from external crates including
+    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines between
+    external imports.
+  - **Empty line separating the groups**
+  - **Group 2 - Internal imports**: All imports from our codebase using
+    `crate::` and `super::`. No empty lines between internal imports.
+  - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
+    within a group
+  - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+  - Module declarations (`mod foo;`) can appear between imports if needed
+  - This pattern applies to ALL modules including test modules
+    (`#[cfg(test)] mod tests`)
+  - Example of correct import organization:
+    ```rust
+    use std::sync::Arc;
+    use alloy::primitives::{Address, B256};
+    use cqrs_es::{CqrsFramework, EventStore};
+    use serde::{Deserialize, Serialize};
+
+    use crate::account::ClientId;
+    use crate::mint::TokenizationRequestId;
+    use super::{Mint, MintCommand};
+    ```
+  - Example of **INCORRECT** import organization:
+    ```rust
+    // ❌ WRONG - Three groups, internal imports mixed with external
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, B256};
+    use crate::account::ClientId;  // Internal import in wrong place
+    use cqrs_es::CqrsFramework;
+
+    use super::Mint;
+    ```
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
-  module is clear (e.g. use `info!` instead of `tracing::info!`). Generally
-  avoid imports inside functions. We don't do function-level imports, instead we
-  do top-of-module imports. Note that I said top-of-module and not top-of-file,
+  module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
+  imports inside functions. We don't do function-level imports, instead we do
+  top-of-module imports. Note that I said top-of-module and not top-of-file,
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
