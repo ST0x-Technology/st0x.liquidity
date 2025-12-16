@@ -1,8 +1,14 @@
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
+use alloy::signers::local::PrivateKeySigner;
 use clap::{Parser, Subcommand, ValueEnum};
+use cqrs_es::CqrsFramework;
+use cqrs_es::persist::PersistedEventStore;
+use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::io::Write;
+use std::sync::Arc;
 use st0x_execution::schwab::{
     SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
 };
@@ -13,13 +19,26 @@ use st0x_execution::{
 use thiserror::Error;
 use tracing::{error, info};
 
+use crate::alpaca_tokenization::AlpacaTokenizationService;
+use crate::alpaca_wallet::AlpacaWalletService;
+use crate::cctp::{
+    CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
+};
 use crate::env::{BrokerConfig, Config, Env};
+use crate::equity_redemption::RedemptionAggregateId;
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::vault::{VaultId, VaultService};
 use crate::onchain::{OnchainTrade, accumulator};
+use crate::rebalancing::mint::Mint;
+use crate::rebalancing::redemption::Redeem;
+use crate::rebalancing::usdc::UsdcRebalanceManager;
+use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
+use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::usdc_rebalance::UsdcRebalanceId;
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -246,11 +265,24 @@ async fn run_command_with_writers<W: Write>(
             quantity,
             token_address,
         } => {
-            transfer_equity_command(stdout, direction, &ticker, quantity, token_address)?;
+            transfer_equity_command(
+                stdout,
+                direction,
+                &ticker,
+                quantity,
+                token_address,
+                &config,
+                pool,
+            )
+            .await?;
         }
 
         Commands::TransferUsdc { direction, amount } => {
-            transfer_usdc_command(stdout, direction, amount)?;
+            // Connect to Base via WebSocket
+            let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
+            let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
+
+            transfer_usdc_command(stdout, direction, amount, &config, pool, base_provider).await?;
         }
     }
 
@@ -258,12 +290,14 @@ async fn run_command_with_writers<W: Write>(
     Ok(())
 }
 
-fn transfer_equity_command<W: Write>(
+async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
     direction: TransferDirection,
     ticker: &Symbol,
     quantity: FractionalShares,
     token_address: Option<Address>,
+    config: &Config,
+    pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
@@ -274,22 +308,113 @@ fn transfer_equity_command<W: Write>(
     writeln!(stdout, "   Ticker: {ticker}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
 
-    if let Some(addr) = token_address {
-        writeln!(stdout, "   Token Address: {addr}")?;
+    // Validate broker is Alpaca
+    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
+        anyhow::bail!("transfer-equity requires Alpaca broker configuration");
+    };
+
+    // Validate rebalancing config exists
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "transfer-equity requires rebalancing configuration (set REBALANCING_ENABLED=true)"
+        )
+    })?;
+
+    // Connect to Base via WebSocket
+    let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
+    let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
+
+    // Create AlpacaTokenizationService (same as spawn.rs)
+    let tokenization_service = Arc::new(AlpacaTokenizationService::new(
+        alpaca_auth.base_url(),
+        alpaca_auth.alpaca_api_key.clone(),
+        alpaca_auth.alpaca_api_secret.clone(),
+        base_provider.clone(),
+        rebalancing_config.redemption_wallet,
+    ));
+
+    match direction {
+        TransferDirection::ToRaindex => {
+            writeln!(stdout, "   Creating mint request...")?;
+
+            // Create event store and CQRS for mint aggregate
+            let mint_store =
+                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
+            let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
+            let mint_manager = MintManager::new(tokenization_service, mint_cqrs);
+
+            // Generate unique issuer request ID
+            let issuer_request_id =
+                IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
+
+            // Get market maker wallet for receiving minted tokens
+            let wallet = rebalancing_config.market_maker_wallet;
+
+            writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
+            writeln!(stdout, "   Receiving Wallet: {wallet}")?;
+
+            mint_manager
+                .execute_mint(&issuer_request_id, ticker.clone(), quantity, wallet)
+                .await?;
+
+            writeln!(stdout, "✅ Mint completed successfully")?;
+        }
+
+        TransferDirection::ToAlpaca => {
+            // For redemption, token_address is required
+            let token = token_address.ok_or_else(|| {
+                anyhow::anyhow!("--token-address is required for to-alpaca direction (redemption)")
+            })?;
+
+            writeln!(stdout, "   Token Address: {token}")?;
+            writeln!(stdout, "   Sending tokens for redemption...")?;
+
+            // Create event store and CQRS for redemption aggregate
+            let redemption_store =
+                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
+            let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
+            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_cqrs);
+
+            // Generate unique aggregate ID
+            let aggregate_id =
+                RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
+
+            // Convert quantity to U256 with 18 decimals for token transfer
+            let amount = decimal_to_u256_18_decimals(quantity.into())?;
+
+            writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
+            writeln!(stdout, "   Amount (wei): {amount}")?;
+
+            redemption_manager
+                .execute_redemption(&aggregate_id, ticker.clone(), quantity, token, amount)
+                .await?;
+
+            writeln!(stdout, "✅ Redemption completed successfully")?;
+        }
     }
 
-    // TODO: Validate token_address is provided for to-alpaca direction
-    // TODO: Construct managers using spawn.rs patterns and call existing methods
-
-    writeln!(stdout, "❌ TransferEquity command not yet implemented")?;
-    anyhow::bail!("TransferEquity command not yet implemented")
+    Ok(())
 }
 
-fn transfer_usdc_command<W: Write>(
+fn decimal_to_u256_18_decimals(
+    value: rust_decimal::Decimal,
+) -> anyhow::Result<alloy::primitives::U256> {
+    let scaled = value * rust_decimal::Decimal::from(10u64.pow(18));
+    let as_str = scaled.trunc().to_string();
+    Ok(alloy::primitives::U256::from_str_radix(&as_str, 10)?)
+}
+
+async fn transfer_usdc_command<W: Write, BP>(
     stdout: &mut W,
     direction: TransferDirection,
     amount: Usdc,
-) -> anyhow::Result<()> {
+    config: &Config,
+    pool: &SqlitePool,
+    base_provider: BP,
+) -> anyhow::Result<()>
+where
+    BP: Provider + Clone + Send + Sync + 'static,
+{
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex",
         TransferDirection::ToAlpaca => "Raindex → Alpaca",
@@ -298,10 +423,123 @@ fn transfer_usdc_command<W: Write>(
     writeln!(stdout, "🔄 Transferring USDC: {direction_str}")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    // TODO: Construct UsdcRebalanceManager using spawn.rs patterns and call existing methods
+    // Validate broker is Alpaca
+    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
+        anyhow::bail!("transfer-usdc requires Alpaca broker configuration");
+    };
 
-    writeln!(stdout, "❌ TransferUsdc command not yet implemented")?;
-    anyhow::bail!("TransferUsdc command not yet implemented")
+    // Validate rebalancing config exists
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "transfer-usdc requires rebalancing configuration (set REBALANCING_ENABLED=true)"
+        )
+    })?;
+
+    writeln!(stdout, "   Creating services...")?;
+
+    // Create signer and wallet from private key
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let ethereum_wallet = EthereumWallet::from(signer.clone());
+
+    // Create Ethereum HTTP provider
+    let ethereum_provider = ProviderBuilder::new()
+        .wallet(ethereum_wallet)
+        .connect_http(rebalancing_config.ethereum_rpc_url.clone());
+
+    // Create AlpacaWalletService
+    let alpaca_wallet = Arc::new(
+        AlpacaWalletService::new(
+            alpaca_auth.base_url(),
+            alpaca_auth.alpaca_api_key.clone(),
+            alpaca_auth.alpaca_api_secret.clone(),
+        )
+        .await?,
+    );
+
+    // Create Ethereum EVM for CCTP
+    let ethereum_evm = Evm::new(
+        ethereum_provider,
+        signer.clone(),
+        USDC_ETHEREUM,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+    );
+
+    // Create Base EVM for CCTP
+    let base_evm_for_cctp = Evm::new(
+        base_provider.clone(),
+        signer.clone(),
+        USDC_BASE,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+    );
+
+    // Create Base EVM for Vault
+    let base_evm_for_vault = Evm::new(
+        base_provider,
+        signer,
+        USDC_BASE,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+    );
+
+    // Create CCTP bridge and Vault service
+    let cctp_bridge = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
+    let vault_service = Arc::new(VaultService::new(
+        base_evm_for_vault,
+        rebalancing_config.base_orderbook,
+    ));
+
+    // Create CQRS for USDC rebalance aggregate
+    let usdc_store = PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
+    let usdc_cqrs = Arc::new(CqrsFramework::new(usdc_store, vec![], ()));
+
+    // Create UsdcRebalanceManager
+    let usdc_manager = UsdcRebalanceManager::new(
+        alpaca_wallet,
+        cctp_bridge,
+        vault_service,
+        usdc_cqrs,
+        rebalancing_config.market_maker_wallet,
+        VaultId(rebalancing_config.usdc_vault_id),
+    );
+
+    // Generate unique rebalance ID
+    let rebalance_id = UsdcRebalanceId::new(format!("cli-usdc-{}", uuid::Uuid::new_v4()));
+
+    writeln!(stdout, "   Rebalance ID: {}", rebalance_id.0)?;
+
+    match direction {
+        TransferDirection::ToRaindex => {
+            writeln!(
+                stdout,
+                "   Initiating Alpaca withdrawal and CCTP bridging..."
+            )?;
+            writeln!(stdout, "   (This may take several minutes for attestation)")?;
+
+            usdc_manager
+                .execute_alpaca_to_base(&rebalance_id, amount)
+                .await?;
+
+            writeln!(stdout, "✅ USDC transfer to Raindex completed successfully")?;
+        }
+
+        TransferDirection::ToAlpaca => {
+            writeln!(
+                stdout,
+                "   Withdrawing from vault and initiating CCTP bridging..."
+            )?;
+            writeln!(stdout, "   (This may take several minutes for attestation)")?;
+
+            usdc_manager
+                .execute_base_to_alpaca(&rebalance_id, amount)
+                .await?;
+
+            writeln!(stdout, "✅ USDC transfer to Alpaca completed successfully")?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn ensure_schwab_authentication<W: Write>(

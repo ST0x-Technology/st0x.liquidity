@@ -27,30 +27,62 @@ Add two CLI subcommands:
 - Added `FromStr` and `Display` impls for `FractionalShares` and `Usdc`
 - Added tests for command structure validation
 
-## Task 2. Implement transfer-equity Command
+## Task 2. Implement transfer-equity Command ✅
 
-- [ ] Require Alpaca broker configuration
-- [ ] Require rebalancing configuration
-- [ ] For to-raindex direction:
+- [x] Require Alpaca broker configuration
+- [x] Require rebalancing configuration
+- [x] For to-raindex direction:
   - Create `MintManager` using existing `spawn.rs` service construction
   - Generate `IssuerRequestId`
   - Call `mint_manager.execute_mint()`
-- [ ] For to-alpaca direction:
+- [x] For to-alpaca direction:
   - Create `RedemptionManager` using existing service construction
-  - Look up token address from ticker (or require as parameter)
+  - Require `--token-address` parameter for redemption
   - Generate `RedemptionAggregateId`
   - Call `redemption_manager.execute_redemption()`
-- [ ] Add tests
+- [x] Add tests for CLI command structure
 
-## Task 3. Implement transfer-usdc Command
+**Changes made:**
 
-- [ ] Require Alpaca broker configuration
-- [ ] Require rebalancing configuration
-- [ ] Create `UsdcRebalanceManager` using existing service construction
-- [ ] Generate `UsdcRebalanceId`
-- [ ] For to-raindex: Call `usdc_manager.execute_alpaca_to_base()`
-- [ ] For to-alpaca: Call `usdc_manager.execute_base_to_alpaca()`
-- [ ] Add tests
+- Implemented `transfer_equity_command` function in `src/cli.rs`
+- Validates broker is Alpaca (rejects Schwab/DryRun)
+- Validates rebalancing config exists
+- Creates `AlpacaTokenizationService` with Base provider connection
+- For `ToRaindex`: Creates `MintManager` with CQRS event store, generates
+  `IssuerRequestId`, calls `execute_mint()` with market maker wallet
+- For `ToAlpaca`: Requires `--token-address` parameter, creates
+  `RedemptionManager`, generates `RedemptionAggregateId`, converts quantity to
+  U256 with 18 decimals, calls `execute_redemption()`
+- Added `decimal_to_u256_18_decimals` helper for token amount conversion
+
+## Task 3. Implement transfer-usdc Command ✅
+
+- [x] Require Alpaca broker configuration
+- [x] Require rebalancing configuration
+- [x] Create `UsdcRebalanceManager` using existing service construction
+- [x] Generate `UsdcRebalanceId`
+- [x] For to-raindex: Call `usdc_manager.execute_alpaca_to_base()`
+- [x] For to-alpaca: Call `usdc_manager.execute_base_to_alpaca()`
+- [x] Tests: CLI command structure tests already cover transfer-usdc
+
+**Changes made:**
+
+- Implemented `transfer_usdc_command` function in `src/cli.rs`
+- Validates broker is Alpaca (rejects Schwab/DryRun)
+- Validates rebalancing config exists
+- Creates all required services following `spawn.rs` pattern:
+  - `PrivateKeySigner` and `EthereumWallet` from config's private key
+  - Ethereum HTTP provider for CCTP operations
+  - `AlpacaWalletService` for wallet operations
+  - `CctpBridge` with Ethereum and Base EVMs for cross-chain bridging
+  - `VaultService` for vault deposits/withdrawals
+  - CQRS framework for USDC rebalance aggregate
+- Creates `UsdcRebalanceManager` with all dependencies
+- Generates unique `UsdcRebalanceId`
+- For `ToRaindex`: Calls `execute_alpaca_to_base()` (Alpaca withdrawal → CCTP
+  bridge → vault deposit)
+- For `ToAlpaca`: Calls `execute_base_to_alpaca()` (vault withdrawal → CCTP
+  bridge → Alpaca deposit)
 
 ## Key Principle
 

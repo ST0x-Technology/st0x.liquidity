@@ -65,9 +65,6 @@ pub struct RebalancingEnv {
     /// Private key for signing Ethereum transactions
     #[clap(long, env)]
     ethereum_private_key: B256,
-    /// Raindex OrderBook address on Base for vault operations
-    #[clap(long, env)]
-    base_orderbook: Address,
     /// Vault ID for USDC deposits to the Raindex vault
     #[clap(long, env)]
     usdc_vault_id: B256,
