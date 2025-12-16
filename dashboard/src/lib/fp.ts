@@ -101,24 +101,34 @@ export const unwrapOr = <T, E>(result: Result<T, E>, defaultValue: T): T =>
 
 /**
  * Try to execute a function, catching any thrown errors.
+ *
+ * **Important**: Caught errors are typed as `unknown` at runtime since JavaScript
+ * allows throwing any value. The type parameter `E` defaults to `unknown` and callers
+ * should not assume a specific error type without validation. Use type guards or
+ * instanceof checks before accessing error-specific properties.
  */
 export const tryCatch = <T, E = unknown>(fn: () => T): Result<T, E> => {
   try {
     return ok(fn())
-  } catch (e) {
+  } catch (e: unknown) {
     return err(e as E)
   }
 }
 
 /**
  * Async version of tryCatch.
+ *
+ * **Important**: Caught errors are typed as `unknown` at runtime since JavaScript
+ * allows throwing any value. The type parameter `E` defaults to `unknown` and callers
+ * should not assume a specific error type without validation. Use type guards or
+ * instanceof checks before accessing error-specific properties.
  */
 export const tryCatchAsync = async <T, E = unknown>(
   fn: () => Promise<T>
 ): Promise<Result<T, E>> => {
   try {
     return ok(await fn())
-  } catch (e) {
+  } catch (e: unknown) {
     return err(e as E)
   }
 }

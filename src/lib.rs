@@ -1,7 +1,7 @@
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
 use crate::dashboard::ServerMessage;
@@ -103,17 +103,33 @@ async fn await_shutdown(
     server_task: JoinHandle<Result<Rocket<Ignite>, rocket::Error>>,
     bot_task: JoinHandle<()>,
 ) {
+    let server_abort = server_task.abort_handle();
+    let bot_abort = bot_task.abort_handle();
+
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
-            info!("Received shutdown signal, shutting down gracefully...");
+            handle_ctrl_c(&server_abort, &bot_abort);
         }
         result = server_task => {
             log_server_result(result);
+            abort_task("bot", &bot_abort);
         }
         result = bot_task => {
             log_bot_result(result);
+            abort_task("server", &server_abort);
         }
     }
+}
+
+fn handle_ctrl_c(server_abort: &AbortHandle, bot_abort: &AbortHandle) {
+    info!("Received shutdown signal, shutting down gracefully...");
+    abort_task("server", server_abort);
+    abort_task("bot", bot_abort);
+}
+
+fn abort_task(name: &str, handle: &AbortHandle) {
+    info!("Aborting {name} task");
+    handle.abort();
 }
 
 fn log_server_result(result: Result<Result<Rocket<Ignite>, rocket::Error>, JoinError>) {

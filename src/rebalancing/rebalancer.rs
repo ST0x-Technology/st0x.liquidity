@@ -114,11 +114,20 @@ where
     }
 
     async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
-        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
-
-        let Ok(amount) = convert_shares_for_redemption(&symbol, quantity) else {
-            return;
+        let amount = match shares_to_u256_18_decimals(quantity) {
+            Ok(amount) => amount,
+            Err(e) => {
+                error!(
+                    %symbol,
+                    ?quantity,
+                    error = %e,
+                    "Redemption operation failed: share conversion error"
+                );
+                return;
+            }
         };
+
+        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
         log_redemption_start(&symbol, quantity, token, amount, &aggregate_id);
 
@@ -159,16 +168,6 @@ where
             }
         }
     }
-}
-
-fn convert_shares_for_redemption(
-    symbol: &Symbol,
-    quantity: FractionalShares,
-) -> Result<U256, SharesConversionError> {
-    shares_to_u256_18_decimals(quantity).map_err(|e| {
-        error!(%symbol, error = %e, "Failed to convert quantity to U256");
-        e
-    })
 }
 
 fn log_redemption_start(

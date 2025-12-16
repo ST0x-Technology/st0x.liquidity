@@ -13,16 +13,30 @@
   let ws = $state<WebSocketConnection | null>(null)
 
   const handleBrokerChange = (broker: Broker) => {
-    ws?.disconnect()
-    queryClient.clear()
-    brokerStore.set(broker)
-    ws = createWebSocket(getWebSocketUrl(broker), queryClient)
-    ws.connect()
+    const previousWs = ws
+
+    try {
+      const newWs = createWebSocket(getWebSocketUrl(broker), queryClient)
+      newWs.connect()
+
+      queryClient.clear()
+      brokerStore.set(broker)
+      ws = newWs
+
+      previousWs?.disconnect()
+    } catch (e: unknown) {
+      console.error('Failed to switch broker WebSocket connection:', e)
+    }
   }
 
   onMount(() => {
-    ws = createWebSocket(getWebSocketUrl(brokerStore.value), queryClient)
-    ws.connect()
+    try {
+      ws = createWebSocket(getWebSocketUrl(brokerStore.value), queryClient)
+      ws.connect()
+    } catch (e: unknown) {
+      console.error('Failed to establish WebSocket connection:', e)
+    }
+
     return () => {
       ws?.disconnect()
     }

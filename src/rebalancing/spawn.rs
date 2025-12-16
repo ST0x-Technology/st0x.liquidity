@@ -255,46 +255,27 @@ where
     }
 }
 
-fn build_mint_queries(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<TokenizedEquityMint, Never>>>> {
-    let mut queries: Vec<Box<dyn Query<Lifecycle<TokenizedEquityMint, Never>>>> =
-        vec![Box::new(trigger)];
+macro_rules! build_queries {
+    ($name:ident, $aggregate:ty) => {
+        fn $name(
+            trigger: Arc<RebalancingTrigger>,
+            event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+        ) -> Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> {
+            let mut queries: Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> =
+                vec![Box::new(trigger)];
 
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
+            if let Some(sender) = event_broadcast {
+                queries.push(Box::new(EventBroadcaster::new(sender)));
+            }
 
-    queries
+            queries
+        }
+    };
 }
 
-fn build_redemption_queries(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<EquityRedemption, Never>>>> {
-    let mut queries: Vec<Box<dyn Query<Lifecycle<EquityRedemption, Never>>>> =
-        vec![Box::new(trigger)];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
-}
-
-fn build_usdc_queries(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<UsdcRebalance, Never>>>> {
-    let mut queries: Vec<Box<dyn Query<Lifecycle<UsdcRebalance, Never>>>> = vec![Box::new(trigger)];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
-}
+build_queries!(build_mint_queries, TokenizedEquityMint);
+build_queries!(build_redemption_queries, EquityRedemption);
+build_queries!(build_usdc_queries, UsdcRebalance);
 
 #[cfg(test)]
 mod tests {

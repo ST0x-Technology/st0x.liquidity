@@ -70,12 +70,15 @@ fn check_timeout(
     timeout: Duration,
     transfer_id: AlpacaTransferId,
 ) -> Result<(), AlpacaWalletError> {
-    if start.elapsed() >= timeout {
+    let elapsed = start.elapsed();
+
+    if elapsed >= timeout {
         return Err(AlpacaWalletError::TransferTimeout {
             transfer_id,
-            elapsed: start.elapsed(),
+            elapsed,
         });
     }
+
     Ok(())
 }
 
@@ -173,12 +176,12 @@ fn check_deposit_timeout(
     timeout: Duration,
     tx_hash: TxHash,
 ) -> Result<(), AlpacaWalletError> {
-    if start.elapsed() >= timeout {
-        return Err(AlpacaWalletError::DepositTimeout {
-            tx_hash,
-            elapsed: start.elapsed(),
-        });
+    let elapsed = start.elapsed();
+
+    if elapsed >= timeout {
+        return Err(AlpacaWalletError::DepositTimeout { tx_hash, elapsed });
     }
+
     Ok(())
 }
 
