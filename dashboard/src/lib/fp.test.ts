@@ -194,9 +194,7 @@ describe('tryCatch', () => {
       throw new Error('kaboom')
     })
     expect(isErr(result)).toBe(true)
-    if (result.tag === 'err') {
-      expect(result.error).toBeInstanceOf(Error)
-    }
+    expect((result as { tag: 'err'; error: unknown }).error).toBeInstanceOf(Error)
   })
 
   it('returns Ok for successful execution', () => {

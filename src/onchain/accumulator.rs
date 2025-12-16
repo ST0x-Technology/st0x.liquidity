@@ -451,8 +451,9 @@ async fn mark_execution_as_timed_out(
 
     let base_symbol_str = base_symbol.to_string();
     sqlx::query!(
-        "UPDATE trade_accumulators SET pending_execution_id = NULL WHERE symbol = ?1",
-        base_symbol_str
+        "UPDATE trade_accumulators SET pending_execution_id = NULL WHERE symbol = ?1 AND pending_execution_id = ?2",
+        base_symbol_str,
+        execution_id
     )
     .execute(sql_tx.as_mut())
     .await?;

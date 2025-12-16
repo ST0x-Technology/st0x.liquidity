@@ -9,6 +9,20 @@ const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 30000
 const MAX_EVENTS = 100
 
+const VALID_MESSAGE_TYPES = ['initial', 'event'] as const
+
+const isServerMessage = (value: unknown): value is ServerMessage => {
+  if (typeof value !== 'object' || value === null) return false
+
+  const obj = value as Record<string, unknown>
+
+  if (typeof obj['type'] !== 'string') return false
+  if (!VALID_MESSAGE_TYPES.includes(obj['type'] as (typeof VALID_MESSAGE_TYPES)[number])) return false
+  if (!('data' in obj)) return false
+
+  return true
+}
+
 const matchMessage = matcher<ServerMessage>()('type')
 
 export const createWebSocket = (url: string, queryClient: QueryClient) => {
@@ -63,10 +77,15 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
     socket.onmessage = (event) => {
       try {
-        const msg = JSON.parse(event.data as string) as ServerMessage
-        handleMessage(msg)
+        const parsed: unknown = JSON.parse(event.data as string)
+
+        if (!isServerMessage(parsed)) {
+          console.error('Invalid ServerMessage structure:', parsed)
+          return
+        }
+
+        handleMessage(parsed)
       } catch (e) {
-        // eslint-disable-next-line no-console
         console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data)
       }
     }

@@ -15,7 +15,7 @@
 
   const formatTimestamp = (timestamp: string): string => {
     const date = new Date(timestamp)
-    return date.toLocaleTimeString('en-US', {
+    return date.toLocaleTimeString(navigator.language, {
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',
@@ -25,7 +25,10 @@
 
   const truncateId = (id: string, maxLen: number = 16): string => {
     if (id.length <= maxLen) return id
-    return `${id.slice(0, 8)}...${id.slice(-6)}`
+    const visibleChars = maxLen - 3
+    const left = Math.ceil(visibleChars / 2)
+    const right = Math.floor(visibleChars / 2)
+    return `${id.slice(0, left)}...${id.slice(-right)}`
   }
 
   const events = $derived(eventsQuery.data ?? [])

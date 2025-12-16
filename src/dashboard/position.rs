@@ -4,7 +4,7 @@ use ts_rs::TS;
 
 /// Position information for a symbol.
 ///
-/// Note: Variants will be expanded when position tracking is implemented.
+/// Note: Fields will be expanded when position tracking is implemented.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]

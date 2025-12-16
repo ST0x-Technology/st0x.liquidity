@@ -82,28 +82,58 @@ fn check_timeout(
     Ok(())
 }
 
+/// Represents a validated status transition.
+struct ValidatedTransition {
+    new_status: TransferStatus,
+    changed: bool,
+}
+
+/// Parses a status transition, returning Ok if valid or Err for invalid regressions.
+fn parse_status_transition(
+    prev: TransferStatus,
+    next: TransferStatus,
+) -> Result<ValidatedTransition, (TransferStatus, TransferStatus)> {
+    let is_regression = matches!(
+        (prev, next),
+        (TransferStatus::Processing, TransferStatus::Pending)
+            | (TransferStatus::Complete | TransferStatus::Failed, _)
+    );
+
+    if is_regression {
+        Err((prev, next))
+    } else {
+        Ok(ValidatedTransition {
+            new_status: next,
+            changed: prev != next,
+        })
+    }
+}
+
 fn validate_and_log_status_change(
     transfer_id: AlpacaTransferId,
     last_status: Option<TransferStatus>,
     transfer: &Transfer,
 ) -> Result<(), AlpacaWalletError> {
-    if let Some(prev_status) = last_status {
-        if is_status_regression(prev_status, transfer.status) {
-            return Err(AlpacaWalletError::InvalidStatusTransition {
-                transfer_id,
-                previous: prev_status,
-                next: transfer.status,
-            });
-        }
-
-        if prev_status != transfer.status {
-            let new_status = transfer.status;
-            info!("Transfer {transfer_id} status: {prev_status:?} -> {new_status:?}");
-        }
-    } else {
+    let Some(prev_status) = last_status else {
         let status = transfer.status;
         info!("Transfer {transfer_id} initial status: {status:?}");
+        return Ok(());
+    };
+
+    let transition =
+        parse_status_transition(prev_status, transfer.status).map_err(|(previous, next)| {
+            AlpacaWalletError::InvalidStatusTransition {
+                transfer_id,
+                previous,
+                next,
+            }
+        })?;
+
+    if transition.changed {
+        let new_status = transition.new_status;
+        info!("Transfer {transfer_id} status: {prev_status:?} -> {new_status:?}");
     }
+
     Ok(())
 }
 
@@ -113,14 +143,6 @@ fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStat
         TransferStatus::Failed => info!("Transfer {transfer_id} failed"),
         _ => {}
     }
-}
-
-fn is_status_regression(prev: TransferStatus, next: TransferStatus) -> bool {
-    matches!(
-        (prev, next),
-        (TransferStatus::Processing, TransferStatus::Pending)
-            | (TransferStatus::Complete | TransferStatus::Failed, _)
-    )
 }
 
 /// Polls for a deposit transfer matching the given tx hash until it's detected and complete.
@@ -156,7 +178,7 @@ pub(super) async fn poll_deposit_by_tx_hash(
             continue;
         };
 
-        log_deposit_status_change(tx_hash, last_status, &transfer);
+        validate_and_log_deposit_status_change(*tx_hash, last_status, &transfer)?;
 
         match transfer.status {
             TransferStatus::Complete | TransferStatus::Failed => {
@@ -185,20 +207,32 @@ fn check_deposit_timeout(
     Ok(())
 }
 
-fn log_deposit_status_change(
-    tx_hash: &TxHash,
+fn validate_and_log_deposit_status_change(
+    tx_hash: TxHash,
     last_status: Option<TransferStatus>,
     transfer: &Transfer,
-) {
-    if let Some(prev_status) = last_status {
-        if prev_status != transfer.status {
-            let new_status = transfer.status;
-            info!(%tx_hash, "Deposit status: {prev_status:?} -> {new_status:?}");
-        }
-    } else {
+) -> Result<(), AlpacaWalletError> {
+    let Some(prev_status) = last_status else {
         let status = transfer.status;
         info!(%tx_hash, "Deposit detected with status: {status:?}");
+        return Ok(());
+    };
+
+    let transition =
+        parse_status_transition(prev_status, transfer.status).map_err(|(previous, next)| {
+            AlpacaWalletError::InvalidDepositTransition {
+                tx_hash,
+                previous,
+                next,
+            }
+        })?;
+
+    if transition.changed {
+        let new_status = transition.new_status;
+        info!(%tx_hash, "Deposit status: {prev_status:?} -> {new_status:?}");
     }
+
+    Ok(())
 }
 
 fn log_deposit_final_status(tx_hash: &TxHash, status: TransferStatus) {
@@ -535,67 +569,65 @@ mod tests {
     }
 
     #[test]
-    fn test_is_status_regression_processing_to_pending() {
-        assert!(is_status_regression(
-            TransferStatus::Processing,
-            TransferStatus::Pending
-        ));
+    fn test_parse_status_transition_processing_to_pending_is_regression() {
+        let result = parse_status_transition(TransferStatus::Processing, TransferStatus::Pending);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_is_status_regression_complete_to_any() {
-        assert!(is_status_regression(
-            TransferStatus::Complete,
-            TransferStatus::Pending
-        ));
-        assert!(is_status_regression(
-            TransferStatus::Complete,
-            TransferStatus::Processing
-        ));
-        assert!(is_status_regression(
-            TransferStatus::Complete,
-            TransferStatus::Failed
-        ));
+    fn test_parse_status_transition_complete_to_any_is_regression() {
+        assert!(
+            parse_status_transition(TransferStatus::Complete, TransferStatus::Pending).is_err()
+        );
+        assert!(
+            parse_status_transition(TransferStatus::Complete, TransferStatus::Processing).is_err()
+        );
+        assert!(parse_status_transition(TransferStatus::Complete, TransferStatus::Failed).is_err());
     }
 
     #[test]
-    fn test_is_status_regression_failed_to_any() {
-        assert!(is_status_regression(
-            TransferStatus::Failed,
-            TransferStatus::Pending
-        ));
-        assert!(is_status_regression(
-            TransferStatus::Failed,
-            TransferStatus::Processing
-        ));
-        assert!(is_status_regression(
-            TransferStatus::Failed,
-            TransferStatus::Complete
-        ));
+    fn test_parse_status_transition_failed_to_any_is_regression() {
+        assert!(parse_status_transition(TransferStatus::Failed, TransferStatus::Pending).is_err());
+        assert!(
+            parse_status_transition(TransferStatus::Failed, TransferStatus::Processing).is_err()
+        );
+        assert!(parse_status_transition(TransferStatus::Failed, TransferStatus::Complete).is_err());
     }
 
     #[test]
-    fn test_is_status_regression_valid_transitions() {
-        assert!(!is_status_regression(
-            TransferStatus::Pending,
-            TransferStatus::Processing
-        ));
-        assert!(!is_status_regression(
-            TransferStatus::Pending,
-            TransferStatus::Complete
-        ));
-        assert!(!is_status_regression(
-            TransferStatus::Pending,
-            TransferStatus::Failed
-        ));
-        assert!(!is_status_regression(
-            TransferStatus::Processing,
-            TransferStatus::Complete
-        ));
-        assert!(!is_status_regression(
-            TransferStatus::Processing,
-            TransferStatus::Failed
-        ));
+    fn test_parse_status_transition_valid_transitions() {
+        let result =
+            parse_status_transition(TransferStatus::Pending, TransferStatus::Processing).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.new_status, TransferStatus::Processing);
+
+        let result =
+            parse_status_transition(TransferStatus::Pending, TransferStatus::Complete).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.new_status, TransferStatus::Complete);
+
+        let result =
+            parse_status_transition(TransferStatus::Pending, TransferStatus::Failed).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.new_status, TransferStatus::Failed);
+
+        let result =
+            parse_status_transition(TransferStatus::Processing, TransferStatus::Complete).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.new_status, TransferStatus::Complete);
+
+        let result =
+            parse_status_transition(TransferStatus::Processing, TransferStatus::Failed).unwrap();
+        assert!(result.changed);
+        assert_eq!(result.new_status, TransferStatus::Failed);
+    }
+
+    #[test]
+    fn test_parse_status_transition_same_status_not_changed() {
+        let result =
+            parse_status_transition(TransferStatus::Pending, TransferStatus::Pending).unwrap();
+        assert!(!result.changed);
+        assert_eq!(result.new_status, TransferStatus::Pending);
     }
 
     #[tokio::test]

@@ -150,7 +150,11 @@ impl<B: Broker> OrderStatusPoller<B> {
     ) -> Result<(), OrderPollingError> {
         let execution = self.finalize_order(execution_id, order_state).await?;
 
-        log_filled_order(execution_id, order_state, &execution);
+        let OrderState::Filled { price_cents, .. } = order_state else {
+            return Ok(());
+        };
+
+        log_filled_order(execution_id, *price_cents, &execution);
 
         Ok(())
     }
@@ -217,16 +221,12 @@ fn extract_order_id(execution_id: i64, state: &OrderState) -> Option<String> {
     }
 }
 
-fn log_filled_order(execution_id: i64, order_state: &OrderState, execution: &OffchainExecution) {
+fn log_filled_order(execution_id: i64, price_cents: u64, execution: &OffchainExecution) {
     let symbol = &execution.symbol;
-    if let OrderState::Filled { price_cents, .. } = order_state {
-        info!(
-            execution_id,
-            price_cents,
-            %symbol,
-            "Updated execution to FILLED and cleared locks"
-        );
-    } else {
-        info!(execution_id, %symbol, "Updated execution to FILLED and cleared locks");
-    }
+    info!(
+        execution_id,
+        price_cents,
+        %symbol,
+        "Updated execution to FILLED and cleared locks"
+    );
 }

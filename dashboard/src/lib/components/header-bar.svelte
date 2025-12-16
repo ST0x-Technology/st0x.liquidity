@@ -1,7 +1,6 @@
 <script lang="ts">
   import * as Select from '$lib/components/ui/select'
   import { Badge } from '$lib/components/ui/badge'
-  import { Button } from '$lib/components/ui/button'
   import { Separator } from '$lib/components/ui/separator'
   import type { Broker } from '$lib/env'
   import type { ConnectionStatus } from '$lib/websocket.svelte'
@@ -56,9 +55,7 @@
     </div>
 
     <div class="flex items-center gap-2 md:gap-4">
-      <Button variant="outline" disabled class="hidden md:inline-flex">
-        Circuit Breaker
-      </Button>
+      <!-- TODO: Circuit Breaker button - implement with issues #178-184 -->
 
       <Badge variant={statusVariant}>
         {statusLabel}

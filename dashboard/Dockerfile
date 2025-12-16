@@ -13,6 +13,4 @@ FROM nginx:alpine
 COPY --from=builder /app/build /usr/share/nginx/html
 COPY nginx.conf /etc/nginx/templates/default.conf.template
 
-ENV BACKEND_HOST=localhost
-
 EXPOSE 80

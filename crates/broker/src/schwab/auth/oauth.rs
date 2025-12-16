@@ -200,7 +200,7 @@ impl SchwabAuthEnv {
 
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
                 action: "token request".to_string(),
                 status,
