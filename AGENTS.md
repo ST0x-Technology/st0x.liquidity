@@ -52,6 +52,20 @@ When the user asks a question or challenges your approach:
 This prevents wasted time on undirected exploration and ensures alignment on the
 implementation strategy.
 
+### When user action is required
+
+**CRITICAL**: The user is not reading every word of your output - they are
+monitoring your actions. When you need the user to do something (run a command,
+check output, provide input), you must ensure they see the request:
+
+- If you are **blocked** and cannot proceed without user action, STOP after
+  stating what you need. Do not continue working on other tasks.
+- If you are **not blocked**, you can continue working, but when you're ready to
+  stop, clearly state what you need from the user at the end of your response.
+
+The user checks your output when they see you've stopped. If you give them a
+command mid-response and keep working, they will miss it.
+
 ### Before creating a PR
 
 - **CRITICAL**: Delete PLAN.md before submitting changes for review
@@ -407,6 +421,11 @@ Environment variables (can be set via `.env` file):
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
   impossible
+- **No Duplicate Values in Debug Output**: Never hardcode values that exist
+  elsewhere in the implementation (URLs, paths, constants, config values, etc.)
+  into debug/log statements. These duplicates will inevitably drift out of sync
+  with the real implementation, misleading debugging efforts instead of helping
+  them. Always log the actual runtime value being used, not a hardcoded copy
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the
