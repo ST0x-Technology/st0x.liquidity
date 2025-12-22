@@ -49,6 +49,14 @@ When the user asks a question or challenges your approach:
 4. **Never assume silence or a question means approval to change direction.**
    Explicit confirmation is required before abandoning one approach for another.
 
+### When issues are pointed out
+
+When the user points out an issue, bug, or problem - fix it immediately. Do not
+ask "Want me to fix this?" or "Should I address this?". The user never sends
+messages just for the sake of it; when they point out issues, they expect action
+(usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
+context).
+
 This prevents wasted time on undirected exploration and ensures alignment on the
 implementation strategy.
 
