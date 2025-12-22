@@ -1,6 +1,6 @@
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::OnchainTrade;
 use crate::error::{OnChainError, TradeValidationError};
@@ -411,7 +411,7 @@ async fn clean_up_stale_executions(
 
     for stale_execution in stale_executions {
         let Some(execution_id) = stale_execution.id else {
-            tracing::warn!("Stale execution has null ID, skipping cleanup");
+            warn!("Stale execution has null ID, skipping cleanup");
             continue;
         };
 

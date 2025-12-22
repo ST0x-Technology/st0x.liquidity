@@ -12,6 +12,7 @@ mod conductor;
 pub mod env;
 mod equity_redemption;
 mod error;
+mod error_decoding;
 mod inventory;
 mod lifecycle;
 mod lock;

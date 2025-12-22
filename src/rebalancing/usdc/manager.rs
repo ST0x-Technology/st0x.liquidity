@@ -3,7 +3,7 @@
 //! Coordinates between `AlpacaWalletService`, `CctpBridge`, `VaultService`, and the
 //! `UsdcRebalance` aggregate to execute USDC transfers between Alpaca and Base.
 
-use alloy::primitives::{Address, Bytes, TxHash, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use async_trait::async_trait;

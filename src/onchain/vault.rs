@@ -11,15 +11,18 @@
 //! OrderBook V5 uses a custom float format (B256) for amounts. All conversions between
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
-use alloy::primitives::{Address, B256, TxHash, U256, address};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
+use alloy::sol_types::SolEvent;
+use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
+use tracing::{debug, info};
 
-use crate::bindings::IOrderBookV5;
+use crate::bindings::{IERC20, IOrderBookV5};
 use crate::cctp::Evm;
+use crate::error_decoding::handle_contract_error;
 
-const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
 
 /// Vault identifier for Rain OrderBook vaults.
