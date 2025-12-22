@@ -1,16 +1,17 @@
-# Add Alpaca Broker API + Rename Existing for Clarity
+# Add Alpaca Broker API + Rename for Clarity
 
 ## Overview
 
-1. Rename existing Alpaca Trading API broker for clarity
-2. Add new Alpaca Broker API broker
+1. Rename crate `st0x-broker` → `st0x-execution` and trait `Broker` → `Executor`
+2. Rename existing Alpaca types to have `TradingApi` suffix
+3. Add new Alpaca Broker API implementation
 
 **Final naming:**
 
-| API                    | Module           | Struct                | CLI Value        | SupportedBroker |
-| ---------------------- | ---------------- | --------------------- | ---------------- | --------------- |
-| Trading API (existing) | `alpaca_trading` | `AlpacaTradingBroker` | `alpaca-trading` | `AlpacaTrading` |
-| Broker API (new)       | `alpaca_broker`  | `AlpacaBrokerBroker`  | `alpaca-broker`  | `AlpacaBroker`  |
+| API                    | Module   | Struct             | CLI Value            | SupportedExecutor  |
+| ---------------------- | -------- | ------------------ | -------------------- | ------------------ |
+| Trading API (existing) | `alpaca` | `AlpacaTradingApi` | `alpaca-trading-api` | `AlpacaTradingApi` |
+| Broker API (new)       | `alpaca` | `AlpacaBrokerApi`  | `alpaca-broker-api`  | `AlpacaBrokerApi`  |
 
 **Key API Differences:**
 
@@ -22,69 +23,95 @@
 
 ---
 
-## Task 1. Rename Existing Alpaca Module
+## Task 1. Rename Crate and Core Types
 
-Rename `alpaca` → `alpaca_trading` and update all references.
+Rename the crate and trait to avoid "BrokerBroker" naming confusion.
 
-**File renames:**
+**Crate rename:**
 
-- `crates/broker/src/alpaca/` → `crates/broker/src/alpaca_trading/`
+- `crates/broker/` stays as directory (cargo package name changes)
+- `Cargo.toml`: `name = "st0x-broker"` → `name = "st0x-execution"`
 
-**Struct renames in broker crate:**
+**Core type renames in `crates/broker/src/lib.rs`:**
 
-- `AlpacaAuthEnv` → `AlpacaTradingAuthEnv`
-- `AlpacaBroker` → `AlpacaTradingBroker`
-- `AlpacaClient` → `AlpacaTradingClient`
+- `Broker` trait → `Executor` trait
+- `SupportedBroker` enum → `SupportedExecutor` enum
+- `BrokerError` → `ExecutionError`
+- `TryIntoBroker` trait → `TryIntoExecutor` trait
+- Method: `to_supported_broker()` → `to_supported_executor()`
+- Method: `run_broker_maintenance()` → `run_executor_maintenance()`
 
-**Changes in `crates/broker/src/lib.rs`:**
+**Update imports in main crate:**
 
-- `pub mod alpaca;` → `pub mod alpaca_trading;`
-- `pub use alpaca::AlpacaBroker;` →
-  `pub use alpaca_trading::AlpacaTradingBroker;`
-- `use alpaca::{AlpacaAuthEnv, ...}` →
-  `use alpaca_trading::{AlpacaTradingAuthEnv, ...}`
-- `SupportedBroker::Alpaca` → `SupportedBroker::AlpacaTrading`
-
-**Changes in main crate:**
-
-- `src/env.rs`: `BrokerConfig::Alpaca` → `BrokerConfig::AlpacaTrading`
-- `src/lib.rs`: Update broker handling
-- `src/rebalancing/spawn.rs`: Update imports
+- `use st0x_broker::` → `use st0x_execution::`
+- Update all references to renamed types
 
 **Subtasks:**
 
-- [ ] Rename directory `alpaca` → `alpaca_trading`
-- [ ] Rename structs in broker crate files
-- [ ] Update `crates/broker/src/lib.rs` exports and SupportedBroker
-- [ ] Update `src/env.rs` BrokerConfig enum
-- [ ] Update `src/lib.rs` launch logic
+- [ ] Update `crates/broker/Cargo.toml` package name
+- [ ] Rename trait and types in `crates/broker/src/lib.rs`
+- [ ] Update `src/env.rs` imports and type references
+- [ ] Update `src/lib.rs` imports and type references
 - [ ] Update `src/rebalancing/spawn.rs` imports
-- [ ] Update any other references
+- [ ] Update root `Cargo.toml` workspace member reference if needed
 - [ ] Run `cargo test -q` - all tests must pass
 - [ ] Run `cargo clippy` - no warnings
 
 ---
 
-## Task 2. Implement Alpaca Broker API Configuration and HTTP Client
+## Task 2. Rename Existing Alpaca Types
 
-Create `alpaca_broker` module with configuration types and HTTP client.
+Add `TradingApi` suffix to existing Alpaca types for clarity.
 
-**Files to create:**
+**Type renames in `crates/broker/src/alpaca/`:**
 
-- `crates/broker/src/alpaca_broker/mod.rs`
-- `crates/broker/src/alpaca_broker/auth.rs`
+- `AlpacaBroker` → `AlpacaTradingApi`
+- `AlpacaAuthEnv` → `AlpacaTradingApiAuthEnv`
+- `AlpacaClient` → `AlpacaTradingApiClient`
+- `AlpacaMode` → `AlpacaTradingApiMode`
 
-**Types in `auth.rs`:**
+**Enum variant renames:**
+
+- `SupportedExecutor::Alpaca` → `SupportedExecutor::AlpacaTradingApi`
+- `ExecutorConfig::Alpaca` → `ExecutorConfig::AlpacaTradingApi`
+
+**CLI/Display updates:**
+
+- `"alpaca"` → `"alpaca-trading-api"`
+
+**Subtasks:**
+
+- [ ] Rename types in `crates/broker/src/alpaca/` files
+- [ ] Update exports in `crates/broker/src/alpaca/mod.rs`
+- [ ] Update `crates/broker/src/lib.rs` exports and enum variants
+- [ ] Update `src/env.rs` enum variants
+- [ ] Update `src/lib.rs` match arms
+- [ ] Update `src/rebalancing/spawn.rs` type references
+- [ ] Run `cargo test -q` - all tests must pass
+- [ ] Run `cargo clippy` - no warnings
+
+---
+
+## Task 3. Implement Alpaca Broker API Client
+
+Create client infrastructure for Broker API authentication and HTTP requests.
+
+**Files to create in `crates/broker/src/alpaca/`:**
+
+- `broker_api_auth.rs` - Auth config and HTTP client
+- `broker_api.rs` - Executor implementation
+
+**Types in `broker_api_auth.rs`:**
 
 ```rust
-pub enum AlpacaBrokerMode {
+pub enum AlpacaBrokerApiMode {
     Sandbox,      // broker-api.sandbox.alpaca.markets
     Production,   // broker-api.alpaca.markets
     #[cfg(test)] Mock(String),
 }
 
 #[derive(Parser)]
-pub struct AlpacaBrokerAuthEnv {
+pub struct AlpacaBrokerApiAuthEnv {
     #[clap(long, env = "ALPACA_BROKER_API_KEY")]
     pub alpaca_broker_api_key: String,
 
@@ -94,11 +121,11 @@ pub struct AlpacaBrokerAuthEnv {
     #[clap(long, env = "ALPACA_ACCOUNT_ID")]
     pub alpaca_account_id: String,
 
-    #[clap(long, env = "ALPACA_BROKER_MODE", default_value = "sandbox")]
-    pub alpaca_broker_mode: AlpacaBrokerMode,
+    #[clap(long, env = "ALPACA_BROKER_API_MODE", default_value = "sandbox")]
+    pub alpaca_broker_api_mode: AlpacaBrokerApiMode,
 }
 
-pub(crate) struct AlpacaBrokerClient { ... }
+pub(crate) struct AlpacaBrokerApiClient { ... }
 ```
 
 **HTTP client requirements:**
@@ -110,20 +137,17 @@ pub(crate) struct AlpacaBrokerClient { ... }
 
 **Subtasks:**
 
-- [ ] Create `mod.rs` with private module declarations
-- [ ] Create `AlpacaBrokerMode` enum with `base_url()` method
-- [ ] Create `AlpacaBrokerAuthEnv` config struct with clap parsing
-- [ ] Create `AlpacaBrokerClient` HTTP client with dual auth
-- [ ] Create `AlpacaBrokerError` error type
+- [ ] Create `AlpacaBrokerApiMode` enum with `base_url()` method
+- [ ] Create `AlpacaBrokerApiAuthEnv` config struct with clap parsing
+- [ ] Create `AlpacaBrokerApiClient` HTTP client with dual auth
+- [ ] Create `AlpacaBrokerApiError` error type
 - [ ] Implement Debug that redacts secrets
 - [ ] Add tests for config parsing, URL selection, HTTP methods
-- [ ] Run `cargo test -p st0x-broker -q` - all tests must pass
+- [ ] Run `cargo test -p st0x-execution -q` - all tests must pass
 
 ---
 
-## Task 3. Implement Market Hours
-
-**File:** `crates/broker/src/alpaca_broker/market_hours.rs`
+## Task 4. Implement Market Hours
 
 **Endpoint:** `GET /v1/trading/accounts/{account_id}/clock`
 
@@ -140,23 +164,20 @@ struct ClockResponse {
 
 **Subtasks:**
 
-- [ ] Create `ClockResponse` struct
-- [ ] Implement `wait_until_market_open()` function
+- [ ] Create `ClockResponse` struct in `broker_api_auth.rs`
+- [ ] Implement `wait_until_market_open()` method on client
 - [ ] Add tests with mocked clock responses (market open, market closed)
-- [ ] Run `cargo test -p st0x-broker -q` - all tests must pass
+- [ ] Run `cargo test -p st0x-execution -q` - all tests must pass
 
 ---
 
-## Task 4. Implement Order Operations
-
-**File:** `crates/broker/src/alpaca_broker/order.rs`
+## Task 5. Implement Order Operations
 
 **Endpoints:**
 
 - `POST /v1/trading/accounts/{account_id}/orders` - Place order
 - `GET /v1/trading/accounts/{account_id}/orders/{order_id}` - Get order status
 - `GET /v1/trading/accounts/{account_id}/orders?status=open` - List pending
-  orders
 
 **Request/Response structs:**
 
@@ -176,124 +197,84 @@ struct OrderResponse {
     side: String,
     status: String,
     filled_avg_price: Option<String>,
-    // ...
 }
 ```
 
 **Subtasks:**
 
 - [ ] Create `OrderRequest` and `OrderResponse` structs
-- [ ] Implement `place_market_order()` function
-- [ ] Implement `get_order_status()` function
-- [ ] Implement `poll_pending_orders()` function
-- [ ] Implement `map_alpaca_status()` helper for status mapping
-- [ ] Add tests: place buy/sell, get status (pending/filled/rejected), poll
-      multiple orders
-- [ ] Run `cargo test -p st0x-broker -q` - all tests must pass
+- [ ] Implement `place_market_order()` method
+- [ ] Implement `get_order_status()` method
+- [ ] Implement `poll_pending_orders()` method
+- [ ] Add tests for order operations
+- [ ] Run `cargo test -p st0x-execution -q` - all tests must pass
 
 ---
 
-## Task 5. Implement Broker Trait
+## Task 6. Implement Executor Trait
 
-**File:** `crates/broker/src/alpaca_broker/broker.rs`
+**File:** `crates/broker/src/alpaca/broker_api.rs`
 
 ```rust
-pub struct AlpacaBrokerBroker {
-    client: Arc<AlpacaBrokerClient>,
+pub struct AlpacaBrokerApi {
+    client: Arc<AlpacaBrokerApiClient>,
 }
 
-impl Broker for AlpacaBrokerBroker {
-    type Error = BrokerError;
+impl Executor for AlpacaBrokerApi {
+    type Error = ExecutionError;
     type OrderId = String;  // UUID format
-    type Config = AlpacaBrokerAuthEnv;
+    type Config = AlpacaBrokerApiAuthEnv;
 }
 ```
 
 **Trait methods:**
 
 - `try_from_config` - Create client, verify account
-- `wait_until_market_open` - Delegate to market_hours
-- `place_market_order` - Delegate to order
-- `get_order_status` - Delegate to order
-- `poll_pending_orders` - Delegate to order
-- `to_supported_broker` - Return `SupportedBroker::AlpacaBroker`
+- `wait_until_market_open` - Delegate to client
+- `place_market_order` - Delegate to client
+- `get_order_status` - Delegate to client
+- `poll_pending_orders` - Delegate to client
+- `to_supported_executor` - Return `SupportedExecutor::AlpacaBrokerApi`
 - `parse_order_id` - Validate UUID format
-- `run_broker_maintenance` - Return None (API keys, no refresh)
+- `run_executor_maintenance` - Return None (API keys, no refresh)
 
 **Subtasks:**
 
-- [ ] Implement all 8 Broker trait methods
-- [ ] Add tests for broker initialization (valid/invalid credentials)
+- [ ] Implement all 8 Executor trait methods
+- [ ] Add tests for executor initialization
 - [ ] Add tests for parse_order_id (valid/invalid UUID)
-- [ ] Run `cargo test -p st0x-broker -q` - all tests must pass
+- [ ] Run `cargo test -p st0x-execution -q` - all tests must pass
 
 ---
 
-## Task 6. Update Broker Crate Exports
+## Task 7. Update Exports and Main Crate Integration
 
 **Changes to `crates/broker/src/lib.rs`:**
 
-- Add `pub mod alpaca_broker;`
-- Add `pub use alpaca_broker::AlpacaBrokerBroker;`
-- Add `SupportedBroker::AlpacaBroker` variant
+- Add `SupportedExecutor::AlpacaBrokerApi` variant
 - Update `Display` and `FromStr` for new variant
-- Add `TryIntoBroker` impl for `AlpacaBrokerAuthEnv`
+- Add `TryIntoExecutor` impl for `AlpacaBrokerApiAuthEnv`
+- Export `AlpacaBrokerApi` and `AlpacaBrokerApiAuthEnv`
+
+**Changes to `src/env.rs`:**
+
+- Add `ExecutorConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv)`
+- Update `into_config()` parsing
+- Update `to_supported_executor()`
+
+**Changes to `src/lib.rs`:**
+
+- Add handling for `ExecutorConfig::AlpacaBrokerApi` in launch logic
 
 **Subtasks:**
 
-- [ ] Add module declaration and export
-- [ ] Add `SupportedBroker::AlpacaBroker` variant
-- [ ] Update `Display::fmt` to return `"alpaca_broker"`
-- [ ] Update `FromStr::from_str` to parse `"alpaca-broker"`
-- [ ] Add `TryIntoBroker` implementation
-- [ ] Run `cargo test -p st0x-broker -q` - all tests must pass
-
----
-
-## Task 7. Update Main Crate
-
-**`src/env.rs`:**
-
-- Add import for `AlpacaBrokerAuthEnv`
-- Add `BrokerConfig::AlpacaBroker(AlpacaBrokerAuthEnv)`
-- Update `into_config()` parsing for `SupportedBroker::AlpacaBroker`
-- Update `to_supported_broker()` for new variant
-
-**`src/lib.rs`:**
-
-- Add handling for `BrokerConfig::AlpacaBroker` in launch logic
-
-**Subtasks:**
-
-- [ ] Update `src/env.rs` with new BrokerConfig variant
+- [ ] Update `crates/broker/src/alpaca/mod.rs` exports
+- [ ] Update `crates/broker/src/lib.rs` with new variant and impl
+- [ ] Update `src/env.rs` with new ExecutorConfig variant
 - [ ] Update `src/lib.rs` launch handling
-- [ ] Add test for new broker config parsing
 - [ ] Run `cargo test -q` - all tests must pass
 - [ ] Run `cargo clippy` - no warnings
 - [ ] Run `cargo fmt`
-
----
-
-## Files Summary
-
-**Renamed:**
-
-- `crates/broker/src/alpaca/` → `crates/broker/src/alpaca_trading/`
-
-**New:**
-
-- `crates/broker/src/alpaca_broker/mod.rs`
-- `crates/broker/src/alpaca_broker/auth.rs`
-- `crates/broker/src/alpaca_broker/broker.rs`
-- `crates/broker/src/alpaca_broker/market_hours.rs`
-- `crates/broker/src/alpaca_broker/order.rs`
-
-**Modified:**
-
-- `crates/broker/src/lib.rs`
-- `src/env.rs`
-- `src/lib.rs`
-- `src/rebalancing/spawn.rs`
 
 ---
 
@@ -310,14 +291,14 @@ impl Broker for AlpacaBrokerBroker {
 - `ALPACA_BROKER_API_KEY`
 - `ALPACA_BROKER_API_SECRET`
 - `ALPACA_ACCOUNT_ID`
-- `ALPACA_BROKER_MODE` (sandbox/production)
+- `ALPACA_BROKER_API_MODE` (sandbox/production)
 
 **CLI Usage:**
 
 ```bash
 # Trading API
---broker alpaca-trading
+--executor alpaca-trading-api
 
 # Broker API
---broker alpaca-broker
+--executor alpaca-broker-api
 ```
