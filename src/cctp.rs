@@ -8,8 +8,7 @@
 //! Circle CCTP enables native USDC transfers between blockchains by burning on the
 //! source chain and minting on the destination chain. This implementation uses
 //! **CCTP V2 Fast Transfer** which reduces transfer time from 13-19 minutes per chain
-//! to approximately **30 seconds total** (20s on Ethereum + 8s on Base) for a cost of
-//! 1 basis point (0.01%) per transfer.
+//! to ~40-70 seconds for a cost of 1 basis point (0.01%) per transfer.
 //!
 //! ## Supported Chains
 //!
@@ -43,18 +42,22 @@
 //! `depositForBurn()` call. The fee is dynamically queried from Circle's API
 //! (`/v2/burn/USDC/fees`) before each burn operation.
 //!
-//! **Timing**: ~30 seconds total (20s Ethereum finality + 8s Base finality)
+//! **Timing**: ~40s Base->Ethereum, ~70s Ethereum->Base (measured)
 //! **Cost**: 1 basis point (0.01%) of transfer amount
 
-use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address, keccak256};
+use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use backon::Retryable;
+use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use tracing::{debug, info, warn};
 
 use crate::bindings::IERC20;
+use crate::error_decoding::handle_contract_error;
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -78,8 +81,38 @@ const ETHEREUM_DOMAIN: u32 = 0;
 /// CCTP domain identifier for Base
 const BASE_DOMAIN: u32 = 6;
 
+/// Direction of a CCTP bridge transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BridgeDirection {
+    /// Bridge USDC from Ethereum to Base
+    EthereumToBase,
+    /// Bridge USDC from Base to Ethereum
+    BaseToEthereum,
+}
+
+impl BridgeDirection {
+    /// Returns the source CCTP domain for this bridge direction.
+    const fn source_domain(self) -> u32 {
+        match self {
+            Self::EthereumToBase => ETHEREUM_DOMAIN,
+            Self::BaseToEthereum => BASE_DOMAIN,
+        }
+    }
+
+    /// Returns the destination CCTP domain for this bridge direction.
+    const fn dest_domain(self) -> u32 {
+        match self {
+            Self::EthereumToBase => BASE_DOMAIN,
+            Self::BaseToEthereum => ETHEREUM_DOMAIN,
+        }
+    }
+}
+
 pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+
+pub(crate) const USDC_ETHEREUM_SEPOLIA: Address =
+    address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
 
 pub(crate) const TOKEN_MESSENGER_V2: Address =
     address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
@@ -92,20 +125,29 @@ const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
 const FAST_TRANSFER_THRESHOLD: u32 = 1000;
 
 /// Receipt from burning USDC on the source chain.
-///
-/// Contains all information needed to poll for attestation and mint on the destination chain.
 #[derive(Debug)]
 pub(crate) struct BurnReceipt {
     /// Transaction hash of the burn transaction
     pub(crate) tx: TxHash,
     /// CCTP message nonce (extracted from message bytes at index 12-44)
     pub(crate) nonce: FixedBytes<32>,
-    /// Keccak256 hash of the CCTP message (used for attestation polling)
-    pub(crate) hash: FixedBytes<32>,
-    /// Full CCTP message bytes (passed to `receiveMessage()` on destination)
-    pub(crate) message: Bytes,
     /// Amount of USDC burned (in smallest unit, 6 decimals for USDC)
     pub(crate) amount: U256,
+}
+
+/// Response from Circle's attestation API for CCTP V2.
+///
+/// Contains both the CCTP message bytes and the Circle attestation signature,
+/// which together are required to call `receiveMessage()` on the destination chain.
+#[derive(Debug)]
+pub(crate) struct AttestationResponse {
+    /// CCTP message bytes from the attestation API.
+    /// This should match the message from the burn transaction but is
+    /// returned by Circle's API for consistency.
+    pub(crate) message: Bytes,
+    /// Circle's attestation signature for the message.
+    /// Required to prove the burn happened and authorize minting.
+    pub(crate) attestation: Bytes,
 }
 
 /// EVM chain connection with provider, signer, and contract instances.
@@ -163,8 +205,14 @@ where
 /// # Example
 ///
 /// ```rust,ignore
-/// let ethereum = Evm::new(eth_provider, eth_signer, USDC_ETHEREUM, TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2);
-/// let base = Evm::new(base_provider, base_signer, USDC_BASE, TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2);
+/// let ethereum = Evm::new(
+///     eth_provider, eth_signer, USDC_ETHEREUM,
+///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+/// );
+/// let base = Evm::new(
+///     base_provider, base_signer, USDC_BASE,
+///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+/// );
 /// let bridge = CctpBridge::new(ethereum, base);
 ///
 /// let amount = U256::from(1_000_000); // 1 USDC
@@ -189,6 +237,8 @@ pub(crate) enum CctpError {
     Transaction(#[from] alloy::providers::PendingTransactionError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
+    #[error("Contract reverted: {0}")]
+    Revert(#[from] AbiDecodedErrorType),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -200,6 +250,8 @@ pub(crate) enum CctpError {
     MessageSentEventNotFound,
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
+    #[error("Fast transfer fee not available for {direction:?}")]
+    FastTransferFeeNotAvailable { direction: BridgeDirection },
     #[error("Invalid hex encoding: {0}")]
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
@@ -213,14 +265,28 @@ pub(crate) enum AttestationError {
     Http(#[from] reqwest::Error),
     #[error("Invalid hex encoding: {0}")]
     HexDecode(#[from] alloy::hex::FromHexError),
-    #[error("Attestation not ready")]
-    NotReady,
+    #[error("Failed to parse attestation response: {0}")]
+    JsonParse(#[from] serde_json::Error),
+    #[error("Attestation pending: {status}")]
+    Pending { status: String },
+    #[error("No messages in attestation response")]
+    NoMessages,
+    #[error("Attestation response missing required field: {field}")]
+    MissingField { field: &'static str },
+    #[error("Attestation not yet available (HTTP {status})")]
+    NotYetAvailable { status: u16 },
 }
 
-#[derive(Deserialize)]
-struct FeeResponse {
-    #[serde(rename = "minFee")]
-    min_fee: String,
+/// Fee entry from Circle's `/v2/burn/USDC/fees/{source}/{dest}` API.
+///
+/// The API returns an array of these entries, one per finality threshold level.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct FeeEntry {
+    /// Finality threshold: 1000 = fast transfer, 2000 = standard transfer
+    finality_threshold: u32,
+    /// Minimum fee in basis points (1 = 0.01%)
+    minimum_fee: u64,
 }
 
 impl<EP, BP, S> CctpBridge<EP, BP, S>
@@ -238,22 +304,65 @@ where
         }
     }
 
-    #[cfg(test)]
-    fn with_circle_api_base(mut self, base_url: String) -> Self {
-        self.circle_api_base = base_url;
-        self
+    /// Creates a bridge configured for mainnet (Ethereum <-> Base).
+    pub(crate) fn mainnet(ethereum_provider: EP, base_provider: BP, signer: S) -> Self {
+        let ethereum = Evm::new(
+            ethereum_provider,
+            signer.clone(),
+            USDC_ETHEREUM,
+            TOKEN_MESSENGER_V2,
+            MESSAGE_TRANSMITTER_V2,
+        );
+        let base = Evm::new(
+            base_provider,
+            signer,
+            USDC_BASE,
+            TOKEN_MESSENGER_V2,
+            MESSAGE_TRANSMITTER_V2,
+        );
+        Self::new(ethereum, base)
     }
 
-    async fn query_fast_transfer_fee(&self, amount: U256) -> Result<U256, CctpError> {
-        let url = format!("{}/v2/burn/USDC/fees", self.circle_api_base);
+    async fn query_fast_transfer_fee(
+        &self,
+        amount: U256,
+        direction: BridgeDirection,
+    ) -> Result<U256, CctpError> {
+        let url = format!(
+            "{}/v2/burn/USDC/fees/{}/{}",
+            self.circle_api_base,
+            direction.source_domain(),
+            direction.dest_domain()
+        );
         let response = self.http_client.get(&url).send().await?;
 
-        let fee_response: FeeResponse = response.json().await?;
+        if !response.status().is_success() {
+            warn!(
+                url,
+                status = response.status().as_u16(),
+                "Fee endpoint failed"
+            );
+            return Err(CctpError::FastTransferFeeNotAvailable { direction });
+        }
 
-        let fee_bps: u64 = fee_response.min_fee.parse()?;
+        let fee_entries: Vec<FeeEntry> = response.json().await?;
 
+        // Find the fast transfer fee (threshold 1000)
+        let fast_fee = fee_entries
+            .iter()
+            .find(|e| e.finality_threshold == FAST_TRANSFER_THRESHOLD)
+            .ok_or(CctpError::FastTransferFeeNotAvailable { direction })?
+            .minimum_fee;
+
+        debug!(
+            ?direction,
+            fast_fee_bps = fast_fee,
+            "Retrieved fast transfer fee"
+        );
+
+        // Calculate maxFee: amount * fee_bps / 10000
         let max_fee = amount
-            .checked_mul(U256::from(fee_bps))
+            .checked_mul(U256::from(fast_fee))
             .ok_or(CctpError::FeeCalculationOverflow)?
             / U256::from(10000u64);
 
@@ -267,13 +376,11 @@ where
         let allowance = self.ethereum.usdc.allowance(owner, spender).call().await?;
 
         if allowance < amount {
-            self.ethereum
-                .usdc
-                .approve(spender, amount)
-                .send()
-                .await?
-                .get_receipt()
-                .await?;
+            let pending = match self.ethereum.usdc.approve(spender, amount).send().await {
+                Ok(pending) => pending,
+                Err(e) => return Err(handle_contract_error(e).await),
+            };
+            pending.get_receipt().await?;
         }
 
         Ok(())
@@ -286,13 +393,11 @@ where
         let allowance = self.base.usdc.allowance(owner, spender).call().await?;
 
         if allowance < amount {
-            self.base
-                .usdc
-                .approve(spender, amount)
-                .send()
-                .await?
-                .get_receipt()
-                .await?;
+            let pending = match self.base.usdc.approve(spender, amount).send().await {
+                Ok(pending) => pending,
+                Err(e) => return Err(handle_contract_error(e).await),
+            };
+            pending.get_receipt().await?;
         }
 
         Ok(())
@@ -305,7 +410,9 @@ where
     ) -> Result<BurnReceipt, CctpError> {
         self.ensure_usdc_approval_ethereum(amount).await?;
 
-        let max_fee = self.query_fast_transfer_fee(amount).await?;
+        let direction = BridgeDirection::EthereumToBase;
+        let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+        info!(%max_fee, %amount, "Calculated maxFee for fast transfer");
 
         let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
 
@@ -313,17 +420,26 @@ where
         // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
         let destination_caller = FixedBytes::<32>::ZERO;
 
-        let call = self.ethereum.token_messenger.depositForBurn(
-            amount,
-            BASE_DOMAIN,
-            recipient_bytes32,
-            *self.ethereum.usdc.address(),
-            destination_caller,
-            max_fee,
-            FAST_TRANSFER_THRESHOLD,
-        );
+        let pending = match self
+            .ethereum
+            .token_messenger
+            .depositForBurn(
+                amount,
+                direction.dest_domain(),
+                recipient_bytes32,
+                *self.ethereum.usdc.address(),
+                destination_caller,
+                max_fee,
+                FAST_TRANSFER_THRESHOLD,
+            )
+            .send()
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
 
-        let receipt = call.send().await?.get_receipt().await?;
+        let receipt = pending.get_receipt().await?;
 
         let message_sent_event = receipt
             .inner
@@ -333,7 +449,6 @@ where
             .ok_or(CctpError::MessageSentEventNotFound)?;
 
         let message = message_sent_event.message.clone();
-        let hash = keccak256(&message);
 
         const NONCE_INDEX: usize = 12;
         let nonce = FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + 32]);
@@ -341,44 +456,114 @@ where
         Ok(BurnReceipt {
             tx: receipt.transaction_hash,
             nonce,
-            hash,
-            message,
             amount,
         })
     }
 
-    pub(crate) async fn poll_attestation(&self, hash: FixedBytes<32>) -> Result<Bytes, CctpError> {
+    /// Polls for attestation using CCTP V2 API.
+    pub(crate) async fn poll_attestation(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<AttestationResponse, CctpError> {
         const MAX_ATTEMPTS: usize = 60;
         const RETRY_INTERVAL_SECS: u64 = 5;
 
-        let url = format!("{CIRCLE_API_BASE}/attestations/{hash}");
+        // V2 API: /v2/messages/{sourceDomainId}?transactionHash={txHash}
+        let url = format!(
+            "{}/v2/messages/{}?transactionHash={tx_hash}",
+            self.circle_api_base,
+            direction.source_domain()
+        );
+
+        info!(%url, "Polling attestation API");
 
         let backoff = backon::ConstantBuilder::default()
             .with_delay(std::time::Duration::from_secs(RETRY_INTERVAL_SECS))
             .with_max_times(MAX_ATTEMPTS);
 
-        #[derive(Deserialize)]
-        struct AttestationResponse {
-            attestation: String,
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "camelCase")]
+        struct MessageEntry {
+            attestation: Option<String>,
+            message: Option<String>,
+            status: String,
+            #[serde(default)]
+            src_domain: Option<u32>,
+            #[serde(default)]
+            dest_domain: Option<u32>,
+            #[serde(default)]
+            delay_reason: Option<String>,
         }
 
+        #[derive(Deserialize, Debug)]
+        struct V2Response {
+            messages: Vec<MessageEntry>,
+        }
+
+        let attempt_counter = AtomicUsize::new(0);
+        let logged_first_response = AtomicBool::new(false);
+
         let fetch_attestation = || async {
+            let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
             let response = self.http_client.get(&url).send().await?;
 
             if !response.status().is_success() {
-                return Err(AttestationError::NotReady);
+                let status = response.status().as_u16();
+                debug!(attempt, status, "V2 attestation API non-success");
+                return Err(AttestationError::NotYetAvailable { status });
             }
 
-            let attestation_response: AttestationResponse = response.json().await?;
+            // Log raw response on first attempt for debugging
+            let body = response.text().await?;
+            if !logged_first_response.swap(true, Ordering::Relaxed) {
+                info!(attempt, body = %body, "First attestation API response");
+            }
 
-            let attestation_hex = attestation_response
-                .attestation
-                .strip_prefix("0x")
-                .unwrap_or(&attestation_response.attestation);
+            let v2_response: V2Response = serde_json::from_str(&body)?;
+
+            let entry = v2_response
+                .messages
+                .first()
+                .ok_or(AttestationError::NoMessages)?;
+
+            if let Some(ref reason) = entry.delay_reason {
+                warn!(attempt, %reason, "Attestation delayed");
+            } else {
+                info!(
+                    attempt,
+                    status = %entry.status,
+                    src_domain = ?entry.src_domain,
+                    dest_domain = ?entry.dest_domain,
+                    "Polling V2 attestation"
+                );
+            }
+
+            if entry.status != "complete" {
+                return Err(AttestationError::Pending {
+                    status: entry.status.clone(),
+                });
+            }
+
+            let attestation_hex =
+                entry
+                    .attestation
+                    .as_ref()
+                    .ok_or(AttestationError::MissingField {
+                        field: "attestation",
+                    })?;
+            let message_hex = entry
+                .message
+                .as_ref()
+                .ok_or(AttestationError::MissingField { field: "message" })?;
 
             let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+            let message_bytes = alloy::hex::decode(message_hex)?;
 
-            Ok(Bytes::from(attestation_bytes))
+            Ok(AttestationResponse {
+                message: Bytes::from(message_bytes),
+                attestation: Bytes::from(attestation_bytes),
+            })
         };
 
         fetch_attestation
@@ -395,12 +580,18 @@ where
         message: Bytes,
         attestation: Bytes,
     ) -> Result<TxHash, CctpError> {
-        let call = self
+        let pending = match self
             .base
             .message_transmitter
-            .receiveMessage(message, attestation);
+            .receiveMessage(message, attestation)
+            .send()
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
 
-        let receipt = call.send().await?.get_receipt().await?;
+        let receipt = pending.get_receipt().await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -415,7 +606,9 @@ where
     ) -> Result<BurnReceipt, CctpError> {
         self.ensure_usdc_approval_base(amount).await?;
 
-        let max_fee = self.query_fast_transfer_fee(amount).await?;
+        let direction = BridgeDirection::BaseToEthereum;
+        let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+        info!(%max_fee, %amount, "Calculated maxFee for fast transfer");
 
         let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
 
@@ -423,17 +616,26 @@ where
         // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
         let destination_caller = FixedBytes::<32>::ZERO;
 
-        let call = self.base.token_messenger.depositForBurn(
-            amount,
-            ETHEREUM_DOMAIN,
-            recipient_bytes32,
-            *self.base.usdc.address(),
-            destination_caller,
-            max_fee,
-            FAST_TRANSFER_THRESHOLD,
-        );
+        let pending = match self
+            .base
+            .token_messenger
+            .depositForBurn(
+                amount,
+                direction.dest_domain(),
+                recipient_bytes32,
+                *self.base.usdc.address(),
+                destination_caller,
+                max_fee,
+                FAST_TRANSFER_THRESHOLD,
+            )
+            .send()
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
 
-        let receipt = call.send().await?.get_receipt().await?;
+        let receipt = pending.get_receipt().await?;
 
         let message_sent_event = receipt
             .inner
@@ -443,7 +645,6 @@ where
             .ok_or(CctpError::MessageSentEventNotFound)?;
 
         let message = message_sent_event.message.clone();
-        let hash = keccak256(&message);
 
         const NONCE_INDEX: usize = 12;
         let nonce = FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + 32]);
@@ -451,8 +652,6 @@ where
         Ok(BurnReceipt {
             tx: receipt.transaction_hash,
             nonce,
-            hash,
-            message,
             amount,
         })
     }
@@ -465,29 +664,68 @@ where
         message: Bytes,
         attestation: Bytes,
     ) -> Result<TxHash, CctpError> {
-        let call = self
+        let pending = match self
             .ethereum
             .message_transmitter
-            .receiveMessage(message, attestation);
+            .receiveMessage(message, attestation)
+            .send()
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
 
-        let receipt = call.send().await?.get_receipt().await?;
+        let receipt = pending.get_receipt().await?;
 
         Ok(receipt.transaction_hash)
+    }
+
+    /// Burns USDC on the source chain for the given bridge direction.
+    pub(crate) async fn burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<BurnReceipt, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.burn_on_ethereum(amount, recipient).await,
+            BridgeDirection::BaseToEthereum => self.burn_on_base(amount, recipient).await,
+        }
+    }
+
+    /// Mints USDC on the destination chain for the given bridge direction.
+    pub(crate) async fn mint(
+        &self,
+        direction: BridgeDirection,
+        message: Bytes,
+        attestation: Bytes,
+    ) -> Result<TxHash, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.mint_on_base(message, attestation).await,
+            BridgeDirection::BaseToEthereum => self.mint_on_ethereum(message, attestation).await,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_circle_api_base(mut self, base_url: String) -> Self {
+        self.circle_api_base = base_url;
+        self
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, b256};
+    use alloy::primitives::{B256, b256, keccak256};
     use alloy::providers::ProviderBuilder;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
     use httpmock::prelude::*;
     use rand::Rng;
+
+    use super::*;
 
     fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
@@ -576,15 +814,13 @@ mod tests {
             let response = bridge.http_client.get(&url).send().await?;
 
             if !response.status().is_success() {
-                return Err(AttestationError::NotReady);
+                return Err(AttestationError::NotYetAvailable {
+                    status: response.status().as_u16(),
+                });
             }
 
             let attestation_response: AttestationResponse = response.json().await?;
-            let attestation_hex = attestation_response
-                .attestation
-                .strip_prefix("0x")
-                .unwrap_or(&attestation_response.attestation);
-            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+            let attestation_bytes = alloy::hex::decode(&attestation_response.attestation)?;
 
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
@@ -634,15 +870,13 @@ mod tests {
             let response = bridge.http_client.get(&url).send().await?;
 
             if !response.status().is_success() {
-                return Err(AttestationError::NotReady);
+                return Err(AttestationError::NotYetAvailable {
+                    status: response.status().as_u16(),
+                });
             }
 
             let attestation_response: AttestationResponse = response.json().await?;
-            let attestation_hex = attestation_response
-                .attestation
-                .strip_prefix("0x")
-                .unwrap_or(&attestation_response.attestation);
-            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+            let attestation_bytes = alloy::hex::decode(&attestation_response.attestation)?;
 
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
@@ -654,8 +888,11 @@ mod tests {
             "Expected attestation to fail after max retries"
         );
         assert!(
-            matches!(result.unwrap_err(), AttestationError::NotReady),
-            "Expected AttestationError::NotReady"
+            matches!(
+                result.unwrap_err(),
+                AttestationError::NotYetAvailable { status: 404 }
+            ),
+            "Expected AttestationError::NotYetAvailable with status 404"
         );
         assert!(
             mock.hits() >= 3,
@@ -1232,11 +1469,13 @@ mod tests {
             Self::mint_usdc(&base_endpoint, &deployer_key, base.usdc, deployer_address).await?;
 
             let fee_mock_server = MockServer::start();
+            // Mock fee endpoint for any domain pair - returns fast (1000) and standard (2000) fees
             fee_mock_server.mock(|when, then| {
-                when.method(GET).path("/v2/burn/USDC/fees");
-                then.status(200).json_body(serde_json::json!({
-                    "minFee": "1"
-                }));
+                when.method(GET).path_contains("/v2/burn/USDC/fees/");
+                then.status(200).json_body(serde_json::json!([
+                    {"finalityThreshold": 1000, "minimumFee": 1},
+                    {"finalityThreshold": 2000, "minimumFee": 0}
+                ]));
             });
 
             Ok(Self {
@@ -1477,6 +1716,35 @@ mod tests {
                 .with_circle_api_base(self.fee_mock_server.base_url()))
         }
 
+        /// Extracts the CCTP message from a burn transaction receipt.
+        /// In production, this message comes from Circle's attestation API.
+        async fn extract_message_from_burn_tx(
+            &self,
+            tx_hash: TxHash,
+            is_ethereum: bool,
+        ) -> Result<Bytes, Box<dyn std::error::Error>> {
+            let endpoint = if is_ethereum {
+                &self.ethereum_endpoint
+            } else {
+                &self.base_endpoint
+            };
+
+            let provider = ProviderBuilder::new().connect(endpoint).await?;
+            let receipt = provider
+                .get_transaction_receipt(tx_hash)
+                .await?
+                .ok_or("Transaction receipt not found")?;
+
+            let message_sent_event = receipt
+                .inner
+                .logs()
+                .iter()
+                .find_map(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).ok())
+                .ok_or("MessageSent event not found")?;
+
+            Ok(message_sent_event.message.clone())
+        }
+
         /// Signs a CCTP message as the attester.
         ///
         /// In CCTP V2, the MessageSent event contains a message with EMPTY_NONCE (bytes32(0))
@@ -1540,8 +1808,14 @@ mod tests {
 
         let receipt = result.unwrap();
         assert!(!receipt.tx.is_zero(), "Transaction hash should be set");
-        assert!(!receipt.message.is_empty(), "Message should not be empty");
         assert_eq!(receipt.amount, amount, "Amount should match");
+
+        // Verify we can extract the message from the burn tx (as Circle's API would)
+        let message = cctp
+            .extract_message_from_burn_tx(receipt.tx, true)
+            .await
+            .expect("Should be able to extract message from burn tx");
+        assert!(!message.is_empty(), "Message should not be empty");
     }
 
     #[tokio::test]
@@ -1560,8 +1834,14 @@ mod tests {
 
         let receipt = result.unwrap();
         assert!(!receipt.tx.is_zero(), "Transaction hash should be set");
-        assert!(!receipt.message.is_empty(), "Message should not be empty");
         assert_eq!(receipt.amount, amount, "Amount should match");
+
+        // Verify we can extract the message from the burn tx (as Circle's API would)
+        let message = cctp
+            .extract_message_from_burn_tx(receipt.tx, false)
+            .await
+            .expect("Should be able to extract message from burn tx");
+        assert!(!message.is_empty(), "Message should not be empty");
     }
 
     #[tokio::test]
@@ -1580,9 +1860,15 @@ mod tests {
             .await
             .expect("burn_on_ethereum failed");
 
+        // Extract message from burn tx (simulating Circle's attestation API)
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .expect("Failed to extract message");
+
         // sign_message returns (attestation, modified_message_with_nonce)
         let (attestation, message_with_nonce) = cctp
-            .sign_message(&burn_receipt.message)
+            .sign_message(&message)
             .await
             .expect("Failed to sign message");
 
@@ -1609,9 +1895,15 @@ mod tests {
             .await
             .expect("burn_on_base failed");
 
+        // Extract message from burn tx (simulating Circle's attestation API)
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, false)
+            .await
+            .expect("Failed to extract message");
+
         // sign_message returns (attestation, modified_message_with_nonce)
         let (attestation, message_with_nonce) = cctp
-            .sign_message(&burn_receipt.message)
+            .sign_message(&message)
             .await
             .expect("Failed to sign message");
 
@@ -1641,9 +1933,15 @@ mod tests {
             .await
             .expect("burn_on_base failed");
 
+        // Extract message from burn tx (simulating Circle's attestation API)
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, false)
+            .await
+            .expect("Failed to extract message");
+
         // Get the message with a proper nonce, but use an invalid attestation
         let (_, message_with_nonce) = cctp
-            .sign_message(&burn_receipt.message)
+            .sign_message(&message)
             .await
             .expect("Failed to sign message");
 
@@ -1655,11 +1953,11 @@ mod tests {
             .await
             .expect_err("Expected error for invalid attestation");
 
-        let err_msg = err.to_string();
         assert!(
-            matches!(err, CctpError::Contract(_)),
-            "Expected Contract error, got: {err:?}"
+            matches!(err, CctpError::Revert(_)),
+            "Expected Revert error, got: {err:?}"
         );
+        let err_msg = err.to_string();
         assert!(
             err_msg.contains("ECDSA: invalid signature"),
             "Expected ECDSA invalid signature error, got: {err_msg}"
@@ -1681,18 +1979,24 @@ mod tests {
             .await
             .expect("burn_on_ethereum failed");
 
+        // Extract message from burn tx (simulating Circle's attestation API)
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .expect("Failed to extract message");
+
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_on_base(burn_receipt.message.clone(), invalid_attestation)
+            .mint_on_base(message, invalid_attestation)
             .await
             .expect_err("Expected error for invalid attestation");
 
-        let err_msg = err.to_string();
         assert!(
-            matches!(err, CctpError::Contract(_)),
-            "Expected Contract error, got: {err:?}"
+            matches!(err, CctpError::Revert(_)),
+            "Expected Revert error, got: {err:?}"
         );
+        let err_msg = err.to_string();
         assert!(
             err_msg.contains("ECDSA: invalid signature"),
             "Expected ECDSA invalid signature error, got: {err_msg}"
