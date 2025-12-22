@@ -15,7 +15,7 @@ use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{BurnReceipt, CctpBridge};
+use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -118,10 +118,9 @@ where
         let burn_amount = usdc_to_u256(amount)?;
         let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
-        let attestation = self.poll_attestation(id, &burn_receipt).await?;
+        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
 
-        self.execute_cctp_mint(id, &burn_receipt, attestation)
-            .await?;
+        self.execute_cctp_mint(id, attestation_response).await?;
 
         self.deposit_to_vault(id, burn_receipt.amount).await?;
 

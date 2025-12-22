@@ -45,19 +45,18 @@
 //! **Timing**: ~40s Base->Ethereum, ~70s Ethereum->Base (measured)
 //! **Cost**: 1 basis point (0.01%) of transfer amount
 
+mod evm;
+
+pub(crate) use evm::Evm;
+
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
 use alloy::sol;
-use alloy::sol_types::SolEvent;
 use backon::Retryable;
 use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{debug, info, warn};
-
-use crate::bindings::IERC20;
-use crate::error_decoding::handle_contract_error;
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -148,47 +147,6 @@ pub(crate) struct AttestationResponse {
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
     pub(crate) attestation: Bytes,
-}
-
-/// EVM chain connection with provider, signer, and contract instances.
-pub(crate) struct Evm<P, S>
-where
-    P: Provider + Clone,
-    S: Signer + Clone + Sync,
-{
-    /// Provider for reading chain state and sending transactions
-    pub(crate) provider: P,
-    /// Transaction signer for authorizing transactions
-    pub(crate) signer: S,
-    /// USDC token contract instance
-    usdc: IERC20::IERC20Instance<P>,
-    /// TokenMessengerV2 contract instance for CCTP burns
-    token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
-    /// MessageTransmitterV2 contract instance for CCTP mints
-    message_transmitter: MessageTransmitterV2::MessageTransmitterV2Instance<P>,
-}
-
-impl<P, S> Evm<P, S>
-where
-    P: Provider + Clone,
-    S: Signer + Clone + Sync,
-{
-    /// Creates a new EVM chain connection with the given provider, signer, and contract addresses.
-    pub(crate) fn new(
-        provider: P,
-        signer: S,
-        usdc: Address,
-        token_messenger: Address,
-        message_transmitter: Address,
-    ) -> Self {
-        Self {
-            provider: provider.clone(),
-            signer,
-            usdc: IERC20::new(usdc, provider.clone()),
-            token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
-            message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
-        }
-    }
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
@@ -369,97 +327,6 @@ where
         Ok(max_fee)
     }
 
-    async fn ensure_usdc_approval_ethereum(&self, amount: U256) -> Result<(), CctpError> {
-        let owner = self.ethereum.signer.address();
-        let spender = *self.ethereum.token_messenger.address();
-
-        let allowance = self.ethereum.usdc.allowance(owner, spender).call().await?;
-
-        if allowance < amount {
-            let pending = match self.ethereum.usdc.approve(spender, amount).send().await {
-                Ok(pending) => pending,
-                Err(e) => return Err(handle_contract_error(e).await),
-            };
-            pending.get_receipt().await?;
-        }
-
-        Ok(())
-    }
-
-    async fn ensure_usdc_approval_base(&self, amount: U256) -> Result<(), CctpError> {
-        let owner = self.base.signer.address();
-        let spender = *self.base.token_messenger.address();
-
-        let allowance = self.base.usdc.allowance(owner, spender).call().await?;
-
-        if allowance < amount {
-            let pending = match self.base.usdc.approve(spender, amount).send().await {
-                Ok(pending) => pending,
-                Err(e) => return Err(handle_contract_error(e).await),
-            };
-            pending.get_receipt().await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn burn_on_ethereum(
-        &self,
-        amount: U256,
-        recipient: Address,
-    ) -> Result<BurnReceipt, CctpError> {
-        self.ensure_usdc_approval_ethereum(amount).await?;
-
-        let direction = BridgeDirection::EthereumToBase;
-        let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
-        info!(%max_fee, %amount, "Calculated maxFee for fast transfer");
-
-        let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
-
-        // bytes32(0) allows any address to call receiveMessage() on destination.
-        // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
-        let destination_caller = FixedBytes::<32>::ZERO;
-
-        let pending = match self
-            .ethereum
-            .token_messenger
-            .depositForBurn(
-                amount,
-                direction.dest_domain(),
-                recipient_bytes32,
-                *self.ethereum.usdc.address(),
-                destination_caller,
-                max_fee,
-                FAST_TRANSFER_THRESHOLD,
-            )
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
-
-        let message_sent_event = receipt
-            .inner
-            .logs()
-            .iter()
-            .find_map(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).ok())
-            .ok_or(CctpError::MessageSentEventNotFound)?;
-
-        let message = message_sent_event.message.clone();
-
-        const NONCE_INDEX: usize = 12;
-        let nonce = FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + 32]);
-
-        Ok(BurnReceipt {
-            tx: receipt.transaction_hash,
-            nonce,
-            amount,
-        })
-    }
-
     /// Polls for attestation using CCTP V2 API.
     pub(crate) async fn poll_attestation(
         &self,
@@ -469,7 +336,6 @@ where
         const MAX_ATTEMPTS: usize = 60;
         const RETRY_INTERVAL_SECS: u64 = 5;
 
-        // V2 API: /v2/messages/{sourceDomainId}?transactionHash={txHash}
         let url = format!(
             "{}/v2/messages/{}?transactionHash={tx_hash}",
             self.circle_api_base,
@@ -488,12 +354,6 @@ where
             attestation: Option<String>,
             message: Option<String>,
             status: String,
-            #[serde(default)]
-            src_domain: Option<u32>,
-            #[serde(default)]
-            dest_domain: Option<u32>,
-            #[serde(default)]
-            delay_reason: Option<String>,
         }
 
         #[derive(Deserialize, Debug)]
@@ -501,43 +361,21 @@ where
             messages: Vec<MessageEntry>,
         }
 
-        let attempt_counter = AtomicUsize::new(0);
-        let logged_first_response = AtomicBool::new(false);
-
         let fetch_attestation = || async {
-            let attempt = attempt_counter.fetch_add(1, Ordering::Relaxed) + 1;
             let response = self.http_client.get(&url).send().await?;
 
             if !response.status().is_success() {
-                let status = response.status().as_u16();
-                debug!(attempt, status, "V2 attestation API non-success");
-                return Err(AttestationError::NotYetAvailable { status });
+                return Err(AttestationError::NotYetAvailable {
+                    status: response.status().as_u16(),
+                });
             }
 
-            // Log raw response on first attempt for debugging
-            let body = response.text().await?;
-            if !logged_first_response.swap(true, Ordering::Relaxed) {
-                info!(attempt, body = %body, "First attestation API response");
-            }
-
-            let v2_response: V2Response = serde_json::from_str(&body)?;
+            let v2_response: V2Response = response.json().await?;
 
             let entry = v2_response
                 .messages
                 .first()
                 .ok_or(AttestationError::NoMessages)?;
-
-            if let Some(ref reason) = entry.delay_reason {
-                warn!(attempt, %reason, "Attestation delayed");
-            } else {
-                info!(
-                    attempt,
-                    status = %entry.status,
-                    src_domain = ?entry.src_domain,
-                    dest_domain = ?entry.dest_domain,
-                    "Polling V2 attestation"
-                );
-            }
 
             if entry.status != "complete" {
                 return Err(AttestationError::Pending {
@@ -557,127 +395,28 @@ where
                 .as_ref()
                 .ok_or(AttestationError::MissingField { field: "message" })?;
 
-            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
-            let message_bytes = alloy::hex::decode(message_hex)?;
-
             Ok(AttestationResponse {
-                message: Bytes::from(message_bytes),
-                attestation: Bytes::from(attestation_bytes),
+                message: Bytes::from(alloy::hex::decode(message_hex)?),
+                attestation: Bytes::from(alloy::hex::decode(attestation_hex)?),
             })
         };
 
         fetch_attestation
             .retry(backoff)
+            .notify(|err, dur| match err {
+                AttestationError::Pending { status } => {
+                    info!(%status, ?dur, "Attestation pending, retrying");
+                }
+                AttestationError::NotYetAvailable { status } => {
+                    debug!(status, ?dur, "API non-success, retrying");
+                }
+                err => warn!(?err, ?dur, "Attestation error, retrying"),
+            })
             .await
             .map_err(|err| CctpError::AttestationTimeout {
                 attempts: MAX_ATTEMPTS,
                 source: err,
             })
-    }
-
-    pub(crate) async fn mint_on_base(
-        &self,
-        message: Bytes,
-        attestation: Bytes,
-    ) -> Result<TxHash, CctpError> {
-        let pending = match self
-            .base
-            .message_transmitter
-            .receiveMessage(message, attestation)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
-
-        Ok(receipt.transaction_hash)
-    }
-
-    /// Burns USDC on Base chain for cross-chain transfer to Ethereum.
-    ///
-    /// This is the reverse direction of `burn_on_ethereum`.
-    pub(crate) async fn burn_on_base(
-        &self,
-        amount: U256,
-        recipient: Address,
-    ) -> Result<BurnReceipt, CctpError> {
-        self.ensure_usdc_approval_base(amount).await?;
-
-        let direction = BridgeDirection::BaseToEthereum;
-        let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
-        info!(%max_fee, %amount, "Calculated maxFee for fast transfer");
-
-        let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
-
-        // bytes32(0) allows any address to call receiveMessage() on destination.
-        // See: https://github.com/circlefin/evm-cctp-contracts/blob/master/src/TokenMessenger.sol
-        let destination_caller = FixedBytes::<32>::ZERO;
-
-        let pending = match self
-            .base
-            .token_messenger
-            .depositForBurn(
-                amount,
-                direction.dest_domain(),
-                recipient_bytes32,
-                *self.base.usdc.address(),
-                destination_caller,
-                max_fee,
-                FAST_TRANSFER_THRESHOLD,
-            )
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
-
-        let message_sent_event = receipt
-            .inner
-            .logs()
-            .iter()
-            .find_map(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).ok())
-            .ok_or(CctpError::MessageSentEventNotFound)?;
-
-        let message = message_sent_event.message.clone();
-
-        const NONCE_INDEX: usize = 12;
-        let nonce = FixedBytes::<32>::from_slice(&message[NONCE_INDEX..NONCE_INDEX + 32]);
-
-        Ok(BurnReceipt {
-            tx: receipt.transaction_hash,
-            nonce,
-            amount,
-        })
-    }
-
-    /// Mints USDC on Ethereum chain after cross-chain transfer from Base.
-    ///
-    /// This is the reverse direction of `mint_on_base`.
-    pub(crate) async fn mint_on_ethereum(
-        &self,
-        message: Bytes,
-        attestation: Bytes,
-    ) -> Result<TxHash, CctpError> {
-        let pending = match self
-            .ethereum
-            .message_transmitter
-            .receiveMessage(message, attestation)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
-
-        Ok(receipt.transaction_hash)
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
@@ -687,9 +426,21 @@ where
         amount: U256,
         recipient: Address,
     ) -> Result<BurnReceipt, CctpError> {
+        let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+
         match direction {
-            BridgeDirection::EthereumToBase => self.burn_on_ethereum(amount, recipient).await,
-            BridgeDirection::BaseToEthereum => self.burn_on_base(amount, recipient).await,
+            BridgeDirection::EthereumToBase => {
+                self.ethereum.ensure_usdc_approval(amount).await?;
+                self.ethereum
+                    .deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base.ensure_usdc_approval(amount).await?;
+                self.base
+                    .deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
         }
     }
 
@@ -701,8 +452,8 @@ where
         attestation: Bytes,
     ) -> Result<TxHash, CctpError> {
         match direction {
-            BridgeDirection::EthereumToBase => self.mint_on_base(message, attestation).await,
-            BridgeDirection::BaseToEthereum => self.mint_on_ethereum(message, attestation).await,
+            BridgeDirection::EthereumToBase => self.base.claim(message, attestation).await,
+            BridgeDirection::BaseToEthereum => self.ethereum.claim(message, attestation).await,
         }
     }
 
@@ -721,7 +472,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
-    use alloy::sol_types::SolCall;
+    use alloy::sol_types::{SolCall, SolEvent};
     use httpmock::prelude::*;
     use rand::Rng;
 
@@ -938,7 +689,7 @@ mod tests {
 
         let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
             .await
-            .expect("Failed to deploy mock USDC");
+            .unwrap();
 
         let bridge = create_bridge(
             &ethereum_endpoint,
@@ -951,38 +702,27 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.signer.address();
-        let spender = *bridge.ethereum.token_messenger.address();
+        let spender = *bridge.ethereum.token_messenger().address();
 
         let initial_allowance = bridge
             .ethereum
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            initial_allowance,
-            U256::ZERO,
-            "Initial allowance should be zero"
-        );
+        assert_eq!(initial_allowance, U256::ZERO);
 
-        let result = bridge.ensure_usdc_approval_ethereum(amount).await;
-        assert!(
-            result.is_ok(),
-            "ensure_usdc_approval_ethereum should succeed: {result:?}"
-        );
+        bridge.ethereum.ensure_usdc_approval(amount).await.unwrap();
 
         let final_allowance = bridge
             .ethereum
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            final_allowance, amount,
-            "Allowance should equal requested amount"
-        );
+        assert_eq!(final_allowance, amount);
     }
 
     #[tokio::test]
@@ -992,7 +732,7 @@ mod tests {
 
         let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
             .await
-            .expect("Failed to deploy mock USDC");
+            .unwrap();
 
         let bridge = create_bridge(
             &ethereum_endpoint,
@@ -1006,11 +746,11 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.ethereum.signer.address();
-        let spender = *bridge.ethereum.token_messenger.address();
+        let spender = *bridge.ethereum.token_messenger().address();
 
         bridge
             .ethereum
-            .usdc
+            .usdc()
             .approve(spender, higher_amount)
             .send()
             .await
@@ -1021,33 +761,23 @@ mod tests {
 
         let initial_allowance = bridge
             .ethereum
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            initial_allowance, higher_amount,
-            "Initial allowance should be set"
-        );
+        assert_eq!(initial_allowance, higher_amount);
 
-        let result = bridge.ensure_usdc_approval_ethereum(amount).await;
-        assert!(
-            result.is_ok(),
-            "ensure_usdc_approval_ethereum should succeed: {result:?}"
-        );
+        bridge.ethereum.ensure_usdc_approval(amount).await.unwrap();
 
         let final_allowance = bridge
             .ethereum
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            final_allowance, higher_amount,
-            "Allowance should remain unchanged when sufficient"
-        );
+        assert_eq!(final_allowance, higher_amount);
     }
 
     #[tokio::test]
@@ -1057,7 +787,7 @@ mod tests {
 
         let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
             .await
-            .expect("Failed to deploy mock USDC");
+            .unwrap();
 
         let bridge = create_bridge(
             &ethereum_endpoint,
@@ -1071,11 +801,11 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.signer.address();
-        let spender = *bridge.ethereum.token_messenger.address();
+        let spender = *bridge.ethereum.token_messenger().address();
 
         bridge
             .ethereum
-            .usdc
+            .usdc()
             .approve(spender, initial_allowance_amount)
             .send()
             .await
@@ -1086,33 +816,27 @@ mod tests {
 
         let initial_allowance = bridge
             .ethereum
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            initial_allowance, initial_allowance_amount,
-            "Initial allowance should be set"
-        );
+        assert_eq!(initial_allowance, initial_allowance_amount);
 
-        let result = bridge.ensure_usdc_approval_ethereum(required_amount).await;
-        assert!(
-            result.is_ok(),
-            "ensure_usdc_approval_ethereum should succeed: {result:?}"
-        );
+        bridge
+            .ethereum
+            .ensure_usdc_approval(required_amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .ethereum
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            final_allowance, required_amount,
-            "Allowance should be updated to required amount"
-        );
+        assert_eq!(final_allowance, required_amount);
     }
 
     async fn create_bridge_with_base_usdc(
@@ -1161,9 +885,7 @@ mod tests {
         let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
         let (_base_anvil, base_endpoint, base_key) = setup_anvil();
 
-        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key)
-            .await
-            .expect("Failed to deploy mock USDC on Base");
+        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key).await.unwrap();
 
         let bridge = create_bridge_with_base_usdc(
             &ethereum_endpoint,
@@ -1176,38 +898,27 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.base.signer.address();
-        let spender = *bridge.base.token_messenger.address();
+        let spender = *bridge.base.token_messenger().address();
 
         let initial_allowance = bridge
             .base
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            initial_allowance,
-            U256::ZERO,
-            "Initial allowance should be zero"
-        );
+        assert_eq!(initial_allowance, U256::ZERO);
 
-        let result = bridge.ensure_usdc_approval_base(amount).await;
-        assert!(
-            result.is_ok(),
-            "ensure_usdc_approval_base should succeed: {result:?}"
-        );
+        bridge.base.ensure_usdc_approval(amount).await.unwrap();
 
         let final_allowance = bridge
             .base
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            final_allowance, amount,
-            "Allowance should equal requested amount"
-        );
+        assert_eq!(final_allowance, amount);
     }
 
     #[tokio::test]
@@ -1215,9 +926,7 @@ mod tests {
         let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
         let (_base_anvil, base_endpoint, base_key) = setup_anvil();
 
-        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key)
-            .await
-            .expect("Failed to deploy mock USDC on Base");
+        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key).await.unwrap();
 
         let bridge = create_bridge_with_base_usdc(
             &ethereum_endpoint,
@@ -1231,11 +940,11 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.base.signer.address();
-        let spender = *bridge.base.token_messenger.address();
+        let spender = *bridge.base.token_messenger().address();
 
         bridge
             .base
-            .usdc
+            .usdc()
             .approve(spender, higher_amount)
             .send()
             .await
@@ -1246,33 +955,23 @@ mod tests {
 
         let initial_allowance = bridge
             .base
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            initial_allowance, higher_amount,
-            "Initial allowance should be set"
-        );
+        assert_eq!(initial_allowance, higher_amount);
 
-        let result = bridge.ensure_usdc_approval_base(amount).await;
-        assert!(
-            result.is_ok(),
-            "ensure_usdc_approval_base should succeed: {result:?}"
-        );
+        bridge.base.ensure_usdc_approval(amount).await.unwrap();
 
         let final_allowance = bridge
             .base
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            final_allowance, higher_amount,
-            "Allowance should remain unchanged when sufficient"
-        );
+        assert_eq!(final_allowance, higher_amount);
     }
 
     #[tokio::test]
@@ -1280,9 +979,7 @@ mod tests {
         let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
         let (_base_anvil, base_endpoint, base_key) = setup_anvil();
 
-        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key)
-            .await
-            .expect("Failed to deploy mock USDC on Base");
+        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key).await.unwrap();
 
         let bridge = create_bridge_with_base_usdc(
             &ethereum_endpoint,
@@ -1296,11 +993,11 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.base.signer.address();
-        let spender = *bridge.base.token_messenger.address();
+        let spender = *bridge.base.token_messenger().address();
 
         bridge
             .base
-            .usdc
+            .usdc()
             .approve(spender, initial_allowance_amount)
             .send()
             .await
@@ -1311,33 +1008,27 @@ mod tests {
 
         let initial_allowance = bridge
             .base
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            initial_allowance, initial_allowance_amount,
-            "Initial allowance should be set"
-        );
+        assert_eq!(initial_allowance, initial_allowance_amount);
 
-        let result = bridge.ensure_usdc_approval_base(required_amount).await;
-        assert!(
-            result.is_ok(),
-            "ensure_usdc_approval_base should succeed: {result:?}"
-        );
+        bridge
+            .base
+            .ensure_usdc_approval(required_amount)
+            .await
+            .unwrap();
 
         let final_allowance = bridge
             .base
-            .usdc
+            .usdc()
             .allowance(owner, spender)
             .call()
             .await
             .unwrap();
-        assert_eq!(
-            final_allowance, required_amount,
-            "Allowance should be updated to required amount"
-        );
+        assert_eq!(final_allowance, required_amount);
     }
 
     sol!(
@@ -1791,215 +1482,181 @@ mod tests {
 
     #[tokio::test]
     async fn test_burn_on_ethereum_with_deployed_contracts() {
-        let cctp = LocalCctp::new()
-            .await
-            .expect("Failed to deploy CCTP infrastructure");
+        let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.base.signer.address();
         let amount = U256::from(1_000_000u64); // 1 USDC
 
-        let result = bridge.burn_on_ethereum(amount, recipient).await;
+        let receipt = bridge
+            .burn(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
 
-        assert!(
-            result.is_ok(),
-            "burn_on_ethereum should succeed: {result:?}"
-        );
-
-        let receipt = result.unwrap();
         assert!(!receipt.tx.is_zero(), "Transaction hash should be set");
         assert_eq!(receipt.amount, amount, "Amount should match");
 
-        // Verify we can extract the message from the burn tx (as Circle's API would)
         let message = cctp
             .extract_message_from_burn_tx(receipt.tx, true)
             .await
-            .expect("Should be able to extract message from burn tx");
+            .unwrap();
         assert!(!message.is_empty(), "Message should not be empty");
     }
 
     #[tokio::test]
     async fn test_burn_on_base_with_deployed_contracts() {
-        let cctp = LocalCctp::new()
-            .await
-            .expect("Failed to deploy CCTP infrastructure");
+        let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.ethereum.signer.address();
         let amount = U256::from(1_000_000u64); // 1 USDC
 
-        let result = bridge.burn_on_base(amount, recipient).await;
+        let receipt = bridge
+            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
 
-        assert!(result.is_ok(), "burn_on_base should succeed: {result:?}");
-
-        let receipt = result.unwrap();
         assert!(!receipt.tx.is_zero(), "Transaction hash should be set");
         assert_eq!(receipt.amount, amount, "Amount should match");
 
-        // Verify we can extract the message from the burn tx (as Circle's API would)
         let message = cctp
             .extract_message_from_burn_tx(receipt.tx, false)
             .await
-            .expect("Should be able to extract message from burn tx");
+            .unwrap();
         assert!(!message.is_empty(), "Message should not be empty");
     }
 
     #[tokio::test]
     async fn test_full_bridge_ethereum_to_base() {
-        let cctp = LocalCctp::new()
-            .await
-            .expect("Failed to deploy CCTP infrastructure");
+        let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.base.signer.address();
         let amount = U256::from(1_000_000u64); // 1 USDC
 
-        // Step 1: Burn on Ethereum
         let burn_receipt = bridge
-            .burn_on_ethereum(amount, recipient)
+            .burn(BridgeDirection::EthereumToBase, amount, recipient)
             .await
-            .expect("burn_on_ethereum failed");
+            .unwrap();
 
-        // Extract message from burn tx (simulating Circle's attestation API)
         let message = cctp
             .extract_message_from_burn_tx(burn_receipt.tx, true)
             .await
-            .expect("Failed to extract message");
+            .unwrap();
 
-        // sign_message returns (attestation, modified_message_with_nonce)
-        let (attestation, message_with_nonce) = cctp
-            .sign_message(&message)
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce,
+                attestation,
+            )
             .await
-            .expect("Failed to sign message");
-
-        let mint_result = bridge.mint_on_base(message_with_nonce, attestation).await;
-
-        assert!(
-            mint_result.is_ok(),
-            "mint_on_base should succeed: {mint_result:?}"
-        );
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_full_bridge_base_to_ethereum() {
-        let cctp = LocalCctp::new()
-            .await
-            .expect("Failed to deploy CCTP infrastructure");
+        let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.ethereum.signer.address();
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_on_base(amount, recipient)
+            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
-            .expect("burn_on_base failed");
+            .unwrap();
 
-        // Extract message from burn tx (simulating Circle's attestation API)
         let message = cctp
             .extract_message_from_burn_tx(burn_receipt.tx, false)
             .await
-            .expect("Failed to extract message");
+            .unwrap();
 
-        // sign_message returns (attestation, modified_message_with_nonce)
-        let (attestation, message_with_nonce) = cctp
-            .sign_message(&message)
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                attestation,
+            )
             .await
-            .expect("Failed to sign message");
-
-        let mint_result = bridge
-            .mint_on_ethereum(message_with_nonce, attestation)
-            .await;
-
-        assert!(
-            mint_result.is_ok(),
-            "mint_on_ethereum should succeed: {mint_result:?}"
-        );
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_mint_on_ethereum_with_invalid_attestation() {
-        let cctp = LocalCctp::new()
-            .await
-            .expect("Failed to deploy CCTP infrastructure");
+        let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.ethereum.signer.address();
         let amount = U256::from(1_000_000u64);
 
-        // Burn on Base to get a valid message
         let burn_receipt = bridge
-            .burn_on_base(amount, recipient)
+            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
-            .expect("burn_on_base failed");
+            .unwrap();
 
-        // Extract message from burn tx (simulating Circle's attestation API)
         let message = cctp
             .extract_message_from_burn_tx(burn_receipt.tx, false)
             .await
-            .expect("Failed to extract message");
+            .unwrap();
 
-        // Get the message with a proper nonce, but use an invalid attestation
-        let (_, message_with_nonce) = cctp
-            .sign_message(&message)
-            .await
-            .expect("Failed to sign message");
+        let (_, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
-        // Use invalid attestation (wrong signature)
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_on_ethereum(message_with_nonce, invalid_attestation)
+            .mint(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                invalid_attestation,
+            )
             .await
-            .expect_err("Expected error for invalid attestation");
+            .unwrap_err();
 
+        assert!(matches!(err, CctpError::Revert(_)), "got: {err:?}");
         assert!(
-            matches!(err, CctpError::Revert(_)),
-            "Expected Revert error, got: {err:?}"
-        );
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("ECDSA: invalid signature"),
-            "Expected ECDSA invalid signature error, got: {err_msg}"
+            err.to_string().contains("ECDSA: invalid signature"),
+            "got: {err}"
         );
     }
 
     #[tokio::test]
     async fn test_mint_on_base_with_invalid_attestation() {
-        let cctp = LocalCctp::new()
-            .await
-            .expect("Failed to deploy CCTP infrastructure");
+        let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.base.signer.address();
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn_on_ethereum(amount, recipient)
+            .burn(BridgeDirection::EthereumToBase, amount, recipient)
             .await
-            .expect("burn_on_ethereum failed");
+            .unwrap();
 
-        // Extract message from burn tx (simulating Circle's attestation API)
         let message = cctp
             .extract_message_from_burn_tx(burn_receipt.tx, true)
             .await
-            .expect("Failed to extract message");
+            .unwrap();
 
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint_on_base(message, invalid_attestation)
+            .mint(
+                BridgeDirection::EthereumToBase,
+                message,
+                invalid_attestation,
+            )
             .await
-            .expect_err("Expected error for invalid attestation");
+            .unwrap_err();
 
+        assert!(matches!(err, CctpError::Revert(_)), "got: {err:?}");
         assert!(
-            matches!(err, CctpError::Revert(_)),
-            "Expected Revert error, got: {err:?}"
-        );
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("ECDSA: invalid signature"),
-            "Expected ECDSA invalid signature error, got: {err_msg}"
+            err.to_string().contains("ECDSA: invalid signature"),
+            "got: {err}"
         );
     }
 }
