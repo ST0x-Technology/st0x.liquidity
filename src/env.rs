@@ -6,9 +6,10 @@ use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
 use crate::telemetry::HyperDxConfig;
-use st0x_broker::SupportedBroker;
-use st0x_broker::alpaca::AlpacaAuthEnv;
-use st0x_broker::schwab::SchwabAuthEnv;
+use st0x_execution::SupportedExecutor;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
+use st0x_execution::schwab::SchwabAuthEnv;
 
 // Dummy program name required by clap when parsing from environment variables.
 // clap's try_parse_from expects argv[0] to be the program name, but we only
@@ -18,16 +19,18 @@ const DUMMY_PROGRAM_NAME: &[&str] = &["server"];
 #[derive(Debug, Clone)]
 pub enum BrokerConfig {
     Schwab(SchwabAuthEnv),
-    Alpaca(AlpacaAuthEnv),
+    AlpacaTradingApi(AlpacaTradingApiAuthEnv),
+    AlpacaBrokerApi(AlpacaBrokerApiAuthEnv),
     DryRun,
 }
 
 impl BrokerConfig {
-    pub fn to_supported_broker(&self) -> SupportedBroker {
+    pub fn to_supported_executor(&self) -> SupportedExecutor {
         match self {
-            Self::Schwab(_) => SupportedBroker::Schwab,
-            Self::Alpaca(_) => SupportedBroker::Alpaca,
-            Self::DryRun => SupportedBroker::DryRun,
+            Self::Schwab(_) => SupportedExecutor::Schwab,
+            Self::AlpacaTradingApi(_) => SupportedExecutor::AlpacaTradingApi,
+            Self::AlpacaBrokerApi(_) => SupportedExecutor::AlpacaBrokerApi,
+            Self::DryRun => SupportedExecutor::DryRun,
         }
     }
 }
@@ -135,9 +138,9 @@ pub struct Env {
     /// Maximum jitter in seconds for order polling to prevent thundering herd
     #[clap(long, env, default_value = "5")]
     order_polling_max_jitter: u64,
-    /// Broker to use for trading (required: schwab, alpaca, or dry-run)
+    /// Broker to use for trading (required: schwab, alpaca-trading-api, or dry-run)
     #[clap(long, env)]
-    broker: SupportedBroker,
+    executor: SupportedExecutor,
     /// HyperDX API key for observability (optional)
     #[clap(long, env)]
     hyperdx_api_key: Option<String>,
@@ -151,16 +154,20 @@ pub struct Env {
 
 impl Env {
     pub fn into_config(self) -> Result<Config, ConfigError> {
-        let broker = match self.broker {
-            SupportedBroker::Schwab => {
+        let broker = match self.executor {
+            SupportedExecutor::Schwab => {
                 let schwab_auth = SchwabAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
                 BrokerConfig::Schwab(schwab_auth)
             }
-            SupportedBroker::Alpaca => {
-                let alpaca_auth = AlpacaAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
-                BrokerConfig::Alpaca(alpaca_auth)
+            SupportedExecutor::AlpacaTradingApi => {
+                let alpaca_auth = AlpacaTradingApiAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                BrokerConfig::AlpacaTradingApi(alpaca_auth)
             }
-            SupportedBroker::DryRun => BrokerConfig::DryRun,
+            SupportedExecutor::AlpacaBrokerApi => {
+                let alpaca_auth = AlpacaBrokerApiAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                BrokerConfig::AlpacaBrokerApi(alpaca_auth)
+            }
+            SupportedExecutor::DryRun => BrokerConfig::DryRun,
         };
 
         let log_level_tracing: Level = (&self.log_level).into();
@@ -208,7 +215,7 @@ impl Config {
 
 pub fn setup_tracing(log_level: &LogLevel) {
     let level: Level = log_level.into();
-    let default_filter = format!("st0x_hedge={level},st0x_broker={level}");
+    let default_filter = format!("st0x_hedge={level},st0x_execution={level}");
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -224,8 +231,8 @@ pub mod tests {
     use crate::onchain::EvmEnv;
     use alloy::primitives::{FixedBytes, address};
     use rust_decimal::Decimal;
-    use st0x_broker::schwab::{SchwabAuthEnv, SchwabConfig};
-    use st0x_broker::{MockBrokerConfig, TryIntoBroker};
+    use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
+    use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -302,12 +309,12 @@ pub mod tests {
             auth: schwab_auth.clone(),
             pool: pool.clone(),
         };
-        let schwab_result = schwab_config.try_into_broker().await;
+        let schwab_result = schwab_config.try_into_executor().await;
         assert!(schwab_result.is_err());
 
-        // MockBroker should always work
-        let test_broker = MockBrokerConfig.try_into_broker().await.unwrap();
-        assert!(format!("{test_broker:?}").contains("MockBroker"));
+        // MockExecutor should always work
+        let test_executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        assert!(format!("{test_executor:?}").contains("MockExecutor"));
     }
 
     #[test]
@@ -333,7 +340,7 @@ pub mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--deployment-block",
             "1",
-            "--broker",
+            "--executor",
             "dry-run",
         ];
 
@@ -356,7 +363,7 @@ pub mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "--deployment-block",
             "1",
-            "--broker",
+            "--executor",
             "dry-run",
         ];
 
@@ -392,7 +399,7 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
+                    "--executor",
                     "schwab",
                     "--rebalancing-enabled",
                     "true",
@@ -445,8 +452,8 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
-                    "alpaca",
+                    "--executor",
+                    "alpaca-trading-api",
                     "--rebalancing-enabled",
                     "true",
                 ];

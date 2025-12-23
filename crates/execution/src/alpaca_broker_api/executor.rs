@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
 use super::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiClient};
-use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate};
+use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate, TryIntoExecutor};
 
 /// Alpaca Broker API executor implementation
 #[derive(Debug, Clone)]
@@ -87,6 +87,17 @@ impl Executor for AlpacaBrokerApi {
     async fn run_executor_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
         // Alpaca uses API keys, no token refresh needed
         None
+    }
+}
+
+#[async_trait]
+impl TryIntoExecutor for AlpacaBrokerApiAuthEnv {
+    type Executor = AlpacaBrokerApi;
+
+    async fn try_into_executor(
+        self,
+    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
+        AlpacaBrokerApi::try_from_config(self).await
     }
 }
 

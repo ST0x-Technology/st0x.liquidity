@@ -18,7 +18,7 @@ use offchain_order::migrate_offchain_orders;
 use onchain_trade::migrate_onchain_trades;
 use position::migrate_positions;
 use schwab_auth::migrate_schwab_auth;
-use st0x_broker::schwab::{EncryptionError, SchwabAuthError};
+use st0x_execution::schwab::{EncryptionError, SchwabAuthError};
 
 #[derive(Debug, Parser)]
 #[command(

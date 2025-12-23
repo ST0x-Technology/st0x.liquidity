@@ -4,8 +4,12 @@
 use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
-use st0x_broker::order::status::ParseOrderStatusError;
-use st0x_broker::{InvalidBrokerError, PersistenceError};
+use st0x_execution::order::status::ParseOrderStatusError;
+use st0x_execution::schwab::SchwabError;
+use st0x_execution::{
+    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
+    InvalidSharesError, PersistenceError,
+};
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::onchain::position_calculator::ConversionError;
@@ -85,9 +89,11 @@ pub(crate) enum EventProcessingError {
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
-    Schwab(#[from] st0x_broker::schwab::SchwabError),
+    Schwab(#[from] SchwabError),
     #[error("Broker error: {0}")]
-    Broker(#[from] st0x_broker::BrokerError),
+    Broker(#[from] ExecutionError),
+    #[error(transparent)]
+    EmptySymbol(#[from] EmptySymbolError),
 }
 
 /// Order polling errors for order status monitoring.
@@ -103,8 +109,8 @@ pub(crate) enum OrderPollingError {
     OnChain(#[from] OnChainError),
 }
 
-impl From<st0x_broker::BrokerError> for OrderPollingError {
-    fn from(err: st0x_broker::BrokerError) -> Self {
+impl From<ExecutionError> for OrderPollingError {
+    fn from(err: ExecutionError) -> Self {
         Self::Broker(Box::new(err))
     }
 }
@@ -120,19 +126,25 @@ pub(crate) enum OnChainError {
     #[error("Alloy error: {0}")]
     Alloy(#[from] AlloyError),
     #[error("Broker error: {0}")]
-    Broker(#[from] st0x_broker::BrokerError),
+    Broker(#[from] ExecutionError),
     #[error("Event queue error: {0}")]
     EventQueue(#[from] EventQueueError),
     #[error("Order status parse error: {0}")]
     OrderStatusParse(#[from] ParseOrderStatusError),
-    #[error("Invalid broker: {0}")]
-    InvalidBroker(#[from] InvalidBrokerError),
+    #[error("Invalid executor: {0}")]
+    InvalidExecutor(#[from] InvalidExecutorError),
     #[error("Numeric conversion error: {0}")]
     Conversion(#[from] ConversionError),
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
     #[error("Integer conversion error: {0}")]
     IntConversion(#[from] TryFromIntError),
+    #[error(transparent)]
+    EmptySymbol(#[from] EmptySymbolError),
+    #[error(transparent)]
+    InvalidShares(#[from] InvalidSharesError),
+    #[error(transparent)]
+    InvalidDirection(#[from] InvalidDirectionError),
 }
 
 impl From<sqlx::Error> for OnChainError {
@@ -150,12 +162,6 @@ impl From<alloy::contract::Error> for OnChainError {
 impl From<ParseFloatError> for OnChainError {
     fn from(err: ParseFloatError) -> Self {
         Self::Validation(TradeValidationError::U256ToF64(err))
-    }
-}
-
-impl From<st0x_broker::InvalidDirectionError> for OnChainError {
-    fn from(err: st0x_broker::InvalidDirectionError) -> Self {
-        Self::Persistence(PersistenceError::InvalidDirection(err))
     }
 }
 

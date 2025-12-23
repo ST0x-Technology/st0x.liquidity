@@ -1,7 +1,7 @@
 use chrono::Utc;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::schwab::{EncryptedToken, SchwabAuth, SchwabAuthCommand};
+use st0x_execution::schwab::{EncryptedToken, SchwabAuth, SchwabAuthCommand};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
@@ -65,7 +65,7 @@ mod tests {
     use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
 
-    use st0x_broker::schwab::EncryptionKey;
+    use st0x_execution::schwab::EncryptionKey;
 
     use super::{ExecutionMode, migrate_schwab_auth};
 

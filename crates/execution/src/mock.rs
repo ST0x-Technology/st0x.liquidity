@@ -8,7 +8,7 @@ use tracing::{info, warn};
 
 use crate::{
     ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate,
-    SupportedExecutor,
+    SupportedExecutor, TryIntoExecutor,
 };
 
 /// Configuration for MockExecutor
@@ -139,6 +139,17 @@ impl Executor for MockExecutor {
 
     async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
         None
+    }
+}
+
+#[async_trait]
+impl TryIntoExecutor for MockExecutorConfig {
+    type Executor = MockExecutor;
+
+    async fn try_into_executor(
+        self,
+    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
+        MockExecutor::try_from_config(self).await
     }
 }
 

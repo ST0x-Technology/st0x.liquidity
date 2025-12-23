@@ -26,7 +26,7 @@ use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 pub(crate) use builder::ConductorBuilder;
-use st0x_broker::{Broker, BrokerError, MarketOrder, SupportedBroker, Symbol};
+use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 pub(crate) struct Conductor {
     pub(crate) broker_maintenance: Option<JoinHandle<()>>,
@@ -38,7 +38,7 @@ pub(crate) struct Conductor {
     pub(crate) rebalancer: Option<JoinHandle<()>>,
 }
 
-pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
+pub(crate) async fn run_market_hours_loop<B: Executor + Clone + Send + 'static>(
     broker: B,
     config: Config,
     pool: SqlitePool,
@@ -77,7 +77,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
 
             tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
 
-            let new_maintenance = broker.run_broker_maintenance().await;
+            let new_maintenance = broker.run_executor_maintenance().await;
 
             return Box::pin(run_market_hours_loop(
                 broker,
@@ -111,7 +111,7 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
 }
 
 impl Conductor {
-    pub(crate) async fn start<B: Broker + Clone + Send + 'static>(
+    pub(crate) async fn start<B: Executor + Clone + Send + 'static>(
         config: &Config,
         pool: &SqlitePool,
         broker: B,
@@ -133,7 +133,7 @@ impl Conductor {
 
         // Spawn rebalancer with the provider if configured
         let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
-            (Some(rebalancing_config), BrokerConfig::Alpaca(alpaca_auth), None) => {
+            (Some(rebalancing_config), BrokerConfig::AlpacaTradingApi(alpaca_auth), None) => {
                 info!("Initializing rebalancing infrastructure");
                 Some(
                     spawn_rebalancer(
