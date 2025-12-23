@@ -6,10 +6,10 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
-use st0x_broker::schwab::SchwabConfig;
-use st0x_broker::{
-    Broker, Direction, MarketOrder, MockBrokerConfig, OrderPlacement, OrderState, Shares, Symbol,
-    TryIntoBroker,
+use st0x_execution::schwab::SchwabConfig;
+use st0x_execution::{
+    Direction, Executor, MarketOrder, MockExecutorConfig, OrderPlacement, OrderState, Shares,
+    Symbol, TryIntoExecutor,
 };
 
 use crate::env::{BrokerConfig, Config};
@@ -112,7 +112,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 pub(super) async fn execute_broker_order<W: Write>(
     config: &Config,
     pool: &SqlitePool,
-    market_order: st0x_broker::MarketOrder,
+    market_order: MarketOrder,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &config.broker {
@@ -123,7 +123,7 @@ pub(super) async fn execute_broker_order<W: Write>(
                 auth: schwab_auth.clone(),
                 pool: pool.clone(),
             };
-            let broker = schwab_config.try_into_broker().await?;
+            let broker = schwab_config.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -132,20 +132,31 @@ pub(super) async fn execute_broker_order<W: Write>(
             )?;
             Ok(placement)
         }
-        BrokerConfig::Alpaca(alpaca_auth) => {
-            writeln!(stdout, "🔄 Executing Alpaca order...")?;
-            let broker = alpaca_auth.clone().try_into_broker().await?;
+        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+            writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
-                "✅ Alpaca order placed with ID: {}",
+                "✅ Alpaca Trading API order placed with ID: {}",
+                placement.order_id
+            )?;
+            Ok(placement)
+        }
+        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+            writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            let placement = broker.place_market_order(market_order).await?;
+            writeln!(
+                stdout,
+                "✅ Alpaca Broker API order placed with ID: {}",
                 placement.order_id
             )?;
             Ok(placement)
         }
         BrokerConfig::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
-            let broker = MockBrokerConfig.try_into_broker().await?;
+            let broker = MockExecutorConfig.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -171,7 +182,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
         onchain_trade,
-        config.broker.to_supported_broker(),
+        config.broker.to_supported_executor(),
     )
     .await?;
     sql_tx.commit().await?;
@@ -183,7 +194,7 @@ pub(super) async fn process_found_trade<W: Write>(
         writeln!(
             stdout,
             "✅ Trade triggered execution for {:?} (ID: {execution_id})",
-            config.broker.to_supported_broker()
+            config.broker.to_supported_executor()
         )?;
 
         let market_order = MarketOrder {
@@ -243,7 +254,7 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_broker::schwab::SchwabAuthEnv;
+    use st0x_execution::schwab::SchwabAuthEnv;
 
     use super::*;
     use crate::env::LogLevel;

@@ -11,7 +11,7 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use std::sync::Arc;
 
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::AlpacaWalletService;
@@ -50,8 +50,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
 
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("transfer-equity requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -64,9 +64,9 @@ pub(super) async fn transfer_equity_command<W: Write>(
     let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
-        alpaca_auth.base_url(),
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.base_url().to_string(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
         base_provider.clone(),
         rebalancing_config.redemption_wallet,
     ));
@@ -144,8 +144,8 @@ where
     };
     writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
 
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("transfer-usdc requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -164,7 +164,7 @@ where
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_provider(base_provider);
 
-    let broker_url = if alpaca_auth.is_paper_trading() {
+    let broker_url = if alpaca_auth.is_sandbox() {
         "https://broker-api.sandbox.alpaca.markets"
     } else {
         "https://broker-api.alpaca.markets"
@@ -173,8 +173,8 @@ where
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_url.into(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
     ));
 
     let ethereum_evm = Evm::new(
@@ -248,7 +248,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_broker::alpaca::{AlpacaAuthEnv, AlpacaTradingMode};
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
     use std::str::FromStr;
 
     use super::*;
@@ -277,10 +277,11 @@ mod tests {
 
     fn create_alpaca_config_without_rebalancing() -> Config {
         let mut config = create_config_without_rebalancing();
-        config.broker = BrokerConfig::Alpaca(AlpacaAuthEnv {
-            alpaca_api_key: "test-key".to_string(),
-            alpaca_api_secret: "test-secret".to_string(),
-            alpaca_trading_mode: AlpacaTradingMode::Paper,
+        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
         });
         config
     }
@@ -311,8 +312,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -362,8 +363,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 

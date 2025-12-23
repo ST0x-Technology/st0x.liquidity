@@ -22,8 +22,8 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "Depositing USDC directly to Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("alpaca-deposit requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-deposit requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -42,7 +42,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         .wallet(ethereum_wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
-    let broker_api_base_url = if alpaca_auth.is_paper_trading() {
+    let broker_api_base_url = if alpaca_auth.is_sandbox() {
         "https://broker-api.sandbox.alpaca.markets"
     } else {
         "https://broker-api.alpaca.markets"
@@ -51,8 +51,8 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
     );
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
@@ -64,7 +64,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     let amount_u256 = amount.to_u256_6_decimals()?;
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
-    let (usdc_address, network) = if alpaca_auth.is_paper_trading() {
+    let (usdc_address, network) = if alpaca_auth.is_sandbox() {
         (USDC_ETHEREUM_SEPOLIA, "Ethereum Sepolia")
     } else {
         (USDC_ETHEREUM, "Ethereum Mainnet")
@@ -126,8 +126,8 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     writeln!(stdout, "Withdrawing USDC from Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("alpaca-withdraw requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-withdraw requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -147,7 +147,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
         .wallet(ethereum_wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
-    let (usdc_address, network) = if alpaca_auth.is_paper_trading() {
+    let (usdc_address, network) = if alpaca_auth.is_sandbox() {
         (USDC_ETHEREUM_SEPOLIA, "Ethereum Sepolia")
     } else {
         (USDC_ETHEREUM, "Ethereum Mainnet")
@@ -159,7 +159,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     let balance_before = usdc.balanceOf(destination).call().await?;
     writeln!(stdout, "   Balance before: {balance_before}")?;
 
-    let broker_api_base_url = if alpaca_auth.is_paper_trading() {
+    let broker_api_base_url = if alpaca_auth.is_sandbox() {
         "https://broker-api.sandbox.alpaca.markets"
     } else {
         "https://broker-api.alpaca.markets"
@@ -168,8 +168,8 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
@@ -233,8 +233,8 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     address: Option<Address>,
     config: &Config,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("alpaca-whitelist requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-whitelist requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -252,7 +252,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     writeln!(stdout, "   Asset: USDC")?;
     writeln!(stdout, "   Network: Ethereum")?;
 
-    let broker_api_base_url = if alpaca_auth.is_paper_trading() {
+    let broker_api_base_url = if alpaca_auth.is_sandbox() {
         "https://broker-api.sandbox.alpaca.markets"
     } else {
         "https://broker-api.alpaca.markets"
@@ -261,8 +261,8 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
     );
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
@@ -314,8 +314,8 @@ pub(super) async fn alpaca_fund_sandbox_command<W: Write>(
     writeln!(stdout, "Funding Alpaca sandbox account")?;
     writeln!(stdout, "   Amount: {amount} USD")?;
 
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("alpaca-fund-sandbox requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-fund-sandbox requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -324,7 +324,7 @@ pub(super) async fn alpaca_fund_sandbox_command<W: Write>(
         )
     })?;
 
-    if !alpaca_auth.is_paper_trading() {
+    if !alpaca_auth.is_sandbox() {
         anyhow::bail!(
             "alpaca-fund-sandbox only works in sandbox mode. Current mode is live trading."
         );
@@ -333,8 +333,8 @@ pub(super) async fn alpaca_fund_sandbox_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         "https://broker-api.sandbox.alpaca.markets".to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
     );
 
     let amount_decimal: rust_decimal::Decimal = amount.into();
@@ -354,8 +354,8 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
     config: &Config,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
-        anyhow::bail!("alpaca-transfers requires Alpaca broker configuration");
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
     };
 
     let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
@@ -364,7 +364,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
         )
     })?;
 
-    let broker_api_base_url = if alpaca_auth.is_paper_trading() {
+    let broker_api_base_url = if alpaca_auth.is_sandbox() {
         "https://broker-api.sandbox.alpaca.markets"
     } else {
         "https://broker-api.alpaca.markets"
@@ -373,8 +373,8 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_api_key.clone(),
-        alpaca_auth.alpaca_api_secret.clone(),
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
     );
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
@@ -415,7 +415,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_broker::alpaca::{AlpacaAuthEnv, AlpacaTradingMode};
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
     use uuid::uuid;
 
     use super::*;
@@ -446,33 +446,53 @@ mod tests {
 
     fn create_alpaca_config_without_rebalancing() -> Config {
         let mut config = create_config_without_alpaca();
-        config.broker = BrokerConfig::Alpaca(AlpacaAuthEnv {
-            alpaca_api_key: "test-key".to_string(),
-            alpaca_api_secret: "test-secret".to_string(),
-            alpaca_trading_mode: AlpacaTradingMode::Paper,
+        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
         });
         config
     }
 
     fn create_full_alpaca_config() -> Config {
-        let mut config = create_alpaca_config_without_rebalancing();
-        config.rebalancing = Some(RebalancingConfig {
-            ethereum_private_key: B256::ZERO,
-            ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
-            usdc_vault_id: B256::ZERO,
-            market_maker_wallet: Address::ZERO,
-            redemption_wallet: Address::ZERO,
-            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-            equity_threshold: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.1),
+        let alpaca_account_id = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+        Config {
+            database_url: ":memory:".to_string(),
+            log_level: LogLevel::Debug,
+            server_port: 8080,
+            evm: EvmEnv {
+                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                orderbook: address!("0x1234567890123456789012345678901234567890"),
+                order_owner: Address::ZERO,
+                deployment_block: 1,
             },
-            usdc_threshold: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.1),
-            },
-        });
-        config
+            order_polling_interval: 15,
+            order_polling_max_jitter: 5,
+            broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
+                alpaca_broker_api_key: "test-key".to_string(),
+                alpaca_broker_api_secret: "test-secret".to_string(),
+                alpaca_account_id: alpaca_account_id.to_string(),
+                alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            }),
+            hyperdx: None,
+            rebalancing: Some(RebalancingConfig {
+                ethereum_private_key: B256::ZERO,
+                ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+                usdc_vault_id: B256::ZERO,
+                market_maker_wallet: Address::ZERO,
+                redemption_wallet: Address::ZERO,
+                alpaca_account_id,
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.1),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.1),
+                },
+            }),
+        }
     }
 
     #[tokio::test]
@@ -485,8 +505,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -530,8 +550,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -559,8 +579,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -587,8 +607,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -617,8 +637,8 @@ mod tests {
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("requires Alpaca broker configuration"),
-            "Expected Alpaca broker error, got: {err_msg}"
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
         );
     }
 
@@ -639,12 +659,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_alpaca_fund_sandbox_rejects_live_trading() {
+    async fn test_alpaca_fund_sandbox_rejects_production_mode() {
         let mut config = create_full_alpaca_config();
-        config.broker = BrokerConfig::Alpaca(AlpacaAuthEnv {
-            alpaca_api_key: "test-key".to_string(),
-            alpaca_api_secret: "test-secret".to_string(),
-            alpaca_trading_mode: AlpacaTradingMode::Live,
+        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
         });
         let amount = Usdc(dec!(100));
 

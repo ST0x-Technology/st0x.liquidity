@@ -11,8 +11,8 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
-use std::io::Write;
 use st0x_execution::{Direction, Symbol};
+use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
@@ -402,8 +402,8 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_execution::OrderStatus;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens};
+    use st0x_execution::{OrderStatus, Shares};
     use std::str::FromStr;
 
     use super::*;
@@ -1282,12 +1282,10 @@ mod tests {
         account_mock.assert();
         order_mock.assert();
 
-        let stored_tokens = SchwabTokens::load(
-            &pool,
-            &get_schwab_auth_from_config(&config).encryption_key,
-        )
-        .await
-        .unwrap();
+        let stored_tokens =
+            SchwabTokens::load(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+                .await
+                .unwrap();
         assert_eq!(stored_tokens.access_token, "new_access_token");
         assert_eq!(stored_tokens.refresh_token, "new_refresh_token");
     }

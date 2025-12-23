@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
-use st0x_broker::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens, extract_code_from_url};
+use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens, extract_code_from_url};
 
 use crate::env::BrokerConfig;
 

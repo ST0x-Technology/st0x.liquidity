@@ -69,8 +69,14 @@ impl std::fmt::Debug for AlpacaBrokerApiAuthEnv {
 }
 
 impl AlpacaBrokerApiAuthEnv {
+    /// Returns the base URL for Alpaca Broker API.
     pub fn base_url(&self) -> &str {
         self.alpaca_broker_api_mode.base_url()
+    }
+
+    /// Returns true if using sandbox mode (paper trading).
+    pub fn is_sandbox(&self) -> bool {
+        !matches!(self.alpaca_broker_api_mode, AlpacaBrokerApiMode::Production)
     }
 }
 
