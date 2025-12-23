@@ -1,6 +1,7 @@
 //! Spawns the rebalancing infrastructure.
 
 use alloy::network::{Ethereum, EthereumWallet};
+use alloy::primitives::Address;
 use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
@@ -60,7 +61,7 @@ type HttpProvider = FillProvider<
 type ConfiguredRebalancer<BP> = Rebalancer<
     MintManager<BP, MintEventStore>,
     RedemptionManager<BP, RedemptionEventStore>,
-    UsdcRebalanceManager<BP, PrivateKeySigner, UsdcEventStore>,
+    UsdcRebalanceManager<BP, UsdcEventStore>,
 >;
 
 /// Spawns the rebalancing infrastructure.
@@ -77,8 +78,14 @@ where
     let signer = PrivateKeySigner::from_bytes(&config.ethereum_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
 
-    let services =
-        Services::new(config, alpaca_auth, &ethereum_wallet, signer, base_provider).await?;
+    let services = Services::new(
+        config,
+        alpaca_auth,
+        &ethereum_wallet,
+        signer.address(),
+        base_provider,
+    )
+    .await?;
 
     let rebalancer = services.into_rebalancer(pool, config, symbol_cache);
 
@@ -103,8 +110,8 @@ where
 {
     tokenization: Arc<AlpacaTokenizationService<BP>>,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<HttpProvider, BP, PrivateKeySigner>>,
-    vault: Arc<VaultService<BP, PrivateKeySigner>>,
+    cctp: Arc<CctpBridge<HttpProvider, BP>>,
+    vault: Arc<VaultService<BP>>,
 }
 
 impl<BP> Services<BP>
@@ -115,7 +122,7 @@ where
         config: &RebalancingConfig,
         alpaca_auth: &AlpacaAuthEnv,
         ethereum_wallet: &EthereumWallet,
-        signer: PrivateKeySigner,
+        owner: Address,
         base_provider: BP,
     ) -> Result<Self, AlpacaWalletError> {
         let ethereum_provider = ProviderBuilder::new()
@@ -143,32 +150,22 @@ where
 
         let ethereum_evm = Evm::new(
             ethereum_provider,
-            signer.clone(),
+            owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
-        // CctpBridge and VaultService each need their own Evm instance because
-        // Evm holds contract instances that borrow the provider, preventing Clone.
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
-            signer.clone(),
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-
-        let base_evm_for_vault = Evm::new(
-            base_provider,
-            signer,
+            owner,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-        let vault = Arc::new(VaultService::new(base_evm_for_vault, config.base_orderbook));
+        let vault = Arc::new(VaultService::new(base_provider, config.base_orderbook));
 
         Ok(Self {
             tokenization,
@@ -385,9 +382,11 @@ mod tests {
                 .unwrap(),
         );
 
+        let owner = signer.address();
+
         let ethereum_evm = Evm::new(
             ethereum_provider,
-            signer.clone(),
+            owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -395,22 +394,14 @@ mod tests {
 
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
-            signer.clone(),
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-
-        let base_evm_for_vault = Evm::new(
-            base_provider,
-            signer,
+            owner,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-        let vault = Arc::new(VaultService::new(base_evm_for_vault, config.base_orderbook));
+        let vault = Arc::new(VaultService::new(base_provider, config.base_orderbook));
 
         let services = Services {
             tokenization,
