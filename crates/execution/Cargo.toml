@@ -1,5 +1,5 @@
 [package]
-name = "st0x-broker"
+name = "st0x-execution"
 version = "0.1.0"
 edition = "2024"
 

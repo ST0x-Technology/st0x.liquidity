@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::{Mutex, RwLock};
 
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 /// Global symbol-level locks to prevent race conditions during concurrent trade processing.
 /// Each symbol gets its own mutex to ensure atomic accumulation operations.

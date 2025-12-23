@@ -108,7 +108,7 @@ mod tests {
     use crate::usdc_rebalance::UsdcRebalanceEvent;
     use alloy::primitives::Address;
     use cqrs_es::Query;
-    use st0x_broker::Symbol;
+    use st0x_execution::Symbol;
     use std::collections::HashMap;
 
     fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
