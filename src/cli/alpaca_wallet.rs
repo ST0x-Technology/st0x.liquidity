@@ -6,7 +6,9 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use std::io::Write;
 
-use crate::alpaca_wallet::{AlpacaWalletService, TokenSymbol, TransferStatus, WhitelistStatus};
+use crate::alpaca_wallet::{
+    AlpacaWalletService, Network, TokenSymbol, TransferStatus, WhitelistStatus,
+};
 use crate::bindings::IERC20;
 use crate::cctp::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use crate::env::{BrokerConfig, Config};
@@ -48,13 +50,15 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id.clone(),
+        rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_api_key.clone(),
         alpaca_auth.alpaca_api_secret.clone(),
     );
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
-    let deposit_address = alpaca_wallet.get_wallet_address("USDC", "ethereum").await?;
+    let usdc = TokenSymbol::new("USDC");
+    let ethereum = Network::new("ethereum");
+    let deposit_address = alpaca_wallet.get_wallet_address(&usdc, &ethereum).await?;
     writeln!(stdout, "   Alpaca deposit address: {deposit_address}")?;
 
     let amount_u256 = amount.to_u256_6_decimals()?;
@@ -163,7 +167,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id.clone(),
+        rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_api_key.clone(),
         alpaca_auth.alpaca_api_secret.clone(),
     );
@@ -256,7 +260,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id.clone(),
+        rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_api_key.clone(),
         alpaca_auth.alpaca_api_secret.clone(),
     );
@@ -275,7 +279,11 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
 
     writeln!(stdout, "   Creating whitelist entry...")?;
     let entry = alpaca_wallet
-        .create_whitelist_entry(&target_address, "USDC", "ethereum")
+        .create_whitelist_entry(
+            &target_address,
+            &TokenSymbol::new("USDC"),
+            &Network::new("ethereum"),
+        )
         .await?;
 
     writeln!(stdout, "Whitelist entry created!")?;
@@ -293,6 +301,51 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
             "In sandbox, approval may be instant - try withdrawing."
         )?;
     }
+
+    Ok(())
+}
+
+pub(super) async fn alpaca_fund_sandbox_command<W: Write>(
+    stdout: &mut W,
+    amount: Usdc,
+    wire_instruction: &str,
+    config: &Config,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "Funding Alpaca sandbox account")?;
+    writeln!(stdout, "   Amount: {amount} USD")?;
+
+    let BrokerConfig::Alpaca(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-fund-sandbox requires Alpaca broker configuration");
+    };
+
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "alpaca-fund-sandbox requires rebalancing configuration (set REBALANCING_ENABLED=true)"
+        )
+    })?;
+
+    if !alpaca_auth.is_paper_trading() {
+        anyhow::bail!(
+            "alpaca-fund-sandbox only works in sandbox mode. Current mode is live trading."
+        );
+    }
+
+    let alpaca_wallet = AlpacaWalletService::new(
+        "https://broker-api.sandbox.alpaca.markets".to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.alpaca_api_key.clone(),
+        alpaca_auth.alpaca_api_secret.clone(),
+    );
+
+    let amount_decimal: rust_decimal::Decimal = amount.into();
+    writeln!(stdout, "   Simulating wire transfer...")?;
+
+    alpaca_wallet
+        .fund_sandbox(amount_decimal, wire_instruction)
+        .await?;
+
+    writeln!(stdout, "Sandbox funding completed successfully!")?;
+    writeln!(stdout, "   {amount} USD has been credited to the account.")?;
 
     Ok(())
 }
@@ -319,7 +372,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
 
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id.clone(),
+        rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_api_key.clone(),
         alpaca_auth.alpaca_api_secret.clone(),
     );
@@ -361,11 +414,12 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address};
-    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use st0x_broker::alpaca::{AlpacaAuthEnv, AlpacaTradingMode};
-    use std::str::FromStr;
+    use uuid::uuid;
 
     use super::*;
+    use crate::alpaca_wallet::AlpacaAccountId;
     use crate::env::LogLevel;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
@@ -408,14 +462,14 @@ mod tests {
             usdc_vault_id: B256::ZERO,
             market_maker_wallet: Address::ZERO,
             redemption_wallet: Address::ZERO,
-            alpaca_account_id: "test-account".to_string(),
+            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             equity_threshold: ImbalanceThreshold {
-                target: Decimal::from_str("0.5").unwrap(),
-                deviation: Decimal::from_str("0.1").unwrap(),
+                target: dec!(0.5),
+                deviation: dec!(0.1),
             },
             usdc_threshold: ImbalanceThreshold {
-                target: Decimal::from_str("0.5").unwrap(),
-                deviation: Decimal::from_str("0.1").unwrap(),
+                target: dec!(0.5),
+                deviation: dec!(0.1),
             },
         });
         config
@@ -424,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_requires_alpaca_broker() {
         let config = create_config_without_alpaca();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
         let result = alpaca_deposit_command(&mut stdout, amount, &config).await;
@@ -439,7 +493,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_requires_rebalancing_config() {
         let config = create_alpaca_config_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
         let result = alpaca_deposit_command(&mut stdout, amount, &config).await;
@@ -454,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_deposit_writes_amount_to_stdout() {
         let config = create_full_alpaca_config();
-        let amount = Usdc(Decimal::from_str("500.50").unwrap());
+        let amount = Usdc(dec!(500.50));
 
         let mut stdout = Vec::new();
         let _ = alpaca_deposit_command(&mut stdout, amount, &config).await;
@@ -469,7 +523,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_withdraw_requires_alpaca_broker() {
         let config = create_config_without_alpaca();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
         let result = alpaca_withdraw_command(&mut stdout, amount, None, &config).await;
@@ -484,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn test_alpaca_withdraw_requires_rebalancing_config() {
         let config = create_alpaca_config_without_rebalancing();
-        let amount = Usdc(Decimal::from_str("100").unwrap());
+        let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
         let result = alpaca_withdraw_command(&mut stdout, amount, None, &config).await;
@@ -549,6 +603,74 @@ mod tests {
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_fund_sandbox_requires_alpaca_broker() {
+        let config = create_config_without_alpaca();
+        let amount = Usdc(dec!(100));
+
+        let mut stdout = Vec::new();
+        let result =
+            alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("requires Alpaca broker configuration"),
+            "Expected Alpaca broker error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_fund_sandbox_requires_rebalancing_config() {
+        let config = create_alpaca_config_without_rebalancing();
+        let amount = Usdc(dec!(100));
+
+        let mut stdout = Vec::new();
+        let result =
+            alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("requires rebalancing configuration"),
+            "Expected rebalancing config error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_fund_sandbox_rejects_live_trading() {
+        let mut config = create_full_alpaca_config();
+        config.broker = BrokerConfig::Alpaca(AlpacaAuthEnv {
+            alpaca_api_key: "test-key".to_string(),
+            alpaca_api_secret: "test-secret".to_string(),
+            alpaca_trading_mode: AlpacaTradingMode::Live,
+        });
+        let amount = Usdc(dec!(100));
+
+        let mut stdout = Vec::new();
+        let result =
+            alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("only works in sandbox mode"),
+            "Expected sandbox-only error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_fund_sandbox_writes_amount_to_stdout() {
+        let config = create_full_alpaca_config();
+        let amount = Usdc(dec!(500.50));
+
+        let mut stdout = Vec::new();
+        let _ = alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("500.50 USD"),
+            "Expected amount in output, got: {output}"
         );
     }
 }

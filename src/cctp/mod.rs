@@ -206,6 +206,8 @@ pub(crate) enum CctpError {
     },
     #[error("MessageSent event not found in transaction receipt")]
     MessageSentEventNotFound,
+    #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
+    MessageTooShort { length: usize },
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
     #[error("Fast transfer fee not available for {direction:?}")]

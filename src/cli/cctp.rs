@@ -233,8 +233,10 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use uuid::uuid;
 
     use super::*;
+    use crate::alpaca_wallet::AlpacaAccountId;
     use crate::env::{BrokerConfig, LogLevel};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
@@ -267,7 +269,7 @@ mod tests {
             usdc_vault_id: B256::ZERO,
             market_maker_wallet: Address::ZERO,
             redemption_wallet: Address::ZERO,
-            alpaca_account_id: "test-account".to_string(),
+            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             equity_threshold: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
