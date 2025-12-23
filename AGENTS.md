@@ -959,6 +959,36 @@ assert_eq!(result.unwrap(), "refreshed_access_token");
 
 so that if we get an unexpected result value, we immediately see the value.
 
+#### Assertions must be specific
+
+Test assertions must check for the exact expected behavior, not vague
+alternatives. Never use `||` in assertions to accept multiple possible outcomes
+unless those outcomes are genuinely equivalent.
+
+```rust
+// ❌ BAD - Lazy, accepts vaguely similar outcomes
+assert!(
+    output.contains("Failed") || output.contains("❌"),
+    "Output should indicate failure"
+);
+
+// ❌ BAD - Too permissive, doesn't verify actual behavior
+assert!(result.is_some());
+
+// ✅ GOOD - Checks for exact expected output
+assert!(
+    output.contains("❌ Failed to place order"),
+    "Expected failure message, got: {output}"
+);
+
+// ✅ GOOD - Verifies specific value
+assert_eq!(result.unwrap().order_id, "12345");
+```
+
+If you find yourself writing `||` in an assertion, ask: are these outcomes
+actually equivalent? If not, you probably don't understand what the code should
+do, and need to investigate before writing the test.
+
 #### Type modeling examples
 
 **Principle**: Choose the type representation that most accurately models the
