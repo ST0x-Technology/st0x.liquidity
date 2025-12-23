@@ -178,7 +178,7 @@ impl Env {
         });
 
         let rebalancing = if self.rebalancing_enabled {
-            if !matches!(broker, BrokerConfig::Alpaca(_)) {
+            if !matches!(broker, BrokerConfig::AlpacaBrokerApi(_)) {
                 return Err(RebalancingConfigError::NotAlpacaBroker.into());
             }
             Some(RebalancingConfig::from_env()?)
@@ -407,12 +407,15 @@ pub mod tests {
 
                 let env = Env::try_parse_from(args).unwrap();
                 let result = env.into_config();
-                assert!(matches!(
-                    result,
-                    Err(ConfigError::Rebalancing(
-                        RebalancingConfigError::NotAlpacaBroker
-                    ))
-                ));
+                assert!(
+                    matches!(
+                        result,
+                        Err(ConfigError::Rebalancing(
+                            RebalancingConfigError::NotAlpacaBroker
+                        ))
+                    ),
+                    "Expected NotAlpacaBroker error, got {result:?}"
+                );
             },
         );
     }
@@ -421,9 +424,9 @@ pub mod tests {
     fn rebalancing_enabled_missing_redemption_wallet_fails() {
         temp_env::with_vars(
             [
-                ("ALPACA_API_KEY", Some("test_key")),
-                ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
                     "ETHEREUM_PRIVATE_KEY",
@@ -453,7 +456,7 @@ pub mod tests {
                     "--deployment-block",
                     "1",
                     "--executor",
-                    "alpaca-trading-api",
+                    "alpaca-broker-api",
                     "--rebalancing-enabled",
                     "true",
                 ];
@@ -475,9 +478,9 @@ pub mod tests {
     fn rebalancing_enabled_missing_ethereum_rpc_url_fails() {
         temp_env::with_vars(
             [
-                ("ALPACA_API_KEY", Some("test_key")),
-                ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -509,8 +512,8 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
-                    "alpaca",
+                    "--executor",
+                    "alpaca-broker-api",
                     "--rebalancing-enabled",
                     "true",
                 ];
@@ -532,9 +535,9 @@ pub mod tests {
     fn rebalancing_enabled_missing_ethereum_private_key_fails() {
         temp_env::with_vars(
             [
-                ("ALPACA_API_KEY", Some("test_key")),
-                ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -563,8 +566,8 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
-                    "alpaca",
+                    "--executor",
+                    "alpaca-broker-api",
                     "--rebalancing-enabled",
                     "true",
                 ];
@@ -586,9 +589,9 @@ pub mod tests {
     fn rebalancing_enabled_with_alpaca_and_all_fields_succeeds() {
         temp_env::with_vars(
             [
-                ("ALPACA_API_KEY", Some("test_key")),
-                ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -625,8 +628,8 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
-                    "alpaca",
+                    "--executor",
+                    "alpaca-broker-api",
                     "--rebalancing-enabled",
                     "true",
                 ];
@@ -651,9 +654,9 @@ pub mod tests {
     fn rebalancing_uses_default_threshold_values() {
         temp_env::with_vars(
             [
-                ("ALPACA_API_KEY", Some("test_key")),
-                ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -690,8 +693,8 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
-                    "alpaca",
+                    "--executor",
+                    "alpaca-broker-api",
                     "--rebalancing-enabled",
                     "true",
                 ];
@@ -712,9 +715,9 @@ pub mod tests {
     fn rebalancing_custom_threshold_values() {
         temp_env::with_vars(
             [
-                ("ALPACA_API_KEY", Some("test_key")),
-                ("ALPACA_API_SECRET", Some("test_secret")),
-                ("ALPACA_TRADING_MODE", Some("paper")),
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -755,8 +758,8 @@ pub mod tests {
                     "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "--deployment-block",
                     "1",
-                    "--broker",
-                    "alpaca",
+                    "--executor",
+                    "alpaca-broker-api",
                     "--rebalancing-enabled",
                     "true",
                 ];

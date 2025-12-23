@@ -7,8 +7,8 @@ use std::str::FromStr;
 use crate::error::{OnChainError, TradeValidationError};
 use st0x_execution::{Direction, Symbol};
 
-/// Macro to create a TokenizedEquitySymbol.
-/// This macro provides a convenient way to create tokenized equity symbols.
+/// Test-only macro to create a TokenizedEquitySymbol.
+#[cfg(test)]
 #[macro_export]
 macro_rules! tokenized_symbol {
     ($symbol:expr) => {
@@ -16,14 +16,12 @@ macro_rules! tokenized_symbol {
     };
 }
 
-// The macro is available via the crate::tokenized_symbol path
-
-/// Macro to create a Symbol.
-/// This macro provides a convenient way to create symbols.
+/// Test-only macro to create a Symbol.
+#[cfg(test)]
 #[macro_export]
 macro_rules! symbol {
     ($symbol:expr) => {
-        st0x_broker::Symbol::new($symbol).unwrap()
+        st0x_execution::Symbol::new($symbol).unwrap()
     };
 }
 
