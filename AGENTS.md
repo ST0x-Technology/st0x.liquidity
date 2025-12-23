@@ -646,6 +646,13 @@ explicit permission.**
 - **Test Quality**: Never write tests that only exercise language features
   without testing our application logic. Tests should verify actual business
   logic, not just struct field assignments or basic language operations
+- **Property-Based Testing**: Use `proptest` for property-based tests whenever
+  there are clear invariants to verify. Property tests are excellent for:
+  - Parsing/serialization roundtrips
+  - Boundary conditions (e.g., message length validation)
+  - Invariants that should hold for all inputs (e.g., extracted data matches
+    input regardless of surrounding bytes)
+  - Numeric operations where edge cases are hard to enumerate manually
 
 #### Writing Meaningful Tests
 
