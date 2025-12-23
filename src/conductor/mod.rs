@@ -554,10 +554,10 @@ async fn handle_queue_processing_result<B: Broker + Clone>(
 ) {
     match result {
         Ok(Some(execution)) => {
-            if let Some(exec_id) = execution.id
-                && let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await
-            {
-                error!("Failed to execute offchain order {exec_id}: {e}");
+            if let Some(exec_id) = execution.id {
+                if let Err(e) = execute_pending_offchain_execution(broker, pool, exec_id).await {
+                    error!("Failed to execute offchain order {exec_id}: {e}");
+                }
             }
         }
         Ok(None) => sleep(Duration::from_millis(100)).await,
