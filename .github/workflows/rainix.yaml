@@ -1,17 +1,21 @@
 name: Rainix CI
 on: [push]
+
 concurrency:
   group: ${{ github.ref }}-rainix
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 jobs:
   rainix:
     env:
       DATABASE_URL: "sqlite:schwab.db"
+
     strategy:
       matrix:
         os: [ubuntu-latest]
         task: [rainix-rs-test, rainix-rs-static]
       fail-fast: false
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -41,20 +45,29 @@ jobs:
         run: nix develop -c ${{ matrix.task }}
 
   dashboard:
+    env:
+      DATABASE_URL: "sqlite:schwab.db"
+
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
       - uses: nixbuild/nix-quick-install-action@v30
         with:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
+
       - name: Restore and save Nix store
         uses: nix-community/cache-nix-action@v6
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
+
       - name: Install dependencies
         run: nix develop -c bun install --cwd dashboard
       - name: Generate TypeScript types
@@ -64,6 +77,7 @@ jobs:
           nix develop -c sqlx db create
           nix develop -c sqlx migrate run
           nix develop -c cargo run --bin codegen
+
       - name: Type check
         run: nix develop -c bun run --cwd dashboard check
       - name: Lint
