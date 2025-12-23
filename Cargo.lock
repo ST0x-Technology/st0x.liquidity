@@ -6578,7 +6578,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "st0x-broker"
+name = "st0x-execution"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -6596,6 +6596,7 @@ dependencies = [
  "num-traits",
  "rand 0.8.5",
  "reqwest 0.12.24",
+ "rust_decimal",
  "serde",
  "serde_json",
  "serial_test",
@@ -6646,7 +6647,7 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
- "st0x-broker",
+ "st0x-execution",
  "temp-env",
  "thiserror 2.0.17",
  "tokio",
