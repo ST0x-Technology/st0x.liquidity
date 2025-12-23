@@ -5,7 +5,7 @@ services:
     container_name: schwarbot
     command: ["./server"]
     environment:
-      - BROKER=${SCHWAB_BROKER}
+      - EXECUTOR=${SCHWAB_EXECUTOR}
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/schwab.db
       - ENCRYPTION_KEY
@@ -23,7 +23,7 @@ services:
     container_name: alpacabot
     command: ["./server"]
     environment:
-      - BROKER=${ALPACA_BROKER}
+      - EXECUTOR=${ALPACA_EXECUTOR}
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:

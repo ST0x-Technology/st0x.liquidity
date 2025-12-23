@@ -58,17 +58,18 @@ jobs:
       - name: Verify required files exist
         run: |
           echo "Checking for required files..."
-          ls -la .env.example docker-compose.template.yaml Dockerfile.grafana grafana-datasource.yaml prep-docker-compose.sh
+          ls -la .env.example docker-compose.template.yaml Dockerfile.grafana grafana-datasource.yaml .github/workflows/prep-docker-compose.sh .github/workflows/generate-env.sh
           echo "File verification complete"
 
       - name: Encode file contents
         run: |
           echo "ENV_TEMPLATE=$(base64 -w 0 .env.example)" >> $GITHUB_ENV
-          echo "PREP_DOCKER_COMPOSE_SCRIPT=$(base64 -w 0 prep-docker-compose.sh)" >> $GITHUB_ENV
+          echo "GENERATE_ENV_SCRIPT=$(base64 -w 0 .github/workflows/generate-env.sh)" >> $GITHUB_ENV
+          echo "PREP_DOCKER_COMPOSE_SCRIPT=$(base64 -w 0 .github/workflows/prep-docker-compose.sh)" >> $GITHUB_ENV
           echo "DOCKER_COMPOSE_TEMPLATE=$(base64 -w 0 docker-compose.template.yaml)" >> $GITHUB_ENV
           echo "GRAFANA_DOCKERFILE=$(base64 -w 0 Dockerfile.grafana)" >> $GITHUB_ENV
           echo "GRAFANA_DATASOURCE_YAML=$(base64 -w 0 grafana-datasource.yaml)" >> $GITHUB_ENV
-          echo "PREP_SCRIPT=$(base64 -w 0 prep-docker-compose.sh)" >> $GITHUB_ENV
+          echo "PREP_SCRIPT=$(base64 -w 0 .github/workflows/prep-docker-compose.sh)" >> $GITHUB_ENV
 
       - name: Push image to DO Registry
         run: |
@@ -81,7 +82,7 @@ jobs:
           host: ${{ secrets.DROPLET_HOST }}
           username: root
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,WS_RPC_URL,ORDERBOOK,ORDER_OWNER,DEPLOYMENT_BLOCK,SCHWAB_APP_KEY,SCHWAB_APP_SECRET,ALPACA_API_KEY,ALPACA_API_SECRET,ENCRYPTION_KEY,HYPERDX_API_KEY,ENV_TEMPLATE,DOCKER_COMPOSE_TEMPLATE,GRAFANA_DOCKERFILE,GRAFANA_DATASOURCE_YAML,PREP_SCRIPT,GRAFANA_ADMIN_PASSWORD
+          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,WS_RPC_URL,ORDERBOOK,ORDER_OWNER,DEPLOYMENT_BLOCK,SCHWAB_APP_KEY,SCHWAB_APP_SECRET,ALPACA_API_KEY,ALPACA_API_SECRET,ALPACA_BROKER_API_KEY,ALPACA_BROKER_API_SECRET,ALPACA_ACCOUNT_ID,ENCRYPTION_KEY,HYPERDX_API_KEY,ENV_TEMPLATE,GENERATE_ENV_SCRIPT,DOCKER_COMPOSE_TEMPLATE,GRAFANA_DOCKERFILE,GRAFANA_DATASOURCE_YAML,PREP_SCRIPT,GRAFANA_ADMIN_PASSWORD
           script: |
             set -euo pipefail
 
@@ -153,29 +154,6 @@ jobs:
               exit 1
             }
 
-            # Function to validate required environment variables
-            validate_required_env() {
-              local missing_vars=()
-
-              for var in REGISTRY_NAME SHORT_SHA DATA_VOLUME_PATH GRAFANA_ADMIN_PASSWORD \
-                         WS_RPC_URL SCHWAB_APP_KEY SCHWAB_APP_SECRET ALPACA_API_KEY \
-                         ALPACA_API_SECRET ENCRYPTION_KEY; do
-                local value="${!var:-}"
-                if [ -z "$value" ]; then
-                  missing_vars+=("$var")
-                fi
-              done
-
-              if [ ${#missing_vars[@]} -gt 0 ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: Required environment variables are missing:" | tee -a "${DEPLOY_LOG}" >&2
-                for var in "${missing_vars[@]}"; do
-                  echo "  - $var" | tee -a "${DEPLOY_LOG}" >&2
-                done
-                echo "$(date '+%Y-%m-%d %H:%M:%S') - Deployment aborted due to missing configuration" | tee -a "${DEPLOY_LOG}" >&2
-                exit 1
-              fi
-            }
-
             # Function to check if a container is running
             check_container_running() {
               local container_name="$1"
@@ -208,11 +186,6 @@ jobs:
 
             # Set production data volume path
             export DATA_VOLUME_PATH="/mnt/volume_nyc3_01"
-
-            # Validate all required environment variables
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Validating required environment variables..." | tee -a "${DEPLOY_LOG}"
-            validate_required_env
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - All required environment variables present" | tee -a "${DEPLOY_LOG}"
 
             # Docker login
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Logging into Docker registry" | tee -a "${DEPLOY_LOG}"
@@ -270,8 +243,10 @@ jobs:
             export ENCRYPTION_KEY="${ENCRYPTION_KEY}"
             export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
 
-            # Create .env file using template with envsubst
-            echo "$ENV_TEMPLATE" | base64 -d | envsubst > /mnt/volume_nyc3_01/.env
+            # Decode and run the generate-env script (ENV_TEMPLATE is already set)
+            echo "$GENERATE_ENV_SCRIPT" | base64 -d > /mnt/volume_nyc3_01/generate-env.sh
+            chmod +x /mnt/volume_nyc3_01/generate-env.sh
+            ENV_TEMPLATE="$ENV_TEMPLATE" /mnt/volume_nyc3_01/generate-env.sh > /mnt/volume_nyc3_01/.env
             chmod 600 /mnt/volume_nyc3_01/.env
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting services with docker-compose" | tee -a "${DEPLOY_LOG}"
@@ -340,10 +315,14 @@ jobs:
           SCHWAB_APP_SECRET: ${{ secrets.APP_SECRET }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_KEY }}
           ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
+          ALPACA_BROKER_API_KEY: ${{ secrets.ALPACA_BROKER_API_KEY }}
+          ALPACA_BROKER_API_SECRET: ${{ secrets.ALPACA_BROKER_API_SECRET }}
+          ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
           ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
           HYPERDX_API_KEY: ${{ secrets.HYPERDX_API_KEY }}
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
           ENV_TEMPLATE: ${{ env.ENV_TEMPLATE }}
+          GENERATE_ENV_SCRIPT: ${{ env.GENERATE_ENV_SCRIPT }}
           PREP_DOCKER_COMPOSE_SCRIPT: ${{ env.PREP_DOCKER_COMPOSE_SCRIPT }}
           DOCKER_COMPOSE_TEMPLATE: ${{ env.DOCKER_COMPOSE_TEMPLATE }}
           GRAFANA_DOCKERFILE: ${{ env.GRAFANA_DOCKERFILE }}

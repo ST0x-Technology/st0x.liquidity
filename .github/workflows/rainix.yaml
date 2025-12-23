@@ -25,7 +25,38 @@ jobs:
           fetch-depth: 0
 
       - name: Build Docker image
-        run: docker build .
+        run: docker build -t st0x-test .
+
+      # Validate deployment config by running the same steps as deploy.yaml
+      # Uses the same env vars that deploy.yaml maps from GitHub secrets
+      - name: Generate deployment .env
+        env:
+          WS_RPC_URL: ${{ secrets.WS_RPC_URL }}
+          ORDERBOOK: "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
+          ORDER_OWNER: "0x71b94911FD1CE621FC40970450004c544e5287a8"
+          DEPLOYMENT_BLOCK: "34844164"
+          SCHWAB_APP_KEY: ${{ secrets.APP_KEY }}
+          SCHWAB_APP_SECRET: ${{ secrets.APP_SECRET }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_KEY }}
+          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
+          ALPACA_BROKER_API_KEY: ${{ secrets.ALPACA_BROKER_API_KEY }}
+          ALPACA_BROKER_API_SECRET: ${{ secrets.ALPACA_BROKER_API_SECRET }}
+          ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
+          ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
+          HYPERDX_API_KEY: ${{ secrets.HYPERDX_API_KEY }}
+          RUST_LOG: "debug"
+        run: |
+          .github/workflows/generate-env.sh > .env
+          cat .env
+
+      - name: Validate server can start with deployment config
+        run: |
+          # Run the server with --help to validate config parsing works
+          # This fails if any required env var is missing from deploy.yaml
+          docker run --rm --env-file .env \
+            -e EXECUTOR=dry-run \
+            -e DATABASE_URL=sqlite:///tmp/test.db \
+            st0x-test ./server --help
 
   rainix:
     env:
