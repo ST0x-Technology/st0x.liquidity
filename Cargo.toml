@@ -71,6 +71,7 @@ opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.30.0"
 tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
+rust_decimal = { version = "1.38.0", features = ["serde"] }
 
 [package]
 name = "st0x-hedge"
@@ -109,7 +110,7 @@ rand.workspace = true
 rocket = { version = "0.5.1", features = ["json"] }
 chrono-tz.workspace = true
 aes-gcm = "0.10.3"
-rust_decimal = "1.38.0"
+rust_decimal.workspace = true
 num-traits.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true

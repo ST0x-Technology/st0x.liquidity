@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
 use super::auth::{AlpacaTradingApiAuthEnv, AlpacaTradingApiClient};
-use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate, TryIntoExecutor};
+use crate::{
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
+    TryIntoExecutor,
+};
 
 /// Alpaca Trading API executor implementation
 #[derive(Debug, Clone)]
@@ -54,19 +57,26 @@ impl Executor for AlpacaTradingApi {
         let order_update = super::order::get_order_status(self.client.client(), order_id).await?;
 
         match order_update.status {
-            crate::OrderStatus::Pending | crate::OrderStatus::Submitted => {
-                Ok(OrderState::Submitted {
+            OrderStatus::Pending | OrderStatus::Submitted => Ok(OrderState::Submitted {
+                order_id: order_id.clone(),
+            }),
+            OrderStatus::Filled => {
+                let price_cents = order_update.price_cents.ok_or_else(|| {
+                    AlpacaTradingApiError::IncompleteFilledOrder {
+                        order_id: order_id.clone(),
+                        field: "price".to_string(),
+                    }
+                })?;
+
+                Ok(OrderState::Filled {
+                    executed_at: order_update.updated_at,
                     order_id: order_id.clone(),
+                    price_cents,
                 })
             }
-            crate::OrderStatus::Filled => Ok(OrderState::Filled {
-                executed_at: order_update.updated_at,
-                order_id: order_id.clone(),
-                price_cents: order_update.price_cents.unwrap_or(0),
-            }),
-            crate::OrderStatus::Failed => Ok(OrderState::Failed {
+            OrderStatus::Failed => Ok(OrderState::Failed {
                 failed_at: order_update.updated_at,
-                error_reason: Some(format!("Order status: {:?}", order_update.status)),
+                error_reason: None,
             }),
         }
     }
@@ -75,8 +85,8 @@ impl Executor for AlpacaTradingApi {
         super::order::poll_pending_orders(self.client.client()).await
     }
 
-    fn to_supported_executor(&self) -> crate::SupportedExecutor {
-        crate::SupportedExecutor::AlpacaTradingApi
+    fn to_supported_executor(&self) -> SupportedExecutor {
+        SupportedExecutor::AlpacaTradingApi
     }
 
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
@@ -103,10 +113,11 @@ impl TryIntoExecutor for AlpacaTradingApiAuthEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::alpaca_trading_api::AlpacaTradingApiMode;
     use httpmock::prelude::*;
     use serde_json::json;
+
+    use super::*;
+    use crate::alpaca_trading_api::AlpacaTradingApiMode;
 
     fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiAuthEnv {
         AlpacaTradingApiAuthEnv {
@@ -302,7 +313,7 @@ mod tests {
 
         assert_eq!(
             executor.to_supported_executor(),
-            crate::SupportedExecutor::AlpacaTradingApi
+            SupportedExecutor::AlpacaTradingApi
         );
     }
 

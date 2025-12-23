@@ -1,8 +1,11 @@
+use std::time::Duration;
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::{DateTime, FixedOffset};
 use clap::{Parser, ValueEnum};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
@@ -74,7 +77,7 @@ impl AlpacaBrokerApiAuthEnv {
 /// Account status from Alpaca Broker API
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum AccountStatus {
+pub enum AccountStatus {
     Onboarding,
     SubmissionFailed,
     Submitted,
@@ -169,6 +172,12 @@ pub(super) struct OrderResponse {
     pub symbol: Symbol,
     #[serde(rename = "qty", deserialize_with = "deserialize_shares_from_string")]
     pub quantity: Shares,
+    #[serde(
+        rename = "filled_qty",
+        default,
+        deserialize_with = "deserialize_optional_decimal"
+    )]
+    pub filled_quantity: Option<Decimal>,
     pub side: OrderSide,
     pub status: BrokerOrderStatus,
     #[serde(
@@ -195,6 +204,18 @@ where
     let opt: Option<String> = Option::deserialize(deserializer)?;
     opt.map_or(Ok(None), |s| {
         s.parse::<f64>().map(Some).map_err(serde::de::Error::custom)
+    })
+}
+
+fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    opt.map_or(Ok(None), |s| {
+        s.parse::<Decimal>()
+            .map(Some)
+            .map_err(serde::de::Error::custom)
     })
 }
 
@@ -231,6 +252,8 @@ impl AlpacaBrokerApiClient {
 
         let http_client = reqwest::Client::builder()
             .default_headers(headers)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()?;
 
         Ok(Self {
@@ -242,9 +265,10 @@ impl AlpacaBrokerApiClient {
     }
 
     pub(crate) fn is_sandbox(&self) -> bool {
-        matches!(self.mode, AlpacaBrokerApiMode::Sandbox)
+        !matches!(self.mode, AlpacaBrokerApiMode::Production)
     }
 
+    #[cfg(test)]
     pub(crate) fn account_id(&self) -> &str {
         &self.account_id
     }
@@ -430,12 +454,18 @@ mod tests {
     fn test_alpaca_broker_api_client_sandbox_vs_production() {
         let sandbox_config = create_test_sandbox_config();
         let production_config = create_test_production_config();
+        let mock_config = create_test_mock_config("http://localhost:8080");
 
         let sandbox_client = AlpacaBrokerApiClient::new(&sandbox_config).unwrap();
         let production_client = AlpacaBrokerApiClient::new(&production_config).unwrap();
+        let mock_client = AlpacaBrokerApiClient::new(&mock_config).unwrap();
 
         assert!(sandbox_client.is_sandbox());
         assert!(!production_client.is_sandbox());
+        assert!(
+            mock_client.is_sandbox(),
+            "Mock mode should be treated as non-production"
+        );
     }
 
     #[test]
@@ -513,7 +543,7 @@ mod tests {
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(serde_json::json!({
-                    "code": 40110000,
+                    "code": 40_110_000,
                     "message": "Invalid credentials"
                 }));
         });
@@ -645,6 +675,7 @@ mod tests {
                         "id": "904837e3-3b76-47ec-b432-046db621571b",
                         "symbol": "AAPL",
                         "qty": "100",
+                        "filled_qty": "0",
                         "side": "buy",
                         "status": "new",
                         "filled_avg_price": null
@@ -653,6 +684,7 @@ mod tests {
                         "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
                         "symbol": "TSLA",
                         "qty": "50",
+                        "filled_qty": "25",
                         "side": "sell",
                         "status": "partially_filled",
                         "filled_avg_price": "245.50"
@@ -667,9 +699,11 @@ mod tests {
         assert_eq!(orders.len(), 2);
         assert_eq!(orders[0].symbol.to_string(), "AAPL");
         assert_eq!(orders[0].quantity.value(), 100);
+        assert_eq!(orders[0].filled_quantity, Some(Decimal::ZERO));
         assert_eq!(orders[0].status, BrokerOrderStatus::New);
         assert_eq!(orders[1].symbol.to_string(), "TSLA");
         assert_eq!(orders[1].quantity.value(), 50);
+        assert_eq!(orders[1].filled_quantity, Some(Decimal::from(25)));
         assert_eq!(orders[1].status, BrokerOrderStatus::PartiallyFilled);
     }
 

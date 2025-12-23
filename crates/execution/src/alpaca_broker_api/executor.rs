@@ -5,8 +5,11 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiClient};
-use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate, TryIntoExecutor};
+use super::auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiClient};
+use crate::{
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
+    TryIntoExecutor,
+};
 
 /// Alpaca Broker API executor implementation
 #[derive(Debug, Clone)]
@@ -23,15 +26,19 @@ impl Executor for AlpacaBrokerApi {
     async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
         let client = AlpacaBrokerApiClient::new(&config)?;
 
-        client.verify_account().await?;
+        let account = client.verify_account().await?;
+
+        if account.status != AccountStatus::Active {
+            return Err(AlpacaBrokerApiError::AccountNotActive {
+                account_id: account.id,
+                status: account.status,
+            });
+        }
 
         info!(
-            "Alpaca Broker API executor initialized in {} mode",
-            if client.is_sandbox() {
-                "sandbox"
-            } else {
-                "production"
-            }
+            account_id = %account.id,
+            mode = if client.is_sandbox() { "sandbox" } else { "production" },
+            "Alpaca Broker API executor initialized"
         );
 
         Ok(Self {
@@ -54,19 +61,26 @@ impl Executor for AlpacaBrokerApi {
         let order_update = super::order::get_order_status(&self.client, order_id).await?;
 
         match order_update.status {
-            crate::OrderStatus::Pending | crate::OrderStatus::Submitted => {
-                Ok(OrderState::Submitted {
+            OrderStatus::Pending | OrderStatus::Submitted => Ok(OrderState::Submitted {
+                order_id: order_id.clone(),
+            }),
+            OrderStatus::Filled => {
+                let price_cents = order_update.price_cents.ok_or_else(|| {
+                    AlpacaBrokerApiError::IncompleteFilledOrder {
+                        order_id: order_id.clone(),
+                        field: "price".to_string(),
+                    }
+                })?;
+
+                Ok(OrderState::Filled {
+                    executed_at: order_update.updated_at,
                     order_id: order_id.clone(),
+                    price_cents,
                 })
             }
-            crate::OrderStatus::Filled => Ok(OrderState::Filled {
-                executed_at: order_update.updated_at,
-                order_id: order_id.clone(),
-                price_cents: order_update.price_cents.unwrap_or(0),
-            }),
-            crate::OrderStatus::Failed => Ok(OrderState::Failed {
+            OrderStatus::Failed => Ok(OrderState::Failed {
                 failed_at: order_update.updated_at,
-                error_reason: Some(format!("Order status: {:?}", order_update.status)),
+                error_reason: None,
             }),
         }
     }
@@ -75,8 +89,8 @@ impl Executor for AlpacaBrokerApi {
         super::order::poll_pending_orders(&self.client).await
     }
 
-    fn to_supported_executor(&self) -> crate::SupportedExecutor {
-        crate::SupportedExecutor::AlpacaBrokerApi
+    fn to_supported_executor(&self) -> SupportedExecutor {
+        SupportedExecutor::AlpacaBrokerApi
     }
 
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
@@ -103,10 +117,11 @@ impl TryIntoExecutor for AlpacaBrokerApiAuthEnv {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
     use httpmock::prelude::*;
     use serde_json::json;
+
+    use super::*;
+    use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
 
     fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthEnv {
         AlpacaBrokerApiAuthEnv {
@@ -154,7 +169,7 @@ mod tests {
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "code": 40110000,
+                    "code": 40_110_000,
                     "message": "Invalid credentials"
                 }));
         });
@@ -247,7 +262,7 @@ mod tests {
 
         assert_eq!(
             executor.to_supported_executor(),
-            crate::SupportedExecutor::AlpacaBrokerApi
+            SupportedExecutor::AlpacaBrokerApi
         );
     }
 

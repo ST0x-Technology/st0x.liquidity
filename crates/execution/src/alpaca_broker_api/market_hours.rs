@@ -8,9 +8,15 @@ pub(super) async fn wait_until_market_open(
     client: &AlpacaBrokerApiClient,
 ) -> Result<std::time::Duration, AlpacaBrokerApiError> {
     loop {
-        debug!("Checking market status via Alpaca Broker API Clock endpoint");
-
         let clock_data = client.get_clock().await?;
+
+        debug!(
+            server_time = %clock_data.timestamp,
+            is_open = clock_data.is_open,
+            next_open = %clock_data.next_open,
+            next_close = %clock_data.next_close,
+            "Market clock status"
+        );
 
         if clock_data.is_open {
             let now = Utc::now();

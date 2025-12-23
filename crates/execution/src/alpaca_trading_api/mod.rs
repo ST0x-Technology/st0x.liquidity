@@ -36,6 +36,8 @@ pub enum AlpacaTradingApiError {
     PriceConversion(f64),
     #[error("Notional orders not supported")]
     NotionalOrdersNotSupported,
+    #[error("Filled order {order_id} is missing required field: {field}")]
+    IncompleteFilledOrder { order_id: String, field: String },
 }
 
 impl From<apca::Error> for AlpacaTradingApiError {

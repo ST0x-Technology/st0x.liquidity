@@ -138,7 +138,7 @@ pub struct Env {
     /// Maximum jitter in seconds for order polling to prevent thundering herd
     #[clap(long, env, default_value = "5")]
     order_polling_max_jitter: u64,
-    /// Broker to use for trading (required: schwab, alpaca-trading-api, or dry-run)
+    /// Executor to use for trading (schwab, alpaca-trading-api, alpaca-broker-api, or dry-run)
     #[clap(long, env)]
     executor: SupportedExecutor,
     /// HyperDX API key for observability (optional)
@@ -147,7 +147,7 @@ pub struct Env {
     /// Service name for HyperDX traces (only used when hyperdx_api_key is set)
     #[clap(long, env, default_value = "st0x-hedge")]
     hyperdx_service_name: String,
-    /// Enable rebalancing operations (requires Alpaca broker)
+    /// Enable rebalancing operations (requires Alpaca Broker API)
     #[clap(long, env, default_value = "false", action = clap::ArgAction::Set)]
     rebalancing_enabled: bool,
 }

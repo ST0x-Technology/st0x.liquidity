@@ -60,6 +60,16 @@ pub(super) async fn get_order_status(
     let status = map_broker_status_to_order_status(response.status);
     let price_cents = convert_price_to_cents(response.filled_average_price)?;
 
+    if response.status == BrokerOrderStatus::PartiallyFilled {
+        debug!(
+            order_id,
+            symbol = %response.symbol,
+            ordered_qty = response.quantity.value(),
+            filled_qty = ?response.filled_quantity,
+            "Order is partially filled"
+        );
+    }
+
     Ok(OrderUpdate {
         order_id: order_id.to_string(),
         symbol: response.symbol,
@@ -88,6 +98,16 @@ pub(super) async fn poll_pending_orders(
 
             let status = map_broker_status_to_order_status(response.status);
             let price_cents = convert_price_to_cents(response.filled_average_price)?;
+
+            if response.status == BrokerOrderStatus::PartiallyFilled {
+                debug!(
+                    order_id = %response.id,
+                    symbol = %response.symbol,
+                    ordered_qty = response.quantity.value(),
+                    filled_qty = ?response.filled_quantity,
+                    "Order is partially filled"
+                );
+            }
 
             Ok(OrderUpdate {
                 order_id: response.id.to_string(),
@@ -145,6 +165,7 @@ fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBroke
 mod tests {
     use super::*;
     use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use crate::{Shares, Symbol};
     use httpmock::prelude::*;
     use serde_json::json;
 

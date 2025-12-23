@@ -379,7 +379,7 @@ mod tests {
         id
     }
 
-    async fn find_by_broker(
+    async fn find_by_executor(
         pool: &SqlitePool,
         executor: SupportedExecutor,
     ) -> Vec<OffchainExecution> {
@@ -462,17 +462,21 @@ mod tests {
         assert_eq!(all.len(), 3);
 
         assert_eq!(
-            find_by_broker(&pool, SupportedExecutor::Schwab).await.len(),
-            1
-        );
-        assert_eq!(
-            find_by_broker(&pool, SupportedExecutor::AlpacaTradingApi)
+            find_by_executor(&pool, SupportedExecutor::Schwab)
                 .await
                 .len(),
             1
         );
         assert_eq!(
-            find_by_broker(&pool, SupportedExecutor::DryRun).await.len(),
+            find_by_executor(&pool, SupportedExecutor::AlpacaTradingApi)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            find_by_executor(&pool, SupportedExecutor::DryRun)
+                .await
+                .len(),
             1
         );
     }

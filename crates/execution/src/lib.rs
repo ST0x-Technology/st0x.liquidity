@@ -21,9 +21,6 @@ pub use mock::{MockExecutor, MockExecutorConfig};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::SchwabExecutor;
 
-use alpaca_broker_api::AlpacaBrokerApiAuthEnv;
-use alpaca_trading_api::AlpacaTradingApiAuthEnv;
-
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;

@@ -1,11 +1,12 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 mod auth;
 mod executor;
 mod market_hours;
 mod order;
 
-pub use auth::AlpacaBrokerApiAuthEnv;
+pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
 pub use executor::AlpacaBrokerApi;
 
 #[derive(Debug, Error)]
@@ -48,4 +49,13 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Price {0} cannot be converted to cents")]
     PriceConversion(f64),
+
+    #[error("Filled order {order_id} is missing required field: {field}")]
+    IncompleteFilledOrder { order_id: String, field: String },
+
+    #[error("Account {account_id} is not active (status: {status:?})")]
+    AccountNotActive {
+        account_id: Uuid,
+        status: AccountStatus,
+    },
 }
