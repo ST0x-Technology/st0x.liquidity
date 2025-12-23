@@ -1,3 +1,4 @@
+use alloy::primitives::U256;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -66,6 +67,15 @@ impl std::ops::Mul<Decimal> for FractionalShares {
     }
 }
 
+/// 10^18 scale factor for tokenized equity decimal conversion.
+///
+/// Tokenized equities use 18 decimals (unlike USDC which uses 6).
+/// This equals 1,000,000,000,000,000,000 (one quintillion).
+/// The `from_parts` representation: lo=2_808_348_672, mid=232_830_643, hi=0, negative=false, scale=0.
+/// Verified by `tokenized_equity_scale_equals_10_pow_18` test.
+const TOKENIZED_EQUITY_SCALE: Decimal =
+    Decimal::from_parts(2_808_348_672, 232_830_643, 0, false, 0);
+
 impl FractionalShares {
     #[cfg(test)]
     pub(crate) const ONE: Self = Self(Decimal::ONE);
@@ -73,6 +83,45 @@ impl FractionalShares {
     pub(crate) fn abs(self) -> Self {
         Self(self.0.abs())
     }
+
+    /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
+    ///
+    /// Returns an error for negative values, underflow (values < 1e-18),
+    /// or overflow during scaling.
+    pub(crate) fn to_u256_18_decimals(self) -> Result<U256, SharesConversionError> {
+        if self.0.is_sign_negative() {
+            return Err(SharesConversionError::NegativeValue(self.0));
+        }
+
+        if self.0.is_zero() {
+            return Ok(U256::ZERO);
+        }
+
+        let scaled = self
+            .0
+            .checked_mul(TOKENIZED_EQUITY_SCALE)
+            .ok_or(SharesConversionError::Overflow)?;
+
+        let truncated = scaled.trunc();
+
+        if truncated.is_zero() {
+            return Err(SharesConversionError::Underflow(self.0));
+        }
+
+        U256::from_str_radix(&truncated.to_string(), 10).map_err(SharesConversionError::ParseError)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SharesConversionError {
+    #[error("shares value cannot be negative: {0}")]
+    NegativeValue(Decimal),
+    #[error("shares value too small to represent with 18 decimals: {0}")]
+    Underflow(Decimal),
+    #[error("overflow when scaling shares to 18 decimals")]
+    Overflow,
+    #[error("failed to parse U256: {0}")]
+    ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
 
 impl std::ops::Add for FractionalShares {
@@ -107,7 +156,20 @@ impl std::ops::Sub for FractionalShares {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+
+    #[test]
+    fn tokenized_equity_scale_equals_10_pow_18() {
+        // Verify that TOKENIZED_EQUITY_SCALE constructed via Decimal::from_parts
+        // actually equals 10^18 (1,000,000,000,000,000,000).
+        let expected = Decimal::from_str("1000000000000000000").unwrap();
+        assert_eq!(
+            TOKENIZED_EQUITY_SCALE, expected,
+            "TOKENIZED_EQUITY_SCALE must equal 10^18"
+        );
+    }
 
     #[test]
     fn add_succeeds() {
@@ -188,5 +250,66 @@ mod tests {
         assert_eq!(err.operation, "*");
         assert_eq!(err.lhs, max);
         assert_eq!(err.rhs, FractionalShares(two));
+    }
+
+    #[test]
+    fn to_u256_18_decimals_zero_returns_zero() {
+        let shares = FractionalShares(Decimal::ZERO);
+
+        let result = shares.to_u256_18_decimals().unwrap();
+
+        assert_eq!(result, U256::ZERO);
+    }
+
+    #[test]
+    fn to_u256_18_decimals_one_returns_10_pow_18() {
+        let shares = FractionalShares(Decimal::ONE);
+
+        let result = shares.to_u256_18_decimals().unwrap();
+
+        assert_eq!(result, U256::from_str("1000000000000000000").unwrap());
+    }
+
+    #[test]
+    fn to_u256_18_decimals_fractional_value() {
+        let shares = FractionalShares(Decimal::from_str("1.5").unwrap());
+
+        let result = shares.to_u256_18_decimals().unwrap();
+
+        assert_eq!(result, U256::from_str("1500000000000000000").unwrap());
+    }
+
+    #[test]
+    fn to_u256_18_decimals_small_fractional_value() {
+        let shares = FractionalShares(Decimal::from_str("0.000000000000000001").unwrap());
+
+        let result = shares.to_u256_18_decimals().unwrap();
+
+        assert_eq!(result, U256::from(1));
+    }
+
+    #[test]
+    fn to_u256_18_decimals_negative_returns_error() {
+        let shares = FractionalShares(Decimal::NEGATIVE_ONE);
+
+        let err = shares.to_u256_18_decimals().unwrap_err();
+
+        assert!(
+            matches!(err, SharesConversionError::NegativeValue(_)),
+            "Expected NegativeValue error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn to_u256_18_decimals_underflow_returns_error() {
+        // Value smaller than 1e-18 cannot be represented
+        let shares = FractionalShares(Decimal::from_str("0.0000000000000000001").unwrap());
+
+        let err = shares.to_u256_18_decimals().unwrap_err();
+
+        assert!(
+            matches!(err, SharesConversionError::Underflow(_)),
+            "Expected Underflow error, got: {err:?}"
+        );
     }
 }

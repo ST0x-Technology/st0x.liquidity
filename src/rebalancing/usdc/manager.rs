@@ -116,11 +116,16 @@ where
         self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
 
         let burn_amount = usdc_to_u256(amount)?;
-        let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
+        let burn_receipt = self
+            .execute_cctp_burn(id, burn_amount, BridgeDirection::EthereumToBase)
+            .await?;
 
-        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
+        let attestation_response = self
+            .poll_attestation(id, &burn_receipt, BridgeDirection::EthereumToBase)
+            .await?;
 
-        self.execute_cctp_mint(id, attestation_response).await?;
+        self.execute_cctp_mint(id, attestation_response, BridgeDirection::EthereumToBase)
+            .await?;
 
         self.deposit_to_vault(id, burn_receipt.amount).await?;
 
@@ -213,15 +218,16 @@ where
         Ok(())
     }
 
-    #[instrument(skip(self), fields(?id, %amount))]
+    #[instrument(skip(self), fields(?id, %amount, ?direction))]
     async fn execute_cctp_burn(
         &self,
         id: &UsdcRebalanceId,
         amount: U256,
+        direction: BridgeDirection,
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_ethereum(amount, self.market_maker_wallet)
+            .burn(direction, amount, self.market_maker_wallet)
             .await
         {
             Ok(r) => r,
@@ -256,13 +262,18 @@ where
         Ok(burn_receipt)
     }
 
-    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx))]
+    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx, ?direction))]
     async fn poll_attestation(
         &self,
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
-    ) -> Result<Bytes, UsdcRebalanceManagerError> {
-        let attestation = match self.cctp_bridge.poll_attestation(burn_receipt.hash).await {
+        direction: BridgeDirection,
+    ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
+        let response = match self
+            .cctp_bridge
+            .poll_attestation(direction, burn_receipt.tx)
+            .await
+        {
             Ok(a) => a,
             Err(e) => {
                 warn!("Attestation polling failed: {e}");
@@ -282,25 +293,29 @@ where
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation.to_vec(),
+                    attestation: response.attestation.to_vec(),
                 },
             )
             .await?;
 
         info!("Circle attestation received");
-        Ok(attestation)
+        Ok(response)
     }
 
-    #[instrument(skip(self, burn_receipt, attestation), fields(?id, burn_tx = %burn_receipt.tx))]
+    #[instrument(skip(self, attestation_response), fields(?id, ?direction))]
     async fn execute_cctp_mint(
         &self,
         id: &UsdcRebalanceId,
-        burn_receipt: &BurnReceipt,
-        attestation: Bytes,
+        attestation_response: AttestationResponse,
+        direction: BridgeDirection,
     ) -> Result<TxHash, UsdcRebalanceManagerError> {
         let mint_tx = match self
             .cctp_bridge
-            .mint_on_base(burn_receipt.message.clone(), attestation)
+            .mint(
+                direction,
+                attestation_response.message,
+                attestation_response.attestation,
+            )
             .await
         {
             Ok(tx) => tx,
@@ -396,14 +411,16 @@ where
 
         self.withdraw_from_vault(id, amount, amount_u256).await?;
 
-        let burn_receipt = self.execute_cctp_burn_on_base(id, amount_u256).await?;
+        let burn_receipt = self
+            .execute_cctp_burn(id, amount_u256, BridgeDirection::BaseToEthereum)
+            .await?;
 
-        let attestation = self
-            .poll_attestation_for_base_burn(id, &burn_receipt)
+        let attestation_response = self
+            .poll_attestation(id, &burn_receipt, BridgeDirection::BaseToEthereum)
             .await?;
 
         let mint_tx = self
-            .execute_cctp_mint_on_ethereum(id, &burn_receipt, attestation)
+            .execute_cctp_mint(id, attestation_response, BridgeDirection::BaseToEthereum)
             .await?;
 
         self.poll_and_confirm_alpaca_deposit(id, mint_tx).await?;
@@ -445,119 +462,6 @@ where
 
         info!(%withdraw_tx, "Vault withdrawal completed");
         Ok(())
-    }
-
-    #[instrument(skip(self), fields(?id, ?amount))]
-    async fn execute_cctp_burn_on_base(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: U256,
-    ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
-        let burn_receipt = match self
-            .cctp_bridge
-            .burn_on_base(amount, self.market_maker_wallet)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("CCTP burn on Base failed: {e}");
-                self.cqrs
-                    .execute(
-                        &id.0,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Burn on Base failed: {e}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcRebalanceManagerError::Cctp(e));
-            }
-        };
-
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
-        self.cqrs
-            .execute(
-                &id.0,
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx: burn_receipt.tx,
-                    cctp_nonce,
-                },
-            )
-            .await?;
-
-        info!(burn_tx = %burn_receipt.tx, "CCTP burn on Base executed");
-        Ok(burn_receipt)
-    }
-
-    #[instrument(skip(self, burn_receipt), fields(?id, burn_tx = %burn_receipt.tx))]
-    async fn poll_attestation_for_base_burn(
-        &self,
-        id: &UsdcRebalanceId,
-        burn_receipt: &BurnReceipt,
-    ) -> Result<Bytes, UsdcRebalanceManagerError> {
-        let attestation = match self.cctp_bridge.poll_attestation(burn_receipt.hash).await {
-            Ok(a) => a,
-            Err(e) => {
-                warn!("Attestation polling failed: {e}");
-                self.cqrs
-                    .execute(
-                        &id.0,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Attestation polling failed: {e}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcRebalanceManagerError::Cctp(e));
-            }
-        };
-
-        self.cqrs
-            .execute(
-                &id.0,
-                UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation.to_vec(),
-                },
-            )
-            .await?;
-
-        info!("Circle attestation received for Base burn");
-        Ok(attestation)
-    }
-
-    #[instrument(skip(self, burn_receipt, attestation), fields(?id, burn_tx = %burn_receipt.tx))]
-    async fn execute_cctp_mint_on_ethereum(
-        &self,
-        id: &UsdcRebalanceId,
-        burn_receipt: &BurnReceipt,
-        attestation: Bytes,
-    ) -> Result<TxHash, UsdcRebalanceManagerError> {
-        let mint_tx = match self
-            .cctp_bridge
-            .mint_on_ethereum(burn_receipt.message.clone(), attestation)
-            .await
-        {
-            Ok(tx) => tx,
-            Err(e) => {
-                warn!("CCTP mint on Ethereum failed: {e}");
-                self.cqrs
-                    .execute(
-                        &id.0,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!("Mint on Ethereum failed: {e}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcRebalanceManagerError::Cctp(e));
-            }
-        };
-
-        self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
-            .await?;
-
-        info!(%mint_tx, "CCTP mint on Ethereum executed");
-        Ok(mint_tx)
     }
 
     #[instrument(skip(self), fields(?id, %mint_tx))]
@@ -681,18 +585,19 @@ mod tests {
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
+    use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{AggregateError, CqrsFramework};
     use httpmock::prelude::*;
     use reqwest::StatusCode;
     use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use uuid::uuid;
+
     use super::*;
-    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, create_account_mock};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
     use crate::onchain::vault::VaultService;
-    use crate::usdc_rebalance::UsdcRebalanceError;
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
     const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
@@ -701,6 +606,8 @@ mod tests {
     const TEST_VAULT_ID: VaultId = VaultId(b256!(
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     type TestProvider = FillProvider<
         JoinFill<
@@ -729,18 +636,13 @@ mod tests {
         (anvil, endpoint, private_key)
     }
 
-    async fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
-        let account_mock = create_account_mock(server, "test-account-id");
-
+    fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key".to_string(),
             "test_secret".to_string(),
-        )
-        .await
-        .unwrap();
-
-        account_mock.assert();
+        );
 
         AlpacaWalletService::new_with_client(client, None)
     }
@@ -792,7 +694,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        let vault_service = VaultService::new(vault_evm, ORDERBOOK_ADDRESS);
+        let vault_service = VaultService::new_unchecked(vault_evm, ORDERBOOK_ADDRESS, USDC_ADDRESS);
 
         (cctp_bridge, vault_service)
     }
@@ -824,7 +726,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
@@ -842,7 +744,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/test-account-id/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -870,7 +772,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
@@ -888,7 +790,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/test-account-id/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
@@ -923,7 +825,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
@@ -941,7 +843,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/test-account-id/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(500).body("Internal Server Error");
         });
 
@@ -1004,7 +906,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
@@ -1035,11 +937,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_base_to_alpaca_cctp_burn_fails_with_contract_error() {
+    async fn test_execute_base_to_alpaca_vault_contract_error() {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, signer);
         let cqrs = create_test_cqrs();
@@ -1060,14 +962,10 @@ mod tests {
 
         let result = manager.execute_base_to_alpaca(&id, amount).await;
 
+        // Anvil has no OrderBook deployed, so vault withdrawal fails with contract error
         assert!(
-            matches!(
-                result,
-                Err(UsdcRebalanceManagerError::Aggregate(
-                    AggregateError::UserError(UsdcRebalanceError::BridgingNotInitiated)
-                ))
-            ),
-            "Expected Aggregate(UserError(BridgingNotInitiated)) error, got: {result:?}"
+            matches!(result, Err(UsdcRebalanceManagerError::Vault(_))),
+            "Expected Vault error from missing OrderBook contract, got: {result:?}"
         );
     }
 }

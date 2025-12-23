@@ -15,6 +15,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
+use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
@@ -68,6 +69,9 @@ pub struct RebalancingEnv {
     /// Vault ID for USDC deposits to the Raindex vault
     #[clap(long, env)]
     usdc_vault_id: B256,
+    /// Alpaca account ID (UUID) for Broker API wallet operations
+    #[clap(long, env, value_parser = AlpacaAccountId::parse)]
+    alpaca_account_id: AlpacaAccountId,
 }
 
 impl RebalancingConfig {
@@ -78,6 +82,7 @@ impl RebalancingConfig {
         const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
 
         let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+
         Ok(Self {
             equity_threshold: ImbalanceThreshold {
                 target: env.equity_target_ratio,
@@ -92,6 +97,7 @@ impl RebalancingConfig {
             ethereum_rpc_url: env.ethereum_rpc_url,
             ethereum_private_key: env.ethereum_private_key,
             usdc_vault_id: env.usdc_vault_id,
+            alpaca_account_id: env.alpaca_account_id,
         })
     }
 }
@@ -108,6 +114,8 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) ethereum_private_key: B256,
     pub(crate) usdc_vault_id: B256,
+    /// Alpaca account ID (UUID) for Broker API wallet operations.
+    pub(crate) alpaca_account_id: AlpacaAccountId,
 }
 
 impl std::fmt::Debug for RebalancingConfig {
@@ -120,6 +128,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("ethereum_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
+            .field("alpaca_account_id", &self.alpaca_account_id)
             .finish()
     }
 }
@@ -1342,7 +1351,7 @@ mod tests {
         ));
     }
 
-    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 7] {
+    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 8] {
         [
             (
                 "REDEMPTION_WALLET",
@@ -1365,6 +1374,10 @@ mod tests {
             (
                 "USDC_VAULT_ID",
                 Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "ALPACA_ACCOUNT_ID",
+                Some("904837e3-3b76-47ec-b432-046db621571b"),
             ),
         ]
     }
@@ -1410,6 +1423,10 @@ mod tests {
                 "USDC_VAULT_ID",
                 Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
             ),
+            (
+                "ALPACA_ACCOUNT_ID",
+                Some("904837e3-3b76-47ec-b432-046db621571b"),
+            ),
             ("EQUITY_TARGET_RATIO", Some("0.6")),
             ("EQUITY_DEVIATION", Some("0.1")),
             ("USDC_TARGET_RATIO", Some("0.4")),
@@ -1430,6 +1447,10 @@ mod tests {
     fn from_env_missing_redemption_wallet_fails() {
         let vars = [
             ("REDEMPTION_WALLET", None),
+            (
+                "MARKET_MAKER_WALLET",
+                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
+            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
                 "ETHEREUM_PRIVATE_KEY",
@@ -1443,6 +1464,10 @@ mod tests {
             (
                 "USDC_VAULT_ID",
                 Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "ALPACA_ACCOUNT_ID",
+                Some("904837e3-3b76-47ec-b432-046db621571b"),
             ),
         ];
 
@@ -1462,6 +1487,10 @@ mod tests {
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
             ),
+            (
+                "MARKET_MAKER_WALLET",
+                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
+            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             ("ETHEREUM_PRIVATE_KEY", None),
             ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -1472,6 +1501,10 @@ mod tests {
             (
                 "USDC_VAULT_ID",
                 Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "ALPACA_ACCOUNT_ID",
+                Some("904837e3-3b76-47ec-b432-046db621571b"),
             ),
         ];
 
@@ -1488,6 +1521,10 @@ mod tests {
     fn from_env_invalid_address_format_fails() {
         let vars = [
             ("REDEMPTION_WALLET", Some("not-an-address")),
+            (
+                "MARKET_MAKER_WALLET",
+                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
+            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
                 "ETHEREUM_PRIVATE_KEY",
@@ -1501,6 +1538,10 @@ mod tests {
             (
                 "USDC_VAULT_ID",
                 Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "ALPACA_ACCOUNT_ID",
+                Some("904837e3-3b76-47ec-b432-046db621571b"),
             ),
         ];
 
@@ -1520,6 +1561,10 @@ mod tests {
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
             ),
+            (
+                "MARKET_MAKER_WALLET",
+                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
+            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             ("ETHEREUM_PRIVATE_KEY", Some("not-a-valid-key")),
             ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -1530,6 +1575,10 @@ mod tests {
             (
                 "USDC_VAULT_ID",
                 Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
+            ),
+            (
+                "ALPACA_ACCOUNT_ID",
+                Some("904837e3-3b76-47ec-b432-046db621571b"),
             ),
         ];
 
