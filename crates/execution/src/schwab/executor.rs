@@ -7,8 +7,8 @@ use crate::schwab::SchwabAuthEnv;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate,
-    Shares, Symbol, TryIntoExecutor,
+    Direction, ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus,
+    OrderUpdate, Shares, Symbol, TryIntoExecutor,
 };
 
 /// Configuration for SchwabExecutor containing auth environment and database pool
@@ -190,16 +190,8 @@ impl Executor for SchwabExecutor {
 
         for row in rows {
             let Some(order_id_value) = row.order_id else {
-                let id_str = row
-                    .id
-                    .map_or_else(|| "unknown".to_string(), |id| id.to_string());
-
-                return Err(ExecutionError::InvalidOrder {
-                    reason: format!(
-                        "SUBMITTED order missing order_id: id={id_str}, \
-                         symbol={}, shares={}, direction={}",
-                        row.symbol, row.shares, row.direction
-                    ),
+                return Err(ExecutionError::MissingOrderId {
+                    status: OrderStatus::Submitted,
                 });
             };
 
@@ -213,28 +205,15 @@ impl Executor for SchwabExecutor {
                             _ => None,
                         };
 
-                        let symbol =
-                            Symbol::new(row.symbol).map_err(|e| ExecutionError::InvalidOrder {
-                                reason: format!("Invalid symbol in database: {e}"),
-                            })?;
+                        let symbol = Symbol::new(row.symbol)?;
 
-                        let shares = Shares::new(row.shares.try_into().map_err(|_| {
-                            ExecutionError::InvalidOrder {
-                                reason: format!("Shares value {} is negative", row.shares),
-                            }
-                        })?)
-                        .map_err(|e| ExecutionError::InvalidOrder {
-                            reason: format!("Invalid shares in database: {e}"),
-                        })?;
+                        let shares_u64: u64 = row
+                            .shares
+                            .try_into()
+                            .map_err(|_| ExecutionError::NegativeShares { value: row.shares })?;
+                        let shares = Shares::new(shares_u64)?;
 
-                        let direction =
-                            row.direction
-                                .parse()
-                                .map_err(|e: crate::InvalidDirectionError| {
-                                    ExecutionError::InvalidOrder {
-                                        reason: format!("Invalid direction in database: {e}"),
-                                    }
-                                })?;
+                        let direction: Direction = row.direction.parse()?;
 
                         updates.push(OrderUpdate {
                             order_id: order_id_value.clone(),

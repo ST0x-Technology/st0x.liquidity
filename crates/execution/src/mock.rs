@@ -76,8 +76,8 @@ impl Executor for MockExecutor {
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         if self.should_fail {
-            return Err(ExecutionError::OrderPlacement {
-                reason: self.failure_message.clone(),
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
             });
         }
 
@@ -117,8 +117,8 @@ impl Executor for MockExecutor {
 
     async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
         if self.should_fail {
-            return Err(ExecutionError::OrderPlacement {
-                reason: self.failure_message.clone(),
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
             });
         }
 
@@ -156,6 +156,8 @@ impl TryIntoExecutor for MockExecutorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::{Direction, Shares, Symbol};
 
     #[tokio::test]
     async fn test_try_from_config_success() {
@@ -198,5 +200,78 @@ mod tests {
     async fn test_to_supported_executor() {
         let executor = MockExecutor::new();
         assert_eq!(executor.to_supported_executor(), SupportedExecutor::DryRun);
+    }
+
+    #[tokio::test]
+    async fn test_place_market_order_success() {
+        let executor = MockExecutor::new();
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Shares::new(10).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = executor.place_market_order(order).await;
+        let placement = result.unwrap();
+
+        assert!(placement.order_id.starts_with("TEST_"));
+        assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
+        assert_eq!(placement.shares, Shares::new(10).unwrap());
+        assert_eq!(placement.direction, Direction::Buy);
+    }
+
+    #[tokio::test]
+    async fn test_place_market_order_failure() {
+        let executor = MockExecutor::with_failure("Simulated API error");
+        let order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Shares::new(10).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = executor.place_market_order(order).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "Simulated API error"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_success() {
+        let executor = MockExecutor::new();
+        let result = executor.poll_pending_orders().await;
+
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_failure() {
+        let executor = MockExecutor::with_failure("Connection timeout");
+        let result = executor.poll_pending_orders().await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "Connection timeout"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_status_success() {
+        let executor = MockExecutor::new();
+        let result = executor.get_order_status(&"TEST_1".to_string()).await;
+
+        let state = result.unwrap();
+        assert!(matches!(state, OrderState::Filled { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_get_order_status_failure() {
+        let executor = MockExecutor::with_failure("Test failure");
+        let result = executor.get_order_status(&"TEST_1".to_string()).await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::OrderNotFound { order_id } if order_id == "TEST_1"
+        ));
     }
 }

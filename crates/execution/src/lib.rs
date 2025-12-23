@@ -235,18 +235,26 @@ pub enum ExecutionError {
     Database(#[from] sqlx::Error),
     #[error("Schwab error: {0}")]
     Schwab(#[from] schwab::SchwabError),
-    #[error("Invalid order: {reason}")]
-    InvalidOrder { reason: String },
+    #[error("{status:?} order requires order_id")]
+    MissingOrderId { status: OrderStatus },
+    #[error("{status:?} order requires price_cents")]
+    MissingPriceCents { status: OrderStatus },
+    #[error("{status:?} order requires executed_at timestamp")]
+    MissingExecutedAt { status: OrderStatus },
     #[error("Order not found: {order_id}")]
     OrderNotFound { order_id: String },
-    #[error("Order placement failed: {reason}")]
-    OrderPlacement { reason: String },
+    #[error("Mock executor failure: {message}")]
+    MockFailure { message: String },
     #[error("Incomplete order response: {field} missing for {status:?} order")]
     IncompleteOrderResponse { field: String, status: OrderStatus },
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
     #[error(transparent)]
     InvalidShares(#[from] InvalidSharesError),
+    #[error(transparent)]
+    InvalidDirection(#[from] InvalidDirectionError),
+    #[error("Negative shares value: {value}")]
+    NegativeShares { value: i64 },
     #[error("Price {price} cannot be converted to cents")]
     PriceConversion { price: f64 },
     #[error("Numeric conversion error: {0}")]

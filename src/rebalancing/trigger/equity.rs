@@ -3,13 +3,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use st0x_execution::Symbol;
 use tokio::sync::RwLock;
 
+use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 use crate::symbol::cache::SymbolCache;
-use st0x_execution::Symbol;
-
-use super::TriggeredOperation;
 
 /// Why an equity trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
