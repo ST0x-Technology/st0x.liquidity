@@ -265,7 +265,7 @@ The system provides two top-level capabilities:
 
 ### **Architecture Layers**
 
-```
+```text
 ┌───────────────────────────────────────────────────────────────────────┐
 │                          INTEGRATIONS                                 │
 │                 (external API wrappers, trait + impls)                │
@@ -385,7 +385,7 @@ This enables:
 
 The crate extraction is sequenced around the CQRS/ES migration:
 
-**Phase 1: Prerequisite Refactors**
+### Phase 1: Prerequisite Refactors
 
 Fix coupling issues before extraction:
 
@@ -394,7 +394,7 @@ Fix coupling issues before extraction:
 - Move ID types: `IssuerRequestId`/`TokenizationRequestId` move from aggregate
   to tokenization module, reversing the dependency direction
 
-**Phase 2: Integration Layer Extraction**
+### Phase 2: Integration Layer Extraction
 
 Extract external API wrappers (no CQRS/ES dependencies):
 
@@ -402,15 +402,16 @@ Extract external API wrappers (no CQRS/ES dependencies):
 - `st0x-bridge`: CCTP cross-chain transfers, defines `Bridge` trait
 - `st0x-vault`: Rain orderbook vault operations, defines `Vault` trait
 
-**Phase 3: Rebalancing Domain Extraction**
+### Phase 3: Rebalancing Domain Extraction
 
 Extract rebalancing logic (already clean CQRS, no legacy persistence):
 
 - `st0x-rebalance`: TokenizedEquityMint, EquityRedemption, UsdcRebalance
   aggregates plus orchestration logic
 
-**Phase 4: Hedging Extraction & Application Layer** (after CQRS migration Phase
-3 completes)
+### Phase 4: Hedging Extraction & Application Layer
+
+After CQRS migration Phase 3 completes.
 
 Extract hedging logic and create application binary (must happen atomically):
 
