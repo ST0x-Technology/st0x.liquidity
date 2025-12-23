@@ -163,6 +163,10 @@ resolution and feature selection.
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
   the interactive view, e.g. `git --no-pager diff`
+- **CRITICAL: NEVER run `cargo run` unless explicitly asked by the user.** If
+  you want to understand CLI commands or configuration options, read the code.
+  If you want to test functionality, write proper tests. There is never a reason
+  to run the application speculatively.
 
 ## Architecture Overview
 

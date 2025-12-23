@@ -43,8 +43,6 @@ pub enum AlpacaWalletError {
         tx_hash: TxHash,
         elapsed: std::time::Duration,
     },
-    #[error("Sandbox-only endpoint called in production environment")]
-    SandboxOnlyEndpoint,
 }
 
 pub struct AlpacaWalletClient {
@@ -192,42 +190,6 @@ impl AlpacaWalletClient {
         Ok(serde_json::from_str::<WhitelistEntry>(&text)?)
     }
 
-    /// Simulates an incoming wire transfer in sandbox environment.
-    ///
-    /// This endpoint only works in sandbox (broker-api.sandbox.alpaca.markets).
-    /// It immediately credits USD to the account for testing purposes.
-    ///
-    /// # Arguments
-    /// * `amount` - Amount in USD to credit to the account
-    /// * `wire_instruction` - Wire routing instruction provided by Alpaca
-    ///
-    /// # Errors
-    /// Returns `SandboxOnlyEndpoint` if called against production API.
-    pub(super) async fn fund_sandbox(
-        &self,
-        amount: Decimal,
-        wire_instruction: &str,
-    ) -> Result<(), AlpacaWalletError> {
-        if !self.base_url.contains("sandbox") {
-            return Err(AlpacaWalletError::SandboxOnlyEndpoint);
-        }
-
-        #[derive(serde::Serialize)]
-        struct Request<'a> {
-            amount: Decimal,
-            wire_instructions: &'a str,
-        }
-
-        let request = Request {
-            amount,
-            wire_instructions: wire_instruction,
-        };
-
-        self.post("/v1/testing/incoming_wires", &request).await?;
-
-        Ok(())
-    }
-
     /// Gets or creates a wallet deposit address for a specific asset and network.
     ///
     /// Uses GET with account_id in path per Broker API documentation.
@@ -265,7 +227,6 @@ impl AlpacaWalletClient {
 #[cfg(test)]
 mod tests {
     use httpmock::prelude::*;
-    use rust_decimal_macros::dec;
     use serde_json::json;
     use uuid::uuid;
 
@@ -526,86 +487,6 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             AlpacaWalletError::ParseError(_)
-        ));
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_fund_sandbox_success() {
-        let server = MockServer::start();
-
-        // Path includes /sandbox because base_url ends with /sandbox
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/sandbox/v1/testing/incoming_wires")
-                .json_body(serde_json::json!({
-                    "amount": "1000.50",
-                    "wire_instructions": "FFC st4P-123456"
-                }));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(serde_json::json!({"success": true}));
-        });
-
-        // URL must contain "sandbox" to pass the sandbox check
-        let client = AlpacaWalletClient::new(
-            format!("{}/sandbox", server.base_url()),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result = client.fund_sandbox(dec!(1000.50), "FFC st4P-123456").await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_fund_sandbox_rejects_production() {
-        let server = MockServer::start();
-
-        // Production URL (no "sandbox" in it)
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result = client.fund_sandbox(dec!(1000.50), "FFC st4P-123456").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::SandboxOnlyEndpoint
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_fund_sandbox_api_error() {
-        let server = MockServer::start();
-
-        let mock = server.mock(|when, then| {
-            when.method(POST).path("/sandbox/v1/testing/incoming_wires");
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(serde_json::json!({
-                    "message": "Invalid wire instructions"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new(
-            format!("{}/sandbox", server.base_url()),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result = client.fund_sandbox(dec!(1000.50), "invalid").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST
         ));
         mock.assert();
     }

@@ -165,25 +165,6 @@ impl AlpacaWalletService {
     pub(crate) async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
         transfer::list_all_transfers(&self.client).await
     }
-
-    /// Simulates an incoming wire transfer in sandbox environment.
-    ///
-    /// This endpoint only works in sandbox (broker-api.sandbox.alpaca.markets).
-    /// It immediately credits USD to the account for testing purposes.
-    ///
-    /// # Arguments
-    /// * `amount` - Amount in USD to credit to the account
-    /// * `wire_instruction` - Wire routing instruction provided by Alpaca
-    ///
-    /// # Errors
-    /// Returns `SandboxOnlyEndpoint` if called against production API.
-    pub(crate) async fn fund_sandbox(
-        &self,
-        amount: Decimal,
-        wire_instruction: &str,
-    ) -> Result<(), AlpacaWalletError> {
-        self.client.fund_sandbox(amount, wire_instruction).await
-    }
 }
 
 #[cfg(test)]
@@ -380,53 +361,5 @@ mod tests {
 
         assert_eq!(result.status, transfer::TransferStatus::Complete);
         status_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_fund_sandbox_success() {
-        let server = MockServer::start();
-
-        // Path includes /sandbox because base_url ends with /sandbox
-        let mock = server.mock(|when, then| {
-            when.method(POST)
-                .path("/sandbox/v1/testing/incoming_wires")
-                .json_body(json!({
-                    "amount": "500",
-                    "wire_instructions": "FFC st4P-test-account-id"
-                }));
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({"success": true}));
-        });
-
-        let client = AlpacaWalletClient::new(
-            format!("{}/sandbox", server.base_url()),
-            TEST_ACCOUNT_ID,
-            "test_key".to_string(),
-            "test_secret".to_string(),
-        );
-
-        let service = AlpacaWalletService::new_with_client(client, None);
-        let amount = Decimal::new(500, 0);
-        let result = service
-            .fund_sandbox(amount, "FFC st4P-test-account-id")
-            .await;
-
-        assert!(result.is_ok());
-        mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_fund_sandbox_rejects_production() {
-        let server = MockServer::start();
-        let service = create_test_service(&server);
-
-        let amount = Decimal::new(500, 0);
-        let result = service.fund_sandbox(amount, "FFC st4P-123456").await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::SandboxOnlyEndpoint
-        ));
     }
 }

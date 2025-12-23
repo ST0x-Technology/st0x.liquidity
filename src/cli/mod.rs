@@ -225,19 +225,6 @@ pub enum Commands {
         #[arg(long = "chain")]
         chain: CctpChain,
     },
-
-    /// Fund Alpaca sandbox account with simulated wire transfer (sandbox only).
-    ///
-    /// This endpoint only works in sandbox environment. It simulates an incoming
-    /// wire transfer to credit USD to the account for testing purposes.
-    AlpacaFundSandbox {
-        /// Amount in USD to credit to the account
-        #[arg(short = 'a', long = "amount")]
-        amount: Usdc,
-        /// Wire routing instruction provided by Alpaca (e.g., "FFC st4P-123456")
-        #[arg(short = 'w', long = "wire-instruction")]
-        wire_instruction: String,
-    },
 }
 
 #[derive(Debug, Parser)]
@@ -379,13 +366,6 @@ async fn run_command_with_writers<W: Write>(
                 .connect_ws(WsConnect::new(ws_url))
                 .await?;
             cctp::reset_allowance_command(stdout, chain, &config, provider).await?;
-        }
-        Commands::AlpacaFundSandbox {
-            amount,
-            wire_instruction,
-        } => {
-            alpaca_wallet::alpaca_fund_sandbox_command(stdout, amount, &wire_instruction, &config)
-                .await?;
         }
     }
 
@@ -1869,54 +1849,5 @@ mod tests {
         assert_eq!(trade.symbol.to_string(), "GOOG0x");
         assert!((trade.amount - 2.5).abs() < f64::EPSILON);
         assert!((trade.price_usdc - 20000.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_alpaca_fund_sandbox_command_structure() {
-        let cmd = Cli::command();
-
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "alpaca-fund-sandbox"]);
-        assert!(
-            result.is_err(),
-            "alpaca-fund-sandbox without args should fail"
-        );
-
-        let result =
-            cmd.clone()
-                .try_get_matches_from(vec!["cli", "alpaca-fund-sandbox", "-a", "1000"]);
-        assert!(
-            result.is_err(),
-            "alpaca-fund-sandbox without wire-instruction should fail"
-        );
-
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "alpaca-fund-sandbox",
-            "-a",
-            "1000.50",
-            "-w",
-            "FFC st4P-123456",
-        ]);
-        assert!(
-            result.is_ok(),
-            "alpaca-fund-sandbox with all args should succeed: {:?}",
-            result.err()
-        );
-
-        let result = cmd.try_get_matches_from(vec![
-            "cli",
-            "alpaca-fund-sandbox",
-            "--amount",
-            "500",
-            "--wire-instruction",
-            "FFC test-456",
-        ]);
-        assert!(
-            result.is_ok(),
-            "alpaca-fund-sandbox with long args should succeed: {:?}",
-            result.err()
-        );
     }
 }

@@ -305,51 +305,6 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     Ok(())
 }
 
-pub(super) async fn alpaca_fund_sandbox_command<W: Write>(
-    stdout: &mut W,
-    amount: Usdc,
-    wire_instruction: &str,
-    config: &Config,
-) -> anyhow::Result<()> {
-    writeln!(stdout, "Funding Alpaca sandbox account")?;
-    writeln!(stdout, "   Amount: {amount} USD")?;
-
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
-        anyhow::bail!("alpaca-fund-sandbox requires Alpaca Broker API configuration");
-    };
-
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "alpaca-fund-sandbox requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
-
-    if !alpaca_auth.is_sandbox() {
-        anyhow::bail!(
-            "alpaca-fund-sandbox only works in sandbox mode. Current mode is live trading."
-        );
-    }
-
-    let alpaca_wallet = AlpacaWalletService::new(
-        "https://broker-api.sandbox.alpaca.markets".to_string(),
-        rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_auth.alpaca_broker_api_secret.clone(),
-    );
-
-    let amount_decimal: rust_decimal::Decimal = amount.into();
-    writeln!(stdout, "   Simulating wire transfer...")?;
-
-    alpaca_wallet
-        .fund_sandbox(amount_decimal, wire_instruction)
-        .await?;
-
-    writeln!(stdout, "Sandbox funding completed successfully!")?;
-    writeln!(stdout, "   {amount} USD has been credited to the account.")?;
-
-    Ok(())
-}
-
 pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
     config: &Config,
@@ -623,75 +578,6 @@ mod tests {
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_fund_sandbox_requires_alpaca_broker() {
-        let config = create_config_without_alpaca();
-        let amount = Usdc(dec!(100));
-
-        let mut stdout = Vec::new();
-        let result =
-            alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("requires Alpaca Broker API configuration"),
-            "Expected Alpaca Broker API error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_fund_sandbox_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
-        let amount = Usdc(dec!(100));
-
-        let mut stdout = Vec::new();
-        let result =
-            alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("requires rebalancing configuration"),
-            "Expected rebalancing config error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_fund_sandbox_rejects_production_mode() {
-        let mut config = create_full_alpaca_config();
-        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test-key".to_string(),
-            alpaca_broker_api_secret: "test-secret".to_string(),
-            alpaca_account_id: "test-account-id".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
-        });
-        let amount = Usdc(dec!(100));
-
-        let mut stdout = Vec::new();
-        let result =
-            alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("only works in sandbox mode"),
-            "Expected sandbox-only error, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_alpaca_fund_sandbox_writes_amount_to_stdout() {
-        let config = create_full_alpaca_config();
-        let amount = Usdc(dec!(500.50));
-
-        let mut stdout = Vec::new();
-        let _ = alpaca_fund_sandbox_command(&mut stdout, amount, "FFC st4P-123456", &config).await;
-
-        let output = String::from_utf8(stdout).unwrap();
-        assert!(
-            output.contains("500.50 USD"),
-            "Expected amount in output, got: {output}"
         );
     }
 }
