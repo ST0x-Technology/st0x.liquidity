@@ -164,15 +164,15 @@ async fn run(
                 break Ok(());
             }
             Err(e) => {
-                if let Some(broker_error) = e.downcast_ref::<BrokerError>() {
-                    if matches!(
+                if let Some(broker_error) = e.downcast_ref::<BrokerError>()
+                    && matches!(
                         broker_error,
                         BrokerError::Schwab(SchwabError::RefreshTokenExpired)
-                    ) {
-                        warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
-                        tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-                        continue;
-                    }
+                    )
+                {
+                    warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
+                    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
+                    continue;
                 }
 
                 error!("Bot session failed: {e}");
