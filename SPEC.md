@@ -241,6 +241,146 @@ defined in `migrations/20250703115746_trades.sql`.
 - Environment-based configuration injection
 - Resource limits and restart policies for production deployment
 
+## **Crate Architecture**
+
+The codebase is organized into multiple Rust crates to achieve:
+
+1. **Faster builds** - Cargo parallelizes across crates; unchanged crates skip
+   rebuild entirely
+2. **Stricter abstraction boundaries** - Crate visibility (`pub(crate)`)
+   enforces domain isolation at compile-time
+3. **Tighter dependency graph** - Dependencies explicit in Cargo.toml, no cycles
+   allowed
+4. **Reduced coupling** - Each crate defines a clear public API; internals stay
+   hidden
+
+### **Core Capabilities**
+
+The system provides two top-level capabilities:
+
+1. **Hedging** - Offsetting directional exposure by executing trades on
+   brokerages
+2. **Maintaining balance invariants** - Keeping inventory balanced across venues
+   through transfers (tokenization, bridging, vault operations)
+
+### **Architecture Layers**
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                          INTEGRATIONS                                 │
+│                 (external API wrappers, trait + impls)                │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  st0x-execution      st0x-tokenization  st0x-bridge    st0x-vault     │
+│  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Vault trait │
+│  │                   │                  │              │              │
+│  │ features:         │ features:        │ features:    │ features:    │
+│  │ ├─ schwab         │ └─ alpaca        │ └─ cctp      │ └─ rain      │
+│  │ ├─ alpaca-trading │                  │              │              │
+│  │ └─ mock           │                  │              │              │
+│                                                                       │
+└───────┬──────────────────┬──────────────────┬──────────────┬──────────┘
+        │                  │                  │              │
+        ▼                  ▼                  ▼              ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                          DOMAIN LOGIC                                 │
+│                    (business rules, uses traits)                      │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  st0x-hedging                          st0x-rebalancing               │
+│  ├─ Conductor                          ├─ Rebalancer                  │
+│  ├─ Accumulator                        ├─ Trigger logic               │
+│  ├─ Position tracking                  ├─ Mint/Redeem managers        │
+│  └─ Queue processing                   └─ CQRS aggregates             │
+│                                                                       │
+│  depends on: execution                 depends on: tokenization,      │
+│                                                    bridge, vault      │
+│                                                                       │
+└──────────────────────────────────┬────────────────────────────────────┘
+                                   │
+                                   ▼
+┌───────────────────────────────────────────────────────────────────────┐
+│                           APPLICATION                                 │
+├───────────────────────────────────────────────────────────────────────┤
+│                                                                       │
+│  st0x-server                           st0x-dashboard                 │
+│  ├─ main.rs                            ├─ Websocket events            │
+│  ├─ API endpoints                      ├─ Admin UI backend            │
+│  ├─ Automated flows                    └─ Manual operations (future)  │
+│  │                                                                    │
+│  │ features:                                                          │
+│  │ ├─ schwab, alpaca-trading, mock                                    │
+│  │ ├─ alpaca-tokenization                                             │
+│  │ ├─ cctp                                                            │
+│  │ └─ rain                                                            │
+│                                                                       │
+└───────────────────────────────────────────────────────────────────────┘
+
+                · · · · · · · · · · · · · · · · · · · · ·
+                ·                                       ·
+                ·  st0x-cli (temporary utility)         ·
+                ·  ├─ Manual auth flows                 ·
+                ·  ├─ Debug commands                    ·
+                ·  └─ To be deprecated                  ·
+                ·                                       ·
+                · · · · · · · · · · · · · · · · · · · · ·
+```
+
+### **Crate Descriptions**
+
+**Integration Layer** (external API wrappers):
+
+| Crate               | Purpose                                              | Feature Flags                      |
+| ------------------- | ---------------------------------------------------- | ---------------------------------- |
+| `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
+| `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
+| `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
+| `st0x-vault`        | Orderbook vault deposit/withdraw operations          | `rain`                             |
+
+Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
+`Vault`) with one or more implementations selectable via feature flags. This
+allows swapping implementations without changing domain logic.
+
+**Domain Logic Layer** (business rules):
+
+| Crate              | Purpose                                                         | Dependencies                                     |
+| ------------------ | --------------------------------------------------------------- | ------------------------------------------------ |
+| `st0x-hedging`     | Hedging logic: conductor, accumulator, position tracking, queue | `st0x-execution`                                 |
+| `st0x-rebalancing` | Balance maintenance: triggers, managers, CQRS aggregates        | `st0x-tokenization`, `st0x-bridge`, `st0x-vault` |
+
+Domain crates depend on integration traits, not concrete implementations. This
+enables testing with mocks and future implementation swaps.
+
+**Application Layer** (binaries and wiring):
+
+| Crate            | Purpose                                                        |
+| ---------------- | -------------------------------------------------------------- |
+| `st0x-server`    | Main bot binary, wires hedging + rebalancing, API endpoints    |
+| `st0x-dashboard` | Admin dashboard backend, websocket events, manual operations   |
+| `st0x-cli`       | Temporary utility for manual auth and debug (to be deprecated) |
+
+### **Feature Flag Strategy**
+
+Feature flags control which implementations are compiled:
+
+```toml
+# Production equities bot with Schwab
+[dependencies]
+st0x-server = { features = ["schwab", "alpaca-tokenization", "cctp", "rain"] }
+
+# Dry-run testing
+st0x-server = { features = ["mock", "alpaca-tokenization", "cctp", "rain"] }
+
+# Future: crypto + perps fork with different integrations
+st0x-server = { features = ["perp-exchange", "other-bridge", "other-vault"] }
+```
+
+This enables:
+
+- Compile-time selection of integrations (no unused code in binary)
+- Easy addition of new implementations behind new feature flags
+- Fork-friendly architecture for different asset classes
+
 ## **System Risks**
 
 The following risks are known for v1 but will not be addressed in the initial
