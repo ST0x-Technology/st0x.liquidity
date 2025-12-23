@@ -144,6 +144,19 @@ resolution and feature selection.
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
   the interactive view, e.g. `git --no-pager diff`
 
+### Updating GitHub Issues
+
+When updating GitHub issue bodies (especially the roadmap issue #2):
+
+1. Save the current body to a local `.md` file:
+   `gh issue view <number> --repo ST0x-Technology/st0x.liquidity --json body -q '.body' > roadmap-issue-2.md`
+2. Edit the file using the `Edit` tool (so changes are visible for review)
+3. Apply the update:
+   `gh issue edit <number> --repo ST0x-Technology/st0x.liquidity --body-file roadmap-issue-2.md`
+4. Delete the temp file
+
+This pattern ensures changes are reviewable before being applied.
+
 ## Architecture Overview
 
 ### Broker Abstraction Layer
@@ -212,81 +225,21 @@ new brokers, see @crates/broker/AGENTS.md
 
 ### Database Schema & Idempotency
 
-**SQLite Tables:**
+**Key tables** (see migrations for full schema):
 
-- `onchain_trades`: Immutable blockchain trade records
-
-  - `id`: Primary key (auto-increment)
-  - `tx_hash`: Transaction hash (66 chars, 0x-prefixed)
-  - `log_index`: Event log index (non-negative)
-  - `symbol`: Asset symbol (non-empty string)
-  - `amount`: Trade quantity (positive real number)
-  - `direction`: Trade direction ('BUY' or 'SELL')
-  - `price_usdc`: Price in USDC (positive real number)
-  - `created_at`: Timestamp (default CURRENT_TIMESTAMP)
-  - Unique constraint: `(tx_hash, log_index)`
-
-- `schwab_executions`: Schwab order execution tracking
-
-  - `id`: Primary key (auto-increment)
-  - `symbol`: Asset symbol (non-empty string)
-  - `shares`: Whole shares executed (positive integer)
-  - `direction`: Execution direction ('BUY' or 'SELL')
-  - `order_id`: Schwab order ID (nullable, non-empty if present)
-  - `price_cents`: Execution price in cents (nullable, non-negative)
-  - `status`: Execution status ('PENDING', 'COMPLETED', 'FAILED')
-  - `executed_at`: Execution timestamp (nullable)
-  - Check constraints ensure consistent status transitions
-
+- `onchain_trades`: Immutable blockchain trade records, keyed by
+  `(tx_hash, log_index)`
+- `schwab_executions`: Order execution tracking with status transitions
 - `trade_accumulators`: Unified position tracking per symbol
-
-  - `symbol`: Primary key (non-empty string)
-  - `net_position`: Running net position (real number)
-  - `accumulated_long`: Fractional shares for buying (non-negative)
-  - `accumulated_short`: Fractional shares for selling (non-negative)
-  - `pending_execution_id`: Reference to pending execution (nullable)
-  - `last_updated`: Last update timestamp (default CURRENT_TIMESTAMP)
-
-- `trade_execution_links`: Many-to-many audit trail
-
-  - `id`: Primary key (auto-increment)
-  - `trade_id`: Foreign key to onchain_trades
-  - `execution_id`: Foreign key to schwab_executions
-  - `contributed_shares`: Fractional shares contributed (positive)
-  - `created_at`: Link creation timestamp
-  - Unique constraint: `(trade_id, execution_id)`
-
-- `schwab_auth`: OAuth token storage (sensitive data)
-
-  - `id`: Primary key (constrained to 1 for singleton)
-  - `access_token`: Current access token
-  - `access_token_fetched_at`: Access token timestamp
-  - `refresh_token`: Current refresh token
-  - `refresh_token_fetched_at`: Refresh token timestamp
-
-- `event_queue`: Idempotent event processing queue
-
-  - `id`: Primary key (auto-increment)
-  - `tx_hash`: Transaction hash (66 chars, 0x-prefixed)
-  - `log_index`: Event log index (non-negative)
-  - `block_number`: Block number (non-negative)
-  - `event_data`: JSON serialized event (non-empty)
-  - `processed`: Processing status (boolean, default false)
-  - `created_at`: Queue entry timestamp
-  - `processed_at`: Processing completion timestamp (nullable)
-  - Unique constraint: `(tx_hash, log_index)`
-
+- `trade_execution_links`: Many-to-many audit trail between trades and
+  executions
+- `schwab_auth`: OAuth token storage (singleton)
+- `event_queue`: Idempotent event processing queue, keyed by
+  `(tx_hash, log_index)`
 - `symbol_locks`: Per-symbol execution concurrency control
 
-  - `symbol`: Primary key (non-empty string)
-  - `locked_at`: Lock acquisition timestamp
-
-**Idempotency Controls:**
-
-- Uses `(tx_hash, log_index)` as unique identifier to prevent duplicate trade
-  execution
-- Trade status tracking: pending → completed/failed
-- Retry logic with exponential backoff for failed trades
+**Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
+tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
