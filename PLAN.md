@@ -305,7 +305,7 @@ impl Executor for AlpacaBrokerApi {
 
 ---
 
-## Task 7. Update Exports and Main Crate Integration
+## Task 7. Update Exports and Main Crate Integration ✅
 
 **Changes to `crates/broker/src/lib.rs`:**
 
@@ -326,13 +326,26 @@ impl Executor for AlpacaBrokerApi {
 
 **Subtasks:**
 
-- [ ] Update `crates/broker/src/alpaca/mod.rs` exports
-- [ ] Update `crates/broker/src/lib.rs` with new variant and impl
-- [ ] Update `src/env.rs` with new ExecutorConfig variant
-- [ ] Update `src/lib.rs` launch handling
-- [ ] Run `cargo test -q` - all tests must pass
-- [ ] Run `cargo clippy` - no warnings
-- [ ] Run `cargo fmt`
+- [x] Update `crates/broker/src/alpaca/mod.rs` exports
+- [x] Update `crates/broker/src/lib.rs` with new variant and impl
+- [x] Update `src/env.rs` with new ExecutorConfig variant
+- [x] Update `src/lib.rs` launch handling
+- [x] Run `cargo test -q` - all tests must pass
+- [x] Run `cargo clippy` - no warnings
+- [x] Run `cargo fmt`
+
+**Changes made:**
+
+- Updated `src/env.rs` with `BrokerConfig::AlpacaBrokerApi` variant
+- Updated `src/lib.rs` `run_bot_session()` to handle the new variant
+- Updated `src/conductor/mod.rs` renaming `BrokerConfig::Alpaca` to
+  `BrokerConfig::AlpacaTradingApi`
+- Updated `src/cli.rs` to handle both Alpaca variants in CLI commands
+- Fixed price conversion in `order.rs` to use
+  `num_traits::ToPrimitive::to_u64()` for safe f64 to u64 conversion
+- Refactored `test_database_tracks_different_brokers` to use helper functions
+  for clippy compliance
+- All 829 tests passing, clippy clean, code formatted
 
 ---
 
