@@ -218,7 +218,7 @@ async fn ensure_schwab_authentication<W: Write>(
             info!("Authentication tokens are valid, access token obtained");
             return Ok(());
         }
-        Err(st0x_broker::schwab::SchwabError::RefreshTokenExpired) => {
+        Err(SchwabError::RefreshTokenExpired) => {
             info!("Refresh token has expired, launching interactive OAuth flow");
             writeln!(
                 stdout,
@@ -374,7 +374,7 @@ async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 async fn execute_broker_order<W: Write>(
     config: &Config,
     pool: &SqlitePool,
-    market_order: st0x_broker::MarketOrder,
+    market_order: MarketOrder,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &config.broker {
@@ -697,7 +697,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            st0x_broker::schwab::SchwabError::RefreshTokenExpired
+            SchwabError::RefreshTokenExpired
         ));
     }
 
@@ -949,7 +949,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            st0x_broker::schwab::SchwabError::RefreshTokenExpired
+            SchwabError::RefreshTokenExpired
         ));
 
         let mut stdout_buffer = Vec::new();
@@ -1748,14 +1748,14 @@ mod tests {
         // Executions are now in SUBMITTED status with order_id stored for order status polling
         let executions = find_executions_by_symbol_status_and_broker(
             &pool,
-            Some(st0x_broker::Symbol::new("AAPL").unwrap()),
+            Some(Symbol::new("AAPL").unwrap()),
             OrderStatus::Submitted,
             None,
         )
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, st0x_broker::Shares::new(9).unwrap());
+        assert_eq!(executions[0].shares, Shares::new(9).unwrap());
         assert_eq!(executions[0].direction, Direction::Buy);
 
         // Verify order_id was stored in database

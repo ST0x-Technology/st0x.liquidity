@@ -25,7 +25,7 @@ use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use chrono::Utc;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 pub(crate) use equity::EquityTriggerSkip;
 
@@ -551,7 +551,7 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_broker::Direction;
+    use st0x_execution::Direction;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
 

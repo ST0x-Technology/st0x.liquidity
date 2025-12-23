@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::error::{OnChainError, TradeValidationError};
-use st0x_broker::{Direction, Symbol};
+use st0x_execution::{Direction, Symbol};
 
 /// Macro to create a TokenizedEquitySymbol.
 /// This macro provides a convenient way to create tokenized equity symbols.
@@ -297,13 +297,13 @@ mod tests {
         // These fail because after stripping the marker, we're left with an empty string
         // which fails Symbol validation with "Symbol cannot be empty"
         let error = TokenizedEquitySymbol::parse("0x").unwrap_err();
-        assert!(matches!(error, OnChainError::Broker(_)));
+        assert!(matches!(error, OnChainError::EmptySymbol(_)));
 
         let error = TokenizedEquitySymbol::parse("s1").unwrap_err();
-        assert!(matches!(error, OnChainError::Broker(_)));
+        assert!(matches!(error, OnChainError::EmptySymbol(_)));
 
         let error = TokenizedEquitySymbol::parse("t").unwrap_err();
-        assert!(matches!(error, OnChainError::Broker(_)));
+        assert!(matches!(error, OnChainError::EmptySymbol(_)));
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_e
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
 use crate::trade_execution_link::TradeExecutionLink;
-use st0x_broker::{Direction, OrderState, Shares, SupportedBroker, Symbol};
+use st0x_execution::{Direction, OrderState, Shares, SupportedExecutor, Symbol};
 
 /// Processes an onchain trade through the accumulation system with duplicate detection.
 ///
@@ -26,7 +26,7 @@ use st0x_broker::{Direction, OrderState, Shares, SupportedBroker, Symbol};
 pub async fn process_onchain_trade(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     trade: OnchainTrade,
-    broker_type: st0x_broker::SupportedBroker,
+    executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     // Check if trade already exists to handle duplicates gracefully
     let tx_hash_str = trade.tx_hash.to_string();
@@ -91,14 +91,14 @@ pub async fn process_onchain_trade(
 
     let execution = if try_acquire_execution_lease(sql_tx, base_symbol).await? {
         let result =
-            try_create_execution_if_ready(sql_tx, base_symbol, &mut calculator, broker_type)
+            try_create_execution_if_ready(sql_tx, base_symbol, &mut calculator, executor_type)
                 .await?;
 
         match &result {
             Some(execution) => {
                 let execution_id = execution
                     .id
-                    .ok_or(st0x_broker::PersistenceError::MissingExecutionId)?;
+                    .ok_or(st0x_execution::PersistenceError::MissingExecutionId)?;
                 set_pending_execution_id(sql_tx, base_symbol, execution_id).await?;
             }
             None => {
@@ -199,7 +199,7 @@ async fn try_create_execution_if_ready(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
-    broker_type: st0x_broker::SupportedBroker,
+    executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let Some(execution_type) = calculator.determine_execution_type() else {
         return Ok(None);
@@ -210,7 +210,7 @@ async fn try_create_execution_if_ready(
         base_symbol,
         calculator,
         execution_type,
-        broker_type,
+        executor_type,
     )
     .await
 }
@@ -220,7 +220,7 @@ async fn execute_position(
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     execution_type: AccumulationBucket,
-    broker_type: st0x_broker::SupportedBroker,
+    executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let shares = calculator.calculate_executable_shares()?;
 
@@ -366,14 +366,14 @@ async fn create_execution_within_transaction(
     symbol: &Symbol,
     shares: u64,
     direction: Direction,
-    broker: SupportedBroker,
+    executor: SupportedExecutor,
 ) -> Result<OffchainExecution, OnChainError> {
     let execution = OffchainExecution {
         id: None,
         symbol: symbol.clone(),
         shares: Shares::new(shares)?,
         direction,
-        broker,
+        executor,
         state: OrderState::Pending,
     };
 
@@ -460,10 +460,10 @@ async fn clean_up_stale_executions(
 /// to ensure accumulated positions execute even when no new events arrive for those symbols.
 /// It prevents positions from sitting idle indefinitely when they've accumulated
 /// enough shares to execute but the triggering trade didn't push them over the threshold.
-#[tracing::instrument(skip(pool), fields(broker_type = %broker_type), level = tracing::Level::DEBUG)]
+#[tracing::instrument(skip(pool), fields(executor_type = %executor_type), level = tracing::Level::DEBUG)]
 pub async fn check_all_accumulated_positions(
     pool: &SqlitePool,
-    broker_type: st0x_broker::SupportedBroker,
+    executor_type: SupportedExecutor,
 ) -> Result<Vec<OffchainExecution>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
 
@@ -527,7 +527,7 @@ pub async fn check_all_accumulated_positions(
                     &symbol,
                     &mut calculator,
                     execution_type,
-                    broker_type,
+                    executor_type,
                 )
                 .await?;
 
@@ -596,7 +596,7 @@ mod tests {
     use crate::tokenized_symbol;
     use crate::trade_execution_link::TradeExecutionLink;
     use alloy::primitives::fixed_bytes;
-    use st0x_broker::{OrderStatus, Symbol};
+    use st0x_execution::{OrderStatus, Symbol};
 
     // Helper function for tests to handle transaction management
     async fn process_trade_with_tx(
@@ -604,8 +604,7 @@ mod tests {
         trade: OnchainTrade,
     ) -> Result<Option<OffchainExecution>, OnChainError> {
         let mut sql_tx = pool.begin().await?;
-        let result =
-            process_onchain_trade(&mut sql_tx, trade, st0x_broker::SupportedBroker::Schwab).await?;
+        let result = process_onchain_trade(&mut sql_tx, trade, SupportedExecutor::Schwab).await?;
         sql_tx.commit().await?;
         Ok(result)
     }
@@ -861,7 +860,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(50).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
         let mut sql_tx = pool.begin().await.unwrap();
@@ -1835,10 +1834,9 @@ mod tests {
         assert!(aapl_pending.is_none());
 
         // Run the function - should not create any executions since 0.8 < 1.0
-        let executions =
-            check_all_accumulated_positions(&pool, st0x_broker::SupportedBroker::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
+            .await
+            .unwrap();
         assert_eq!(executions.len(), 0);
 
         // Verify AAPL state unchanged
@@ -1852,10 +1850,9 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Run the function on empty database
-        let executions =
-            check_all_accumulated_positions(&pool, st0x_broker::SupportedBroker::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
+            .await
+            .unwrap();
 
         // Should create no executions
         assert_eq!(executions.len(), 0);
@@ -1871,7 +1868,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -1895,10 +1892,9 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         // Run the function
-        let executions =
-            check_all_accumulated_positions(&pool, st0x_broker::SupportedBroker::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
+            .await
+            .unwrap();
 
         // Should create no executions since AAPL has pending execution
         assert_eq!(executions.len(), 0);

@@ -99,8 +99,8 @@ pub(crate) enum EventProcessingError {
 /// Order polling errors for order status monitoring.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OrderPollingError {
-    #[error("Broker error: {0}")]
-    Broker(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Executor error: {0}")]
+    Executor(Box<dyn std::error::Error + Send + Sync>),
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Persistence error: {0}")]
@@ -111,7 +111,7 @@ pub(crate) enum OrderPollingError {
 
 impl From<ExecutionError> for OrderPollingError {
     fn from(err: ExecutionError) -> Self {
-        Self::Broker(Box::new(err))
+        Self::Executor(Box::new(err))
     }
 }
 

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use st0x_broker::{Direction, OrderState};
+use st0x_execution::{Direction, OrderState};
 
 #[cfg(test)]
 use crate::error::OnChainError;
@@ -8,9 +8,9 @@ use crate::onchain::io::TokenizedEquitySymbol;
 #[cfg(test)]
 use sqlx::SqlitePool;
 #[cfg(test)]
-use st0x_broker::PersistenceError;
+use st0x_execution::PersistenceError;
 #[cfg(test)]
-use st0x_broker::{OrderStatus, Shares, SupportedBroker, Symbol};
+use st0x_execution::{OrderStatus, Shares, SupportedExecutor, Symbol};
 
 /// Links individual onchain trades to their contributing Schwab executions.
 ///
@@ -349,7 +349,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -435,7 +435,7 @@ mod tests {
             symbol: Symbol::new("MSFT").unwrap(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: "1004055538123".to_string(),
@@ -486,7 +486,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -578,7 +578,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
