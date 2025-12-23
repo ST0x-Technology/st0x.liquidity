@@ -7,26 +7,26 @@ use crate::schwab::SchwabAuthEnv;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate, Shares, Symbol,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate, Shares, Symbol,
 };
 
-/// Configuration for SchwabBroker containing auth environment and database pool
+/// Configuration for SchwabExecutor containing auth environment and database pool
 #[derive(Debug, Clone)]
 pub struct SchwabConfig {
     pub auth: SchwabAuthEnv,
     pub pool: SqlitePool,
 }
 
-/// Schwab broker implementation
+/// Schwab executor implementation
 #[derive(Debug, Clone)]
-pub struct SchwabBroker {
+pub struct SchwabExecutor {
     auth: SchwabAuthEnv,
     pool: SqlitePool,
 }
 
 #[async_trait]
-impl Broker for SchwabBroker {
-    type Error = BrokerError;
+impl Executor for SchwabExecutor {
+    type Error = ExecutionError;
     type OrderId = String;
     type Config = SchwabConfig;
 
@@ -34,7 +34,7 @@ impl Broker for SchwabBroker {
         // Validate and refresh tokens during initialization
         SchwabTokens::refresh_if_needed(&config.pool, &config.auth).await?;
 
-        info!("Schwab broker initialized with valid tokens");
+        info!("Schwab executor initialized with valid tokens");
 
         Ok(Self {
             auth: config.auth,
@@ -130,13 +130,15 @@ impl Broker for SchwabBroker {
 
         if order_response.is_filled() {
             let price_cents = order_response.price_in_cents()?.ok_or_else(|| {
-                BrokerError::Network(
+                ExecutionError::Network(
                     "Order marked as filled but price information is not available".to_string(),
                 )
             })?;
 
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
-                BrokerError::Network("Order marked as filled but close_time is missing".to_string())
+                ExecutionError::Network(
+                    "Order marked as filled but close_time is missing".to_string(),
+                )
             })?;
 
             let executed_at =
@@ -150,7 +152,9 @@ impl Broker for SchwabBroker {
             })
         } else if order_response.is_terminal_failure() {
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
-                BrokerError::Network("Order marked as failed but close_time is missing".to_string())
+                ExecutionError::Network(
+                    "Order marked as failed but close_time is missing".to_string(),
+                )
             })?;
 
             let failed_at =
@@ -182,15 +186,13 @@ impl Broker for SchwabBroker {
 
         for row in rows {
             let Some(order_id_value) = row.order_id else {
-                return Err(BrokerError::InvalidOrder {
-                    reason: format!(
-                        "SUBMITTED order in database is missing order_id: execution_id={}, symbol={}, shares={}, direction={}",
-                        row.id.unwrap_or(-1),
-                        row.symbol,
-                        row.shares,
-                        row.direction
-                    ),
-                });
+                return Err(ExecutionError::InvalidOrder(format!(
+                    "SUBMITTED order in database is missing order_id: execution_id={}, symbol={}, shares={}, direction={}",
+                    row.id.unwrap_or(-1),
+                    row.symbol,
+                    row.shares,
+                    row.direction
+                )));
             };
 
             // Get current status from Schwab API
@@ -203,27 +205,27 @@ impl Broker for SchwabBroker {
                             _ => None,
                         };
 
-                        let symbol =
-                            Symbol::new(row.symbol).map_err(|e| BrokerError::InvalidOrder {
-                                reason: format!("Invalid symbol in database: {e}"),
-                            })?;
+                        let symbol = Symbol::new(row.symbol).map_err(|e| {
+                            ExecutionError::InvalidOrder(format!("Invalid symbol in database: {e}"))
+                        })?;
 
                         let shares = Shares::new(row.shares.try_into().map_err(|_| {
-                            BrokerError::InvalidOrder {
-                                reason: format!("Shares value {} is negative", row.shares),
-                            }
+                            ExecutionError::InvalidOrder(format!(
+                                "Shares value {} is negative",
+                                row.shares
+                            ))
                         })?)
-                        .map_err(|e| BrokerError::InvalidOrder {
-                            reason: format!("Invalid shares in database: {e}"),
+                        .map_err(|e| {
+                            ExecutionError::InvalidOrder(format!("Invalid shares in database: {e}"))
                         })?;
 
                         let direction =
                             row.direction
                                 .parse()
                                 .map_err(|e: crate::InvalidDirectionError| {
-                                    BrokerError::InvalidOrder {
-                                        reason: format!("Invalid direction in database: {e}"),
-                                    }
+                                    ExecutionError::InvalidOrder(format!(
+                                        "Invalid direction in database: {e}"
+                                    ))
                                 })?;
 
                         updates.push(OrderUpdate {
@@ -248,16 +250,16 @@ impl Broker for SchwabBroker {
         Ok(updates)
     }
 
-    fn to_supported_broker(&self) -> crate::SupportedBroker {
-        crate::SupportedBroker::Schwab
+    fn to_supported_executor(&self) -> crate::SupportedExecutor {
+        crate::SupportedExecutor::Schwab
     }
 
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
-        // For SchwabBroker, OrderId is String, so just clone the input
+        // For SchwabExecutor, OrderId is String, so just clone the input
         Ok(order_id_str.to_string())
     }
 
-    async fn run_broker_maintenance(&self) -> Option<JoinHandle<()>> {
+    async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
         let pool_clone = self.pool.clone();
         let auth_clone = self.auth.clone();
 
@@ -314,10 +316,10 @@ mod tests {
         let auth = create_test_auth_env();
         let config = SchwabConfig { auth, pool };
 
-        let result = SchwabBroker::try_from_config(config).await;
+        let result = SchwabExecutor::try_from_config(config).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), BrokerError::Schwab(_)));
+        assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
     }
 
     #[tokio::test]
@@ -339,7 +341,7 @@ mod tests {
             .unwrap();
 
         let config = SchwabConfig { auth, pool };
-        let result = SchwabBroker::try_from_config(config).await;
+        let result = SchwabExecutor::try_from_config(config).await;
 
         assert!(result.is_ok());
         let broker = result.unwrap();
@@ -385,7 +387,7 @@ mod tests {
             auth,
             pool: pool.clone(),
         };
-        let result = SchwabBroker::try_from_config(config).await;
+        let result = SchwabExecutor::try_from_config(config).await;
 
         assert!(result.is_ok());
         refresh_mock.assert();
@@ -417,12 +419,12 @@ mod tests {
             .unwrap();
 
         let config = SchwabConfig { auth, pool };
-        let result = SchwabBroker::try_from_config(config).await;
+        let result = SchwabExecutor::try_from_config(config).await;
 
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            BrokerError::Schwab(SchwabError::RefreshTokenExpired)
+            ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
         ));
     }
 
@@ -488,7 +490,7 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabBroker { auth, pool };
+        let broker = SchwabExecutor { auth, pool };
         let result = broker.wait_until_market_open().await;
 
         assert!(result.is_ok());
@@ -543,7 +545,7 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabBroker { auth, pool };
+        let broker = SchwabExecutor { auth, pool };
         // This test should not complete because the method loops when market is closed
         // We'll just verify it starts correctly by not panicking immediately
         tokio::time::timeout(
@@ -586,11 +588,11 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabBroker { auth, pool };
+        let broker = SchwabExecutor { auth, pool };
         let result = broker.wait_until_market_open().await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), BrokerError::Schwab(_)));
+        assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
         market_hours_mock.assert();
     }
 
@@ -598,7 +600,7 @@ mod tests {
     async fn test_parse_order_id() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         let auth = create_test_auth_env();
-        let broker = SchwabBroker { auth, pool };
+        let broker = SchwabExecutor { auth, pool };
 
         let test_id = "12345";
         let parsed = broker.parse_order_id(test_id).unwrap();
@@ -606,11 +608,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_to_supported_broker() {
+    async fn test_to_supported_executor() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         let auth = create_test_auth_env();
-        let broker = SchwabBroker { auth, pool };
+        let executor = SchwabExecutor { auth, pool };
 
-        assert_eq!(broker.to_supported_broker(), crate::SupportedBroker::Schwab);
+        assert_eq!(
+            executor.to_supported_executor(),
+            crate::SupportedExecutor::Schwab
+        );
     }
 }

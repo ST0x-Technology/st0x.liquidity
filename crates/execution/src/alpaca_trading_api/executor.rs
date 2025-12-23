@@ -4,30 +4,29 @@ use async_trait::async_trait;
 use tracing::info;
 use uuid::Uuid;
 
-use super::auth::{AlpacaAuthEnv, AlpacaClient};
-use crate::{Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate};
+use super::AlpacaTradingApiError;
+use super::auth::{AlpacaTradingApiAuthEnv, AlpacaTradingApiClient};
+use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate};
 
-/// Alpaca broker implementation
+/// Alpaca Trading API executor implementation
 #[derive(Debug, Clone)]
-pub struct AlpacaBroker {
-    client: Arc<AlpacaClient>,
+pub struct AlpacaTradingApi {
+    client: Arc<AlpacaTradingApiClient>,
 }
 
 #[async_trait]
-impl Broker for AlpacaBroker {
-    type Error = BrokerError;
+impl Executor for AlpacaTradingApi {
+    type Error = AlpacaTradingApiError;
     type OrderId = String;
-    type Config = AlpacaAuthEnv;
+    type Config = AlpacaTradingApiAuthEnv;
 
     async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
-        let client = AlpacaClient::new(&config)?;
+        let client = AlpacaTradingApiClient::new(&config)?;
 
-        client.verify_account().await.map_err(|e| {
-            BrokerError::Authentication(format!("Alpaca account verification failed: {e}"))
-        })?;
+        client.verify_account().await?;
 
         info!(
-            "Alpaca broker initialized in {} mode",
+            "Alpaca Trading API executor initialized in {} mode",
             if client.is_paper_trading() {
                 "paper trading"
             } else {
@@ -76,20 +75,16 @@ impl Broker for AlpacaBroker {
         super::order::poll_pending_orders(self.client.client()).await
     }
 
-    fn to_supported_broker(&self) -> crate::SupportedBroker {
-        crate::SupportedBroker::Alpaca
+    fn to_supported_executor(&self) -> crate::SupportedExecutor {
+        crate::SupportedExecutor::AlpacaTradingApi
     }
 
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
-        // Validate that it's a valid UUID format (Alpaca uses UUIDs for order IDs)
-        Uuid::parse_str(order_id_str).map_err(|e| BrokerError::InvalidOrder {
-            reason: format!("Invalid Alpaca order ID format (expected UUID): {e}"),
-        })?;
-
+        Uuid::parse_str(order_id_str)?;
         Ok(order_id_str.to_string())
     }
 
-    async fn run_broker_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
+    async fn run_executor_maintenance(&self) -> Option<tokio::task::JoinHandle<()>> {
         // Alpaca uses API keys, no token refresh needed
         None
     }
@@ -98,15 +93,15 @@ impl Broker for AlpacaBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alpaca::auth::AlpacaTradingMode;
+    use crate::alpaca::auth::AlpacaTradingApiMode;
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_auth_env(base_url: &str) -> AlpacaAuthEnv {
-        AlpacaAuthEnv {
+    fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiAuthEnv {
+        AlpacaTradingApiAuthEnv {
             alpaca_api_key: "test_key_id".to_string(),
             alpaca_api_secret: "test_secret_key".to_string(),
-            alpaca_trading_mode: AlpacaTradingMode::Mock(base_url.to_string()),
+            alpaca_trading_mode: AlpacaTradingApiMode::Mock(base_url.to_string()),
         }
     }
 
@@ -157,7 +152,7 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let result = AlpacaBroker::try_from_config(auth).await;
+        let result = AlpacaTradingApi::try_from_config(auth).await;
 
         account_mock.assert();
         assert!(result.is_ok());
@@ -179,13 +174,12 @@ mod tests {
                 }));
         });
 
-        let result = AlpacaBroker::try_from_config(auth).await;
+        let result = AlpacaTradingApi::try_from_config(auth).await;
 
         account_mock.assert();
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            BrokerError::Authentication(_)
+            ExecutionError::AlpacaAccountVerification(_)
         ));
     }
 
@@ -208,8 +202,8 @@ mod tests {
                 }));
         });
 
-        let broker = AlpacaBroker::try_from_config(auth).await.unwrap();
-        let result = broker.wait_until_market_open().await;
+        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
+        let result = executor.wait_until_market_open().await;
 
         account_mock.assert();
         clock_mock.assert();
@@ -237,8 +231,8 @@ mod tests {
                 }));
         });
 
-        let broker = AlpacaBroker::try_from_config(auth).await.unwrap();
-        let result = broker.wait_until_market_open().await;
+        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
+        let result = executor.wait_until_market_open().await;
 
         account_mock.assert();
         mock.assert();
@@ -253,12 +247,12 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let broker = AlpacaBroker::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
 
         account_mock.assert();
 
         let valid_uuid = "904837e3-3b76-47ec-b432-046db621571b";
-        let result = broker.parse_order_id(valid_uuid);
+        let result = executor.parse_order_id(valid_uuid);
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), valid_uuid);
@@ -271,46 +265,48 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let broker = AlpacaBroker::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
 
         account_mock.assert();
 
         let invalid_uuid = "not-a-valid-uuid";
-        let result = broker.parse_order_id(invalid_uuid);
+        let result = executor.parse_order_id(invalid_uuid);
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            BrokerError::InvalidOrder { .. }
+            ExecutionError::InvalidOrderId(_)
         ));
     }
 
     #[tokio::test]
-    async fn test_to_supported_broker() {
+    async fn test_to_supported_executor() {
         let server = MockServer::start();
         let auth = create_test_auth_env(&server.base_url());
 
         let account_mock = create_account_mock(&server);
 
-        let broker = AlpacaBroker::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
 
         account_mock.assert();
 
-        assert_eq!(broker.to_supported_broker(), crate::SupportedBroker::Alpaca);
+        assert_eq!(
+            executor.to_supported_executor(),
+            crate::SupportedExecutor::AlpacaTradingApi
+        );
     }
 
     #[tokio::test]
-    async fn test_run_broker_maintenance_returns_none() {
+    async fn test_run_executor_maintenance_returns_none() {
         let server = MockServer::start();
         let auth = create_test_auth_env(&server.base_url());
 
         let account_mock = create_account_mock(&server);
 
-        let broker = AlpacaBroker::try_from_config(auth).await.unwrap();
+        let executor = AlpacaTradingApi::try_from_config(auth).await.unwrap();
 
         account_mock.assert();
 
-        let result = broker.run_broker_maintenance().await;
+        let result = executor.run_executor_maintenance().await;
 
         assert!(result.is_none());
     }

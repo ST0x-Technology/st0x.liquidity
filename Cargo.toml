@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/broker"]
+members = [".", "crates/execution"]
 resolver = "2"
 
 [workspace.package]
@@ -83,7 +83,7 @@ anyhow = "1.0.98"
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
-st0x-broker = { path = "crates/broker" }
+st0x-execution = { path = "crates/execution" }
 backon.workspace = true
 clap.workspace = true
 dotenvy = "0.15.7"

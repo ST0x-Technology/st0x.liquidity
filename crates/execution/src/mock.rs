@@ -7,22 +7,23 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::{
-    Broker, BrokerError, MarketOrder, OrderPlacement, OrderState, OrderUpdate, SupportedBroker,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate,
+    SupportedExecutor,
 };
 
-/// Configuration for MockBroker
+/// Configuration for MockExecutor
 #[derive(Debug, Clone, Default)]
-pub struct MockBrokerConfig;
+pub struct MockExecutorConfig;
 
-/// Unified test broker for dry-run mode and testing that logs operations without executing real trades
+/// Unified test executor for dry-run mode and testing that logs operations without executing real trades
 #[derive(Debug, Clone)]
-pub struct MockBroker {
+pub struct MockExecutor {
     order_counter: Arc<AtomicU64>,
     should_fail: bool,
     failure_message: String,
 }
 
-impl MockBroker {
+impl MockExecutor {
     pub fn new() -> Self {
         Self {
             order_counter: Arc::new(AtomicU64::new(1)),
@@ -45,26 +46,26 @@ impl MockBroker {
     }
 }
 
-impl Default for MockBroker {
+impl Default for MockExecutor {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl Broker for MockBroker {
-    type Error = BrokerError;
+impl Executor for MockExecutor {
+    type Error = ExecutionError;
     type OrderId = String;
-    type Config = MockBrokerConfig;
+    type Config = MockExecutorConfig;
 
     async fn try_from_config(_config: Self::Config) -> Result<Self, Self::Error> {
-        warn!("[MOCK] Initializing mock broker - always ready in dry-run mode");
+        warn!("[MOCK] Initializing mock executor - always ready in dry-run mode");
         Ok(Self::new())
     }
 
     async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
         info!("[TEST] Market hours check - market is always open in test mode");
-        // Test broker should never block on market hours, so return Duration::MAX
+        // Test executor should never block on market hours, so return Duration::MAX
         // to signal no time limit
         Ok(std::time::Duration::MAX)
     }
@@ -75,7 +76,9 @@ impl Broker for MockBroker {
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
         if self.should_fail {
-            return Err(BrokerError::OrderPlacement(self.failure_message.clone()));
+            return Err(ExecutionError::OrderPlacement {
+                reason: self.failure_message.clone(),
+            });
         }
 
         let order_id = self.generate_order_id();
@@ -96,7 +99,7 @@ impl Broker for MockBroker {
 
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error> {
         if self.should_fail {
-            return Err(BrokerError::OrderNotFound {
+            return Err(ExecutionError::OrderNotFound {
                 order_id: order_id.clone(),
             });
         }
@@ -114,7 +117,9 @@ impl Broker for MockBroker {
 
     async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
         if self.should_fail {
-            return Err(BrokerError::Network(self.failure_message.clone()));
+            return Err(ExecutionError::Network {
+                reason: self.failure_message.clone(),
+            });
         }
 
         warn!("[TEST] Polling pending orders - no pending orders in test mode");
@@ -123,16 +128,16 @@ impl Broker for MockBroker {
         Ok(Vec::new())
     }
 
-    fn to_supported_broker(&self) -> SupportedBroker {
-        SupportedBroker::DryRun
+    fn to_supported_executor(&self) -> SupportedExecutor {
+        SupportedExecutor::DryRun
     }
 
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error> {
-        // For MockBroker, OrderId is String, so just clone the input
+        // For MockExecutor, OrderId is String, so just clone the input
         Ok(order_id_str.to_string())
     }
 
-    async fn run_broker_maintenance(&self) -> Option<JoinHandle<()>> {
+    async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
         None
     }
 }
@@ -143,27 +148,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_config_success() {
-        let result = MockBroker::try_from_config(MockBrokerConfig).await;
+        let result = MockExecutor::try_from_config(MockExecutorConfig).await;
         assert!(result.is_ok());
 
-        let broker = result.unwrap();
-        assert!(!broker.should_fail);
-        assert_eq!(broker.failure_message, "");
+        let executor = result.unwrap();
+        assert!(!executor.should_fail);
+        assert_eq!(executor.failure_message, "");
     }
 
     #[tokio::test]
     async fn test_wait_until_market_open_always_returns_none() {
-        let broker = MockBroker::new();
-        let result = broker.wait_until_market_open().await;
+        let executor = MockExecutor::new();
+        let result = executor.wait_until_market_open().await;
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), std::time::Duration::MAX);
     }
 
     #[tokio::test]
-    async fn test_failure_broker_wait_until_market_open() {
-        let broker = MockBroker::with_failure("Test failure");
-        let result = broker.wait_until_market_open().await;
+    async fn test_failure_executor_wait_until_market_open() {
+        let executor = MockExecutor::with_failure("Test failure");
+        let result = executor.wait_until_market_open().await;
 
         assert!(result.is_ok());
         let dur = result.unwrap();
@@ -172,15 +177,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_order_id() {
-        let broker = MockBroker::new();
+        let executor = MockExecutor::new();
         let test_id = "TEST_123";
-        let parsed = broker.parse_order_id(test_id).unwrap();
+        let parsed = executor.parse_order_id(test_id).unwrap();
         assert_eq!(parsed, test_id);
     }
 
     #[tokio::test]
-    async fn test_to_supported_broker() {
-        let broker = MockBroker::new();
-        assert_eq!(broker.to_supported_broker(), SupportedBroker::DryRun);
+    async fn test_to_supported_executor() {
+        let executor = MockExecutor::new();
+        assert_eq!(executor.to_supported_executor(), SupportedExecutor::DryRun);
     }
 }
