@@ -18,15 +18,22 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: false
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 0
+
       - uses: nixbuild/nix-quick-install-action@v30
         with:
           nix_conf: |
             keep-env-derivations = true
             keep-outputs = true
+
       - name: Restore and save Nix store
         uses: nix-community/cache-nix-action@v6
         with:
@@ -35,7 +42,7 @@ jobs:
           # if there's no cache hit, restore a cache by this prefix
           restore-prefixes-first-match: nix-${{ runner.os }}-
           # collect garbage until the Nix store size (in bytes) is at most this number
-          gc-max-store-size-linux: 10G
+          gc-max-store-size-linux: 5G
       - run: nix run .#prepSolArtifacts
       - run: nix flake check
 
@@ -50,6 +57,11 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: false
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -67,6 +79,8 @@ jobs:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
+
+      - run: nix run .#prepSolArtifacts
 
       - name: Install dependencies
         run: nix develop -c bun install --cwd dashboard
