@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tokio::task::JoinHandle;
 
+pub mod alpaca_broker_api;
 pub mod alpaca_trading_api;
 pub mod error;
 pub mod mock;
@@ -13,12 +14,14 @@ pub mod schwab;
 #[cfg(test)]
 pub mod test_utils;
 
+pub use alpaca_broker_api::AlpacaBrokerApi;
 pub use alpaca_trading_api::AlpacaTradingApi;
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorConfig};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::SchwabExecutor;
 
+use alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 use alpaca_trading_api::AlpacaTradingApiAuthEnv;
 
 #[async_trait]
@@ -163,6 +166,7 @@ impl std::error::Error for InvalidDirectionError {}
 pub enum SupportedExecutor {
     Schwab,
     AlpacaTradingApi,
+    AlpacaBrokerApi,
     DryRun,
 }
 
@@ -171,6 +175,7 @@ impl std::fmt::Display for SupportedExecutor {
         match self {
             Self::Schwab => write!(f, "schwab"),
             Self::AlpacaTradingApi => write!(f, "alpaca-trading-api"),
+            Self::AlpacaBrokerApi => write!(f, "alpaca-broker-api"),
             Self::DryRun => write!(f, "dry-run"),
         }
     }
@@ -187,6 +192,7 @@ impl std::str::FromStr for SupportedExecutor {
         match s {
             "schwab" => Ok(Self::Schwab),
             "alpaca-trading-api" => Ok(Self::AlpacaTradingApi),
+            "alpaca-broker-api" => Ok(Self::AlpacaBrokerApi),
             "dry-run" => Ok(Self::DryRun),
             _ => Err(InvalidExecutorError(s.to_string())),
         }
@@ -261,39 +267,6 @@ pub trait TryIntoExecutor {
     -> Result<Self::Executor, <Self::Executor as Executor>::Error>;
 }
 
-#[async_trait]
-impl TryIntoExecutor for schwab::SchwabConfig {
-    type Executor = SchwabExecutor;
-
-    async fn try_into_executor(
-        self,
-    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        SchwabExecutor::try_from_config(self).await
-    }
-}
-
-#[async_trait]
-impl TryIntoExecutor for AlpacaTradingApiAuthEnv {
-    type Executor = AlpacaTradingApi;
-
-    async fn try_into_executor(
-        self,
-    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        AlpacaTradingApi::try_from_config(self).await
-    }
-}
-
-#[async_trait]
-impl TryIntoExecutor for MockExecutorConfig {
-    type Executor = MockExecutor;
-
-    async fn try_into_executor(
-        self,
-    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        MockExecutor::try_from_config(self).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,11 +280,7 @@ mod tests {
     #[test]
     fn test_symbol_new_empty_fails() {
         let result = Symbol::new("");
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ExecutionError::InvalidOrder { .. }
-        ));
+        assert!(matches!(result.unwrap_err(), EmptySymbolError));
     }
 
     #[test]
@@ -332,11 +301,7 @@ mod tests {
     #[test]
     fn test_shares_new_zero_fails() {
         let result = Shares::new(0);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ExecutionError::InvalidOrder { .. }
-        ));
+        assert!(matches!(result.unwrap_err(), InvalidSharesError::Zero));
     }
 
     #[test]
@@ -345,10 +310,9 @@ mod tests {
         assert_eq!(shares.to_string(), u32::MAX.to_string());
 
         let result = Shares::new(u64::from(u32::MAX) + 1);
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            ExecutionError::InvalidOrder { .. }
+            InvalidSharesError::TryFromInt(_)
         ));
     }
 

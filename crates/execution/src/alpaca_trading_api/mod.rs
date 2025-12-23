@@ -6,7 +6,7 @@ mod market_hours;
 mod order;
 
 pub use AlpacaTradingApiError as Error;
-pub use auth::AlpacaTradingApiAuthEnv;
+pub use auth::{AlpacaTradingApiAuthEnv, AlpacaTradingApiMode};
 pub use executor::AlpacaTradingApi;
 pub use market_hours::MarketHoursError;
 

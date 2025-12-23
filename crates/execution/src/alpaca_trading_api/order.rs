@@ -379,7 +379,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::AlpacaOrderCreate(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -407,7 +407,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::AlpacaOrderCreate(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -434,7 +434,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::AlpacaOrderCreate(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -857,7 +857,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::AlpacaOrderList(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
     }
 
     #[tokio::test]
@@ -882,6 +882,6 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::AlpacaOrderList(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
     }
 }

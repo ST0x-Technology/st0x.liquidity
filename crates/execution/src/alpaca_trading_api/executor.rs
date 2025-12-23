@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
 use super::auth::{AlpacaTradingApiAuthEnv, AlpacaTradingApiClient};
-use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate};
+use crate::{Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate, TryIntoExecutor};
 
 /// Alpaca Trading API executor implementation
 #[derive(Debug, Clone)]
@@ -90,10 +90,21 @@ impl Executor for AlpacaTradingApi {
     }
 }
 
+#[async_trait]
+impl TryIntoExecutor for AlpacaTradingApiAuthEnv {
+    type Executor = AlpacaTradingApi;
+
+    async fn try_into_executor(
+        self,
+    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
+        AlpacaTradingApi::try_from_config(self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alpaca::auth::AlpacaTradingApiMode;
+    use crate::alpaca_trading_api::AlpacaTradingApiMode;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -179,7 +190,7 @@ mod tests {
         account_mock.assert();
         assert!(matches!(
             result.unwrap_err(),
-            ExecutionError::AlpacaAccountVerification(_)
+            AlpacaTradingApiError::AccountVerification(_)
         ));
     }
 
@@ -274,7 +285,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            ExecutionError::InvalidOrderId(_)
+            AlpacaTradingApiError::InvalidOrderId(_)
         ));
     }
 

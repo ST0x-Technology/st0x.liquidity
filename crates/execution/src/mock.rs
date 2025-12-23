@@ -117,7 +117,7 @@ impl Executor for MockExecutor {
 
     async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
         if self.should_fail {
-            return Err(ExecutionError::Network {
+            return Err(ExecutionError::OrderPlacement {
                 reason: self.failure_message.clone(),
             });
         }

@@ -7,7 +7,8 @@ use crate::schwab::SchwabAuthEnv;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate, Shares, Symbol,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate,
+    Shares, Symbol, TryIntoExecutor,
 };
 
 /// Configuration for SchwabExecutor containing auth environment and database pool
@@ -130,15 +131,17 @@ impl Executor for SchwabExecutor {
 
         if order_response.is_filled() {
             let price_cents = order_response.price_in_cents()?.ok_or_else(|| {
-                ExecutionError::Network(
-                    "Order marked as filled but price information is not available".to_string(),
-                )
+                ExecutionError::IncompleteOrderResponse {
+                    field: "price".to_string(),
+                    status: OrderStatus::Filled,
+                }
             })?;
 
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
-                ExecutionError::Network(
-                    "Order marked as filled but close_time is missing".to_string(),
-                )
+                ExecutionError::IncompleteOrderResponse {
+                    field: "close_time".to_string(),
+                    status: OrderStatus::Filled,
+                }
             })?;
 
             let executed_at =
@@ -152,9 +155,10 @@ impl Executor for SchwabExecutor {
             })
         } else if order_response.is_terminal_failure() {
             let close_time_str = order_response.close_time.as_ref().ok_or_else(|| {
-                ExecutionError::Network(
-                    "Order marked as failed but close_time is missing".to_string(),
-                )
+                ExecutionError::IncompleteOrderResponse {
+                    field: "close_time".to_string(),
+                    status: OrderStatus::Failed,
+                }
             })?;
 
             let failed_at =
@@ -186,13 +190,17 @@ impl Executor for SchwabExecutor {
 
         for row in rows {
             let Some(order_id_value) = row.order_id else {
-                return Err(ExecutionError::InvalidOrder(format!(
-                    "SUBMITTED order in database is missing order_id: execution_id={}, symbol={}, shares={}, direction={}",
-                    row.id.unwrap_or(-1),
-                    row.symbol,
-                    row.shares,
-                    row.direction
-                )));
+                let id_str = row
+                    .id
+                    .map_or_else(|| "unknown".to_string(), |id| id.to_string());
+
+                return Err(ExecutionError::InvalidOrder {
+                    reason: format!(
+                        "SUBMITTED order missing order_id: id={id_str}, \
+                         symbol={}, shares={}, direction={}",
+                        row.symbol, row.shares, row.direction
+                    ),
+                });
             };
 
             // Get current status from Schwab API
@@ -205,27 +213,27 @@ impl Executor for SchwabExecutor {
                             _ => None,
                         };
 
-                        let symbol = Symbol::new(row.symbol).map_err(|e| {
-                            ExecutionError::InvalidOrder(format!("Invalid symbol in database: {e}"))
-                        })?;
+                        let symbol =
+                            Symbol::new(row.symbol).map_err(|e| ExecutionError::InvalidOrder {
+                                reason: format!("Invalid symbol in database: {e}"),
+                            })?;
 
                         let shares = Shares::new(row.shares.try_into().map_err(|_| {
-                            ExecutionError::InvalidOrder(format!(
-                                "Shares value {} is negative",
-                                row.shares
-                            ))
+                            ExecutionError::InvalidOrder {
+                                reason: format!("Shares value {} is negative", row.shares),
+                            }
                         })?)
-                        .map_err(|e| {
-                            ExecutionError::InvalidOrder(format!("Invalid shares in database: {e}"))
+                        .map_err(|e| ExecutionError::InvalidOrder {
+                            reason: format!("Invalid shares in database: {e}"),
                         })?;
 
                         let direction =
                             row.direction
                                 .parse()
                                 .map_err(|e: crate::InvalidDirectionError| {
-                                    ExecutionError::InvalidOrder(format!(
-                                        "Invalid direction in database: {e}"
-                                    ))
+                                    ExecutionError::InvalidOrder {
+                                        reason: format!("Invalid direction in database: {e}"),
+                                    }
                                 })?;
 
                         updates.push(OrderUpdate {
@@ -274,6 +282,17 @@ impl Executor for SchwabExecutor {
         });
 
         Some(handle)
+    }
+}
+
+#[async_trait]
+impl TryIntoExecutor for SchwabConfig {
+    type Executor = SchwabExecutor;
+
+    async fn try_into_executor(
+        self,
+    ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
+        SchwabExecutor::try_from_config(self).await
     }
 }
 
