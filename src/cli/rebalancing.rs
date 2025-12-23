@@ -172,7 +172,7 @@ where
 
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_url.into(),
-        rebalancing_config.alpaca_account_id.clone(),
+        rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_api_key.clone(),
         alpaca_auth.alpaca_api_secret.clone(),
     ));
