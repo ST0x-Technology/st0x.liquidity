@@ -30,8 +30,9 @@ pub(crate) struct TimeframeMetrics {
     pub(super) max_drawdown: Decimal,
     #[ts(type = "number | null")]
     pub(super) hedge_lag_ms: Option<u64>,
-    #[ts(type = "string")]
-    pub(super) uptime_percent: Decimal,
+    #[ts(optional, type = "string")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) uptime_percent: Option<Decimal>,
 }
 
 impl TimeframeMetrics {
@@ -48,7 +49,7 @@ impl TimeframeMetrics {
             sortino_ratio: None,
             max_drawdown: Decimal::ZERO,
             hedge_lag_ms: None,
-            uptime_percent: Decimal::ONE_HUNDRED,
+            uptime_percent: None,
         }
     }
 }

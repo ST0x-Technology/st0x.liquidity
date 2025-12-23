@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { browser } from '$app/environment'
   import { createQuery } from '@tanstack/svelte-query'
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
@@ -15,7 +16,8 @@
 
   const formatTimestamp = (timestamp: string): string => {
     const date = new Date(timestamp)
-    return date.toLocaleTimeString(navigator.language, {
+    const locale = browser ? navigator.language : 'en-US'
+    return date.toLocaleTimeString(locale, {
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',

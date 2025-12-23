@@ -1,3 +1,11 @@
+use futures_util::SinkExt;
+use rocket::{Route, State, get, routes};
+use rocket_ws::{Channel, Message, WebSocket};
+use serde::Serialize;
+use tokio::sync::broadcast;
+use tracing::warn;
+use ts_rs::TS;
+
 mod auth;
 mod circuit_breaker;
 mod event;
@@ -15,18 +23,11 @@ pub use ts::export_bindings;
 use auth::AuthStatus;
 use circuit_breaker::CircuitBreakerStatus;
 use event::EventStoreEntry;
-use futures_util::SinkExt;
 use inventory::Inventory;
 use performance::PerformanceMetrics;
 use rebalance::RebalanceOperation;
-use rocket::{Route, State, get, routes};
-use rocket_ws::{Channel, WebSocket};
-use serde::Serialize;
 use spread::SpreadSummary;
-use tokio::sync::broadcast;
-use tracing::warn;
 use trade::Trade;
-use ts_rs::TS;
 
 /// Messages sent from the server to WebSocket clients.
 ///
@@ -79,8 +80,6 @@ fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
-            use rocket_ws::Message;
-
             // Stub initial state for dashboard skeleton. Real data will be populated as
             // each panel is implemented: #178 (metrics), #179 (inventory), #180 (spreads),
             // #181 (trades), #182 (rebalances), #183 (circuit breaker), #184 (auth).

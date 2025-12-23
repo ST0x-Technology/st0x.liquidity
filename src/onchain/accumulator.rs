@@ -1,6 +1,6 @@
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::OnchainTrade;
 use crate::error::{OnChainError, TradeValidationError};
@@ -395,7 +395,7 @@ async fn clean_up_stale_executions(
 
     for maybe_execution_id in stale_execution_ids {
         let Some(execution_id) = maybe_execution_id else {
-            tracing::warn!("Stale execution has null ID, skipping cleanup");
+            warn!(symbol = %base_symbol, "Stale execution has null ID, skipping cleanup");
             continue;
         };
 
@@ -450,7 +450,7 @@ async fn mark_execution_as_timed_out(
     failed_state.store_update(sql_tx, execution_id).await?;
 
     let base_symbol_str = base_symbol.to_string();
-    sqlx::query!(
+    let result = sqlx::query!(
         "UPDATE trade_accumulators SET pending_execution_id = NULL WHERE symbol = ?1 AND pending_execution_id = ?2",
         base_symbol_str,
         execution_id
@@ -458,13 +458,15 @@ async fn mark_execution_as_timed_out(
     .execute(sql_tx.as_mut())
     .await?;
 
-    crate::lock::clear_execution_lease(sql_tx, base_symbol).await?;
+    if result.rows_affected() > 0 {
+        clear_execution_lease(sql_tx, base_symbol).await?;
 
-    info!(
-        symbol = %base_symbol,
-        execution_id = execution_id,
-        "Cleared stale execution and released lock"
-    );
+        info!(
+            symbol = %base_symbol,
+            execution_id = execution_id,
+            "Cleared stale execution and released lock"
+        );
+    }
 
     Ok(())
 }

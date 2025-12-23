@@ -25,9 +25,11 @@ pub(crate) struct SpreadSummary {
 pub(crate) struct SpreadUpdate {
     pub(super) symbol: String,
     pub(super) timestamp: DateTime<Utc>,
-    #[ts(type = "string | null")]
+    #[ts(optional, type = "string")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) buy_price: Option<Decimal>,
-    #[ts(type = "string | null")]
+    #[ts(optional, type = "string")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) sell_price: Option<Decimal>,
     #[ts(type = "string")]
     pub(super) pyth_price: Decimal,

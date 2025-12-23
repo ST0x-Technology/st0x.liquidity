@@ -3,7 +3,7 @@ use rand::Rng;
 use sqlx::SqlitePool;
 use std::time::Duration;
 use tokio::time::{Interval, interval};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::execution::{
     OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
@@ -107,6 +107,12 @@ impl<B: Broker> OrderStatusPoller<B> {
         };
 
         let Some(order_id) = extract_order_id(execution_id, &execution.state) else {
+            warn!(
+                execution_id = execution_id,
+                symbol = %execution.symbol,
+                state = ?execution.state,
+                "Missing order_id for polled execution"
+            );
             return Ok(());
         };
 

@@ -13,7 +13,7 @@ mod bindings;
 mod cctp;
 pub mod cli;
 mod conductor;
-pub mod dashboard;
+pub(crate) mod dashboard;
 pub mod env;
 mod equity_redemption;
 mod error;
@@ -36,6 +36,7 @@ mod tokenized_equity_mint;
 mod trade_execution_link;
 mod usdc_rebalance;
 
+pub use dashboard::export_bindings;
 pub use telemetry::{TelemetryError, TelemetryGuard};
 
 #[cfg(test)]
