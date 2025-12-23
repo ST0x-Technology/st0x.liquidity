@@ -37,24 +37,33 @@ Each broker implementation follows strict encapsulation:
 ```
 src/
 ├── lib.rs                 # Public API: Broker trait, domain types, broker exports
-├── error.rs              # Shared error types (PersistenceError)
-├── order/                # Shared order types (MarketOrder, OrderPlacement, etc.)
+├── error.rs               # Shared error types (PersistenceError)
+├── order/                 # Shared order types (MarketOrder, OrderPlacement, etc.)
+│   ├── mod.rs
+│   ├── state.rs           # OrderState enum
+│   └── status.rs          # OrderStatus tracking
 ├── schwab/
-│   ├── mod.rs            # Public: SchwabBroker, SchwabAuthEnv, SchwabError
-│   ├── auth.rs           # Private: OAuth 2.0 implementation
-│   ├── broker.rs         # Private: Broker trait implementation
-│   ├── encryption.rs     # Private: Token encryption/decryption
-│   ├── market_hours.rs   # Private: Market hours checking via Schwab API
-│   ├── order.rs          # Private: Order placement logic
-│   ├── order_status.rs   # Private: Order status polling
-│   └── tokens.rs         # Private: Token storage/retrieval from database
+│   ├── mod.rs             # Public: SchwabBroker, SchwabAuthEnv, SchwabError
+│   ├── auth/              # Private: OAuth 2.0 with CQRS pattern
+│   │   ├── mod.rs         # SchwabAuth aggregate
+│   │   ├── cmd.rs         # SchwabAuthCommand enum
+│   │   ├── event.rs       # SchwabAuthEvent enum
+│   │   ├── oauth.rs       # OAuth flow implementation
+│   │   └── view.rs        # Auth state projection
+│   ├── broker.rs          # Private: Broker trait implementation
+│   ├── encryption.rs      # Private: Token encryption/decryption
+│   ├── market_hours.rs    # Private: Market hours checking via Schwab API
+│   ├── order.rs           # Private: Order placement logic
+│   ├── order_status.rs    # Private: Order status polling
+│   └── tokens.rs          # Private: Token storage/retrieval from database
 ├── alpaca/
-│   ├── mod.rs            # Public: AlpacaBroker, AlpacaAuthEnv, MarketHoursError
-│   ├── auth.rs           # Private: API key authentication
-│   ├── broker.rs         # Private: Broker trait implementation
-│   ├── market_hours.rs   # Private: Market hours via Alpaca Clock API
-│   └── order.rs          # Private: Order placement and status checking
-└── mock.rs               # MockBroker: Single-file testing implementation
+│   ├── mod.rs             # Public: AlpacaBroker, AlpacaAuthEnv, MarketHoursError
+│   ├── auth.rs            # Private: API key authentication
+│   ├── broker.rs          # Private: Broker trait implementation
+│   ├── market_hours.rs    # Private: Market hours via Alpaca Clock API
+│   └── order.rs           # Private: Order placement and status checking
+├── mock.rs                # MockBroker: Single-file testing implementation
+└── test_utils.rs          # Shared test utilities
 ```
 
 **Export philosophy**: Only expose what's needed for broker construction and

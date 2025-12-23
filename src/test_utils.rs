@@ -6,9 +6,9 @@ use alloy::primitives::{LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use sqlx::SqlitePool;
-use st0x_broker::OrderState;
-use st0x_broker::schwab::{SchwabAuthEnv, SchwabTokens};
-use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
+use st0x_execution::OrderState;
+use st0x_execution::schwab::{SchwabAuthEnv, SchwabTokens};
+use st0x_execution::{Direction, Shares, SupportedExecutor, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important – only that the
@@ -184,7 +184,7 @@ impl OffchainExecutionBuilder {
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: Shares::new(100).unwrap(),
                 direction: Direction::Buy,
-                broker: SupportedBroker::Schwab,
+                executor: SupportedExecutor::Schwab,
                 state: OrderState::Pending,
             },
         }

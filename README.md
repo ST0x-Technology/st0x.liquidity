@@ -336,11 +336,21 @@ src/
 │   ├── server.rs       # Arbitrage bot server
 │   ├── reporter.rs     # P&L reporter
 │   └── cli.rs          # CLI for manual operations
+├── position.rs         # Position aggregate (CQRS/ES)
+├── onchain_trade.rs    # OnChain trade aggregate (CQRS/ES)
+├── offchain_order.rs   # OffChain order aggregate (CQRS/ES)
 ├── onchain/            # Blockchain event processing
-├── offchain/           # Database models and execution tracking
+├── offchain/           # Off-chain order execution
 ├── conductor/          # Trade accumulation and broker orchestration
 ├── reporter/           # FIFO P&L calculation and metrics
-└── symbol/             # Token symbol caching
+├── symbol/             # Token symbol caching and locking
+├── alpaca_wallet/      # Alpaca cryptocurrency wallet management
+├── shares.rs           # Fractional shares newtype and arithmetic
+├── threshold.rs        # Execution threshold logic
+├── queue.rs            # Event queue for idempotent processing
+├── api.rs              # REST API endpoints
+├── env.rs              # Environment configuration
+└── cctp.rs             # Cross-chain token bridge (Circle CCTP)
 migrations/             # SQLite database schema
 data/                   # SQLite databases (created at runtime)
 ├── schwab.db           # Schwab instance database
@@ -354,9 +364,10 @@ Standalone library providing unified broker trait:
 ```
 src/
 ├── lib.rs              # Broker trait and shared types
-├── schwab/             # Charles Schwab integration
+├── schwab/             # Charles Schwab integration (with auth/ submodule)
 ├── alpaca/             # Alpaca Markets integration
-└── test.rs             # Test/dry-run broker
+├── order/              # Shared order types (MarketOrder, OrderState)
+└── mock.rs             # Mock broker for testing
 ```
 
 ## Development

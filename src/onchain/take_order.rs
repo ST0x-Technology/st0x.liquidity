@@ -29,11 +29,16 @@ impl OnchainTrade {
             signedContext: _,
         } = event.config;
 
+        // Per IOrderBookV5.sol lines 385-386, TakeOrderV3's `input`/`output` are
+        // "from the perspective of sender" (the taker), NOT the order:
+        // - event.input = what taker received = what order GAVE (order's output)
+        // - event.output = what taker gave = what order RECEIVED (order's input)
+        // We swap them to match the order's validInputs/validOutputs perspective.
         let fill = OrderFill {
             input_index: usize::try_from(inputIOIndex)?,
-            input_amount: event.input,
+            input_amount: event.output,
             output_index: usize::try_from(outputIOIndex)?,
-            output_amount: event.output,
+            output_amount: event.input,
         };
 
         Self::try_from_order_and_fill_details(cache, &provider, order, fill, log, feed_id_cache)
@@ -58,6 +63,10 @@ mod tests {
     fn create_take_order_event_with_order(
         order: crate::bindings::IOrderBookV5::OrderV4,
     ) -> TakeOrderV3 {
+        // Per IOrderBookV5.sol lines 385-386, input/output are from taker's perspective.
+        // For a trade where order receives 100 USDC and gives 9 shares:
+        // - input = 9 (taker received 9 shares = order gave 9 shares)
+        // - output = 100 (taker gave 100 USDC = order received 100 USDC)
         TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -70,11 +79,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
+            input: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
                 .unwrap()
                 .get_inner(),
-
-            output: Float::from_fixed_decimal_lossy(uint!(9_U256), 0)
+            output: Float::from_fixed_decimal_lossy(uint!(100_U256), 0)
                 .unwrap()
                 .get_inner(),
         }
@@ -182,6 +190,10 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
+        // Swapped indices: input from validInputs[1]=AAPL0x, output from validOutputs[0]=USDC
+        // Order receives 5 AAPL0x and gives 50 USDC
+        // event.input = what order gave = 50 USDC
+        // event.output = what order received = 5 AAPL0x
         let take_event = TakeOrderV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
             config: TakeOrderConfigV4 {
@@ -194,10 +206,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: Float::from_fixed_decimal_lossy(uint!(5_U256), 0)
+            input: Float::from_fixed_decimal_lossy(uint!(50_U256), 0)
                 .unwrap()
                 .get_inner(),
-            output: Float::from_fixed_decimal_lossy(uint!(50_U256), 0)
+            output: Float::from_fixed_decimal_lossy(uint!(5_U256), 0)
                 .unwrap()
                 .get_inner(),
         };
@@ -245,6 +257,9 @@ mod tests {
         let order = get_test_order();
         let target_order_owner = order.owner;
 
+        // Order receives 200 USDC (validInputs[0]) and gives 15 shares (validOutputs[1])
+        // event.input = what order gave = 15 shares
+        // event.output = what order received = 200 USDC
         let take_event = TakeOrderV3 {
             sender: address!("0x2222222222222222222222222222222222222222"),
             config: TakeOrderConfigV4 {
@@ -257,10 +272,10 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: Float::from_fixed_decimal_lossy(uint!(200_U256), 0)
+            input: Float::from_fixed_decimal_lossy(uint!(15_U256), 0)
                 .unwrap()
                 .get_inner(),
-            output: Float::from_fixed_decimal_lossy(uint!(15_U256), 0)
+            output: Float::from_fixed_decimal_lossy(uint!(200_U256), 0)
                 .unwrap()
                 .get_inner(),
         };
