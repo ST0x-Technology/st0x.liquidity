@@ -61,10 +61,19 @@ jobs:
           restore-prefixes-first-match: nix-${{ runner.os }}-
           gc-max-store-size-linux: 5G
 
+      - run: nix run .#prepSolArtifacts
+
+      - name: Setup database for sqlx
+        env:
+          DATABASE_URL: sqlite:schwab.db
+        run: |
+          nix develop -c sqlx db create
+          nix develop -c sqlx migrate run
+
       - name: Validate deployment config
         env:
           EXECUTOR: dry-run
-          DATABASE_URL: sqlite:///tmp/test.db
+          DATABASE_URL: sqlite:schwab.db
         run: nix develop -c cargo run -q --bin validate_config
 
   deploy:
