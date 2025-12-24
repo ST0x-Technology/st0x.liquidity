@@ -45,9 +45,7 @@ jobs:
           ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
           HYPERDX_API_KEY: ${{ secrets.HYPERDX_API_KEY }}
           RUST_LOG: "debug"
-        run: |
-          .github/workflows/generate-env.sh > .env
-          cat .env
+        run: .github/workflows/generate-env.sh > .env
 
       - name: Validate server can start with deployment config
         run: |

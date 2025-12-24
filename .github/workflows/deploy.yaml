@@ -65,7 +65,6 @@ jobs:
         run: |
           echo "ENV_TEMPLATE=$(base64 -w 0 .env.example)" >> $GITHUB_ENV
           echo "GENERATE_ENV_SCRIPT=$(base64 -w 0 .github/workflows/generate-env.sh)" >> $GITHUB_ENV
-          echo "PREP_DOCKER_COMPOSE_SCRIPT=$(base64 -w 0 .github/workflows/prep-docker-compose.sh)" >> $GITHUB_ENV
           echo "DOCKER_COMPOSE_TEMPLATE=$(base64 -w 0 docker-compose.template.yaml)" >> $GITHUB_ENV
           echo "GRAFANA_DOCKERFILE=$(base64 -w 0 Dockerfile.grafana)" >> $GITHUB_ENV
           echo "GRAFANA_DATASOURCE_YAML=$(base64 -w 0 grafana-datasource.yaml)" >> $GITHUB_ENV
@@ -323,7 +322,6 @@ jobs:
           GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
           ENV_TEMPLATE: ${{ env.ENV_TEMPLATE }}
           GENERATE_ENV_SCRIPT: ${{ env.GENERATE_ENV_SCRIPT }}
-          PREP_DOCKER_COMPOSE_SCRIPT: ${{ env.PREP_DOCKER_COMPOSE_SCRIPT }}
           DOCKER_COMPOSE_TEMPLATE: ${{ env.DOCKER_COMPOSE_TEMPLATE }}
           GRAFANA_DOCKERFILE: ${{ env.GRAFANA_DOCKERFILE }}
           GRAFANA_DATASOURCE_YAML: ${{ env.GRAFANA_DATASOURCE_YAML }}
