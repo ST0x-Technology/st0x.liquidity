@@ -2,6 +2,9 @@ mod offchain_order;
 mod onchain_trade;
 mod position;
 mod schwab_auth;
+mod startup;
+
+pub(crate) use startup::run_startup_check;
 
 use alloy::primitives::FixedBytes;
 use clap::{Parser, ValueEnum};
@@ -79,7 +82,7 @@ pub struct MigrationEnv {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum MigrationError {
+pub(crate) enum MigrationError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error("Invalid symbol: {0}")]

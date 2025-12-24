@@ -2,6 +2,8 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info, info_span, warn};
 
+use crate::migration::run_startup_check;
+
 mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
@@ -9,6 +11,7 @@ mod bindings;
 mod cctp;
 pub mod cli;
 mod conductor;
+mod dual_write;
 pub mod env;
 mod equity_redemption;
 mod error;
@@ -48,6 +51,11 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
     let pool = config.get_sqlite_pool().await?;
 
     sqlx::migrate!().run(&pool).await?;
+
+    if let Err(e) = run_startup_check(&pool, &config.broker).await {
+        error!("Startup migration/consistency check failed: {e}");
+        return Err(e.into());
+    }
 
     let rocket_config = rocket::Config::figment()
         .merge(("port", config.server_port))
