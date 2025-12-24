@@ -47,14 +47,12 @@ jobs:
           RUST_LOG: "debug"
         run: .github/workflows/generate-env.sh > .env
 
-      - name: Validate server can start with deployment config
+      - name: Validate deployment config
         run: |
-          # Run the server with --help to validate config parsing works
-          # This fails if any required env var is missing from deploy.yaml
           docker run --rm --env-file .env \
             -e EXECUTOR=dry-run \
             -e DATABASE_URL=sqlite:///tmp/test.db \
-            st0x-test ./server --help
+            st0x-test ./validate_config
 
   rainix:
     env:

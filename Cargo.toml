@@ -128,5 +128,9 @@ temp-env = "0.3.6"
 name = "migrate_to_events"
 path = "src/bin/migrate_to_events.rs"
 
+[[bin]]
+name = "validate_config"
+path = "src/bin/validate_config.rs"
+
 [lints]
 workspace = true
