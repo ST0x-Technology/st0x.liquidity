@@ -2575,3 +2575,491 @@ Add to `Cargo.toml`:
 sqlite-es = "0.1"  # Will be published open source
 cqrs-es = "0.4"
 ```
+
+---
+
+## **Admin Dashboard**
+
+### **Overview**
+
+A web-based admin dashboard for monitoring and controlling the liquidity bot
+from a single interface. The dashboard consolidates system health, trading
+activity, P&L metrics, and operational controls without duplicating
+functionality already available in Grafana.
+
+### **Technology Stack**
+
+- **Framework**: SvelteKit with Svelte 5 (runes, snippets)
+- **UI Components**: shadcn-svelte
+- **Charts**: TradingView Lightweight Charts for financial visualizations
+- **Data Fetching**: TanStack Query v6 (svelte-query with runes support)
+- **Grafana**: Embedded iframes for detailed metrics dashboards
+- **Build Tool**: Vite
+- **Language**: TypeScript
+
+### **TypeScript Patterns**
+
+#### **Tagged Unions for Domain Modeling**
+
+Following the same ADT philosophy used in the Rust backend, the dashboard uses
+discriminated unions (tagged unions) for type-safe domain modeling:
+
+```typescript
+// Domain types
+type Position =
+  | { status: "empty"; symbol: string }
+  | {
+    status: "active";
+    symbol: string;
+    net: number;
+    pendingExecutionId?: string;
+  };
+
+// API errors
+type ApiError =
+  | { tag: "network"; message: string }
+  | { tag: "unauthorized" }
+  | { tag: "not_found"; resource: string }
+  | { tag: "server"; status: number; message: string };
+
+// Result type
+type Result<T, E> =
+  | { ok: true; value: T }
+  | { ok: false; error: E };
+```
+
+#### **Custom FP Helpers Module**
+
+A small `lib/fp.ts` module provides utility functions for working with Result
+types and tagged unions:
+
+- `ok<T>(value: T)` / `err<E>(error: E)` - Result constructors
+- `match(union, handlers)` - Exhaustive pattern matching
+- `pipe(value, ...fns)` - Left-to-right function composition
+- `map`, `flatMap`, `mapErr` - Result transformations
+
+No external dependencies - keeps bundle small and avoids library lock-in.
+
+#### **Alternatives Considered**
+
+- **Effect**: Full-featured FP library with structured concurrency, dependency
+  injection, and comprehensive error handling. Rejected as overkill for a
+  dashboard - adds ~50kb+ and significant conceptual overhead. Would shine for
+  complex async orchestration but this is mostly "fetch and display".
+
+- **neverthrow**: Lightweight Result/ResultAsync library (~2kb). Considered for
+  typed error handling but adds friction with TanStack Query (expects throwing
+  promises). Hand-rolled Result type provides 80% of the benefit with zero
+  dependencies.
+
+- **Plain fetch + Svelte stores**: Simplest approach but requires manual
+  caching, retry logic, and background refetch. TanStack Query handles this
+  better.
+
+#### **State Management**
+
+- **Server state**: TanStack Query v6 as reactive cache, populated via WebSocket
+- **Local UI state**: Svelte 5 `$state` and `$derived` runes
+
+#### **WebSocket-First Data Flow**
+
+All read data flows through a single WebSocket connection:
+
+1. Client connects to `WS /api/ws`
+2. Server sends full initial state as first message (positions, trades, P&L,
+   auth status, circuit breaker state)
+3. Server streams incremental updates as events occur
+
+**Benefits**:
+
+- Single connection to manage
+- No race condition between HTTP fetch and WebSocket updates
+- Server controls exactly what state the client starts with
+- HTTP endpoints only needed for mutations (circuit breaker, auth)
+
+**Message Types**:
+
+```typescript
+type ServerMessage =
+  | { type: "initial"; data: InitialState }
+  | { type: "event"; data: EventStoreEntry }
+  | { type: "trade:onchain"; data: OnchainTrade }
+  | { type: "trade:offchain"; data: OffchainTrade }
+  | { type: "position:updated"; data: Position }
+  | { type: "inventory:updated"; data: Inventory }
+  | { type: "metrics:updated"; data: PerformanceMetrics }
+  | { type: "spread:updated"; data: SpreadUpdate }
+  | { type: "rebalance:updated"; data: RebalanceOperation }
+  | { type: "circuit_breaker:changed"; data: CircuitBreakerStatus }
+  | { type: "auth:status"; data: AuthStatus };
+
+type InitialState = {
+  recentTrades: Trade[];
+  inventory: Inventory;
+  metrics: PerformanceMetrics;
+  spreads: SpreadSummary[];
+  activeRebalances: RebalanceOperation[];
+  recentRebalances: RebalanceOperation[];
+  authStatus: AuthStatus;
+  circuitBreaker: CircuitBreakerStatus;
+};
+
+type SpreadSummary = {
+  symbol: string;
+  lastBuyPrice: number;
+  lastSellPrice: number;
+  pythPrice: number;
+  spreadBps: number;
+  updatedAt: Date;
+};
+
+type SpreadUpdate = {
+  symbol: string;
+  timestamp: Date;
+  buyPrice?: number;
+  sellPrice?: number;
+  pythPrice: number;
+};
+
+type Timeframe = "1h" | "1d" | "1w" | "1m" | "all";
+
+type PerformanceMetrics = {
+  [K in Timeframe]: {
+    aum: number;
+    pnl: { absolute: number; percent: number };
+    volume: number;
+    tradeCount: number;
+    sharpeRatio: number | null; // null if insufficient data
+    sortinoRatio: number | null;
+    maxDrawdown: number;
+    hedgeLagMs: number | null; // average ms between onchain and offchain execution
+    uptimePercent: number;
+  };
+};
+
+type EventStoreEntry = {
+  aggregate_type: string;
+  aggregate_id: string;
+  sequence: number;
+  event_type: string;
+  timestamp: string;
+  // payload excluded for dashboard display
+};
+
+type Inventory = {
+  perSymbol: SymbolInventory[];
+  usdc: { onchain: number; offchain: number };
+};
+
+type RebalanceOperation =
+  | { type: "mint"; id: string; symbol: string; amount: number }
+    & RebalanceStatus
+  | { type: "redeem"; id: string; symbol: string; amount: number }
+    & RebalanceStatus
+  | {
+    type: "usdc";
+    id: string;
+    direction: "alpaca_to_base" | "base_to_alpaca";
+    amount: number;
+  } & RebalanceStatus;
+
+type RebalanceStatus =
+  | { status: "in_progress"; startedAt: Date }
+  | { status: "completed"; startedAt: Date; completedAt: Date }
+  | { status: "failed"; startedAt: Date; failedAt: Date; reason: string };
+```
+
+**TanStack Query Integration**:
+
+WebSocket messages populate the TanStack Query cache:
+
+```typescript
+socket.onmessage = (event) => {
+  const msg: ServerMessage = JSON.parse(event.data);
+
+  match(msg, {
+    "initial": ({ data }) => {
+      queryClient.setQueryData(["events"], []); // starts empty, fills with live events
+      queryClient.setQueryData(["trades"], data.recentTrades);
+      queryClient.setQueryData(["inventory"], data.inventory);
+      queryClient.setQueryData(["rebalances", "active"], data.activeRebalances);
+      queryClient.setQueryData(["rebalances", "recent"], data.recentRebalances);
+      queryClient.setQueryData(["auth"], data.authStatus);
+      queryClient.setQueryData(["circuitBreaker"], data.circuitBreaker);
+    },
+    "event": (entry) => {
+      queryClient.setQueryData(
+        ["events"],
+        (old) => [entry, ...old].slice(0, 100),
+      );
+    },
+    "inventory:updated": (inventory) => {
+      queryClient.setQueryData(["inventory"], inventory);
+    },
+    "rebalance:updated": (op) => {
+      // Update active or move to recent based on status
+    },
+    // ... other event handlers
+  });
+};
+```
+
+**Svelte WebSocket Wrapper**:
+
+Minimal wrapper using Svelte 5 runes for connection state:
+
+```typescript
+// lib/websocket.svelte.ts
+export const createWebSocket = (url: string, queryClient: QueryClient) => {
+  let status = $state<"connecting" | "connected" | "disconnected">(
+    "connecting",
+  );
+  let socket: WebSocket | null = null;
+
+  const connect = () => {
+    socket = new WebSocket(url);
+    socket.onopen = () => status = "connected";
+    socket.onclose = () => {
+      status = "disconnected";
+      reconnect();
+    };
+    socket.onmessage = (e) => handleMessage(JSON.parse(e.data), queryClient);
+  };
+
+  // Reconnection with exponential backoff...
+
+  return {
+    get status() {
+      return status;
+    },
+    connect,
+    disconnect,
+  };
+};
+```
+
+TanStack Query provides:
+
+- Reactive cache as single source of truth
+- Devtools for inspecting state
+- Automatic component re-renders on cache updates
+
+### **Core Features**
+
+#### **Grafana Dashboard Embedding**
+
+Embed existing Grafana dashboards directly in the admin UI:
+
+- Configure Grafana for anonymous viewer access (already supported)
+- Embed dashboards via iframe with time range synchronization
+- Dashboard selector for switching between different views (overview, trades,
+  P&L)
+- Fallback UI when Grafana is unavailable
+
+No need to rebuild Grafana's visualization capabilities - leverage existing
+dashboards.
+
+#### **HyperDX Health Status**
+
+Display service health from HyperDX:
+
+- Fetch health metrics via HyperDX API
+- Display health status badge in dashboard header
+- Show recent alerts and error counts
+- Link to full HyperDX dashboard for detailed investigation
+
+```typescript
+// HyperDX API integration
+const response = await fetch("https://api.hyperdx.io/api/v1/alerts", {
+  headers: { Authorization: `Bearer ${HYPERDX_API_KEY}` },
+});
+```
+
+#### **Schwab OAuth Integration**
+
+Streamline the weekly OAuth re-authentication flow:
+
+- Display current authentication status with token expiry countdown
+- Show warning when refresh token is approaching expiry (< 2 days)
+- "Re-authenticate" button that initiates OAuth flow
+- OAuth callback handler in dashboard
+- Eliminates need for manual CLI coordination
+
+**Flow:**
+
+1. User clicks "Re-authenticate" in dashboard
+2. Dashboard opens Schwab OAuth URL in new tab
+3. User authenticates with Schwab
+4. Schwab redirects to dashboard callback URL
+5. Dashboard extracts code and calls existing `POST /auth/refresh` endpoint
+6. Dashboard displays success/error and updates status
+
+#### **Circuit Breaker**
+
+Emergency control to halt all trading activity:
+
+- Prominent toggle in dashboard header (always visible)
+- Confirmation dialog before triggering
+- Displays current status: active/tripped with timestamp and reason
+- When tripped: bot stops placing new hedge orders
+- Existing positions preserved (no forced liquidation)
+- Manual reset required to resume trading
+
+**Implementation:**
+
+- New database table or flag to track circuit breaker state
+- Bot checks flag before placing any broker orders
+- API endpoints for trigger/reset/status
+
+```text
+GET  /api/circuit-breaker/status
+POST /api/circuit-breaker/trigger  { reason: string }
+POST /api/circuit-breaker/reset
+```
+
+### **Dashboard Layout**
+
+Single-page dashboard with live-updating panels, each expandable to full-screen.
+Supports two bot instances (Schwab and Alpaca) via broker selector in header.
+
+**Broker-specific features:**
+
+- **Schwab**: OAuth flow management (weekly re-authentication)
+- **Alpaca**: Automated rebalancing panel (minting, redemption, USDC bridging)
+
+**Header Bar:**
+
+- Broker selector (Schwab / Alpaca) - switches entire dashboard context
+- Auth status indicator with expiry countdown (Schwab only)
+- Circuit breaker status toggle
+- WebSocket connection status
+
+**Panels**:
+
+1. **Performance Metrics**: Live-updating key metrics with timeframe selector
+   (1h, 1d, 1w, 1m, all-time):
+   - AUM (assets under management across both venues)
+   - P&L (absolute and percentage return)
+   - Volume (total traded value in USD)
+   - Trade count
+   - Sharpe ratio
+   - Sortino ratio
+   - Max drawdown
+   - Hedge lag (average time between onchain trade and offchain hedge execution)
+   - Uptime (% of market hours the bot was operational)
+
+2. **Inventory**: Current holdings across both venues (onchain tokens vs
+   offchain shares per symbol, USDC balances). Shows imbalance ratios and
+   proximity to rebalancing thresholds.
+
+3. **Spreads**: Live spread visualization using TradingView Lightweight Charts:
+   - Overview table showing last realized spreads per asset (buy price, sell
+     price, Pyth reference, spread bps)
+   - Asset selector to view detailed chart for a specific symbol
+   - Chart shows buy/sell execution prices vs Pyth oracle price over time
+   - All chart lines (buy/sell/pyth) are toggleable via legend
+
+4. **Trade History**: Live list of trades with toggle switches for
+   onchain/offchain/both (default: both). Shows symbol, direction, amount,
+   price, timestamp, venue.
+
+5. **Rebalancing** (Alpaca only): Active rebalancing operations with live status
+   updates (TokenizedEquityMint, EquityRedemption, UsdcRebalance). Below that,
+   recent completed/failed rebalances.
+
+6. **Live Events**: Real-time stream of domain events as they occur
+   (aggregate_type, aggregate_id, sequence, event_type, timestamp). Payloads
+   excluded to avoid exposing full database records. Starts empty on page load,
+   populates as new events arrive via WebSocket.
+
+### **Architecture**
+
+#### **Separate Frontend Package**
+
+Dashboard lives in `dashboard/` directory at repository root:
+
+```text
+dashboard/
+├── src/
+│   ├── lib/
+│   │   ├── components/     # Panel components, UI primitives
+│   │   ├── api/            # API client and types
+│   │   ├── fp.ts           # Result type, match, pipe utilities
+│   │   └── websocket.svelte.ts
+│   ├── routes/
+│   │   ├── +layout.svelte  # App shell with header bar
+│   │   ├── +page.svelte    # Main dashboard (all panels)
+│   │   └── auth/
+│   │       └── callback/   # OAuth callback handler
+│   └── app.html
+├── static/
+├── package.json
+├── svelte.config.js
+├── tsconfig.json
+└── vite.config.ts
+```
+
+#### **Backend API Extensions**
+
+Extend existing Rocket server (`src/api.rs`):
+
+**WebSocket (all read data):**
+
+```text
+WS /api/ws
+```
+
+Sends initial state on connect, then streams updates. See WebSocket-First Data
+Flow section above.
+
+**Mutations (HTTP, require auth):**
+
+```text
+POST /api/circuit-breaker/trigger  { reason: string }
+POST /api/circuit-breaker/reset
+GET  /api/auth/url                 (generates Schwab OAuth URL)
+POST /auth/refresh                 (existing endpoint)
+```
+
+#### **Authentication**
+
+Public read access with authenticated actions:
+
+- **Read endpoints** (positions, trades, P&L, status): No authentication
+  required
+- **Action endpoints** (circuit breaker trigger/reset, OAuth): Require API key
+- API key sent in `Authorization` header, validated against `DASHBOARD_API_KEY`
+  environment variable
+- Future: Proper user authentication system with role-based access
+
+#### **Deployment**
+
+Dashboard can be deployed as:
+
+1. **Static assets served by Rocket**: Build dashboard, copy to `static/`, serve
+   from existing server
+2. **Separate container**: Nginx serving static files with reverse proxy to API
+
+```dockerfile
+# Dashboard Dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/build /usr/share/nginx/html
+```
+
+### **Non-Goals (MVP)**
+
+- User authentication system (API key is sufficient for actions)
+- Position entry from dashboard (read-only + circuit breaker only)
+- Multi-tenant support
+
+### **Nice to Have**
+
+- Mobile-responsive design (not mobile-first, but usable on mobile - modern
+  stack makes this low effort)
