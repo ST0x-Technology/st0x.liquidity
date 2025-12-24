@@ -142,6 +142,7 @@ impl Conductor {
                         alpaca_auth,
                         provider.clone(),
                         cache.clone(),
+                        config.evm.orderbook,
                     )
                     .await?,
                 )

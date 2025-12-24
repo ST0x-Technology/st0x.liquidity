@@ -14,17 +14,6 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-fn deserialize_optional_decimal_from_string<'de, D>(
-    deserializer: D,
-) -> Result<Option<Decimal>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| s.parse::<Decimal>().map_err(serde::de::Error::custom))
-        .transpose()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
 
@@ -47,6 +36,26 @@ impl AsRef<str> for TokenSymbol {
 }
 
 impl std::fmt::Display for TokenSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AlpacaAccountId(Uuid);
+
+impl AlpacaAccountId {
+    #[cfg(test)]
+    pub(crate) const fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
+impl std::fmt::Display for AlpacaAccountId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -90,27 +99,29 @@ pub(crate) enum TransferStatus {
     Failed,
 }
 
+/// Transfer response from Alpaca Crypto Wallets API.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub(crate) struct Transfer {
     pub(crate) id: AlpacaTransferId,
-    #[serde(rename = "relationship")]
+    #[serde(rename = "tx_hash", default)]
+    pub(crate) tx: Option<TxHash>,
     pub(crate) direction: TransferDirection,
     #[serde(deserialize_with = "deserialize_decimal_from_string")]
     pub(crate) amount: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_string")]
+    pub(crate) usd_value: Decimal,
+    pub(crate) chain: String,
     pub(crate) asset: TokenSymbol,
     #[serde(rename = "from_address")]
-    pub(crate) from: Option<Address>,
+    pub(crate) from: Address,
     #[serde(rename = "to_address")]
     pub(crate) to: Address,
     pub(crate) status: TransferStatus,
-    #[serde(rename = "tx_hash")]
-    pub(crate) tx: Option<TxHash>,
     pub(crate) created_at: DateTime<Utc>,
-    #[serde(
-        rename = "network_fee_amount",
-        deserialize_with = "deserialize_optional_decimal_from_string"
-    )]
-    pub(crate) network_fee: Option<Decimal>,
+    #[serde(deserialize_with = "deserialize_decimal_from_string")]
+    pub(crate) network_fee: Decimal,
+    #[serde(deserialize_with = "deserialize_decimal_from_string")]
+    pub(crate) fees: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -210,6 +221,17 @@ pub(super) async fn get_transfer_status(
         })
 }
 
+/// Lists all transfers for the account.
+pub(super) async fn list_all_transfers(
+    client: &AlpacaWalletClient,
+) -> Result<Vec<Transfer>, AlpacaWalletError> {
+    let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
+
+    let response = client.get(&path).await?;
+
+    Ok(response.json().await?)
+}
+
 /// Finds a transfer by its transaction hash.
 ///
 /// Fetches all transfers and filters by tx_hash. Returns the first match
@@ -235,22 +257,20 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
     use std::str::FromStr;
+    use uuid::uuid;
 
-    use super::super::client::create_account_mock;
     use super::*;
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[tokio::test]
     async fn test_initiate_withdrawal_successful() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .json_body(json!({
                     "amount": "100.5",
                     "asset": "USDC",
@@ -260,25 +280,27 @@ mod tests {
                 .header("content-type", "application/json")
                 .json_body(json!({
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.5",
+                    "usd_value": "100.48",
+                    "chain": "ETH",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "PENDING",
                     "tx_hash": null,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let amount = Decimal::new(1005, 1);
         let transfer = initiate_withdrawal(
@@ -299,25 +321,20 @@ mod tests {
         assert_eq!(transfer.asset.as_ref(), "USDC");
         assert_eq!(transfer.to, expected_address);
         assert_eq!(transfer.status, TransferStatus::Pending);
-        assert_eq!(transfer.network_fee, Some(Decimal::new(5, 1)));
+        assert_eq!(transfer.network_fee, Decimal::new(5, 1));
 
-        account_mock.assert();
         withdrawal_mock.assert();
     }
 
     #[tokio::test]
     async fn test_initiate_withdrawal_zero_amount() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = initiate_withdrawal(
             &client,
@@ -332,23 +349,17 @@ mod tests {
             err,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::ZERO
         ));
-
-        account_mock.assert();
     }
 
     #[tokio::test]
     async fn test_initiate_withdrawal_negative_amount() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = initiate_withdrawal(
             &client,
@@ -363,20 +374,14 @@ mod tests {
             err,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::new(-100, 0)
         ));
-
-        account_mock.assert();
     }
 
     #[tokio::test]
     async fn test_initiate_withdrawal_invalid_asset() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let withdrawal_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(POST)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(400)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -386,11 +391,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = initiate_withdrawal(
             &client,
@@ -405,20 +409,15 @@ mod tests {
             AlpacaWalletError::ApiError { status, .. } if status == 400
         ));
 
-        account_mock.assert();
         withdrawal_mock.assert();
     }
 
     #[tokio::test]
     async fn test_initiate_withdrawal_invalid_address() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let withdrawal_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(POST)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(400)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -428,11 +427,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result =
             initiate_withdrawal(&client, Decimal::new(100, 0), "USDC", "invalid_address").await;
@@ -442,30 +440,24 @@ mod tests {
             AlpacaWalletError::ApiError { status, .. } if status == 400
         ));
 
-        account_mock.assert();
         withdrawal_mock.assert();
     }
 
     #[tokio::test]
     async fn test_initiate_withdrawal_api_error() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let withdrawal_mock = server.mock(|when, then| {
-            when.method(POST).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(POST)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(500).body("Internal Server Error");
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = initiate_withdrawal(
             &client,
@@ -480,46 +472,42 @@ mod tests {
             AlpacaWalletError::ApiError { status, .. } if status == 500
         ));
 
-        account_mock.assert();
         withdrawal_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_pending() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "99.98",
+                    "chain": "ETH",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "PENDING",
                     "tx_hash": null,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
@@ -528,46 +516,42 @@ mod tests {
         assert_eq!(result.status, TransferStatus::Pending);
         assert_eq!(result.id, AlpacaTransferId::from(transfer_id));
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_processing() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "99.98",
+                    "chain": "ETH",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "PROCESSING",
                     "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
@@ -576,46 +560,42 @@ mod tests {
         assert_eq!(result.status, TransferStatus::Processing);
         assert!(result.tx.is_some());
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_complete() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "99.98",
+                    "chain": "ETH",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "COMPLETE",
                     "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
@@ -623,46 +603,42 @@ mod tests {
 
         assert_eq!(result.status, TransferStatus::Complete);
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_failed() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "99.98",
+                    "chain": "ETH",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "FAILED",
                     "tx_hash": null,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": null
+                    "network_fee": "0",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id))
             .await
@@ -670,22 +646,16 @@ mod tests {
 
         assert_eq!(result.status, TransferStatus::Failed);
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_not_found() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
@@ -694,11 +664,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
 
@@ -707,33 +676,26 @@ mod tests {
             AlpacaWalletError::TransferNotFound { .. }
         ));
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_api_error() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(500).body("Internal Server Error");
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
 
@@ -742,22 +704,16 @@ mod tests {
             AlpacaWalletError::ApiError { status, .. } if status == 500
         ));
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_transfer_status_malformed_json() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
@@ -766,18 +722,16 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = get_transfer_status(&client, &AlpacaTransferId::from(transfer_id)).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), AlpacaWalletError::Reqwest(_)));
 
-        account_mock.assert();
         status_mock.assert();
     }
 
@@ -796,54 +750,55 @@ mod tests {
     #[tokio::test]
     async fn test_find_transfer_by_tx_hash_found() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
         let transfer_id = Uuid::new_v4();
 
         let transfers_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
                     {
                         "id": Uuid::new_v4(),
-                        "relationship": "OUTGOING",
+                        "direction": "OUTGOING",
                         "amount": "100",
+                        "usd_value": "99.98",
+                        "chain": "ETH",
                         "asset": "USDC",
-                        "from_address": null,
+                        "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                         "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                         "status": "COMPLETE",
-                        "tx_hash": null,
+                        "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
                         "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee_amount": null
+                        "network_fee": "0",
+                        "fees": "0"
                     },
                     {
                         "id": transfer_id,
-                        "relationship": "INCOMING",
+                        "direction": "INCOMING",
                         "amount": "500",
+                        "usd_value": "499.90",
+                        "chain": "ETH",
                         "asset": "USDC",
                         "from_address": "0x9999999999999999999999999999999999999999",
                         "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                         "status": "COMPLETE",
                         "tx_hash": tx_hash,
                         "created_at": "2024-01-02T00:00:00Z",
-                        "network_fee_amount": "0.5"
+                        "network_fee": "0.5",
+                        "fees": "0"
                     }
                 ]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let transfer = find_transfer_by_tx_hash(&client, &tx_hash)
             .await
@@ -854,70 +809,62 @@ mod tests {
         assert_eq!(transfer.tx, Some(tx_hash));
         assert_eq!(transfer.status, TransferStatus::Complete);
 
-        account_mock.assert();
         transfers_mock.assert();
     }
 
     #[tokio::test]
     async fn test_find_transfer_by_tx_hash_not_found() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
         let transfers_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
                     {
                         "id": Uuid::new_v4(),
-                        "relationship": "OUTGOING",
+                        "direction": "OUTGOING",
                         "amount": "100",
+                        "usd_value": "99.98",
+                        "chain": "ETH",
                         "asset": "USDC",
-                        "from_address": null,
+                        "from_address": "0xabcdef1234567890abcdef1234567890abcdef12",
                         "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                         "status": "COMPLETE",
-                        "tx_hash": null,
+                        "tx_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
                         "created_at": "2024-01-01T00:00:00Z",
-                        "network_fee_amount": null
+                        "network_fee": "0",
+                        "fees": "0"
                     }
                 ]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = find_transfer_by_tx_hash(&client, &tx_hash).await.unwrap();
 
         assert!(result.is_none());
 
-        account_mock.assert();
         transfers_mock.assert();
     }
 
     #[tokio::test]
     async fn test_find_transfer_by_tx_hash_empty_list() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
         let transfers_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -925,43 +872,36 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = find_transfer_by_tx_hash(&client, &tx_hash).await.unwrap();
 
         assert!(result.is_none());
 
-        account_mock.assert();
         transfers_mock.assert();
     }
 
     #[tokio::test]
     async fn test_find_transfer_by_tx_hash_api_error() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
         let transfers_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(500).body("Internal Server Error");
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = find_transfer_by_tx_hash(&client, &tx_hash).await;
 
@@ -970,7 +910,6 @@ mod tests {
             AlpacaWalletError::ApiError { status, .. } if status == 500
         ));
 
-        account_mock.assert();
         transfers_mock.assert();
     }
 }
