@@ -83,29 +83,45 @@ async fn check_onchain_trades(pool: &SqlitePool) -> Result<(), StartupCheckError
     let stats = get_aggregate_stats(pool, "OnChainTrade", "onchain_trades").await?;
 
     if stats.needs_migration() {
-        info!(
-            "OnChainTrade: {} legacy records, 0 events - running migration",
-            stats.legacy_count
-        );
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        super::onchain_trade::migrate_onchain_trades(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("OnChainTrade migration complete");
+        run_onchain_trades_migration(pool, &stats).await?;
     } else if stats.needs_consistency_check() {
-        info!(
-            "OnChainTrade: {} legacy records, {} events - checking consistency",
-            stats.legacy_count, stats.event_count
-        );
+        log_consistency_check("OnChainTrade", &stats);
         verify_onchain_trades_consistency(pool).await;
     } else {
-        info!(
-            "OnChainTrade: {} legacy records, {} events - no action needed",
-            stats.legacy_count, stats.event_count
-        );
+        log_no_action("OnChainTrade", &stats);
     }
 
     Ok(())
+}
+
+async fn run_onchain_trades_migration(
+    pool: &SqlitePool,
+    stats: &AggregateStats,
+) -> Result<(), StartupCheckError> {
+    info!(
+        "OnChainTrade: {} legacy records, 0 events - running migration",
+        stats.legacy_count
+    );
+
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    super::onchain_trade::migrate_onchain_trades(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("OnChainTrade migration complete");
+    Ok(())
+}
+
+fn log_consistency_check(aggregate_type: &str, stats: &AggregateStats) {
+    info!(
+        "{aggregate_type}: {} legacy records, {} events - checking consistency",
+        stats.legacy_count, stats.event_count
+    );
+}
+
+fn log_no_action(aggregate_type: &str, stats: &AggregateStats) {
+    info!(
+        "{aggregate_type}: {} legacy records, {} events - no action needed",
+        stats.legacy_count, stats.event_count
+    );
 }
 
 async fn verify_onchain_trades_consistency(pool: &SqlitePool) {
@@ -133,46 +149,35 @@ async fn check_positions(pool: &SqlitePool) -> Result<(), StartupCheckError> {
     let stats = get_aggregate_stats(pool, "Position", "trade_accumulators").await?;
 
     if stats.needs_migration() {
-        info!(
-            "Position: {} legacy records, 0 events - running migration",
-            stats.legacy_count
-        );
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        super::position::migrate_positions(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("Position migration complete");
+        run_positions_migration(pool, &stats).await?;
     } else if stats.needs_consistency_check() {
-        info!(
-            "Position: {} legacy records, {} events - checking consistency",
-            stats.legacy_count, stats.event_count
-        );
+        log_consistency_check("Position", &stats);
         verify_positions_consistency(pool).await;
     } else {
-        info!(
-            "Position: {} legacy records, {} events - no action needed",
-            stats.legacy_count, stats.event_count
-        );
+        log_no_action("Position", &stats);
     }
 
     Ok(())
 }
 
-async fn verify_positions_consistency(pool: &SqlitePool) {
-    #[derive(sqlx::FromRow)]
-    struct LegacyPosition {
-        symbol: String,
-        net_position: f64,
-        accumulated_long: f64,
-        accumulated_short: f64,
-    }
+async fn run_positions_migration(
+    pool: &SqlitePool,
+    stats: &AggregateStats,
+) -> Result<(), StartupCheckError> {
+    info!(
+        "Position: {} legacy records, 0 events - running migration",
+        stats.legacy_count
+    );
 
-    let legacy_positions = match sqlx::query_as::<_, LegacyPosition>(
-        "SELECT symbol, net_position, accumulated_long, accumulated_short FROM trade_accumulators",
-    )
-    .fetch_all(pool)
-    .await
-    {
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    super::position::migrate_positions(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("Position migration complete");
+    Ok(())
+}
+
+async fn verify_positions_consistency(pool: &SqlitePool) {
+    let legacy_positions = match fetch_legacy_positions(pool).await {
         Ok(rows) => rows,
         Err(e) => {
             error!("Failed to fetch legacy positions for consistency check: {e}");
@@ -187,60 +192,90 @@ async fn verify_positions_consistency(pool: &SqlitePool) {
     >::new_event_store(repo);
 
     for legacy in legacy_positions {
-        let Ok(symbol) = Symbol::new(&legacy.symbol) else {
-            warn!(
-                "Position consistency check: invalid symbol in legacy data: {}",
+        verify_single_position(&store, legacy).await;
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct LegacyPosition {
+    symbol: String,
+    net_position: f64,
+    accumulated_long: f64,
+    accumulated_short: f64,
+}
+
+async fn fetch_legacy_positions(pool: &SqlitePool) -> Result<Vec<LegacyPosition>, sqlx::Error> {
+    sqlx::query_as::<_, LegacyPosition>(
+        "SELECT symbol, net_position, accumulated_long, accumulated_short FROM trade_accumulators",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+async fn verify_single_position(
+    store: &PersistedEventStore<
+        SqliteEventRepository,
+        Lifecycle<Position, ArithmeticError<FractionalShares>>,
+    >,
+    legacy: LegacyPosition,
+) {
+    let Ok(symbol) = Symbol::new(&legacy.symbol) else {
+        warn!(
+            "Position consistency check: invalid symbol in legacy data: {}",
+            legacy.symbol
+        );
+        return;
+    };
+
+    let aggregate_id = Position::aggregate_id(&symbol);
+    let aggregate_context = match store.load_aggregate(&aggregate_id).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            error!(
+                "Position consistency check: failed to load ES state for {}: {e}",
                 legacy.symbol
             );
-            continue;
-        };
-
-        let aggregate_id = Position::aggregate_id(&symbol);
-        let aggregate_context = match store.load_aggregate(&aggregate_id).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                error!(
-                    "Position consistency check: failed to load ES state for {}: {e}",
-                    legacy.symbol
-                );
-                continue;
-            }
-        };
-
-        let es_state = aggregate_context.aggregate();
-
-        let Lifecycle::Live(position) = es_state else {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} exists in legacy but ES state is not Live",
-                legacy.symbol
-            );
-            continue;
-        };
-
-        let legacy_net = Decimal::try_from(legacy.net_position).unwrap_or_default();
-        let legacy_long = Decimal::try_from(legacy.accumulated_long).unwrap_or_default();
-        let legacy_short = Decimal::try_from(legacy.accumulated_short).unwrap_or_default();
-
-        if position.net.0 != legacy_net {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} net_position: ES={} legacy={}",
-                legacy.symbol, position.net.0, legacy_net
-            );
+            return;
         }
+    };
 
-        if position.accumulated_long.0 != legacy_long {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} accumulated_long: ES={} legacy={}",
-                legacy.symbol, position.accumulated_long.0, legacy_long
-            );
-        }
+    let es_state = aggregate_context.aggregate();
 
-        if position.accumulated_short.0 != legacy_short {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} accumulated_short: ES={} legacy={}",
-                legacy.symbol, position.accumulated_short.0, legacy_short
-            );
-        }
+    let Lifecycle::Live(position) = es_state else {
+        error!(
+            "CONSISTENCY MISMATCH: Position {} exists in legacy but ES state is not Live",
+            legacy.symbol
+        );
+        return;
+    };
+
+    compare_position_fields(&legacy, position);
+}
+
+fn compare_position_fields(legacy: &LegacyPosition, position: &Position) {
+    let legacy_net = Decimal::try_from(legacy.net_position).unwrap_or_default();
+    let legacy_long = Decimal::try_from(legacy.accumulated_long).unwrap_or_default();
+    let legacy_short = Decimal::try_from(legacy.accumulated_short).unwrap_or_default();
+
+    if position.net.0 != legacy_net {
+        error!(
+            "CONSISTENCY MISMATCH: Position {} net_position: ES={} legacy={}",
+            legacy.symbol, position.net.0, legacy_net
+        );
+    }
+
+    if position.accumulated_long.0 != legacy_long {
+        error!(
+            "CONSISTENCY MISMATCH: Position {} accumulated_long: ES={} legacy={}",
+            legacy.symbol, position.accumulated_long.0, legacy_long
+        );
+    }
+
+    if position.accumulated_short.0 != legacy_short {
+        error!(
+            "CONSISTENCY MISMATCH: Position {} accumulated_short: ES={} legacy={}",
+            legacy.symbol, position.accumulated_short.0, legacy_short
+        );
     }
 }
 
@@ -248,28 +283,30 @@ async fn check_offchain_orders(pool: &SqlitePool) -> Result<(), StartupCheckErro
     let stats = get_aggregate_stats(pool, "OffchainOrder", "offchain_trades").await?;
 
     if stats.needs_migration() {
-        info!(
-            "OffchainOrder: {} legacy records, 0 events - running migration",
-            stats.legacy_count
-        );
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        super::offchain_order::migrate_offchain_orders(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("OffchainOrder migration complete");
+        run_offchain_orders_migration(pool, &stats).await?;
     } else if stats.needs_consistency_check() {
-        info!(
-            "OffchainOrder: {} legacy records, {} events - checking consistency",
-            stats.legacy_count, stats.event_count
-        );
+        log_consistency_check("OffchainOrder", &stats);
         verify_offchain_orders_consistency(pool).await;
     } else {
-        info!(
-            "OffchainOrder: {} legacy records, {} events - no action needed",
-            stats.legacy_count, stats.event_count
-        );
+        log_no_action("OffchainOrder", &stats);
     }
 
+    Ok(())
+}
+
+async fn run_offchain_orders_migration(
+    pool: &SqlitePool,
+    stats: &AggregateStats,
+) -> Result<(), StartupCheckError> {
+    info!(
+        "OffchainOrder: {} legacy records, 0 events - running migration",
+        stats.legacy_count
+    );
+
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    super::offchain_order::migrate_offchain_orders(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("OffchainOrder migration complete");
     Ok(())
 }
 
@@ -298,30 +335,46 @@ async fn check_schwab_auth(
     pool: &SqlitePool,
     encryption_key: FixedBytes<32>,
 ) -> Result<(), StartupCheckError> {
+    let stats = get_schwab_auth_stats(pool).await?;
+
+    if stats.needs_migration() {
+        run_schwab_auth_migration(pool, encryption_key).await?;
+    } else {
+        info!(
+            "SchwabAuth: {} legacy records, {} events - no migration needed",
+            stats.legacy_count, stats.event_count
+        );
+    }
+
+    Ok(())
+}
+
+async fn get_schwab_auth_stats(pool: &SqlitePool) -> Result<AggregateStats, sqlx::Error> {
     let legacy_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schwab_auth")
         .fetch_one(pool)
         .await?;
 
     let event_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE aggregate_type = 'SchwabAuth'")
-            .bind("SchwabAuth")
             .fetch_one(pool)
             .await?;
 
-    if event_count == 0 && legacy_count > 0 {
-        info!("SchwabAuth: legacy record exists, 0 events - running migration");
+    Ok(AggregateStats {
+        legacy_count,
+        event_count,
+    })
+}
 
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
-        super::schwab_auth::migrate_schwab_auth(pool, &cqrs, ExecutionMode::Commit).await?;
+async fn run_schwab_auth_migration(
+    pool: &SqlitePool,
+    encryption_key: FixedBytes<32>,
+) -> Result<(), StartupCheckError> {
+    info!("SchwabAuth: legacy record exists, 0 events - running migration");
 
-        info!("SchwabAuth migration complete");
-    } else {
-        info!(
-            "SchwabAuth: {} legacy records, {} events - no migration needed",
-            legacy_count, event_count
-        );
-    }
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
+    super::schwab_auth::migrate_schwab_auth(pool, &cqrs, ExecutionMode::Commit).await?;
 
+    info!("SchwabAuth migration complete");
     Ok(())
 }
 

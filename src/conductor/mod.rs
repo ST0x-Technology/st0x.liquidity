@@ -770,50 +770,59 @@ async fn execute_onchain_trade_dual_write(
     trade: &OnchainTrade,
     block_number: u64,
 ) {
-    if let Err(e) = crate::dual_write::witness_trade(dual_write_context, trade, block_number).await
-    {
-        error!(
-            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    } else {
-        info!(
+    execute_witness_trade(dual_write_context, trade, block_number).await;
+    execute_initialize_position(dual_write_context, trade).await;
+    execute_acknowledge_fill(dual_write_context, trade).await;
+}
+
+async fn execute_witness_trade(
+    dual_write_context: &DualWriteContext,
+    trade: &OnchainTrade,
+    block_number: u64,
+) {
+    match crate::dual_write::witness_trade(dual_write_context, trade, block_number).await {
+        Ok(()) => info!(
             "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        ),
     }
+}
 
+async fn execute_initialize_position(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
     let base_symbol = trade.symbol.base();
 
-    // Try to initialize position for new symbols - will fail silently if already initialized
-    if let Err(e) = crate::dual_write::initialize_position(
+    match crate::dual_write::initialize_position(
         dual_write_context,
         base_symbol,
         crate::threshold::ExecutionThreshold::whole_share(),
     )
     .await
     {
-        debug!(
-            "Position initialization skipped (likely already exists): {e}, symbol={}",
-            base_symbol
-        );
-    } else {
-        info!(
+        Ok(()) => info!(
             "Successfully initialized Position aggregate for symbol={}",
             base_symbol
-        );
+        ),
+        Err(e) => debug!(
+            "Position initialization skipped (likely already exists): {e}, symbol={}",
+            base_symbol
+        ),
     }
+}
 
-    if let Err(e) = crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
-        error!(
-            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    } else {
-        info!(
+async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
+    match crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
+        Ok(()) => info!(
             "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        ),
     }
 }
 
@@ -822,30 +831,38 @@ async fn execute_new_execution_dual_write(
     execution: &OffchainExecution,
     base_symbol: &Symbol,
 ) {
-    if let Err(e) =
-        crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
+    execute_place_offchain_order(dual_write_context, execution, base_symbol).await;
+    execute_place_order(dual_write_context, execution).await;
+}
+
+async fn execute_place_offchain_order(
+    dual_write_context: &DualWriteContext,
+    execution: &OffchainExecution,
+    base_symbol: &Symbol,
+) {
+    match crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
     {
-        error!(
-            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
-            execution.id, base_symbol
-        );
-    } else {
-        info!(
+        Ok(()) => info!(
             "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
             execution.id, base_symbol
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
+            execution.id, base_symbol
+        ),
     }
+}
 
-    if let Err(e) = crate::dual_write::place_order(dual_write_context, execution).await {
-        error!(
-            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
-            execution.id, execution.symbol
-        );
-    } else {
-        info!(
+async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainExecution) {
+    match crate::dual_write::place_order(dual_write_context, execution).await {
+        Ok(()) => info!(
             "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
             execution.id, execution.symbol
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
+            execution.id, execution.symbol
+        ),
     }
 }
 
@@ -854,38 +871,61 @@ async fn execute_stale_execution_cleanup_dual_write(
     cleaned_up_executions: Vec<CleanedUpExecution>,
 ) {
     for cleaned_up in cleaned_up_executions {
-        let execution_id = cleaned_up.execution_id;
-        let symbol = cleaned_up.symbol;
-        let error_reason = cleaned_up.error_reason;
-        if let Err(e) =
-            crate::dual_write::mark_failed(dual_write_context, execution_id, error_reason.clone())
-                .await
-        {
-            error!(
-                "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
-            );
-        } else {
-            info!(
-                "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
-            );
-        }
+        execute_single_stale_cleanup(dual_write_context, cleaned_up).await;
+    }
+}
 
-        if let Err(e) = crate::dual_write::fail_offchain_order(
-            dual_write_context,
-            execution_id,
-            &symbol,
-            error_reason,
-        )
-        .await
-        {
-            error!(
-                "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
-            );
-        } else {
-            info!(
-                "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
-            );
-        }
+async fn execute_single_stale_cleanup(
+    dual_write_context: &DualWriteContext,
+    cleaned_up: CleanedUpExecution,
+) {
+    execute_mark_stale_failed(dual_write_context, &cleaned_up).await;
+    execute_fail_stale_offchain(dual_write_context, &cleaned_up).await;
+}
+
+async fn execute_mark_stale_failed(
+    dual_write_context: &DualWriteContext,
+    cleaned_up: &CleanedUpExecution,
+) {
+    let execution_id = cleaned_up.execution_id;
+
+    match crate::dual_write::mark_failed(
+        dual_write_context,
+        execution_id,
+        cleaned_up.error_reason.clone(),
+    )
+    .await
+    {
+        Ok(()) => info!(
+            "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
+        ),
+        Err(e) => error!(
+            "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
+        ),
+    }
+}
+
+async fn execute_fail_stale_offchain(
+    dual_write_context: &DualWriteContext,
+    cleaned_up: &CleanedUpExecution,
+) {
+    let execution_id = cleaned_up.execution_id;
+    let symbol = &cleaned_up.symbol;
+
+    match crate::dual_write::fail_offchain_order(
+        dual_write_context,
+        execution_id,
+        symbol,
+        cleaned_up.error_reason.clone(),
+    )
+    .await
+    {
+        Ok(()) => info!(
+            "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
+        ),
+        Err(e) => error!(
+            "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
+        ),
     }
 }
 

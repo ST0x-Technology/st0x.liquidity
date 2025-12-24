@@ -24,13 +24,7 @@ pub async fn migrate_positions(
     cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
-    let rows = sqlx::query_as::<_, PositionRow>(
-        "SELECT symbol, net_position, accumulated_long, accumulated_short, pending_execution_id
-         FROM trade_accumulators
-         ORDER BY symbol ASC",
-    )
-    .fetch_all(pool)
-    .await?;
+    let rows = fetch_position_rows(pool).await?;
 
     let total = rows.len();
     info!("Found {total} positions to migrate");
@@ -41,43 +35,72 @@ pub async fn migrate_positions(
         .count();
 
     for (idx, row) in rows.into_iter().enumerate() {
-        let processed = idx + 1;
-        if processed % 100 == 0 {
-            info!("Migrating positions: {processed}/{total}");
-        }
-
-        if let Some(exec_id) = row.pending_execution_id {
-            warn!(
-                "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
-                row.symbol
-            );
-        }
-
-        let symbol = Symbol::new(&row.symbol)?;
-        let aggregate_id = Position::aggregate_id(&symbol);
-
-        let net_position = Decimal::try_from(row.net_position)?;
-        let accumulated_long = Decimal::try_from(row.accumulated_long)?;
-        let accumulated_short = Decimal::try_from(row.accumulated_short)?;
-
-        let command = PositionCommand::Migrate {
-            symbol,
-            net_position: FractionalShares(net_position),
-            accumulated_long: FractionalShares(accumulated_long),
-            accumulated_short: FractionalShares(accumulated_short),
-            threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
-        };
-
-        match execution {
-            ExecutionMode::Commit => {
-                cqrs.execute(&aggregate_id, command).await?;
-            }
-            ExecutionMode::DryRun => {}
-        }
+        log_progress("positions", idx + 1, total);
+        migrate_single_position(cqrs, row, execution).await?;
     }
 
     info!("Migrated {total} positions, {pending_count} with pending executions");
     Ok(total)
+}
+
+async fn fetch_position_rows(pool: &SqlitePool) -> Result<Vec<PositionRow>, sqlx::Error> {
+    sqlx::query_as::<_, PositionRow>(
+        "SELECT symbol, net_position, accumulated_long, accumulated_short, pending_execution_id
+         FROM trade_accumulators
+         ORDER BY symbol ASC",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+fn log_progress(entity: &str, progress: usize, total: usize) {
+    if progress % 100 == 0 {
+        info!("Migrating {entity}: {progress}/{total}");
+    }
+}
+
+async fn migrate_single_position(
+    cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    row: PositionRow,
+    execution: ExecutionMode,
+) -> Result<(), MigrationError> {
+    log_pending_execution_warning(&row);
+
+    let symbol = Symbol::new(&row.symbol)?;
+    let aggregate_id = Position::aggregate_id(&symbol);
+    let command = build_position_command(&row, symbol)?;
+
+    if matches!(execution, ExecutionMode::Commit) {
+        cqrs.execute(&aggregate_id, command).await?;
+    }
+
+    Ok(())
+}
+
+fn log_pending_execution_warning(row: &PositionRow) {
+    if let Some(exec_id) = row.pending_execution_id {
+        warn!(
+            "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
+            row.symbol
+        );
+    }
+}
+
+fn build_position_command(
+    row: &PositionRow,
+    symbol: Symbol,
+) -> Result<PositionCommand, MigrationError> {
+    let net_position = Decimal::try_from(row.net_position)?;
+    let accumulated_long = Decimal::try_from(row.accumulated_long)?;
+    let accumulated_short = Decimal::try_from(row.accumulated_short)?;
+
+    Ok(PositionCommand::Migrate {
+        symbol,
+        net_position: FractionalShares(net_position),
+        accumulated_long: FractionalShares(accumulated_long),
+        accumulated_short: FractionalShares(accumulated_short),
+        threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
+    })
 }
 
 #[cfg(test)]

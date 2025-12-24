@@ -152,7 +152,15 @@ pub async fn run_migration(
     pool: &SqlitePool,
     env: &MigrationEnv,
 ) -> anyhow::Result<MigrationSummary> {
-    match env.execution {
+    log_migration_start(env.execution);
+    check_all_aggregate_events(pool, env).await?;
+    safety_prompt(env.confirmation)?;
+    maybe_clean_events(pool, env).await?;
+    execute_migrations(pool, env).await
+}
+
+fn log_migration_start(execution: ExecutionMode) {
+    match execution {
         ExecutionMode::DryRun => {
             info!("Starting migration in DRY-RUN mode - no events will be persisted");
         }
@@ -160,18 +168,30 @@ pub async fn run_migration(
             info!("Starting migration...");
         }
     }
+}
 
+async fn check_all_aggregate_events(
+    pool: &SqlitePool,
+    env: &MigrationEnv,
+) -> Result<(), MigrationError> {
     check_existing_events(pool, "OnChainTrade", env.confirmation, env.clean).await?;
     check_existing_events(pool, "Position", env.confirmation, env.clean).await?;
     check_existing_events(pool, "OffchainOrder", env.confirmation, env.clean).await?;
     check_existing_events(pool, "SchwabAuth", env.confirmation, env.clean).await?;
+    Ok(())
+}
 
-    safety_prompt(env.confirmation)?;
-
+async fn maybe_clean_events(pool: &SqlitePool, env: &MigrationEnv) -> Result<(), MigrationError> {
     if matches!(env.clean, CleanMode::Delete) {
         clean_events(pool, env.confirmation).await?;
     }
+    Ok(())
+}
 
+async fn execute_migrations(
+    pool: &SqlitePool,
+    env: &MigrationEnv,
+) -> anyhow::Result<MigrationSummary> {
     let onchain_trade_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let position_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let offchain_order_cqrs = sqlite_cqrs(pool.clone(), vec![], ());

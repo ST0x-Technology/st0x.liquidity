@@ -1,7 +1,7 @@
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
-use st0x_broker::{Broker, OrderState, OrderStatus, PersistenceError};
+use st0x_broker::{Broker, OrderState, OrderStatus, PersistenceError, Symbol};
 use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
@@ -212,13 +212,19 @@ impl<B: Broker> OrderStatusPoller<B> {
         let symbol = &execution.symbol;
         info!("Updated execution {execution_id} to FAILED and cleared locks for symbol: {symbol}");
 
-        let error_message = match order_state {
-            OrderState::Failed { error_reason, .. } => error_reason
-                .clone()
-                .unwrap_or_else(|| "Order failed with no error reason".to_string()),
-            _ => "Unknown failure reason".to_string(),
-        };
+        let error_message = extract_error_message(order_state);
+        self.execute_failed_order_dual_write(execution_id, symbol, error_message)
+            .await;
 
+        Ok(())
+    }
+
+    async fn execute_failed_order_dual_write(
+        &self,
+        execution_id: i64,
+        symbol: &Symbol,
+        error_message: String,
+    ) {
         if let Err(e) = crate::dual_write::mark_failed(
             &self.dual_write_context,
             execution_id,
@@ -243,8 +249,6 @@ impl<B: Broker> OrderStatusPoller<B> {
                 "Failed to execute Position::FailOffChainOrder command for execution {execution_id}, symbol {symbol}: {e}"
             );
         }
-
-        Ok(())
     }
 
     async fn finalize_order(
@@ -279,6 +283,15 @@ impl<B: Broker> OrderStatusPoller<B> {
             let jitter = Duration::from_millis(jitter_millis);
             tokio::time::sleep(jitter).await;
         }
+    }
+}
+
+fn extract_error_message(order_state: &OrderState) -> String {
+    match order_state {
+        OrderState::Failed { error_reason, .. } => error_reason
+            .clone()
+            .unwrap_or_else(|| "Order failed with no error reason".to_string()),
+        _ => "Unknown failure reason".to_string(),
     }
 }
 
