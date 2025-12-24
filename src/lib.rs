@@ -5,6 +5,7 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
 use crate::dashboard::ServerMessage;
+use crate::migration::run_startup_check;
 
 mod alpaca_tokenization;
 mod alpaca_wallet;
@@ -14,12 +15,14 @@ mod cctp;
 pub mod cli;
 mod conductor;
 pub(crate) mod dashboard;
+mod dual_write;
 pub mod env;
 mod equity_redemption;
 mod error;
 mod inventory;
 mod lifecycle;
 mod lock;
+pub mod migration;
 mod offchain;
 mod offchain_order;
 mod onchain;
@@ -52,6 +55,11 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
 
     let pool = config.get_sqlite_pool().await?;
     sqlx::migrate!().run(&pool).await?;
+
+    if let Err(e) = run_startup_check(&pool, &config.broker).await {
+        error!("Startup migration/consistency check failed: {e}");
+        return Err(e.into());
+    }
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
 

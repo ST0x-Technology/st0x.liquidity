@@ -472,7 +472,10 @@ async fn process_found_trade<W: Write>(
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
     let mut sql_tx = pool.begin().await?;
-    let execution = accumulator::process_onchain_trade(
+    let accumulator::TradeProcessingResult {
+        execution,
+        cleaned_up_executions: _,
+    } = accumulator::process_onchain_trade(
         &mut sql_tx,
         onchain_trade,
         config.broker.to_supported_broker(),

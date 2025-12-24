@@ -98,7 +98,6 @@ impl ExecutionThreshold {
         Ok(Self::DollarValue(value))
     }
 
-    #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
         Self::Shares(FractionalShares::ONE)
     }

@@ -221,6 +221,128 @@ cargo run --bin server -- --broker dry-run
 The bot will now monitor blockchain events and execute offsetting trades
 automatically.
 
+## Data Migration (One-Time)
+
+**Note**: This section applies if you're migrating from a pre-CQRS/ES version of
+the system. New installations can skip this section.
+
+The `migrate_to_events` binary converts legacy CRUD data to event-sourced
+aggregates. This is a one-time operation required before enabling the
+event-sourced system.
+
+### When to Run Migration
+
+- Migrating from legacy CRUD tables (`onchain_trades`, `trade_accumulators`,
+  `offchain_trades`, `schwab_auth`)
+- Before enabling event-sourced aggregates in production
+- After completing database setup but before running the bot
+
+### Prerequisites
+
+1. **Create database backup**:
+   ```bash
+   cp data/schwab.db data/schwab.db.backup
+   ```
+
+2. **Ensure database migrations are current**:
+   ```bash
+   sqlx migrate run
+   ```
+
+### Migration Workflow
+
+**1. Dry run (preview without persisting):**
+
+```bash
+cargo run --bin migrate_to_events -- --execution dry-run
+```
+
+This shows what would be migrated without actually writing events. Review the
+output for:
+
+- Number of trades, positions, orders to migrate
+- Any warnings about pending executions
+- Expected event counts
+
+**2. Run migration:**
+
+```bash
+cargo run --bin migrate_to_events
+```
+
+You'll be prompted to:
+
+- Confirm you've created a database backup
+- Confirm if existing events are detected (if re-running)
+
+The migration will log progress every 100 items and show a summary:
+
+```
+Migration complete:
+  OnChainTrade: 1523
+  Position: 12
+  OffchainOrder: 1498
+  SchwabAuth: migrated
+```
+
+**3. Verify migration (optional but recommended):**
+
+```bash
+# Check event counts
+sqlite3 data/schwab.db "SELECT aggregate_type, COUNT(*) FROM events GROUP BY aggregate_type;"
+```
+
+### Options
+
+| Flag             | Values                           | Description                                                    |
+| ---------------- | -------------------------------- | -------------------------------------------------------------- |
+| `--execution`    | `commit` (default), `dry-run`    | Whether to persist events or just preview                      |
+| `--confirmation` | `interactive` (default), `force` | Whether to prompt for confirmations or skip prompts            |
+| `--clean`        | `preserve` (default), `delete`   | Whether to keep existing events or delete all before migrating |
+| `--database-url` | Path                             | SQLite database path (or set `DATABASE_URL` env var)           |
+
+### Common Scenarios
+
+**Re-run migration after fixing data:**
+
+```bash
+# Clean all events and re-migrate
+cargo run --bin migrate_to_events -- --clean delete --confirmation force
+```
+
+**Automated/CI usage:**
+
+```bash
+# Skip all prompts
+cargo run --bin migrate_to_events -- --confirmation force
+```
+
+**Migration from different database:**
+
+```bash
+cargo run --bin migrate_to_events -- --database-url sqlite:path/to/other.db
+```
+
+### Troubleshooting
+
+**"Events detected for OnChainTrade. Continue? [y/N]"**
+
+- Already migrated. Use `--confirmation force` to proceed anyway
+- Or use `--clean delete` to remove existing events and re-migrate
+
+**Migration fails with data validation error:**
+
+- Migration uses fail-fast behavior for data integrity
+- Check error message for specific issue (invalid symbol, negative amount, etc.)
+- Fix source data in legacy tables and re-run
+
+**Rollback:**
+
+```bash
+# Restore from backup
+mv data/schwab.db.backup data/schwab.db
+```
+
 ## Docker Deployment
 
 The system uses Docker Compose to run two separate bot instances with isolated
@@ -336,11 +458,21 @@ src/
 │   ├── server.rs       # Arbitrage bot server
 │   ├── reporter.rs     # P&L reporter
 │   └── cli.rs          # CLI for manual operations
+├── position.rs         # Position aggregate (CQRS/ES)
+├── onchain_trade.rs    # OnChain trade aggregate (CQRS/ES)
+├── offchain_order.rs   # OffChain order aggregate (CQRS/ES)
 ├── onchain/            # Blockchain event processing
-├── offchain/           # Database models and execution tracking
+├── offchain/           # Off-chain order execution
 ├── conductor/          # Trade accumulation and broker orchestration
 ├── reporter/           # FIFO P&L calculation and metrics
-└── symbol/             # Token symbol caching
+├── symbol/             # Token symbol caching and locking
+├── alpaca_wallet/      # Alpaca cryptocurrency wallet management
+├── shares.rs           # Fractional shares newtype and arithmetic
+├── threshold.rs        # Execution threshold logic
+├── queue.rs            # Event queue for idempotent processing
+├── api.rs              # REST API endpoints
+├── env.rs              # Environment configuration
+└── cctp.rs             # Cross-chain token bridge (Circle CCTP)
 migrations/             # SQLite database schema
 data/                   # SQLite databases (created at runtime)
 ├── schwab.db           # Schwab instance database
@@ -354,9 +486,10 @@ Standalone library providing unified broker trait:
 ```
 src/
 ├── lib.rs              # Broker trait and shared types
-├── schwab/             # Charles Schwab integration
+├── schwab/             # Charles Schwab integration (with auth/ submodule)
 ├── alpaca/             # Alpaca Markets integration
-└── test.rs             # Test/dry-run broker
+├── order/              # Shared order types (MarketOrder, OrderState)
+└── mock.rs             # Mock broker for testing
 ```
 
 ## Development
