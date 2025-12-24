@@ -1,24 +1,25 @@
 # AGENTS.md
 
-This file provides guidance to AI agents working with the `st0x-broker` crate.
+This file provides guidance to AI agents working with the `st0x-execution`
+crate.
 
 ## General Guidelines
 
 **IMPORTANT**: All agents working in this crate MUST obey the top-level
 `@AGENTS.md` at the repository root. This file only contains
-broker-crate-specific additions and clarifications.
+execution-crate-specific additions and clarifications.
 
-## Broker Crate Scope
+## Execution Crate Scope
 
-This is a **standalone library crate** that provides a unified broker trait
+This is a **standalone library crate** that provides a unified `Executor` trait
 abstraction. When working in this crate:
 
-- **Stay focused on broker abstractions**: This crate should remain independent
-  of the parent application
+- **Stay focused on execution abstractions**: This crate should remain
+  independent of the parent application
 - **No parent crate dependencies**: Never add dependencies on `st0x-hedge` or
   other workspace members
 - **Type safety first**: Use newtypes and enums to prevent invalid states
-- **Zero-cost abstractions**: Leverage generics and associated types for broker
+- **Zero-cost abstractions**: Leverage generics and associated types for
   implementations
 
 ## CRITICAL: No Leaky Abstractions
@@ -29,16 +30,16 @@ lists and visibility levels must be **strictly monitored and controlled**.
 ### Encapsulation Requirements
 
 The encapsulation design **pushes users and maintainers towards using the
-`Broker` trait**, not specific broker implementations. Implementation details
-must remain hidden.
+`Executor` trait**, not specific implementations. Implementation details must
+remain hidden.
 
 **What to expose (and ONLY what to expose):**
 
-1. **The `Broker` trait** - The core abstraction
-2. **Broker implementation types** - `SchwabBroker`, `AlpacaBroker`, etc.
-3. **Configuration/initialization types** - What's needed to construct a broker
-   (e.g., `SchwabAuthEnv`, `AlpacaAuthEnv`)
-4. **Error types** - Broker-specific errors and shared error types
+1. **The `Executor` trait** - The core abstraction
+2. **Implementation types** - `SchwabExecutor`, `AlpacaTradingApi`, etc.
+3. **Configuration/initialization types** - What's needed to construct an
+   executor (e.g., `SchwabAuthEnv`, `AlpacaTradingApiEnv`)
+4. **Error types** - Implementation-specific errors and shared error types
 5. **Domain types** - Shared types like `Symbol`, `Shares`, `Direction`,
    `MarketOrder`, `OrderPlacement`
 
@@ -54,25 +55,26 @@ must remain hidden.
 
 ### Module Organization Pattern
 
-Look at `src/schwab/mod.rs` and `src/alpaca/mod.rs` as reference examples:
+Look at `src/schwab/mod.rs` and `src/alpaca_trading_api/mod.rs` as reference
+examples:
 
 ```rust
 // src/schwab/mod.rs - GOOD EXAMPLE
 
 // Private implementation modules
 mod auth;
-mod broker;
+mod executor;
 mod encryption;
 mod market_hours;
 mod order;
 mod order_status;
 mod tokens;
 
-// Re-export ONLY what's needed for broker construction
+// Re-export ONLY what's needed for construction
 pub use auth::SchwabAuthEnv;
-pub use broker::{SchwabBroker, SchwabConfig};
+pub use executor::{SchwabExecutor, SchwabConfig};
 
-// Re-export for auth CLI command (Schwab-specific, not part of generic broker API)
+// Re-export for auth CLI command (Schwab-specific, not part of generic API)
 pub use tokens::SchwabTokens;
 
 // Public error type (needed for error handling)
@@ -103,11 +105,11 @@ When adding new code:
 
 Before exposing anything:
 
-- **Ask**: Can users achieve their goal through the `Broker` trait alone?
+- **Ask**: Can users achieve their goal through the `Executor` trait alone?
 - **Ask**: Does exposing this create a dependency on implementation details?
-- **Ask**: Will this force users to write broker-specific code?
-- **Verify**: Can you use the broker without importing anything except the trait
-  and implementation type?
+- **Ask**: Will this force users to write implementation-specific code?
+- **Verify**: Can you use the executor without importing anything except the
+  trait and implementation type?
 
 ## Testing Requirements
 
@@ -119,36 +121,37 @@ Before exposing anything:
 - **No test utils bloat**: Only add test utilities that are reused across
   multiple test modules
 
-## Adding New Brokers
+## Adding New Implementations
 
-When implementing a new broker (e.g., Interactive Brokers, TD Ameritrade):
+When adding support for a new brokerage (e.g., Interactive Brokers, TD
+Ameritrade):
 
-1. **Create broker module** in `src/your_broker/` with private submodules
-2. **Implement `Broker` trait** with all required methods
+1. **Create module** in `src/your_executor/` with private submodules
+2. **Implement `Executor` trait** with all required methods
 3. **Define minimal public API** in `mod.rs`:
-   - Broker implementation type (`YourBroker`)
+   - Implementation type (`YourExecutor`)
    - Config/auth types needed for construction
-   - Broker-specific error type
+   - Error type
    - Any initialization utilities (like `extract_code_from_url`)
 4. **Keep internals private**: auth logic, token types, HTTP clients, helpers
 5. **Add comprehensive tests** covering authentication, orders, status polling
-6. **Update `src/lib.rs`** to re-export only the broker implementation type
-7. **Document setup** in code comments or broker-specific docs
+6. **Update `src/lib.rs`** to re-export only the implementation type
+7. **Document setup** in code comments or implementation-specific docs
 
-### Example New Broker Module Structure
+### Example New Module Structure
 
 ```rust
 // src/fidelity/mod.rs
 
 mod auth;              // Private - OAuth/token logic
-mod broker;            // Private - Broker trait implementation
+mod executor;          // Private - Executor trait implementation
 mod market_hours;      // Private - Market hours checking
 mod order;             // Private - Order placement logic
 mod order_status;      // Private - Status polling logic
 
 // Public API - ONLY what's needed
 pub use auth::FidelityAuthEnv;           // Config for construction
-pub use broker::FidelityBroker;          // The implementation
+pub use executor::FidelityExecutor;      // The implementation
 
 pub enum FidelityError { ... }           // Error type
 
@@ -157,12 +160,11 @@ pub fn initialize_auth(...) -> ... { }   // If needed for setup
 
 ## Architecture Constraints
 
-- **Trait-based design**: All broker functionality goes through the `Broker`
-  trait
+- **Trait-based design**: All functionality goes through the `Executor` trait
 - **Database schema shared**: This crate uses the parent workspace's migrations,
   coordinate schema changes
-- **No runtime broker selection**: Broker choice happens at compile time through
-  generics
+- **No runtime selection**: Implementation choice happens at compile time
+  through generics
 
 ## Code Quality Specific to This Crate
 
@@ -173,6 +175,6 @@ pub fn initialize_auth(...) -> ... { }   // If needed for setup
 - **Visibility restrictions**: Prefer `pub(crate)` over `pub`, private over
   `pub(crate)`
 - **Type modeling**: Use the typestate pattern where beneficial for encoding
-  broker lifecycles
+  lifecycles
 - **No leaky abstractions**: Review every `pub` declaration - can it be more
   restrictive?

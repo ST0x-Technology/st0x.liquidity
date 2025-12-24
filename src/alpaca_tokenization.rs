@@ -27,7 +27,7 @@ use chrono::{DateTime, Utc};
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};

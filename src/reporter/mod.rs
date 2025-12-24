@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::symbol::Symbol;
-use st0x_broker::Direction;
+use st0x_execution::Direction;
 
 mod pnl;
 

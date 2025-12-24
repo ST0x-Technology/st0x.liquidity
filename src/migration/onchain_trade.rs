@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
@@ -273,7 +273,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            super::MigrationError::InvalidSymbol(_)
+            super::MigrationError::EmptySymbol(_)
         ));
     }
 

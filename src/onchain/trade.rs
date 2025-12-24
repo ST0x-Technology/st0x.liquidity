@@ -14,7 +14,7 @@ use crate::onchain::EvmEnv;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
-use st0x_broker::Direction;
+use st0x_execution::Direction;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {

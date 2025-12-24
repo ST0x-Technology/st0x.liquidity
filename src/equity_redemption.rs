@@ -45,7 +45,7 @@ use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::tokenized_equity_mint::TokenizationRequestId;

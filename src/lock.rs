@@ -1,5 +1,5 @@
 use crate::error::OnChainError;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::{info, warn};
 
 /// Atomically acquires an execution lease for the given symbol.
@@ -110,8 +110,8 @@ mod tests {
     use crate::onchain::accumulator::save_within_transaction;
     use crate::onchain::position_calculator::PositionCalculator;
     use crate::test_utils::setup_test_db;
-    use st0x_broker::OrderState;
-    use st0x_broker::{Direction, Shares, SupportedBroker};
+    use st0x_execution::OrderState;
+    use st0x_execution::{Direction, Shares, SupportedExecutor};
 
     #[tokio::test]
     async fn test_try_acquire_execution_lease_success() {
@@ -206,7 +206,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(100).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -335,7 +335,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(100).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 

@@ -1,5 +1,5 @@
 [package]
-name = "st0x-broker"
+name = "st0x-execution"
 version = "0.1.0"
 edition = "2024"
 
@@ -28,6 +28,7 @@ uuid = { version = "1.10.0", features = ["v4", "serde"] }
 aes-gcm = "0.10.3"
 cqrs-es.workspace = true
 sqlite-es.workspace = true
+rust_decimal.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true

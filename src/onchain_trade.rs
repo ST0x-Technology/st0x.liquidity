@@ -10,7 +10,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use st0x_broker::{Direction, Symbol};
+use st0x_execution::{Direction, Symbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OnChainTrade {

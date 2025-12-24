@@ -15,7 +15,7 @@ use crate::equity_redemption::RedemptionAggregateId;
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 /// Receives triggered rebalancing operations and dispatches them to managers.
 pub(crate) struct Rebalancer<M, R, U>

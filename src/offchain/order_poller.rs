@@ -10,7 +10,7 @@ use super::execution::{
 };
 use crate::error::{OnChainError, OrderPollingError};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id};
-use st0x_broker::{Broker, OrderState, OrderStatus, PersistenceError};
+use st0x_execution::{Executor, OrderState, OrderStatus, PersistenceError};
 
 #[derive(Debug, Clone)]
 pub struct OrderPollerConfig {
@@ -27,22 +27,22 @@ impl Default for OrderPollerConfig {
     }
 }
 
-pub struct OrderStatusPoller<B: Broker> {
+pub struct OrderStatusPoller<E: Executor> {
     config: OrderPollerConfig,
     pool: SqlitePool,
     interval: Interval,
-    broker: B,
+    executor: E,
 }
 
-impl<B: Broker> OrderStatusPoller<B> {
-    pub fn new(config: OrderPollerConfig, pool: SqlitePool, broker: B) -> Self {
+impl<E: Executor> OrderStatusPoller<E> {
+    pub fn new(config: OrderPollerConfig, pool: SqlitePool, executor: E) -> Self {
         let interval = interval(config.polling_interval);
 
         Self {
             config,
             pool,
             interval,
-            broker,
+            executor,
         }
     }
 
@@ -65,12 +65,12 @@ impl<B: Broker> OrderStatusPoller<B> {
     async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
         debug!("Starting polling cycle for submitted orders");
 
-        let broker = self.broker.to_supported_broker();
+        let executor_type = self.executor.to_supported_executor();
         let submitted_executions = find_executions_by_symbol_status_and_broker(
             &self.pool,
             None,
             OrderStatus::Submitted,
-            Some(broker),
+            Some(executor_type),
         )
         .await?;
 
@@ -121,15 +121,15 @@ impl<B: Broker> OrderStatusPoller<B> {
         };
 
         let parsed_order_id = self
-            .broker
+            .executor
             .parse_order_id(&order_id)
-            .map_err(|e| OrderPollingError::Broker(Box::new(e)))?;
+            .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
 
         let order_state = self
-            .broker
+            .executor
             .get_order_status(&parsed_order_id)
             .await
-            .map_err(|e| OrderPollingError::Broker(Box::new(e)))?;
+            .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
 
         match &order_state {
             OrderState::Filled { .. } => {

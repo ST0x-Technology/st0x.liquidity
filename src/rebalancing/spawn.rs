@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tracing::info;
 
-use st0x_broker::alpaca::AlpacaAuthEnv;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
 use tokio::task::JoinHandle;
 
 use super::usdc::UsdcRebalanceManager;
@@ -67,7 +67,7 @@ type ConfiguredRebalancer<BP> = Rebalancer<
 pub(crate) async fn spawn_rebalancer<BP>(
     pool: SqlitePool,
     config: &RebalancingConfig,
-    alpaca_auth: &AlpacaAuthEnv,
+    alpaca_auth: &AlpacaTradingApiAuthEnv,
     base_provider: BP,
     symbol_cache: SymbolCache,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
@@ -113,7 +113,7 @@ where
 {
     async fn new(
         config: &RebalancingConfig,
-        alpaca_auth: &AlpacaAuthEnv,
+        alpaca_auth: &AlpacaTradingApiAuthEnv,
         ethereum_wallet: &EthereumWallet,
         signer: PrivateKeySigner,
         base_provider: BP,

@@ -17,11 +17,11 @@ pub enum PersistenceError {
     InvalidSymbol(String),
 }
 
-impl From<crate::BrokerError> for PersistenceError {
-    fn from(err: crate::BrokerError) -> Self {
+impl From<crate::ExecutionError> for PersistenceError {
+    fn from(err: crate::ExecutionError) -> Self {
         match err {
-            crate::BrokerError::Database(db_err) => Self::Database(db_err),
-            other => Self::InvalidTradeStatus(format!("BrokerError: {other}")),
+            crate::ExecutionError::Database(db_err) => Self::Database(db_err),
+            other => Self::InvalidTradeStatus(format!("ExecutionError: {other}")),
         }
     }
 }

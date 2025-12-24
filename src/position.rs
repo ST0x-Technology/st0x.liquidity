@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, SupportedBroker, Symbol};
+use st0x_execution::{Direction, SupportedExecutor, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
@@ -218,7 +218,7 @@ impl Position {
         execution_id: ExecutionId,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
     ) -> Result<Vec<PositionEvent>, PositionError> {
         if let Some(pending) = self.pending_execution_id {
             return Err(PositionError::PendingExecution {
@@ -237,7 +237,7 @@ impl Position {
             execution_id,
             shares,
             direction,
-            broker,
+            executor,
             trigger_reason,
             placed_at: Utc::now(),
         }])
@@ -324,9 +324,11 @@ impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
                     execution_id,
                     shares,
                     direction,
-                    broker,
+                    executor,
                 },
-            ) => position.handle_place_offchain_order(*execution_id, *shares, *direction, *broker),
+            ) => {
+                position.handle_place_offchain_order(*execution_id, *shares, *direction, *executor)
+            }
 
             (
                 Ok(position),
@@ -433,7 +435,7 @@ pub(crate) enum PositionCommand {
         execution_id: ExecutionId,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
     },
     CompleteOffChainOrder {
         execution_id: ExecutionId,
@@ -479,7 +481,7 @@ pub(crate) enum PositionEvent {
         execution_id: ExecutionId,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         trigger_reason: TriggerReason,
         placed_at: DateTime<Utc>,
     },
@@ -680,7 +682,7 @@ mod tests {
                     execution_id,
                     shares,
                     direction: Direction::Sell,
-                    broker: SupportedBroker::Schwab,
+                    executor: SupportedExecutor::Schwab,
                 })
                 .inspect_result();
 
@@ -716,7 +718,7 @@ mod tests {
                 execution_id,
                 shares: FractionalShares::ONE,
                 direction: Direction::Sell,
-                broker: SupportedBroker::Schwab,
+                executor: SupportedExecutor::Schwab,
             })
             .then_expect_error(PositionError::ThresholdNotMet {
                 net_position: FractionalShares(dec!(0.5)),
@@ -752,7 +754,7 @@ mod tests {
                     execution_id,
                     shares: FractionalShares::ONE,
                     direction: Direction::Sell,
-                    broker: SupportedBroker::Schwab,
+                    executor: SupportedExecutor::Schwab,
                     trigger_reason: TriggerReason::SharesThreshold {
                         net_position_shares: dec!(1.5),
                         threshold_shares: dec!(1.0),
@@ -764,7 +766,7 @@ mod tests {
                 execution_id: ExecutionId(2),
                 shares: FractionalShares(dec!(0.5)),
                 direction: Direction::Sell,
-                broker: SupportedBroker::Schwab,
+                executor: SupportedExecutor::Schwab,
             })
             .then_expect_error(PositionError::PendingExecution { execution_id });
     }
@@ -800,7 +802,7 @@ mod tests {
                         execution_id,
                         shares: FractionalShares::ONE,
                         direction: Direction::Sell,
-                        broker: SupportedBroker::Schwab,
+                        executor: SupportedExecutor::Schwab,
                         trigger_reason: TriggerReason::SharesThreshold {
                             net_position_shares: dec!(1.5),
                             threshold_shares: dec!(1.0),
@@ -850,7 +852,7 @@ mod tests {
                         execution_id,
                         shares: FractionalShares::ONE,
                         direction: Direction::Sell,
-                        broker: SupportedBroker::Schwab,
+                        executor: SupportedExecutor::Schwab,
                         trigger_reason: TriggerReason::SharesThreshold {
                             net_position_shares: dec!(1.5),
                             threshold_shares: dec!(1.0),
@@ -895,7 +897,7 @@ mod tests {
                 execution_id,
                 shares: FractionalShares(dec!(1.5)),
                 direction: Direction::Sell,
-                broker: SupportedBroker::Schwab,
+                executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
                     net_position_shares: dec!(2.0),
                     threshold_shares: dec!(1.0),
@@ -957,7 +959,7 @@ mod tests {
                 execution_id,
                 shares: FractionalShares(dec!(1.5)),
                 direction: Direction::Buy,
-                broker: SupportedBroker::Schwab,
+                executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
                     net_position_shares: dec!(2.0),
                     threshold_shares: dec!(1.0),
@@ -1146,7 +1148,7 @@ mod tests {
             execution_id,
             shares: FractionalShares(dec!(100)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             trigger_reason: TriggerReason::SharesThreshold {
                 net_position_shares: dec!(100),
                 threshold_shares: dec!(100),
@@ -1411,7 +1413,7 @@ mod tests {
             execution_id: ExecutionId(1),
             shares: FractionalShares::ONE,
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             trigger_reason: TriggerReason::SharesThreshold {
                 net_position_shares: dec!(1.0),
                 threshold_shares: dec!(1.0),

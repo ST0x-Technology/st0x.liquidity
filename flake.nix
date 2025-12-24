@@ -41,7 +41,7 @@
             name = "prep-docker-compose";
             additionalBuildInputs = [ pkgs.gettext pkgs.docker ];
             body = ''
-              exec ./prep-docker-compose.sh "$@"
+              exec ./.github/workflows/prep-docker-compose.sh "$@"
             '';
           };
         };

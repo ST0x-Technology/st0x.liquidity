@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tokio::task::JoinHandle;
 
-pub mod alpaca;
+pub mod alpaca_broker_api;
+pub mod alpaca_trading_api;
 pub mod error;
 pub mod mock;
 pub mod order;
@@ -13,21 +14,20 @@ pub mod schwab;
 #[cfg(test)]
 pub mod test_utils;
 
-pub use alpaca::AlpacaBroker;
+pub use alpaca_broker_api::AlpacaBrokerApi;
+pub use alpaca_trading_api::AlpacaTradingApi;
 pub use error::PersistenceError;
-pub use mock::{MockBroker, MockBrokerConfig};
+pub use mock::{MockExecutor, MockExecutorConfig};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
-pub use schwab::SchwabBroker;
-
-use alpaca::{AlpacaAuthEnv, MarketHoursError};
+pub use schwab::SchwabExecutor;
 
 #[async_trait]
-pub trait Broker: Send + Sync + 'static {
+pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     type OrderId: Display + Debug + Send + Sync + Clone;
     type Config: Send + Sync + Clone + 'static;
 
-    /// Create and validate broker instance from config
+    /// Create and validate executor instance from config
     /// All initialization and validation happens here
     async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error>
     where
@@ -38,7 +38,7 @@ pub trait Broker: Send + Sync + 'static {
     async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error>;
 
     /// Place a market order for the specified symbol and quantity
-    /// Returns order placement details including broker-assigned order ID
+    /// Returns order placement details including executor-assigned order ID
     async fn place_market_order(
         &self,
         order: MarketOrder,
@@ -52,20 +52,24 @@ pub trait Broker: Send + Sync + 'static {
     /// More efficient than individual get_order_status calls for multiple orders
     async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
-    /// Return the enum variant representing this broker type
+    /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic
-    fn to_supported_broker(&self) -> SupportedBroker;
+    fn to_supported_executor(&self) -> SupportedExecutor;
 
-    /// Convert a string representation to the broker's OrderId type
-    /// This is needed for converting database-stored order IDs back to broker types
+    /// Convert a string representation to the executor's OrderId type
+    /// This is needed for converting database-stored order IDs back to executor types
     fn parse_order_id(&self, order_id_str: &str) -> Result<Self::OrderId, Self::Error>;
 
-    /// Run broker-specific maintenance tasks (token refresh, connection health, etc.)
+    /// Run executor-specific maintenance tasks (token refresh, connection health, etc.)
     /// Returns None if no maintenance needed, Some(handle) if maintenance task spawned
     /// Tasks should run indefinitely and be aborted by the caller when shutdown is needed
     /// Errors are logged inside the task and do not propagate to the caller
-    async fn run_broker_maintenance(&self) -> Option<JoinHandle<()>>;
+    async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>>;
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("Symbol cannot be empty")]
+pub struct EmptySymbolError;
 
 /// Stock symbol newtype wrapper with validation
 ///
@@ -75,16 +79,10 @@ pub trait Broker: Send + Sync + 'static {
 pub struct Symbol(String);
 
 impl Symbol {
-    /// Create a new symbol with validation
-    ///
-    /// # Errors
-    /// Returns `BrokerError::InvalidOrder` if symbol is empty
-    pub fn new(symbol: impl Into<String>) -> Result<Self, BrokerError> {
+    pub fn new(symbol: impl Into<String>) -> Result<Self, EmptySymbolError> {
         let symbol = symbol.into();
         if symbol.is_empty() {
-            return Err(BrokerError::InvalidOrder {
-                reason: "Symbol cannot be empty".to_string(),
-            });
+            return Err(EmptySymbolError);
         }
         Ok(Self(symbol))
     }
@@ -106,6 +104,14 @@ impl Display for Symbol {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidSharesError {
+    #[error("Shares cannot be zero")]
+    Zero,
+    #[error(transparent)]
+    TryFromInt(#[from] std::num::TryFromIntError),
+}
+
 /// Share quantity newtype wrapper with validation
 ///
 /// Represents whole share quantities with bounds checking.
@@ -114,21 +120,11 @@ impl Display for Symbol {
 pub struct Shares(u32);
 
 impl Shares {
-    /// Create a new share quantity with validation
-    ///
-    /// # Errors
-    /// Returns `BrokerError::InvalidOrder` if shares is 0 or exceeds u32::MAX
-    pub fn new(shares: u64) -> Result<Self, BrokerError> {
+    pub fn new(shares: u64) -> Result<Self, InvalidSharesError> {
         if shares == 0 {
-            return Err(BrokerError::InvalidOrder {
-                reason: "Shares must be greater than 0".to_string(),
-            });
+            return Err(InvalidSharesError::Zero);
         }
-        u32::try_from(shares)
-            .map(Self)
-            .map_err(|_| BrokerError::InvalidOrder {
-                reason: "Shares exceeds maximum allowed value".to_string(),
-            })
+        Ok(Self(u32::try_from(shares)?))
     }
 
     pub fn value(&self) -> u32 {
@@ -164,35 +160,38 @@ impl std::fmt::Display for InvalidDirectionError {
 impl std::error::Error for InvalidDirectionError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
-pub enum SupportedBroker {
+pub enum SupportedExecutor {
     Schwab,
-    Alpaca,
+    AlpacaTradingApi,
+    AlpacaBrokerApi,
     DryRun,
 }
 
-impl std::fmt::Display for SupportedBroker {
+impl std::fmt::Display for SupportedExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Schwab => write!(f, "schwab"),
-            Self::Alpaca => write!(f, "alpaca"),
-            Self::DryRun => write!(f, "dry_run"),
+            Self::AlpacaTradingApi => write!(f, "alpaca-trading-api"),
+            Self::AlpacaBrokerApi => write!(f, "alpaca-broker-api"),
+            Self::DryRun => write!(f, "dry-run"),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("Invalid broker: {0}")]
-pub struct InvalidBrokerError(String);
+#[error("Invalid executor: {0}")]
+pub struct InvalidExecutorError(String);
 
-impl std::str::FromStr for SupportedBroker {
-    type Err = InvalidBrokerError;
+impl std::str::FromStr for SupportedExecutor {
+    type Err = InvalidExecutorError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "schwab" => Ok(Self::Schwab),
-            "alpaca" => Ok(Self::Alpaca),
-            "dry_run" => Ok(Self::DryRun),
-            _ => Err(InvalidBrokerError(s.to_string())),
+            "alpaca-trading-api" => Ok(Self::AlpacaTradingApi),
+            "alpaca-broker-api" => Ok(Self::AlpacaBrokerApi),
+            "dry-run" => Ok(Self::DryRun),
+            _ => Err(InvalidExecutorError(s.to_string())),
         }
     }
 }
@@ -231,92 +230,46 @@ impl std::str::FromStr for Direction {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum BrokerError {
+pub enum ExecutionError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-
-    #[error("Schwab API error: {0}")]
+    #[error("Schwab error: {0}")]
     Schwab(#[from] schwab::SchwabError),
-
-    #[error("Alpaca API error: {0}")]
-    Alpaca(Box<apca::Error>),
-
-    #[error("Alpaca request error: {0}")]
-    AlpacaRequest(String),
-
-    #[error("Market hours error: {0}")]
-    MarketHours(#[from] MarketHoursError),
-
-    #[error("Authentication failed: {0}")]
-    Authentication(String),
-
-    #[error("Order placement failed: {0}")]
-    OrderPlacement(String),
-
+    #[error("{status:?} order requires order_id")]
+    MissingOrderId { status: OrderStatus },
+    #[error("{status:?} order requires price_cents")]
+    MissingPriceCents { status: OrderStatus },
+    #[error("{status:?} order requires executed_at timestamp")]
+    MissingExecutedAt { status: OrderStatus },
     #[error("Order not found: {order_id}")]
     OrderNotFound { order_id: String },
-
-    #[error("Network error: {0}")]
-    Network(String),
-
-    #[error("Rate limited: retry after {retry_after_seconds} seconds")]
-    RateLimit { retry_after_seconds: u64 },
-
-    #[error("Broker unavailable: {message}")]
-    Unavailable { message: String },
-
-    #[error("Invalid order: {reason}")]
-    InvalidOrder { reason: String },
-
+    #[error("Mock executor failure: {message}")]
+    MockFailure { message: String },
+    #[error("Incomplete order response: {field} missing for {status:?} order")]
+    IncompleteOrderResponse { field: String, status: OrderStatus },
+    #[error(transparent)]
+    EmptySymbol(#[from] EmptySymbolError),
+    #[error(transparent)]
+    InvalidShares(#[from] InvalidSharesError),
+    #[error(transparent)]
+    InvalidDirection(#[from] InvalidDirectionError),
+    #[error("Negative shares value: {value}")]
+    NegativeShares { value: i64 },
+    #[error("Price {price} cannot be converted to cents")]
+    PriceConversion { price: f64 },
     #[error("Numeric conversion error: {0}")]
     NumericConversion(#[from] std::num::TryFromIntError),
-
     #[error("Date/time parse error: {0}")]
     DateTimeParse(#[from] chrono::ParseError),
-
-    #[error("Price conversion failed: {price} cannot be converted to cents")]
-    PriceConversion { price: f64 },
 }
 
-impl From<apca::Error> for BrokerError {
-    fn from(error: apca::Error) -> Self {
-        Self::Alpaca(Box::new(error))
-    }
-}
-
-/// Trait for converting broker-specific configs into their corresponding broker implementations
+/// Trait for converting executor-specific configs into their corresponding executor implementations
 #[async_trait]
-pub trait TryIntoBroker {
-    type Broker: Broker;
+pub trait TryIntoExecutor {
+    type Executor: Executor;
 
-    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error>;
-}
-
-#[async_trait]
-impl TryIntoBroker for schwab::SchwabConfig {
-    type Broker = SchwabBroker;
-
-    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
-        SchwabBroker::try_from_config(self).await
-    }
-}
-
-#[async_trait]
-impl TryIntoBroker for AlpacaAuthEnv {
-    type Broker = AlpacaBroker;
-
-    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
-        AlpacaBroker::try_from_config(self).await
-    }
-}
-
-#[async_trait]
-impl TryIntoBroker for MockBrokerConfig {
-    type Broker = MockBroker;
-
-    async fn try_into_broker(self) -> Result<Self::Broker, <Self::Broker as Broker>::Error> {
-        MockBroker::try_from_config(self).await
-    }
+    async fn try_into_executor(self)
+    -> Result<Self::Executor, <Self::Executor as Executor>::Error>;
 }
 
 #[cfg(test)]
@@ -332,11 +285,7 @@ mod tests {
     #[test]
     fn test_symbol_new_empty_fails() {
         let result = Symbol::new("");
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BrokerError::InvalidOrder { .. }
-        ));
+        assert!(matches!(result.unwrap_err(), EmptySymbolError));
     }
 
     #[test]
@@ -357,11 +306,7 @@ mod tests {
     #[test]
     fn test_shares_new_zero_fails() {
         let result = Shares::new(0);
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            BrokerError::InvalidOrder { .. }
-        ));
+        assert!(matches!(result.unwrap_err(), InvalidSharesError::Zero));
     }
 
     #[test]
@@ -370,10 +315,9 @@ mod tests {
         assert_eq!(shares.to_string(), u32::MAX.to_string());
 
         let result = Shares::new(u64::from(u32::MAX) + 1);
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
-            BrokerError::InvalidOrder { .. }
+            InvalidSharesError::TryFromInt(_)
         ));
     }
 
