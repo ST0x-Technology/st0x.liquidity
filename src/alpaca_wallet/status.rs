@@ -2,7 +2,7 @@ use alloy::primitives::TxHash;
 use backon::{ExponentialBuilder, Retryable};
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
 use super::transfer::{
@@ -141,7 +141,11 @@ fn log_transfer_final_status(transfer_id: AlpacaTransferId, status: TransferStat
     match status {
         TransferStatus::Complete => info!("Transfer {transfer_id} completed successfully"),
         TransferStatus::Failed => info!("Transfer {transfer_id} failed"),
-        _ => {}
+        _ => warn!(
+            transfer_id = %transfer_id,
+            status = ?status,
+            "Unexpected non-final transfer status in log_transfer_final_status"
+        ),
     }
 }
 
