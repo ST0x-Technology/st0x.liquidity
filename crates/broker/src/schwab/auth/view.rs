@@ -4,15 +4,6 @@ use serde::{Deserialize, Serialize};
 use super::super::encryption::EncryptedToken;
 use super::{SchwabAuth, SchwabAuthEvent};
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SchwabAuthViewError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
-
-    #[error("Deserialization error: {0}")]
-    Deserialization(#[from] serde_json::Error),
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SchwabAuthView {
     NotAuthenticated,
