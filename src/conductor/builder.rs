@@ -45,6 +45,7 @@ pub(crate) struct WithDexStreams {
     take_stream: TakeStream,
     event_sender: UnboundedSender<(TradeEvent, Log)>,
     event_receiver: UnboundedReceiver<(TradeEvent, Log)>,
+    rebalancer: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct ConductorBuilder<P, B, State> {
@@ -112,6 +113,7 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
                 take_stream: Box::new(take_stream),
                 event_sender,
                 event_receiver,
+                rebalancer: None,
             },
         }
     }
@@ -120,16 +122,19 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
 impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
     ConductorBuilder<P, B, WithDexStreams>
 {
+    pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self {
+        self.state.rebalancer = Some(rebalancer);
+        self
+    }
+
     pub(crate) fn spawn(self) -> Conductor {
         info!("Starting conductor orchestration");
 
         let broker_maintenance = self.state.broker_maintenance;
+        let rebalancer = self.state.rebalancer;
 
-        if broker_maintenance.is_some() {
-            info!("Started broker maintenance tasks");
-        } else {
-            info!("No broker maintenance tasks needed");
-        }
+        log_optional_task_status("broker maintenance", broker_maintenance.is_some());
+        log_optional_task_status("rebalancer", rebalancer.is_some());
 
         let order_poller = spawn_order_poller(
             &self.common.config,
@@ -163,6 +168,15 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
             event_processor,
             position_checker,
             queue_processor,
+            rebalancer,
         }
+    }
+}
+
+fn log_optional_task_status(task_name: &str, is_configured: bool) {
+    if is_configured {
+        info!("Started {task_name} task");
+    } else {
+        info!("{task_name} not configured", task_name = task_name);
     }
 }

@@ -308,7 +308,7 @@ mod tests {
     use st0x_broker::{Direction, Shares, SupportedBroker};
 
     use super::*;
-    use crate::position::BrokerOrderId;
+    use crate::offchain_order::BrokerOrderId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 

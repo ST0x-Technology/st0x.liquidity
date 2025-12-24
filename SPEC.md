@@ -742,6 +742,50 @@ they serve different purposes in different bounded contexts.
 
 ### **Aggregate Design**
 
+#### **Lifecycle Wrapper Pattern**
+
+All event-sourced aggregates use the `Lifecycle<T, E>` wrapper which handles
+infrastructure concerns while keeping business logic clean:
+
+```rust
+enum Lifecycle<T, E> {
+    Uninitialized,     // No events applied yet (default state)
+    Live(T),           // Normal operational state
+    Failed {           // Error state (no panics in financial apps)
+        error: LifecycleError<E>,
+        last_valid_state: Option<Box<T>>,
+    },
+}
+```
+
+**Why This Pattern Exists**:
+
+- `Aggregate::apply` and `View::update` are infallible (no `Result` return)
+- Financial applications cannot panic on arithmetic overflow
+- Events might arrive before genesis (replay ordering, bugs)
+- Transitions might fail (overflow, invalid state combinations)
+
+**Usage in `apply()` method**:
+
+```rust
+fn apply(&mut self, event: Self::Event) {
+    *self = self
+        .clone()
+        .transition(&event, MyEntity::apply_transition)
+        .or_initialize(&event, MyEntity::from_event);
+}
+```
+
+- `transition()` applies events to an existing entity
+- `or_initialize()` handles genesis events if entity doesn't exist yet
+- Failures transition to `Failed` instead of panicking
+
+**Error Type Parameter**:
+
+- Use `Never` (uninhabited type) for aggregates with no fallible operations
+- Use domain-specific error types (e.g., `ArithmeticError`) when transitions can
+  fail
+
 #### **OnChainTrade Aggregate**
 
 **Purpose**: Represents a single filled order from the blockchain. Decouples
@@ -750,32 +794,26 @@ affecting position calculations.
 
 **Aggregate ID**: `"{tx_hash}:{log_index}"` (e.g., "0x123...abc:5")
 
-**States**:
+**Type**: `Lifecycle<OnChainTrade, Never>` (transitions never fail)
+
+**State**:
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum OnChainTrade {
-    Filled {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        filled_at: DateTime<Utc>,
-    },
-    Enriched {
-        symbol: Symbol,
-        amount: Decimal,
-        direction: Direction,
-        price_usdc: Decimal,
-        block_number: u64,
-        block_timestamp: DateTime<Utc>,
-        filled_at: DateTime<Utc>,
-        gas_used: u64,
-        pyth_price: PythPrice,
-        enriched_at: DateTime<Utc>,
-    },
+struct OnChainTrade {
+    symbol: Symbol,
+    amount: Decimal,
+    direction: Direction,
+    price_usdc: Decimal,
+    block_number: u64,
+    block_timestamp: DateTime<Utc>,
+    filled_at: DateTime<Utc>,
+    enrichment: Option<Enrichment>,
+}
+
+struct Enrichment {
+    gas_used: u64,
+    pyth_price: PythPrice,
+    enriched_at: DateTime<Utc>,
 }
 ```
 
@@ -802,6 +840,17 @@ enum OnChainTradeCommand {
 
 ```rust
 enum OnChainTradeEvent {
+    Migrated {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_number: u64,
+        block_timestamp: DateTime<Utc>,
+        gas_used: Option<u64>,
+        pyth_price: Option<PythPrice>,
+        migrated_at: DateTime<Utc>,
+    },
     Filled {
         symbol: Symbol,
         amount: Decimal,
@@ -831,23 +880,24 @@ fractional shares and coordinating offchain hedging when thresholds are reached.
 
 **Aggregate ID**: `symbol` (e.g., "AAPL")
 
+**Type**: `Lifecycle<Position, ArithmeticError>` (arithmetic can overflow)
+
 **State**:
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Position {
+    symbol: Symbol,
     net: FractionalShares,
     accumulated_long: FractionalShares,
     accumulated_short: FractionalShares,
     pending_execution_id: Option<ExecutionId>,
-    threshold: Option<ExecutionThreshold>,
+    threshold: ExecutionThreshold,
     last_updated: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ExecutionThreshold {
-    Shares(Decimal),      // Schwab: 1.0 shares minimum
-    DollarValue(Decimal), // Alpaca: $1.00 minimum trade value
+    Shares(FractionalShares),  // Schwab: 1.0 shares minimum
+    DollarValue(Usdc),         // Alpaca: $1.00 minimum trade value
 }
 ```
 
@@ -862,6 +912,7 @@ struct TradeId {
 
 enum PositionCommand {
     Initialize {
+        symbol: Symbol,
         threshold: ExecutionThreshold,
     },
     AcknowledgeOnChainFill {
@@ -880,6 +931,7 @@ enum PositionCommand {
     CompleteOffChainOrder {
         execution_id: ExecutionId,
         shares_filled: FractionalShares,
+        direction: Direction,
         broker_order_id: BrokerOrderId,
         price_cents: PriceCents,
         broker_timestamp: DateTime<Utc>,
@@ -898,7 +950,16 @@ enum PositionCommand {
 
 ```rust
 enum PositionEvent {
+    Migrated {
+        symbol: Symbol,
+        net_position: FractionalShares,
+        accumulated_long: FractionalShares,
+        accumulated_short: FractionalShares,
+        threshold: ExecutionThreshold,
+        migrated_at: DateTime<Utc>,
+    },
     Initialized {
+        symbol: Symbol,
         threshold: ExecutionThreshold,
         initialized_at: DateTime<Utc>,
     },
@@ -921,6 +982,7 @@ enum PositionEvent {
     OffChainOrderFilled {
         execution_id: ExecutionId,
         shares_filled: FractionalShares,
+        direction: Direction,
         broker_order_id: BrokerOrderId,
         price_cents: PriceCents,
         broker_timestamp: DateTime<Utc>,
@@ -937,7 +999,6 @@ enum PositionEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
 enum TriggerReason {
     SharesThreshold {
         net_position_shares: Decimal,
@@ -972,24 +1033,24 @@ enum TriggerReason {
 **Purpose**: Manages the lifecycle of a single broker order, tracking
 submission, filling, and settlement.
 
-**Aggregate ID**: `order_id` (UUID)
+**Aggregate ID**: `execution_id` (integer from schwab_executions table)
+
+**Type**: `Lifecycle<OffchainOrder, Never>` (transitions never fail)
 
 **States**:
 
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
 enum OffchainOrder {
-    NotPlaced,
     Pending {
         symbol: Symbol,
-        shares: Decimal,  // Decimal to support Alpaca fractional trading
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         placed_at: DateTime<Utc>,
     },
     Submitted {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
@@ -998,8 +1059,8 @@ enum OffchainOrder {
     },
     PartiallyFilled {
         symbol: Symbol,
-        shares: Decimal,
-        shares_filled: Decimal,
+        shares: FractionalShares,
+        shares_filled: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
@@ -1010,7 +1071,7 @@ enum OffchainOrder {
     },
     Filled {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         broker_order_id: BrokerOrderId,
@@ -1021,7 +1082,7 @@ enum OffchainOrder {
     },
     Failed {
         symbol: Symbol,
-        shares: Decimal,
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         error: String,
@@ -1037,7 +1098,7 @@ enum OffchainOrder {
 enum OffchainOrderCommand {
     Place {
         symbol: Symbol,
-        shares: Decimal,  // Decimal to support Alpaca fractional trading
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
     },
@@ -1045,13 +1106,13 @@ enum OffchainOrderCommand {
         broker_order_id: BrokerOrderId,
     },
     UpdatePartialFill {
-        shares_filled: Decimal,
+        shares_filled: FractionalShares,
         avg_price_cents: PriceCents,
     },
     CompleteFill {
         price_cents: PriceCents,
     },
-    Fail {
+    MarkFailed {
         error: String,
     },
 }
@@ -1061,9 +1122,20 @@ enum OffchainOrderCommand {
 
 ```rust
 enum OffchainOrderEvent {
+    Migrated {
+        symbol: Symbol,
+        shares: FractionalShares,
+        direction: Direction,
+        broker: SupportedBroker,
+        status: MigratedOrderStatus,
+        broker_order_id: Option<BrokerOrderId>,
+        price_cents: Option<PriceCents>,
+        executed_at: Option<DateTime<Utc>>,
+        migrated_at: DateTime<Utc>,
+    },
     Placed {
         symbol: Symbol,
-        shares: Decimal,  // Decimal to support Alpaca fractional trading
+        shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
         placed_at: DateTime<Utc>,
@@ -1073,7 +1145,7 @@ enum OffchainOrderEvent {
         submitted_at: DateTime<Utc>,
     },
     PartiallyFilled {
-        shares_filled: Decimal,
+        shares_filled: FractionalShares,
         avg_price_cents: PriceCents,
         partially_filled_at: DateTime<Utc>,
     },
@@ -1085,6 +1157,13 @@ enum OffchainOrderEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+}
+
+enum MigratedOrderStatus {
+    Pending,
+    Submitted,
+    Filled,
+    Failed { error: String },
 }
 ```
 
@@ -1404,19 +1483,27 @@ enum UsdcRebalance {
     NotStarted,
     WithdrawalInitiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalConfirmed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
+    WithdrawalFailed {
+        direction: RebalancingDirection,
+        amount: Usdc,
+        withdrawal_ref: TransferRef,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
     BridgingInitiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         initiated_at: DateTime<Utc>,
@@ -1424,7 +1511,7 @@ enum UsdcRebalance {
     },
     BridgeAttestationReceived {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
         attestation: Bytes,
@@ -1433,15 +1520,24 @@ enum UsdcRebalance {
     },
     Bridged {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
     },
+    BridgingFailed {
+        direction: RebalancingDirection,
+        amount: Usdc,
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
     DepositInitiated {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         deposit_ref: TransferRef,
@@ -1450,23 +1546,18 @@ enum UsdcRebalance {
     },
     DepositConfirmed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         deposit_confirmed_at: DateTime<Utc>,
     },
-    Completed {
+    DepositFailed {
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
-        initiated_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-    },
-    Failed {
-        direction: RebalancingDirection,
-        amount: Decimal,
+        deposit_ref: Option<TransferRef>,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -1478,11 +1569,9 @@ enum UsdcRebalance {
 
 ```rust
 enum UsdcRebalanceCommand {
-    InitiateRebalancing {
+    Initiate {
         direction: RebalancingDirection,
-        amount: Decimal,
-    },
-    InitiateWithdrawal {
+        amount: Usdc,
         withdrawal: TransferRef,
     },
     ConfirmWithdrawal,
@@ -1500,8 +1589,13 @@ enum UsdcRebalanceCommand {
         deposit: TransferRef,
     },
     ConfirmDeposit,
-    Finalize,
-    Fail {
+    FailWithdrawal {
+        reason: String,
+    },
+    FailBridging {
+        reason: String,
+    },
+    FailDeposit {
         reason: String,
     },
 }
@@ -1511,17 +1605,18 @@ enum UsdcRebalanceCommand {
 
 ```rust
 enum UsdcRebalanceEvent {
-    RebalancingInitiated {
+    Initiated {
         direction: RebalancingDirection,
-        amount: Decimal,
-        initiated_at: DateTime<Utc>,
-    },
-    WithdrawalInitiated {
+        amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
     WithdrawalConfirmed {
         confirmed_at: DateTime<Utc>,
+    },
+    WithdrawalFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
     BridgingInitiated {
         burn_tx_hash: TxHash,
@@ -1536,6 +1631,12 @@ enum UsdcRebalanceEvent {
         mint_tx_hash: TxHash,
         minted_at: DateTime<Utc>,
     },
+    BridgingFailed {
+        burn_tx_hash: Option<TxHash>,
+        cctp_nonce: Option<u64>,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
     DepositInitiated {
         deposit_ref: TransferRef,
         deposit_initiated_at: DateTime<Utc>,
@@ -1543,10 +1644,8 @@ enum UsdcRebalanceEvent {
     DepositConfirmed {
         deposit_confirmed_at: DateTime<Utc>,
     },
-    RebalancingCompleted {
-        completed_at: DateTime<Utc>,
-    },
-    RebalancingFailed {
+    DepositFailed {
+        deposit_ref: Option<TransferRef>,
         reason: String,
         failed_at: DateTime<Utc>,
     },
@@ -1582,31 +1681,45 @@ enum UsdcRebalanceEvent {
 - **Circle Attestation API**: Poll for attestation using CCTP nonce
 - **Rain OrderBook**: deposit2()/withdraw2() for vault operations
 
-**CCTP Flow**:
+**CCTP Flow (using V2 Fast Transfer)**:
 
 Alpaca to Base:
 
 1. Initiate USDC withdrawal from Alpaca (get transfer_id)
 2. Poll Alpaca API until withdrawal status is COMPLETE
-3. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
-4. Wait for burn tx confirmation and extract CCTP nonce from event logs
-5. Poll Circle attestation service for signature using CCTP nonce
-6. Submit receiveMessage() tx on Base MessageTransmitter with attestation
-7. Wait for mint tx confirmation
-8. Submit deposit tx to Rain orderbook vault on Base
-9. Wait for deposit tx confirmation
+3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
+4. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
+   with minFinalityThreshold=1000 and calculated maxFee for fast transfer
+5. Wait for burn tx confirmation and extract CCTP nonce from event logs
+6. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
+   for fast transfer)
+7. Submit receiveMessage() tx on Base MessageTransmitter with attestation
+8. Wait for mint tx confirmation (~8 seconds on Base)
+9. Submit deposit tx to Rain orderbook vault on Base
+10. Wait for deposit tx confirmation
 
 Base to Alpaca:
 
 1. Submit withdraw tx from Rain orderbook vault on Base
 2. Wait for withdraw tx confirmation
-3. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0)
-4. Wait for burn tx confirmation and extract CCTP nonce from event logs
-5. Poll Circle attestation service for signature using CCTP nonce
-6. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
-7. Wait for mint tx confirmation
-8. Initiate USDC deposit to Alpaca (get transfer_id)
-9. Poll Alpaca API until deposit status is COMPLETE
+3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
+4. Submit depositForBurn() tx on Base TokenMessenger (domain 6 -> domain 0) with
+   minFinalityThreshold=1000 and calculated maxFee for fast transfer
+5. Wait for burn tx confirmation and extract CCTP nonce from event logs
+6. Poll Circle attestation service for signature using CCTP nonce (~8 seconds
+   for fast transfer)
+7. Submit receiveMessage() tx on Ethereum MessageTransmitter with attestation
+8. Wait for mint tx confirmation (~20 seconds on Ethereum)
+9. Initiate USDC deposit to Alpaca (get transfer_id)
+10. Poll Alpaca API until deposit status is COMPLETE
+
+**Fast Transfer Benefits**:
+
+- **Timing**: ~20-30 seconds for CCTP bridge portion vs 13-19 minutes standard
+  transfer (50-80x faster)
+- **Cost**: 1 basis point (0.01%) fee per transfer
+- **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
+  rather than bridge time
 
 #### **Rebalancing Triggers**
 
@@ -1910,7 +2023,7 @@ enum UsdcRebalanceView {
     Rebalancing {
         rebalancing_id: Uuid,
         direction: RebalancingDirection,
-        amount: Decimal,
+        amount: Usdc,
         status: RebalancingStatus,
         burn_tx_hash: Option<TxHash>,
         mint_tx_hash: Option<TxHash>,
@@ -2412,48 +2525,45 @@ async fn test_full_flow_blockchain_to_broker() {
 
 ### **Code Organization**
 
-```
+Aggregates use flat file structure by default. Submodules are only introduced
+when natural business logic boundaries emerge (e.g., `schwab/auth/` uses CQRS
+submodules because auth is a complex domain with distinct commands, events, and
+views).
+
+```text
 Cargo.toml                        - Workspace definition (st0x-hedge + crates/broker)
 src/                              - Main st0x-hedge library crate
   lib.rs                          - Library exports, CQRS setup
   bin/
-    server.rs                     - Main arbitrage bot server (existing)
-    cli.rs                        - CLI for manual operations (existing)
-    reporter.rs                   - Reporter binary (existing)
-    migrate_to_events.rs          - One-time existing data import (NEW)
-  onchain_trade/
-    mod.rs                        - OnChainTrade aggregate
-    cmd.rs                        - OnChainTradeCommand enum
-    event.rs                      - OnChainTradeEvent enum
-    view.rs                       - OnChainTradeView + queries
-  position/
-    mod.rs                        - Position aggregate
-    cmd.rs                        - PositionCommand enum
-    event.rs                      - PositionEvent enum
-    view.rs                       - PositionView + queries
-  offchain_order/
-    mod.rs                        - OffchainOrder aggregate
-    cmd.rs                        - OffchainOrderCommand enum
-    event.rs                      - OffchainOrderEvent enum
-    view.rs                       - OffchainTradeView + queries
-    manager.rs                    - OrderManager for broker workflows
-  managers/
-    trade.rs                      - TradeManager for onchain->position coordination
-    order.rs                      - OrderManager for broker order workflows
+    server.rs                     - Main arbitrage bot server
+    cli.rs                        - CLI for manual operations
+    reporter.rs                   - P&L reporter binary
+  position.rs                     - Position aggregate (commands, events, state in one file)
+  onchain_trade.rs                - OnChainTrade aggregate
+  offchain_order.rs               - OffchainOrder aggregate
+  shares.rs                       - FractionalShares newtype and arithmetic
+  threshold.rs                    - Execution threshold logic
+  queue.rs                        - Event queue for idempotent processing
+  onchain/                        - Blockchain event processing
+  offchain/                       - Off-chain order execution
+  conductor/                      - Trade accumulation and broker orchestration
+  reporter/                       - FIFO P&L calculation and metrics
+  symbol/                         - Token symbol caching and locking
+  alpaca_wallet/                  - Alpaca cryptocurrency wallet management
+  api.rs                          - REST API endpoints
+  env.rs                          - Environment configuration
+  cctp.rs                         - Cross-chain token bridge (Circle CCTP)
 crates/
-  broker/                         - Broker abstraction library (existing)
-    Cargo.toml
+  broker/                         - Broker abstraction library
     src/
-      lib.rs
-      broker.rs                   - Broker trait
+      lib.rs                      - Broker trait and shared types
+      order/                      - Shared order types
       schwab/
-        mod.rs                    - Schwab broker implementation
-        auth.rs                   - SchwabAuth aggregate
-        cmd.rs                    - SchwabAuthCommand enum
-        event.rs                  - SchwabAuthEvent enum
-        view.rs                   - SchwabAuthView
-      alpaca.rs                   - Alpaca broker implementation
-      test_broker.rs              - Mock broker for testing
+        mod.rs                    - SchwabBroker, SchwabAuthEnv, SchwabError
+        auth/                     - CQRS submodule (cmd.rs, event.rs, view.rs, oauth.rs)
+        broker.rs, order.rs, etc. - Private implementation
+      alpaca/                     - Alpaca broker implementation
+      mock.rs                     - Mock broker for testing
 ```
 
 ### **Dependencies**

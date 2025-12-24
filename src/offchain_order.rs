@@ -8,8 +8,22 @@ use st0x_broker::{Direction, SupportedBroker, Symbol};
 use tracing::error;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::position::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::shares::FractionalShares;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ExecutionId(pub(crate) i64);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BrokerOrderId(pub(crate) String);
+
+impl BrokerOrderId {
+    pub(crate) fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PriceCents(pub(crate) u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum OffchainOrder {

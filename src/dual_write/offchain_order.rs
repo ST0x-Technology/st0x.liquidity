@@ -2,8 +2,8 @@ use rust_decimal::Decimal;
 use st0x_broker::OrderState;
 
 use crate::offchain::execution::OffchainExecution;
+use crate::offchain_order::{BrokerOrderId, PriceCents};
 use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
-use crate::position::{BrokerOrderId, PriceCents};
 use crate::shares::FractionalShares;
 
 use super::{DualWriteContext, DualWriteError};

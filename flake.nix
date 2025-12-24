@@ -20,10 +20,11 @@
             body = ''
               set -euxo pipefail
               npm install
-              (cd lib/rain.orderbook.interface/ && forge build)
-              (cd lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
+              (cd lib/rain.orderbook/ && forge build)
+              (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd node_modules/@pythnetwork/pyth-sdk-solidity/ && forge build)
+              (cd lib/evm-cctp-contracts/ && forge build)
             '';
           };
 

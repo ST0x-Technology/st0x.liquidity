@@ -53,7 +53,7 @@ impl std::fmt::Debug for AlpacaAuthEnv {
 }
 
 impl AlpacaAuthEnv {
-    pub(crate) fn base_url(&self) -> String {
+    pub fn base_url(&self) -> String {
         self.alpaca_trading_mode.base_url()
     }
 }
@@ -69,7 +69,7 @@ impl std::fmt::Debug for AlpacaClient {
         f.debug_struct("AlpacaClient")
             .field("client", &"<Client>")
             .field("trading_mode", &self.trading_mode)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

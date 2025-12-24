@@ -1004,6 +1004,7 @@ mod tests {
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,
+            rebalancing: None,
         }
     }
 

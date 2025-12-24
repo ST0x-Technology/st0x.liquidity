@@ -9,7 +9,7 @@ use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain_order::{NegativePriceCents, OffchainOrder, OffchainOrderError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
 use crate::position::{Position, PositionError};
-use crate::shares::ArithmeticError;
+use crate::shares::{ArithmeticError, FractionalShares};
 
 mod offchain_order;
 mod onchain_trade;
@@ -53,7 +53,7 @@ pub(crate) enum DualWriteError {
 #[derive(Clone)]
 pub(crate) struct DualWriteContext {
     onchain_trade: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
-    position: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError>>>,
+    position: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>>,
     offchain_order: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
 }
 
@@ -70,7 +70,9 @@ impl DualWriteContext {
         &self.onchain_trade
     }
 
-    pub(crate) fn position_framework(&self) -> &SqliteCqrs<Lifecycle<Position, ArithmeticError>> {
+    pub(crate) fn position_framework(
+        &self,
+    ) -> &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>> {
         &self.position
     }
 

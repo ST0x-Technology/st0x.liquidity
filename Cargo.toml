@@ -29,7 +29,7 @@ must_use_candidate = "allow"
 redundant_pub_crate = "allow"
 
 [workspace.dependencies]
-alloy = { version = "1.0.38", features = ["full", "rand"] }
+alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
 async-trait = "0.1.81"
 cqrs-es = "0.4"
 sqlite-es = { git = "https://github.com/ST0x-Technology/st0x.issuance", package = "sqlite-es" }
@@ -47,7 +47,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 clap = { version = "4.5.40", features = ["derive", "env"] }
 flate2 = "1.0"
 httpmock = "0.7.0"
-rain-math-float = { path = "lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
+rain-math-float = { path = "lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/crates/float" }
 reqwest = { version = "0.12.4", features = [
   "json",
   "rustls-tls",
@@ -63,6 +63,7 @@ tracing = "0.1.41"
 url = { version = "2.5.4", features = ["serde"] }
 urlencoding = "2.1"
 rand = "0.8"
+uuid = { version = "1.11", features = ["serde", "v4"] }
 chrono-tz = "0.10.4"
 num-traits = "0.2"
 opentelemetry = "0.30.0"
@@ -98,6 +99,7 @@ reqwest.workspace = true
 serde.workspace = true
 chrono.workspace = true
 base64.workspace = true
+uuid.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 urlencoding.workspace = true
@@ -119,6 +121,7 @@ httpmock.workspace = true
 serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest.workspace = true
+temp-env = "0.3.6"
 
 [[bin]]
 name = "migrate_to_events"

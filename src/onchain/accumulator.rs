@@ -642,8 +642,8 @@ mod tests {
     use super::*;
     use crate::dual_write::DualWriteContext;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
-    use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
-    use crate::position::{BrokerOrderId, Position, PositionCommand};
+    use crate::offchain_order::{BrokerOrderId, OffchainOrder, OffchainOrderCommand};
+    use crate::position::{Position, PositionCommand};
     use crate::symbol;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
