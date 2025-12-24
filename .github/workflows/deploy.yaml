@@ -2,7 +2,6 @@ name: Build and deploy
 
 on:
   push:
-    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -13,14 +12,25 @@ permissions:
   contents: read
 
 env:
-  DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
   ORDERBOOK: "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
   ORDER_OWNER: "0x71b94911FD1CE621FC40970450004c544e5287a8"
   DEPLOYMENT_BLOCK: 34844164
   REGISTRY_NAME: stox
+  WS_RPC_URL: ${{ secrets.WS_RPC_URL }}
+  SCHWAB_APP_KEY: ${{ secrets.APP_KEY }}
+  SCHWAB_APP_SECRET: ${{ secrets.APP_SECRET }}
+  ALPACA_API_KEY: ${{ secrets.ALPACA_KEY }}
+  ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
+  ALPACA_BROKER_API_KEY: ${{ secrets.ALPACA_BROKER_API_KEY }}
+  ALPACA_BROKER_API_SECRET: ${{ secrets.ALPACA_BROKER_API_SECRET }}
+  ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
+  ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
+  HYPERDX_API_KEY: ${{ secrets.HYPERDX_API_KEY }}
+  GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+  DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
 
 jobs:
-  build-and-deploy:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - name: Free disk space
@@ -38,10 +48,43 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
+      - uses: nixbuild/nix-quick-install-action@v30
         with:
-          token: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
+
+      - name: Validate deployment config
+        env:
+          EXECUTOR: dry-run
+          DATABASE_URL: sqlite:///tmp/test.db
+        run: nix develop -c cargo run -q --bin validate_config
+
+  deploy:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
       - name: Build Docker image
         run: |
@@ -52,16 +95,25 @@ jobs:
             -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:$SHORT_SHA \
             -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:latest .
 
+      - name: Install doctl
+        if: github.ref == 'refs/heads/master'
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ env.DIGITALOCEAN_ACCESS_TOKEN }}
+
       - name: Log in to DO Container Registry
+        if: github.ref == 'refs/heads/master'
         run: doctl registry login --expiry-seconds 1200
 
       - name: Verify required files exist
+        if: github.ref == 'refs/heads/master'
         run: |
           echo "Checking for required files..."
           ls -la .env.example docker-compose.template.yaml Dockerfile.grafana grafana-datasource.yaml .github/workflows/prep-docker-compose.sh .github/workflows/generate-env.sh
           echo "File verification complete"
 
       - name: Encode file contents
+        if: github.ref == 'refs/heads/master'
         run: |
           echo "ENV_TEMPLATE=$(base64 -w 0 .env.example)" >> $GITHUB_ENV
           echo "GENERATE_ENV_SCRIPT=$(base64 -w 0 .github/workflows/generate-env.sh)" >> $GITHUB_ENV
@@ -71,11 +123,13 @@ jobs:
           echo "PREP_SCRIPT=$(base64 -w 0 .github/workflows/prep-docker-compose.sh)" >> $GITHUB_ENV
 
       - name: Push image to DO Registry
+        if: github.ref == 'refs/heads/master'
         run: |
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:${{ env.SHORT_SHA }}
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:latest
 
       - name: Deploy to Droplet
+        if: github.ref == 'refs/heads/master'
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DROPLET_HOST }}
@@ -308,21 +362,3 @@ jobs:
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Deployment completed successfully!" | tee -a "${DEPLOY_LOG}"
             echo "Deployment logs: ${DEPLOY_LOG}"
             echo "Container logs: ${DOCKER_LOG}"
-        env:
-          WS_RPC_URL: ${{ secrets.WS_RPC_URL }}
-          SCHWAB_APP_KEY: ${{ secrets.APP_KEY }}
-          SCHWAB_APP_SECRET: ${{ secrets.APP_SECRET }}
-          ALPACA_API_KEY: ${{ secrets.ALPACA_KEY }}
-          ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
-          ALPACA_BROKER_API_KEY: ${{ secrets.ALPACA_BROKER_API_KEY }}
-          ALPACA_BROKER_API_SECRET: ${{ secrets.ALPACA_BROKER_API_SECRET }}
-          ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
-          ENCRYPTION_KEY: ${{ secrets.TOKEN_ENCRYPTION_KEY }}
-          HYPERDX_API_KEY: ${{ secrets.HYPERDX_API_KEY }}
-          GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
-          ENV_TEMPLATE: ${{ env.ENV_TEMPLATE }}
-          GENERATE_ENV_SCRIPT: ${{ env.GENERATE_ENV_SCRIPT }}
-          DOCKER_COMPOSE_TEMPLATE: ${{ env.DOCKER_COMPOSE_TEMPLATE }}
-          GRAFANA_DOCKERFILE: ${{ env.GRAFANA_DOCKERFILE }}
-          GRAFANA_DATASOURCE_YAML: ${{ env.GRAFANA_DATASOURCE_YAML }}
-          PREP_SCRIPT: ${{ env.PREP_SCRIPT }}
