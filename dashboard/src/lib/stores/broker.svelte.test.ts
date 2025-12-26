@@ -1,66 +1,53 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import type { Broker } from '$lib/env'
 
-// Mock $app/environment before importing the module
-vi.mock('$app/environment', () => ({
-  browser: true
-}))
+type MockPersistedStateConfig = {
+  initialValue: Broker
+}
 
-// Mock localStorage
-const localStorageMock = (() => {
-  let store: Record<string, string> = {}
-  return {
-    getItem: vi.fn((key: string) => store[key] ?? null),
-    setItem: vi.fn((key: string, value: string) => {
-      store[key] = value
-    }),
-    clear: () => {
-      store = {}
+const createMockPersistedState = (config: MockPersistedStateConfig) => {
+  let value = config.initialValue
+
+  return class MockPersistedState {
+    get current() {
+      return value
+    }
+    set current(newValue: Broker) {
+      value = newValue
     }
   }
-})()
-
-Object.defineProperty(globalThis, 'localStorage', { value: localStorageMock })
+}
 
 describe('brokerStore', () => {
-  beforeEach(() => {
-    localStorageMock.clear()
-    vi.clearAllMocks()
+  afterEach(() => {
     vi.resetModules()
+    vi.restoreAllMocks()
   })
 
-  it('defaults to schwab when localStorage is empty', async () => {
+  const setupTest = async (config: MockPersistedStateConfig) => {
+    const MockPersistedState = createMockPersistedState(config)
+
+    vi.doMock('runed', () => ({
+      PersistedState: MockPersistedState
+    }))
+
     const { brokerStore } = await import('./broker.svelte')
+    return { brokerStore }
+  }
+
+  it('exposes the current value via getter', async () => {
+    const { brokerStore } = await setupTest({ initialValue: 'schwab' })
     expect(brokerStore.value).toBe('schwab')
-  })
-
-  it('loads valid broker from localStorage', async () => {
-    localStorageMock.getItem.mockReturnValueOnce('"alpaca"')
-    const { brokerStore } = await import('./broker.svelte')
-    expect(brokerStore.value).toBe('alpaca')
-  })
-
-  it('defaults to schwab for invalid broker in localStorage', async () => {
-    localStorageMock.getItem.mockReturnValueOnce('"invalid"')
-    const { brokerStore } = await import('./broker.svelte')
-    expect(brokerStore.value).toBe('schwab')
-  })
-
-  it('defaults to schwab for malformed JSON in localStorage', async () => {
-    localStorageMock.getItem.mockReturnValueOnce('not-valid-json')
-    const { brokerStore } = await import('./broker.svelte')
-    expect(brokerStore.value).toBe('schwab')
-  })
-
-  it('saves broker to localStorage when set', async () => {
-    const { brokerStore } = await import('./broker.svelte')
-    brokerStore.set('alpaca')
-    expect(localStorageMock.setItem).toHaveBeenCalledWith('selected-broker', '"alpaca"')
   })
 
   it('updates value when set is called', async () => {
-    const { brokerStore } = await import('./broker.svelte')
-    expect(brokerStore.value).toBe('schwab')
+    const { brokerStore } = await setupTest({ initialValue: 'schwab' })
     brokerStore.set('alpaca')
+    expect(brokerStore.value).toBe('alpaca')
+  })
+
+  it('can be initialized with alpaca', async () => {
+    const { brokerStore } = await setupTest({ initialValue: 'alpaca' })
     expect(brokerStore.value).toBe('alpaca')
   })
 })

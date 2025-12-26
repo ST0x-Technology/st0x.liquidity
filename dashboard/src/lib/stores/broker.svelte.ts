@@ -1,51 +1,27 @@
-import { browser } from '$app/environment'
+import { PersistedState } from 'runed'
 import type { Broker } from '$lib/env'
-import { tryCatch, isOk, isErr } from '$lib/fp'
-
-const STORAGE_KEY = 'selected-broker'
-const DEFAULT_BROKER: Broker = 'schwab'
-
-const VALID_BROKERS: readonly Broker[] = ['schwab', 'alpaca'] as const
 
 const isBroker = (value: unknown): value is Broker =>
-  typeof value === 'string' && (VALID_BROKERS as readonly string[]).includes(value)
+  value === 'schwab' || value === 'alpaca'
 
-const loadBroker = (): Broker => {
-  if (!browser) return DEFAULT_BROKER
-
-  const result = tryCatch(() => {
-    const raw = localStorage.getItem(STORAGE_KEY)
-    if (raw === null) return null
-
-    return JSON.parse(raw) as unknown
-  })
-
-  if (!isOk(result)) return DEFAULT_BROKER
-
-  return isBroker(result.value) ? result.value : DEFAULT_BROKER
-}
-
-const saveBroker = (broker: Broker) => {
-  if (!browser) return
-
-  const result = tryCatch(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(broker))
-  })
-
-  if (isErr(result)) {
-    console.error(`Failed to save broker to localStorage (key: ${STORAGE_KEY}):`, result.error)
+const brokerState = new PersistedState<Broker>('selected-broker', 'schwab', {
+  storage: 'local',
+  syncTabs: true,
+  serializer: {
+    serialize: JSON.stringify,
+    deserialize: (raw) => {
+      const parsed: unknown = JSON.parse(raw)
+      return isBroker(parsed) ? parsed : 'schwab'
+    }
   }
-}
-
-let selectedBroker = $state<Broker>(loadBroker())
+})
 
 export const brokerStore = {
   get value() {
-    return selectedBroker
+    return brokerState.current
   },
 
   set(broker: Broker) {
-    selectedBroker = broker
-    saveBroker(broker)
+    brokerState.current = broker
   }
 }
