@@ -92,6 +92,12 @@ export default [
       'svelte/no-at-html-tags': 'error',
       'svelte/require-each-key': 'error',
       'svelte/valid-each-key': 'error',
+      'svelte/no-reactive-reassign': 'error',
+      'svelte/no-immutable-reactive-statements': 'error',
+      'svelte/no-reactive-literals': 'error',
+      'svelte/no-unused-class-name': 'error',
+      'svelte/require-optimized-style-attribute': 'error',
+      'svelte/require-stores-init': 'error',
       'func-style': ['error', 'expression']
     }
   },
