@@ -20,6 +20,43 @@ Uses shadcn-svelte. Add components via:
 - **Runed**: Local reactive state, persisted state, FSM
 - **TanStack Query**: Server state cache (populated via WebSocket)
 
+### FP and FRP Patterns
+
+This codebase uses functional programming utilities from two modules:
+
+**`$lib/fp` - Pure functional utilities** (non-reactive):
+
+- `Result<T, E>` type with `ok`, `err`, `map`, `flatMap`, `unwrapOr`
+- `matcher` for exhaustive pattern matching on discriminated unions
+- `tryCatch` / `tryCatchAsync` for error handling
+- `pipe` for left-to-right composition
+
+**`$lib/frp.svelte` - Functional Reactive Programming** (Svelte 5 runes):
+
+- `reactive<T>(initial)` - creates reactive state with explicit mutations
+
+```typescript
+// FRP: Explicit mutations via update()
+const count = reactive(0);
+count.update((n) => n + 1); // transform
+count.update(() => 0); // reset
+console.log(count.current); // read
+
+// FP: Pattern matching on discriminated unions
+type State = { type: "loading" } | { type: "ready"; data: string };
+const matchState = matcher<State>()("type");
+matchState(state, {
+  loading: () => "Loading...",
+  ready: (s) => s.data,
+});
+```
+
+**Prefer these patterns over**:
+
+- Direct `$state` mutations → use `reactive()` for explicit updates
+- Nested if/else on union types → use `matcher()` for exhaustive matching
+- Try/catch blocks → use `tryCatch()` / `Result` type
+
 ### Testing
 
 **Avoid mutable module-level state in tests.** Mutable variables shared across
