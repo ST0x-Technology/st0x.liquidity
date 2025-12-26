@@ -33,7 +33,6 @@ const saveBroker = (broker: Broker) => {
   })
 
   if (isErr(result)) {
-    // eslint-disable-next-line no-console
     console.error(`Failed to save broker to localStorage (key: ${STORAGE_KEY}):`, result.error)
   }
 }

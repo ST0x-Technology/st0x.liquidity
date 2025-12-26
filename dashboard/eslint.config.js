@@ -56,7 +56,7 @@ export default [
       '@typescript-eslint/prefer-optional-chain': 'error',
       '@typescript-eslint/strict-boolean-expressions': 'error',
       '@typescript-eslint/switch-exhaustiveness-check': 'error',
-      'no-console': 'warn',
+      'no-console': 'off',
       eqeqeq: ['error', 'always'],
       'prefer-const': 'error',
       'no-var': 'error',
