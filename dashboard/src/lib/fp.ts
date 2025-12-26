@@ -102,34 +102,32 @@ export const unwrapOr = <T, E>(result: Result<T, E>, defaultValue: T): T =>
 /**
  * Try to execute a function, catching any thrown errors.
  *
- * **Important**: Caught errors are typed as `unknown` at runtime since JavaScript
- * allows throwing any value. The type parameter `E` defaults to `unknown` and callers
- * should not assume a specific error type without validation. Use type guards or
- * instanceof checks before accessing error-specific properties.
+ * Returns Result<T, unknown> because JavaScript allows throwing any value,
+ * so we cannot guarantee the error type at compile time. Use type guards
+ * or instanceof checks before accessing error-specific properties.
  */
-export const tryCatch = <T, E = unknown>(fn: () => T): Result<T, E> => {
+export const tryCatch = <T>(fn: () => T): Result<T, unknown> => {
   try {
     return ok(fn())
   } catch (e: unknown) {
-    return err(e as E)
+    return err(e)
   }
 }
 
 /**
  * Async version of tryCatch.
  *
- * **Important**: Caught errors are typed as `unknown` at runtime since JavaScript
- * allows throwing any value. The type parameter `E` defaults to `unknown` and callers
- * should not assume a specific error type without validation. Use type guards or
- * instanceof checks before accessing error-specific properties.
+ * Returns Result<T, unknown> because JavaScript allows throwing any value,
+ * so we cannot guarantee the error type at compile time. Use type guards
+ * or instanceof checks before accessing error-specific properties.
  */
-export const tryCatchAsync = async <T, E = unknown>(
+export const tryCatchAsync = async <T>(
   fn: () => Promise<T>
-): Promise<Result<T, E>> => {
+): Promise<Result<T, unknown>> => {
   try {
     return ok(await fn())
   } catch (e: unknown) {
-    return err(e as E)
+    return err(e)
   }
 }
 

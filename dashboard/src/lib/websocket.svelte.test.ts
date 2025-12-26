@@ -31,6 +31,10 @@ class MockWebSocket {
     this.onmessage?.({ data: JSON.stringify(msg) })
   }
 
+  simulateRawMessage(data: string) {
+    this.onmessage?.({ data })
+  }
+
   simulateError() {
     this.onerror?.()
   }
@@ -344,6 +348,7 @@ describe('createWebSocket', () => {
   it('does not connect if already connected', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
     ws.connect()
     MockWebSocket.getInstance(0).simulateOpen()
@@ -351,6 +356,13 @@ describe('createWebSocket', () => {
     ws.connect()
 
     expect(MockWebSocket.instances.length).toBe(1)
+    expect(consoleSpy).toHaveBeenCalledWith(
+      'No action defined for event',
+      'connect',
+      'in state',
+      'connected'
+    )
+    consoleSpy.mockRestore()
   })
 
   it('caps reconnect delay at maximum', () => {
@@ -412,5 +424,136 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(1).simulateOpen()
 
     expect(ws.error).toBeNull()
+  })
+
+  it('rejects messages with invalid JSON', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage('not valid json')
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalled()
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects messages without type field', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(JSON.stringify({ data: {} }))
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', { data: {} })
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects messages with unknown type', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({ type: 'unknown', data: {} })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
+      type: 'unknown',
+      data: {}
+    })
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects initial message with missing data fields', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({
+        type: 'initial',
+        data: { recentTrades: [] }
+      })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
+      type: 'initial',
+      data: { recentTrades: [] }
+    })
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects event message with missing fields', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({
+        type: 'event',
+        data: { aggregate_type: 'Position' }
+      })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
+      type: 'event',
+      data: { aggregate_type: 'Position' }
+    })
+    consoleSpy.mockRestore()
+  })
+
+  it('rejects event message with wrong field types', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+
+    MockWebSocket.getInstance(0).simulateRawMessage(
+      JSON.stringify({
+        type: 'event',
+        data: {
+          aggregate_type: 'Position',
+          aggregate_id: 123,
+          sequence: 'not a number',
+          event_type: 'Created',
+          timestamp: '2024-01-01T00:00:00Z'
+        }
+      })
+    )
+
+    expect(queryClient.setQueryDataSpy).not.toHaveBeenCalled()
+    expect(consoleSpy).toHaveBeenCalledWith('Invalid ServerMessage structure:', {
+      type: 'event',
+      data: {
+        aggregate_type: 'Position',
+        aggregate_id: 123,
+        sequence: 'not a number',
+        event_type: 'Created',
+        timestamp: '2024-01-01T00:00:00Z'
+      }
+    })
+    consoleSpy.mockRestore()
   })
 })

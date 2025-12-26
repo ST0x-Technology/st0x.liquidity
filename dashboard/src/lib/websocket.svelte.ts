@@ -12,21 +12,44 @@ const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 30000
 const MAX_EVENTS = 100
 
-const VALID_MESSAGE_TYPES = ['initial', 'event'] as const
+const isObject = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null
+
+const isEventStoreEntry = (v: unknown): boolean => {
+  if (!isObject(v)) return false
+  return (
+    typeof v['aggregate_type'] === 'string' &&
+    typeof v['aggregate_id'] === 'string' &&
+    typeof v['sequence'] === 'number' &&
+    typeof v['event_type'] === 'string' &&
+    typeof v['timestamp'] === 'string'
+  )
+}
+
+const isInitialState = (v: unknown): boolean => {
+  if (!isObject(v)) return false
+  return (
+    Array.isArray(v['recentTrades']) &&
+    isObject(v['inventory']) &&
+    isObject(v['metrics']) &&
+    Array.isArray(v['spreads']) &&
+    Array.isArray(v['activeRebalances']) &&
+    Array.isArray(v['recentRebalances']) &&
+    isObject(v['authStatus']) &&
+    isObject(v['circuitBreaker'])
+  )
+}
 
 const isServerMessage = (value: unknown): value is ServerMessage => {
-  if (typeof value !== 'object' || value === null) return false
+  if (!isObject(value)) return false
+  if (!('type' in value) || !('data' in value)) return false
 
-  const obj = value as Record<string, unknown>
+  const { type, data } = value
 
-  if (typeof obj['type'] !== 'string') return false
+  if (type === 'initial') return isInitialState(data)
+  if (type === 'event') return isEventStoreEntry(data)
 
-  const msgType = obj['type'] as (typeof VALID_MESSAGE_TYPES)[number]
-  if (!VALID_MESSAGE_TYPES.includes(msgType)) return false
-
-  if (!('data' in obj)) return false
-
-  return true
+  return false
 }
 
 const matchMessage = matcher<ServerMessage>()('type')
@@ -52,6 +75,7 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
         queryClient.setQueryData(['trades'], data.recentTrades)
         queryClient.setQueryData(['inventory'], data.inventory)
         queryClient.setQueryData(['metrics'], data.metrics)
+        queryClient.setQueryData(['spreads'], data.spreads)
         queryClient.setQueryData(['rebalances', 'active'], data.activeRebalances)
         queryClient.setQueryData(['rebalances', 'recent'], data.recentRebalances)
         queryClient.setQueryData(['auth'], data.authStatus)

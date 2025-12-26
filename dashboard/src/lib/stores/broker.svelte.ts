@@ -1,8 +1,6 @@
 import { PersistedState } from 'runed'
-import type { Broker } from '$lib/env'
-
-const isBroker = (value: unknown): value is Broker =>
-  value === 'schwab' || value === 'alpaca'
+import { isBroker, type Broker } from '$lib/env'
+import { tryCatch, isOk } from '$lib/fp'
 
 const brokerState = new PersistedState<Broker>('selected-broker', 'schwab', {
   storage: 'local',
@@ -10,8 +8,9 @@ const brokerState = new PersistedState<Broker>('selected-broker', 'schwab', {
   serializer: {
     serialize: JSON.stringify,
     deserialize: (raw) => {
-      const parsed: unknown = JSON.parse(raw)
-      return isBroker(parsed) ? parsed : 'schwab'
+      const result = tryCatch(() => JSON.parse(raw) as unknown)
+      if (!isOk(result)) return 'schwab'
+      return isBroker(result.value) ? result.value : 'schwab'
     }
   }
 })

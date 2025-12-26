@@ -4,6 +4,7 @@
   import * as Card from '$lib/components/ui/card'
   import * as Table from '$lib/components/ui/table'
   import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
+  import { truncateId } from './live-events-panel'
 
   // This query doesn't fetch - it's used as a reactive state store. The WebSocket
   // connection populates it via queryClient.setQueryData(['events'], ...) in
@@ -23,14 +24,6 @@
       minute: '2-digit',
       second: '2-digit'
     })
-  }
-
-  const truncateId = (id: string, maxLen: number = 16): string => {
-    if (id.length <= maxLen) return id
-    const visibleChars = maxLen - 3
-    const left = Math.ceil(visibleChars / 2)
-    const right = Math.floor(visibleChars / 2)
-    return `${id.slice(0, left)}...${id.slice(-right)}`
   }
 
   const events = $derived(eventsQuery.data ?? [])
