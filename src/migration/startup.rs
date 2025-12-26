@@ -253,28 +253,39 @@ async fn verify_single_position(
 }
 
 fn compare_position_fields(legacy: &LegacyPosition, position: &Position) {
-    let legacy_net = Decimal::try_from(legacy.net_position).unwrap_or_default();
-    let legacy_long = Decimal::try_from(legacy.accumulated_long).unwrap_or_default();
-    let legacy_short = Decimal::try_from(legacy.accumulated_short).unwrap_or_default();
+    compare_field(
+        &legacy.symbol,
+        "net_position",
+        legacy.net_position,
+        position.net.0,
+    );
+    compare_field(
+        &legacy.symbol,
+        "accumulated_long",
+        legacy.accumulated_long,
+        position.accumulated_long.0,
+    );
+    compare_field(
+        &legacy.symbol,
+        "accumulated_short",
+        legacy.accumulated_short,
+        position.accumulated_short.0,
+    );
+}
 
-    if position.net.0 != legacy_net {
+fn compare_field(symbol: &str, field: &str, legacy_value: f64, es_value: Decimal) {
+    let Ok(legacy_decimal) = Decimal::try_from(legacy_value) else {
         error!(
-            "CONSISTENCY MISMATCH: Position {} net_position: ES={} legacy={}",
-            legacy.symbol, position.net.0, legacy_net
+            "Failed to convert {} for {}: value={}",
+            field, symbol, legacy_value
         );
-    }
+        return;
+    };
 
-    if position.accumulated_long.0 != legacy_long {
+    if es_value != legacy_decimal {
         error!(
-            "CONSISTENCY MISMATCH: Position {} accumulated_long: ES={} legacy={}",
-            legacy.symbol, position.accumulated_long.0, legacy_long
-        );
-    }
-
-    if position.accumulated_short.0 != legacy_short {
-        error!(
-            "CONSISTENCY MISMATCH: Position {} accumulated_short: ES={} legacy={}",
-            legacy.symbol, position.accumulated_short.0, legacy_short
+            "CONSISTENCY MISMATCH: Position {} {}: ES={} legacy={}",
+            symbol, field, es_value, legacy_decimal
         );
     }
 }
