@@ -6,11 +6,9 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::fmt::Display;
-use std::str::FromStr;
+use st0x_broker::{Direction, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use st0x_broker::{Direction, Symbol};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OnChainTrade {
@@ -324,48 +322,9 @@ pub(crate) struct PythPrice {
     pub(crate) publish_time: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TradeAggregateId {
-    pub(crate) tx_hash: TxHash,
-    pub(crate) log_index: u64,
-}
-
-impl FromStr for TradeAggregateId {
-    type Err = AggregateIdError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() != 2 {
-            return Err(AggregateIdError::InvalidFormat(s.to_string()));
-        }
-
-        let tx_hash = TxHash::from_str(parts[0])?;
-        let log_index = parts[1].parse::<u64>()?;
-
-        Ok(Self { tx_hash, log_index })
-    }
-}
-
-impl Display for TradeAggregateId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.tx_hash, self.log_index)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum AggregateIdError {
-    #[error("Invalid format: expected 'tx_hash:log_index', got '{0}'")]
-    InvalidFormat(String),
-    #[error("Failed to parse tx_hash: {0}")]
-    ParseTxHash(#[from] alloy::hex::FromHexError),
-    #[error("Failed to parse log_index: {0}")]
-    ParseLogIndex(#[from] std::num::ParseIntError),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
@@ -634,56 +593,6 @@ mod tests {
         let result = aggregate.handle(command, &()).await;
 
         assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
-    }
-
-    proptest! {
-        #[test]
-        fn test_aggregate_id_roundtrip(
-            tx_hash_bytes in prop::array::uniform32(any::<u8>()),
-            log_index in any::<u64>()
-        ) {
-            let tx_hash = TxHash::from(tx_hash_bytes);
-            let aggregate_id = TradeAggregateId { tx_hash, log_index };
-
-            let serialized = aggregate_id.to_string();
-            let deserialized = serialized.parse::<TradeAggregateId>().unwrap();
-
-            prop_assert_eq!(aggregate_id, deserialized);
-        }
-    }
-
-    #[test]
-    fn test_aggregate_id_parse_invalid_format() {
-        let input = "invalid_format";
-        let result = input.parse::<TradeAggregateId>();
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AggregateIdError::InvalidFormat(_)
-        ));
-    }
-
-    #[test]
-    fn test_aggregate_id_parse_invalid_tx_hash() {
-        let input = "not_a_hex_hash:123";
-        let result = input.parse::<TradeAggregateId>();
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AggregateIdError::ParseTxHash(_)
-        ));
-    }
-
-    #[test]
-    fn test_aggregate_id_parse_invalid_log_index() {
-        let input =
-            "0x1234567890123456789012345678901234567890123456789012345678901234:not_a_number";
-        let result = input.parse::<TradeAggregateId>();
-
-        assert!(matches!(
-            result.unwrap_err(),
-            AggregateIdError::ParseLogIndex(_)
-        ));
     }
 
     #[test]

@@ -121,85 +121,108 @@ async fn run_command_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     match command {
         Commands::Buy { ticker, quantity } => {
-            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
-            let validated_ticker = validate_ticker(&ticker)?;
-            if quantity == 0 {
-                return Err(CliError::InvalidQuantity { value: quantity }.into());
-            }
-            info!("Processing buy order: ticker={validated_ticker}, quantity={quantity}");
-            execute_order_with_writers(
-                validated_ticker,
-                quantity,
-                Direction::Buy,
-                &config,
-                pool,
-                stdout,
-            )
-            .await?;
+            handle_trade_command(&config, pool, stdout, ticker, quantity, Direction::Buy).await?;
         }
         Commands::Sell { ticker, quantity } => {
-            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
-            let validated_ticker = validate_ticker(&ticker)?;
-            if quantity == 0 {
-                return Err(CliError::InvalidQuantity { value: quantity }.into());
-            }
-            info!("Processing sell order: ticker={validated_ticker}, quantity={quantity}");
-            execute_order_with_writers(
-                validated_ticker,
-                quantity,
-                Direction::Sell,
-                &config,
-                pool,
-                stdout,
-            )
-            .await?;
+            handle_trade_command(&config, pool, stdout, ticker, quantity, Direction::Sell).await?;
         }
         Commands::ProcessTx { tx_hash } => {
-            info!("Processing transaction: tx_hash={tx_hash}");
-            let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
-            let provider = ProviderBuilder::new().connect_ws(ws).await?;
-            let cache = SymbolCache::default();
-            process_tx_with_provider(tx_hash, &config, pool, stdout, &provider, &cache).await?;
+            handle_process_tx_command(&config, pool, stdout, tx_hash).await?;
         }
-        Commands::Auth => {
-            let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
-                anyhow::bail!("Auth command is only supported for Schwab broker")
-            };
-
-            info!("Starting OAuth authentication flow");
-            writeln!(
-                stdout,
-                "🔄 Starting Charles Schwab OAuth authentication process..."
-            )?;
-            writeln!(
-                stdout,
-                "   You will be guided through the authentication process."
-            )?;
-
-            match run_oauth_flow(pool, schwab_auth).await {
-                Ok(()) => {
-                    info!("OAuth authentication completed successfully");
-                    writeln!(stdout, "✅ Authentication successful!")?;
-                    writeln!(
-                        stdout,
-                        "   Your tokens have been saved and are ready to use."
-                    )?;
-                }
-                Err(oauth_error) => {
-                    error!("OAuth authentication failed: {oauth_error:?}");
-                    writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
-                    writeln!(
-                        stdout,
-                        "   Please ensure you have a valid Charles Schwab account and try again."
-                    )?;
-                    return Err(oauth_error.into());
-                }
-            }
-        }
+        Commands::Auth => handle_auth_command(&config, pool, stdout).await?,
     }
 
     info!("CLI operation completed successfully");
     Ok(())
+}
+
+async fn handle_trade_command<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+    ticker: String,
+    quantity: u64,
+    direction: Direction,
+) -> anyhow::Result<()> {
+    ensure_schwab_authentication(pool, &config.broker, stdout).await?;
+
+    let validated_ticker = validate_ticker(&ticker)?;
+    if quantity == 0 {
+        return Err(CliError::InvalidQuantity { value: quantity }.into());
+    }
+
+    info!("Processing {direction:?} order: ticker={validated_ticker}, quantity={quantity}");
+
+    execute_order_with_writers(validated_ticker, quantity, direction, config, pool, stdout).await
+}
+
+async fn handle_process_tx_command<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+    tx_hash: B256,
+) -> anyhow::Result<()> {
+    info!("Processing transaction: tx_hash={tx_hash}");
+    let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
+    let provider = ProviderBuilder::new().connect_ws(ws).await?;
+    let cache = SymbolCache::default();
+    process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache).await
+}
+
+async fn handle_auth_command<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
+        anyhow::bail!("Auth command is only supported for Schwab broker")
+    };
+
+    info!("Starting OAuth authentication flow");
+    write_auth_start_message(stdout)?;
+
+    match run_oauth_flow(pool, schwab_auth).await {
+        Ok(()) => {
+            info!("OAuth authentication completed successfully");
+            write_auth_success_message(stdout)?;
+            Ok(())
+        }
+        Err(oauth_error) => {
+            error!("OAuth authentication failed: {oauth_error:?}");
+            write_auth_failure_message(stdout, &oauth_error)?;
+            Err(oauth_error.into())
+        }
+    }
+}
+
+fn write_auth_start_message<W: Write>(stdout: &mut W) -> std::io::Result<()> {
+    writeln!(
+        stdout,
+        "🔄 Starting Charles Schwab OAuth authentication process..."
+    )?;
+    writeln!(
+        stdout,
+        "   You will be guided through the authentication process."
+    )
+}
+
+fn write_auth_success_message<W: Write>(stdout: &mut W) -> std::io::Result<()> {
+    writeln!(stdout, "✅ Authentication successful!")?;
+    writeln!(
+        stdout,
+        "   Your tokens have been saved and are ready to use."
+    )
+}
+
+fn write_auth_failure_message<W: Write>(
+    stdout: &mut W,
+    error: &SchwabError,
+) -> std::io::Result<()> {
+    writeln!(stdout, "❌ Authentication failed: {error}")?;
+    writeln!(
+        stdout,
+        "   Please ensure you have a valid Charles Schwab account and try again."
+    )
 }
 
 async fn ensure_schwab_authentication<W: Write>(
@@ -213,29 +236,52 @@ async fn ensure_schwab_authentication<W: Write>(
 
     info!("Refreshing authentication tokens if needed");
 
+    if try_existing_token(pool, schwab_auth, stdout).await? {
+        return Ok(());
+    }
+
+    run_oauth_with_feedback(pool, schwab_auth, stdout).await
+}
+
+async fn try_existing_token<W: Write>(
+    pool: &SqlitePool,
+    schwab_auth: &SchwabAuthEnv,
+    stdout: &mut W,
+) -> anyhow::Result<bool> {
     match SchwabTokens::get_valid_access_token(pool, schwab_auth).await {
-        Ok(_access_token) => {
+        Ok(_) => {
             info!("Authentication tokens are valid, access token obtained");
-            return Ok(());
+            Ok(true)
         }
-        Err(st0x_broker::schwab::SchwabError::RefreshTokenExpired) => {
+        Err(SchwabError::RefreshTokenExpired) => {
             info!("Refresh token has expired, launching interactive OAuth flow");
-            writeln!(
-                stdout,
-                "🔄 Your refresh token has expired. Starting authentication process..."
-            )?;
-            writeln!(
-                stdout,
-                "   You will be guided through the Charles Schwab OAuth process."
-            )?;
+            write_token_expired_message(stdout)?;
+            Ok(false)
         }
         Err(e) => {
             error!("Failed to obtain valid access token: {e:?}");
             writeln!(stdout, "❌ Authentication failed: {e}")?;
-            return Err(e.into());
+            Err(e.into())
         }
     }
+}
 
+fn write_token_expired_message<W: Write>(stdout: &mut W) -> std::io::Result<()> {
+    writeln!(
+        stdout,
+        "🔄 Your refresh token has expired. Starting authentication process..."
+    )?;
+    writeln!(
+        stdout,
+        "   You will be guided through the Charles Schwab OAuth process."
+    )
+}
+
+async fn run_oauth_with_feedback<W: Write>(
+    pool: &SqlitePool,
+    schwab_auth: &SchwabAuthEnv,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
     match run_oauth_flow(pool, schwab_auth).await {
         Ok(()) => {
             info!("OAuth flow completed successfully");
@@ -247,11 +293,7 @@ async fn ensure_schwab_authentication<W: Write>(
         }
         Err(oauth_error) => {
             error!("OAuth flow failed: {oauth_error:?}");
-            writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
-            writeln!(
-                stdout,
-                "   Please ensure you have a valid Charles Schwab account and try again."
-            )?;
+            write_auth_failure_message(stdout, &oauth_error)?;
             Err(oauth_error.into())
         }
     }

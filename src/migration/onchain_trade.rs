@@ -38,46 +38,62 @@ pub async fn migrate_onchain_trades(
     info!("Found {total} onchain trades to migrate");
 
     for (idx, row) in rows.into_iter().enumerate() {
-        let progress = idx + 1;
-        if progress % 100 == 0 {
-            info!("Migrating onchain trades: {progress}/{total}");
-        }
-
-        let tx_hash: TxHash = row.tx_hash.parse()?;
-        let log_index: u64 =
-            row.log_index
-                .try_into()
-                .map_err(|_| MigrationError::NegativeValue {
-                    field: "log_index".to_string(),
-                    value: row.log_index,
-                })?;
-        let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);
-        let symbol = Symbol::new(&row.symbol)?;
-        let amount = Decimal::try_from(row.amount)?;
-        let direction = row.direction.parse()?;
-        let price_usdc = Decimal::try_from(row.price_usdc)?;
-
-        let command = OnChainTradeCommand::Migrate {
-            symbol,
-            amount,
-            direction,
-            price_usdc,
-            block_number: 0,
-            block_timestamp: row.created_at,
-            gas_used: None,
-            pyth_price: None,
-        };
-
-        match execution {
-            ExecutionMode::Commit => {
-                cqrs.execute(&aggregate_id, command).await?;
-            }
-            ExecutionMode::DryRun => {}
-        }
+        log_progress("onchain trades", idx + 1, total);
+        migrate_single_onchain_trade(cqrs, row, execution).await?;
     }
 
     info!("Migrated {total} onchain trades");
     Ok(total)
+}
+
+fn log_progress(entity: &str, progress: usize, total: usize) {
+    if progress % 100 == 0 {
+        info!("Migrating {entity}: {progress}/{total}");
+    }
+}
+
+async fn migrate_single_onchain_trade(
+    cqrs: &SqliteCqrs<Lifecycle<OnChainTrade, Never>>,
+    row: OnchainTradeRow,
+    execution: ExecutionMode,
+) -> Result<(), MigrationError> {
+    let tx_hash: TxHash = row.tx_hash.parse()?;
+    let log_index: u64 = row
+        .log_index
+        .try_into()
+        .map_err(|_| MigrationError::NegativeValue {
+            field: "log_index".to_string(),
+            value: row.log_index,
+        })?;
+
+    let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);
+    let command = build_onchain_trade_command(&row)?;
+
+    if matches!(execution, ExecutionMode::Commit) {
+        cqrs.execute(&aggregate_id, command).await?;
+    }
+
+    Ok(())
+}
+
+fn build_onchain_trade_command(
+    row: &OnchainTradeRow,
+) -> Result<OnChainTradeCommand, MigrationError> {
+    let symbol = Symbol::new(&row.symbol)?;
+    let amount = Decimal::try_from(row.amount)?;
+    let direction = row.direction.parse()?;
+    let price_usdc = Decimal::try_from(row.price_usdc)?;
+
+    Ok(OnChainTradeCommand::Migrate {
+        symbol,
+        amount,
+        direction,
+        price_usdc,
+        block_number: 0,
+        block_timestamp: row.created_at,
+        gas_used: None,
+        pyth_price: None,
+    })
 }
 
 #[cfg(test)]
