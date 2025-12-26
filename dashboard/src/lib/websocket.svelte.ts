@@ -1,9 +1,12 @@
+import { FiniteStateMachine } from 'runed'
 import type { QueryClient } from '@tanstack/svelte-query'
 import type { EventStoreEntry } from '$lib/api/EventStoreEntry'
 import type { ServerMessage } from '$lib/api/ServerMessage'
 import { matcher } from '$lib/fp'
+import { reactive } from '$lib/frp.svelte'
 
-export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected'
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error'
+type ConnectionEvent = 'connect' | 'open' | 'close' | 'error' | 'disconnect'
 
 const RECONNECT_DELAY_MS = 1000
 const MAX_RECONNECT_DELAY_MS = 30000
@@ -17,7 +20,10 @@ const isServerMessage = (value: unknown): value is ServerMessage => {
   const obj = value as Record<string, unknown>
 
   if (typeof obj['type'] !== 'string') return false
-  if (!VALID_MESSAGE_TYPES.includes(obj['type'] as (typeof VALID_MESSAGE_TYPES)[number])) return false
+
+  const msgType = obj['type'] as (typeof VALID_MESSAGE_TYPES)[number]
+  if (!VALID_MESSAGE_TYPES.includes(msgType)) return false
+
   if (!('data' in obj)) return false
 
   return true
@@ -25,11 +31,19 @@ const isServerMessage = (value: unknown): value is ServerMessage => {
 
 const matchMessage = matcher<ServerMessage>()('type')
 
+const getReconnectDelay = (attempts: number): number =>
+  Math.min(RECONNECT_DELAY_MS * Math.pow(2, attempts), MAX_RECONNECT_DELAY_MS)
+
+export type ErrorContext = {
+  attempts: number
+  nextRetryMs: number
+}
+
 export const createWebSocket = (url: string, queryClient: QueryClient) => {
-  let status = $state<ConnectionStatus>('disconnected')
   let socket: WebSocket | null = null
-  let reconnectAttempts = 0
   let reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null
+  const reconnectAttempts = reactive(0)
+  const error = reactive<ErrorContext | null>(null)
 
   const handleMessage = (msg: ServerMessage) => {
     matchMessage(msg, {
@@ -52,27 +66,11 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
     })
   }
 
-  const scheduleReconnect = () => {
-    if (reconnectTimeoutId !== null) return
-
-    const delay = Math.min(RECONNECT_DELAY_MS * Math.pow(2, reconnectAttempts), MAX_RECONNECT_DELAY_MS)
-    reconnectAttempts++
-
-    reconnectTimeoutId = setTimeout(() => {
-      reconnectTimeoutId = null
-      connect()
-    }, delay)
-  }
-
-  const connect = () => {
-    if (socket !== null) return
-
-    status = 'connecting'
+  const createSocket = () => {
     socket = new WebSocket(url)
 
     socket.onopen = () => {
-      status = 'connected'
-      reconnectAttempts = 0
+      fsm.send('open')
     }
 
     socket.onmessage = (event) => {
@@ -92,38 +90,92 @@ export const createWebSocket = (url: string, queryClient: QueryClient) => {
 
     socket.onclose = () => {
       socket = null
-      status = 'disconnected'
-      scheduleReconnect()
+      fsm.send('close')
     }
 
     socket.onerror = () => {
-      socket?.close()
+      fsm.send('error')
     }
   }
 
-  const disconnect = () => {
+  const cleanupSocket = () => {
+    if (socket !== null) {
+      socket.onclose = null
+      socket.onerror = null
+      socket.onmessage = null
+      socket.onopen = null
+      socket.close()
+      socket = null
+    }
+  }
+
+  const cancelReconnect = () => {
     if (reconnectTimeoutId !== null) {
       clearTimeout(reconnectTimeoutId)
       reconnectTimeoutId = null
     }
-
-    reconnectAttempts = 0
-
-    if (socket !== null) {
-      socket.onclose = null
-      socket.close()
-      socket = null
-    }
-
-    status = 'disconnected'
   }
 
-  return {
-    get status() {
-      return status
+  const scheduleReconnect = () => {
+    cancelReconnect()
+    const delay = getReconnectDelay(reconnectAttempts.current)
+    error.update(() => ({ attempts: reconnectAttempts.current + 1, nextRetryMs: delay }))
+    reconnectAttempts.update(n => n + 1)
+    reconnectTimeoutId = setTimeout(() => fsm.send('connect'), delay)
+  }
+
+  const fsm = new FiniteStateMachine<ConnectionState, ConnectionEvent>('disconnected', {
+    disconnected: {
+      connect: 'connecting',
+      _enter: () => {
+        cancelReconnect()
+        cleanupSocket()
+      }
     },
-    connect,
-    disconnect
+
+    connecting: {
+      open: 'connected',
+      error: 'error',
+      close: 'error',
+      disconnect: 'disconnected',
+      _enter: () => {
+        createSocket()
+      }
+    },
+
+    connected: {
+      close: 'error',
+      error: 'error',
+      disconnect: 'disconnected',
+      _enter: () => {
+        reconnectAttempts.update(() => 0)
+        error.update(() => null)
+      }
+    },
+
+    error: {
+      disconnect: 'disconnected',
+      connect: 'connecting',
+      _enter: () => {
+        cleanupSocket()
+        scheduleReconnect()
+      }
+    },
+
+    '*': {
+      disconnect: 'disconnected'
+    }
+  })
+
+  return {
+    get state(): ConnectionState {
+      return fsm.current
+    },
+    get error(): ErrorContext | null {
+      return error.current
+    },
+    connect: () => fsm.send('connect'),
+    disconnect: () => fsm.send('disconnect')
   }
 }
 

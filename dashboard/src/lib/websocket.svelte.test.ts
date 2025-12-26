@@ -125,7 +125,7 @@ describe('createWebSocket', () => {
     const queryClient = createMockQueryClient()
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
-    expect(ws.status).toBe('disconnected')
+    expect(ws.state).toBe('disconnected')
   })
 
   it('transitions to connecting then connected on successful connect', () => {
@@ -133,10 +133,10 @@ describe('createWebSocket', () => {
     const ws = createWebSocket('ws://localhost:8080', queryClient)
 
     ws.connect()
-    expect(ws.status).toBe('connecting')
+    expect(ws.state).toBe('connecting')
 
     MockWebSocket.getInstance(0).simulateOpen()
-    expect(ws.status).toBe('connected')
+    expect(ws.state).toBe('connected')
   })
 
   it('populates query cache on initial message', () => {
@@ -223,7 +223,7 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(0).simulateOpen()
     MockWebSocket.getInstance(0).simulateClose()
 
-    expect(ws.status).toBe('disconnected')
+    expect(ws.state).toBe('error')
 
     vi.advanceTimersByTime(1000)
     expect(MockWebSocket.instances.length).toBe(2)
@@ -268,7 +268,7 @@ describe('createWebSocket', () => {
 
     vi.advanceTimersByTime(10000)
     expect(MockWebSocket.instances.length).toBe(1)
-    expect(ws.status).toBe('disconnected')
+    expect(ws.state).toBe('disconnected')
   })
 
   it('handles multiple concurrent clients', () => {
@@ -288,8 +288,8 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(0).simulateOpen()
     MockWebSocket.getInstance(1).simulateOpen()
 
-    expect(ws1.status).toBe('connected')
-    expect(ws2.status).toBe('connected')
+    expect(ws1.state).toBe('connected')
+    expect(ws2.state).toBe('connected')
   })
 
   it('handles event messages by prepending to events list', () => {
@@ -367,5 +367,50 @@ describe('createWebSocket', () => {
     MockWebSocket.getInstance(10).simulateClose()
     vi.advanceTimersByTime(30000)
     expect(MockWebSocket.instances.length).toBe(12)
+  })
+
+  it('exposes null error when not in error state', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    expect(ws.error).toBeNull()
+
+    ws.connect()
+    expect(ws.error).toBeNull()
+
+    MockWebSocket.getInstance(0).simulateOpen()
+    expect(ws.error).toBeNull()
+  })
+
+  it('exposes error context with attempt count and retry delay', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+    MockWebSocket.getInstance(0).simulateClose()
+
+    expect(ws.error).toEqual({ attempts: 1, nextRetryMs: 1000 })
+
+    vi.advanceTimersByTime(1000)
+    MockWebSocket.getInstance(1).simulateClose()
+
+    expect(ws.error).toEqual({ attempts: 2, nextRetryMs: 2000 })
+  })
+
+  it('clears error context on successful reconnection', () => {
+    const queryClient = createMockQueryClient()
+    const ws = createWebSocket('ws://localhost:8080', queryClient)
+
+    ws.connect()
+    MockWebSocket.getInstance(0).simulateOpen()
+    MockWebSocket.getInstance(0).simulateClose()
+
+    expect(ws.error).not.toBeNull()
+
+    vi.advanceTimersByTime(1000)
+    MockWebSocket.getInstance(1).simulateOpen()
+
+    expect(ws.error).toBeNull()
   })
 })

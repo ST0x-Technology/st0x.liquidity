@@ -95,7 +95,8 @@ export default [
       'svelte/no-reactive-reassign': 'error',
       'svelte/no-immutable-reactive-statements': 'error',
       'svelte/no-reactive-literals': 'error',
-      'svelte/no-unused-class-name': 'error',
+      // Disabled: gives false positives with Tailwind CSS utility classes
+      'svelte/no-unused-class-name': 'off',
       'svelte/require-optimized-style-attribute': 'error',
       'svelte/require-stores-init': 'error',
       'func-style': ['error', 'expression']

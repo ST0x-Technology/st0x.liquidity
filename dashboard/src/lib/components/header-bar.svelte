@@ -3,12 +3,12 @@
   import { Badge } from '$lib/components/ui/badge'
   import { Separator } from '$lib/components/ui/separator'
   import type { Broker } from '$lib/env'
-  import type { ConnectionStatus } from '$lib/websocket.svelte'
+  import type { ConnectionState } from '$lib/websocket.svelte'
 
   type Props = {
     broker: Broker
     onBrokerChange: (broker: Broker) => void
-    connectionStatus: ConnectionStatus
+    connectionStatus: ConnectionState
   }
 
   const { broker, onBrokerChange, connectionStatus }: Props = $props()
