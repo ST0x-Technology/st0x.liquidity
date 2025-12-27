@@ -114,12 +114,12 @@ pub(super) async fn check_imbalance_and_build_operation(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use alloy::primitives::TxHash;
+    use alloy::primitives::{TxHash, address};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use st0x_execution::Direction;
 
+    use super::*;
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
     use crate::shares::FractionalShares;
@@ -244,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn test_too_much_onchain_with_cached_token_returns_redemption() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let token_address = alloy::primitives::address!("1234567890123456789012345678901234567890");
+        let token_address = address!("0x1234567890123456789012345678901234567890");
         let view = InventoryView::default().with_equity(symbol.clone());
 
         // 80 onchain, 20 offchain -> 80% onchain ratio, above 70% threshold

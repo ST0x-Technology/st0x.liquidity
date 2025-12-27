@@ -229,14 +229,14 @@ pub fn setup_tracing(log_level: &LogLevel) {
 pub mod tests {
     use super::*;
     use crate::onchain::EvmEnv;
-    use alloy::primitives::{FixedBytes, address};
+    use alloy::primitives::{Address, FixedBytes, address};
     use rust_decimal::Decimal;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    pub fn create_test_config_with_order_owner(order_owner: alloy::primitives::Address) -> Config {
+    pub fn create_test_config_with_order_owner(order_owner: Address) -> Config {
         Config {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
@@ -328,48 +328,54 @@ pub mod tests {
 
     #[test]
     fn test_dry_run_broker_does_not_require_any_credentials() {
-        let args = vec![
-            "test",
-            "--db",
-            ":memory:",
-            "--ws-rpc-url",
-            "ws://localhost:8545",
-            "--orderbook",
-            "0x1111111111111111111111111111111111111111",
-            "--order-owner",
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--deployment-block",
-            "1",
-            "--executor",
-            "dry-run",
-        ];
+        // Explicitly unset REBALANCING_ENABLED to avoid env var pollution
+        temp_env::with_vars([("REBALANCING_ENABLED", None::<&str>)], || {
+            let args = vec![
+                "test",
+                "--db",
+                ":memory:",
+                "--ws-rpc-url",
+                "ws://localhost:8545",
+                "--orderbook",
+                "0x1111111111111111111111111111111111111111",
+                "--order-owner",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--deployment-block",
+                "1",
+                "--executor",
+                "dry-run",
+            ];
 
-        let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config().unwrap();
-        assert!(matches!(config.broker, BrokerConfig::DryRun));
+            let env = Env::try_parse_from(args).unwrap();
+            let config = env.into_config().unwrap();
+            assert!(matches!(config.broker, BrokerConfig::DryRun));
+        });
     }
 
     #[test]
     fn rebalancing_disabled_by_default() {
-        let args = vec![
-            "test",
-            "--db",
-            ":memory:",
-            "--ws-rpc-url",
-            "ws://localhost:8545",
-            "--orderbook",
-            "0x1111111111111111111111111111111111111111",
-            "--order-owner",
-            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "--deployment-block",
-            "1",
-            "--executor",
-            "dry-run",
-        ];
+        // Explicitly unset REBALANCING_ENABLED to avoid env var pollution
+        temp_env::with_vars([("REBALANCING_ENABLED", None::<&str>)], || {
+            let args = vec![
+                "test",
+                "--db",
+                ":memory:",
+                "--ws-rpc-url",
+                "ws://localhost:8545",
+                "--orderbook",
+                "0x1111111111111111111111111111111111111111",
+                "--order-owner",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--deployment-block",
+                "1",
+                "--executor",
+                "dry-run",
+            ];
 
-        let env = Env::try_parse_from(args).unwrap();
-        let config = env.into_config().unwrap();
-        assert!(config.rebalancing.is_none());
+            let env = Env::try_parse_from(args).unwrap();
+            let config = env.into_config().unwrap();
+            assert!(config.rebalancing.is_none());
+        });
     }
 
     #[test]
@@ -426,7 +432,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
                     "ETHEREUM_PRIVATE_KEY",
@@ -441,6 +450,9 @@ pub mod tests {
                     "USDC_VAULT_ID",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                // Explicitly unset to avoid env pollution
+                ("REDEMPTION_WALLET", None),
+                ("MARKET_MAKER_WALLET", None),
             ],
             || {
                 let args = vec![
@@ -480,10 +492,17 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                (
+                    "MARKET_MAKER_WALLET",
+                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
                 ),
                 (
                     "ETHEREUM_PRIVATE_KEY",
@@ -498,6 +517,8 @@ pub mod tests {
                     "USDC_VAULT_ID",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                // Explicitly unset to avoid env pollution
+                ("ETHEREUM_RPC_URL", None),
             ],
             || {
                 let args = vec![
@@ -537,10 +558,17 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                (
+                    "MARKET_MAKER_WALLET",
+                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
                 ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -552,6 +580,8 @@ pub mod tests {
                     "USDC_VAULT_ID",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                // Explicitly unset to avoid env pollution
+                ("ETHEREUM_PRIVATE_KEY", None),
             ],
             || {
                 let args = vec![
@@ -591,7 +621,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -656,7 +689,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -717,7 +753,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),

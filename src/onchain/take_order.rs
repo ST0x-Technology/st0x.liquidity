@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 
@@ -15,7 +16,7 @@ impl OnchainTrade {
         provider: P,
         event: TakeOrderV3,
         log: Log,
-        target_order_owner: alloy::primitives::Address,
+        target_order_owner: Address,
         feed_id_cache: &FeedIdCache,
     ) -> Result<Option<Self>, OnChainError> {
         if event.config.order.owner != target_order_owner {

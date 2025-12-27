@@ -175,48 +175,49 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
     use std::sync::Arc;
-    use uuid::Uuid;
+    use uuid::{Uuid, uuid};
 
-    use super::super::client::create_account_mock;
+    use super::super::transfer::AlpacaAccountId;
     use super::*;
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[tokio::test]
     async fn test_poll_transfer_processing_to_complete() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
 
         let transfer_id = Uuid::new_v4();
 
         let complete_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "100.0",
+                    "chain": "ethereum",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "COMPLETE",
                     "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -232,47 +233,43 @@ mod tests {
 
         assert_eq!(result.status, TransferStatus::Complete);
 
-        account_mock.assert();
         complete_mock.assert();
     }
 
     #[tokio::test]
     async fn test_poll_transfer_failed() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "100.0",
+                    "chain": "ethereum",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "FAILED",
                     "tx_hash": null,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": null
+                    "network_fee": "0",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -288,47 +285,43 @@ mod tests {
 
         assert_eq!(result.status, TransferStatus::Failed);
 
-        account_mock.assert();
         status_mock.assert();
     }
 
     #[tokio::test]
     async fn test_poll_transfer_timeout() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "100.0",
+                    "chain": "ethereum",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "PENDING",
                     "tx_hash": null,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -346,34 +339,27 @@ mod tests {
             AlpacaWalletError::TransferTimeout { .. }
         ));
 
-        account_mock.assert();
         assert!(status_mock.hits() >= 2);
     }
 
     #[tokio::test]
     async fn test_poll_transfer_retry_on_5xx() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
 
         let error_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(503).body("Service Unavailable");
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(100),
@@ -386,7 +372,6 @@ mod tests {
         let result =
             poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config).await;
 
-        account_mock.assert();
         assert!(
             error_mock.hits() >= 1,
             "Expected at least one retry attempt"
@@ -400,40 +385,35 @@ mod tests {
     #[tokio::test]
     async fn test_poll_transfer_status_regression() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let transfer_id = Uuid::new_v4();
 
-        let client = Arc::new(
-            AlpacaWalletClient::new(
-                server.base_url(),
-                "test_key_id".to_string(),
-                "test_secret_key".to_string(),
-            )
-            .await
-            .unwrap(),
-        );
+        let client = Arc::new(AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        ));
 
         let mut processing_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "100.0",
+                    "chain": "ethereum",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "PROCESSING",
                     "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
@@ -459,23 +439,24 @@ mod tests {
 
         let pending_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!(
-                    "/v1/accounts/{expected_account_id}/wallets/transfers"
-                ))
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .query_param("transfer_id", transfer_id.to_string());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
                     "id": transfer_id,
-                    "relationship": "OUTGOING",
+                    "direction": "OUTGOING",
                     "amount": "100.0",
+                    "usd_value": "100.0",
+                    "chain": "ethereum",
                     "asset": "USDC",
-                    "from_address": null,
+                    "from_address": "0x0000000000000000000000000000000000000001",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "PENDING",
                     "tx_hash": null,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": "0.5"
+                    "network_fee": "0.5",
+                    "fees": "0"
                 }]));
         });
 
@@ -490,7 +471,6 @@ mod tests {
             }
         ));
 
-        account_mock.assert();
         pending_mock.assert();
     }
 
@@ -561,40 +541,38 @@ mod tests {
     #[tokio::test]
     async fn test_poll_deposit_by_tx_hash_found_immediately() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
         let transfer_id = Uuid::new_v4();
 
         let transfers_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "INCOMING",
+                    "direction": "INCOMING",
                     "amount": "500",
+                    "usd_value": "500",
+                    "chain": "ethereum",
                     "asset": "USDC",
                     "from_address": "0x9999999999999999999999999999999999999999",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "COMPLETE",
                     "tx_hash": tx_hash,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": null
+                    "network_fee": "0",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(10),
@@ -611,34 +589,26 @@ mod tests {
         assert_eq!(transfer.status, TransferStatus::Complete);
         assert_eq!(transfer.tx, Some(tx_hash));
 
-        account_mock.assert();
         transfers_mock.assert();
     }
 
     #[tokio::test]
     async fn test_poll_deposit_by_tx_hash_not_found_then_found() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
         let transfer_id = Uuid::new_v4();
 
-        let client = Arc::new(
-            AlpacaWalletClient::new(
-                server.base_url(),
-                "test_key_id".to_string(),
-                "test_secret_key".to_string(),
-            )
-            .await
-            .unwrap(),
-        );
+        let client = Arc::new(AlpacaWalletClient::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_key_id".to_string(),
+            "test_secret_key".to_string(),
+        ));
 
         let mut empty_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -665,44 +635,41 @@ mod tests {
         empty_mock.delete();
 
         let found_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "INCOMING",
+                    "direction": "INCOMING",
                     "amount": "500",
+                    "usd_value": "500",
+                    "chain": "ethereum",
                     "asset": "USDC",
                     "from_address": "0x9999999999999999999999999999999999999999",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "COMPLETE",
                     "tx_hash": tx_hash,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": null
+                    "network_fee": "0",
+                    "fees": "0"
                 }]));
         });
 
         let transfer = poll_handle.await.unwrap().unwrap();
         assert_eq!(transfer.status, TransferStatus::Complete);
-        account_mock.assert();
         found_mock.assert();
     }
 
     #[tokio::test]
     async fn test_poll_deposit_by_tx_hash_timeout() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
         let empty_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -710,11 +677,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(10),
@@ -734,47 +700,44 @@ mod tests {
             "Expected DepositTimeout error"
         );
 
-        account_mock.assert();
         assert!(empty_mock.hits() >= 1, "Expected at least one poll attempt");
     }
 
     #[tokio::test]
     async fn test_poll_deposit_by_tx_hash_found_failed() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let tx_hash: TxHash =
             fixed_bytes!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
         let transfer_id = Uuid::new_v4();
 
         let transfers_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/transfers"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
                     "id": transfer_id,
-                    "relationship": "INCOMING",
+                    "direction": "INCOMING",
                     "amount": "500",
+                    "usd_value": "500",
+                    "chain": "ethereum",
                     "asset": "USDC",
                     "from_address": "0x9999999999999999999999999999999999999999",
                     "to_address": "0x1234567890abcdef1234567890abcdef12345678",
                     "status": "FAILED",
                     "tx_hash": tx_hash,
                     "created_at": "2024-01-01T00:00:00Z",
-                    "network_fee_amount": null
+                    "network_fee": "0",
+                    "fees": "0"
                 }]));
         });
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let config = PollingConfig {
             interval: Duration::from_millis(10),
@@ -790,7 +753,6 @@ mod tests {
 
         assert_eq!(transfer.status, TransferStatus::Failed);
 
-        account_mock.assert();
         transfers_mock.assert();
     }
 }

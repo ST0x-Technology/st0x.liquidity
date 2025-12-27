@@ -16,6 +16,7 @@ pub enum AlpacaTradingApiMode {
 }
 
 impl AlpacaTradingApiMode {
+    /// Returns the base URL for Alpaca Trading API.
     fn base_url(&self) -> String {
         match self {
             Self::Paper => "https://paper-api.alpaca.markets".to_string(),
@@ -53,8 +54,17 @@ impl std::fmt::Debug for AlpacaTradingApiAuthEnv {
 }
 
 impl AlpacaTradingApiAuthEnv {
+    /// Returns the base URL for Alpaca Trading API.
     pub fn base_url(&self) -> String {
         self.alpaca_trading_mode.base_url()
+    }
+
+    /// Returns true if using paper trading mode (sandbox).
+    ///
+    /// Paper trading uses Ethereum Sepolia for crypto operations,
+    /// while live trading uses Ethereum mainnet.
+    pub fn is_paper_trading(&self) -> bool {
+        matches!(self.alpaca_trading_mode, AlpacaTradingApiMode::Paper)
     }
 }
 

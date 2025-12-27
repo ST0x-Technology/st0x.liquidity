@@ -24,6 +24,7 @@
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use chrono::{DateTime, Utc};
+use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
+use crate::error_decoding::handle_contract_error;
 use crate::onchain::io::TokenizedEquitySymbol;
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
@@ -250,6 +252,9 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Redemption transfer failed: {0}")]
     RedemptionTransferFailed(#[from] alloy::contract::Error),
 
+    #[error("Contract reverted: {0}")]
+    Revert(#[from] AbiDecodedErrorType),
+
     #[error("Transaction error: {0}")]
     Transaction(#[from] alloy::providers::PendingTransactionError),
 
@@ -445,6 +450,7 @@ where
     /// # Errors
     ///
     /// - `RedemptionTransferFailed` if the contract call fails
+    /// - `Revert` if the contract reverts with a decoded error
     /// - `Transaction` if the transaction fails to confirm
     async fn send_tokens_for_redemption(
         &self,
@@ -453,12 +459,12 @@ where
     ) -> Result<TxHash, AlpacaTokenizationError> {
         let erc20 = IERC20::new(token, self.provider.clone());
 
-        let receipt = erc20
-            .transfer(self.redemption_wallet, amount)
-            .send()
-            .await?
-            .get_receipt()
-            .await?;
+        let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
+
+        let receipt = pending.get_receipt().await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -1003,12 +1009,15 @@ pub(crate) mod tests {
             .send_tokens_for_redemption(token_address, transfer_amount)
             .await;
 
+        let err = result.expect_err("expected error for insufficient balance");
         assert!(
-            matches!(
-                result,
-                Err(AlpacaTokenizationError::RedemptionTransferFailed(_))
-            ),
-            "expected RedemptionTransferFailed with insufficient balance, got: {result:?}"
+            matches!(err, AlpacaTokenizationError::Revert(_)),
+            "expected Revert error variant, got: {err:?}"
+        );
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("transfer amount exceeds balance"),
+            "expected 'transfer amount exceeds balance' in error message, got: {err_msg}"
         );
     }
 
