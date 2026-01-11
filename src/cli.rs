@@ -601,9 +601,8 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_broker::Direction;
-    use st0x_broker::OrderStatus;
     use st0x_broker::schwab::SchwabAuthEnv;
+    use st0x_broker::{Direction, OrderStatus, Shares, Symbol};
     use std::str::FromStr;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -1817,14 +1816,14 @@ mod tests {
         // Executions are now in SUBMITTED status with order_id stored for order status polling
         let executions = find_executions_by_symbol_status_and_broker(
             &pool,
-            Some(st0x_broker::Symbol::new("AAPL").unwrap()),
+            Some(Symbol::new("AAPL").unwrap()),
             OrderStatus::Submitted,
             None,
         )
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, st0x_broker::Shares::new(9).unwrap());
+        assert_eq!(executions[0].shares, Shares::new(9).unwrap());
         assert_eq!(executions[0].direction, Direction::Buy);
 
         // Verify order_id was stored in database

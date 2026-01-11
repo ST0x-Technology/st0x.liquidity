@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
-use st0x_broker::{Broker, BrokerError, MarketOrder, OrderState, SupportedBroker, Symbol};
+use st0x_broker::{Broker, BrokerError, MarketOrder, SupportedBroker, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
@@ -1034,36 +1034,6 @@ async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
 
     let broker_order_id = BrokerOrderId::new(&placement.order_id);
 
-    let submitted_state = OrderState::Submitted {
-        order_id: placement.order_id.to_string(),
-    };
-
-    let mut sql_tx = pool.begin().await.map_err(|e| {
-        EventProcessingError::AccumulatorProcessing(format!(
-            "Failed to start transaction for status update: {e}"
-        ))
-    })?;
-
-    submitted_state
-        .store_update(&mut sql_tx, execution_id)
-        .await
-        .map_err(|e| {
-            EventProcessingError::AccumulatorProcessing(format!(
-                "Failed to update execution status to SUBMITTED: {e}"
-            ))
-        })?;
-
-    sql_tx.commit().await.map_err(|e| {
-        EventProcessingError::AccumulatorProcessing(format!(
-            "Failed to commit status update transaction: {e}"
-        ))
-    })?;
-
-    info!(
-        "Updated execution {execution_id} to SUBMITTED with order_id={}",
-        placement.order_id
-    );
-
     if let Err(e) = crate::dual_write::confirm_submission(
         dual_write_context,
         execution_id,
@@ -1184,7 +1154,10 @@ mod tests {
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
-    use st0x_broker::{Direction, MockBrokerConfig, OrderState, Shares, TryIntoBroker};
+    use st0x_broker::{
+        Direction, MockBrokerConfig, OrderState, OrderStatus, Shares, SupportedBroker, Symbol,
+        TryIntoBroker,
+    };
 
     #[tokio::test]
     async fn test_event_enqueued_when_trade_conversion_returns_none() {
@@ -1876,7 +1849,7 @@ mod tests {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let symbol = st0x_broker::Symbol::new("GOOGL").unwrap();
+        let symbol = Symbol::new("GOOGL").unwrap();
         let shares = Shares::new(5).unwrap();
 
         crate::dual_write::initialize_position(
@@ -1904,7 +1877,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::DryRun,
+            broker: SupportedBroker::DryRun,
             state: OrderState::Pending,
         };
 
@@ -1952,7 +1925,7 @@ mod tests {
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let symbol = st0x_broker::Symbol::new("AMZN").unwrap();
+        let symbol = Symbol::new("AMZN").unwrap();
         let shares = Shares::new(10).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
@@ -1963,7 +1936,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                st0x_broker::SupportedBroker::DryRun,
+                SupportedBroker::DryRun,
             )
             .await
             .unwrap();
@@ -1974,7 +1947,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::DryRun,
+            broker: SupportedBroker::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2023,7 +1996,7 @@ mod tests {
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let symbol = st0x_broker::Symbol::new("BMNR").unwrap();
+        let symbol = Symbol::new("BMNR").unwrap();
         let shares = Shares::new(1).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
@@ -2034,7 +2007,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                st0x_broker::SupportedBroker::DryRun,
+                SupportedBroker::DryRun,
             )
             .await
             .unwrap();
@@ -2058,7 +2031,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::DryRun,
+            broker: SupportedBroker::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2118,7 +2091,7 @@ mod tests {
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let symbol = st0x_broker::Symbol::new("TSLA").unwrap();
+        let symbol = Symbol::new("TSLA").unwrap();
         let shares = Shares::new(5).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
@@ -2129,7 +2102,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Sell,
-                st0x_broker::SupportedBroker::DryRun,
+                SupportedBroker::DryRun,
             )
             .await
             .unwrap();
@@ -2140,7 +2113,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
-            broker: st0x_broker::SupportedBroker::DryRun,
+            broker: SupportedBroker::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2180,7 +2153,7 @@ mod tests {
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let symbol = st0x_broker::Symbol::new("NVDA").unwrap();
+        let symbol = Symbol::new("NVDA").unwrap();
         let shares = Shares::new(3).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
@@ -2191,7 +2164,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                st0x_broker::SupportedBroker::DryRun,
+                SupportedBroker::DryRun,
             )
             .await
             .unwrap();
@@ -2202,7 +2175,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::DryRun,
+            broker: SupportedBroker::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2213,8 +2186,8 @@ mod tests {
         let submitted_before = find_executions_by_symbol_status_and_broker(
             &pool,
             Some(symbol.clone()),
-            st0x_broker::OrderStatus::Submitted,
-            Some(st0x_broker::SupportedBroker::DryRun),
+            OrderStatus::Submitted,
+            Some(SupportedBroker::DryRun),
         )
         .await
         .unwrap();
@@ -2231,8 +2204,8 @@ mod tests {
         let submitted_after = find_executions_by_symbol_status_and_broker(
             &pool,
             Some(symbol.clone()),
-            st0x_broker::OrderStatus::Submitted,
-            Some(st0x_broker::SupportedBroker::DryRun),
+            OrderStatus::Submitted,
+            Some(SupportedBroker::DryRun),
         )
         .await
         .unwrap();
@@ -2264,7 +2237,7 @@ mod tests {
         let broker = MockBrokerConfig.try_into_broker().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let symbol = st0x_broker::Symbol::new("GOOGL").unwrap();
+        let symbol = Symbol::new("GOOGL").unwrap();
         let shares = Shares::new(2).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
@@ -2275,7 +2248,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                st0x_broker::SupportedBroker::DryRun,
+                SupportedBroker::DryRun,
             )
             .await
             .unwrap();
@@ -2286,7 +2259,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::DryRun,
+            broker: SupportedBroker::DryRun,
             state: OrderState::Pending,
         };
 

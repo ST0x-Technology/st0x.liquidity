@@ -305,7 +305,7 @@ impl<B: Broker> OrderStatusPoller<B> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_broker::{Direction, Shares, SupportedBroker};
+    use st0x_broker::{Direction, MockBroker, Shares, SupportedBroker, Symbol};
 
     use super::*;
     use crate::offchain_order::BrokerOrderId;
@@ -314,7 +314,7 @@ mod tests {
 
     async fn setup_position_with_onchain_fill(
         dual_write_context: &DualWriteContext,
-        symbol: &st0x_broker::Symbol,
+        symbol: &Symbol,
         tokenized_symbol: &str,
         amount: f64,
     ) {
@@ -524,4 +524,60 @@ mod tests {
         assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
         assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
     }
+
+    async fn setup_stuck_execution_state(pool: &SqlitePool, symbol: &Symbol, execution_id: i64) {
+        let symbol_str = symbol.to_string();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO trade_accumulators (
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                pending_execution_id
+            )
+            VALUES (?1, 0.0, 0.0, 0.0, ?2)
+            ON CONFLICT(symbol) DO UPDATE SET
+                pending_execution_id = excluded.pending_execution_id
+            "#,
+            symbol_str,
+            execution_id
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO symbol_locks (symbol) VALUES (?1)")
+            .bind(symbol.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_locks_cleared(pool: &SqlitePool, symbol: &Symbol) {
+        let symbol_str = symbol.to_string();
+
+        let row = sqlx::query!(
+            "SELECT pending_execution_id FROM trade_accumulators WHERE symbol = ?1",
+            symbol_str
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.pending_execution_id, None,
+            "pending_execution_id should be cleared"
+        );
+
+        let lock_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM symbol_locks WHERE symbol = ?1",
+            symbol_str
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(lock_count, 0, "symbol_locks should be cleared");
+    }
+
 }
