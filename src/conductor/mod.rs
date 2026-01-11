@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
-use st0x_broker::{Broker, BrokerError, MarketOrder, SupportedBroker, Symbol};
+use st0x_broker::{Broker, BrokerError, MarketOrder, OrderState, SupportedBroker, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
@@ -1034,6 +1034,36 @@ async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
 
     let broker_order_id = BrokerOrderId::new(&placement.order_id);
 
+    let submitted_state = OrderState::Submitted {
+        order_id: placement.order_id.to_string(),
+    };
+
+    let mut sql_tx = pool.begin().await.map_err(|e| {
+        EventProcessingError::AccumulatorProcessing(format!(
+            "Failed to start transaction for status update: {e}"
+        ))
+    })?;
+
+    submitted_state
+        .store_update(&mut sql_tx, execution_id)
+        .await
+        .map_err(|e| {
+            EventProcessingError::AccumulatorProcessing(format!(
+                "Failed to update execution status to SUBMITTED: {e}"
+            ))
+        })?;
+
+    sql_tx.commit().await.map_err(|e| {
+        EventProcessingError::AccumulatorProcessing(format!(
+            "Failed to commit status update transaction: {e}"
+        ))
+    })?;
+
+    info!(
+        "Updated execution {execution_id} to SUBMITTED with order_id={}",
+        placement.order_id
+    );
+
     if let Err(e) = crate::dual_write::confirm_submission(
         dual_write_context,
         execution_id,
@@ -1147,7 +1177,9 @@ mod tests {
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3};
     use crate::env::tests::create_test_config;
-    use crate::offchain::execution::OffchainExecution;
+    use crate::offchain::execution::{
+        OffchainExecution, find_executions_by_symbol_status_and_broker,
+    };
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -1973,6 +2005,329 @@ mod tests {
         );
         assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
         assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
+    }
+
+    /// Regression test for the dual-write bug where the legacy `offchain_trades` table
+    /// was not updated from PENDING to SUBMITTED after order placement.
+    ///
+    /// The order poller queries for SUBMITTED orders from the legacy table, but if
+    /// `execute_pending_offchain_execution` doesn't update the legacy table, the order
+    /// will never be polled and will remain stuck in PENDING state indefinitely.
+    ///
+    /// This test verifies that after `execute_pending_offchain_execution`:
+    /// 1. The event store has the Submitted event (dual-write path)
+    /// 2. The legacy `offchain_trades` table has SUBMITTED status with broker order_id
+    #[tokio::test]
+    async fn test_execute_pending_offchain_execution_updates_legacy_table_to_submitted() {
+        let pool = setup_test_db().await;
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let symbol = st0x_broker::Symbol::new("BMNR").unwrap();
+        let shares = Shares::new(1).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let pending_state = OrderState::Pending;
+        let execution_id = pending_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                st0x_broker::SupportedBroker::DryRun,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let legacy_row_before = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_row_before.status, "PENDING");
+        assert!(
+            legacy_row_before.order_id.is_none(),
+            "order_id should be None before execution"
+        );
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: st0x_broker::SupportedBroker::DryRun,
+            state: OrderState::Pending,
+        };
+
+        crate::dual_write::place_order(&dual_write_context, &pending_execution)
+            .await
+            .unwrap();
+
+        let result =
+            execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+                .await;
+        assert!(result.is_ok());
+
+        let aggregate_id = execution_id.to_string();
+        let offchain_order_events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+            ORDER BY sequence",
+            aggregate_id
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            offchain_order_events.len(),
+            2,
+            "Expected 2 OffchainOrder events (Placed, Submitted), got {offchain_order_events:?}"
+        );
+        assert_eq!(offchain_order_events[0], "OffchainOrderEvent::Placed");
+        assert_eq!(offchain_order_events[1], "OffchainOrderEvent::Submitted");
+
+        let legacy_row_after = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            legacy_row_after.status, "SUBMITTED",
+            "Legacy table should be updated to SUBMITTED status after order placement. \
+            Currently stuck at PENDING which causes the order poller to never find this order."
+        );
+
+        assert!(
+            legacy_row_after.order_id.is_some(),
+            "Legacy table should have broker order_id after order placement. \
+            Without this, the order poller cannot query Schwab for order status."
+        );
+    }
+
+    /// Tests that the order_id stored in the legacy table matches the broker's returned order_id.
+    #[tokio::test]
+    async fn test_execute_pending_offchain_execution_stores_correct_order_id() {
+        let pool = setup_test_db().await;
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let symbol = st0x_broker::Symbol::new("TSLA").unwrap();
+        let shares = Shares::new(5).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let pending_state = OrderState::Pending;
+        let execution_id = pending_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Sell,
+                st0x_broker::SupportedBroker::DryRun,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Sell,
+            broker: st0x_broker::SupportedBroker::DryRun,
+            state: OrderState::Pending,
+        };
+
+        crate::dual_write::place_order(&dual_write_context, &pending_execution)
+            .await
+            .unwrap();
+
+        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+            .await
+            .unwrap();
+
+        let legacy_row = sqlx::query!(
+            "SELECT order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let order_id = legacy_row
+            .order_id
+            .expect("order_id should be set after execution");
+
+        assert!(!order_id.is_empty(), "order_id should not be empty");
+
+        assert!(
+            order_id.starts_with("TEST_"),
+            "MockBroker order_id should start with 'TEST_', got: {order_id}"
+        );
+    }
+
+    /// Tests that orders updated to SUBMITTED can be found by the order poller's query.
+    /// This verifies the fix enables the order poller to track orders correctly.
+    #[tokio::test]
+    async fn test_order_poller_can_find_orders_after_execution() {
+        let pool = setup_test_db().await;
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let symbol = st0x_broker::Symbol::new("NVDA").unwrap();
+        let shares = Shares::new(3).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let pending_state = OrderState::Pending;
+        let execution_id = pending_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                st0x_broker::SupportedBroker::DryRun,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: st0x_broker::SupportedBroker::DryRun,
+            state: OrderState::Pending,
+        };
+
+        crate::dual_write::place_order(&dual_write_context, &pending_execution)
+            .await
+            .unwrap();
+
+        let submitted_before = find_executions_by_symbol_status_and_broker(
+            &pool,
+            Some(symbol.clone()),
+            st0x_broker::OrderStatus::Submitted,
+            Some(st0x_broker::SupportedBroker::DryRun),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            submitted_before.is_empty(),
+            "No SUBMITTED orders should exist before execution"
+        );
+
+        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+            .await
+            .unwrap();
+
+        let submitted_after = find_executions_by_symbol_status_and_broker(
+            &pool,
+            Some(symbol.clone()),
+            st0x_broker::OrderStatus::Submitted,
+            Some(st0x_broker::SupportedBroker::DryRun),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            submitted_after.len(),
+            1,
+            "Order poller query should find exactly 1 SUBMITTED order after execution"
+        );
+
+        assert_eq!(submitted_after[0].id, Some(execution_id));
+
+        match &submitted_after[0].state {
+            OrderState::Submitted { order_id } => {
+                assert!(
+                    order_id.starts_with("TEST_"),
+                    "Order should have broker order_id starting with TEST_, got: {order_id}"
+                );
+            }
+            other => panic!("Expected Submitted state, got: {other:?}"),
+        }
+    }
+
+    /// Tests that both legacy table and event store are updated atomically.
+    /// Verifies the dual-write pattern works correctly.
+    #[tokio::test]
+    async fn test_execute_pending_offchain_execution_dual_write_consistency() {
+        let pool = setup_test_db().await;
+        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let symbol = st0x_broker::Symbol::new("GOOGL").unwrap();
+        let shares = Shares::new(2).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let pending_state = OrderState::Pending;
+        let execution_id = pending_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                st0x_broker::SupportedBroker::DryRun,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: st0x_broker::SupportedBroker::DryRun,
+            state: OrderState::Pending,
+        };
+
+        crate::dual_write::place_order(&dual_write_context, &pending_execution)
+            .await
+            .unwrap();
+
+        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+            .await
+            .unwrap();
+
+        let legacy_row = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let legacy_order_id = legacy_row
+            .order_id
+            .expect("Legacy table should have order_id");
+
+        let aggregate_id = execution_id.to_string();
+        let event_payload: String = sqlx::query_scalar!(
+            r#"SELECT payload as "payload!: String" FROM events
+            WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ?
+            AND event_type = 'OffchainOrderEvent::Submitted'"#,
+            aggregate_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            event_payload.contains(&legacy_order_id),
+            "Event store order_id should match legacy table order_id. \
+            Legacy: {legacy_order_id}, Event payload: {event_payload}"
+        );
+
+        assert_eq!(legacy_row.status, "SUBMITTED");
     }
 
     #[tokio::test]
