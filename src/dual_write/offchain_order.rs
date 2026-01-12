@@ -1,5 +1,6 @@
 use rust_decimal::Decimal;
 use st0x_broker::OrderState;
+use tracing::info;
 
 use crate::offchain::execution::OffchainExecution;
 use crate::offchain_order::{BrokerOrderId, PriceCents};
@@ -40,12 +41,27 @@ pub(crate) async fn confirm_submission(
 ) -> Result<(), DualWriteError> {
     let aggregate_id = OffchainOrder::aggregate_id(execution_id);
 
-    let command = OffchainOrderCommand::ConfirmSubmission { broker_order_id };
+    let command = OffchainOrderCommand::ConfirmSubmission {
+        broker_order_id: broker_order_id.clone(),
+    };
 
     context
         .offchain_order_framework()
         .execute(&aggregate_id, command)
         .await?;
+
+    let submitted_state = OrderState::Submitted {
+        order_id: broker_order_id.0.clone(),
+    };
+
+    let mut tx = context.pool().begin().await?;
+    submitted_state.store_update(&mut tx, execution_id).await?;
+    tx.commit().await?;
+
+    info!(
+        "Updated execution {execution_id} to SUBMITTED with order_id={:?}",
+        broker_order_id
+    );
 
     Ok(())
 }
@@ -100,7 +116,7 @@ pub(crate) async fn mark_failed(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_broker::{Direction, Symbol};
+    use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
 
     use super::*;
     use crate::test_utils::setup_test_db;
@@ -114,9 +130,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Pending,
         };
 
@@ -151,9 +167,9 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol,
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Pending,
         };
 
@@ -172,22 +188,39 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Shares::new(10).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
         let execution = OffchainExecution {
-            id: Some(2),
+            id: Some(execution_id),
             symbol,
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Pending,
         };
 
         place_order(&context, &execution).await.unwrap();
 
-        let result = confirm_submission(&context, 2, BrokerOrderId::new("ORD123")).await;
+        let result = confirm_submission(&context, execution_id, BrokerOrderId::new("ORD123")).await;
         assert!(result.is_ok());
 
         let event_count = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '2'"
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ?",
+            execution_id
         )
         .fetch_one(&pool)
         .await
@@ -196,7 +229,10 @@ mod tests {
         assert_eq!(event_count, 2);
 
         let event_type = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '2' ORDER BY sequence DESC LIMIT 1"
+            "SELECT event_type FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+             ORDER BY sequence DESC LIMIT 1",
+            execution_id
         )
         .fetch_one(&pool)
         .await
@@ -211,12 +247,27 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Shares::new(10).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
         let execution = OffchainExecution {
-            id: Some(3),
+            id: Some(execution_id),
             symbol,
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Filled {
                 order_id: "ORD456".to_string(),
                 price_cents: 15025,
@@ -226,7 +277,7 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        confirm_submission(&context, 3, BrokerOrderId::new("ORD456"))
+        confirm_submission(&context, execution_id, BrokerOrderId::new("ORD456"))
             .await
             .unwrap();
 
@@ -234,7 +285,10 @@ mod tests {
         assert!(result.is_ok());
 
         let event_type = sqlx::query_scalar!(
-            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '3' ORDER BY sequence DESC LIMIT 1"
+            "SELECT event_type FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+             ORDER BY sequence DESC LIMIT 1",
+            execution_id
         )
         .fetch_one(&pool)
         .await
@@ -252,9 +306,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(4),
             symbol,
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Pending,
         };
 
@@ -276,9 +330,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(5),
             symbol,
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Pending,
         };
 
@@ -303,12 +357,27 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Shares::new(10).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
         let execution = OffchainExecution {
-            id: Some(6),
+            id: Some(execution_id),
             symbol,
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares,
             direction: Direction::Buy,
-            broker: st0x_broker::SupportedBroker::Schwab,
+            broker: SupportedBroker::Schwab,
             state: OrderState::Filled {
                 order_id: "ORD789".to_string(),
                 price_cents: 15000,
@@ -318,19 +387,311 @@ mod tests {
 
         place_order(&context, &execution).await.unwrap();
 
-        confirm_submission(&context, 6, BrokerOrderId::new("ORD789"))
+        confirm_submission(&context, execution_id, BrokerOrderId::new("ORD789"))
             .await
             .unwrap();
 
         record_fill(&context, &execution).await.unwrap();
 
         let sequences: Vec<i64> = sqlx::query_scalar!(
-            "SELECT sequence FROM events WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = '6' ORDER BY sequence"
+            "SELECT sequence FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+             ORDER BY sequence",
+            execution_id
         )
         .fetch_all(&pool)
         .await
         .unwrap();
 
         assert_eq!(sequences, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_submission_updates_both_es_and_legacy_consistently() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("TSLA").unwrap();
+        let shares = Shares::new(5).unwrap();
+        let broker_order_id = BrokerOrderId::new("SCHWAB-12345");
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol,
+            shares,
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        place_order(&context, &execution).await.unwrap();
+        confirm_submission(&context, execution_id, broker_order_id.clone())
+            .await
+            .unwrap();
+
+        let es_event = sqlx::query_scalar!(
+            "SELECT event_type FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+             ORDER BY sequence DESC LIMIT 1",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let legacy_row = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(es_event, "OffchainOrderEvent::Submitted");
+        assert_eq!(legacy_row.status, "SUBMITTED");
+        assert_eq!(legacy_row.order_id.unwrap(), broker_order_id.0);
+    }
+
+    #[tokio::test]
+    async fn test_confirm_submission_order_id_matches_between_es_and_legacy() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("NVDA").unwrap();
+        let shares = Shares::new(3).unwrap();
+        let broker_order_id = BrokerOrderId::new("ORDER-ABC-789");
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Sell,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol,
+            shares,
+            direction: Direction::Sell,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        place_order(&context, &execution).await.unwrap();
+        confirm_submission(&context, execution_id, broker_order_id.clone())
+            .await
+            .unwrap();
+
+        let es_event_payload: String = sqlx::query_scalar(
+            "SELECT payload FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? \
+             AND event_type = 'OffchainOrderEvent::Submitted'",
+        )
+        .bind(execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let legacy_order_id: String =
+            sqlx::query_scalar("SELECT order_id FROM offchain_trades WHERE id = ?")
+                .bind(execution_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(&es_event_payload).unwrap();
+        let es_order_id = payload["Submitted"]["broker_order_id"].as_str().unwrap();
+
+        assert_eq!(
+            es_order_id, legacy_order_id,
+            "Order ID must match between ES event and legacy table for safe deprecation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_es_failure_prevents_legacy_write() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("GOOG").unwrap();
+        let shares = Shares::new(5).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let result =
+            confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-FAIL")).await;
+
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                DualWriteError::OffchainOrderAggregate(_)
+            ),
+            "ES should fail because place_order was never called"
+        );
+
+        let legacy_row = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            legacy_row.status, "PENDING",
+            "Legacy row should remain PENDING when ES fails"
+        );
+        assert!(
+            legacy_row.order_id.is_none(),
+            "Legacy order_id should remain None when ES fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_failure_after_es_success_propagates_error() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("META").unwrap();
+        let shares = Shares::new(5).unwrap();
+        let nonexistent_execution_id = 99999i64;
+
+        let execution = OffchainExecution {
+            id: Some(nonexistent_execution_id),
+            symbol,
+            shares,
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        place_order(&context, &execution).await.unwrap();
+
+        let result = confirm_submission(
+            &context,
+            nonexistent_execution_id,
+            BrokerOrderId::new("ORD-ORPHAN"),
+        )
+        .await;
+
+        assert!(
+            matches!(result.unwrap_err(), DualWriteError::Persistence(_)),
+            "Should fail with RowNotFound when legacy row doesn't exist"
+        );
+
+        let es_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ?",
+        )
+        .bind(nonexistent_execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            es_event_count, 2,
+            "ES events exist (Placed + Submitted) even though legacy write failed - \
+             this documents the dual-write inconsistency risk"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_transaction_rollback_on_commit_failure() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("AMZN").unwrap();
+        let shares = Shares::new(5).unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        let execution_id = OrderState::Pending
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        place_order(&context, &execution).await.unwrap();
+
+        confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-SUCCESS"))
+            .await
+            .unwrap();
+
+        let legacy_row = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(legacy_row.status, "SUBMITTED");
+        assert_eq!(legacy_row.order_id.unwrap(), "ORD-SUCCESS");
+
+        let result =
+            confirm_submission(&context, execution_id, BrokerOrderId::new("ORD-DUPLICATE")).await;
+
+        assert!(
+            result.is_err(),
+            "Second confirm_submission should fail at ES level (invalid state transition)"
+        );
+
+        let legacy_row_after = sqlx::query!(
+            "SELECT status, order_id FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            legacy_row_after.order_id.unwrap(),
+            "ORD-SUCCESS",
+            "Legacy order_id should remain unchanged after failed duplicate submission"
+        );
     }
 }

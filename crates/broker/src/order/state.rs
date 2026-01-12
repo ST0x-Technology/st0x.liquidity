@@ -91,7 +91,7 @@ impl OrderState {
         let status_str = self.status().as_str();
         let db_fields = self.to_db_fields()?;
 
-        sqlx::query!(
+        let result = sqlx::query!(
             "
             UPDATE offchain_trades
             SET status = ?1, order_id = ?2, price_cents = ?3, executed_at = ?4
@@ -105,6 +105,10 @@ impl OrderState {
         )
         .execute(&mut **sql_tx)
         .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(crate::PersistenceError::RowNotFound { execution_id });
+        }
 
         Ok(())
     }

@@ -305,7 +305,7 @@ impl<B: Broker> OrderStatusPoller<B> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_broker::{Direction, Shares, SupportedBroker};
+    use st0x_broker::{Direction, MockBroker, Shares, SupportedBroker, Symbol};
 
     use super::*;
     use crate::offchain_order::BrokerOrderId;
@@ -314,7 +314,7 @@ mod tests {
 
     async fn setup_position_with_onchain_fill(
         dual_write_context: &DualWriteContext,
-        symbol: &st0x_broker::Symbol,
+        symbol: &Symbol,
         tokenized_symbol: &str,
         amount: f64,
     ) {
@@ -523,5 +523,135 @@ mod tests {
         assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
         assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
         assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
+    }
+
+    async fn setup_stuck_execution_state(pool: &SqlitePool, symbol: &Symbol, execution_id: i64) {
+        let symbol_str = symbol.to_string();
+
+        sqlx::query!(
+            r#"
+            INSERT INTO trade_accumulators (
+                symbol,
+                net_position,
+                accumulated_long,
+                accumulated_short,
+                pending_execution_id
+            )
+            VALUES (?1, 0.0, 0.0, 0.0, ?2)
+            ON CONFLICT(symbol) DO UPDATE SET
+                pending_execution_id = excluded.pending_execution_id
+            "#,
+            symbol_str,
+            execution_id
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO symbol_locks (symbol) VALUES (?1)")
+            .bind(symbol.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn assert_locks_cleared(pool: &SqlitePool, symbol: &Symbol) {
+        let symbol_str = symbol.to_string();
+
+        let row = sqlx::query!(
+            "SELECT pending_execution_id FROM trade_accumulators WHERE symbol = ?1",
+            symbol_str
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.pending_execution_id, None,
+            "pending_execution_id should be cleared"
+        );
+
+        let lock_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) as count FROM symbol_locks WHERE symbol = ?1",
+            symbol_str
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(lock_count, 0, "symbol_locks should be cleared");
+    }
+
+    /// Reproduces the production recovery scenario:
+    /// - Execution is SUBMITTED with order_id
+    /// - pending_execution_id is set in trade_accumulators
+    /// - symbol_locks has a stale lock
+    /// - Order poller finds order is FILLED
+    /// - Verifies BOTH pending_execution_id AND symbol_locks are cleared
+    #[tokio::test]
+    async fn test_handle_filled_order_clears_pending_execution_id_and_symbol_lock() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockBroker::default();
+        let config = OrderPollerConfig::default();
+
+        let symbol = Symbol::new("BMNR").unwrap();
+        let shares = Shares::new(1).unwrap();
+        let order_id = "1005070742758";
+
+        setup_position_with_onchain_fill(&dual_write_context, &symbol, "BMNR0x", 1.0).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let submitted_state = OrderState::Submitted {
+            order_id: order_id.to_string(),
+        };
+        let execution_id = submitted_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedBroker::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let pending_execution = OffchainExecution {
+            id: Some(execution_id),
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        setup_offchain_order_aggregate(&dual_write_context, &pending_execution, &symbol, order_id)
+            .await;
+
+        setup_stuck_execution_state(&pool, &symbol, execution_id).await;
+
+        let filled_state = OrderState::Filled {
+            order_id: order_id.to_string(),
+            price_cents: 3181,
+            executed_at: Utc::now(),
+        };
+
+        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+        poller
+            .handle_filled_order(execution_id, &filled_state)
+            .await
+            .expect("handle_filled_order should succeed");
+
+        assert_locks_cleared(&pool, &symbol).await;
+
+        let legacy_row = sqlx::query!(
+            "SELECT status, order_id, price_cents FROM offchain_trades WHERE id = ?1",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(legacy_row.status, "FILLED");
+        assert_eq!(legacy_row.order_id, Some(order_id.to_string()));
+        assert_eq!(legacy_row.price_cents, Some(3181));
     }
 }
