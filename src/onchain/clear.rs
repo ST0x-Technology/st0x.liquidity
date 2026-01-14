@@ -114,6 +114,18 @@ impl OnchainTrade {
     }
 }
 
+/// Fetches the AfterClearV2 event that corresponds to a ClearV3 event.
+///
+/// The smart contract always emits ClearV3 followed immediately by AfterClearV2 in the same
+/// transaction, so AfterClearV2 should always exist with a higher log index.
+///
+/// # Node Provider Workaround
+///
+/// We've observed that some RPC nodes return incomplete results from `eth_getLogs` for
+/// historical blocks, even when the logs exist in the transaction receipt. When `get_logs`
+/// fails to find the AfterClearV2, we fall back to extracting it directly from the
+/// transaction receipt. This was discovered during backfill operations where `get_logs`
+/// returned 0 AfterClearV2 logs, but `get_transaction_receipt` showed both logs present.
 async fn fetch_after_clear_event<P: Provider>(
     provider: &P,
     env: &EvmEnv,
@@ -122,6 +134,8 @@ async fn fetch_after_clear_event<P: Provider>(
     let block_number = log
         .block_number
         .ok_or(TradeValidationError::NoBlockNumber)?;
+    let tx_hash = log.transaction_hash.ok_or(TradeValidationError::NoTxHash)?;
+    let clear_log_index = log.log_index.ok_or(TradeValidationError::NoLogIndex)?;
 
     let filter = Filter::new()
         .select(block_number)
@@ -129,15 +143,81 @@ async fn fetch_after_clear_event<P: Provider>(
         .event_signature(AfterClearV2::SIGNATURE_HASH);
 
     let after_clear_logs = provider.get_logs(&filter).await?;
-    let after_clear_log = after_clear_logs
-        .iter()
-        .find(|after_clear_log| {
-            after_clear_log.transaction_hash == log.transaction_hash
-                && after_clear_log.log_index > log.log_index
-        })
-        .ok_or(TradeValidationError::NoAfterClearLog)?;
 
-    Ok(after_clear_log.log_decode::<AfterClearV2>()?.data().clone())
+    if let Some(after_clear_log) = after_clear_logs.iter().find(|after_clear_log| {
+        after_clear_log.transaction_hash == log.transaction_hash
+            && after_clear_log.log_index > log.log_index
+    }) {
+        return Ok(after_clear_log.log_decode::<AfterClearV2>()?.data().clone());
+    }
+
+    // Fallback: extract from tx receipt when get_logs returns incomplete data.
+    // Some RPC nodes fail to return logs via eth_getLogs for historical blocks,
+    // but the logs are present in the transaction receipt.
+    let receipt = provider.get_transaction_receipt(tx_hash).await?;
+    let Some(r) = receipt else {
+        return Err(TradeValidationError::NodeReceiptMissing {
+            block_number,
+            tx_hash,
+            clear_log_index,
+        }
+        .into());
+    };
+
+    // Find the AfterClearV2 log in the receipt with log_index > clear_log_index
+    for receipt_log in r.inner.logs() {
+        if receipt_log.address() != env.orderbook {
+            continue;
+        }
+
+        if receipt_log.topics().first() != Some(&AfterClearV2::SIGNATURE_HASH) {
+            continue;
+        }
+
+        let Some(receipt_log_index) = receipt_log.log_index else {
+            continue;
+        };
+
+        if receipt_log_index <= clear_log_index {
+            continue;
+        }
+
+        // Found it - decode and return
+        let decoded = receipt_log.log_decode::<AfterClearV2>()?;
+        debug!(
+            block_number,
+            %tx_hash,
+            clear_log_index,
+            receipt_log_index,
+            "Extracted AfterClearV2 from tx receipt (get_logs returned incomplete data)"
+        );
+        return Ok(decoded.data().clone());
+    }
+
+    // Check what's actually in the receipt for error reporting
+    let clear_in_receipt = r.inner.logs().iter().any(|l| {
+        l.address() == env.orderbook && l.topics().first() == Some(&ClearV3::SIGNATURE_HASH)
+    });
+    let after_clear_in_receipt = r.inner.logs().iter().any(|l| {
+        l.address() == env.orderbook && l.topics().first() == Some(&AfterClearV2::SIGNATURE_HASH)
+    });
+
+    if clear_in_receipt && !after_clear_in_receipt {
+        return Err(TradeValidationError::AfterClearMissingFromReceipt {
+            block_number,
+            tx_hash,
+            clear_log_index,
+        }
+        .into());
+    }
+
+    // Neither log in receipt or AfterClearV2 has wrong log index - node issue
+    Err(TradeValidationError::NodeReceiptMissing {
+        block_number,
+        tx_hash,
+        clear_log_index,
+    }
+    .into())
 }
 
 #[cfg(test)]
@@ -492,8 +572,11 @@ mod tests {
             removed: false,
         };
 
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
         let asserter = Asserter::new();
         asserter.push_success(&json!([])); // No after clear logs found
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
@@ -509,7 +592,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
         ));
     }
 
@@ -564,6 +647,7 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong transaction hash
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
@@ -579,7 +663,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
         ));
     }
 
@@ -632,6 +716,7 @@ mod tests {
 
         let asserter = Asserter::new();
         asserter.push_success(&json!([wrong_after_clear_log])); // Wrong log index ordering
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // Receipt with no logs
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
@@ -647,7 +732,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
         ));
     }
 
@@ -900,7 +985,8 @@ mod tests {
         };
 
         let asserter = Asserter::new();
-        asserter.push_success(&json!([after_clear_log_equal_index]));
+        asserter.push_success(&json!([after_clear_log_equal_index])); // get_logs returns log with equal index (not valid)
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt has no logs
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let feed_id_cache = FeedIdCache::default();
 
@@ -914,9 +1000,10 @@ mod tests {
         )
         .await;
 
+        // Falls back to receipt, but receipt has no logs, so NodeReceiptMissing
         assert!(matches!(
             result.unwrap_err(),
-            OnChainError::Validation(crate::error::TradeValidationError::NoAfterClearLog)
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
         ));
     }
 
