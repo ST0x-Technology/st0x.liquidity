@@ -1,11 +1,14 @@
-//! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist, transfers).
+//! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist, transfers, convert).
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
+use st0x_execution::Executor;
+use st0x_execution::alpaca_broker_api::ConversionDirection;
 use std::io::Write;
 
+use super::ConvertDirection;
 use crate::alpaca_wallet::{
     AlpacaWalletService, Network, TokenSymbol, TransferStatus, WhitelistStatus,
 };
@@ -366,6 +369,57 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     Ok(())
 }
 
+pub(super) async fn alpaca_convert_command<W: Write>(
+    stdout: &mut W,
+    direction: ConvertDirection,
+    amount: Usdc,
+    config: &Config,
+) -> anyhow::Result<()> {
+    let direction_str = match direction {
+        ConvertDirection::ToUsd => "USDC → USD",
+        ConvertDirection::ToUsdc => "USD → USDC",
+    };
+
+    writeln!(stdout, "Converting {direction_str} on Alpaca")?;
+    writeln!(stdout, "   Amount: {amount} USDC")?;
+
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
+    };
+
+    let executor =
+        st0x_execution::alpaca_broker_api::AlpacaBrokerApi::try_from_config(alpaca_auth.clone())
+            .await?;
+
+    let conversion_direction = match direction {
+        ConvertDirection::ToUsd => ConversionDirection::UsdcToUsd,
+        ConvertDirection::ToUsdc => ConversionDirection::UsdToUsdc,
+    };
+
+    let amount_decimal: rust_decimal::Decimal = amount.into();
+
+    writeln!(stdout, "   Placing market order...")?;
+
+    let order = executor
+        .convert_usdc_usd(amount_decimal, conversion_direction)
+        .await?;
+
+    writeln!(stdout, "Conversion completed successfully!")?;
+    writeln!(stdout, "   Order ID: {}", order.id)?;
+    writeln!(stdout, "   Symbol: {}", order.symbol)?;
+    writeln!(stdout, "   Quantity: {}", order.quantity)?;
+    writeln!(stdout, "   Status: {}", order.status_display())?;
+    if let Some(price) = order.filled_average_price {
+        writeln!(stdout, "   Filled Price: ${price:.4}")?;
+    }
+    if let Some(filled_qty) = order.filled_quantity {
+        writeln!(stdout, "   Filled Quantity: {filled_qty}")?;
+    }
+    writeln!(stdout, "   Created: {}", order.created_at)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, address};
@@ -375,6 +429,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaAccountId;
+    use crate::cli::ConvertDirection;
     use crate::env::LogLevel;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
@@ -578,6 +633,57 @@ mod tests {
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_convert_requires_alpaca_broker() {
+        let config = create_config_without_alpaca();
+        let amount = Usdc(dec!(100));
+
+        let mut stdout = Vec::new();
+        let result =
+            alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &config).await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("requires Alpaca Broker API configuration"),
+            "Expected Alpaca Broker API error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_convert_writes_direction_to_stdout() {
+        let config = create_alpaca_config_without_rebalancing();
+        let amount = Usdc(dec!(500.50));
+
+        let mut stdout = Vec::new();
+        let _ = alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &config).await;
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("USDC → USD"),
+            "Expected USDC to USD in output, got: {output}"
+        );
+        assert!(
+            output.contains("500.50 USDC"),
+            "Expected amount in output, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_alpaca_convert_to_usdc_writes_direction_to_stdout() {
+        let config = create_alpaca_config_without_rebalancing();
+        let amount = Usdc(dec!(250));
+
+        let mut stdout = Vec::new();
+        let _ =
+            alpaca_convert_command(&mut stdout, ConvertDirection::ToUsdc, amount, &config).await;
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("USD → USDC"),
+            "Expected USD to USDC in output, got: {output}"
         );
     }
 }

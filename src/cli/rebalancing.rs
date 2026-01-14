@@ -8,13 +8,17 @@ use cqrs_es::CqrsFramework;
 use cqrs_es::persist::PersistedEventStore;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use st0x_execution::Symbol;
 
-use crate::alpaca_tokenization::AlpacaTokenizationService;
+use crate::alpaca_tokenization::{
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
+};
 use crate::alpaca_wallet::AlpacaWalletService;
+use crate::bindings::IERC20;
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
@@ -65,6 +69,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_broker_api_key.clone(),
         alpaca_auth.alpaca_broker_api_secret.clone(),
         base_provider.clone(),
@@ -237,6 +242,271 @@ where
                 .await?;
             writeln!(stdout, "USDC transfer to Alpaca completed successfully")?;
         }
+    }
+
+    Ok(())
+}
+
+/// Isolated tokenization command - calls Alpaca tokenization API directly.
+pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
+    stdout: &mut W,
+    symbol: Symbol,
+    quantity: FractionalShares,
+    wallet: Option<Address>,
+    token: Address,
+    config: &Config,
+    provider: P,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
+    writeln!(stdout, "   Symbol: {symbol}")?;
+    writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Token: {token}")?;
+
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-tokenize requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
+    })?;
+
+    let receiving_wallet = wallet.unwrap_or(rebalancing_config.market_maker_wallet);
+    writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
+
+    let erc20 = IERC20::new(token, provider.clone());
+    let initial_balance = erc20.balanceOf(receiving_wallet).call().await?;
+    writeln!(stdout, "   Initial balance: {initial_balance}")?;
+
+    let expected_amount = quantity.to_u256_18_decimals()?;
+    let expected_final = initial_balance + expected_amount;
+    writeln!(stdout, "   Expected final balance: {expected_final}")?;
+
+    let tokenization_service = AlpacaTokenizationService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
+        provider.clone(),
+        rebalancing_config.redemption_wallet,
+    );
+
+    writeln!(stdout, "   Sending mint request to Alpaca...")?;
+
+    let request = tokenization_service
+        .request_mint(symbol.clone(), quantity, receiving_wallet)
+        .await?;
+
+    writeln!(stdout, "   Request ID: {}", request.id.0)?;
+    writeln!(stdout, "   Status: {:?}", request.status)?;
+
+    if request.status == TokenizationRequestStatus::Pending {
+        writeln!(stdout, "   Polling Alpaca until completion...")?;
+
+        let completed = tokenization_service
+            .poll_mint_until_complete(&request.id)
+            .await?;
+
+        writeln!(stdout, "   Alpaca status: {:?}", completed.status)?;
+
+        if let Some(tx_hash) = completed.tx_hash {
+            writeln!(stdout, "   Alpaca tx hash: {tx_hash}")?;
+        }
+
+        if completed.status == TokenizationRequestStatus::Rejected {
+            writeln!(stdout, "❌ Tokenization was rejected by Alpaca")?;
+            return Ok(());
+        }
+    }
+
+    writeln!(stdout, "   Polling for tokens to arrive on Base...")?;
+
+    let poll_interval = Duration::from_secs(5);
+    let max_attempts = 60; // 5 minutes max
+
+    for attempt in 1..=max_attempts {
+        let current_balance = erc20.balanceOf(receiving_wallet).call().await?;
+
+        if current_balance >= expected_final {
+            writeln!(stdout, "   Final balance: {current_balance}")?;
+            writeln!(stdout, "✅ Tokenization completed - tokens received!")?;
+            return Ok(());
+        }
+
+        if attempt % 6 == 0 {
+            writeln!(
+                stdout,
+                "   Still waiting... (attempt {attempt}/{max_attempts}, balance: {current_balance})",
+            )?;
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    let final_balance = erc20.balanceOf(receiving_wallet).call().await?;
+    writeln!(stdout, "   Final balance: {final_balance}")?;
+    writeln!(stdout, "⏳ Timed out waiting for tokens (may still arrive)")?;
+
+    Ok(())
+}
+
+/// Isolated redemption command - calls Alpaca tokenization API directly.
+pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
+    stdout: &mut W,
+    symbol: Symbol,
+    quantity: FractionalShares,
+    token: Address,
+    config: &Config,
+    provider: P,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
+    writeln!(stdout, "   Symbol: {symbol}")?;
+    writeln!(stdout, "   Quantity: {quantity}")?;
+    writeln!(stdout, "   Token: {token}")?;
+
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("alpaca-redeem requires rebalancing configuration for wallet addresses")
+    })?;
+
+    let redemption_wallet = rebalancing_config.redemption_wallet;
+    writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
+
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let provider_with_wallet = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_provider(provider);
+
+    let tokenization_service = AlpacaTokenizationService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
+        provider_with_wallet,
+        redemption_wallet,
+    );
+
+    let amount = quantity.to_u256_18_decimals()?;
+    writeln!(stdout, "   Amount (wei): {amount}")?;
+
+    writeln!(stdout, "   Sending tokens to redemption wallet...")?;
+
+    let tx_hash = tokenization_service
+        .send_for_redemption(token, amount)
+        .await?;
+
+    writeln!(stdout, "   Transfer tx: {tx_hash}")?;
+    writeln!(stdout, "   Waiting for Alpaca to detect transfer...")?;
+
+    let request = tokenization_service.poll_for_redemption(&tx_hash).await?;
+
+    writeln!(stdout, "   Request ID: {}", request.id.0)?;
+    writeln!(stdout, "   Status: {:?}", request.status)?;
+
+    if request.status == TokenizationRequestStatus::Pending {
+        writeln!(stdout, "   Polling until completion...")?;
+
+        let completed = tokenization_service
+            .poll_redemption_until_complete(&request.id)
+            .await?;
+
+        writeln!(stdout, "   Final status: {:?}", completed.status)?;
+
+        match completed.status {
+            TokenizationRequestStatus::Completed => {
+                writeln!(stdout, "✅ Redemption completed successfully")?;
+            }
+            TokenizationRequestStatus::Rejected => {
+                writeln!(stdout, "❌ Redemption was rejected")?;
+            }
+            TokenizationRequestStatus::Pending => {
+                writeln!(stdout, "⏳ Redemption still pending (polling timed out)")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// List all Alpaca tokenization requests.
+pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider + Clone>(
+    stdout: &mut W,
+    config: &Config,
+    provider: P,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "📋 Listing Alpaca tokenization requests")?;
+
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("alpaca-tokenization-requests requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "alpaca-tokenization-requests requires rebalancing configuration for account ID"
+        )
+    })?;
+
+    let tokenization_service = AlpacaTokenizationService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
+        provider,
+        rebalancing_config.redemption_wallet,
+    );
+
+    let requests = tokenization_service.list_requests().await?;
+
+    if requests.is_empty() {
+        writeln!(stdout, "   No tokenization requests found")?;
+        return Ok(());
+    }
+
+    writeln!(stdout, "   Found {} request(s):", requests.len())?;
+    writeln!(stdout)?;
+
+    for request in requests {
+        format_tokenization_request(stdout, &request)?;
+    }
+
+    Ok(())
+}
+
+fn format_tokenization_request<W: Write>(
+    stdout: &mut W,
+    request: &TokenizationRequest,
+) -> io::Result<()> {
+    let type_str = request
+        .r#type
+        .map_or_else(|| "unknown".to_string(), |t| t.to_string());
+
+    let status_str = match request.status {
+        TokenizationRequestStatus::Pending => "⏳ pending",
+        TokenizationRequestStatus::Completed => "✅ completed",
+        TokenizationRequestStatus::Rejected => "❌ rejected",
+    };
+
+    writeln!(stdout, "   ─────────────────────────────────────")?;
+    writeln!(stdout, "   ID:       {}", request.id.0)?;
+    writeln!(stdout, "   Type:     {type_str}")?;
+    writeln!(stdout, "   Status:   {status_str}")?;
+    writeln!(stdout, "   Symbol:   {}", request.underlying_symbol)?;
+    writeln!(stdout, "   Quantity: {}", request.quantity)?;
+
+    if let Some(ref wallet) = request.wallet {
+        writeln!(stdout, "   Wallet:   {wallet}")?;
+    }
+
+    writeln!(stdout, "   Created:  {}", request.created_at)?;
+
+    if let Some(ref tx_hash) = request.tx_hash {
+        writeln!(stdout, "   Tx Hash:  {tx_hash}")?;
+    }
+
+    if let Some(ref issuer_id) = request.issuer_request_id {
+        writeln!(stdout, "   Issuer ID: {}", issuer_id.0)?;
     }
 
     Ok(())

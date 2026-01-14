@@ -31,6 +31,15 @@ pub enum TransferDirection {
     ToAlpaca,
 }
 
+/// Direction for USDC/USD conversion on Alpaca.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ConvertDirection {
+    /// Convert USDC to USD buying power (sell USDC/USD)
+    ToUsd,
+    /// Convert USD buying power to USDC (buy USDC/USD)
+    ToUsdc,
+}
+
 /// CCTP chain identifier for specifying source chain.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CctpChain {
@@ -225,6 +234,63 @@ pub enum Commands {
         #[arg(long = "chain")]
         chain: CctpChain,
     },
+
+    /// Request tokenization of shares via Alpaca (isolated test command)
+    ///
+    /// Calls the Alpaca tokenization API to convert offchain shares to onchain tokens.
+    /// This is an isolated test command that only interacts with Alpaca's API,
+    /// without any Raindex/vault operations.
+    AlpacaTokenize {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of shares to tokenize (supports fractional shares)
+        #[arg(short = 'q', long = "quantity")]
+        quantity: FractionalShares,
+        /// Wallet address to receive tokens (defaults to MARKET_MAKER_WALLET from env)
+        #[arg(short = 'w', long = "wallet")]
+        wallet: Option<Address>,
+        /// Token contract address (to verify balance after tokenization)
+        #[arg(short = 't', long = "token")]
+        token: Address,
+    },
+
+    /// Request redemption of tokenized shares via Alpaca (isolated test command)
+    ///
+    /// Calls the Alpaca tokenization API to convert onchain tokens back to offchain shares.
+    /// This is an isolated test command that only interacts with Alpaca's API,
+    /// without any Raindex/vault operations.
+    AlpacaRedeem {
+        /// Stock symbol (e.g., AAPL, TSLA)
+        #[arg(short = 's', long = "symbol")]
+        symbol: Symbol,
+        /// Number of shares to redeem (supports fractional shares)
+        #[arg(short = 'q', long = "quantity")]
+        quantity: FractionalShares,
+        /// Token contract address
+        #[arg(short = 't', long = "token")]
+        token: Address,
+    },
+
+    /// Convert USDC to/from USD on Alpaca
+    ///
+    /// Uses the USDC/USD trading pair to convert between USDC (crypto) and USD (buying power).
+    /// - `to-usd`: Sell USDC for USD buying power
+    /// - `to-usdc`: Buy USDC with USD buying power
+    AlpacaConvert {
+        /// Conversion direction
+        #[arg(short = 'd', long = "direction")]
+        direction: ConvertDirection,
+        /// Amount of USDC to convert
+        #[arg(short = 'a', long = "amount")]
+        amount: Usdc,
+    },
+
+    /// List all Alpaca tokenization requests
+    ///
+    /// Shows mint and redemption requests for the Alpaca account.
+    /// Useful for debugging tokenization status without creating new requests.
+    AlpacaTokenizationRequests,
 }
 
 #[derive(Debug, Parser)]
@@ -273,32 +339,177 @@ async fn execute_order<W: Write>(
     trading::execute_order_with_writers(symbol, quantity, direction, config, pool, stdout).await
 }
 
+/// Commands that don't require a WebSocket provider.
+enum SimpleCommand {
+    Buy {
+        symbol: Symbol,
+        quantity: u64,
+    },
+    Sell {
+        symbol: Symbol,
+        quantity: u64,
+    },
+    Auth,
+    TransferEquity {
+        direction: TransferDirection,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        token_address: Option<Address>,
+    },
+    AlpacaDeposit {
+        amount: Usdc,
+    },
+    AlpacaWithdraw {
+        amount: Usdc,
+        to_address: Option<Address>,
+    },
+    AlpacaWhitelist {
+        address: Option<Address>,
+    },
+    AlpacaTransfers,
+    AlpacaConvert {
+        direction: ConvertDirection,
+        amount: Usdc,
+    },
+}
+
+/// Commands that require a WebSocket provider.
+enum ProviderCommand {
+    ProcessTx {
+        tx_hash: B256,
+    },
+    TransferUsdc {
+        direction: TransferDirection,
+        amount: Usdc,
+    },
+    VaultDeposit {
+        amount: Usdc,
+    },
+    VaultWithdraw {
+        amount: Usdc,
+    },
+    CctpBridge {
+        amount: Option<Usdc>,
+        all: bool,
+        from: CctpChain,
+    },
+    CctpRecover {
+        burn_tx: B256,
+        source_chain: CctpChain,
+    },
+    ResetAllowance {
+        chain: CctpChain,
+    },
+    AlpacaTokenize {
+        symbol: Symbol,
+        quantity: FractionalShares,
+        wallet: Option<Address>,
+        token: Address,
+    },
+    AlpacaRedeem {
+        symbol: Symbol,
+        quantity: FractionalShares,
+        token: Address,
+    },
+    AlpacaTokenizationRequests,
+}
+
 async fn run_command_with_writers<W: Write>(
     config: Config,
     command: Commands,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let ws_url = config.evm.ws_rpc_url.as_str();
+    match classify_command(command) {
+        Ok(simple) => run_simple_command(simple, &config, pool, stdout).await?,
+        Err(provider_cmd) => run_provider_command(provider_cmd, &config, pool, stdout).await?,
+    }
 
+    info!("CLI operation completed successfully");
+    Ok(())
+}
+
+fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
-        Commands::Buy { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Buy, &config, pool, stdout).await?;
-        }
-        Commands::Sell { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Sell, &config, pool, stdout).await?;
-        }
-        Commands::ProcessTx { tx_hash } => {
-            info!("Processing transaction: tx_hash={tx_hash}");
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, &config, pool, stdout, &provider, &cache)
-                .await?;
-        }
-        Commands::Auth => auth::auth_command(stdout, &config.broker, pool).await?,
+        Commands::Buy { symbol, quantity } => Ok(SimpleCommand::Buy { symbol, quantity }),
+        Commands::Sell { symbol, quantity } => Ok(SimpleCommand::Sell { symbol, quantity }),
+        Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
+            direction,
+            symbol,
+            quantity,
+            token_address,
+        } => Ok(SimpleCommand::TransferEquity {
+            direction,
+            symbol,
+            quantity,
+            token_address,
+        }),
+        Commands::AlpacaDeposit { amount } => Ok(SimpleCommand::AlpacaDeposit { amount }),
+        Commands::AlpacaWithdraw { amount, to_address } => {
+            Ok(SimpleCommand::AlpacaWithdraw { amount, to_address })
+        }
+        Commands::AlpacaWhitelist { address } => Ok(SimpleCommand::AlpacaWhitelist { address }),
+        Commands::AlpacaTransfers => Ok(SimpleCommand::AlpacaTransfers),
+        Commands::AlpacaConvert { direction, amount } => {
+            Ok(SimpleCommand::AlpacaConvert { direction, amount })
+        }
+        Commands::AlpacaTokenizationRequests => Err(ProviderCommand::AlpacaTokenizationRequests),
+        Commands::ProcessTx { tx_hash } => Err(ProviderCommand::ProcessTx { tx_hash }),
+        Commands::TransferUsdc { direction, amount } => {
+            Err(ProviderCommand::TransferUsdc { direction, amount })
+        }
+        Commands::VaultDeposit { amount } => Err(ProviderCommand::VaultDeposit { amount }),
+        Commands::VaultWithdraw { amount } => Err(ProviderCommand::VaultWithdraw { amount }),
+        Commands::CctpBridge { amount, all, from } => {
+            Err(ProviderCommand::CctpBridge { amount, all, from })
+        }
+        Commands::CctpRecover {
+            burn_tx,
+            source_chain,
+        } => Err(ProviderCommand::CctpRecover {
+            burn_tx,
+            source_chain,
+        }),
+        Commands::ResetAllowance { chain } => Err(ProviderCommand::ResetAllowance { chain }),
+        Commands::AlpacaTokenize {
+            symbol,
+            quantity,
+            wallet,
+            token,
+        } => Err(ProviderCommand::AlpacaTokenize {
+            symbol,
+            quantity,
+            wallet,
+            token,
+        }),
+        Commands::AlpacaRedeem {
+            symbol,
+            quantity,
+            token,
+        } => Err(ProviderCommand::AlpacaRedeem {
+            symbol,
+            quantity,
+            token,
+        }),
+    }
+}
+
+async fn run_simple_command<W: Write>(
+    command: SimpleCommand,
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    match command {
+        SimpleCommand::Buy { symbol, quantity } => {
+            execute_order(symbol, quantity, Direction::Buy, config, pool, stdout).await
+        }
+        SimpleCommand::Sell { symbol, quantity } => {
+            execute_order(symbol, quantity, Direction::Sell, config, pool, stdout).await
+        }
+        SimpleCommand::Auth => auth::auth_command(stdout, &config.broker, pool).await,
+        SimpleCommand::TransferEquity {
             direction,
             symbol,
             quantity,
@@ -310,67 +521,89 @@ async fn run_command_with_writers<W: Write>(
                 &symbol,
                 quantity,
                 token_address,
-                &config,
+                config,
                 pool,
             )
-            .await?;
+            .await
         }
-        Commands::TransferUsdc { direction, amount } => {
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            rebalancing::transfer_usdc_command(stdout, direction, amount, &config, pool, provider)
-                .await?;
+        SimpleCommand::AlpacaDeposit { amount } => {
+            alpaca_wallet::alpaca_deposit_command(stdout, amount, config).await
         }
-        Commands::AlpacaDeposit { amount } => {
-            alpaca_wallet::alpaca_deposit_command(stdout, amount, &config).await?;
+        SimpleCommand::AlpacaWithdraw { amount, to_address } => {
+            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, config).await
         }
-        Commands::AlpacaWithdraw { amount, to_address } => {
-            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, &config).await?;
+        SimpleCommand::AlpacaWhitelist { address } => {
+            alpaca_wallet::alpaca_whitelist_command(stdout, address, config).await
         }
-        Commands::AlpacaWhitelist { address } => {
-            alpaca_wallet::alpaca_whitelist_command(stdout, address, &config).await?;
+        SimpleCommand::AlpacaTransfers => {
+            alpaca_wallet::alpaca_transfers_command(stdout, config).await
         }
-        Commands::AlpacaTransfers => {
-            alpaca_wallet::alpaca_transfers_command(stdout, &config).await?;
-        }
-        Commands::VaultDeposit { amount } => {
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            vault::vault_deposit_command(stdout, amount, &config, provider).await?;
-        }
-        Commands::VaultWithdraw { amount } => {
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            vault::vault_withdraw_command(stdout, amount, &config, provider).await?;
-        }
-        Commands::CctpBridge { amount, all, from } => {
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            cctp::cctp_bridge_command(stdout, amount, all, from, &config, provider).await?;
-        }
-        Commands::CctpRecover {
-            burn_tx,
-            source_chain,
-        } => {
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            cctp::cctp_recover_command(stdout, burn_tx, source_chain, &config, provider).await?;
-        }
-        Commands::ResetAllowance { chain } => {
-            let provider = ProviderBuilder::new()
-                .connect_ws(WsConnect::new(ws_url))
-                .await?;
-            cctp::reset_allowance_command(stdout, chain, &config, provider).await?;
+        SimpleCommand::AlpacaConvert { direction, amount } => {
+            alpaca_wallet::alpaca_convert_command(stdout, direction, amount, config).await
         }
     }
+}
 
-    info!("CLI operation completed successfully");
-    Ok(())
+async fn run_provider_command<W: Write>(
+    command: ProviderCommand,
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let provider = ProviderBuilder::new()
+        .connect_ws(WsConnect::new(config.evm.ws_rpc_url.as_str()))
+        .await?;
+
+    match command {
+        ProviderCommand::ProcessTx { tx_hash } => {
+            info!("Processing transaction: tx_hash={tx_hash}");
+            let cache = SymbolCache::default();
+            trading::process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache)
+                .await
+        }
+        ProviderCommand::TransferUsdc { direction, amount } => {
+            rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
+                .await
+        }
+        ProviderCommand::VaultDeposit { amount } => {
+            vault::vault_deposit_command(stdout, amount, config, provider).await
+        }
+        ProviderCommand::VaultWithdraw { amount } => {
+            vault::vault_withdraw_command(stdout, amount, config, provider).await
+        }
+        ProviderCommand::CctpBridge { amount, all, from } => {
+            cctp::cctp_bridge_command(stdout, amount, all, from, config, provider).await
+        }
+        ProviderCommand::CctpRecover {
+            burn_tx,
+            source_chain,
+        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, config, provider).await,
+        ProviderCommand::ResetAllowance { chain } => {
+            cctp::reset_allowance_command(stdout, chain, config, provider).await
+        }
+        ProviderCommand::AlpacaTokenize {
+            symbol,
+            quantity,
+            wallet,
+            token,
+        } => {
+            rebalancing::alpaca_tokenize_command(
+                stdout, symbol, quantity, wallet, token, config, provider,
+            )
+            .await
+        }
+        ProviderCommand::AlpacaRedeem {
+            symbol,
+            quantity,
+            token,
+        } => {
+            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, config, provider)
+                .await
+        }
+        ProviderCommand::AlpacaTokenizationRequests => {
+            rebalancing::alpaca_tokenization_requests_command(stdout, config, provider).await
+        }
+    }
 }
 
 #[cfg(test)]
