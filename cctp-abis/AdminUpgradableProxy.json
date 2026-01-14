@@ -1,0 +1,306 @@
+{
+  "abi": [
+    {
+      "type": "constructor",
+      "inputs": [
+        { "name": "_logic", "type": "address", "internalType": "address" },
+        { "name": "admin_", "type": "address", "internalType": "address" },
+        { "name": "_data", "type": "bytes", "internalType": "bytes" }
+      ],
+      "stateMutability": "payable"
+    },
+    { "type": "fallback", "stateMutability": "payable" },
+    { "type": "receive", "stateMutability": "payable" },
+    {
+      "type": "function",
+      "name": "admin",
+      "inputs": [],
+      "outputs": [
+        { "name": "admin_", "type": "address", "internalType": "address" }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "changeAdmin",
+      "inputs": [
+        { "name": "newAdmin", "type": "address", "internalType": "address" }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "implementation",
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "implementation_",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "stateMutability": "view"
+    },
+    {
+      "type": "function",
+      "name": "upgradeTo",
+      "inputs": [
+        {
+          "name": "newImplementation",
+          "type": "address",
+          "internalType": "address"
+        }
+      ],
+      "outputs": [],
+      "stateMutability": "nonpayable"
+    },
+    {
+      "type": "function",
+      "name": "upgradeToAndCall",
+      "inputs": [
+        {
+          "name": "newImplementation",
+          "type": "address",
+          "internalType": "address"
+        },
+        { "name": "data", "type": "bytes", "internalType": "bytes" }
+      ],
+      "outputs": [],
+      "stateMutability": "payable"
+    },
+    {
+      "type": "event",
+      "name": "AdminChanged",
+      "inputs": [
+        {
+          "name": "previousAdmin",
+          "type": "address",
+          "indexed": false,
+          "internalType": "address"
+        },
+        {
+          "name": "newAdmin",
+          "type": "address",
+          "indexed": false,
+          "internalType": "address"
+        }
+      ],
+      "anonymous": false
+    },
+    {
+      "type": "event",
+      "name": "Upgraded",
+      "inputs": [
+        {
+          "name": "implementation",
+          "type": "address",
+          "indexed": true,
+          "internalType": "address"
+        }
+      ],
+      "anonymous": false
+    }
+  ],
+  "bytecode": {
+    "object": "0x608060405260405162000cd038038062000cd0833981810160405260608110156200002957600080fd5b815160208301516040808501805191519395929483019291846401000000008211156200005557600080fd5b9083019060208201858111156200006b57600080fd5b82516401000000008111828201881017156200008657600080fd5b82525081516020918201929091019080838360005b83811015620000b55781810151838201526020016200009b565b50505050905090810190601f168015620000e35780820380516001836020036101000a031916815260200191505b5060405250849150829050620000f98262000137565b8051156200011a57620001188282620001ae60201b620003fb1760201c565b505b50620001239050565b6200012e82620001dd565b505050620003be565b6200014d816200020160201b620004271760201c565b6200018a5760405162461bcd60e51b815260040180806020018281038252603681526020018062000c746036913960400191505060405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc55565b6060620001d6838360405180606001604052806027815260200162000c4d6027913962000207565b9392505050565b7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d610355565b3b151590565b6060620002148462000201565b620002515760405162461bcd60e51b815260040180806020018281038252602681526020018062000caa6026913960400191505060405180910390fd5b600080856001600160a01b0316856040518082805190602001908083835b60208310620002905780518252601f1990920191602091820191016200026f565b6001836020036101000a038019825116818451168082178552505050505050905001915050600060405180830381855af49150503d8060008114620002f2576040519150601f19603f3d011682016040523d82523d6000602084013e620002f7565b606091505b5090925090506200030a82828662000314565b9695505050505050565b6060831562000325575081620001d6565b825115620003365782518084602001fd5b8160405162461bcd60e51b81526004018080602001828103825283818151815260200191508051906020019080838360005b838110156200038257818101518382015260200162000368565b50505050905090810190601f168015620003b05780820380516001836020036101000a031916815260200191505b509250505060405180910390fd5b61087f80620003ce6000396000f3fe60806040526004361061005e5760003560e01c80635c60da1b116100435780635c60da1b146101425780638f28397014610180578063f851a440146101c05761006d565b80633659cfe6146100755780634f1ef286146100b55761006d565b3661006d5761006b6101d5565b005b61006b6101d5565b34801561008157600080fd5b5061006b6004803603602081101561009857600080fd5b503573ffffffffffffffffffffffffffffffffffffffff166101ef565b61006b600480360360408110156100cb57600080fd5b73ffffffffffffffffffffffffffffffffffffffff823516919081019060408101602082013564010000000081111561010357600080fd5b82018360208201111561011557600080fd5b8035906020019184600183028401116401000000008311171561013757600080fd5b509092509050610243565b34801561014e57600080fd5b506101576102da565b6040805173ffffffffffffffffffffffffffffffffffffffff9092168252519081900360200190f35b34801561018c57600080fd5b5061006b600480360360208110156101a357600080fd5b503573ffffffffffffffffffffffffffffffffffffffff166102e9565b3480156101cc57600080fd5b506101576103f1565b6101dd6101ed565b6101ed6101e861042d565b610452565b565b6101f7610476565b73ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff161415610238576102338161049b565b610240565b6102406101d5565b50565b61024b610476565b73ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614156102cd576102878361049b565b6102c78383838080601f0160208091040260200160405190810160405280939291908181526020018383808284376000920191909152506103fb92505050565b506102d5565b6102d56101d5565b505050565b60006102e461042d565b905090565b6102f1610476565b73ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614156102385773ffffffffffffffffffffffffffffffffffffffff8116610390576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260338152602001806107946033913960400191505060405180910390fd5b7f7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f6103b9610476565b6040805173ffffffffffffffffffffffffffffffffffffffff928316815291841660208301528051918290030190a1610233816104e8565b60006102e4610476565b606061042083836040518060600160405280602781526020016107c76027913961050c565b9392505050565b3b151590565b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5490565b3660008037600080366000845af43d6000803e808015610471573d6000f35b3d6000fd5b7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d61035490565b6104a481610653565b60405173ffffffffffffffffffffffffffffffffffffffff8216907fbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b90600090a250565b7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d610355565b606061051784610427565b61056c576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260268152602001806108246026913960400191505060405180910390fd5b6000808573ffffffffffffffffffffffffffffffffffffffff16856040518082805190602001908083835b602083106105d457805182527fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe09092019160209182019101610597565b6001836020036101000a038019825116818451168082178552505050505050905001915050600060405180830381855af49150503d8060008114610634576040519150601f19603f3d011682016040523d82523d6000602084013e610639565b606091505b50915091506106498282866106d5565b9695505050505050565b61065c81610427565b6106b1576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260368152602001806107ee6036913960400191505060405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc55565b606083156106e4575081610420565b8251156106f45782518084602001fd5b816040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825283818151815260200191508051906020019080838360005b83811015610758578181015183820152602001610740565b50505050905090810190601f1680156107855780820380516001836020036101000a031916815260200191505b509250505060405180910390fdfe41646d696e55706772616461626c6550726f78793a206e65772061646d696e20697320746865207a65726f2061646472657373416464726573733a206c6f772d6c6576656c2064656c65676174652063616c6c206661696c65645570677261646561626c6550726f78793a206e657720696d706c656d656e746174696f6e206973206e6f74206120636f6e7472616374416464726573733a2064656c65676174652063616c6c20746f206e6f6e2d636f6e7472616374a2646970667358221220068f811348b609f5517cbc7465c83b11974babdf4b0be88e961401326b39178264736f6c63430007060033416464726573733a206c6f772d6c6576656c2064656c65676174652063616c6c206661696c65645570677261646561626c6550726f78793a206e657720696d706c656d656e746174696f6e206973206e6f74206120636f6e7472616374416464726573733a2064656c65676174652063616c6c20746f206e6f6e2d636f6e7472616374",
+    "sourceMap": "1581:3393:64:-:0;;;2533:293;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;2533:293:64;;;;;;;;;;-1:-1:-1;2533:293:64;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;2533:293:64;;-1:-1:-1;2652:6:64;;-1:-1:-1;2660:5:64;;-1:-1:-1;1197:26:30;1216:6;1197:18;:26::i;:::-;1236:12;;:16;1233:89;;1268:43;1297:6;1305:5;1268:28;;;;;:43;;:::i;:::-;;1233:89;-1:-1:-1;2677:115:64::1;::::0;-1:-1:-1;2677:115:64;::::1;2802:17;2812:6:::0;2802:9:::1;:17::i;:::-;2533:293:::0;;;1581:3393;;2492:360:30;2573:37;2592:17;2573:18;;;;;:37;;:::i;:::-;2565:104;;;;-1:-1:-1;;;2565:104:30;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;1727:66;2805:31;2791:55::o;6284:198:33:-;6367:12;6398:77;6419:6;6427:4;6398:77;;;;;;;;;;;;;;;;;:20;:77::i;:::-;6391:84;6284:198;-1:-1:-1;;;6284:198:33:o;4820:152:64:-;2016:66;4934:22;4920:46::o;726:413:33:-;1086:20;1124:8;;;726:413::o;6668:417::-;6779:12;6811:18;6822:6;6811:10;:18::i;:::-;6803:69;;;;-1:-1:-1;;;6803:69:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;6943:12;6957:23;6984:6;-1:-1:-1;;;;;6984:19:33;7004:4;6984:25;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;;6984:25:33;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;6942:67:33;;-1:-1:-1;6942:67:33;-1:-1:-1;7026:52:33;6942:67;;7065:12;7026:17;:52::i;:::-;7019:59;6668:417;-1:-1:-1;;;;;;6668:417:33:o;7091:725::-;7206:12;7234:7;7230:580;;;-1:-1:-1;7264:10:33;7257:17;;7230:580;7375:17;;:21;7371:429;;7633:10;7627:17;7693:15;7680:10;7676:2;7672:19;7665:44;7582:145;7765:20;;-1:-1:-1;7765:20:33;;;;;;;;;;;;;;;;;7772:12;;7765:20;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;1581:3393:64;;;;;;;",
+    "linkReferences": {}
+  },
+  "deployedBytecode": {
+    "object": "0x60806040526004361061005e5760003560e01c80635c60da1b116100435780635c60da1b146101425780638f28397014610180578063f851a440146101c05761006d565b80633659cfe6146100755780634f1ef286146100b55761006d565b3661006d5761006b6101d5565b005b61006b6101d5565b34801561008157600080fd5b5061006b6004803603602081101561009857600080fd5b503573ffffffffffffffffffffffffffffffffffffffff166101ef565b61006b600480360360408110156100cb57600080fd5b73ffffffffffffffffffffffffffffffffffffffff823516919081019060408101602082013564010000000081111561010357600080fd5b82018360208201111561011557600080fd5b8035906020019184600183028401116401000000008311171561013757600080fd5b509092509050610243565b34801561014e57600080fd5b506101576102da565b6040805173ffffffffffffffffffffffffffffffffffffffff9092168252519081900360200190f35b34801561018c57600080fd5b5061006b600480360360208110156101a357600080fd5b503573ffffffffffffffffffffffffffffffffffffffff166102e9565b3480156101cc57600080fd5b506101576103f1565b6101dd6101ed565b6101ed6101e861042d565b610452565b565b6101f7610476565b73ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff161415610238576102338161049b565b610240565b6102406101d5565b50565b61024b610476565b73ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614156102cd576102878361049b565b6102c78383838080601f0160208091040260200160405190810160405280939291908181526020018383808284376000920191909152506103fb92505050565b506102d5565b6102d56101d5565b505050565b60006102e461042d565b905090565b6102f1610476565b73ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff1614156102385773ffffffffffffffffffffffffffffffffffffffff8116610390576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260338152602001806107946033913960400191505060405180910390fd5b7f7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f6103b9610476565b6040805173ffffffffffffffffffffffffffffffffffffffff928316815291841660208301528051918290030190a1610233816104e8565b60006102e4610476565b606061042083836040518060600160405280602781526020016107c76027913961050c565b9392505050565b3b151590565b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc5490565b3660008037600080366000845af43d6000803e808015610471573d6000f35b3d6000fd5b7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d61035490565b6104a481610653565b60405173ffffffffffffffffffffffffffffffffffffffff8216907fbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b90600090a250565b7fb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d610355565b606061051784610427565b61056c576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260268152602001806108246026913960400191505060405180910390fd5b6000808573ffffffffffffffffffffffffffffffffffffffff16856040518082805190602001908083835b602083106105d457805182527fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe09092019160209182019101610597565b6001836020036101000a038019825116818451168082178552505050505050905001915050600060405180830381855af49150503d8060008114610634576040519150601f19603f3d011682016040523d82523d6000602084013e610639565b606091505b50915091506106498282866106d5565b9695505050505050565b61065c81610427565b6106b1576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260368152602001806107ee6036913960400191505060405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc55565b606083156106e4575081610420565b8251156106f45782518084602001fd5b816040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825283818151815260200191508051906020019080838360005b83811015610758578181015183820152602001610740565b50505050905090810190601f1680156107855780820380516001836020036101000a031916815260200191505b509250505060405180910390fdfe41646d696e55706772616461626c6550726f78793a206e65772061646d696e20697320746865207a65726f2061646472657373416464726573733a206c6f772d6c6576656c2064656c65676174652063616c6c206661696c65645570677261646561626c6550726f78793a206e657720696d706c656d656e746174696f6e206973206e6f74206120636f6e7472616374416464726573733a2064656c65676174652063616c6c20746f206e6f6e2d636f6e7472616374a2646970667358221220068f811348b609f5517cbc7465c83b11974babdf4b0be88e961401326b39178264736f6c63430007060033",
+    "sourceMap": "1581:3393:64:-:0;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;2843:11:29;:9;:11::i;:::-;1581:3393:64;;2619:11:29;:9;:11::i;3794:117:64:-;;;;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;3794:117:64;;;;:::i;4274:238::-;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;4274:238:64;;-1:-1:-1;4274:238:64;-1:-1:-1;4274:238:64;:::i;3047:126::-;;;;;;;;;;;;;:::i;:::-;;;;;;;;;;;;;;;;;;;3363:277;;;;;;;;;;;;;;;;;;;;;;;;;;-1:-1:-1;3363:277:64;;;;:::i;2887:90::-;;;;;;;;;;;;;:::i;2265:110:29:-;2313:17;:15;:17::i;:::-;2340:28;2350:17;:15;:17::i;:::-;2340:9;:28::i;:::-;2265:110::o;3794:117:64:-;2271:8;:6;:8::i;:::-;2257:22;;:10;:22;;;2253:96;;;3875:29:::1;3886:17;3875:10;:29::i;:::-;2253:96:::0;;;2327:11;:9;:11::i;:::-;3794:117;:::o;4274:238::-;2271:8;:6;:8::i;:::-;2257:22;;:10;:22;;;2253:96;;;4413:29:::1;4424:17;4413:10;:29::i;:::-;4452:53;4481:17;4500:4;;4452:53;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;::::0;::::1;::::0;;;;-1:-1:-1;4452:28:64::1;::::0;-1:-1:-1;;;4452:53:64:i:1;:::-;;2253:96:::0;;;2327:11;:9;:11::i;:::-;4274:238;;;:::o;3047:126::-;3096:23;3149:17;:15;:17::i;:::-;3131:35;;3047:126;:::o;3363:277::-;2271:8;:6;:8::i;:::-;2257:22;;:10;:22;;;2253:96;;;3458:22:::1;::::0;::::1;3437:120;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;3572:32;3585:8;:6;:8::i;:::-;3572:32;::::0;;::::1;::::0;;::::1;::::0;;;;::::1;;::::0;::::1;::::0;;;;;;;;;::::1;3614:19;3624:8;3614:9;:19::i;2887:90::-:0;2927:14;2962:8;:6;:8::i;6284:198:33:-;6367:12;6398:77;6419:6;6427:4;6398:77;;;;;;;;;;;;;;;;;:20;:77::i;:::-;6391:84;6284:198;-1:-1:-1;;;6284:198:33:o;726:413::-;1086:20;1124:8;;;726:413::o;1872:250:30:-;1727:66;2095:11;;2073:43::o;891:895:29:-;1285:14;1282:1;1279;1266:34;1499:1;1496;1480:14;1477:1;1461:14;1454:5;1441:60;1575:16;1572:1;1569;1554:38;1613:6;1680:38;;;;1751:16;1748:1;1741:27;1680:38;1699:16;1696:1;1689:27;4573:165:64;2016:66;4711:11;;4690:42::o;2241:160:30:-;2315:37;2334:17;2315:18;:37::i;:::-;2367:27;;;;;;;;;;;2241:160;:::o;4820:152:64:-;2016:66;4934:22;4920:46::o;6668:417:33:-;6779:12;6811:18;6822:6;6811:10;:18::i;:::-;6803:69;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;6943:12;6957:23;6984:6;:19;;7004:4;6984:25;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;6942:67;;;;7026:52;7044:7;7053:10;7065:12;7026:17;:52::i;:::-;7019:59;6668:417;-1:-1:-1;;;;;;6668:417:33:o;2492:360:30:-;2573:37;2592:17;2573:18;:37::i;:::-;2565:104;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;1727:66;2805:31;2791:55::o;7091:725:33:-;7206:12;7234:7;7230:580;;;-1:-1:-1;7264:10:33;7257:17;;7230:580;7375:17;;:21;7371:429;;7633:10;7627:17;7693:15;7680:10;7676:2;7672:19;7665:44;7582:145;7772:12;7765:20;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;",
+    "linkReferences": {}
+  },
+  "methodIdentifiers": {
+    "admin()": "f851a440",
+    "changeAdmin(address)": "8f283970",
+    "implementation()": "5c60da1b",
+    "upgradeTo(address)": "3659cfe6",
+    "upgradeToAndCall(address,bytes)": "4f1ef286"
+  },
+  "rawMetadata": "{\"compiler\":{\"version\":\"0.7.6+commit.7338295f\"},\"language\":\"Solidity\",\"output\":{\"abi\":[{\"inputs\":[{\"internalType\":\"address\",\"name\":\"_logic\",\"type\":\"address\"},{\"internalType\":\"address\",\"name\":\"admin_\",\"type\":\"address\"},{\"internalType\":\"bytes\",\"name\":\"_data\",\"type\":\"bytes\"}],\"stateMutability\":\"payable\",\"type\":\"constructor\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":false,\"internalType\":\"address\",\"name\":\"previousAdmin\",\"type\":\"address\"},{\"indexed\":false,\"internalType\":\"address\",\"name\":\"newAdmin\",\"type\":\"address\"}],\"name\":\"AdminChanged\",\"type\":\"event\"},{\"anonymous\":false,\"inputs\":[{\"indexed\":true,\"internalType\":\"address\",\"name\":\"implementation\",\"type\":\"address\"}],\"name\":\"Upgraded\",\"type\":\"event\"},{\"stateMutability\":\"payable\",\"type\":\"fallback\"},{\"inputs\":[],\"name\":\"admin\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"admin_\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"newAdmin\",\"type\":\"address\"}],\"name\":\"changeAdmin\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[],\"name\":\"implementation\",\"outputs\":[{\"internalType\":\"address\",\"name\":\"implementation_\",\"type\":\"address\"}],\"stateMutability\":\"view\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"newImplementation\",\"type\":\"address\"}],\"name\":\"upgradeTo\",\"outputs\":[],\"stateMutability\":\"nonpayable\",\"type\":\"function\"},{\"inputs\":[{\"internalType\":\"address\",\"name\":\"newImplementation\",\"type\":\"address\"},{\"internalType\":\"bytes\",\"name\":\"data\",\"type\":\"bytes\"}],\"name\":\"upgradeToAndCall\",\"outputs\":[],\"stateMutability\":\"payable\",\"type\":\"function\"},{\"stateMutability\":\"payable\",\"type\":\"receive\"}],\"devdoc\":{\"details\":\"Forked from https://github.com/OpenZeppelin/openzeppelin-contracts/blob/8e0296096449d9b1cd7c5631e917330635244c37/contracts/proxy/TransparentUpgradeableProxy.sol#L1 Modifications (10/1/2024): - Remove ifAdmin modifier from admin() and implementation() and updated natspec. - Update admin() and implementation() functions to be view functions. - Pin Solidity to 0.7.6. - Remove constructor visibility specifier. - Remove overriden _beforeFallback() implementation. - Bump constants, modifiers, and event declarations above constructor for consistency. - Use \\\"AdminUpgradableProxy\\\" in revert string\",\"events\":{\"AdminChanged(address,address)\":{\"details\":\"Emitted when the admin account has changed.\"}},\"kind\":\"dev\",\"methods\":{\"admin()\":{\"details\":\"Returns the current admin.\"},\"changeAdmin(address)\":{\"details\":\"Changes the admin of the proxy. Emits an {AdminChanged} event.Only the admin can call this function; other callers are delegated\"},\"constructor\":{\"details\":\"Initializes an upgradeable proxy managed by `_admin`, backed by the implementation at `_logic`, and optionally initialized with `_data`.\"},\"implementation()\":{\"details\":\"Returns the current implementation.\"},\"upgradeTo(address)\":{\"details\":\"Upgrade the implementation of the proxy.Only the admin can call this function; other callers are delegated\"},\"upgradeToAndCall(address,bytes)\":{\"details\":\"Upgrade the implementation of the proxy, and then call a function from the new implementation as specified by `data`, which should be an encoded function call. This is useful to initialize new storage variables in the proxied contract.Only the admin can call this function; other callers are delegated\"}},\"stateVariables\":{\"_ADMIN_SLOT\":{\"details\":\"Storage slot with the admin of the contract. This is the keccak-256 hash of \\\"eip1967.proxy.admin\\\" subtracted by 1, and is validated in the constructor.\"}},\"title\":\"AdminUpgradeableProxy\",\"version\":1},\"userdoc\":{\"kind\":\"user\",\"methods\":{},\"notice\":\"This contract combines an upgradeable proxy with an authorization mechanism for administrative tasks.\",\"version\":1}},\"settings\":{\"compilationTarget\":{\"src/proxy/AdminUpgradableProxy.sol\":\"AdminUpgradableProxy\"},\"evmVersion\":\"istanbul\",\"libraries\":{},\"metadata\":{\"bytecodeHash\":\"ipfs\"},\"optimizer\":{\"enabled\":true,\"runs\":100000},\"remappings\":[\":@memview-sol/=lib/memview-sol/\",\":@openzeppelin/=lib/openzeppelin-contracts/\",\":centre-tokens.git/=lib/centre-tokens.git/\",\":ds-test/=lib/ds-test/src/\",\":forge-std/=lib/forge-std/src/\",\":memview-sol/=lib/memview-sol/contracts/\",\":openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/\"]},\"sources\":{\"lib/openzeppelin-contracts/contracts/proxy/Proxy.sol\":{\"keccak256\":\"0x0414d54056b3d8f9102ae1142264e9361408397878148203ab7a25cbf6248f08\",\"license\":\"MIT\",\"urls\":[\"bzz-raw://ebdc01639f69030c754dc3462d5f437c4644164465066187e320f524579fbede\",\"dweb:/ipfs/QmZZhoPYagwu4MoJMAg26Y6Nfj4d9HJzUnvrMNsbo9ZorM\"]},\"lib/openzeppelin-contracts/contracts/proxy/UpgradeableProxy.sol\":{\"keccak256\":\"0x81af1059a5bd5fb25cb0351499e1d4110416f5b0000ffad6427cbf6088b193a4\",\"license\":\"MIT\",\"urls\":[\"bzz-raw://621f2fedaeeacf70ff1554748f63356555f591cdcf29c74e3d23a83720a078a2\",\"dweb:/ipfs/QmYGnscyZgJGYgXKcoYhNX2M6uoJiHS1zTsQnu5NsJxPGG\"]},\"lib/openzeppelin-contracts/contracts/utils/Address.sol\":{\"keccak256\":\"0x28911e614500ae7c607a432a709d35da25f3bc5ddc8bd12b278b66358070c0ea\",\"license\":\"MIT\",\"urls\":[\"bzz-raw://256c8c8af5eb072bc473226ab2b2187149b8fc04f5f4a4820db22527f5ce8e3c\",\"dweb:/ipfs/QmRvi5BhnL7Rxf85KrJhwM6RRhukm4tzoctRdgQEheNyiN\"]},\"src/proxy/AdminUpgradableProxy.sol\":{\"keccak256\":\"0x3c571050747644576286e807b97c6d33a192eec853785ac541b98a9ebc5b8bb1\",\"license\":\"Apache-2.0\",\"urls\":[\"bzz-raw://ee6094f0ddea1f80630a6a741beae15b7d74773ae2f02db78374fa57a4d83209\",\"dweb:/ipfs/QmbwzLahgqXRvHk5Nux1ESXJX1LT6fyj5zYbxuRxzCCtgb\"]}},\"version\":1}",
+  "metadata": {
+    "compiler": { "version": "0.7.6+commit.7338295f" },
+    "language": "Solidity",
+    "output": {
+      "abi": [
+        {
+          "inputs": [
+            { "internalType": "address", "name": "_logic", "type": "address" },
+            { "internalType": "address", "name": "admin_", "type": "address" },
+            { "internalType": "bytes", "name": "_data", "type": "bytes" }
+          ],
+          "stateMutability": "payable",
+          "type": "constructor"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "previousAdmin",
+              "type": "address",
+              "indexed": false
+            },
+            {
+              "internalType": "address",
+              "name": "newAdmin",
+              "type": "address",
+              "indexed": false
+            }
+          ],
+          "type": "event",
+          "name": "AdminChanged",
+          "anonymous": false
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "implementation",
+              "type": "address",
+              "indexed": true
+            }
+          ],
+          "type": "event",
+          "name": "Upgraded",
+          "anonymous": false
+        },
+        { "inputs": [], "stateMutability": "payable", "type": "fallback" },
+        {
+          "inputs": [],
+          "stateMutability": "view",
+          "type": "function",
+          "name": "admin",
+          "outputs": [
+            { "internalType": "address", "name": "admin_", "type": "address" }
+          ]
+        },
+        {
+          "inputs": [
+            { "internalType": "address", "name": "newAdmin", "type": "address" }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function",
+          "name": "changeAdmin"
+        },
+        {
+          "inputs": [],
+          "stateMutability": "view",
+          "type": "function",
+          "name": "implementation",
+          "outputs": [
+            {
+              "internalType": "address",
+              "name": "implementation_",
+              "type": "address"
+            }
+          ]
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newImplementation",
+              "type": "address"
+            }
+          ],
+          "stateMutability": "nonpayable",
+          "type": "function",
+          "name": "upgradeTo"
+        },
+        {
+          "inputs": [
+            {
+              "internalType": "address",
+              "name": "newImplementation",
+              "type": "address"
+            },
+            { "internalType": "bytes", "name": "data", "type": "bytes" }
+          ],
+          "stateMutability": "payable",
+          "type": "function",
+          "name": "upgradeToAndCall"
+        },
+        { "inputs": [], "stateMutability": "payable", "type": "receive" }
+      ],
+      "devdoc": {
+        "kind": "dev",
+        "methods": {
+          "admin()": { "details": "Returns the current admin." },
+          "changeAdmin(address)": {
+            "details": "Changes the admin of the proxy. Emits an {AdminChanged} event.Only the admin can call this function; other callers are delegated"
+          },
+          "constructor": {
+            "details": "Initializes an upgradeable proxy managed by `_admin`, backed by the implementation at `_logic`, and optionally initialized with `_data`."
+          },
+          "implementation()": {
+            "details": "Returns the current implementation."
+          },
+          "upgradeTo(address)": {
+            "details": "Upgrade the implementation of the proxy.Only the admin can call this function; other callers are delegated"
+          },
+          "upgradeToAndCall(address,bytes)": {
+            "details": "Upgrade the implementation of the proxy, and then call a function from the new implementation as specified by `data`, which should be an encoded function call. This is useful to initialize new storage variables in the proxied contract.Only the admin can call this function; other callers are delegated"
+          }
+        },
+        "version": 1
+      },
+      "userdoc": { "kind": "user", "methods": {}, "version": 1 }
+    },
+    "settings": {
+      "remappings": [
+        "@memview-sol/=lib/memview-sol/",
+        "@openzeppelin/=lib/openzeppelin-contracts/",
+        "centre-tokens.git/=lib/centre-tokens.git/",
+        "ds-test/=lib/ds-test/src/",
+        "forge-std/=lib/forge-std/src/",
+        "memview-sol/=lib/memview-sol/contracts/",
+        "openzeppelin-contracts/=lib/openzeppelin-contracts/contracts/"
+      ],
+      "optimizer": { "enabled": true, "runs": 100000 },
+      "metadata": { "bytecodeHash": "ipfs" },
+      "compilationTarget": {
+        "src/proxy/AdminUpgradableProxy.sol": "AdminUpgradableProxy"
+      },
+      "evmVersion": "istanbul",
+      "libraries": {}
+    },
+    "sources": {
+      "lib/openzeppelin-contracts/contracts/proxy/Proxy.sol": {
+        "keccak256": "0x0414d54056b3d8f9102ae1142264e9361408397878148203ab7a25cbf6248f08",
+        "urls": [
+          "bzz-raw://ebdc01639f69030c754dc3462d5f437c4644164465066187e320f524579fbede",
+          "dweb:/ipfs/QmZZhoPYagwu4MoJMAg26Y6Nfj4d9HJzUnvrMNsbo9ZorM"
+        ],
+        "license": "MIT"
+      },
+      "lib/openzeppelin-contracts/contracts/proxy/UpgradeableProxy.sol": {
+        "keccak256": "0x81af1059a5bd5fb25cb0351499e1d4110416f5b0000ffad6427cbf6088b193a4",
+        "urls": [
+          "bzz-raw://621f2fedaeeacf70ff1554748f63356555f591cdcf29c74e3d23a83720a078a2",
+          "dweb:/ipfs/QmYGnscyZgJGYgXKcoYhNX2M6uoJiHS1zTsQnu5NsJxPGG"
+        ],
+        "license": "MIT"
+      },
+      "lib/openzeppelin-contracts/contracts/utils/Address.sol": {
+        "keccak256": "0x28911e614500ae7c607a432a709d35da25f3bc5ddc8bd12b278b66358070c0ea",
+        "urls": [
+          "bzz-raw://256c8c8af5eb072bc473226ab2b2187149b8fc04f5f4a4820db22527f5ce8e3c",
+          "dweb:/ipfs/QmRvi5BhnL7Rxf85KrJhwM6RRhukm4tzoctRdgQEheNyiN"
+        ],
+        "license": "MIT"
+      },
+      "src/proxy/AdminUpgradableProxy.sol": {
+        "keccak256": "0x3c571050747644576286e807b97c6d33a192eec853785ac541b98a9ebc5b8bb1",
+        "urls": [
+          "bzz-raw://ee6094f0ddea1f80630a6a741beae15b7d74773ae2f02db78374fa57a4d83209",
+          "dweb:/ipfs/QmbwzLahgqXRvHk5Nux1ESXJX1LT6fyj5zYbxuRxzCCtgb"
+        ],
+        "license": "Apache-2.0"
+      }
+    },
+    "version": 1
+  },
+  "id": 64
+}
