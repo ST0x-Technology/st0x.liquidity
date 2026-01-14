@@ -335,8 +335,7 @@ mod tests {
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers")
-                .query_param("transfer_id", transfer_id.to_string());
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/transfers");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{

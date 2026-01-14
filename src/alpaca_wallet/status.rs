@@ -191,8 +191,7 @@ mod tests {
 
         let complete_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
-                .query_param("transfer_id", transfer_id.to_string());
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
@@ -243,8 +242,7 @@ mod tests {
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
-                .query_param("transfer_id", transfer_id.to_string());
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
@@ -295,8 +293,7 @@ mod tests {
 
         let status_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
-                .query_param("transfer_id", transfer_id.to_string());
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
@@ -349,8 +346,7 @@ mod tests {
 
         let error_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
-                .query_param("transfer_id", transfer_id.to_string());
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(503).body("Service Unavailable");
         });
 
@@ -396,8 +392,7 @@ mod tests {
 
         let mut processing_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
-                .query_param("transfer_id", transfer_id.to_string());
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
@@ -439,8 +434,7 @@ mod tests {
 
         let pending_mock = server.mock(|when, then| {
             when.method(GET)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
-                .query_param("transfer_id", transfer_id.to_string());
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body_obj(&json!([{
