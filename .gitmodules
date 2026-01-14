@@ -1,9 +1,6 @@
 [submodule "lib/forge-std"]
 	path = lib/forge-std
 	url = https://github.com/foundry-rs/forge-std
-[submodule "lib/evm-cctp-contracts"]
-	path = lib/evm-cctp-contracts
-	url = https://github.com/circlefin/evm-cctp-contracts
 [submodule "lib/rain.orderbook"]
 	path = lib/rain.orderbook
 	url = https://github.com/rainlanguage/rain.orderbook
