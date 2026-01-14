@@ -6,8 +6,8 @@
 //!
 //! # API Endpoints
 //!
-//! - `POST /v2/tokenization/mint` - Request mint (shares to tokens)
-//! - `GET /v2/tokenization/requests` - List/poll tokenization requests
+//! - `POST /v1/accounts/{ap_account_id}/tokenization/mint` - Request mint (shares to tokens)
+//! - `GET /v1/accounts/{ap_account_id}/tokenization/requests` - List/poll tokenization requests
 //!
 //! # Workflows
 //!
@@ -21,6 +21,9 @@
 //! 2. Poll `list_requests` for Alpaca's detection
 //! 3. Poll until status is `Completed` or `Rejected`
 
+use std::fmt::{Display, Formatter, Result as FmtResult};
+use std::time::Duration;
+
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use chrono::{DateTime, Utc};
@@ -29,11 +32,11 @@ use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
+use tracing::{debug, error, warn};
 
-use crate::alpaca_wallet::{Network, PollingConfig};
+use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
 use crate::onchain::io::TokenizedEquitySymbol;
@@ -58,6 +61,7 @@ where
     /// Create a new tokenization service.
     pub(crate) fn new(
         base_url: String,
+        account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
         provider: P,
@@ -65,6 +69,7 @@ where
     ) -> Self {
         let client = AlpacaTokenizationClient::new(
             base_url,
+            account_id,
             api_key,
             api_secret,
             provider,
@@ -138,6 +143,15 @@ where
             .await
     }
 
+    /// List all tokenization requests.
+    pub(crate) async fn list_requests(
+        &self,
+    ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
+        self.client
+            .list_requests(ListRequestsParams::default())
+            .await
+    }
+
     #[cfg(test)]
     fn new_with_client(client: AlpacaTokenizationClient<P>, polling_config: PollingConfig) -> Self {
         Self {
@@ -147,23 +161,21 @@ where
     }
 }
 
-fn deserialize_tokenized_symbol<'de, D>(
-    deserializer: D,
-) -> Result<Option<TokenizedEquitySymbol>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let opt = Option::<String>::deserialize(deserializer)?;
-    opt.map(|s| s.parse().map_err(serde::de::Error::custom))
-        .transpose()
-}
-
 /// Type of tokenization request.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum TokenizationRequestType {
+pub(crate) enum TokenizationRequestType {
     Mint,
     Redeem,
+}
+
+impl std::fmt::Display for TokenizationRequestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mint => write!(f, "mint"),
+            Self::Redeem => write!(f, "redeem"),
+        }
+    }
 }
 
 /// Status of a tokenization request.
@@ -190,22 +202,49 @@ impl Issuer {
 pub(crate) struct TokenizationRequest {
     #[serde(rename = "tokenization_request_id")]
     pub(crate) id: TokenizationRequestId,
-    r#type: TokenizationRequestType,
+    #[serde(default)]
+    pub(crate) r#type: Option<TokenizationRequestType>,
     pub(crate) status: TokenizationRequestStatus,
-    underlying_symbol: Symbol,
+    pub(crate) underlying_symbol: Symbol,
     #[serde(deserialize_with = "deserialize_tokenized_symbol")]
-    token_symbol: Option<TokenizedEquitySymbol>,
+    pub(crate) token_symbol: Option<TokenizedEquitySymbol>,
     #[serde(rename = "qty")]
     pub(crate) quantity: FractionalShares,
     issuer: Issuer,
     network: Network,
     #[serde(rename = "wallet_address")]
-    wallet: Address,
+    pub(crate) wallet: Option<Address>,
     pub(crate) issuer_request_id: Option<IssuerRequestId>,
+    #[serde(default, deserialize_with = "deserialize_tx_hash")]
     pub(crate) tx_hash: Option<TxHash>,
     fees: Option<Decimal>,
-    created_at: DateTime<Utc>,
+    pub(crate) created_at: DateTime<Utc>,
     updated_at: Option<DateTime<Utc>>,
+}
+
+fn deserialize_tokenized_symbol<'de, D>(
+    deserializer: D,
+) -> Result<Option<TokenizedEquitySymbol>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+    opt.map(|s| s.parse().map_err(serde::de::Error::custom))
+        .transpose()
+}
+
+/// Deserialize tx_hash that may be an empty string (Alpaca quirk).
+fn deserialize_tx_hash<'de, D>(deserializer: D) -> Result<Option<TxHash>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+    }
 }
 
 /// Request body for initiating a mint operation.
@@ -233,6 +272,9 @@ struct ListRequestsParams {
 pub(crate) enum AlpacaTokenizationError {
     #[error(transparent)]
     Reqwest(#[from] reqwest::Error),
+
+    #[error("Failed to parse API response: {0}")]
+    JsonParse(#[from] serde_json::Error),
 
     #[error("API error (status {status}): {message}")]
     ApiError { status: StatusCode, message: String },
@@ -269,6 +311,7 @@ where
 {
     http_client: Client,
     base_url: String,
+    account_id: AlpacaAccountId,
     api_key: String,
     api_secret: String,
     provider: P,
@@ -281,6 +324,7 @@ where
 {
     fn new(
         base_url: String,
+        account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
         provider: P,
@@ -289,6 +333,7 @@ where
         Self {
             http_client: Client::new(),
             base_url,
+            account_id,
             api_key,
             api_secret,
             provider,
@@ -299,6 +344,7 @@ where
     #[cfg(test)]
     fn new_with_base_url(
         base_url: String,
+        account_id: AlpacaAccountId,
         api_key: String,
         api_secret: String,
         provider: P,
@@ -307,6 +353,7 @@ where
         Self {
             http_client: Client::new(),
             base_url,
+            account_id,
             api_key,
             api_secret,
             provider,
@@ -327,7 +374,18 @@ where
         &self,
         request: MintRequest,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
-        let url = format!("{}/v2/tokenization/mint", self.base_url);
+        let url = format!(
+            "{}/v1/accounts/{}/tokenization/mint",
+            self.base_url, self.account_id
+        );
+
+        debug!(
+            url = %url,
+            symbol = %request.underlying_symbol,
+            quantity = %request.quantity,
+            wallet = %request.wallet,
+            "Sending tokenization mint request"
+        );
 
         let response = self
             .http_client
@@ -339,13 +397,24 @@ where
             .await?;
 
         let status = response.status();
+        debug!(status = %status, "Received tokenization response");
 
         if status.is_success() {
-            let tokenization_request: TokenizationRequest = response.json().await?;
+            let body = response.text().await?;
+            debug!(body = %body, "Tokenization response body");
+
+            let tokenization_request: TokenizationRequest =
+                serde_json::from_str(&body).map_err(|e| {
+                    error!(body = %body, error = %e, "Failed to deserialize tokenization response");
+                    e
+                })?;
+
+            debug!(request_id = %tokenization_request.id.0, "Mint request created");
             return Ok(tokenization_request);
         }
 
         let message = response.text().await?;
+        warn!(status = %status, message = %message, "Tokenization request failed");
 
         match status {
             StatusCode::FORBIDDEN => {
@@ -374,7 +443,10 @@ where
         &self,
         params: ListRequestsParams,
     ) -> Result<Vec<TokenizationRequest>, AlpacaTokenizationError> {
-        let mut url = format!("{}/v2/tokenization/requests", self.base_url);
+        let mut url = format!(
+            "{}/v1/accounts/{}/tokenization/requests",
+            self.base_url, self.account_id
+        );
         let mut query_params = Vec::new();
 
         if let Some(ref request_type) = params.request_type {
@@ -414,7 +486,14 @@ where
         let status = response.status();
 
         if status.is_success() {
-            let requests: Vec<TokenizationRequest> = response.json().await?;
+            let body = response.text().await?;
+            debug!(body = %body, "List requests response body");
+
+            let requests: Vec<TokenizationRequest> = serde_json::from_str(&body).map_err(|e| {
+                error!(body = %body, error = %e, "Failed to deserialize list requests response");
+                e
+            })?;
+
             return Ok(requests);
         }
 
@@ -576,12 +655,24 @@ pub(crate) mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::time::Duration;
+    use uuid::uuid;
 
     use super::*;
     use crate::bindings::TestERC20;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
+    pub(crate) fn tokenization_mint_path() -> String {
+        format!("/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/mint")
+    }
+
+    pub(crate) fn tokenization_requests_path() -> String {
+        format!("/v1/accounts/{TEST_ACCOUNT_ID}/tokenization/requests")
+    }
 
     pub(crate) fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
@@ -607,6 +698,7 @@ pub(crate) mod tests {
 
         AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             provider,
@@ -657,7 +749,7 @@ pub(crate) mod tests {
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v2/tokenization/mint")
+                .path(tokenization_mint_path())
                 .header("APCA-API-KEY-ID", "test_api_key")
                 .header("APCA-API-SECRET-KEY", "test_api_secret")
                 .json_body(json!({
@@ -688,7 +780,7 @@ pub(crate) mod tests {
         let result = client.request_mint(request).await.unwrap();
 
         assert_eq!(result.id, TokenizationRequestId("tok_req_123".to_string()));
-        assert_eq!(result.r#type, TokenizationRequestType::Mint);
+        assert_eq!(result.r#type, Some(TokenizationRequestType::Mint));
         assert_eq!(result.status, TokenizationRequestStatus::Pending);
         assert_eq!(result.underlying_symbol.to_string(), "AAPL");
         assert_eq!(
@@ -713,7 +805,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(403)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -741,7 +833,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(422)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -789,7 +881,7 @@ pub(crate) mod tests {
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .header("APCA-API-KEY-ID", "test_api_key")
                 .header("APCA-API-SECRET-KEY", "test_api_secret");
             then.status(200)
@@ -807,9 +899,9 @@ pub(crate) mod tests {
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].id, TokenizationRequestId("req_1".to_string()));
-        assert_eq!(result[0].r#type, TokenizationRequestType::Mint);
+        assert_eq!(result[0].r#type, Some(TokenizationRequestType::Mint));
         assert_eq!(result[1].id, TokenizationRequestId("req_2".to_string()));
-        assert_eq!(result[1].r#type, TokenizationRequestType::Redeem);
+        assert_eq!(result[1].r#type, Some(TokenizationRequestType::Redeem));
 
         list_mock.assert();
     }
@@ -822,7 +914,7 @@ pub(crate) mod tests {
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .query_param("type", "mint");
             then.status(200)
                 .header("content-type", "application/json")
@@ -838,7 +930,7 @@ pub(crate) mod tests {
         let result = client.list_requests(params).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].r#type, TokenizationRequestType::Mint);
+        assert_eq!(result[0].r#type, Some(TokenizationRequestType::Mint));
 
         list_mock.assert();
     }
@@ -851,7 +943,7 @@ pub(crate) mod tests {
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .query_param("type", "redeem");
             then.status(200)
                 .header("content-type", "application/json")
@@ -867,7 +959,7 @@ pub(crate) mod tests {
         let result = client.list_requests(params).await.unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].r#type, TokenizationRequestType::Redeem);
+        assert_eq!(result[0].r#type, Some(TokenizationRequestType::Redeem));
 
         list_mock.assert();
     }
@@ -879,7 +971,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -892,7 +984,7 @@ pub(crate) mod tests {
         let result = client.get_request(&id).await.unwrap();
 
         assert_eq!(result.id, id);
-        assert_eq!(result.r#type, TokenizationRequestType::Redeem);
+        assert_eq!(result.r#type, Some(TokenizationRequestType::Redeem));
         assert_eq!(result.underlying_symbol.to_string(), "TSLA");
 
         list_mock.assert();
@@ -905,7 +997,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_tokenization_request_json(
@@ -953,6 +1045,7 @@ pub(crate) mod tests {
 
         let client = AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             provider.clone(),
@@ -998,6 +1091,7 @@ pub(crate) mod tests {
 
         let client = AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_api_key".to_string(),
             "test_api_secret".to_string(),
             provider,
@@ -1052,7 +1146,7 @@ pub(crate) mod tests {
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .query_param("type", "redeem");
             then.status(200)
                 .header("content-type", "application/json")
@@ -1086,7 +1180,7 @@ pub(crate) mod tests {
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .query_param("type", "redeem");
             then.status(200)
                 .header("content-type", "application/json")
@@ -1127,7 +1221,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_request_with_status("req_1", "completed")]));
@@ -1155,7 +1249,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let list_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_request_with_status("req_1", "rejected")]));
@@ -1187,7 +1281,7 @@ pub(crate) mod tests {
 
         let list_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .query_param("type", "redeem");
             then.status(200)
                 .header("content-type", "application/json")
@@ -1221,7 +1315,7 @@ pub(crate) mod tests {
         let client = create_test_client(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
 
         let _list_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_request_with_status("req_1", "pending")]));
@@ -1252,14 +1346,14 @@ pub(crate) mod tests {
         let service = create_test_service(client);
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(sample_request_with_status("mint_123", "pending"));
         });
 
         let list_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_request_with_status("mint_123", "completed")]));
@@ -1303,7 +1397,7 @@ pub(crate) mod tests {
 
         let detection_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v2/tokenization/requests")
+                .path(tokenization_requests_path())
                 .query_param("type", "redeem");
             then.status(200)
                 .header("content-type", "application/json")
@@ -1323,7 +1417,7 @@ pub(crate) mod tests {
         });
 
         let complete_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
