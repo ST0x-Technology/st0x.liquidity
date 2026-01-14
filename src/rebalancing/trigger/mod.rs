@@ -114,7 +114,7 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) ethereum_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Alpaca account ID (UUID) for Broker API wallet operations.
+    /// Alpaca AP (Authorized Participant) account ID for Broker API operations.
     pub(crate) alpaca_account_id: AlpacaAccountId,
 }
 

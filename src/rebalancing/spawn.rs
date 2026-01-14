@@ -136,6 +136,7 @@ where
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             alpaca_auth.base_url(),
+            config.alpaca_account_id,
             alpaca_auth.alpaca_api_key.clone(),
             alpaca_auth.alpaca_api_secret.clone(),
             base_provider.clone(),
@@ -390,8 +391,11 @@ mod tests {
             .wallet(ethereum_wallet)
             .connect_http(config.ethereum_rpc_url.clone());
 
+        let test_account_id = AlpacaAccountId::new(Uuid::nil());
+
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url().parse().unwrap(),
+            test_account_id,
             "test_key".into(),
             "test_secret".into(),
             base_provider.clone(),
@@ -400,7 +404,7 @@ mod tests {
 
         let wallet = Arc::new(AlpacaWalletService::new(
             server.base_url(),
-            AlpacaAccountId::new(Uuid::nil()),
+            test_account_id,
             "test_key".into(),
             "test_secret".into(),
         ));
