@@ -102,9 +102,17 @@ This project uses a Cargo workspace with:
 
 ### Building & Running
 
-- `cargo build` - Build all workspace members
-- `cargo build -p st0x-hedge` - Build main crate only
-- `cargo build -p st0x-execution` - Build execution crate only
+**CRITICAL: NEVER use `cargo build` for verification.** It's slower than
+`cargo check` and less useful than `cargo test` or `cargo clippy`. Use:
+
+- `cargo check` for fast compilation verification
+- `cargo test` for verification with test coverage
+- `cargo clippy` for verification with linting
+
+Only use `cargo build` when you actually need the build artifacts (e.g., final
+verification before a release, or when the user explicitly asks to run the
+binary).
+
 - `cargo run --bin server` - Run the main arbitrage bot
 - `cargo run --bin cli -- auth` - Run the authentication flow for Charles Schwab
   OAuth setup
@@ -704,12 +712,13 @@ expected bounds.
 
 ### Workflow Best Practices
 
-- **Always run tests, clippy, and formatters before handing over a piece of
-  work** (skip if only documentation/markdown files were changed)
-  - Run tests first, as changing tests can break clippy
-  - Run clippy next, as fixing linting errors can break formatting
-  - Deny warnings when running clippy
-  - Always run `cargo fmt` last to ensure clean code formatting
+- **Always run verification steps before handing over a piece of work** (skip if
+  only documentation/markdown files were changed). Run them in this order to
+  fail fast:
+  1. `cargo check` - fastest, catches compilation errors first
+  2. `cargo test -q` - only run after check passes
+  3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
+  4. `cargo fmt` - always run last to ensure clean formatting
 
 #### CRITICAL: Lint Policy
 
