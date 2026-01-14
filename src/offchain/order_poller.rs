@@ -532,12 +532,11 @@ mod tests {
             r#"
             INSERT INTO trade_accumulators (
                 symbol,
-                net_position,
                 accumulated_long,
                 accumulated_short,
                 pending_execution_id
             )
-            VALUES (?1, 0.0, 0.0, 0.0, ?2)
+            VALUES (?1, 0.0, 0.0, ?2)
             ON CONFLICT(symbol) DO UPDATE SET
                 pending_execution_id = excluded.pending_execution_id
             "#,

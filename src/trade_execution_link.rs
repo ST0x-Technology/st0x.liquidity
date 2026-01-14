@@ -311,13 +311,15 @@ pub struct AuditTrailEntry {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::fixed_bytes;
+    use chrono::Utc;
+
     use super::*;
     use crate::offchain::execution::OffchainExecution;
     use crate::onchain::OnchainTrade;
+    use crate::onchain::io::Usdc;
     use crate::test_utils::setup_test_db;
     use crate::tokenized_symbol;
-    use alloy::primitives::fixed_bytes;
-    use chrono::Utc;
 
     #[tokio::test]
     async fn test_trade_execution_link_save_and_find() {
@@ -333,7 +335,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -399,7 +401,7 @@ mod tests {
                 symbol: tokenized_symbol!("MSFT0x"),
                 amount: 0.5,
                 direction: Direction::Buy,
-                price_usdc: 300.0,
+                price: Usdc::new(300.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: None,
@@ -418,7 +420,7 @@ mod tests {
                 symbol: tokenized_symbol!("MSFT0x"),
                 amount: 0.8,
                 direction: Direction::Buy,
-                price_usdc: 305.0,
+                price: Usdc::new(305.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: None,
@@ -503,7 +505,7 @@ mod tests {
                 symbol: tokenized_symbol!("AAPL0x"),
                 amount,
                 direction: Direction::Sell,
-                price_usdc: 150.0,
+                price: Usdc::new(150.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: None,
@@ -562,7 +564,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.0,
             direction: Direction::Buy,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,

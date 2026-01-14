@@ -1150,6 +1150,7 @@ mod tests {
     use crate::offchain::execution::{
         OffchainExecution, find_executions_by_symbol_status_and_broker,
     };
+    use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -1232,7 +1233,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 5.0,
             direction: Direction::Sell,
-            price_usdc: 20000.0,
+            price: Usdc::new(20000.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
