@@ -216,8 +216,24 @@ async fn verify_positions_consistency(pool: &SqlitePool) {
             continue;
         };
 
-        let legacy_long = Decimal::try_from(legacy.accumulated_long).unwrap_or_default();
-        let legacy_short = Decimal::try_from(legacy.accumulated_short).unwrap_or_default();
+        let Ok(legacy_long) = Decimal::try_from(legacy.accumulated_long) else {
+            warn!(
+                symbol = %legacy.symbol,
+                raw_value = legacy.accumulated_long,
+                "Position consistency check: invalid accumulated_long value, skipping"
+            );
+            continue;
+        };
+
+        let Ok(legacy_short) = Decimal::try_from(legacy.accumulated_short) else {
+            warn!(
+                symbol = %legacy.symbol,
+                raw_value = legacy.accumulated_short,
+                "Position consistency check: invalid accumulated_short value, skipping"
+            );
+            continue;
+        };
+
         let legacy_net = legacy_long - legacy_short;
 
         if position.net.0 != legacy_net {

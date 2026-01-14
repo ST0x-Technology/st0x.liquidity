@@ -249,7 +249,6 @@ new brokers, see @crates/broker/AGENTS.md
 - `trade_accumulators`: Unified position tracking per symbol
 
   - `symbol`: Primary key (non-empty string)
-  - `net_position`: Running net position (real number)
   - `accumulated_long`: Fractional shares for buying (non-negative)
   - `accumulated_short`: Fractional shares for selling (non-negative)
   - `pending_execution_id`: Reference to pending execution (nullable)
