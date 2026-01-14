@@ -58,20 +58,22 @@ use rain_error_decoding::AbiDecodedErrorType;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+// Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
     #[derive(serde::Serialize, serde::Deserialize)]
     TokenMessengerV2,
-    "lib/evm-cctp-contracts/out/TokenMessengerV2.sol/TokenMessengerV2.json"
+    "cctp-abis/TokenMessengerV2.json"
 );
 
+// Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
     #[derive(serde::Serialize, serde::Deserialize)]
     MessageTransmitterV2,
-    "lib/evm-cctp-contracts/out/MessageTransmitterV2.sol/MessageTransmitterV2.json"
+    "cctp-abis/MessageTransmitterV2.json"
 );
 
 /// CCTP domain identifier for Ethereum mainnet
@@ -653,10 +655,11 @@ mod tests {
         );
     }
 
+    // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
     sol!(
         #![sol(all_derives = true, rpc)]
         MockMintBurnToken,
-        "lib/evm-cctp-contracts/out/MockMintBurnToken.sol/MockMintBurnToken.json"
+        "cctp-abis/MockMintBurnToken.json"
     );
 
     async fn deploy_mock_usdc(
@@ -1033,16 +1036,18 @@ mod tests {
         assert_eq!(final_allowance, required_amount);
     }
 
+    // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
     sol!(
         #![sol(all_derives = true, rpc)]
         TokenMinterV2,
-        "lib/evm-cctp-contracts/out/TokenMinterV2.sol/TokenMinterV2.json"
+        "cctp-abis/TokenMinterV2.json"
     );
 
+    // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
     sol!(
         #![sol(all_derives = true, rpc)]
         AdminUpgradableProxy,
-        "lib/evm-cctp-contracts/out/AdminUpgradableProxy.sol/AdminUpgradableProxy.json"
+        "cctp-abis/AdminUpgradableProxy.json"
     );
 
     /// CCTP domain for test "Ethereum" chain
