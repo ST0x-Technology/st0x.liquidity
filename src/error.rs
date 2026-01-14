@@ -42,8 +42,24 @@ pub(crate) enum TradeValidationError {
     U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]
     TransactionNotFound(B256),
-    #[error("No AfterClear log found for ClearV2 log")]
-    NoAfterClearLog,
+    #[error(
+        "Node provider issue: tx receipt missing or has no logs. \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    NodeReceiptMissing {
+        block_number: u64,
+        tx_hash: B256,
+        clear_log_index: u64,
+    },
+    #[error(
+        "Unexpected: tx receipt has ClearV3 but no AfterClearV2 (should be impossible). \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    AfterClearMissingFromReceipt {
+        block_number: u64,
+        tx_hash: B256,
+        clear_log_index: u64,
+    },
     #[error("Negative shares amount: {0}")]
     NegativeShares(f64),
     #[error("Negative USDC amount: {0}")]
