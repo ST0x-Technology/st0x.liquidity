@@ -694,4 +694,58 @@ mod tests {
             "Legacy order_id should remain unchanged after failed duplicate submission"
         );
     }
+
+    /// Bug: confirm_submission writes ES before legacy, leaving inconsistent state
+    /// when legacy fails.
+    ///
+    /// ES writes first, so if legacy write fails, ES already has the Submitted
+    /// event. Combined with non-idempotent ConfirmSubmission, this creates an
+    /// unrecoverable inconsistent state.
+    #[tokio::test]
+    async fn test_confirm_submission_es_first_write_order_causes_inconsistency() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("GOOGL").unwrap();
+        let shares = Shares::new(5).unwrap();
+        let nonexistent_execution_id = 88888i64;
+
+        let execution = OffchainExecution {
+            id: Some(nonexistent_execution_id),
+            symbol,
+            shares,
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            state: OrderState::Pending,
+        };
+
+        place_order(&context, &execution).await.unwrap();
+
+        let result = confirm_submission(
+            &context,
+            nonexistent_execution_id,
+            BrokerOrderId::new("ORD-WILL-FAIL"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Legacy write should fail for nonexistent row"
+        );
+
+        let es_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ?",
+        )
+        .bind(nonexistent_execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            es_event_count, 1,
+            "When legacy fails, ES should NOT have Submitted event (only Placed). \
+             Legacy-first write order would prevent this inconsistency."
+        );
+    }
 }

@@ -2143,4 +2143,53 @@ mod tests {
 
         assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
     }
+
+    /// Bug: ConfirmSubmission is not idempotent, blocking recovery after partial
+    /// dual-write failures.
+    ///
+    /// If ES write succeeds but legacy write fails, retrying with the same
+    /// broker_order_id fails with AlreadySubmitted. System stuck in inconsistent
+    /// state with no programmatic recovery path.
+    #[tokio::test]
+    async fn test_confirm_submission_not_idempotent_blocks_retry_recovery() {
+        let mut order = Lifecycle::Live(OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            broker: SupportedBroker::Schwab,
+            placed_at: Utc::now(),
+        });
+
+        let broker_order_id = BrokerOrderId("ORD-SAME-123".to_string());
+
+        let command = OffchainOrderCommand::ConfirmSubmission {
+            broker_order_id: broker_order_id.clone(),
+        };
+        let events = order.handle(command, &()).await.unwrap();
+        assert_eq!(events.len(), 1);
+        order.apply(events[0].clone());
+
+        let Lifecycle::Live(OffchainOrder::Submitted {
+            broker_order_id: stored_id,
+            ..
+        }) = &order
+        else {
+            panic!("Expected Submitted state");
+        };
+        assert_eq!(stored_id, &broker_order_id);
+
+        let retry_command = OffchainOrderCommand::ConfirmSubmission {
+            broker_order_id: broker_order_id.clone(),
+        };
+
+        let retry_result = order.handle(retry_command, &()).await;
+
+        let events = retry_result
+            .expect("Retry with same broker_order_id should succeed for idempotent behavior");
+
+        assert!(
+            events.is_empty(),
+            "Idempotent retry should return empty events vec, got {events:?}"
+        );
+    }
 }
