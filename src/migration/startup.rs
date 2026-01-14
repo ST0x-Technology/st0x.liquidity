@@ -162,13 +162,12 @@ async fn verify_positions_consistency(pool: &SqlitePool) {
     #[derive(sqlx::FromRow)]
     struct LegacyPosition {
         symbol: String,
-        net_position: f64,
         accumulated_long: f64,
         accumulated_short: f64,
     }
 
     let legacy_positions = match sqlx::query_as::<_, LegacyPosition>(
-        "SELECT symbol, net_position, accumulated_long, accumulated_short FROM trade_accumulators",
+        "SELECT symbol, accumulated_long, accumulated_short FROM trade_accumulators",
     )
     .fetch_all(pool)
     .await
@@ -217,9 +216,25 @@ async fn verify_positions_consistency(pool: &SqlitePool) {
             continue;
         };
 
-        let legacy_net = Decimal::try_from(legacy.net_position).unwrap_or_default();
-        let legacy_long = Decimal::try_from(legacy.accumulated_long).unwrap_or_default();
-        let legacy_short = Decimal::try_from(legacy.accumulated_short).unwrap_or_default();
+        let Ok(legacy_long) = Decimal::try_from(legacy.accumulated_long) else {
+            warn!(
+                symbol = %legacy.symbol,
+                raw_value = legacy.accumulated_long,
+                "Position consistency check: invalid accumulated_long value, skipping"
+            );
+            continue;
+        };
+
+        let Ok(legacy_short) = Decimal::try_from(legacy.accumulated_short) else {
+            warn!(
+                symbol = %legacy.symbol,
+                raw_value = legacy.accumulated_short,
+                "Position consistency check: invalid accumulated_short value, skipping"
+            );
+            continue;
+        };
+
+        let legacy_net = legacy_long - legacy_short;
 
         if position.net.0 != legacy_net {
             error!(
@@ -438,8 +453,8 @@ mod tests {
         let pool = create_test_pool().await;
 
         sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
-             VALUES ('AAPL', 10.0, 15.0, 5.0)"
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short)
+             VALUES ('AAPL', 15.0, 5.0)"
         )
         .execute(&pool)
         .await
@@ -497,8 +512,8 @@ mod tests {
         .unwrap();
 
         sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
-             VALUES ('AAPL', 10.0, 10.0, 0.0)"
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short)
+             VALUES ('AAPL', 10.0, 0.0)"
         )
         .execute(&pool)
         .await

@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
         assert!((trade.amount - 15.0).abs() < f64::EPSILON);
         // Price should be 200 USDC / 15 shares = 13.333... USDC per share
-        assert!((trade.price_usdc - 13.333_333_333_333_334).abs() < 0.001);
+        assert!((trade.price.value() - 13.333_333_333_333_334).abs() < 0.001);
     }
 
     #[tokio::test]

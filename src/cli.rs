@@ -575,7 +575,7 @@ fn display_trade_details<W: Write>(
     writeln!(
         stdout,
         "   Price per Share: ${:.2}",
-        onchain_trade.price_usdc
+        onchain_trade.price.value()
     )?;
     Ok(())
 }
@@ -588,6 +588,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmEnv;
+    use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::get_test_order;
     use crate::test_utils::setup_test_db;
@@ -2173,7 +2174,7 @@ mod tests {
             symbol: tokenized_symbol!("GOOG0x"),
             amount: 2.5,
             direction: Direction::Buy,
-            price_usdc: 20000.0,
+            price: Usdc::new(20000.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -2209,6 +2210,6 @@ mod tests {
         assert_eq!(trade.log_index, 42);
         assert_eq!(trade.symbol.to_string(), "GOOG0x");
         assert!((trade.amount - 2.5).abs() < f64::EPSILON);
-        assert!((trade.price_usdc - 20000.0).abs() < f64::EPSILON);
+        assert_eq!(trade.price, Usdc::new(20000.0).unwrap());
     }
 }

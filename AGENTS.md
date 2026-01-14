@@ -249,7 +249,6 @@ new brokers, see @crates/broker/AGENTS.md
 - `trade_accumulators`: Unified position tracking per symbol
 
   - `symbol`: Primary key (non-empty string)
-  - `net_position`: Running net position (real number)
   - `accumulated_long`: Fractional shares for buying (non-negative)
   - `accumulated_short`: Fractional shares for selling (non-negative)
   - `pending_execution_id`: Reference to pending execution (nullable)
@@ -369,6 +368,13 @@ Environment variables (can be set via `.env` file):
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where
   possible
+- **No Denormalized Columns**: Never store values that can be computed from
+  other columns. Denormalized data inevitably becomes stale when the source
+  columns are updated but the derived column is forgotten. Always compute
+  derived values on-demand in queries (e.g., use
+  `ABS(accumulated_long - accumulated_short) >= 1.0` instead of storing a
+  separate `net_position` column). If performance requires caching, use database
+  views or generated columns that auto-update, never manually-maintained columns
 - **Functional Programming Patterns**: Favor FP and ADT patterns over OOP
   patterns. Avoid unnecessary encapsulation, inheritance hierarchies, or
   getter/setter patterns that don't make sense with Rust's algebraic data types.
