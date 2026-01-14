@@ -224,7 +224,7 @@ async fn fetch_after_clear_event<P: Provider>(
 mod tests {
     use alloy::hex;
     use alloy::primitives::{
-        Address, B256, IntoLogData, LogData, U256, address, fixed_bytes, uint,
+        Address, B256, Bytes, IntoLogData, LogData, U256, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
@@ -355,15 +355,15 @@ mod tests {
         };
 
         let asserter = Asserter::new();
-        asserter.push_success(&json!([after_clear_log]));
-        asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -435,15 +435,15 @@ mod tests {
         };
 
         let asserter = Asserter::new();
-        asserter.push_success(&json!([after_clear_log]));
-        asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
+        // Mock decimals() then symbol() calls for input token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
@@ -779,15 +779,15 @@ mod tests {
         };
 
         let asserter = Asserter::new();
-        asserter.push_success(&json!([after_clear_log]));
-        asserter.push_success(&mocked_receipt_hex(tx_hash));
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&json!([after_clear_log])); // get_logs returns AfterClearV2
+        asserter.push_success(&mocked_receipt_hex(tx_hash)); // receipt for gas info
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -858,9 +858,12 @@ mod tests {
         }
     }
 
-    fn create_test_receipt_json(tx_hash: B256) -> serde_json::Value {
+    fn create_receipt_json_with_logs(
+        tx_hash: B256,
+        logs: &[serde_json::Value],
+    ) -> serde_json::Value {
         json!({
-            "transactionHash": tx_hash,
+            "transactionHash": hex::encode_prefixed(tx_hash),
             "transactionIndex": "0x1",
             "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
             "blockNumber": "0x1",
@@ -872,7 +875,28 @@ mod tests {
             "status": "0x1",
             "type": "0x2",
             "logsBloom": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-            "logs": []
+            "logs": logs
+        })
+    }
+
+    fn create_receipt_log_json(
+        address: Address,
+        tx_hash: B256,
+        log_index: u64,
+        topics: &[B256],
+        data: Bytes,
+    ) -> serde_json::Value {
+        let topics_hex: Vec<String> = topics.iter().map(hex::encode_prefixed).collect();
+        json!({
+            "address": hex::encode_prefixed(address),
+            "topics": topics_hex,
+            "data": hex::encode_prefixed(data),
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x1",
+            "transactionHash": hex::encode_prefixed(tx_hash),
+            "transactionIndex": "0x1",
+            "logIndex": format!("0x{:x}", log_index),
+            "removed": false
         })
     }
 
@@ -905,16 +929,16 @@ mod tests {
             create_test_log(orderbook, tx_hash, after_clear_event_2.to_log_data(), 7);
 
         let asserter = Asserter::new();
-        asserter.push_success(&json!([after_clear_log_1, after_clear_log_2]));
-        let receipt_json = create_test_receipt_json(tx_hash);
-        asserter.push_success(&receipt_json);
-        // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
+        asserter.push_success(&json!([after_clear_log_1, after_clear_log_2])); // get_logs returns multiple AfterClearV2
+        let receipt_json = create_receipt_json_with_logs(tx_hash, &[]);
+        asserter.push_success(&receipt_json); // receipt for gas info
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"USDC".to_string(),
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
-        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
@@ -1046,8 +1070,10 @@ mod tests {
         );
 
         let asserter = Asserter::new();
+        // get_logs returns a log with wrong tx_hash but also the correct one
         asserter.push_success(&json!([wrong_tx_log, correct_log]));
-        let receipt_json = create_test_receipt_json(target_tx_hash);
+        // Receipt mock needed for gas info in try_from_order_and_fill_details (empty is fine)
+        let receipt_json = create_receipt_json_with_logs(target_tx_hash, &[]);
         asserter.push_success(&receipt_json);
         // Mock decimals() then symbol() calls in the order they're called for input token (USDC)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC decimals
@@ -1056,6 +1082,427 @@ mod tests {
         ));
         // Mock decimals() then symbol() calls for output token (AAPL0x)
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // AAPL0x decimals
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"AAPL0x".to_string(),
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await
+        .unwrap();
+
+        let trade = result.unwrap();
+        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+    }
+
+    fn create_after_clear_log_data() -> (Vec<B256>, Bytes) {
+        let log_data = create_after_clear_event().to_log_data();
+        (log_data.topics().to_vec(), log_data.data)
+    }
+
+    fn create_clear_v3_log_data(event: &ClearV3) -> (Vec<B256>, Bytes) {
+        let log_data = event.to_log_data();
+        (log_data.topics().to_vec(), log_data.data)
+    }
+
+    #[tokio::test]
+    async fn test_fallback_to_receipt_when_get_logs_returns_empty() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 1);
+
+        let (after_clear_topics, after_clear_data) = create_after_clear_log_data();
+        let receipt_log =
+            create_receipt_log_json(orderbook, tx_hash, 2, &after_clear_topics, after_clear_data);
+        let receipt = create_receipt_json_with_logs(tx_hash, &[receipt_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
+        asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
+        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"USDC".to_string(),
+        ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"AAPL0x".to_string(),
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await
+        .unwrap();
+
+        let trade = result.unwrap();
+        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.tx_hash, tx_hash);
+        assert_eq!(trade.log_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_receipt_with_multiple_logs_picks_correct_after_clear() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 3);
+
+        // Create two AfterClearV2 logs in receipt - only the one with log_index > 3 should be used
+        let (after_clear_topics, after_clear_data) = create_after_clear_log_data();
+        let wrong_receipt_log = create_receipt_log_json(
+            orderbook,
+            tx_hash,
+            2, // log_index 2 <= 3, should be skipped
+            &after_clear_topics,
+            after_clear_data.clone(),
+        );
+        let correct_receipt_log = create_receipt_log_json(
+            orderbook,
+            tx_hash,
+            4, // log_index 4 > 3, should be used
+            &after_clear_topics,
+            after_clear_data,
+        );
+        let receipt =
+            create_receipt_json_with_logs(tx_hash, &[wrong_receipt_log, correct_receipt_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty
+        asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
+        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"USDC".to_string(),
+        ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"AAPL0x".to_string(),
+        ));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await
+        .unwrap();
+
+        let trade = result.unwrap();
+        assert_eq!(trade.symbol, tokenized_symbol!("AAPL0x"));
+        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_receipt_rejects_wrong_contract_address() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let wrong_address = address!("0x2222222222222222222222222222222222222222");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 1);
+
+        let (after_clear_topics, after_clear_data) = create_after_clear_log_data();
+        let wrong_address_log = create_receipt_log_json(
+            wrong_address, // Wrong contract address
+            tx_hash,
+            2,
+            &after_clear_topics,
+            after_clear_data,
+        );
+        let receipt = create_receipt_json_with_logs(tx_hash, &[wrong_address_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
+        asserter.push_success(&receipt); // receipt for fallback - has log but wrong contract address
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_receipt_rejects_log_index_less_than_or_equal_to_clear() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 5);
+
+        let (after_clear_topics, after_clear_data) = create_after_clear_log_data();
+        let earlier_log = create_receipt_log_json(
+            orderbook,
+            tx_hash,
+            3, // log_index 3 < 5, should be rejected
+            &after_clear_topics,
+            after_clear_data,
+        );
+        let receipt = create_receipt_json_with_logs(tx_hash, &[earlier_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
+        asserter.push_success(&receipt); // receipt for fallback - has AfterClearV2 but log_index < clear's
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_after_clear_missing_from_receipt_error() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 1);
+
+        // Receipt has ClearV3 but no AfterClearV2 - theoretically impossible but we handle it
+        let (clear_topics, clear_data) = create_clear_v3_log_data(&clear_event);
+        let clear_log_in_receipt =
+            create_receipt_log_json(orderbook, tx_hash, 1, &clear_topics, clear_data);
+        let receipt = create_receipt_json_with_logs(tx_hash, &[clear_log_in_receipt]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
+        asserter.push_success(&receipt); // receipt for fallback - has ClearV3 but no AfterClearV2
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OnChainError::Validation(TradeValidationError::AfterClearMissingFromReceipt { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_receipt_ignores_wrong_event_signature() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+
+        let clear_log = create_test_log(orderbook, tx_hash, clear_event.to_log_data(), 1);
+
+        // Receipt has a log with correct address but unrelated event signature (random hash)
+        let (_, after_clear_data) = create_after_clear_log_data();
+        let unrelated_event_sig =
+            fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let wrong_sig_log = create_receipt_log_json(
+            orderbook,
+            tx_hash,
+            2,
+            &[unrelated_event_sig], // Unrelated event signature (not ClearV3 or AfterClearV2)
+            after_clear_data,
+        );
+        let receipt = create_receipt_json_with_logs(tx_hash, &[wrong_sig_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([])); // get_logs returns empty (simulating unreliable node)
+        asserter.push_success(&receipt); // receipt for fallback - has log but unrecognized event signature
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let feed_id_cache = FeedIdCache::default();
+
+        let result = OnchainTrade::try_from_clear_v3(
+            &env,
+            &cache,
+            provider,
+            clear_event,
+            clear_log,
+            &feed_id_cache,
+        )
+        .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            OnChainError::Validation(TradeValidationError::NodeReceiptMissing { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fallback_get_logs_has_wrong_tx_but_receipt_has_correct() {
+        let env = create_test_env();
+        let cache = SymbolCache::default();
+
+        let order = get_test_order();
+        let different_order = {
+            let mut order = get_test_order();
+            order.nonce =
+                fixed_bytes!("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+            order
+        };
+
+        let clear_event = create_clear_event(order.clone(), different_order);
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let target_tx_hash =
+            fixed_bytes!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let other_tx_hash =
+            fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+        let clear_log = create_test_log(orderbook, target_tx_hash, clear_event.to_log_data(), 1);
+
+        // get_logs returns a log with wrong tx_hash
+        let after_clear_event = create_after_clear_event();
+        let wrong_tx_log =
+            create_test_log(orderbook, other_tx_hash, after_clear_event.to_log_data(), 2);
+
+        // But receipt has the correct log
+        let (after_clear_topics, after_clear_data) = create_after_clear_log_data();
+        let correct_receipt_log = create_receipt_log_json(
+            orderbook,
+            target_tx_hash,
+            2,
+            &after_clear_topics,
+            after_clear_data,
+        );
+        let receipt = create_receipt_json_with_logs(target_tx_hash, &[correct_receipt_log]);
+
+        let asserter = Asserter::new();
+        asserter.push_success(&json!([wrong_tx_log])); // get_logs returns wrong tx
+        asserter.push_success(&receipt); // receipt for fallback AfterClearV2 extraction
+        asserter.push_success(&receipt); // receipt for gas info in try_from_order_and_fill_details
+        // Mock decimals() then symbol() calls for input token (USDC)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
+        asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
+            &"USDC".to_string(),
+        ));
+        // Mock decimals() then symbol() calls for output token (AAPL0x)
+        asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         asserter.push_success(&<symbolCall as SolCall>::abi_encode_returns(
             &"AAPL0x".to_string(),
         ));
