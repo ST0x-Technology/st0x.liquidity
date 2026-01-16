@@ -543,7 +543,8 @@ async fn run_queue_processor<P: Provider + Clone, E: Executor + Clone>(
     let executor_type = executor.to_supported_executor();
 
     loop {
-        match process_next_queued_event(
+        process_queue_iteration(
+            executor,
             executor_type,
             config,
             pool,
@@ -551,23 +552,44 @@ async fn run_queue_processor<P: Provider + Clone, E: Executor + Clone>(
             &provider,
             &feed_id_cache,
         )
+        .await;
+    }
+}
+
+async fn process_queue_iteration<P: Provider + Clone, E: Executor + Clone>(
+    executor: &E,
+    executor_type: SupportedExecutor,
+    config: &Config,
+    pool: &SqlitePool,
+    cache: &SymbolCache,
+    provider: &P,
+    feed_id_cache: &FeedIdCache,
+) {
+    match process_next_queued_event(executor_type, config, pool, cache, provider, feed_id_cache)
         .await
-        {
-            Ok(Some(execution)) => {
-                if let Some(exec_id) = execution.id {
-                    if let Err(e) =
-                        execute_pending_offchain_execution(executor, pool, exec_id).await
-                    {
-                        error!("Failed to execute offchain order {exec_id}: {e}");
-                    }
-                }
-            }
-            Ok(None) => sleep(Duration::from_millis(100)).await,
-            Err(e) => {
-                error!("Error processing queued event: {e}");
-                sleep(Duration::from_millis(500)).await;
-            }
+    {
+        Ok(Some(execution)) => {
+            handle_successful_execution(executor, pool, execution).await;
         }
+        Ok(None) => sleep(Duration::from_millis(100)).await,
+        Err(e) => {
+            error!("Error processing queued event: {e}");
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+async fn handle_successful_execution<E: Executor + Clone>(
+    executor: &E,
+    pool: &SqlitePool,
+    execution: OffchainExecution,
+) {
+    let Some(exec_id) = execution.id else {
+        return;
+    };
+
+    if let Err(e) = execute_pending_offchain_execution(executor, pool, exec_id).await {
+        error!("Failed to execute offchain order {exec_id}: {e}");
     }
 }
 

@@ -9,7 +9,6 @@ pub(crate) mod position_calculator;
 pub(crate) mod pyth;
 mod take_order;
 pub(crate) mod trade;
-pub(crate) mod vault;
 
 pub use trade::OnchainTrade;
 

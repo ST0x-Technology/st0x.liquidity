@@ -41,43 +41,63 @@ pub async fn migrate_positions(
         .count();
 
     for (idx, row) in rows.into_iter().enumerate() {
-        let processed = idx + 1;
-        if processed % 100 == 0 {
-            info!("Migrating positions: {processed}/{total}");
-        }
-
-        if let Some(exec_id) = row.pending_execution_id {
-            warn!(
-                "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
-                row.symbol
-            );
-        }
-
-        let symbol = Symbol::new(&row.symbol)?;
-        let aggregate_id = Position::aggregate_id(&symbol);
-
-        let net_position = Decimal::try_from(row.net_position)?;
-        let accumulated_long = Decimal::try_from(row.accumulated_long)?;
-        let accumulated_short = Decimal::try_from(row.accumulated_short)?;
-
-        let command = PositionCommand::Migrate {
-            symbol,
-            net_position: FractionalShares(net_position),
-            accumulated_long: FractionalShares(accumulated_long),
-            accumulated_short: FractionalShares(accumulated_short),
-            threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
-        };
-
-        match execution {
-            ExecutionMode::Commit => {
-                cqrs.execute(&aggregate_id, command).await?;
-            }
-            ExecutionMode::DryRun => {}
-        }
+        log_progress(idx, total);
+        migrate_position_row(cqrs, row, execution).await?;
     }
 
     info!("Migrated {total} positions, {pending_count} with pending executions");
     Ok(total)
+}
+
+fn log_progress(idx: usize, total: usize) {
+    let processed = idx + 1;
+    if processed % 100 == 0 {
+        info!("Migrating positions: {processed}/{total}");
+    }
+}
+
+async fn migrate_position_row(
+    cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    row: PositionRow,
+    execution: ExecutionMode,
+) -> Result<(), MigrationError> {
+    if let Some(exec_id) = row.pending_execution_id {
+        warn!(
+            "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
+            row.symbol
+        );
+    }
+
+    let symbol = Symbol::new(&row.symbol)?;
+    let aggregate_id = Position::aggregate_id(&symbol);
+
+    let command = build_migrate_command(&row, symbol)?;
+
+    match execution {
+        ExecutionMode::Commit => {
+            cqrs.execute(&aggregate_id, command).await?;
+        }
+        ExecutionMode::DryRun => {}
+    }
+
+    Ok(())
+}
+
+fn build_migrate_command(
+    row: &PositionRow,
+    symbol: Symbol,
+) -> Result<PositionCommand, MigrationError> {
+    let net_position = Decimal::try_from(row.net_position)?;
+    let accumulated_long = Decimal::try_from(row.accumulated_long)?;
+    let accumulated_short = Decimal::try_from(row.accumulated_short)?;
+
+    Ok(PositionCommand::Migrate {
+        symbol,
+        net_position: FractionalShares(net_position),
+        accumulated_long: FractionalShares(accumulated_long),
+        accumulated_short: FractionalShares(accumulated_short),
+        threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
+    })
 }
 
 #[cfg(test)]

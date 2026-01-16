@@ -26,15 +26,16 @@ use super::{
     MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RebalancingTriggerConfig,
     RedemptionManager,
 };
-use crate::alpaca_tokenization::AlpacaTokenizationService;
-use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
-use crate::cctp::{
+use st0x_bridge::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
+use st0x_vault::{VaultId, VaultService};
+
+use crate::alpaca_tokenization::AlpacaTokenizationService;
+use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultId, VaultService};
 use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};

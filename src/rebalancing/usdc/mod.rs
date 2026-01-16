@@ -13,9 +13,10 @@ use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use thiserror::Error;
 
+use st0x_bridge::CctpError;
+use st0x_vault::VaultError;
+
 use crate::alpaca_wallet::AlpacaWalletError;
-use crate::cctp::CctpError;
-use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
 

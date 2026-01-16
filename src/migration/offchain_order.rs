@@ -49,7 +49,19 @@ pub async fn migrate_offchain_orders(
     let total = rows.len();
     info!("Found {total} offchain orders to migrate");
 
-    let status_counts = rows.iter().fold(
+    let status_counts = count_by_status(&rows);
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        log_progress(idx, total);
+        migrate_offchain_order_row(cqrs, row, execution).await?;
+    }
+
+    log_migration_summary(total, status_counts);
+    Ok(total)
+}
+
+fn count_by_status(rows: &[OffchainOrderRow]) -> (usize, usize, usize, usize) {
+    rows.iter().fold(
         (0usize, 0usize, 0usize, 0usize),
         |(pending, submitted, filled, failed), row| match row.status.as_str() {
             "PENDING" => (pending + 1, submitted, filled, failed),
@@ -58,55 +70,70 @@ pub async fn migrate_offchain_orders(
             "FAILED" => (pending, submitted, filled, failed + 1),
             _ => (pending, submitted, filled, failed),
         },
-    );
+    )
+}
 
-    for (idx, row) in rows.into_iter().enumerate() {
-        let processed = idx + 1;
-        if processed % 100 == 0 {
-            info!("Migrating offchain orders: {processed}/{total}");
-        }
-
-        let aggregate_id = OffchainOrder::aggregate_id(row.id);
-        let symbol = Symbol::new(&row.symbol)?;
-
-        if row.shares < 0 {
-            return Err(MigrationError::NegativeValue {
-                field: "shares".to_string(),
-                value: row.shares,
-            });
-        }
-        let shares = Decimal::from(row.shares);
-
-        let direction = row.direction.parse()?;
-        let migrated_status = row.status.parse()?;
-
-        let broker_order_id = row.order_id.map(BrokerOrderId);
-        let price_cents = row.price_cents.map(PriceCents::try_from).transpose()?;
-
-        let command = OffchainOrderCommand::Migrate {
-            symbol,
-            shares: FractionalShares(shares),
-            direction,
-            executor: SupportedExecutor::Schwab,
-            status: migrated_status,
-            broker_order_id,
-            price_cents,
-            executed_at: row.executed_at,
-        };
-
-        match execution {
-            ExecutionMode::Commit => {
-                cqrs.execute(&aggregate_id, command).await?;
-            }
-            ExecutionMode::DryRun => {}
-        }
+fn log_progress(idx: usize, total: usize) {
+    let processed = idx + 1;
+    if processed % 100 == 0 {
+        info!("Migrating offchain orders: {processed}/{total}");
     }
+}
 
+fn log_migration_summary(total: usize, status_counts: (usize, usize, usize, usize)) {
     let (pending, submitted, filled, failed) = status_counts;
     info!(
         "Migrated {total} offchain orders. Status breakdown: {pending} PENDING, {submitted} SUBMITTED, {filled} FILLED, {failed} FAILED"
     );
-    Ok(total)
+}
+
+async fn migrate_offchain_order_row(
+    cqrs: &SqliteCqrs<Lifecycle<OffchainOrder, Never>>,
+    row: OffchainOrderRow,
+    execution: ExecutionMode,
+) -> Result<(), MigrationError> {
+    let aggregate_id = OffchainOrder::aggregate_id(row.id);
+    let command = build_offchain_order_command(row)?;
+
+    match execution {
+        ExecutionMode::Commit => {
+            cqrs.execute(&aggregate_id, command).await?;
+        }
+        ExecutionMode::DryRun => {}
+    }
+
+    Ok(())
+}
+
+fn build_offchain_order_command(
+    row: OffchainOrderRow,
+) -> Result<OffchainOrderCommand, MigrationError> {
+    let symbol = Symbol::new(&row.symbol)?;
+
+    if row.shares < 0 {
+        return Err(MigrationError::NegativeValue {
+            field: "shares".to_string(),
+            value: row.shares,
+        });
+    }
+    let shares = Decimal::from(row.shares);
+
+    let direction = row.direction.parse()?;
+    let migrated_status = row.status.parse()?;
+
+    let broker_order_id = row.order_id.map(BrokerOrderId);
+    let price_cents = row.price_cents.map(PriceCents::try_from).transpose()?;
+
+    Ok(OffchainOrderCommand::Migrate {
+        symbol,
+        shares: FractionalShares(shares),
+        direction,
+        executor: SupportedExecutor::Schwab,
+        status: migrated_status,
+        broker_order_id,
+        price_cents,
+        executed_at: row.executed_at,
+    })
 }
 
 #[cfg(test)]
