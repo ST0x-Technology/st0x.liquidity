@@ -154,7 +154,7 @@ mod tests {
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "code": 40110000,
+                    "code": 40_110_000,
                     "message": "Invalid credentials"
                 }));
         });

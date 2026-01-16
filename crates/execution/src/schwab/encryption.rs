@@ -1,5 +1,6 @@
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{Aes256Gcm, KeyInit};
+use alloy::hex::FromHexError;
 use alloy::primitives::FixedBytes;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -93,7 +94,7 @@ pub enum EncryptionError {
     #[error("Decrypted data is not valid UTF-8: {0}")]
     Utf8Error(String),
     #[error("Hex decoding error: {0}")]
-    Hex(#[from] alloy::hex::FromHexError),
+    Hex(#[from] FromHexError),
 }
 
 #[cfg(test)]

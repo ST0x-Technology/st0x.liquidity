@@ -1,11 +1,11 @@
+use alloy::hex;
+use alloy::primitives::FixedBytes;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration as TokioDuration, interval};
 use tracing::{error, info, warn};
-
-use alloy::primitives::FixedBytes;
 
 use super::SchwabError;
 use super::auth::SchwabAuthEnv;
@@ -57,8 +57,8 @@ impl SchwabTokens {
         let encrypted_access = encrypt_token(encryption_key, &self.access_token)?;
         let encrypted_refresh = encrypt_token(encryption_key, &self.refresh_token)?;
 
-        let encrypted_access_hex = alloy::hex::encode(&encrypted_access);
-        let encrypted_refresh_hex = alloy::hex::encode(&encrypted_refresh);
+        let encrypted_access_hex = hex::encode(&encrypted_access);
+        let encrypted_refresh_hex = hex::encode(&encrypted_refresh);
 
         sqlx::query!(
             r#"
@@ -110,9 +110,9 @@ impl SchwabTokens {
         .await?;
 
         let encrypted_access_bytes: Vec<u8> =
-            alloy::hex::decode(&row.access_token).map_err(EncryptionError::Hex)?;
+            hex::decode(&row.access_token).map_err(EncryptionError::Hex)?;
         let encrypted_refresh_bytes: Vec<u8> =
-            alloy::hex::decode(&row.refresh_token).map_err(EncryptionError::Hex)?;
+            hex::decode(&row.refresh_token).map_err(EncryptionError::Hex)?;
 
         let encrypted_access = EncryptedToken::from(encrypted_access_bytes);
         let encrypted_refresh = EncryptedToken::from(encrypted_refresh_bytes);

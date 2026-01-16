@@ -24,8 +24,10 @@
 //! 2. **Attest**: Poll Circle's attestation API for signed message (fast transfer: ~20-30s)
 //! 3. **Mint**: Mint native USDC on destination chain via `MessageTransmitterV2.receiveMessage()`
 
+use alloy::contract;
+use alloy::hex::{self, FromHexError};
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address, keccak256};
-use alloy::providers::Provider;
+use alloy::providers::{PendingTransactionError, Provider};
 use alloy::sol;
 use alloy::sol_types::SolEvent;
 use async_trait::async_trait;
@@ -138,29 +140,22 @@ where
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
     #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
-
+    Transaction(#[from] PendingTransactionError),
     #[error("Contract error: {0}")]
-    Contract(#[from] alloy::contract::Error),
-
+    Contract(#[from] contract::Error),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
-
     #[error("Attestation timeout after {attempts} attempts: {source}")]
     AttestationTimeout {
         attempts: usize,
         source: AttestationError,
     },
-
     #[error("MessageSent event not found in transaction receipt")]
     MessageSentEventNotFound,
-
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
-
     #[error("Invalid hex encoding: {0}")]
-    HexDecode(#[from] alloy::hex::FromHexError),
-
+    HexDecode(#[from] FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
 }
@@ -172,7 +167,7 @@ pub enum AttestationError {
     Http(#[from] reqwest::Error),
 
     #[error("Invalid hex encoding: {0}")]
-    HexDecode(#[from] alloy::hex::FromHexError),
+    HexDecode(#[from] FromHexError),
 
     #[error("Attestation not ready")]
     NotReady,
@@ -336,7 +331,7 @@ where
                 .strip_prefix("0x")
                 .unwrap_or(&attestation_response.attestation);
 
-            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+            let attestation_bytes = hex::decode(attestation_hex)?;
 
             Ok(Bytes::from(attestation_bytes))
         };
@@ -780,7 +775,7 @@ mod tests {
                 .attestation
                 .strip_prefix("0x")
                 .unwrap_or(&attestation_response.attestation);
-            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+            let attestation_bytes = hex::decode(attestation_hex)?;
 
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
@@ -837,7 +832,7 @@ mod tests {
                 .attestation
                 .strip_prefix("0x")
                 .unwrap_or(&attestation_response.attestation);
-            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+            let attestation_bytes = hex::decode(attestation_hex)?;
 
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };

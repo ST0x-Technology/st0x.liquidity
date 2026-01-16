@@ -143,10 +143,12 @@ fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBroke
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    use super::*;
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use crate::{Shares, Symbol};
 
     fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthEnv {
         AlpacaBrokerApiAuthEnv {
