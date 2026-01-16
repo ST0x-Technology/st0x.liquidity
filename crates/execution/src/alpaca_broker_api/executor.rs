@@ -1,11 +1,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use rust_decimal::Decimal;
 use tracing::info;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiClient};
+use super::auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
+use super::client::AlpacaBrokerApiClient;
+use super::order::{ConversionDirection, CryptoOrderResponse};
 use crate::{
     Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
     TryIntoExecutor,
@@ -115,8 +118,36 @@ impl TryIntoExecutor for AlpacaBrokerApiAuthEnv {
     }
 }
 
+impl AlpacaBrokerApi {
+    /// Convert USDC to/from USD buying power.
+    ///
+    /// This uses the USDC/USD trading pair on Alpaca:
+    /// - `UsdcToUsd`: Sells USDC for USD buying power
+    /// - `UsdToUsdc`: Buys USDC with USD buying power
+    ///
+    /// Returns the completed order response after the order is filled.
+    pub async fn convert_usdc_usd(
+        &self,
+        amount: Decimal,
+        direction: ConversionDirection,
+    ) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+        let order = super::order::convert_usdc_usd(&self.client, amount, direction).await?;
+
+        info!(
+            order_id = %order.id,
+            amount = %amount,
+            direction = ?direction,
+            "USDC/USD conversion order placed, polling for completion..."
+        );
+
+        super::order::poll_crypto_order_until_filled(&self.client, order.id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use chrono_tz::America::New_York;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -189,24 +220,34 @@ mod tests {
         let config = create_test_config(&server.base_url());
 
         let account_mock = create_account_mock(&server);
-        let clock_mock = server.mock(|when, then| {
-            when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/clock");
+
+        // Get today's date in ET timezone to build a response that represents
+        // market currently being open
+        let now = Utc::now();
+        let now_et = now.with_timezone(&New_York);
+        let today = now_et.date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+
+        // Mock calendar endpoint - returns today as a trading day with market
+        // hours that span the entire day so the test always finds market "open"
+        let calendar_mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/calendar");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(json!({
-                    "timestamp": "2025-01-03T14:30:00-05:00",
-                    "is_open": true,
-                    "next_open": "2030-01-06T14:30:00+00:00",
-                    "next_close": "2030-01-06T21:00:00+00:00"
-                }));
+                .json_body(json!([
+                    {
+                        "date": today_str,
+                        "open": "0000",
+                        "close": "2359"
+                    }
+                ]));
         });
 
         let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
         let result = executor.wait_until_market_open().await;
 
         account_mock.assert();
-        clock_mock.assert();
+        calendar_mock.assert();
         assert!(result.is_ok());
         assert!(result.unwrap().as_secs() > 0);
     }

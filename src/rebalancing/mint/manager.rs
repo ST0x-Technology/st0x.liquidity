@@ -231,7 +231,8 @@ mod tests {
 
     use super::*;
     use crate::alpaca_tokenization::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
+        TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
+        tokenization_requests_path,
     };
 
     type TestCqrs = CqrsFramework<
@@ -314,14 +315,14 @@ mod tests {
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(sample_pending_response("mint_123"));
         });
 
         let poll_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_completed_response("mint_123")]));
@@ -352,14 +353,14 @@ mod tests {
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(sample_pending_response("mint_456"));
         });
 
         let poll_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
@@ -402,7 +403,7 @@ mod tests {
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(500).body("Internal Server Error");
         });
 
@@ -430,14 +431,14 @@ mod tests {
         let manager = MintManager::new(service, cqrs);
 
         let mint_mock = server.mock(|when, then| {
-            when.method(POST).path("/v2/tokenization/mint");
+            when.method(POST).path(tokenization_mint_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(sample_pending_response("trait_test"));
         });
 
         let poll_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/tokenization/requests");
+            when.method(GET).path(tokenization_requests_path());
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([sample_completed_response("trait_test")]));

@@ -1,16 +1,65 @@
 //! Execution threshold configuration for position management.
 
+use alloy::primitives::U256;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
+use std::str::FromStr;
 
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Usdc(pub(crate) Decimal);
+pub struct Usdc(pub(crate) Decimal);
+
+impl FromStr for Usdc {
+    type Err = rust_decimal::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Decimal::from_str(s).map(Self)
+    }
+}
+
+impl Display for Usdc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 impl HasZero for Usdc {
     const ZERO: Self = Self(Decimal::ZERO);
+}
+
+/// 10^6 scale factor for USDC (6 decimals).
+const USDC_DECIMAL_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
+
+impl Usdc {
+    /// Converts to U256 with 6 decimal places (USDC standard).
+    ///
+    /// Returns an error for negative values or overflow during scaling.
+    pub fn to_u256_6_decimals(self) -> Result<U256, UsdcConversionError> {
+        if self.0.is_sign_negative() {
+            return Err(UsdcConversionError::NegativeValue(self.0));
+        }
+
+        let scaled = self
+            .0
+            .checked_mul(USDC_DECIMAL_SCALE)
+            .ok_or(UsdcConversionError::Overflow)?;
+
+        U256::from_str_radix(&scaled.trunc().to_string(), 10)
+            .map_err(UsdcConversionError::ParseError)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum UsdcConversionError {
+    #[error("USDC amount cannot be negative: {0}")]
+    NegativeValue(Decimal),
+    #[error("overflow when scaling USDC to 6 decimals")]
+    Overflow,
+    #[error("failed to parse U256: {0}")]
+    ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
 
 impl From<Usdc> for Decimal {

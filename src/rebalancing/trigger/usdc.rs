@@ -3,16 +3,26 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rust_decimal::Decimal;
 use tokio::sync::RwLock;
+use tracing::debug;
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
+use crate::threshold::Usdc;
+
+/// Minimum USDC amount for Alpaca withdrawals.
+/// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~6bps),
+/// we use $51 to ensure we always meet the minimum.
+const ALPACA_MINIMUM_WITHDRAWAL: Usdc = Usdc(Decimal::from_parts(51, 0, 0, false, 0));
 
 /// Why a USDC trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UsdcTriggerSkip {
     /// No USDC imbalance detected.
     NoImbalance,
+    /// Imbalance exists but amount is below Alpaca's minimum withdrawal ($51).
+    BelowMinimumWithdrawal { excess: Usdc },
 }
 
 /// RAII guard that holds a USDC in-progress claim.
@@ -72,6 +82,14 @@ pub(super) async fn check_imbalance_and_build_operation(
     let imbalance = imbalance.ok_or(UsdcTriggerSkip::NoImbalance)?;
 
     match imbalance {
+        Imbalance::TooMuchOffchain { excess } if excess < ALPACA_MINIMUM_WITHDRAWAL => {
+            debug!(
+                excess = %excess.0,
+                minimum = %ALPACA_MINIMUM_WITHDRAWAL.0,
+                "USDC imbalance below Alpaca minimum withdrawal, skipping"
+            );
+            Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess })
+        }
         Imbalance::TooMuchOffchain { excess } => {
             Ok(TriggeredOperation::UsdcAlpacaToBase { amount: excess })
         }
@@ -134,5 +152,97 @@ mod tests {
         let result = check_imbalance_and_build_operation(&threshold, &inventory).await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
+    }
+
+    #[test]
+    fn alpaca_minimum_withdrawal_is_51_usdc() {
+        assert_eq!(
+            ALPACA_MINIMUM_WITHDRAWAL,
+            Usdc(dec!(51)),
+            "Alpaca minimum withdrawal should be $51 to account for USDC/USD spread"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_excess_below_minimum_returns_below_minimum_withdrawal() {
+        // 90 offchain, 10 onchain = 90% offchain
+        // Excess to reach 50% target = 90 - 50 = 40 USDC (below $51 minimum)
+        let inventory = InventoryView::default().with_usdc(Usdc(dec!(10)), Usdc(dec!(90)));
+
+        let inventory = Arc::new(RwLock::new(inventory));
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory).await;
+
+        assert!(
+            matches!(result, Err(UsdcTriggerSkip::BelowMinimumWithdrawal { excess }) if excess.0 < dec!(51)),
+            "Expected BelowMinimumWithdrawal, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_excess_above_minimum_triggers_alpaca_to_base() {
+        // 500 offchain, 100 onchain = 83% offchain
+        // To reach 50% target: need 300 each, so excess = 500 - 300 = 200 USDC
+        let inventory = InventoryView::default().with_usdc(Usdc(dec!(100)), Usdc(dec!(500)));
+
+        let inventory = Arc::new(RwLock::new(inventory));
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory).await;
+
+        assert!(
+            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount.0 >= dec!(51)),
+            "Expected UsdcAlpacaToBase with amount >= 51, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_excess_at_exactly_minimum_triggers_alpaca_to_base() {
+        // Edge case: excess is exactly $51
+        // Total = 102, target = 51 each
+        // If offchain = 102, onchain = 0, excess = 102 - 51 = 51
+        let inventory = InventoryView::default().with_usdc(Usdc(dec!(0)), Usdc(dec!(102)));
+
+        let inventory = Arc::new(RwLock::new(inventory));
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory).await;
+
+        assert!(
+            matches!(result, Ok(TriggeredOperation::UsdcAlpacaToBase { amount }) if amount == Usdc(dec!(51))),
+            "Expected UsdcAlpacaToBase with amount = 51, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_too_much_onchain_has_no_minimum_restriction() {
+        // When there's too much onchain (Base), we deposit to Alpaca.
+        // Deposits have no minimum restriction (verified in production at 0.01 USDC).
+        // 10 offchain, 90 onchain = 10% offchain (below 30% lower bound)
+        // Excess = 90 - 50 = 40 USDC (would be below withdrawal minimum, but deposits are fine)
+        let inventory = InventoryView::default().with_usdc(Usdc(dec!(90)), Usdc(dec!(10)));
+
+        let inventory = Arc::new(RwLock::new(inventory));
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        let result = check_imbalance_and_build_operation(&threshold, &inventory).await;
+
+        assert!(
+            matches!(result, Ok(TriggeredOperation::UsdcBaseToAlpaca { amount }) if amount == Usdc(dec!(40))),
+            "Expected UsdcBaseToAlpaca with amount = 40 (no minimum for deposits), got {result:?}"
+        );
     }
 }

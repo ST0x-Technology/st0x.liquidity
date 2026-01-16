@@ -49,8 +49,30 @@ When the user asks a question or challenges your approach:
 4. **Never assume silence or a question means approval to change direction.**
    Explicit confirmation is required before abandoning one approach for another.
 
+### When issues are pointed out
+
+When the user points out an issue, bug, or problem - fix it immediately. Do not
+ask "Want me to fix this?" or "Should I address this?". The user never sends
+messages just for the sake of it; when they point out issues, they expect action
+(usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
+context).
+
 This prevents wasted time on undirected exploration and ensures alignment on the
 implementation strategy.
+
+### When user action is required
+
+**CRITICAL**: The user is not reading every word of your output - they are
+monitoring your actions. When you need the user to do something (run a command,
+check output, provide input), you must ensure they see the request:
+
+- If you are **blocked** and cannot proceed without user action, STOP after
+  stating what you need. Do not continue working on other tasks.
+- If you are **not blocked**, you can continue working, but when you're ready to
+  stop, clearly state what you need from the user at the end of your response.
+
+The user checks your output when they see you've stopped. If you give them a
+command mid-response and keep working, they will miss it.
 
 ### Before creating a PR
 
@@ -80,9 +102,17 @@ This project uses a Cargo workspace with:
 
 ### Building & Running
 
-- `cargo build` - Build all workspace members
-- `cargo build -p st0x-hedge` - Build main crate only
-- `cargo build -p st0x-execution` - Build execution crate only
+**CRITICAL: NEVER use `cargo build` for verification.** It's slower than
+`cargo check` and less useful than `cargo test` or `cargo clippy`. Use:
+
+- `cargo check` for fast compilation verification
+- `cargo test` for verification with test coverage
+- `cargo clippy` for verification with linting
+
+Only use `cargo build` when you actually need the build artifacts (e.g., final
+verification before a release, or when the user explicitly asks to run the
+binary).
+
 - `cargo run --bin server` - Run the main arbitrage bot
 - `cargo run --bin cli -- auth` - Run the authentication flow for Charles Schwab
   OAuth setup
@@ -141,6 +171,10 @@ resolution and feature selection.
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
   the interactive view, e.g. `git --no-pager diff`
+- **CRITICAL: NEVER run `cargo run` unless explicitly asked by the user.** If
+  you want to understand CLI commands or configuration options, read the code.
+  If you want to test functionality, write proper tests. There is never a reason
+  to run the application speculatively.
 
 ## Architecture Overview
 
@@ -407,6 +441,11 @@ Environment variables (can be set via `.env` file):
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
   impossible
+- **No Duplicate Values in Debug Output**: Never hardcode values that exist
+  elsewhere in the implementation (URLs, paths, constants, config values, etc.)
+  into debug/log statements. These duplicates will inevitably drift out of sync
+  with the real implementation, misleading debugging efforts instead of helping
+  them. Always log the actual runtime value being used, not a hardcoded copy
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the
@@ -619,6 +658,13 @@ explicit permission.**
 - **Test Quality**: Never write tests that only exercise language features
   without testing our application logic. Tests should verify actual business
   logic, not just struct field assignments or basic language operations
+- **Property-Based Testing**: Use `proptest` for property-based tests whenever
+  there are clear invariants to verify. Property tests are excellent for:
+  - Parsing/serialization roundtrips
+  - Boundary conditions (e.g., message length validation)
+  - Invariants that should hold for all inputs (e.g., extracted data matches
+    input regardless of surrounding bytes)
+  - Numeric operations where edge cases are hard to enumerate manually
 
 #### Writing Meaningful Tests
 
@@ -666,12 +712,13 @@ expected bounds.
 
 ### Workflow Best Practices
 
-- **Always run tests, clippy, and formatters before handing over a piece of
-  work** (skip if only documentation/markdown files were changed)
-  - Run tests first, as changing tests can break clippy
-  - Run clippy next, as fixing linting errors can break formatting
-  - Deny warnings when running clippy
-  - Always run `cargo fmt` last to ensure clean code formatting
+- **Always run verification steps before handing over a piece of work** (skip if
+  only documentation/markdown files were changed). Run them in this order to
+  fail fast:
+  1. `cargo check` - fastest, catches compilation errors first
+  2. `cargo test -q` - only run after check passes
+  3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
+  4. `cargo fmt` - always run last to ensure clean formatting
 
 #### CRITICAL: Lint Policy
 
@@ -806,41 +853,13 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
 #### Bad Comment Examples
 
 ```rust
-// ❌ Redundant - the function name says this
-// Spawn background token refresh task
+// ❌ Redundant - function name already says this
 spawn_automatic_token_refresh(pool, env);
 
-// ❌ Obvious from context
-// Store test tokens
-let tokens = SchwabTokens { /* ... */ };
-tokens.store(&pool).await.unwrap();
-
 // ❌ Just restating the code
-// Mock account hash endpoint
-let mock = server.mock(|when, then| {
-    when.method(GET).path("/trader/v1/accounts/accountNumbers");
-    // ...
-});
-
-// ❌ Test section markers that add no value
-// 1. Test token refresh integration
-let result = refresh_tokens(&pool).await;
-
-// ❌ Explaining what the code obviously does
-// Execute the order
-execute_schwab_order(env, pool, trade).await;
-
-// ❌ Obvious variable assignments
-// Create a trade
-let trade = Trade { /* ... */ };
-
-// ❌ Test setup that's clear from code structure
-// Verify mocks were called
-mock.assert();
-
-// ❌ Obvious control flow
-// Save trade to DB
-trade.try_save_to_db(&pool).await?;
+let tokens = SchwabTokens { /* ... */ };  // "Store test tokens"
+execute_schwab_order(env, pool, trade).await;  // "Execute the order"
+mock.assert();  // "Verify mocks were called"
 ```
 
 #### Function Documentation
@@ -960,6 +979,36 @@ assert_eq!(result.unwrap(), "refreshed_access_token");
 
 so that if we get an unexpected result value, we immediately see the value.
 
+#### Assertions must be specific
+
+Test assertions must check for the exact expected behavior, not vague
+alternatives. Never use `||` in assertions to accept multiple possible outcomes
+unless those outcomes are genuinely equivalent.
+
+```rust
+// ❌ BAD - Lazy, accepts vaguely similar outcomes
+assert!(
+    output.contains("Failed") || output.contains("❌"),
+    "Output should indicate failure"
+);
+
+// ❌ BAD - Too permissive, doesn't verify actual behavior
+assert!(result.is_some());
+
+// ✅ GOOD - Checks for exact expected output
+assert!(
+    output.contains("❌ Failed to place order"),
+    "Expected failure message, got: {output}"
+);
+
+// ✅ GOOD - Verifies specific value
+assert_eq!(result.unwrap().order_id, "12345");
+```
+
+If you find yourself writing `||` in an assertion, ask: are these outcomes
+actually equivalent? If not, you probably don't understand what the code should
+do, and need to investigate before writing the test.
+
 #### Type modeling examples
 
 **Principle**: Choose the type representation that most accurately models the
@@ -1042,97 +1091,15 @@ Prefer flat code over deeply nested blocks to improve readability and
 maintainability. This includes test modules - do NOT nest submodules inside
 `mod tests`. Put all tests directly in the `tests` module.
 
-##### Use early returns:
+##### Techniques for flat code:
 
-Instead of
-
-```rust
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    if let Some(data) = data {
-        if !data.is_empty() {
-            if data.len() > 5 {
-                Ok(data.to_uppercase())
-            } else {
-                Err(Error::TooShort)
-            }
-        } else {
-            Err(Error::Empty)
-        }
-    } else {
-        Err(Error::None)
-    }
-}
-```
-
-Write
-
-```rust
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    let data = data.ok_or(Error::None)?;
-    
-    if data.is_empty() {
-        return Err(Error::Empty);
-    }
-    
-    if data.len() <= 5 {
-        return Err(Error::TooShort);
-    }
-    
-    Ok(data.to_uppercase())
-}
-```
-
-##### Use let-else pattern for guard clauses:
-
-```rust
-// Use let-else to flatten nested if-let chains
-let Some(trade_data) = convert_event_to_trade(event) else {
-    return Err(Error::ConversionFailed);
-};
-let Some(symbol) = trade_data.extract_symbol() else {
-    return Err(Error::NoSymbol);
-};
-```
-
-##### Extract functions for complex logic:
-
-Break deeply nested event processing into helper functions with clear names.
-
-##### Use pattern matching with guards:
-
-```rust
-// Instead of nested if-let
-if let Some(data) = input {
-    if state == State::Ready && data.is_valid() {
-        process(data)
-    } else { Err(Error::Invalid) }
-} else { Err(Error::NoData) }
-
-// Write
-match (input, state) {
-    (Some(data), State::Ready) if data.is_valid() => process(data),
-    (Some(_), State::Ready) => Err(Error::InvalidData),
-    _ => Err(Error::NoData),
-}
-```
-
-##### Prefer iterator chains over nested loops:
-
-```rust
-// Instead of imperative loops
-let mut results = Vec::new();
-for trade in &trades {
-    if trade.is_valid() {
-        results.push(process_trade(trade)?);
-    }
-}
-
-// Write functional chains
-trades.iter()
-    .filter(|t| t.is_valid())
-    .map(process_trade)
-    .collect::<Result<Vec<_>, _>>()
-```
+- **Early returns**: Use `?` operator and guard clauses instead of nested if-let
+- **let-else pattern**: `let Some(x) = y else { return Err(...); };`
+- **Extract functions**: Break nested logic into helper functions
+- **Pattern matching with guards**: Use `match` with guards instead of nested
+  if-let
+- **Iterator chains**: Use `.filter().map().collect()` instead of imperative
+  loops
 
 #### Struct field access
 
