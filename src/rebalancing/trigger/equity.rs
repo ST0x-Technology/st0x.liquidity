@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 use crate::symbol::cache::SymbolCache;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 use super::TriggeredOperation;
 
@@ -119,7 +119,7 @@ mod tests {
     use alloy::primitives::TxHash;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_broker::Direction;
+    use st0x_execution::Direction;
 
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};

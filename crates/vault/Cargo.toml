@@ -1,0 +1,22 @@
+[package]
+name = "st0x-vault"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+rain = []
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+rain-math-float.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

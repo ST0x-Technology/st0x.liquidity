@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/broker"]
+members = [
+  ".",
+  "crates/execution",
+  "crates/tokenization",
+  "crates/bridge",
+  "crates/vault",
+]
 resolver = "2"
 
 [workspace.package]
@@ -83,7 +89,10 @@ anyhow = "1.0.98"
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
-st0x-broker = { path = "crates/broker" }
+st0x-bridge = { path = "crates/bridge", features = ["cctp"] }
+st0x-execution = { path = "crates/execution" }
+st0x-tokenization = { path = "crates/tokenization", features = ["alpaca"] }
+st0x-vault = { path = "crates/vault", features = ["rain"] }
 backon.workspace = true
 clap.workspace = true
 dotenvy = "0.15.7"
@@ -115,6 +124,12 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
+ts-rs = { version = "11.1.0", features = [
+  "chrono",
+  "chrono-impl",
+  "serde-compat",
+] }
+rocket_ws = "0.1.1"
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -122,6 +137,7 @@ serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
+tokio-tungstenite = "0.28.0"
 
 [[bin]]
 name = "migrate_to_events"

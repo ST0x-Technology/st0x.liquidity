@@ -1,0 +1,25 @@
+[package]
+name = "st0x-tokenization"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+alpaca = []
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+rust_decimal = "1.38.0"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+httpmock.workspace = true
+
+[lints]
+workspace = true

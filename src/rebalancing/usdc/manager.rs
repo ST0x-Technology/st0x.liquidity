@@ -10,13 +10,14 @@ use cqrs_es::{CqrsFramework, EventStore};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
+use st0x_bridge::{BurnReceipt, CctpBridge};
+use st0x_vault::{VaultId, VaultService};
+
 use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{BurnReceipt, CctpBridge};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -684,10 +685,11 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use st0x_bridge::{CctpBridge, Evm};
+    use st0x_vault::VaultService;
+
     use super::*;
     use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, create_account_mock};
-    use crate::cctp::{CctpBridge, Evm};
-    use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::UsdcRebalanceError;
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");

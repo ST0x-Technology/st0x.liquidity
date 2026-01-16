@@ -139,6 +139,24 @@ resolution and feature selection.
   interface
 - `nix run .#checkTestCoverage` - Generate test coverage report
 
+### Dashboard Development
+
+The `dashboard/` directory contains a SvelteKit frontend application.
+
+**Package Manager**: Use `bun` (not npm/yarn/pnpm) for all JavaScript/TypeScript
+operations. Run commands from the repo root using `--cwd`:
+
+- `bun install --cwd dashboard` - Install dependencies
+- `bun run --cwd dashboard dev` - Start development server
+- `bun run --cwd dashboard build` - Build for production
+- `bun run --cwd dashboard check` - Run svelte-check
+- `bun run --cwd dashboard test:run` - Run tests
+
+**Adding shadcn-svelte components** (requires subshell due to config discovery):
+
+- `(cd dashboard && bunx shadcn-svelte@latest add <component>)` - Add a
+  component
+
 ## Development Workflow Notes
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
@@ -608,9 +626,9 @@ fn test_order_poller_respects_jitter_bounds() {
         polling_interval: Duration::from_secs(60),
         max_jitter: Duration::from_secs(10),
     };
-    
+
     let actual_delay = config.calculate_next_poll_delay();
-    
+
     assert!(actual_delay >= Duration::from_secs(60));
     assert!(actual_delay <= Duration::from_secs(70));
 }
@@ -630,70 +648,44 @@ expected bounds.
 
 #### CRITICAL: Lint Policy
 
-**NEVER add `#[allow(clippy::*)]` attributes or disable any lints without
-explicit permission.** This is strictly forbidden. When clippy reports issues,
-you MUST fix the underlying code problems, not suppress the warnings.
+**This policy applies to ALL linters across ALL languages in the repository**
+(clippy, eslint, etc.). NEVER disable or bypass any lint rules without explicit
+user permission.
 
-**Required approach for clippy issues:**
+**FORBIDDEN without explicit permission:**
+
+- `#[allow(clippy::*)]` attributes in Rust
+- `// eslint-disable` comments in TypeScript/JavaScript
+- Any other lint suppression mechanism in any language
+
+**Required approach for lint issues:**
 
 1. **Refactor the code** to address the root cause of the lint violation
 2. **Break down large functions** into smaller, more focused functions
-3. **Improve code structure** to meet clippy's standards
+3. **Improve code structure** to meet the linter's standards
 4. **Use proper error handling** instead of suppressing warnings
 
-**Examples of FORBIDDEN practices:**
+**If you encounter a lint issue you cannot fix:**
 
-```rust
-// ❌ NEVER DO THIS - Suppressing lints is forbidden
-#[allow(clippy::too_many_lines)]
-fn large_function() { /* ... */ }
+1. Understand WHY the linter is flagging the code
+2. Attempt to refactor the code to address the underlying problem
+3. If the lint cannot be fixed (e.g., type system limitations), ask for explicit
+   permission before suppressing it
+4. Document your reasoning in a comment if given permission
 
-#[allow(clippy::needless_continue)]
-// ❌ NEVER DO THIS - Fix the code structure instead
-```
+**Exception for third-party generated code:**
 
-**Required approach:**
+Lint suppression is acceptable for issues originating from code we cannot
+control, such as:
 
-```rust
-// ✅ CORRECT - Refactor to address the issue
-fn process_data() -> Result<(), Error> {
-    let data = get_data()?;
-    validate_data(&data)?;
-    save_data(&data)?;
-    Ok(())
-}
-
-fn validate_data(data: &Data) -> Result<(), Error> {
-    // Extracted validation logic
-}
-
-fn save_data(data: &Data) -> Result<(), Error> {
-    // Extracted saving logic
-}
-```
-
-**If you encounter a clippy issue:**
-
-1. Understand WHY clippy is flagging the code
-2. Refactor the code to address the underlying problem
-3. If you believe a lint is incorrect, ask for permission before suppressing it
-4. Document your reasoning if given permission to suppress a specific lint
-
-**Exception for third-party macro-generated code:**
-
-When using third-party macros, such as `sol!` to generate Rust code , lint
-suppression is acceptable for issues that originate from the contract's function
-signatures, which we cannot control.
-
-For example, to deal with a function generated from a smart contract's ABI, we
-can add `allow` inside the `sol!` macro invocation.
+- Rust: `sol!` macro generating code from smart contract ABIs
+- TypeScript: Auto-generated types from external schemas
 
 ```rust
 // ✅ CORRECT - Suppressing lint for third-party ABI generated code
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
-    #[derive(serde::Serialize, serde::Deserialize)]
     IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
 );
 ```
@@ -734,10 +726,10 @@ that cannot be expressed through code structure alone.
 
 ```rust
 // If the on-chain order has USDC as input and an 0x tokenized stock as
-// output then it means the order received USDC and gave away an 0x  
+// output then it means the order received USDC and gave away an 0x
 // tokenized stock, i.e. sold, which means that to take the opposite
 // trade in schwab we need to buy and vice versa.
-let (schwab_ticker, schwab_instruction) = 
+let (schwab_ticker, schwab_instruction) =
     if onchain_input_symbol == "USDC" && onchain_output_symbol.ends_with("0x") {
         // ... complex mapping logic
     }
@@ -804,7 +796,7 @@ Use Rust doc comments (`///`) for public APIs:
 
 ```rust
 /// Validates Schwab authentication tokens and refreshes if needed.
-/// 
+///
 /// Returns `SchwabError::RefreshTokenExpired` if the refresh token
 /// has expired and manual re-authentication is required.
 pub async fn refresh_if_needed(pool: &SqlitePool) -> Result<bool, SchwabError> {
@@ -1024,15 +1016,15 @@ Write
 ```rust
 fn process_data(data: Option<&str>) -> Result<String, Error> {
     let data = data.ok_or(Error::None)?;
-    
+
     if data.is_empty() {
         return Err(Error::Empty);
     }
-    
+
     if data.len() <= 5 {
         return Err(Error::TooShort);
     }
-    
+
     Ok(data.to_uppercase())
 }
 ```
@@ -1123,7 +1115,7 @@ println!("Token: {}", tokens.access_token);
 impl SchwabTokens {
     // Unnecessary - just sets fields without additional logic
     pub fn new(access_token: String, /* ... */) -> Self { /* ... */ }
-    
+
     // Unnecessary - just returns field value
     pub fn access_token(&self) -> &str { &self.access_token }
 }

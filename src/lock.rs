@@ -1,6 +1,8 @@
 use crate::error::OnChainError;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::{info, warn};
+
+const LOCK_TIMEOUT_MINUTES: i32 = 5;
 
 /// Atomically acquires an execution lease for the given symbol.
 /// Returns true if lease was acquired, false if another worker holds it.
@@ -8,9 +10,23 @@ pub(crate) async fn try_acquire_execution_lease(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     symbol: &Symbol,
 ) -> Result<bool, OnChainError> {
-    const LOCK_TIMEOUT_MINUTES: i32 = 5;
+    cleanup_stale_lock(sql_tx, symbol).await?;
 
-    // Clean up stale lock for this specific symbol (older than 5 minutes)
+    let result = sqlx::query("INSERT OR IGNORE INTO symbol_locks (symbol) VALUES (?1)")
+        .bind(symbol.to_string())
+        .execute(sql_tx.as_mut())
+        .await?;
+
+    let lease_acquired = result.rows_affected() > 0;
+    log_lease_result(symbol, lease_acquired);
+
+    Ok(lease_acquired)
+}
+
+async fn cleanup_stale_lock(
+    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    symbol: &Symbol,
+) -> Result<(), OnChainError> {
     let timeout_param = format!("-{LOCK_TIMEOUT_MINUTES} minutes");
     let symbol_str = symbol.to_string();
     let cleanup_result = sqlx::query!(
@@ -29,13 +45,10 @@ pub(crate) async fn try_acquire_execution_lease(
         );
     }
 
-    // Try to acquire lock by inserting into symbol_locks table
-    let result = sqlx::query("INSERT OR IGNORE INTO symbol_locks (symbol) VALUES (?1)")
-        .bind(symbol.to_string())
-        .execute(sql_tx.as_mut())
-        .await?;
+    Ok(())
+}
 
-    let lease_acquired = result.rows_affected() > 0;
+fn log_lease_result(symbol: &Symbol, lease_acquired: bool) {
     if lease_acquired {
         info!("Acquired execution lease for symbol: {symbol}");
     } else {
@@ -44,8 +57,6 @@ pub(crate) async fn try_acquire_execution_lease(
             symbol
         );
     }
-
-    Ok(lease_acquired)
 }
 
 /// Clears the execution lease when no execution was created
@@ -110,8 +121,8 @@ mod tests {
     use crate::onchain::accumulator::save_within_transaction;
     use crate::onchain::position_calculator::PositionCalculator;
     use crate::test_utils::setup_test_db;
-    use st0x_broker::OrderState;
-    use st0x_broker::{Direction, Shares, SupportedBroker};
+    use st0x_execution::OrderState;
+    use st0x_execution::{Direction, Shares, SupportedExecutor};
 
     #[tokio::test]
     async fn test_try_acquire_execution_lease_success() {
@@ -206,7 +217,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(100).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -335,7 +346,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(100).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 

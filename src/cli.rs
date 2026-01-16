@@ -11,12 +11,12 @@ use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use st0x_broker::schwab::{
+use st0x_execution::schwab::{
     SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
 };
-use st0x_broker::{
-    Broker, Direction, MarketOrder, MockBrokerConfig, OrderPlacement, OrderState, Shares, Symbol,
-    TryIntoBroker,
+use st0x_execution::{
+    Direction, Executor, MarketOrder, MockExecutorConfig, OrderPlacement, OrderState, Shares,
+    Symbol, TryIntoExecutor,
 };
 
 #[derive(Debug, Error)]
@@ -121,85 +121,108 @@ async fn run_command_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     match command {
         Commands::Buy { ticker, quantity } => {
-            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
-            let validated_ticker = validate_ticker(&ticker)?;
-            if quantity == 0 {
-                return Err(CliError::InvalidQuantity { value: quantity }.into());
-            }
-            info!("Processing buy order: ticker={validated_ticker}, quantity={quantity}");
-            execute_order_with_writers(
-                validated_ticker,
-                quantity,
-                Direction::Buy,
-                &config,
-                pool,
-                stdout,
-            )
-            .await?;
+            handle_trade_command(&config, pool, stdout, ticker, quantity, Direction::Buy).await?;
         }
         Commands::Sell { ticker, quantity } => {
-            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
-            let validated_ticker = validate_ticker(&ticker)?;
-            if quantity == 0 {
-                return Err(CliError::InvalidQuantity { value: quantity }.into());
-            }
-            info!("Processing sell order: ticker={validated_ticker}, quantity={quantity}");
-            execute_order_with_writers(
-                validated_ticker,
-                quantity,
-                Direction::Sell,
-                &config,
-                pool,
-                stdout,
-            )
-            .await?;
+            handle_trade_command(&config, pool, stdout, ticker, quantity, Direction::Sell).await?;
         }
         Commands::ProcessTx { tx_hash } => {
-            info!("Processing transaction: tx_hash={tx_hash}");
-            let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
-            let provider = ProviderBuilder::new().connect_ws(ws).await?;
-            let cache = SymbolCache::default();
-            process_tx_with_provider(tx_hash, &config, pool, stdout, &provider, &cache).await?;
+            handle_process_tx_command(&config, pool, stdout, tx_hash).await?;
         }
-        Commands::Auth => {
-            let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
-                anyhow::bail!("Auth command is only supported for Schwab broker")
-            };
-
-            info!("Starting OAuth authentication flow");
-            writeln!(
-                stdout,
-                "🔄 Starting Charles Schwab OAuth authentication process..."
-            )?;
-            writeln!(
-                stdout,
-                "   You will be guided through the authentication process."
-            )?;
-
-            match run_oauth_flow(pool, schwab_auth).await {
-                Ok(()) => {
-                    info!("OAuth authentication completed successfully");
-                    writeln!(stdout, "✅ Authentication successful!")?;
-                    writeln!(
-                        stdout,
-                        "   Your tokens have been saved and are ready to use."
-                    )?;
-                }
-                Err(oauth_error) => {
-                    error!("OAuth authentication failed: {oauth_error:?}");
-                    writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
-                    writeln!(
-                        stdout,
-                        "   Please ensure you have a valid Charles Schwab account and try again."
-                    )?;
-                    return Err(oauth_error.into());
-                }
-            }
-        }
+        Commands::Auth => handle_auth_command(&config, pool, stdout).await?,
     }
 
     info!("CLI operation completed successfully");
     Ok(())
+}
+
+async fn handle_trade_command<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+    ticker: String,
+    quantity: u64,
+    direction: Direction,
+) -> anyhow::Result<()> {
+    ensure_schwab_authentication(pool, &config.broker, stdout).await?;
+
+    let validated_ticker = validate_ticker(&ticker)?;
+    if quantity == 0 {
+        return Err(CliError::InvalidQuantity { value: quantity }.into());
+    }
+
+    info!("Processing {direction:?} order: ticker={validated_ticker}, quantity={quantity}");
+
+    execute_order_with_writers(validated_ticker, quantity, direction, config, pool, stdout).await
+}
+
+async fn handle_process_tx_command<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+    tx_hash: B256,
+) -> anyhow::Result<()> {
+    info!("Processing transaction: tx_hash={tx_hash}");
+    let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
+    let provider = ProviderBuilder::new().connect_ws(ws).await?;
+    let cache = SymbolCache::default();
+    process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache).await
+}
+
+async fn handle_auth_command<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
+        anyhow::bail!("Auth command is only supported for Schwab broker")
+    };
+
+    info!("Starting OAuth authentication flow");
+    write_auth_start_message(stdout)?;
+
+    match run_oauth_flow(pool, schwab_auth).await {
+        Ok(()) => {
+            info!("OAuth authentication completed successfully");
+            write_auth_success_message(stdout)?;
+            Ok(())
+        }
+        Err(oauth_error) => {
+            error!("OAuth authentication failed: {oauth_error:?}");
+            write_auth_failure_message(stdout, &oauth_error)?;
+            Err(oauth_error.into())
+        }
+    }
+}
+
+fn write_auth_start_message<W: Write>(stdout: &mut W) -> std::io::Result<()> {
+    writeln!(
+        stdout,
+        "🔄 Starting Charles Schwab OAuth authentication process..."
+    )?;
+    writeln!(
+        stdout,
+        "   You will be guided through the authentication process."
+    )
+}
+
+fn write_auth_success_message<W: Write>(stdout: &mut W) -> std::io::Result<()> {
+    writeln!(stdout, "✅ Authentication successful!")?;
+    writeln!(
+        stdout,
+        "   Your tokens have been saved and are ready to use."
+    )
+}
+
+fn write_auth_failure_message<W: Write>(
+    stdout: &mut W,
+    error: &SchwabError,
+) -> std::io::Result<()> {
+    writeln!(stdout, "❌ Authentication failed: {error}")?;
+    writeln!(
+        stdout,
+        "   Please ensure you have a valid Charles Schwab account and try again."
+    )
 }
 
 async fn ensure_schwab_authentication<W: Write>(
@@ -213,29 +236,52 @@ async fn ensure_schwab_authentication<W: Write>(
 
     info!("Refreshing authentication tokens if needed");
 
+    if try_existing_token(pool, schwab_auth, stdout).await? {
+        return Ok(());
+    }
+
+    run_oauth_with_feedback(pool, schwab_auth, stdout).await
+}
+
+async fn try_existing_token<W: Write>(
+    pool: &SqlitePool,
+    schwab_auth: &SchwabAuthEnv,
+    stdout: &mut W,
+) -> anyhow::Result<bool> {
     match SchwabTokens::get_valid_access_token(pool, schwab_auth).await {
-        Ok(_access_token) => {
+        Ok(_) => {
             info!("Authentication tokens are valid, access token obtained");
-            return Ok(());
+            Ok(true)
         }
-        Err(st0x_broker::schwab::SchwabError::RefreshTokenExpired) => {
+        Err(SchwabError::RefreshTokenExpired) => {
             info!("Refresh token has expired, launching interactive OAuth flow");
-            writeln!(
-                stdout,
-                "🔄 Your refresh token has expired. Starting authentication process..."
-            )?;
-            writeln!(
-                stdout,
-                "   You will be guided through the Charles Schwab OAuth process."
-            )?;
+            write_token_expired_message(stdout)?;
+            Ok(false)
         }
         Err(e) => {
             error!("Failed to obtain valid access token: {e:?}");
             writeln!(stdout, "❌ Authentication failed: {e}")?;
-            return Err(e.into());
+            Err(e.into())
         }
     }
+}
 
+fn write_token_expired_message<W: Write>(stdout: &mut W) -> std::io::Result<()> {
+    writeln!(
+        stdout,
+        "🔄 Your refresh token has expired. Starting authentication process..."
+    )?;
+    writeln!(
+        stdout,
+        "   You will be guided through the Charles Schwab OAuth process."
+    )
+}
+
+async fn run_oauth_with_feedback<W: Write>(
+    pool: &SqlitePool,
+    schwab_auth: &SchwabAuthEnv,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
     match run_oauth_flow(pool, schwab_auth).await {
         Ok(()) => {
             info!("OAuth flow completed successfully");
@@ -247,11 +293,7 @@ async fn ensure_schwab_authentication<W: Write>(
         }
         Err(oauth_error) => {
             error!("OAuth flow failed: {oauth_error:?}");
-            writeln!(stdout, "❌ Authentication failed: {oauth_error}")?;
-            writeln!(
-                stdout,
-                "   Please ensure you have a valid Charles Schwab account and try again."
-            )?;
+            write_auth_failure_message(stdout, &oauth_error)?;
             Err(oauth_error.into())
         }
     }
@@ -294,7 +336,7 @@ async fn execute_order_with_writers<W: Write>(
         auth: schwab_auth.clone(),
         pool: pool.clone(),
     };
-    let broker = schwab_config.try_into_broker().await?;
+    let broker = schwab_config.try_into_executor().await?;
 
     let market_order = MarketOrder {
         symbol: Symbol::new(ticker.clone())?,
@@ -374,7 +416,7 @@ async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 async fn execute_broker_order<W: Write>(
     config: &Config,
     pool: &SqlitePool,
-    market_order: st0x_broker::MarketOrder,
+    market_order: MarketOrder,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &config.broker {
@@ -385,7 +427,7 @@ async fn execute_broker_order<W: Write>(
                 auth: schwab_auth.clone(),
                 pool: pool.clone(),
             };
-            let broker = schwab_config.try_into_broker().await?;
+            let broker = schwab_config.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -394,20 +436,31 @@ async fn execute_broker_order<W: Write>(
             )?;
             Ok(placement)
         }
-        BrokerConfig::Alpaca(alpaca_auth) => {
-            writeln!(stdout, "🔄 Executing Alpaca order...")?;
-            let broker = alpaca_auth.clone().try_into_broker().await?;
+        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+            writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
-                "✅ Alpaca order placed with ID: {}",
+                "✅ Alpaca Trading API order placed with ID: {}",
+                placement.order_id
+            )?;
+            Ok(placement)
+        }
+        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+            writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            let placement = broker.place_market_order(market_order).await?;
+            writeln!(
+                stdout,
+                "✅ Alpaca Broker API order placed with ID: {}",
                 placement.order_id
             )?;
             Ok(placement)
         }
         BrokerConfig::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
-            let broker = MockBrokerConfig.try_into_broker().await?;
+            let broker = MockExecutorConfig.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -433,7 +486,7 @@ async fn process_found_trade<W: Write>(
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
         onchain_trade,
-        config.broker.to_supported_broker(),
+        config.broker.to_supported_executor(),
     )
     .await?;
     sql_tx.commit().await?;
@@ -445,7 +498,7 @@ async fn process_found_trade<W: Write>(
         writeln!(
             stdout,
             "✅ Trade triggered execution for {:?} (ID: {execution_id})",
-            config.broker.to_supported_broker()
+            config.broker.to_supported_executor()
         )?;
 
         let market_order = MarketOrder {
@@ -521,9 +574,9 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_broker::Direction;
-    use st0x_broker::OrderStatus;
-    use st0x_broker::schwab::SchwabAuthEnv;
+    use st0x_execution::Direction;
+    use st0x_execution::OrderStatus;
+    use st0x_execution::schwab::SchwabAuthEnv;
     use std::str::FromStr;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -686,7 +739,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            st0x_broker::schwab::SchwabError::RefreshTokenExpired
+            SchwabError::RefreshTokenExpired
         ));
     }
 
@@ -938,7 +991,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            st0x_broker::schwab::SchwabError::RefreshTokenExpired
+            SchwabError::RefreshTokenExpired
         ));
 
         let mut stdout_buffer = Vec::new();
@@ -1737,14 +1790,14 @@ mod tests {
         // Executions are now in SUBMITTED status with order_id stored for order status polling
         let executions = find_executions_by_symbol_status_and_broker(
             &pool,
-            Some(st0x_broker::Symbol::new("AAPL").unwrap()),
+            Some(Symbol::new("AAPL").unwrap()),
             OrderStatus::Submitted,
             None,
         )
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, st0x_broker::Shares::new(9).unwrap());
+        assert_eq!(executions[0].shares, Shares::new(9).unwrap());
         assert_eq!(executions[0].direction, Direction::Buy);
 
         // Verify order_id was stored in database
