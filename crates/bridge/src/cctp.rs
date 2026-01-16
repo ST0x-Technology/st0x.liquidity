@@ -479,8 +479,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, address};
-    use httpmock::MockServer;
+    use alloy::network::EthereumWallet;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{Address, B256, U256, address, b256};
+    use alloy::providers::ProviderBuilder;
+    use alloy::signers::Signer;
+    use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol;
+    use alloy::sol_types::SolCall;
+    use httpmock::prelude::*;
+    use rand::Rng;
 
     use super::*;
 
@@ -528,14 +536,11 @@ mod tests {
 
     fn create_test_bridge(
         server: &MockServer,
-    ) -> CctpBridge<
-        alloy::providers::RootProvider<alloy::network::Ethereum>,
-        alloy::providers::RootProvider<alloy::network::Ethereum>,
-    > {
-        let eth_provider = alloy::providers::ProviderBuilder::new()
-            .connect_http("http://localhost:8545".parse().unwrap());
-        let base_provider = alloy::providers::ProviderBuilder::new()
-            .connect_http("http://localhost:8546".parse().unwrap());
+    ) -> CctpBridge<impl Provider + Clone, impl Provider + Clone> {
+        let eth_provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        let base_provider =
+            ProviderBuilder::new().connect_http("http://localhost:8546".parse().unwrap());
 
         let owner = Address::ZERO;
 
@@ -678,5 +683,1139 @@ mod tests {
         let json = r#"{"minFee": "100"}"#;
         let response: FeeResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.min_fee, "100");
+    }
+
+    fn setup_anvil() -> (AnvilInstance, String, B256) {
+        let anvil = Anvil::new().spawn();
+        let endpoint = anvil.endpoint();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        (anvil, endpoint, private_key)
+    }
+
+    async fn create_bridge_with_providers(
+        ethereum_endpoint: &str,
+        base_endpoint: &str,
+        private_key: &B256,
+        ethereum_usdc: Address,
+        base_usdc: Address,
+    ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
+    {
+        let signer = PrivateKeySigner::from_bytes(private_key)?;
+        let wallet = EthereumWallet::from(signer.clone());
+
+        let ethereum_provider = ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect(ethereum_endpoint)
+            .await?;
+
+        let base_provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(base_endpoint)
+            .await?;
+
+        let ethereum = Evm::new(
+            ethereum_provider,
+            signer.address(),
+            ethereum_usdc,
+            TOKEN_MESSENGER_V2,
+            MESSAGE_TRANSMITTER_V2,
+        );
+
+        let base = Evm::new(
+            base_provider,
+            signer.address(),
+            base_usdc,
+            TOKEN_MESSENGER_V2,
+            MESSAGE_TRANSMITTER_V2,
+        );
+
+        Ok(CctpBridge::new(ethereum, base))
+    }
+
+    #[tokio::test]
+    async fn attestation_succeeds_with_retry_logic() {
+        let server = MockServer::start();
+        let message_hash =
+            b256!("0x1234567890123456789012345678901234567890123456789012345678901234");
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!("/{message_hash}"));
+            then.status(200).json_body(serde_json::json!({
+                "attestation": "0x1234567890abcdef"
+            }));
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+            USDC_BASE,
+        )
+        .await
+        .unwrap();
+
+        let url = format!("{}/{message_hash}", server.base_url());
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_millis(10))
+            .with_max_times(5);
+
+        #[derive(serde::Deserialize)]
+        struct AttestationResponse {
+            attestation: String,
+        }
+
+        let fetch_attestation = || async {
+            let response = bridge.http_client.get(&url).send().await?;
+
+            if !response.status().is_success() {
+                return Err(AttestationError::NotReady);
+            }
+
+            let attestation_response: AttestationResponse = response.json().await?;
+            let attestation_hex = attestation_response
+                .attestation
+                .strip_prefix("0x")
+                .unwrap_or(&attestation_response.attestation);
+            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+
+            Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
+        };
+
+        let result = fetch_attestation.retry(backoff).await;
+
+        assert!(result.is_ok(), "Expected attestation to succeed");
+        assert_eq!(mock.hits(), 1, "Expected exactly 1 API call");
+    }
+
+    #[tokio::test]
+    async fn attestation_timeout() {
+        let server = MockServer::start();
+        let message_hash =
+            b256!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd");
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path(format!("/{message_hash}"));
+            then.status(404);
+        });
+
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _base_key) = setup_anvil();
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            USDC_ETHEREUM,
+            USDC_BASE,
+        )
+        .await
+        .unwrap();
+
+        let url = format!("{}/{message_hash}", server.base_url());
+        let backoff = backon::ConstantBuilder::default()
+            .with_delay(std::time::Duration::from_millis(10))
+            .with_max_times(3);
+
+        #[derive(serde::Deserialize)]
+        struct AttestationResponse {
+            attestation: String,
+        }
+
+        let fetch_attestation = || async {
+            let response = bridge.http_client.get(&url).send().await?;
+
+            if !response.status().is_success() {
+                return Err(AttestationError::NotReady);
+            }
+
+            let attestation_response: AttestationResponse = response.json().await?;
+            let attestation_hex = attestation_response
+                .attestation
+                .strip_prefix("0x")
+                .unwrap_or(&attestation_response.attestation);
+            let attestation_bytes = alloy::hex::decode(attestation_hex)?;
+
+            Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
+        };
+
+        let result = fetch_attestation.retry(backoff).await;
+
+        assert!(
+            result.is_err(),
+            "Expected attestation to fail after max retries"
+        );
+        assert!(
+            matches!(result.unwrap_err(), AttestationError::NotReady),
+            "Expected AttestationError::NotReady"
+        );
+        assert!(
+            mock.hits() >= 3,
+            "Expected at least 3 attempts with retries"
+        );
+    }
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        MockMintBurnToken,
+        "cctp-abis/MockMintBurnToken.json"
+    );
+
+    async fn deploy_mock_usdc(
+        anvil_endpoint: &str,
+        deployer_key: &B256,
+    ) -> Result<Address, Box<dyn std::error::Error>> {
+        let signer = PrivateKeySigner::from_bytes(deployer_key)?;
+        let wallet = EthereumWallet::from(signer.clone());
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(anvil_endpoint)
+            .await?;
+
+        let mock = MockMintBurnToken::deploy(&provider).await?;
+        let mock_address = *mock.address();
+
+        let mint_amount = U256::from(1_000_000_000_000u64); // 1M USDC (6 decimals)
+        mock.mint(signer.address(), mint_amount)
+            .send()
+            .await?
+            .get_receipt()
+            .await?;
+
+        Ok(mock_address)
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_ethereum_with_zero_allowance() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .expect("Failed to deploy mock USDC");
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+            USDC_BASE,
+        )
+        .await
+        .unwrap();
+
+        let amount = U256::from(1_000_000u64);
+        let owner = bridge.ethereum.owner;
+        let spender = *bridge.ethereum.token_messenger.address();
+
+        let initial_allowance = bridge
+            .ethereum
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "Initial allowance should be zero"
+        );
+
+        let result = bridge.ensure_usdc_approval_ethereum(amount).await;
+        assert!(
+            result.is_ok(),
+            "ensure_usdc_approval_ethereum should succeed: {result:?}"
+        );
+
+        let final_allowance = bridge
+            .ethereum
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance, amount,
+            "Allowance should equal requested amount"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_ethereum_with_sufficient_allowance() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .expect("Failed to deploy mock USDC");
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+            USDC_BASE,
+        )
+        .await
+        .unwrap();
+
+        let amount = U256::from(1_000_000u64);
+        let higher_amount = U256::from(2_000_000u64);
+        let owner = bridge.ethereum.owner;
+        let spender = *bridge.ethereum.token_messenger.address();
+
+        bridge
+            .ethereum
+            .usdc
+            .approve(spender, higher_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let initial_allowance = bridge
+            .ethereum
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance, higher_amount,
+            "Initial allowance should be set"
+        );
+
+        let result = bridge.ensure_usdc_approval_ethereum(amount).await;
+        assert!(
+            result.is_ok(),
+            "ensure_usdc_approval_ethereum should succeed: {result:?}"
+        );
+
+        let final_allowance = bridge
+            .ethereum
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance, higher_amount,
+            "Allowance should remain unchanged when sufficient"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_ethereum_with_insufficient_allowance() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .expect("Failed to deploy mock USDC");
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+            USDC_BASE,
+        )
+        .await
+        .unwrap();
+
+        let initial_allowance_amount = U256::from(500_000u64);
+        let required_amount = U256::from(1_000_000u64);
+        let owner = bridge.ethereum.owner;
+        let spender = *bridge.ethereum.token_messenger.address();
+
+        bridge
+            .ethereum
+            .usdc
+            .approve(spender, initial_allowance_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let initial_allowance = bridge
+            .ethereum
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance, initial_allowance_amount,
+            "Initial allowance should be set"
+        );
+
+        let result = bridge.ensure_usdc_approval_ethereum(required_amount).await;
+        assert!(
+            result.is_ok(),
+            "ensure_usdc_approval_ethereum should succeed: {result:?}"
+        );
+
+        let final_allowance = bridge
+            .ethereum
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance, required_amount,
+            "Allowance should be updated to required amount"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_base_with_zero_allowance() {
+        let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
+        let (_base_anvil, base_endpoint, base_key) = setup_anvil();
+
+        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key)
+            .await
+            .expect("Failed to deploy mock USDC on Base");
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &base_key,
+            USDC_ETHEREUM,
+            base_usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let amount = U256::from(1_000_000u64);
+        let owner = bridge.base.owner;
+        let spender = *bridge.base.token_messenger.address();
+
+        let initial_allowance = bridge
+            .base
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "Initial allowance should be zero"
+        );
+
+        let result = bridge.ensure_usdc_approval_base(amount).await;
+        assert!(
+            result.is_ok(),
+            "ensure_usdc_approval_base should succeed: {result:?}"
+        );
+
+        let final_allowance = bridge
+            .base
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance, amount,
+            "Allowance should equal requested amount"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_base_with_sufficient_allowance() {
+        let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
+        let (_base_anvil, base_endpoint, base_key) = setup_anvil();
+
+        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key)
+            .await
+            .expect("Failed to deploy mock USDC on Base");
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &base_key,
+            USDC_ETHEREUM,
+            base_usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let amount = U256::from(1_000_000u64);
+        let higher_amount = U256::from(2_000_000u64);
+        let owner = bridge.base.owner;
+        let spender = *bridge.base.token_messenger.address();
+
+        bridge
+            .base
+            .usdc
+            .approve(spender, higher_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let initial_allowance = bridge
+            .base
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance, higher_amount,
+            "Initial allowance should be set"
+        );
+
+        let result = bridge.ensure_usdc_approval_base(amount).await;
+        assert!(
+            result.is_ok(),
+            "ensure_usdc_approval_base should succeed: {result:?}"
+        );
+
+        let final_allowance = bridge
+            .base
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance, higher_amount,
+            "Allowance should remain unchanged when sufficient"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_base_with_insufficient_allowance() {
+        let (_ethereum_anvil, ethereum_endpoint, _) = setup_anvil();
+        let (_base_anvil, base_endpoint, base_key) = setup_anvil();
+
+        let base_usdc_address = deploy_mock_usdc(&base_endpoint, &base_key)
+            .await
+            .expect("Failed to deploy mock USDC on Base");
+
+        let bridge = create_bridge_with_providers(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &base_key,
+            USDC_ETHEREUM,
+            base_usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let initial_allowance_amount = U256::from(500_000u64);
+        let required_amount = U256::from(1_000_000u64);
+        let owner = bridge.base.owner;
+        let spender = *bridge.base.token_messenger.address();
+
+        bridge
+            .base
+            .usdc
+            .approve(spender, initial_allowance_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let initial_allowance = bridge
+            .base
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance, initial_allowance_amount,
+            "Initial allowance should be set"
+        );
+
+        let result = bridge.ensure_usdc_approval_base(required_amount).await;
+        assert!(
+            result.is_ok(),
+            "ensure_usdc_approval_base should succeed: {result:?}"
+        );
+
+        let final_allowance = bridge
+            .base
+            .usdc
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            final_allowance, required_amount,
+            "Allowance should be updated to required amount"
+        );
+    }
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        TokenMinterV2,
+        "cctp-abis/TokenMinterV2.json"
+    );
+
+    sol!(
+        #![sol(all_derives = true, rpc)]
+        AdminUpgradableProxy,
+        "cctp-abis/AdminUpgradableProxy.json"
+    );
+
+    const TEST_ETHEREUM_DOMAIN: u32 = 0;
+    const TEST_BASE_DOMAIN: u32 = 6;
+    const MESSAGE_VERSION: u32 = 1;
+    const MESSAGE_BODY_VERSION: u32 = 1;
+    const MAX_MESSAGE_BODY_SIZE: U256 = U256::from_limbs([8192, 0, 0, 0]);
+
+    struct DeployedCctpChain {
+        usdc: Address,
+        token_messenger: Address,
+        message_transmitter: Address,
+        token_minter: Address,
+    }
+
+    struct LocalCctp {
+        _ethereum_anvil: AnvilInstance,
+        _base_anvil: AnvilInstance,
+        ethereum_endpoint: String,
+        base_endpoint: String,
+        ethereum: DeployedCctpChain,
+        base: DeployedCctpChain,
+        deployer_key: B256,
+        attester_key: B256,
+        fee_mock_server: MockServer,
+    }
+
+    impl LocalCctp {
+        async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+            let ethereum_anvil = Anvil::new().spawn();
+            let base_anvil = Anvil::new().spawn();
+
+            let ethereum_endpoint = ethereum_anvil.endpoint();
+            let base_endpoint = base_anvil.endpoint();
+
+            let deployer_key = B256::from_slice(&ethereum_anvil.keys()[0].to_bytes());
+            let attester_key = B256::from_slice(&ethereum_anvil.keys()[1].to_bytes());
+            let attester_signer = PrivateKeySigner::from_bytes(&attester_key)?;
+            let attester_address = attester_signer.address();
+
+            let deployer_signer = PrivateKeySigner::from_bytes(&deployer_key)?;
+            let deployer_address = deployer_signer.address();
+
+            let ethereum = Self::deploy_cctp_chain(
+                &ethereum_endpoint,
+                &deployer_key,
+                TEST_ETHEREUM_DOMAIN,
+                attester_address,
+            )
+            .await?;
+
+            let base = Self::deploy_cctp_chain(
+                &base_endpoint,
+                &deployer_key,
+                TEST_BASE_DOMAIN,
+                attester_address,
+            )
+            .await?;
+
+            Self::link_remote_token_messenger(
+                &ethereum_endpoint,
+                &deployer_key,
+                ethereum.token_messenger,
+                TEST_BASE_DOMAIN,
+                base.token_messenger,
+            )
+            .await?;
+
+            Self::link_remote_token_messenger(
+                &base_endpoint,
+                &deployer_key,
+                base.token_messenger,
+                TEST_ETHEREUM_DOMAIN,
+                ethereum.token_messenger,
+            )
+            .await?;
+
+            Self::link_token_pair(
+                &ethereum_endpoint,
+                &deployer_key,
+                ethereum.token_minter,
+                ethereum.usdc,
+                TEST_BASE_DOMAIN,
+                base.usdc,
+            )
+            .await?;
+
+            Self::link_token_pair(
+                &base_endpoint,
+                &deployer_key,
+                base.token_minter,
+                base.usdc,
+                TEST_ETHEREUM_DOMAIN,
+                ethereum.usdc,
+            )
+            .await?;
+
+            Self::mint_usdc(
+                &ethereum_endpoint,
+                &deployer_key,
+                ethereum.usdc,
+                deployer_address,
+            )
+            .await?;
+            Self::mint_usdc(&base_endpoint, &deployer_key, base.usdc, deployer_address).await?;
+
+            let fee_mock_server = MockServer::start();
+            fee_mock_server.mock(|when, then| {
+                when.method(GET).path("/v2/burn/USDC/fees");
+                then.status(200).json_body(serde_json::json!({
+                    "minFee": "1"
+                }));
+            });
+
+            Ok(Self {
+                _ethereum_anvil: ethereum_anvil,
+                _base_anvil: base_anvil,
+                ethereum_endpoint,
+                base_endpoint,
+                ethereum,
+                base,
+                deployer_key,
+                attester_key,
+                fee_mock_server,
+            })
+        }
+
+        async fn deploy_cctp_chain(
+            endpoint: &str,
+            deployer_key: &B256,
+            domain: u32,
+            attester: Address,
+        ) -> Result<DeployedCctpChain, Box<dyn std::error::Error>> {
+            let signer = PrivateKeySigner::from_bytes(deployer_key)?;
+            let deployer = signer.address();
+            let wallet = EthereumWallet::from(signer);
+            let provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect(endpoint)
+                .await?;
+
+            let usdc = MockMintBurnToken::deploy(&provider).await?;
+            let usdc_address = *usdc.address();
+
+            let token_minter = TokenMinterV2::deploy(&provider, deployer).await?;
+            let token_minter_address = *token_minter.address();
+
+            let msg_transmitter_impl =
+                MessageTransmitterV2::deploy(&provider, domain, MESSAGE_VERSION).await?;
+
+            let attesters = vec![attester];
+            let init_data = MessageTransmitterV2::initializeCall {
+                owner_: deployer,
+                attesterManager_: deployer,
+                pauser_: deployer,
+                rescuer_: deployer,
+                attesters_: attesters,
+                signatureThreshold_: U256::from(1),
+                maxMessageBodySize_: MAX_MESSAGE_BODY_SIZE,
+            }
+            .abi_encode();
+
+            let msg_transmitter_proxy = AdminUpgradableProxy::deploy(
+                &provider,
+                *msg_transmitter_impl.address(),
+                deployer,
+                Bytes::from(init_data),
+            )
+            .await?;
+            let message_transmitter_address = *msg_transmitter_proxy.address();
+
+            let token_messenger_impl = TokenMessengerV2::deploy(
+                &provider,
+                message_transmitter_address,
+                MESSAGE_BODY_VERSION,
+            )
+            .await?;
+
+            let roles = TokenMessengerV2::TokenMessengerV2Roles {
+                owner: deployer,
+                rescuer: deployer,
+                feeRecipient: deployer,
+                denylister: deployer,
+                tokenMinter: token_minter_address,
+                minFeeController: deployer,
+            };
+            let init_data = TokenMessengerV2::initializeCall {
+                roles,
+                minFee_: U256::from(1),
+                remoteDomains_: vec![],
+                remoteTokenMessengers_: vec![],
+            }
+            .abi_encode();
+
+            let token_messenger_proxy = AdminUpgradableProxy::deploy(
+                &provider,
+                *token_messenger_impl.address(),
+                deployer,
+                Bytes::from(init_data),
+            )
+            .await?;
+            let token_messenger_address = *token_messenger_proxy.address();
+
+            token_minter
+                .addLocalTokenMessenger(token_messenger_address)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            token_minter
+                .setMaxBurnAmountPerMessage(usdc_address, U256::from(1_000_000_000_000u64))
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            Ok(DeployedCctpChain {
+                usdc: usdc_address,
+                token_messenger: token_messenger_address,
+                message_transmitter: message_transmitter_address,
+                token_minter: token_minter_address,
+            })
+        }
+
+        async fn link_remote_token_messenger(
+            endpoint: &str,
+            deployer_key: &B256,
+            local_token_messenger: Address,
+            remote_domain: u32,
+            remote_token_messenger: Address,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let signer = PrivateKeySigner::from_bytes(deployer_key)?;
+            let wallet = EthereumWallet::from(signer);
+            let provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect(endpoint)
+                .await?;
+
+            let token_messenger = TokenMessengerV2::new(local_token_messenger, &provider);
+            let remote_bytes32 =
+                FixedBytes::<32>::left_padding_from(remote_token_messenger.as_slice());
+
+            token_messenger
+                .addRemoteTokenMessenger(remote_domain, remote_bytes32)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            Ok(())
+        }
+
+        async fn link_token_pair(
+            endpoint: &str,
+            deployer_key: &B256,
+            token_minter: Address,
+            local_token: Address,
+            remote_domain: u32,
+            remote_token: Address,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let signer = PrivateKeySigner::from_bytes(deployer_key)?;
+            let wallet = EthereumWallet::from(signer);
+            let provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect(endpoint)
+                .await?;
+
+            let minter = TokenMinterV2::new(token_minter, &provider);
+            let remote_bytes32 = FixedBytes::<32>::left_padding_from(remote_token.as_slice());
+
+            minter
+                .linkTokenPair(local_token, remote_domain, remote_bytes32)
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            Ok(())
+        }
+
+        async fn mint_usdc(
+            endpoint: &str,
+            deployer_key: &B256,
+            usdc: Address,
+            to: Address,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let signer = PrivateKeySigner::from_bytes(deployer_key)?;
+            let wallet = EthereumWallet::from(signer);
+            let provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect(endpoint)
+                .await?;
+
+            let token = MockMintBurnToken::new(usdc, &provider);
+            token
+                .mint(to, U256::from(1_000_000_000_000u64))
+                .send()
+                .await?
+                .get_receipt()
+                .await?;
+
+            Ok(())
+        }
+
+        async fn create_bridge(
+            &self,
+        ) -> Result<
+            CctpBridge<impl Provider + Clone, impl Provider + Clone>,
+            Box<dyn std::error::Error>,
+        > {
+            let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
+            let wallet = EthereumWallet::from(signer.clone());
+
+            let ethereum_provider = ProviderBuilder::new()
+                .wallet(wallet.clone())
+                .connect(&self.ethereum_endpoint)
+                .await?;
+
+            let base_provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect(&self.base_endpoint)
+                .await?;
+
+            let ethereum = Evm::new(
+                ethereum_provider,
+                signer.address(),
+                self.ethereum.usdc,
+                self.ethereum.token_messenger,
+                self.ethereum.message_transmitter,
+            );
+
+            let base = Evm::new(
+                base_provider,
+                signer.address(),
+                self.base.usdc,
+                self.base.token_messenger,
+                self.base.message_transmitter,
+            );
+
+            Ok(CctpBridge::new(ethereum, base)
+                .with_circle_api_base(self.fee_mock_server.base_url()))
+        }
+
+        async fn sign_message(
+            &self,
+            message: &[u8],
+        ) -> Result<(Bytes, Bytes), Box<dyn std::error::Error>> {
+            let mut nonce = [0u8; 32];
+            rand::thread_rng().fill(&mut nonce);
+            nonce[0] |= 1;
+
+            let mut modified_message = message.to_vec();
+
+            const NONCE_INDEX: usize = 12;
+            modified_message[NONCE_INDEX..NONCE_INDEX + 32].copy_from_slice(&nonce);
+
+            const FINALITY_THRESHOLD_EXECUTED_INDEX: usize = 144;
+            const FINALITY_THRESHOLD_FINALIZED: u32 = 2000;
+            modified_message
+                [FINALITY_THRESHOLD_EXECUTED_INDEX..FINALITY_THRESHOLD_EXECUTED_INDEX + 4]
+                .copy_from_slice(&FINALITY_THRESHOLD_FINALIZED.to_be_bytes());
+
+            let signer = PrivateKeySigner::from_bytes(&self.attester_key)?;
+            let message_hash = keccak256(&modified_message);
+            let signature = signer.sign_hash(&message_hash).await?;
+
+            Ok((
+                Bytes::from(signature.as_bytes().to_vec()),
+                Bytes::from(modified_message),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn burn_on_ethereum_with_deployed_contracts() {
+        let cctp = LocalCctp::new()
+            .await
+            .expect("Failed to deploy CCTP infrastructure");
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner;
+        let amount = U256::from(1_000_000u64);
+
+        let result = bridge.burn_on_ethereum(amount, recipient).await;
+
+        assert!(
+            result.is_ok(),
+            "burn_on_ethereum should succeed: {result:?}"
+        );
+
+        let receipt = result.unwrap();
+        assert!(!receipt.tx.is_zero(), "Transaction hash should be set");
+        assert!(!receipt.message.is_empty(), "Message should not be empty");
+        assert_eq!(receipt.amount, amount, "Amount should match");
+    }
+
+    #[tokio::test]
+    async fn burn_on_base_with_deployed_contracts() {
+        let cctp = LocalCctp::new()
+            .await
+            .expect("Failed to deploy CCTP infrastructure");
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner;
+        let amount = U256::from(1_000_000u64);
+
+        let result = bridge.burn_on_base(amount, recipient).await;
+
+        assert!(result.is_ok(), "burn_on_base should succeed: {result:?}");
+
+        let receipt = result.unwrap();
+        assert!(!receipt.tx.is_zero(), "Transaction hash should be set");
+        assert!(!receipt.message.is_empty(), "Message should not be empty");
+        assert_eq!(receipt.amount, amount, "Amount should match");
+    }
+
+    #[tokio::test]
+    async fn full_bridge_ethereum_to_base() {
+        let cctp = LocalCctp::new()
+            .await
+            .expect("Failed to deploy CCTP infrastructure");
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner;
+        let amount = U256::from(1_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_on_ethereum(amount, recipient)
+            .await
+            .expect("burn_on_ethereum failed");
+
+        let (attestation, message_with_nonce) = cctp
+            .sign_message(&burn_receipt.message)
+            .await
+            .expect("Failed to sign message");
+
+        let mint_result = bridge.mint_on_base(message_with_nonce, attestation).await;
+
+        assert!(
+            mint_result.is_ok(),
+            "mint_on_base should succeed: {mint_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_bridge_base_to_ethereum() {
+        let cctp = LocalCctp::new()
+            .await
+            .expect("Failed to deploy CCTP infrastructure");
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner;
+        let amount = U256::from(1_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_on_base(amount, recipient)
+            .await
+            .expect("burn_on_base failed");
+
+        let (attestation, message_with_nonce) = cctp
+            .sign_message(&burn_receipt.message)
+            .await
+            .expect("Failed to sign message");
+
+        let mint_result = bridge
+            .mint_on_ethereum(message_with_nonce, attestation)
+            .await;
+
+        assert!(
+            mint_result.is_ok(),
+            "mint_on_ethereum should succeed: {mint_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_on_ethereum_with_invalid_attestation() {
+        let cctp = LocalCctp::new()
+            .await
+            .expect("Failed to deploy CCTP infrastructure");
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner;
+        let amount = U256::from(1_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_on_base(amount, recipient)
+            .await
+            .expect("burn_on_base failed");
+
+        let (_, message_with_nonce) = cctp
+            .sign_message(&burn_receipt.message)
+            .await
+            .expect("Failed to sign message");
+
+        let invalid_attestation = Bytes::from(vec![0u8; 65]);
+
+        let err = bridge
+            .mint_on_ethereum(message_with_nonce, invalid_attestation)
+            .await
+            .expect_err("Expected error for invalid attestation");
+
+        let err_msg = err.to_string();
+        assert!(
+            matches!(err, CctpError::Contract(_)),
+            "Expected Contract error, got: {err:?}"
+        );
+        assert!(
+            err_msg.contains("ECDSA: invalid signature"),
+            "Expected ECDSA invalid signature error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_on_base_with_invalid_attestation() {
+        let cctp = LocalCctp::new()
+            .await
+            .expect("Failed to deploy CCTP infrastructure");
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner;
+        let amount = U256::from(1_000_000u64);
+
+        let burn_receipt = bridge
+            .burn_on_ethereum(amount, recipient)
+            .await
+            .expect("burn_on_ethereum failed");
+
+        let invalid_attestation = Bytes::from(vec![0u8; 65]);
+
+        let err = bridge
+            .mint_on_base(burn_receipt.message.clone(), invalid_attestation)
+            .await
+            .expect_err("Expected error for invalid attestation");
+
+        let err_msg = err.to_string();
+        assert!(
+            matches!(err, CctpError::Contract(_)),
+            "Expected Contract error, got: {err:?}"
+        );
+        assert!(
+            err_msg.contains("ECDSA: invalid signature"),
+            "Expected ECDSA invalid signature error, got: {err_msg}"
+        );
     }
 }
