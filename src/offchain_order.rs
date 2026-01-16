@@ -440,17 +440,9 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
 
             (Err(e), _) => Err(e.into()),
 
-            (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => match order
-            {
-                OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
-                    broker_order_id: broker_order_id.clone(),
-                    submitted_at: Utc::now(),
-                }]),
-                OffchainOrder::Submitted { .. }
-                | OffchainOrder::PartiallyFilled { .. }
-                | OffchainOrder::Filled { .. }
-                | OffchainOrder::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
-            },
+            (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => {
+                handle_confirm_submission(order, broker_order_id)
+            }
 
             (
                 Ok(order),
@@ -497,6 +489,34 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
                 }
             },
         }
+    }
+}
+
+fn handle_confirm_submission(
+    order: &OffchainOrder,
+    broker_order_id: &BrokerOrderId,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    match order {
+        OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
+            broker_order_id: broker_order_id.clone(),
+            submitted_at: Utc::now(),
+        }]),
+        OffchainOrder::Submitted {
+            broker_order_id: existing_id,
+            ..
+        } => {
+            if existing_id == broker_order_id {
+                Ok(vec![])
+            } else {
+                Err(OffchainOrderError::ConflictingBrokerOrderId {
+                    existing: existing_id.clone(),
+                    attempted: broker_order_id.clone(),
+                })
+            }
+        }
+        OffchainOrder::PartiallyFilled { .. }
+        | OffchainOrder::Filled { .. }
+        | OffchainOrder::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
     }
 }
 
@@ -705,6 +725,14 @@ pub(crate) enum OffchainOrderError {
     AlreadyCompleted,
     #[error("Cannot submit order: order has already been submitted")]
     AlreadySubmitted,
+    #[error(
+        "Cannot confirm submission: order already submitted with different broker_order_id \
+         (existing: {existing:?}, attempted: {attempted:?})"
+    )]
+    ConflictingBrokerOrderId {
+        existing: BrokerOrderId,
+        attempted: BrokerOrderId,
+    },
     #[error(transparent)]
     State(#[from] LifecycleError<Never>),
 }
@@ -988,7 +1016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_submit_twice() {
+    async fn test_submit_with_different_order_id_fails() {
         let order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
@@ -1005,7 +1033,10 @@ mod tests {
 
         let result = order.handle(command, &()).await;
 
-        assert!(matches!(result, Err(OffchainOrderError::AlreadySubmitted)));
+        assert!(matches!(
+            result,
+            Err(OffchainOrderError::ConflictingBrokerOrderId { .. })
+        ));
     }
 
     #[tokio::test]
