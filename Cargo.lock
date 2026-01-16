@@ -6504,6 +6504,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-bridge"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "backon",
+ "httpmock",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
 name = "st0x-execution"
 version = "0.1.0"
 dependencies = [
@@ -6572,7 +6588,10 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
+ "st0x-bridge",
  "st0x-execution",
+ "st0x-tokenization",
+ "st0x-vault",
  "temp-env",
  "thiserror 2.0.17",
  "tokio",
@@ -6584,6 +6603,35 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "st0x-tokenization"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "chrono",
+ "httpmock",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+]
+
+[[package]]
+name = "st0x-vault"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "rain-math-float",
+ "serde",
+ "thiserror 2.0.17",
+ "tokio",
+ "url",
 ]
 
 [[package]]

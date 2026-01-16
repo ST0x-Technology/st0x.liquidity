@@ -1,0 +1,25 @@
+[package]
+name = "st0x-bridge"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+cctp = []
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+backon.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+httpmock.workspace = true
+rand.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

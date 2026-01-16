@@ -1,5 +1,11 @@
 [workspace]
-members = [".", "crates/execution"]
+members = [
+  ".",
+  "crates/execution",
+  "crates/tokenization",
+  "crates/bridge",
+  "crates/vault",
+]
 resolver = "2"
 
 [workspace.package]
@@ -83,7 +89,10 @@ anyhow = "1.0.98"
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
+st0x-bridge = { path = "crates/bridge", features = ["cctp"] }
 st0x-execution = { path = "crates/execution" }
+st0x-tokenization = { path = "crates/tokenization", features = ["alpaca"] }
+st0x-vault = { path = "crates/vault", features = ["rain"] }
 backon.workspace = true
 clap.workspace = true
 dotenvy = "0.15.7"
