@@ -21,7 +21,6 @@
 //! 2. Poll `list_requests` for Alpaca's detection
 //! 3. Poll until status is `Completed` or `Rejected`
 
-use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash, U256};

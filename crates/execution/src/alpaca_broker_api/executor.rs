@@ -146,6 +146,8 @@ impl AlpacaBrokerApi {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
+    use chrono_tz::America::New_York;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -219,16 +221,24 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        // Mock calendar endpoint - returns a future trading day with regular market hours
+        // Get today's date in ET timezone to build a response that represents
+        // market currently being open
+        let now = Utc::now();
+        let now_et = now.with_timezone(&New_York);
+        let today = now_et.date_naive();
+        let today_str = today.format("%Y-%m-%d").to_string();
+
+        // Mock calendar endpoint - returns today as a trading day with market
+        // hours that span the entire day so the test always finds market "open"
         let calendar_mock = server.mock(|when, then| {
             when.method(GET).path("/v1/calendar");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
                     {
-                        "date": "2030-01-06",
-                        "open": "0930",
-                        "close": "1600"
+                        "date": today_str,
+                        "open": "0000",
+                        "close": "2359"
                     }
                 ]));
         });
