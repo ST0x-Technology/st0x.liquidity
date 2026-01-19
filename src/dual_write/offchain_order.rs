@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use st0x_execution::OrderState;
+use st0x_execution::{OrderState, PersistenceError};
 use tracing::info;
 
 use crate::offchain::execution::OffchainExecution;
@@ -39,8 +39,20 @@ pub(crate) async fn confirm_submission(
     execution_id: i64,
     broker_order_id: BrokerOrderId,
 ) -> Result<(), DualWriteError> {
-    let aggregate_id = OffchainOrder::aggregate_id(execution_id);
+    let row_exists = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM offchain_trades WHERE id = ?",
+        execution_id
+    )
+    .fetch_one(context.pool())
+    .await?;
 
+    if row_exists == 0 {
+        return Err(DualWriteError::Persistence(PersistenceError::RowNotFound {
+            execution_id,
+        }));
+    }
+
+    let aggregate_id = OffchainOrder::aggregate_id(execution_id);
     let command = OffchainOrderCommand::ConfirmSubmission {
         broker_order_id: broker_order_id.clone(),
     };
@@ -577,8 +589,10 @@ mod tests {
         );
     }
 
+    /// Verifies that when legacy row doesn't exist, confirm_submission fails
+    /// WITHOUT writing to ES, preventing inconsistency between ES and legacy.
     #[tokio::test]
-    async fn test_legacy_failure_after_es_success_propagates_error() {
+    async fn test_legacy_validation_prevents_orphan_es_events() {
         let pool = setup_test_db().await;
         let context = DualWriteContext::new(pool.clone());
 
@@ -619,9 +633,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            es_event_count, 2,
-            "ES events exist (Placed + Submitted) even though legacy write failed - \
-             this documents the dual-write inconsistency risk"
+            es_event_count, 1,
+            "ES should only have Placed event - Submitted should NOT be written \
+             when legacy row doesn't exist (validates legacy first)"
         );
     }
 
@@ -692,6 +706,59 @@ mod tests {
             legacy_row_after.order_id.unwrap(),
             "ORD-SUCCESS",
             "Legacy order_id should remain unchanged after failed duplicate submission"
+        );
+    }
+
+    /// Verifies legacy-first write order prevents ES inconsistency when legacy fails.
+    ///
+    /// With legacy-first ordering, if legacy write fails, ES should not have the
+    /// Submitted event. This prevents inconsistent state where ES shows Submitted
+    /// but legacy still shows Pending.
+    #[tokio::test]
+    async fn test_confirm_submission_legacy_first_prevents_es_inconsistency() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool.clone());
+
+        let symbol = Symbol::new("GOOGL").unwrap();
+        let shares = Shares::new(5).unwrap();
+        let nonexistent_execution_id = 88888i64;
+
+        let execution = OffchainExecution {
+            id: Some(nonexistent_execution_id),
+            symbol,
+            shares,
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        place_order(&context, &execution).await.unwrap();
+
+        let result = confirm_submission(
+            &context,
+            nonexistent_execution_id,
+            BrokerOrderId::new("ORD-WILL-FAIL"),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Legacy write should fail for nonexistent row"
+        );
+
+        let es_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ?",
+        )
+        .bind(nonexistent_execution_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            es_event_count, 1,
+            "When legacy fails, ES should NOT have Submitted event (only Placed). \
+             Legacy-first write order prevents this inconsistency."
         );
     }
 }
