@@ -12,6 +12,7 @@ use st0x_execution::Executor;
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
 use crate::env::Config;
+use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
 
@@ -121,8 +122,11 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     }
 }
 
-impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
-    ConductorBuilder<P, E, WithDexStreams>
+impl<P, E> ConductorBuilder<P, E, WithDexStreams>
+where
+    P: Provider + Clone + Send + 'static,
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
 {
     pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self {
         self.state.rebalancer = Some(rebalancer);

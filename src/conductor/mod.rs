@@ -43,13 +43,17 @@ pub(crate) struct Conductor {
     pub(crate) rebalancer: Option<JoinHandle<()>>,
 }
 
-pub(crate) async fn run_market_hours_loop<E: Executor + Clone + Send + 'static>(
+pub(crate) async fn run_market_hours_loop<E>(
     executor: E,
     config: Config,
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     const RERUN_DELAY_SECS: u64 = 10;
 
     let timeout = executor
@@ -116,13 +120,17 @@ pub(crate) async fn run_market_hours_loop<E: Executor + Clone + Send + 'static>(
 }
 
 impl Conductor {
-    pub(crate) async fn start<E: Executor + Clone + Send + 'static>(
+    pub(crate) async fn start<E>(
         config: &Config,
         pool: &SqlitePool,
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         rebalancer: Option<JoinHandle<()>>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self>
+    where
+        E: Executor + Clone + Send + 'static,
+        EventProcessingError: From<E::Error>,
+    {
         let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
         let cache = SymbolCache::default();
@@ -333,16 +341,18 @@ fn spawn_event_processor(
     })
 }
 
-fn spawn_queue_processor<
-    P: Provider + Clone + Send + 'static,
-    E: Executor + Clone + Send + 'static,
->(
+fn spawn_queue_processor<P, E>(
     executor: E,
     config: &Config,
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    P: Provider + Clone + Send + 'static,
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     info!("Starting queue processor service");
     let config_clone = config.clone();
     let pool_clone = pool.clone();
@@ -362,11 +372,15 @@ fn spawn_queue_processor<
     })
 }
 
-fn spawn_periodic_accumulated_position_check<E: Executor + Clone + Send + 'static>(
+fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     pool: SqlitePool,
     dual_write_context: DualWriteContext,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     info!("Starting periodic accumulated position checker");
 
     tokio::spawn(async move {
@@ -493,14 +507,18 @@ async fn process_live_event(
     Ok(())
 }
 
-async fn run_queue_processor<P: Provider + Clone, E: Executor + Clone>(
+async fn run_queue_processor<P, E>(
     executor: &E,
     config: &Config,
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
     dual_write_context: &DualWriteContext,
-) {
+) where
+    P: Provider + Clone,
+    E: Executor + Clone,
+    EventProcessingError: From<E::Error>,
+{
     info!("Starting queue processor service");
 
     let feed_id_cache = FeedIdCache::default();
@@ -936,11 +954,15 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<E: Executor + Clone + Send + 'static>(
+async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
-) -> Result<(), EventProcessingError> {
+) -> Result<(), EventProcessingError>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     let executor_type = executor.to_supported_executor();
     let executions = check_all_accumulated_positions(pool, executor_type).await?;
 
@@ -1004,12 +1026,16 @@ fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
 }
 
 #[tracing::instrument(skip(executor, pool, dual_write_context), level = tracing::Level::INFO)]
-async fn execute_pending_offchain_execution<E: Executor + Clone + Send + 'static>(
+async fn execute_pending_offchain_execution<E>(
     executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
     execution_id: i64,
-) -> Result<(), EventProcessingError> {
+) -> Result<(), EventProcessingError>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     let execution = find_execution_by_id(pool, execution_id)
         .await?
         .ok_or_else(|| {
@@ -1026,12 +1052,7 @@ async fn execute_pending_offchain_execution<E: Executor + Clone + Send + 'static
         direction: execution.direction,
     };
 
-    let placement = executor
-        .place_market_order(market_order)
-        .await
-        .map_err(|e| {
-            EventProcessingError::AccumulatorProcessing(format!("Order placement failed: {e}"))
-        })?;
+    let placement = executor.place_market_order(market_order).await?;
 
     info!("Order placed with ID: {}", placement.order_id);
 

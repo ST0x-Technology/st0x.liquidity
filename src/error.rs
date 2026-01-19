@@ -4,6 +4,8 @@
 use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
@@ -92,6 +94,10 @@ pub(crate) enum EventProcessingError {
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
     Schwab(#[from] SchwabError),
+    #[error("Alpaca Broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Alpaca Trading API error: {0}")]
+    AlpacaTradingApi(#[from] AlpacaTradingApiError),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error(transparent)]

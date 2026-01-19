@@ -193,12 +193,16 @@ async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<(
     }
 }
 
-async fn run_with_executor<E: Executor + Clone + Send + 'static>(
+async fn run_with_executor<E>(
     config: Config,
     pool: SqlitePool,
     executor: E,
     rebalancer: Option<JoinHandle<()>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    error::EventProcessingError: From<E::Error>,
+{
     let executor_maintenance = executor.run_executor_maintenance().await;
 
     conductor::run_market_hours_loop(executor, config, pool, executor_maintenance, rebalancer).await
