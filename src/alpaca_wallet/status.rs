@@ -243,7 +243,11 @@ fn log_deposit_final_status(tx_hash: &TxHash, status: TransferStatus) {
     match status {
         TransferStatus::Complete => info!(%tx_hash, "Deposit completed successfully"),
         TransferStatus::Failed => info!(%tx_hash, "Deposit failed"),
-        _ => {}
+        _ => warn!(
+            %tx_hash,
+            ?status,
+            "Unexpected non-final deposit status in log_deposit_final_status"
+        ),
     }
 }
 
