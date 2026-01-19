@@ -49,6 +49,9 @@ mod evm;
 
 pub(crate) use evm::Evm;
 
+use std::mem::size_of;
+use std::time::Duration;
+
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::sol;
@@ -159,10 +162,16 @@ impl AttestationResponse {
     /// Returns the nonce as a u64 by taking the last 8 bytes.
     ///
     /// CCTP nonces are 32 bytes but the significant portion fits in u64 for our use case.
-    /// The first 24 bytes are typically zeros (source domain padding).
-    pub(crate) fn nonce_as_u64(&self) -> u64 {
-        let bytes = self.nonce.as_slice();
-        u64::from_be_bytes(bytes[24..32].try_into().expect("slice is exactly 8 bytes"))
+    /// Returns an error if the first 24 bytes are non-zero, indicating the nonce exceeds u64.
+    pub(crate) fn nonce_as_u64(&self) -> Result<u64, CctpError> {
+        let bytes: &[u8; 32] = self.nonce.as_ref();
+        let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
+
+        if padding.iter().any(|&b| b != 0) {
+            return Err(CctpError::NonceOverflow { nonce: self.nonce });
+        }
+
+        Ok(u64::from_be_bytes(value.try_into()?))
     }
 }
 
@@ -174,7 +183,8 @@ impl AttestationResponse {
 // - Bytes 44+: remaining message data
 // Minimum length required: 44 bytes (to include the full nonce)
 const NONCE_INDEX: usize = 12;
-const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + 32;
+const NONCE_SIZE: usize = size_of::<FixedBytes<32>>();
+const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + NONCE_SIZE;
 
 /// Extracts the 32-byte nonce from a CCTP V2 message.
 ///
@@ -247,6 +257,10 @@ pub(crate) enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
+    #[error("Nonce exceeds u64: upper 24 bytes are non-zero")]
+    NonceOverflow { nonce: FixedBytes<32> },
+    #[error("Slice conversion error: {0}")]
+    SliceConversion(#[from] std::array::TryFromSliceError),
 }
 
 /// Errors specific to attestation polling from Circle's API.
@@ -285,13 +299,17 @@ where
     EP: Provider + Clone,
     BP: Provider + Clone,
 {
-    pub(crate) fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Self {
-        Self {
+    pub(crate) fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Result<Self, CctpError> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        Ok(Self {
             ethereum,
             base,
-            http_client: reqwest::Client::new(),
+            http_client,
             circle_api_base: CIRCLE_API_BASE.to_string(),
-        }
+        })
     }
 
     async fn query_fast_transfer_fee(
@@ -545,7 +563,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        Ok(CctpBridge::new(ethereum, base))
+        Ok(CctpBridge::new(ethereum, base)?)
     }
 
     #[tokio::test]
@@ -903,7 +921,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        Ok(CctpBridge::new(ethereum, base))
+        Ok(CctpBridge::new(ethereum, base)?)
     }
 
     #[tokio::test]
@@ -1436,7 +1454,7 @@ mod tests {
                 self.base.message_transmitter,
             );
 
-            Ok(CctpBridge::new(ethereum, base)
+            Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
         }
 

@@ -283,7 +283,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.attestation.to_vec(),
-                    cctp_nonce: response.nonce_as_u64(),
+                    cctp_nonce: response.nonce_as_u64()?,
                 },
             )
             .await?;
@@ -525,7 +525,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.attestation.to_vec(),
-                    cctp_nonce: response.nonce_as_u64(),
+                    cctp_nonce: response.nonce_as_u64()?,
                 },
             )
             .await?;
@@ -795,7 +795,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        let cctp_bridge = CctpBridge::new(ethereum, base);
+        let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
 
         let vault_service = VaultService::new(provider, ORDERBOOK_ADDRESS);
 

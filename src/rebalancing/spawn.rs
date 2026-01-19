@@ -45,6 +45,8 @@ pub(crate) enum SpawnRebalancerError {
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("failed to create Alpaca wallet service: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
+    #[error("failed to create CCTP bridge: {0}")]
+    Cctp(#[from] crate::cctp::CctpError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -128,7 +130,7 @@ where
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
-    ) -> Result<Self, AlpacaWalletError> {
+    ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
             .connect_http(config.ethereum_rpc_url.clone());
@@ -168,7 +170,7 @@ where
             MESSAGE_TRANSMITTER_V2,
         );
 
-        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
+        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
         let vault = Arc::new(VaultService::new(base_provider, config.base_orderbook));
 
         Ok(Self {
@@ -431,7 +433,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
+        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
         let vault = Arc::new(VaultService::new(base_provider, config.base_orderbook));
 
         let services = Services {
