@@ -13,12 +13,10 @@
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
 use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 
 use crate::bindings::IOrderBookV5;
-use crate::cctp::Evm;
 use crate::error_decoding::handle_contract_error;
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -47,8 +45,7 @@ pub(crate) enum VaultError {
 /// # Example
 ///
 /// ```ignore
-/// let account = Evm::new(provider, signer);
-/// let service = VaultService::new(account, orderbook_address);
+/// let service = VaultService::new(provider, orderbook_address);
 ///
 /// // Deposit USDC to vault
 /// let vault_id = VaultId(U256::from(1));
@@ -58,22 +55,21 @@ pub(crate) enum VaultError {
 /// // Withdraw USDC from vault
 /// service.withdraw_usdc(vault_id, amount).await?;
 /// ```
-pub(crate) struct VaultService<P, S>
+pub(crate) struct VaultService<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    account: Evm<P, S>,
-    orderbook: Address,
+    orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
 }
 
-impl<P, S> VaultService<P, S>
+impl<P> VaultService<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    pub(crate) fn new(account: Evm<P, S>, orderbook: Address) -> Self {
-        Self { account, orderbook }
+    pub(crate) fn new(provider: P, orderbook: Address) -> Self {
+        Self {
+            orderbook: IOrderBookV5::new(orderbook, provider),
+        }
     }
 
     /// Deposits tokens to a Rain OrderBook vault.
@@ -103,11 +99,10 @@ where
 
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
 
-        let contract = IOrderBookV5::new(self.orderbook, self.account.provider.clone());
-
         let tasks = Vec::new();
 
-        let pending = match contract
+        let pending = match self
+            .orderbook
             .deposit3(token, vault_id.0, amount_float.get_inner(), tasks)
             .send()
             .await
@@ -148,11 +143,10 @@ where
 
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
 
-        let contract = IOrderBookV5::new(self.orderbook, self.account.provider.clone());
-
         let tasks = Vec::new();
 
-        let pending = match contract
+        let pending = match self
+            .orderbook
             .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
             .send()
             .await
@@ -338,17 +332,6 @@ mod tests {
 
             Ok(balance)
         }
-
-        fn evm(&self) -> Evm<LocalEvmProvider, PrivateKeySigner> {
-            let dummy_address = address!("0x0000000000000000000000000000000000000000");
-            Evm::new(
-                self.provider.clone(),
-                self.signer.clone(),
-                dummy_address,
-                dummy_address,
-                dummy_address,
-            )
-        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -374,7 +357,7 @@ mod tests {
     async fn deposit_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(local_evm.evm(), local_evm.orderbook_address);
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         let result = service
             .deposit(
@@ -404,7 +387,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.evm(), local_evm.orderbook_address);
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -440,7 +423,7 @@ mod tests {
     async fn withdraw_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(local_evm.evm(), local_evm.orderbook_address);
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         let result = service
             .withdraw(
@@ -471,7 +454,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.evm(), local_evm.orderbook_address);
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         service
             .deposit(
