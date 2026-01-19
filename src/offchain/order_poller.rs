@@ -176,8 +176,6 @@ impl<E: Executor> OrderStatusPoller<E> {
         execution_id: i64,
         order_state: &OrderState,
     ) -> Result<(), OrderPollingError> {
-        let execution = self.finalize_order(execution_id, order_state).await?;
-
         let OrderState::Filled { price_cents, .. } = order_state else {
             error!(
                 execution_id = execution_id,
@@ -186,6 +184,8 @@ impl<E: Executor> OrderStatusPoller<E> {
             );
             return Ok(());
         };
+
+        let execution = self.finalize_order(execution_id, order_state).await?;
 
         log_filled_order(execution_id, *price_cents, &execution);
 
