@@ -11,7 +11,7 @@ use super::execution::{
 };
 use crate::dual_write::DualWriteContext;
 use crate::error::{OnChainError, OrderPollingError};
-use crate::lock::{clear_execution_lease, clear_pending_execution_id};
+use crate::lock::{clear_execution_lease, clear_pending_execution_id, renew_execution_lease};
 
 #[derive(Debug, Clone)]
 pub struct OrderPollerConfig {
@@ -135,7 +135,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             .await
             .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
 
-        self.process_order_state(execution_id, &order_id, &order_state)
+        self.process_order_state(execution_id, &order_id, &order_state, &execution.symbol)
             .await
     }
 
@@ -144,6 +144,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         execution_id: i64,
         order_id: &str,
         order_state: &OrderState,
+        symbol: &Symbol,
     ) -> Result<(), OrderPollingError> {
         match order_state {
             OrderState::Filled { .. } => self.handle_filled_order(execution_id, order_state).await,
@@ -152,6 +153,19 @@ impl<E: Executor> OrderStatusPoller<E> {
                 debug!(
                     "Order {order_id} (execution {execution_id}) still pending with state: {order_state:?}"
                 );
+
+                let mut tx = self.pool.begin().await?;
+                let renewed = renew_execution_lease(&mut tx, symbol).await?;
+                tx.commit().await?;
+
+                if renewed {
+                    debug!(
+                        execution_id,
+                        %symbol,
+                        "Renewed execution lease for pending order"
+                    );
+                }
+
                 Ok(())
             }
         }
@@ -717,5 +731,117 @@ mod tests {
         assert_eq!(legacy_row.status, "FILLED");
         assert_eq!(legacy_row.order_id, Some(order_id.to_string()));
         assert_eq!(legacy_row.price_cents, Some(3181));
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_order_renews_execution_lease() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockExecutor::default();
+        let config = OrderPollerConfig::default();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Shares::new(10).unwrap();
+
+        // Create execution in SUBMITTED state
+        let mut tx = pool.begin().await.unwrap();
+        let submitted_state = OrderState::Submitted {
+            order_id: "ORD123".to_string(),
+        };
+        let execution_id = submitted_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedExecutor::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Set up a symbol lock with an old timestamp (10 minutes ago)
+        let symbol_str = symbol.to_string();
+        sqlx::query(
+            "INSERT INTO symbol_locks (symbol, locked_at) VALUES (?1, datetime('now', '-10 minutes'))",
+        )
+        .bind(&symbol_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify the lock has old timestamp
+        let old_lock_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM symbol_locks WHERE symbol = ?1 AND locked_at < datetime('now', '-5 minutes')",
+            symbol_str
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            old_lock_count, 1,
+            "Lock should have old timestamp before processing"
+        );
+
+        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+
+        // Process order state as still Submitted - should renew the lease
+        poller
+            .process_order_state(execution_id, "ORD123", &submitted_state, &symbol)
+            .await
+            .expect("process_order_state should succeed");
+
+        // Verify the lock timestamp was renewed (now recent, not old)
+        let renewed_lock_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM symbol_locks WHERE symbol = ?1 AND locked_at > datetime('now', '-1 minute')",
+            symbol_str
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            renewed_lock_count, 1,
+            "Lock should have recent timestamp after processing pending order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_order_without_lock_does_not_fail() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockExecutor::default();
+        let config = OrderPollerConfig::default();
+
+        let symbol = Symbol::new("MSFT").unwrap();
+        let shares = Shares::new(5).unwrap();
+
+        // Create execution in SUBMITTED state but no symbol lock
+        let mut tx = pool.begin().await.unwrap();
+        let submitted_state = OrderState::Submitted {
+            order_id: "ORD456".to_string(),
+        };
+        let execution_id = submitted_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Sell,
+                SupportedExecutor::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+
+        // Processing should succeed even without a lock (renewal returns false but doesn't error)
+        let result = poller
+            .process_order_state(execution_id, "ORD456", &submitted_state, &symbol)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "process_order_state should not fail when no lock exists"
+        );
     }
 }
