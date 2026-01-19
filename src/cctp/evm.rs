@@ -2,7 +2,6 @@
 
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
 use alloy::sol_types::SolEvent;
 use tracing::info;
 
@@ -36,34 +35,38 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
     ))
 }
 
-/// EVM chain connection with provider, signer, and contract instances.
-pub(crate) struct Evm<P, S>
+/// EVM chain connection with provider and contract instances.
+pub(crate) struct Evm<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    pub(crate) provider: P,
-    pub(crate) signer: S,
+    /// Address of the account that owns tokens and signs transactions
+    owner: Address,
+    /// USDC token contract instance
     usdc: IERC20::IERC20Instance<P>,
+    /// TokenMessengerV2 contract instance for CCTP burns
     token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
+    /// MessageTransmitterV2 contract instance for CCTP mints
     message_transmitter: MessageTransmitterV2::MessageTransmitterV2Instance<P>,
 }
 
-impl<P, S> Evm<P, S>
+impl<P> Evm<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
+    /// Creates a new EVM chain connection with the given provider and contract addresses.
+    ///
+    /// The `owner` address should be the account that will sign transactions
+    /// (typically obtained from a signer via `.address()`).
     pub(crate) fn new(
         provider: P,
-        signer: S,
+        owner: Address,
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
     ) -> Self {
         Self {
-            provider: provider.clone(),
-            signer,
+            owner,
             usdc: IERC20::new(usdc, provider.clone()),
             token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
             message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
@@ -71,7 +74,7 @@ where
     }
 
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
-        let owner = self.signer.address();
+        let owner = self.owner;
         let spender = *self.token_messenger.address();
 
         let allowance = self.usdc.allowance(owner, spender).call().await?;
@@ -158,6 +161,11 @@ where
         let receipt = pending.get_receipt().await?;
 
         Ok(receipt.transaction_hash)
+    }
+
+    #[cfg(test)]
+    pub(super) fn owner(&self) -> Address {
+        self.owner
     }
 
     #[cfg(test)]

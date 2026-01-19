@@ -6,7 +6,7 @@ use alloy::signers::local::PrivateKeySigner;
 use std::io::Write;
 
 use crate::bindings::IERC20;
-use crate::cctp::{Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE};
+use crate::cctp::USDC_BASE;
 use crate::env::Config;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -66,15 +66,7 @@ pub(super) async fn vault_deposit_command<
         approve_receipt.transaction_hash
     )?;
 
-    let evm = Evm::new(
-        base_provider_with_wallet,
-        signer,
-        USDC_BASE,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    let vault_service = VaultService::new(evm, config.evm.orderbook, USDC_BASE).await?;
+    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
     let vault_id = VaultId(rebalancing_config.usdc_vault_id);
 
     writeln!(stdout, "   USDC address: {USDC_BASE}")?;
@@ -117,15 +109,7 @@ pub(super) async fn vault_withdraw_command<
         .wallet(base_wallet)
         .connect_provider(base_provider);
 
-    let evm = Evm::new(
-        base_provider_with_wallet,
-        signer,
-        USDC_BASE,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    let vault_service = VaultService::new(evm, config.evm.orderbook, USDC_BASE).await?;
+    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
     let vault_id = VaultId(rebalancing_config.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;

@@ -33,7 +33,7 @@ use crate::cctp::{
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultError, VaultId, VaultService};
+use crate::onchain::vault::{VaultId, VaultService};
 use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
@@ -45,8 +45,6 @@ pub(crate) enum SpawnRebalancerError {
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("failed to create Alpaca wallet service: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
-    #[error("failed to initialize vault service: {0}")]
-    Vault(#[from] VaultError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -66,7 +64,7 @@ type HttpProvider = FillProvider<
 type ConfiguredRebalancer<BP> = Rebalancer<
     MintManager<BP, MintEventStore>,
     RedemptionManager<BP, RedemptionEventStore>,
-    UsdcRebalanceManager<BP, PrivateKeySigner, UsdcEventStore>,
+    UsdcRebalanceManager<BP, UsdcEventStore>,
 >;
 
 /// Spawns the rebalancing infrastructure.
@@ -89,11 +87,10 @@ where
         config,
         alpaca_auth,
         &ethereum_wallet,
-        signer,
+        signer.address(),
         base_provider,
         orderbook,
-    )
-    .await?;
+    );
 
     let rebalancer = services.into_rebalancer(pool, config, symbol_cache, event_broadcast);
 
@@ -118,22 +115,22 @@ where
 {
     tokenization: Arc<AlpacaTokenizationService<BP>>,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<HttpProvider, BP, PrivateKeySigner>>,
-    vault: Arc<VaultService<BP, PrivateKeySigner>>,
+    cctp: Arc<CctpBridge<HttpProvider, BP>>,
+    vault: Arc<VaultService<BP>>,
 }
 
 impl<BP> Services<BP>
 where
     BP: Provider + Clone + 'static,
 {
-    async fn new(
+    fn new(
         config: &RebalancingConfig,
         alpaca_auth: &AlpacaTradingApiAuthEnv,
         ethereum_wallet: &EthereumWallet,
-        signer: PrivateKeySigner,
+        owner: Address,
         base_provider: BP,
         orderbook: Address,
-    ) -> Result<Self, VaultError> {
+    ) -> Self {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
             .connect_http(config.ethereum_rpc_url.clone());
@@ -163,41 +160,29 @@ where
 
         let ethereum_evm = Evm::new(
             ethereum_provider,
-            signer.clone(),
+            owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
-        // CctpBridge and VaultService each need their own Evm instance because
-        // Evm holds contract instances that borrow the provider, preventing Clone.
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
-            signer.clone(),
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-
-        let base_evm_for_vault = Evm::new(
-            base_provider,
-            signer,
+            owner,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-        let vault = VaultService::new(base_evm_for_vault, orderbook, USDC_BASE)
-            .await?
-            .arc();
+        let vault = Arc::new(VaultService::new(base_provider, orderbook));
 
-        Ok(Self {
+        Self {
             tokenization,
             wallet,
             cctp,
             vault,
-        })
+        }
     }
 
     fn into_rebalancer(
@@ -298,12 +283,11 @@ build_queries!(build_usdc_queries, UsdcRebalance);
 mod tests {
     use super::*;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{Address, address, b256};
+    use alloy::primitives::{address, b256};
     use alloy::providers::ProviderBuilder;
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
-
     use uuid::Uuid;
 
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
@@ -422,11 +406,9 @@ mod tests {
             .wallet(ethereum_wallet)
             .connect_http(config.ethereum_rpc_url.clone());
 
-        let test_account_id = AlpacaAccountId::new(Uuid::nil());
-
         let tokenization = Arc::new(AlpacaTokenizationService::new(
-            server.base_url().parse().unwrap(),
-            test_account_id,
+            server.base_url(),
+            config.alpaca_account_id,
             "test_key".into(),
             "test_secret".into(),
             base_provider.clone(),
@@ -435,14 +417,16 @@ mod tests {
 
         let wallet = Arc::new(AlpacaWalletService::new(
             server.base_url(),
-            test_account_id,
+            config.alpaca_account_id,
             "test_key".into(),
             "test_secret".into(),
         ));
 
+        let owner = signer.address();
+
         let ethereum_evm = Evm::new(
             ethereum_provider,
-            signer.clone(),
+            owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -450,23 +434,14 @@ mod tests {
 
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
-            signer.clone(),
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-
-        let base_evm_for_vault = Evm::new(
-            base_provider,
-            signer,
+            owner,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp));
-        let vault =
-            VaultService::new_unchecked(base_evm_for_vault, TEST_ORDERBOOK, USDC_BASE).arc();
+        let vault = Arc::new(VaultService::new(base_provider, TEST_ORDERBOOK));
 
         let services = Services {
             tokenization,

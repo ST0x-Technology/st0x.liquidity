@@ -11,18 +11,13 @@
 //! OrderBook V5 uses a custom float format (B256) for amounts. All conversions between
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
-use alloy::primitives::{Address, B256, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256, address};
 use alloy::providers::Provider;
-use alloy::signers::Signer;
-use alloy::sol_types::SolEvent;
-use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
-use tracing::{debug, info};
 
-use crate::bindings::{IERC20, IOrderBookV5};
-use crate::cctp::Evm;
-use crate::error_decoding::handle_contract_error;
+use crate::bindings::IOrderBookV5;
 
+const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
 
 /// Vault identifier for Rain OrderBook vaults.
@@ -35,22 +30,10 @@ pub(crate) enum VaultError {
     Transaction(#[from] alloy::providers::PendingTransactionError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
     #[error("Amount cannot be zero")]
     ZeroAmount,
-    #[error("Insufficient vault balance: requested {requested}, available {available}")]
-    InsufficientBalance { requested: U256, available: U256 },
-    #[error("WithdrawV2 event not found in transaction receipt")]
-    WithdrawEventNotFound,
-    #[error("No contract code at orderbook address {0}")]
-    NoContractCode(Address),
-    #[error("Address {0} is not a valid OrderBook V5 contract")]
-    InvalidOrderbook(Address),
-    #[error("RPC error: {0}")]
-    Rpc(#[from] alloy::transports::TransportError),
 }
 
 /// Service for managing Rain OrderBook vault operations.
@@ -58,8 +41,7 @@ pub(crate) enum VaultError {
 /// # Example
 ///
 /// ```ignore
-/// let account = Evm::new(provider, signer);
-/// let service = VaultService::new(account, orderbook_address, usdc_address);
+/// let service = VaultService::new(provider, orderbook_address);
 ///
 /// // Deposit USDC to vault
 /// let vault_id = VaultId(U256::from(1));
@@ -69,101 +51,37 @@ pub(crate) enum VaultError {
 /// // Withdraw USDC from vault
 /// service.withdraw_usdc(vault_id, amount).await?;
 /// ```
-pub(crate) struct VaultService<P, S>
+pub(crate) struct VaultService<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    account: Evm<P, S>,
-    orderbook: Address,
-    usdc_address: Address,
+    orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
 }
 
-impl<P, S> VaultService<P, S>
+impl<P> VaultService<P>
 where
     P: Provider + Clone,
-    S: Signer + Clone + Sync,
 {
-    /// Creates a new VaultService after verifying the orderbook is a valid V5 contract.
-    ///
-    /// # Errors
-    ///
-    /// Returns `VaultError::NoContractCode` if there's no code at the address.
-    /// Returns `VaultError::InvalidOrderbook` if the contract doesn't implement V5 interface.
-    pub(crate) async fn new(
-        account: Evm<P, S>,
-        orderbook: Address,
-        usdc_address: Address,
-    ) -> Result<Self, VaultError> {
-        let code = account.provider.get_code_at(orderbook).await?;
-
-        if code.is_empty() {
-            return Err(VaultError::NoContractCode(orderbook));
-        }
-
-        // Verify it's a V5 orderbook by checking for deposit3 with V5 signature
-        // deposit3(address,bytes32,bytes32,TaskV2[]) selector = 0x7921a962
-        let deposit3_selector: [u8; 4] = [0x79, 0x21, 0xa9, 0x62];
-        if !code.as_ref().windows(4).any(|w| w == deposit3_selector) {
-            return Err(VaultError::InvalidOrderbook(orderbook));
-        }
-
-        debug!(%orderbook, "Verified OrderBook V5 contract");
-
-        Ok(Self {
-            account,
-            orderbook,
-            usdc_address,
-        })
-    }
-
-    /// Wraps the service in an Arc for shared ownership.
-    pub(crate) fn arc(self) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(self)
-    }
-
-    /// Creates a VaultService without validation.
-    ///
-    /// For tests that don't deploy an actual orderbook contract.
-    #[cfg(test)]
-    pub(crate) fn new_unchecked(
-        account: Evm<P, S>,
-        orderbook: Address,
-        usdc_address: Address,
-    ) -> Self {
+    pub(crate) fn new(provider: P, orderbook: Address) -> Self {
         Self {
-            account,
-            orderbook,
-            usdc_address,
+            orderbook: IOrderBookV5::new(orderbook, provider),
         }
-    }
-
-    async fn ensure_token_approval(&self, token: Address, amount: U256) -> Result<(), VaultError> {
-        let owner = self.account.signer.address();
-        let token_contract = IERC20::new(token, self.account.provider.clone());
-
-        let allowance = token_contract
-            .allowance(owner, self.orderbook)
-            .call()
-            .await?;
-
-        if allowance < amount {
-            debug!(%allowance, %amount, "Approving token spend");
-            let approval_receipt = token_contract
-                .approve(self.orderbook, amount)
-                .send()
-                .await?
-                .get_receipt()
-                .await?;
-            info!(tx = %approval_receipt.transaction_hash, "Approval confirmed");
-        }
-
-        Ok(())
     }
 
     /// Deposits tokens to a Rain OrderBook vault.
     ///
-    /// Handles ERC20 approval automatically if the current allowance is insufficient.
+    /// # Parameters
+    ///
+    /// * `token` - ERC20 token address to deposit
+    /// * `vault_id` - Target vault identifier
+    /// * `amount` - Amount of tokens to deposit (in token's base units)
+    /// * `decimals` - Token decimals for float conversion
+    ///
+    /// # Errors
+    ///
+    /// Returns `VaultError::ZeroAmount` if amount is zero.
+    /// Returns `VaultError::Float` if amount cannot be converted to float format.
+    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
     pub(crate) async fn deposit(
         &self,
         token: Address,
@@ -175,42 +93,35 @@ where
             return Err(VaultError::ZeroAmount);
         }
 
-        debug!(%token, ?vault_id, %amount, decimals, "Starting deposit");
-
-        self.ensure_token_approval(token, amount).await?;
-
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
-        let contract = IOrderBookV5::new(self.orderbook, self.account.provider.clone());
 
-        let pending = match contract
-            .deposit3(token, vault_id.0, amount_float.get_inner(), Vec::new())
+        let tasks = Vec::new();
+
+        let receipt = self
+            .orderbook
+            .deposit3(token, vault_id.0, amount_float.get_inner(), tasks)
             .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
-        info!(tx = %receipt.transaction_hash, %amount, "Deposit confirmed");
+            .await?
+            .get_receipt()
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
 
-    fn parse_withdraw_event(
-        receipt: &alloy::rpc::types::TransactionReceipt,
-    ) -> Result<U256, VaultError> {
-        let withdraw_event = receipt
-            .inner
-            .logs()
-            .iter()
-            .find_map(|log| IOrderBookV5::WithdrawV2::decode_log(log.as_ref()).ok())
-            .ok_or(VaultError::WithdrawEventNotFound)?;
-
-        Ok(withdraw_event.withdrawAmountUint256)
-    }
-
     /// Withdraws tokens from a Rain OrderBook vault.
+    ///
+    /// # Parameters
+    ///
+    /// * `token` - ERC20 token address to withdraw
+    /// * `vault_id` - Source vault identifier
+    /// * `target_amount` - Target amount of tokens to withdraw (in token's base units)
+    /// * `decimals` - Token decimals for float conversion
+    ///
+    /// # Errors
+    ///
+    /// Returns `VaultError::ZeroAmount` if target_amount is zero.
+    /// Returns `VaultError::Float` if amount cannot be converted to float format.
+    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
     pub(crate) async fn withdraw(
         &self,
         token: Address,
@@ -222,31 +133,17 @@ where
             return Err(VaultError::ZeroAmount);
         }
 
-        debug!(%token, ?vault_id, %target_amount, decimals, "Starting withdraw");
-
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
-        let contract = IOrderBookV5::new(self.orderbook, self.account.provider.clone());
 
-        let pending = match contract
-            .withdraw3(token, vault_id.0, amount_float.get_inner(), Vec::new())
+        let tasks = Vec::new();
+
+        let receipt = self
+            .orderbook
+            .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
             .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
-        let actual_withdrawn = Self::parse_withdraw_event(&receipt)?;
-
-        if actual_withdrawn < target_amount {
-            return Err(VaultError::InsufficientBalance {
-                requested: target_amount,
-                available: actual_withdrawn,
-            });
-        }
-
-        info!(tx = %receipt.transaction_hash, %actual_withdrawn, "Withdraw confirmed");
+            .await?
+            .get_receipt()
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -264,7 +161,7 @@ where
         vault_id: VaultId,
         amount: U256,
     ) -> Result<TxHash, VaultError> {
-        self.deposit(self.usdc_address, vault_id, amount, USDC_DECIMALS)
+        self.deposit(USDC_BASE, vault_id, amount, USDC_DECIMALS)
             .await
     }
 
@@ -281,7 +178,7 @@ where
         vault_id: VaultId,
         target_amount: U256,
     ) -> Result<TxHash, VaultError> {
-        self.withdraw(self.usdc_address, vault_id, target_amount, USDC_DECIMALS)
+        self.withdraw(USDC_BASE, vault_id, target_amount, USDC_DECIMALS)
             .await
     }
 }
@@ -291,7 +188,7 @@ mod tests {
     use super::*;
     use alloy::network::{Ethereum, EthereumWallet};
     use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{B256, b256};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
     };
@@ -423,30 +320,6 @@ mod tests {
 
             Ok(balance)
         }
-
-        async fn get_allowance(
-            &self,
-            token: Address,
-            spender: Address,
-        ) -> Result<U256, LocalEvmError> {
-            let token_contract = TestERC20::new(token, &self.provider);
-            let allowance = token_contract
-                .allowance(self.signer.address(), spender)
-                .call()
-                .await?;
-            Ok(allowance)
-        }
-
-        fn evm(&self) -> Evm<LocalEvmProvider, PrivateKeySigner> {
-            let dummy_address = address!("0x0000000000000000000000000000000000000000");
-            Evm::new(
-                self.provider.clone(),
-                self.signer.clone(),
-                dummy_address,
-                dummy_address,
-                dummy_address,
-            )
-        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -472,13 +345,7 @@ mod tests {
     async fn deposit_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         let result = service
             .deposit(
@@ -508,13 +375,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -550,13 +411,7 @@ mod tests {
     async fn withdraw_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         let result = service
             .withdraw(
@@ -587,13 +442,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
 
         service
             .deposit(
@@ -618,142 +467,11 @@ mod tests {
         assert!(!tx_hash.is_zero());
     }
 
-    #[tokio::test]
-    async fn deposit_auto_approves_when_allowance_is_zero() {
-        let local_evm = LocalEvm::new().await.unwrap();
-        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
-
-        // Verify starting with zero allowance
-        let allowance_before = local_evm
-            .get_allowance(local_evm.token_address, local_evm.orderbook_address)
-            .await
-            .unwrap();
-        assert!(allowance_before.is_zero());
-
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
-
-        // Deposit should auto-approve and succeed
-        let tx_hash = service
-            .deposit(
-                local_evm.token_address,
-                TEST_VAULT_ID,
-                deposit_amount,
-                TEST_TOKEN_DECIMALS,
-            )
-            .await
-            .unwrap();
-
-        assert!(!tx_hash.is_zero());
-
-        // Allowance should be zero after deposit consumed it
-        let allowance_after = local_evm
-            .get_allowance(local_evm.token_address, local_evm.orderbook_address)
-            .await
-            .unwrap();
-        assert!(allowance_after.is_zero());
-    }
-
-    #[tokio::test]
-    async fn deposit_skips_approval_when_allowance_is_sufficient() {
-        let local_evm = LocalEvm::new().await.unwrap();
-        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
-        let pre_approval = deposit_amount * U256::from(2);
-
-        // Pre-approve more than needed
-        local_evm
-            .approve_tokens(
-                local_evm.token_address,
-                local_evm.orderbook_address,
-                pre_approval,
-            )
-            .await
-            .unwrap();
-
-        let allowance_before = local_evm
-            .get_allowance(local_evm.token_address, local_evm.orderbook_address)
-            .await
-            .unwrap();
-        assert_eq!(allowance_before, pre_approval);
-
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
-
-        // Deposit should succeed without additional approval
-        service
-            .deposit(
-                local_evm.token_address,
-                TEST_VAULT_ID,
-                deposit_amount,
-                TEST_TOKEN_DECIMALS,
-            )
-            .await
-            .unwrap();
-
-        // Allowance should be reduced by deposit amount, not reset
-        let allowance_after = local_evm
-            .get_allowance(local_evm.token_address, local_evm.orderbook_address)
-            .await
-            .unwrap();
-        assert_eq!(allowance_after, pre_approval - deposit_amount);
-    }
-
-    #[tokio::test]
-    async fn deposit_auto_approves_when_allowance_is_insufficient() {
-        let local_evm = LocalEvm::new().await.unwrap();
-        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
-        let insufficient_approval = deposit_amount / U256::from(2);
-
-        // Pre-approve less than needed
-        local_evm
-            .approve_tokens(
-                local_evm.token_address,
-                local_evm.orderbook_address,
-                insufficient_approval,
-            )
-            .await
-            .unwrap();
-
-        let allowance_before = local_evm
-            .get_allowance(local_evm.token_address, local_evm.orderbook_address)
-            .await
-            .unwrap();
-        assert_eq!(allowance_before, insufficient_approval);
-
-        let service = VaultService::new(
-            local_evm.evm(),
-            local_evm.orderbook_address,
-            local_evm.token_address,
-        )
-        .await
-        .unwrap();
-
-        // Deposit should auto-approve the exact amount needed and succeed
-        service
-            .deposit(
-                local_evm.token_address,
-                TEST_VAULT_ID,
-                deposit_amount,
-                TEST_TOKEN_DECIMALS,
-            )
-            .await
-            .unwrap();
-
-        // Allowance should be zero after deposit consumed the exact approval
-        let allowance_after = local_evm
-            .get_allowance(local_evm.token_address, local_evm.orderbook_address)
-            .await
-            .unwrap();
-        assert!(allowance_after.is_zero());
+    #[test]
+    fn usdc_base_address_is_correct() {
+        assert_eq!(
+            USDC_BASE,
+            address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+        );
     }
 }

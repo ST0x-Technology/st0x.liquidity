@@ -16,7 +16,6 @@ use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
-use crate::cctp::BridgeDirection;
 use crate::env::{Config, Env};
 use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
@@ -47,16 +46,6 @@ pub enum CctpChain {
     Ethereum,
     /// Base mainnet (destination: Ethereum)
     Base,
-}
-
-impl CctpChain {
-    /// Converts to the bridge direction (from this chain to its destination).
-    const fn to_bridge_direction(self) -> BridgeDirection {
-        match self {
-            Self::Ethereum => BridgeDirection::EthereumToBase,
-            Self::Base => BridgeDirection::BaseToEthereum,
-        }
-    }
 }
 
 #[derive(Debug, Error)]

@@ -182,9 +182,11 @@ where
         alpaca_auth.alpaca_broker_api_secret.clone(),
     ));
 
+    let owner = signer.address();
+
     let ethereum_evm = Evm::new(
         ethereum_provider,
-        signer.clone(),
+        owner,
         USDC_ETHEREUM,
         TOKEN_MESSENGER_V2,
         MESSAGE_TRANSMITTER_V2,
@@ -192,23 +194,17 @@ where
 
     let base_cctp = Evm::new(
         base_provider_with_wallet.clone(),
-        signer.clone(),
-        USDC_BASE,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    let base_vault = Evm::new(
-        base_provider_with_wallet,
-        signer,
+        owner,
         USDC_BASE,
         TOKEN_MESSENGER_V2,
         MESSAGE_TRANSMITTER_V2,
     );
 
     let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp));
-    let vault_service =
-        Arc::new(VaultService::new(base_vault, config.evm.orderbook, USDC_BASE).await?);
+    let vault_service = Arc::new(VaultService::new(
+        base_provider_with_wallet,
+        config.evm.orderbook,
+    ));
     let event_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
     let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));

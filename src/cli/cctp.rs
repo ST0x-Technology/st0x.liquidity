@@ -8,12 +8,25 @@ use rust_decimal::Decimal;
 use std::io::Write;
 
 use crate::bindings::IERC20;
-use crate::cctp::{CctpBridge, USDC_BASE, USDC_ETHEREUM};
+use crate::cctp::{
+    BridgeDirection, CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE,
+    USDC_ETHEREUM,
+};
 use crate::env::Config;
 use crate::rebalancing::RebalancingConfig;
 use crate::threshold::Usdc;
 
 use super::CctpChain;
+
+impl CctpChain {
+    /// Converts to the bridge direction (from this chain to its destination).
+    const fn to_bridge_direction(self) -> BridgeDirection {
+        match self {
+            Self::Ethereum => BridgeDirection::EthereumToBase,
+            Self::Base => BridgeDirection::BaseToEthereum,
+        }
+    }
+}
 
 pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + Sync + 'static>(
     stdout: &mut W,
@@ -70,7 +83,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
     writeln!(stdout, "   Wallet: {wallet}")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer);
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer.clone());
 
     let direction = from.to_bridge_direction();
 
@@ -99,15 +112,33 @@ fn build_cctp_bridge<BP: Provider + Clone>(
     rebalancing: &RebalancingConfig,
     base_provider: BP,
     signer: PrivateKeySigner,
-) -> CctpBridge<impl Provider + Clone, impl Provider + Clone, PrivateKeySigner> {
+) -> CctpBridge<impl Provider + Clone, impl Provider + Clone> {
+    let owner = signer.address();
+
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_http(rebalancing.ethereum_rpc_url.clone());
     let base_provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer.clone()))
+        .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
 
-    CctpBridge::mainnet(ethereum_provider, base_provider, signer)
+    let ethereum = Evm::new(
+        ethereum_provider,
+        owner,
+        USDC_ETHEREUM,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+    );
+
+    let base = Evm::new(
+        base_provider,
+        owner,
+        USDC_BASE,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+    );
+
+    CctpBridge::new(ethereum, base)
 }
 
 pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send + Sync + 'static>(
@@ -136,6 +167,8 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
     let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer);
+
+    // Use the V2 API which returns both message and attestation from tx hash
     let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;
 
     writeln!(
@@ -145,7 +178,6 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     )?;
 
     writeln!(stdout, "   Calling receiveMessage on {dest_chain:?}...")?;
-
     let mint_tx = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
