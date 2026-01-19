@@ -2,12 +2,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod auth;
+mod client;
 mod executor;
 mod market_hours;
 mod order;
 
-pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
+pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
+pub use order::{ConversionDirection, CryptoOrderResponse};
 
 #[derive(Debug, Error)]
 pub enum AlpacaBrokerApiError {
@@ -21,22 +23,6 @@ pub enum AlpacaBrokerApiError {
     ApiError {
         status: reqwest::StatusCode,
         body: String,
-    },
-
-    #[error(
-        "Inconsistent market data: market is open but next_close ({next_close}) is not in the future (now: {now})"
-    )]
-    MarketOpenButCloseInPast {
-        next_close: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
-    },
-
-    #[error(
-        "Inconsistent market data: market is closed but next_open ({next_open}) is not in the future (now: {now})"
-    )]
-    MarketClosedButOpenInPast {
-        next_open: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
     },
 
     #[error(
@@ -57,5 +43,17 @@ pub enum AlpacaBrokerApiError {
     AccountNotActive {
         account_id: Uuid,
         status: AccountStatus,
+    },
+
+    #[error("Failed to parse calendar data: {0}")]
+    CalendarParse(String),
+
+    #[error("No trading days found between {from} and {to}")]
+    NoTradingDaysFound { from: String, to: String },
+
+    #[error("Crypto order {order_id} failed with status: {status}")]
+    CryptoOrderFailed {
+        order_id: uuid::Uuid,
+        status: String,
     },
 }

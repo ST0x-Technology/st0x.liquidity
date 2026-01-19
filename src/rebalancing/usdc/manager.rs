@@ -699,8 +699,10 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use uuid::uuid;
+
     use super::*;
-    use crate::alpaca_wallet::{AlpacaWalletClient, AlpacaWalletError, create_account_mock};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::UsdcRebalanceError;
@@ -740,18 +742,16 @@ mod tests {
         (anvil, endpoint, private_key)
     }
 
-    async fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
-        let account_mock = create_account_mock(server, "test-account-id");
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
+    fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key".to_string(),
             "test_secret".to_string(),
-        )
-        .await
-        .unwrap();
-
-        account_mock.assert();
+        );
 
         AlpacaWalletService::new_with_client(client, None)
     }
@@ -829,7 +829,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
         let cqrs = create_test_cqrs();
@@ -847,7 +847,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/test-account-id/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -875,7 +875,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
         let cqrs = create_test_cqrs();
@@ -893,7 +893,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/test-account-id/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
@@ -928,7 +928,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
         let cqrs = create_test_cqrs();
@@ -946,7 +946,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/test-account-id/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(500).body("Internal Server Error");
         });
 
@@ -1009,7 +1009,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
         let cqrs = create_test_cqrs();
@@ -1044,7 +1044,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
-        let alpaca_wallet = Arc::new(create_test_wallet_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
         let cqrs = create_test_cqrs();

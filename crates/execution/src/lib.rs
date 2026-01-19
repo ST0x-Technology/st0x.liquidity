@@ -104,6 +104,14 @@ impl Display for Symbol {
     }
 }
 
+impl std::str::FromStr for Symbol {
+    type Err = EmptySymbolError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::new(s)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]

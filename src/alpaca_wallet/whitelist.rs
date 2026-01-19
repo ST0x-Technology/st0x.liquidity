@@ -27,24 +27,24 @@ mod tests {
     use alloy::primitives::address;
     use httpmock::prelude::*;
     use serde_json::json;
+    use uuid::uuid;
 
-    use super::super::client::{AlpacaWalletClient, create_account_mock};
-    use super::super::transfer::{Network, TokenSymbol};
+    use super::super::client::AlpacaWalletClient;
+    use super::super::transfer::{AlpacaAccountId, Network, TokenSymbol};
     use super::*;
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[tokio::test]
     async fn test_get_whitelisted_addresses() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let test_address1 = "0x1234567890abcdef1234567890abcdef12345678";
         let test_address2 = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -69,11 +69,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let result = client.get_whitelisted_addresses().await.unwrap();
 
@@ -83,22 +82,17 @@ mod tests {
         assert_eq!(result[1].id, "whitelist-456");
         assert_eq!(result[1].status, WhitelistStatus::Pending);
 
-        account_mock.assert();
         whitelist_mock.assert();
     }
 
     #[tokio::test]
     async fn test_is_address_whitelisted_and_approved_true() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -115,11 +109,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
 
@@ -130,22 +123,17 @@ mod tests {
 
         assert!(result);
 
-        account_mock.assert();
         whitelist_mock.assert();
     }
 
     #[tokio::test]
     async fn test_is_address_whitelisted_and_approved_pending() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -162,11 +150,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
@@ -178,22 +165,17 @@ mod tests {
 
         assert!(!result);
 
-        account_mock.assert();
         whitelist_mock.assert();
     }
 
     #[tokio::test]
     async fn test_is_address_whitelisted_and_approved_rejected() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -210,11 +192,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let asset = TokenSymbol::new("USDC");
         let network = Network::new("Ethereum");
@@ -226,22 +207,17 @@ mod tests {
 
         assert!(!result);
 
-        account_mock.assert();
         whitelist_mock.assert();
     }
 
     #[tokio::test]
     async fn test_is_address_whitelisted_and_approved_not_found() {
         let server = MockServer::start();
-        let expected_account_id = "904837e3-3b76-47ec-b432-046db621571b";
-        let account_mock = create_account_mock(&server, expected_account_id);
-
         let other_address = "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd";
 
         let whitelist_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
-                "/v1/accounts/{expected_account_id}/wallets/whitelists"
-            ));
+            when.method(GET)
+                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/whitelists"));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -258,11 +234,10 @@ mod tests {
 
         let client = AlpacaWalletClient::new(
             server.base_url(),
+            TEST_ACCOUNT_ID,
             "test_key_id".to_string(),
             "test_secret_key".to_string(),
-        )
-        .await
-        .unwrap();
+        );
 
         let address = address!("0x1234567890abcdef1234567890abcdef12345678");
         let asset = TokenSymbol::new("USDC");
@@ -275,7 +250,6 @@ mod tests {
 
         assert!(!result);
 
-        account_mock.assert();
         whitelist_mock.assert();
     }
 }
