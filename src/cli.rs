@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use std::io::Write;
 use thiserror::Error;
@@ -167,11 +168,8 @@ fn format_order_state<W: Write>(stdout: &mut W, order_state: OrderState) -> anyh
             writeln!(stdout, "   Status: FILLED ✅")?;
             writeln!(stdout, "   Order ID: {oid}")?;
             writeln!(stdout, "   Executed At: {executed_at}")?;
-            writeln!(
-                stdout,
-                "   Fill Price: ${:.2}",
-                f64::from(u32::try_from(price_cents)?) / 100.0
-            )?;
+            let dollars = Decimal::from(price_cents) / Decimal::from(100);
+            writeln!(stdout, "   Fill Price: ${dollars:.2}")?;
         }
         OrderState::Failed {
             failed_at,
@@ -2342,5 +2340,27 @@ mod tests {
         let output_str = String::from_utf8(output).unwrap();
         assert!(output_str.contains("FAILED"));
         assert!(!output_str.contains("Reason:"));
+    }
+
+    #[test]
+    fn format_order_state_filled_handles_large_price_cents() {
+        let mut output = Vec::new();
+        // 500_000_000_000 cents = $5 billion - exceeds u32::MAX (4,294,967,295)
+        let large_price_cents: u64 = 500_000_000_000;
+        format_order_state(
+            &mut output,
+            OrderState::Filled {
+                executed_at: Utc::now(),
+                order_id: "ORD123".to_string(),
+                price_cents: large_price_cents,
+            },
+        )
+        .unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("FILLED"));
+        assert!(
+            output_str.contains("$5000000000.00"),
+            "Expected price format $5000000000.00, got: {output_str}"
+        );
     }
 }

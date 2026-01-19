@@ -17,6 +17,8 @@ pub enum PersistenceError {
     InvalidSymbol(String),
     #[error("Row not found for update: execution_id={execution_id}")]
     RowNotFound { execution_id: i64 },
+    #[error("Execution not found: {0}")]
+    ExecutionNotFound(i64),
     #[error("Execution error: {0}")]
     Execution(#[source] Box<crate::ExecutionError>),
 }

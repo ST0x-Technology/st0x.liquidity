@@ -165,6 +165,11 @@ impl<E: Executor> OrderStatusPoller<E> {
         let execution = self.finalize_order(execution_id, order_state).await?;
 
         let OrderState::Filled { price_cents, .. } = order_state else {
+            error!(
+                execution_id = execution_id,
+                ?order_state,
+                "handle_filled_order called with non-Filled order state"
+            );
             return Ok(());
         };
 
@@ -179,8 +184,19 @@ impl<E: Executor> OrderStatusPoller<E> {
             state: order_state.clone(),
         };
 
+        self.execute_filled_order_dual_write(execution_id, &execution_with_state)
+            .await;
+
+        Ok(())
+    }
+
+    async fn execute_filled_order_dual_write(
+        &self,
+        execution_id: i64,
+        execution_with_state: &OffchainExecution,
+    ) {
         if let Err(e) =
-            crate::dual_write::record_fill(&self.dual_write_context, &execution_with_state).await
+            crate::dual_write::record_fill(&self.dual_write_context, execution_with_state).await
         {
             error!(
                 "Failed to execute OffchainOrder::CompleteFill command for execution {execution_id}: {e}"
@@ -189,18 +205,16 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         if let Err(e) = crate::dual_write::complete_offchain_order(
             &self.dual_write_context,
-            &execution_with_state,
-            &execution.symbol,
+            execution_with_state,
+            &execution_with_state.symbol,
         )
         .await
         {
             error!(
                 "Failed to execute Position::CompleteOffChainOrder command for execution {execution_id}, symbol {}: {e}",
-                execution.symbol
+                execution_with_state.symbol
             );
         }
-
-        Ok(())
     }
 
     async fn handle_failed_order(
@@ -259,7 +273,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
             error!("Execution {execution_id} not found in database");
             return Err(OrderPollingError::OnChain(OnChainError::Persistence(
-                PersistenceError::InvalidTradeStatus("Execution not found".to_string()),
+                PersistenceError::ExecutionNotFound(execution_id),
             )));
         };
 
@@ -596,6 +610,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(lock_count, 0, "symbol_locks should be cleared");
+    }
+
+    #[tokio::test]
+    async fn test_finalize_order_returns_execution_not_found_error_for_missing_execution() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockExecutor::default();
+        let config = OrderPollerConfig::default();
+
+        let poller = OrderStatusPoller::new(config, pool, broker, dual_write_context);
+
+        let nonexistent_execution_id = 99999;
+        let filled_state = OrderState::Filled {
+            order_id: "ORD999".to_string(),
+            price_cents: 10000,
+            executed_at: Utc::now(),
+        };
+
+        let result = poller
+            .handle_filled_order(nonexistent_execution_id, &filled_state)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrderPollingError::OnChain(OnChainError::Persistence(
+                    PersistenceError::ExecutionNotFound(99999)
+                ))
+            ),
+            "Expected ExecutionNotFound(99999), got: {err:?}"
+        );
     }
 
     /// Reproduces the production recovery scenario:
