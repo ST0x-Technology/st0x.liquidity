@@ -1,7 +1,7 @@
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
 use st0x_execution::{Direction, OrderState, PersistenceError, Shares, SupportedExecutor, Symbol};
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use super::OnchainTrade;
 use crate::error::{OnChainError, TradeValidationError};
@@ -11,8 +11,6 @@ use crate::onchain::position_calculator::{
     AccumulationBucket, ConversionError, PositionCalculator,
 };
 use crate::trade_execution_link::TradeExecutionLink;
-
-const STALE_EXECUTION_MINUTES: i32 = 10;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CleanedUpExecution {
@@ -408,17 +406,44 @@ async fn create_execution_within_transaction(
     Ok(execution_with_id)
 }
 
+const STALE_EXECUTION_MINUTES: i32 = 10;
+
 /// Clean up stale executions that have been in PENDING or SUBMITTED state for too long
 /// Returns list of cleaned up executions for dual-write
 async fn clean_up_stale_executions(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     base_symbol: &Symbol,
 ) -> Result<Vec<CleanedUpExecution>, OnChainError> {
+    let stale_execution_ids = find_stale_execution_ids(sql_tx, base_symbol).await?;
+
+    let mut cleaned_up = Vec::new();
+
+    for maybe_execution_id in stale_execution_ids {
+        let Some(execution_id) = maybe_execution_id else {
+            warn!(symbol = %base_symbol, "Stale execution has null ID, skipping cleanup");
+            continue;
+        };
+
+        if let Some(cleaned) =
+            mark_execution_as_timed_out(sql_tx, base_symbol, execution_id).await?
+        {
+            cleaned_up.push(cleaned);
+        }
+    }
+
+    Ok(cleaned_up)
+}
+
+async fn find_stale_execution_ids(
+    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    base_symbol: &Symbol,
+) -> Result<Vec<Option<i64>>, sqlx::Error> {
     let timeout_param = format!("-{STALE_EXECUTION_MINUTES} minutes");
     let base_symbol_str = base_symbol.to_string();
-    let stale_executions = sqlx::query!(
+
+    sqlx::query_scalar!(
         r#"
-        SELECT se.id, se.symbol
+        SELECT se.id
         FROM offchain_trades se
         JOIN trade_accumulators ta ON ta.pending_execution_id = se.id
         WHERE ta.symbol = ?1
@@ -429,37 +454,71 @@ async fn clean_up_stale_executions(
         timeout_param
     )
     .fetch_all(sql_tx.as_mut())
-    .await?;
-
-    let valid_executions = stale_executions.into_iter().filter_map(|stale_execution| {
-        stale_execution
-            .id
-            .map(|execution_id| (execution_id, stale_execution.symbol))
-            .or_else(|| {
-                tracing::warn!("Stale execution has null ID, skipping cleanup");
-                None
-            })
-    });
-
-    let mut cleaned_up = Vec::new();
-
-    for (execution_id, symbol_str) in valid_executions {
-        let cleaned =
-            cleanup_stale_execution(sql_tx, base_symbol, execution_id, symbol_str).await?;
-
-        cleaned_up.push(cleaned);
-    }
-
-    Ok(cleaned_up)
+    .await
 }
 
-async fn cleanup_stale_execution(
+/// Checks if an execution is eligible for timeout cleanup.
+/// Returns true if the execution exists, is in PENDING/SUBMITTED status, and pending_execution_id matches.
+async fn is_execution_eligible_for_timeout(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     base_symbol: &Symbol,
     execution_id: i64,
-    symbol_str: String,
-) -> Result<CleanedUpExecution, OnChainError> {
-    let symbol = Symbol::new(symbol_str)?;
+) -> Result<bool, OnChainError> {
+    let base_symbol_str = base_symbol.to_string();
+    let preflight = sqlx::query!(
+        r#"
+        SELECT se.status, ta.pending_execution_id
+        FROM offchain_trades se
+        LEFT JOIN trade_accumulators ta ON ta.symbol = ?1
+        WHERE se.id = ?2
+        "#,
+        base_symbol_str,
+        execution_id
+    )
+    .fetch_optional(sql_tx.as_mut())
+    .await?;
+
+    let Some(row) = preflight else {
+        debug!(
+            symbol = %base_symbol,
+            execution_id = execution_id,
+            "Execution not found, skipping cleanup"
+        );
+        return Ok(false);
+    };
+
+    let status = &row.status;
+    if status != "PENDING" && status != "SUBMITTED" {
+        debug!(
+            symbol = %base_symbol,
+            execution_id = execution_id,
+            status = status,
+            "Execution already progressed beyond PENDING/SUBMITTED, skipping cleanup"
+        );
+        return Ok(false);
+    }
+
+    if row.pending_execution_id != Some(execution_id) {
+        debug!(
+            symbol = %base_symbol,
+            execution_id = execution_id,
+            actual_pending_execution_id = ?row.pending_execution_id,
+            "pending_execution_id mismatch, skipping cleanup"
+        );
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+async fn mark_execution_as_timed_out(
+    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    base_symbol: &Symbol,
+    execution_id: i64,
+) -> Result<Option<CleanedUpExecution>, OnChainError> {
+    if !is_execution_eligible_for_timeout(sql_tx, base_symbol, execution_id).await? {
+        return Ok(None);
+    }
 
     info!(
         symbol = %base_symbol,
@@ -480,26 +539,29 @@ async fn cleanup_stale_execution(
     failed_state.store_update(sql_tx, execution_id).await?;
 
     let base_symbol_str = base_symbol.to_string();
-    sqlx::query!(
-        "UPDATE trade_accumulators SET pending_execution_id = NULL WHERE symbol = ?1",
-        base_symbol_str
+    let result = sqlx::query!(
+        "UPDATE trade_accumulators SET pending_execution_id = NULL WHERE symbol = ?1 AND pending_execution_id = ?2",
+        base_symbol_str,
+        execution_id
     )
     .execute(sql_tx.as_mut())
     .await?;
 
-    crate::lock::clear_execution_lease(sql_tx, base_symbol).await?;
+    if result.rows_affected() > 0 {
+        clear_execution_lease(sql_tx, base_symbol).await?;
 
-    info!(
-        symbol = %base_symbol,
-        execution_id = execution_id,
-        "Cleared stale execution and released lock"
-    );
+        info!(
+            symbol = %base_symbol,
+            execution_id = execution_id,
+            "Cleared stale execution and released lock"
+        );
+    }
 
-    Ok(CleanedUpExecution {
+    Ok(Some(CleanedUpExecution {
         execution_id,
-        symbol,
+        symbol: base_symbol.clone(),
         error_reason,
-    })
+    }))
 }
 
 /// Checks all accumulated positions and executes any that are ready for execution.
@@ -1430,6 +1492,7 @@ mod tests {
             .await
             .unwrap();
         let execution = result2.unwrap();
+
         let execution_id = execution.id.unwrap();
 
         // Verify both trades are linked to the execution
@@ -2340,5 +2403,159 @@ mod tests {
             0,
             "No new execution since one is already pending and net is below threshold"
         );
+    }
+
+    #[tokio::test]
+    async fn test_mark_execution_as_timed_out_returns_none_when_execution_already_filled() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Create execution and mark it as FILLED
+        let execution = OffchainExecution {
+            id: None,
+            symbol: symbol.clone(),
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+
+        let calculator = PositionCalculator::new();
+        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id))
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        // Update execution to FILLED status
+        let filled_state = OrderState::Filled {
+            order_id: "ORD123".to_string(),
+            price_cents: 15000,
+            executed_at: Utc::now(),
+        };
+        let mut sql_tx = pool.begin().await.unwrap();
+        filled_state
+            .store_update(&mut sql_tx, execution_id)
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        // Try to mark as timed out - should return None since already FILLED
+        let mut sql_tx = pool.begin().await.unwrap();
+        let result = mark_execution_as_timed_out(&mut sql_tx, &symbol, execution_id)
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "Should return None when execution is already FILLED"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_execution_as_timed_out_returns_none_when_pending_execution_id_mismatch() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Create first execution (the one we'll try to mark as timed out)
+        // Use a different symbol to avoid unique constraint on offchain_trades
+        let symbol_other = Symbol::new("MSFT").unwrap();
+        let execution1 = OffchainExecution {
+            id: None,
+            symbol: symbol_other,
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        // Create second execution (the one that will be in the accumulator for AAPL)
+        let execution2 = OffchainExecution {
+            id: None,
+            symbol: symbol.clone(),
+            shares: Shares::new(2).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let execution_id_1 = execution1
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+        let execution_id_2 = execution2
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+
+        // Create accumulator pointing to execution_id_2 (not execution_id_1)
+        let calculator = PositionCalculator::new();
+        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id_2))
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        // Try to mark execution_id_1 as timed out - should return None since
+        // pending_execution_id points to execution_id_2
+        let mut sql_tx = pool.begin().await.unwrap();
+        let result = mark_execution_as_timed_out(&mut sql_tx, &symbol, execution_id_1)
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        assert!(
+            result.is_none(),
+            "Should return None when pending_execution_id doesn't match"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mark_execution_as_timed_out_returns_some_when_conditions_met() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Create execution in PENDING state
+        let execution = OffchainExecution {
+            id: None,
+            symbol: symbol.clone(),
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+
+        let calculator = PositionCalculator::new();
+        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id))
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        // Mark as timed out - should succeed
+        let mut sql_tx = pool.begin().await.unwrap();
+        let result = mark_execution_as_timed_out(&mut sql_tx, &symbol, execution_id)
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        assert!(
+            result.is_some(),
+            "Should return Some when execution is PENDING and pending_execution_id matches"
+        );
+        let cleaned = result.unwrap();
+        assert_eq!(cleaned.execution_id, execution_id);
+        assert_eq!(cleaned.symbol, symbol);
     }
 }

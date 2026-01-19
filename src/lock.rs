@@ -1,6 +1,8 @@
 use crate::error::OnChainError;
 use st0x_execution::Symbol;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+const LOCK_TIMEOUT_MINUTES: i32 = 15;
 
 /// Atomically acquires an execution lease for the given symbol.
 /// Returns true if lease was acquired, false if another worker holds it.
@@ -8,9 +10,23 @@ pub(crate) async fn try_acquire_execution_lease(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     symbol: &Symbol,
 ) -> Result<bool, OnChainError> {
-    const LOCK_TIMEOUT_MINUTES: i32 = 5;
+    cleanup_stale_lock(sql_tx, symbol).await?;
 
-    // Clean up stale lock for this specific symbol (older than 5 minutes)
+    let result = sqlx::query("INSERT OR IGNORE INTO symbol_locks (symbol) VALUES (?1)")
+        .bind(symbol.to_string())
+        .execute(sql_tx.as_mut())
+        .await?;
+
+    let lease_acquired = result.rows_affected() > 0;
+    log_lease_result(symbol, lease_acquired);
+
+    Ok(lease_acquired)
+}
+
+async fn cleanup_stale_lock(
+    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    symbol: &Symbol,
+) -> Result<(), OnChainError> {
     let timeout_param = format!("-{LOCK_TIMEOUT_MINUTES} minutes");
     let symbol_str = symbol.to_string();
     let cleanup_result = sqlx::query!(
@@ -29,13 +45,10 @@ pub(crate) async fn try_acquire_execution_lease(
         );
     }
 
-    // Try to acquire lock by inserting into symbol_locks table
-    let result = sqlx::query("INSERT OR IGNORE INTO symbol_locks (symbol) VALUES (?1)")
-        .bind(symbol.to_string())
-        .execute(sql_tx.as_mut())
-        .await?;
+    Ok(())
+}
 
-    let lease_acquired = result.rows_affected() > 0;
+fn log_lease_result(symbol: &Symbol, lease_acquired: bool) {
     if lease_acquired {
         info!("Acquired execution lease for symbol: {symbol}");
     } else {
@@ -44,8 +57,30 @@ pub(crate) async fn try_acquire_execution_lease(
             symbol
         );
     }
+}
 
-    Ok(lease_acquired)
+/// Renews an existing execution lease by updating the locked_at timestamp.
+/// Returns true if a lock existed and was renewed, false if no lock was found.
+pub(crate) async fn renew_execution_lease(
+    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    symbol: &Symbol,
+) -> Result<bool, OnChainError> {
+    let symbol_str = symbol.to_string();
+    let result = sqlx::query!(
+        "UPDATE symbol_locks SET locked_at = CURRENT_TIMESTAMP WHERE symbol = ?1",
+        symbol_str
+    )
+    .execute(sql_tx.as_mut())
+    .await?;
+
+    let renewed = result.rows_affected() > 0;
+    if renewed {
+        debug!("Renewed execution lease for symbol: {symbol}");
+    } else {
+        warn!("Failed to renew execution lease for symbol: {symbol} (no lock found)");
+    }
+
+    Ok(renewed)
 }
 
 /// Clears the execution lease when no execution was created
@@ -380,5 +415,99 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row.pending_execution_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_renew_execution_lease_extends_lock() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Acquire a lease
+        let mut sql_tx = pool.begin().await.unwrap();
+        let acquired = try_acquire_execution_lease(&mut sql_tx, &symbol)
+            .await
+            .unwrap();
+        assert!(acquired);
+        sql_tx.commit().await.unwrap();
+
+        // Set the locked_at timestamp to be 10 minutes old
+        sqlx::query(
+            "UPDATE symbol_locks SET locked_at = datetime('now', '-10 minutes') WHERE symbol = ?1",
+        )
+        .bind(symbol.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Renew the lease
+        let mut sql_tx = pool.begin().await.unwrap();
+        let renewed = renew_execution_lease(&mut sql_tx, &symbol).await.unwrap();
+        assert!(renewed, "Lease renewal should succeed");
+        sql_tx.commit().await.unwrap();
+
+        // Verify the locked_at timestamp was updated to recent time
+        let symbol_str = symbol.to_string();
+        let stale_check_result = sqlx::query!(
+            "SELECT COUNT(*) as count FROM symbol_locks WHERE symbol = ?1 AND locked_at > datetime('now', '-1 minute')",
+            symbol_str
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stale_check_result.count, 1,
+            "Lock should have recent timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_renew_execution_lease_returns_false_when_no_lock() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Try to renew without acquiring first
+        let mut sql_tx = pool.begin().await.unwrap();
+        let renewed = renew_execution_lease(&mut sql_tx, &symbol).await.unwrap();
+        assert!(!renewed, "Renewal should fail when no lock exists");
+        sql_tx.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_renewed_lock_not_cleaned_up_as_stale() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // Acquire a lease and immediately set it to be older than LOCK_TIMEOUT_MINUTES (15)
+        let mut sql_tx = pool.begin().await.unwrap();
+        let acquired = try_acquire_execution_lease(&mut sql_tx, &symbol)
+            .await
+            .unwrap();
+        assert!(acquired);
+        sql_tx.commit().await.unwrap();
+
+        sqlx::query(
+            "UPDATE symbol_locks SET locked_at = datetime('now', '-20 minutes') WHERE symbol = ?1",
+        )
+        .bind(symbol.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Renew the lease
+        let mut sql_tx = pool.begin().await.unwrap();
+        let renewed = renew_execution_lease(&mut sql_tx, &symbol).await.unwrap();
+        assert!(renewed);
+        sql_tx.commit().await.unwrap();
+
+        // Try to acquire the same lease - should fail because renewal extended it
+        let mut sql_tx = pool.begin().await.unwrap();
+        let acquired = try_acquire_execution_lease(&mut sql_tx, &symbol)
+            .await
+            .unwrap();
+        assert!(
+            !acquired,
+            "Should not acquire lease that was recently renewed"
+        );
+        sql_tx.rollback().await.unwrap();
     }
 }

@@ -6,6 +6,7 @@ use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
 use std::time::Duration;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -14,6 +15,7 @@ use tracing::{debug, error, info, trace};
 use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
+use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
 use crate::error::EventProcessingError;
@@ -49,6 +51,7 @@ pub(crate) async fn run_market_hours_loop<E>(
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
+    event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -61,12 +64,7 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("Market hours check failed: {e}"))?;
 
-    let timeout_minutes = timeout.as_secs() / 60;
-    if timeout_minutes < 60 * 24 {
-        info!("Market is open, starting conductor (will timeout in {timeout_minutes} minutes)");
-    } else {
-        info!("Starting conductor (no market hours restrictions)");
-    }
+    log_market_status(timeout);
 
     let mut conductor = match Conductor::start(
         &config,
@@ -74,49 +72,133 @@ where
         executor.clone(),
         executor_maintenance,
         rebalancer,
+        event_sender.clone(),
     )
     .await
     {
         Ok(c) => c,
         Err(e) => {
-            error!(
-                "Failed to start conductor: {e}, retrying in {} seconds",
-                RERUN_DELAY_SECS
-            );
-
-            tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-
-            let new_maintenance = executor.run_executor_maintenance().await;
-
-            return Box::pin(run_market_hours_loop(
-                executor,
-                config,
-                pool,
-                new_maintenance,
-                None,
-            ))
-            .await;
+            return retry_after_failure(executor, config, pool, e, RERUN_DELAY_SECS, event_sender)
+                .await;
         }
     };
 
     info!("Market opened, conductor running");
 
+    run_conductor_until_market_close(
+        &mut conductor,
+        executor,
+        config,
+        pool,
+        timeout,
+        event_sender,
+    )
+    .await
+}
+
+fn log_market_status(timeout: Duration) {
+    let timeout_minutes = timeout.as_secs() / 60;
+    if timeout_minutes < 60 * 24 {
+        info!("Market is open, starting conductor (will timeout in {timeout_minutes} minutes)");
+    } else {
+        info!("Starting conductor (no market hours restrictions)");
+    }
+}
+
+async fn retry_after_failure<E>(
+    executor: E,
+    config: Config,
+    pool: SqlitePool,
+    error: anyhow::Error,
+    delay_secs: u64,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    error!("Failed to start conductor: {error}, retrying in {delay_secs} seconds");
+    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
+    let new_maintenance = executor.run_executor_maintenance().await;
+    Box::pin(run_market_hours_loop(
+        executor,
+        config,
+        pool,
+        new_maintenance,
+        None,
+        event_sender,
+    ))
+    .await
+}
+
+async fn run_conductor_until_market_close<E>(
+    conductor: &mut Conductor,
+    executor: E,
+    config: Config,
+    pool: SqlitePool,
+    timeout: Duration,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     tokio::select! {
         result = conductor.wait_for_completion() => {
-            info!("Conductor completed");
-            conductor.abort_all();
-            result?;
-            info!("Conductor completed successfully, continuing to next market session");
-            Ok(())
+            handle_conductor_completion(conductor, result)
         }
         () = tokio::time::sleep(timeout) => {
-            info!("Market closed, shutting down trading tasks");
-            conductor.abort_trading_tasks();
-            let next_maintenance = conductor.executor_maintenance;
-            info!("Trading tasks shutdown, DEX events buffering");
-            Box::pin(run_market_hours_loop(executor, config, pool, next_maintenance, None)).await
+            handle_market_close(conductor, executor, config, pool, event_sender).await
         }
     }
+}
+
+fn handle_conductor_completion(
+    conductor: &Conductor,
+    result: Result<(), anyhow::Error>,
+) -> anyhow::Result<()> {
+    info!("Conductor completed");
+    conductor.order_poller.abort();
+    conductor.dex_event_receiver.abort();
+    conductor.event_processor.abort();
+    conductor.position_checker.abort();
+    conductor.queue_processor.abort();
+    if let Some(ref handle) = conductor.executor_maintenance {
+        handle.abort();
+    }
+    if let Some(ref handle) = conductor.rebalancer {
+        handle.abort();
+    }
+    result?;
+    info!("Conductor completed successfully, continuing to next market session");
+    Ok(())
+}
+
+async fn handle_market_close<E>(
+    conductor: &mut Conductor,
+    executor: E,
+    config: Config,
+    pool: SqlitePool,
+    event_sender: broadcast::Sender<ServerMessage>,
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    info!("Market closed, shutting down trading tasks");
+    conductor.abort_trading_tasks();
+    let next_maintenance = conductor.executor_maintenance.take();
+    info!("Trading tasks shutdown, DEX events buffering");
+    Box::pin(run_market_hours_loop(
+        executor,
+        config,
+        pool,
+        next_maintenance,
+        None,
+        event_sender,
+    ))
+    .await
 }
 
 impl Conductor {
@@ -126,6 +208,7 @@ impl Conductor {
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
         rebalancer: Option<JoinHandle<()>>,
+        event_sender: broadcast::Sender<ServerMessage>,
     ) -> anyhow::Result<Self>
     where
         E: Executor + Clone + Send + 'static,
@@ -157,6 +240,7 @@ impl Conductor {
                         alpaca_auth,
                         provider.clone(),
                         cache.clone(),
+                        Some(event_sender),
                     )
                     .await?,
                 )
@@ -183,43 +267,11 @@ impl Conductor {
     }
 
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
-        let maintenance_task = async {
-            if let Some(handle) = &mut self.executor_maintenance {
-                match handle.await {
-                    Ok(()) => {
-                        info!("Broker maintenance completed successfully");
-                    }
-                    Err(e) if e.is_cancelled() => {
-                        info!("Broker maintenance cancelled (expected during shutdown)");
-                    }
-                    Err(e) => error!("Broker maintenance task panicked: {e}"),
-                }
-            }
-        };
+        let maintenance_task =
+            wait_for_optional_task(&mut self.executor_maintenance, "Executor maintenance");
+        let rebalancer_task = wait_for_optional_task(&mut self.rebalancer, "Rebalancer");
 
-        let rebalancer_task = async {
-            if let Some(handle) = &mut self.rebalancer {
-                match handle.await {
-                    Ok(()) => {
-                        info!("Rebalancer completed successfully");
-                    }
-                    Err(e) if e.is_cancelled() => {
-                        info!("Rebalancer cancelled (expected during shutdown)");
-                    }
-                    Err(e) => error!("Rebalancer task panicked: {e}"),
-                }
-            }
-        };
-
-        let (
-            (),
-            (),
-            poller_result,
-            dex_receiver_result,
-            processor_result,
-            position_result,
-            queue_result,
-        ) = tokio::join!(
+        let ((), (), poller, dex, processor, position, queue) = tokio::join!(
             maintenance_task,
             rebalancer_task,
             &mut self.order_poller,
@@ -229,21 +281,11 @@ impl Conductor {
             &mut self.queue_processor
         );
 
-        if let Err(e) = poller_result {
-            error!("Order poller task panicked: {e}");
-        }
-        if let Err(e) = dex_receiver_result {
-            error!("DEX event receiver task panicked: {e}");
-        }
-        if let Err(e) = processor_result {
-            error!("Event processor task panicked: {e}");
-        }
-        if let Err(e) = position_result {
-            error!("Position checker task panicked: {e}");
-        }
-        if let Err(e) = queue_result {
-            error!("Queue processor task panicked: {e}");
-        }
+        log_task_result(poller, "Order poller");
+        log_task_result(dex, "DEX event receiver");
+        log_task_result(processor, "Event processor");
+        log_task_result(position, "Position checker");
+        log_task_result(queue, "Queue processor");
 
         Ok(())
     }
@@ -262,25 +304,21 @@ impl Conductor {
 
         info!("Trading tasks aborted successfully (DEX events will continue buffering)");
     }
+}
 
-    pub(crate) fn abort_all(self) {
-        info!("Aborting all background tasks");
+async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
+    let Some(handle) = handle else { return };
 
-        if let Some(handle) = self.executor_maintenance {
-            handle.abort();
-        }
+    match handle.await {
+        Ok(()) => info!("{task_name} completed successfully"),
+        Err(e) if e.is_cancelled() => info!("{task_name} cancelled (expected during shutdown)"),
+        Err(e) => error!("{task_name} task panicked: {e}"),
+    }
+}
 
-        if let Some(handle) = self.rebalancer {
-            handle.abort();
-        }
-
-        self.order_poller.abort();
-        self.dex_event_receiver.abort();
-        self.event_processor.abort();
-        self.position_checker.abort();
-        self.queue_processor.abort();
-
-        info!("All background tasks aborted successfully");
+fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) {
+    if let Err(e) = result {
+        error!("{task_name} task panicked: {e}");
     }
 }
 
@@ -423,22 +461,30 @@ async fn receive_blockchain_events<S1, S2>(
             }
         };
 
-        match event_result {
-            Ok((event, log)) => {
-                trace!(
-                    "Received blockchain event: tx_hash={:?}, log_index={:?}, block_number={:?}",
-                    log.transaction_hash, log.log_index, log.block_number
-                );
-                if event_sender.send((event, log)).is_err() {
-                    error!("Event receiver dropped, shutting down");
-                    break;
-                }
-            }
-            Err(e) => {
-                error!("Error in event stream: {e}");
-            }
+        if !handle_event_result(event_result, &event_sender) {
+            break;
         }
     }
+}
+
+fn handle_event_result(
+    result: Result<(TradeEvent, Log), sol_types::Error>,
+    sender: &UnboundedSender<(TradeEvent, Log)>,
+) -> bool {
+    match result {
+        Ok((event, log)) => {
+            trace!(
+                "Received blockchain event: tx_hash={:?}, log_index={:?}, block_number={:?}",
+                log.transaction_hash, log.log_index, log.block_number
+            );
+            if sender.send((event, log)).is_err() {
+                error!("Event receiver dropped, shutting down");
+                return false;
+            }
+        }
+        Err(e) => error!("Error in event stream: {e}"),
+    }
+    true
 }
 
 pub(crate) async fn get_cutoff_block<S1, S2, P>(
@@ -523,22 +569,12 @@ async fn run_queue_processor<P, E>(
 
     let feed_id_cache = FeedIdCache::default();
 
-    match crate::queue::count_unprocessed(pool).await {
-        Ok(count) if count > 0 => {
-            info!("Found {count} unprocessed events from previous sessions to process");
-        }
-        Ok(_) => {
-            info!("No unprocessed events found, starting fresh");
-        }
-        Err(e) => {
-            error!("Failed to count unprocessed events: {e}");
-        }
-    }
+    log_unprocessed_event_count(pool).await;
 
     let executor_type = executor.to_supported_executor();
 
     loop {
-        match process_next_queued_event(
+        let result = process_next_queued_event(
             executor_type,
             config,
             pool,
@@ -547,29 +583,45 @@ async fn run_queue_processor<P, E>(
             &feed_id_cache,
             dual_write_context,
         )
-        .await
-        {
-            Ok(Some(execution)) => {
-                if let Some(exec_id) = execution.id {
-                    if let Err(e) = execute_pending_offchain_execution(
-                        executor,
-                        pool,
-                        dual_write_context,
-                        exec_id,
-                    )
-                    .await
-                    {
-                        error!("Failed to execute offchain order {exec_id}: {e}");
-                    }
-                }
+        .await;
+
+        handle_queue_processing_result(executor, pool, dual_write_context, result).await;
+    }
+}
+
+async fn log_unprocessed_event_count(pool: &SqlitePool) {
+    match crate::queue::count_unprocessed(pool).await {
+        Ok(count) if count > 0 => {
+            info!("Found {count} unprocessed events from previous sessions to process");
+        }
+        Ok(_) => info!("No unprocessed events found, starting fresh"),
+        Err(e) => error!("Failed to count unprocessed events: {e}"),
+    }
+}
+
+async fn handle_queue_processing_result<E>(
+    executor: &E,
+    pool: &SqlitePool,
+    dual_write_context: &DualWriteContext,
+    result: Result<Option<OffchainExecution>, EventProcessingError>,
+) where
+    E: Executor + Clone,
+    EventProcessingError: From<E::Error>,
+{
+    match result {
+        Ok(Some(execution)) => {
+            if let Some(exec_id) = execution.id
+                && let Err(e) =
+                    execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
+                        .await
+            {
+                error!("Failed to execute offchain order {exec_id}: {e}");
             }
-            Ok(None) => {
-                sleep(Duration::from_millis(100)).await;
-            }
-            Err(e) => {
-                error!("Error processing queued event: {e}");
-                sleep(Duration::from_millis(500)).await;
-            }
+        }
+        Ok(None) => sleep(Duration::from_millis(100)).await,
+        Err(e) => {
+            error!("Error processing queued event: {e}");
+            sleep(Duration::from_millis(500)).await;
         }
     }
 }
@@ -739,50 +791,59 @@ async fn execute_onchain_trade_dual_write(
     trade: &OnchainTrade,
     block_number: u64,
 ) {
-    if let Err(e) = crate::dual_write::witness_trade(dual_write_context, trade, block_number).await
-    {
-        error!(
-            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    } else {
-        info!(
+    execute_witness_trade(dual_write_context, trade, block_number).await;
+    execute_initialize_position(dual_write_context, trade).await;
+    execute_acknowledge_fill(dual_write_context, trade).await;
+}
+
+async fn execute_witness_trade(
+    dual_write_context: &DualWriteContext,
+    trade: &OnchainTrade,
+    block_number: u64,
+) {
+    match crate::dual_write::witness_trade(dual_write_context, trade, block_number).await {
+        Ok(()) => info!(
             "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        ),
     }
+}
 
+async fn execute_initialize_position(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
     let base_symbol = trade.symbol.base();
 
-    // Try to initialize position for new symbols - will fail silently if already initialized
-    if let Err(e) = crate::dual_write::initialize_position(
+    match crate::dual_write::initialize_position(
         dual_write_context,
         base_symbol,
         crate::threshold::ExecutionThreshold::whole_share(),
     )
     .await
     {
-        debug!(
-            "Position initialization skipped (likely already exists): {e}, symbol={}",
-            base_symbol
-        );
-    } else {
-        info!(
+        Ok(()) => info!(
             "Successfully initialized Position aggregate for symbol={}",
             base_symbol
-        );
+        ),
+        Err(e) => debug!(
+            "Position initialization skipped (likely already exists): {e}, symbol={}",
+            base_symbol
+        ),
     }
+}
 
-    if let Err(e) = crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
-        error!(
-            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
-            trade.tx_hash, trade.log_index, trade.symbol
-        );
-    } else {
-        info!(
+async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
+    match crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
+        Ok(()) => info!(
             "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            trade.tx_hash, trade.log_index, trade.symbol
+        ),
     }
 }
 
@@ -791,30 +852,38 @@ async fn execute_new_execution_dual_write(
     execution: &OffchainExecution,
     base_symbol: &Symbol,
 ) {
-    if let Err(e) =
-        crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
+    execute_place_offchain_order(dual_write_context, execution, base_symbol).await;
+    execute_place_order(dual_write_context, execution).await;
+}
+
+async fn execute_place_offchain_order(
+    dual_write_context: &DualWriteContext,
+    execution: &OffchainExecution,
+    base_symbol: &Symbol,
+) {
+    match crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
     {
-        error!(
-            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
-            execution.id, base_symbol
-        );
-    } else {
-        info!(
+        Ok(()) => info!(
             "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
             execution.id, base_symbol
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
+            execution.id, base_symbol
+        ),
     }
+}
 
-    if let Err(e) = crate::dual_write::place_order(dual_write_context, execution).await {
-        error!(
-            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
-            execution.id, execution.symbol
-        );
-    } else {
-        info!(
+async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainExecution) {
+    match crate::dual_write::place_order(dual_write_context, execution).await {
+        Ok(()) => info!(
             "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
             execution.id, execution.symbol
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
+            execution.id, execution.symbol
+        ),
     }
 }
 
@@ -823,38 +892,61 @@ async fn execute_stale_execution_cleanup_dual_write(
     cleaned_up_executions: Vec<CleanedUpExecution>,
 ) {
     for cleaned_up in cleaned_up_executions {
-        let execution_id = cleaned_up.execution_id;
-        let symbol = cleaned_up.symbol;
-        let error_reason = cleaned_up.error_reason;
-        if let Err(e) =
-            crate::dual_write::mark_failed(dual_write_context, execution_id, error_reason.clone())
-                .await
-        {
-            error!(
-                "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
-            );
-        } else {
-            info!(
-                "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
-            );
-        }
+        execute_single_stale_cleanup(dual_write_context, cleaned_up).await;
+    }
+}
 
-        if let Err(e) = crate::dual_write::fail_offchain_order(
-            dual_write_context,
-            execution_id,
-            &symbol,
-            error_reason,
-        )
-        .await
-        {
-            error!(
-                "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
-            );
-        } else {
-            info!(
-                "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
-            );
-        }
+async fn execute_single_stale_cleanup(
+    dual_write_context: &DualWriteContext,
+    cleaned_up: CleanedUpExecution,
+) {
+    execute_mark_stale_failed(dual_write_context, &cleaned_up).await;
+    execute_fail_stale_offchain(dual_write_context, &cleaned_up).await;
+}
+
+async fn execute_mark_stale_failed(
+    dual_write_context: &DualWriteContext,
+    cleaned_up: &CleanedUpExecution,
+) {
+    let execution_id = cleaned_up.execution_id;
+
+    match crate::dual_write::mark_failed(
+        dual_write_context,
+        execution_id,
+        cleaned_up.error_reason.clone(),
+    )
+    .await
+    {
+        Ok(()) => info!(
+            "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
+        ),
+        Err(e) => error!(
+            "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
+        ),
+    }
+}
+
+async fn execute_fail_stale_offchain(
+    dual_write_context: &DualWriteContext,
+    cleaned_up: &CleanedUpExecution,
+) {
+    let execution_id = cleaned_up.execution_id;
+    let symbol = &cleaned_up.symbol;
+
+    match crate::dual_write::fail_offchain_order(
+        dual_write_context,
+        execution_id,
+        symbol,
+        cleaned_up.error_reason.clone(),
+    )
+    .await
+    {
+        Ok(()) => info!(
+            "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
+        ),
+        Err(e) => error!(
+            "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
+        ),
     }
 }
 
@@ -1096,36 +1188,56 @@ where
     loop {
         tokio::select! {
             Some(result) = clear_stream.next() => {
-                match result {
-                    Ok((event, log)) => {
-                        if let Some(block_number) = log.block_number {
-                            events.push((TradeEvent::ClearV3(Box::new(event)), log));
-                            return Some((events, block_number));
-                        }
-                        error!("ClearV3 event missing block number");
-                    }
-                    Err(e) => {
-                        error!("Error in clear event stream during startup: {e}");
-                    }
+                if let Some(first_event) = handle_startup_clear_event(result, &mut events) {
+                    return Some(first_event);
                 }
             }
             Some(result) = take_stream.next() => {
-                match result {
-                    Ok((event, log)) => {
-                        if let Some(block_number) = log.block_number {
-                            events.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
-                            return Some((events, block_number));
-                        }
-                        error!("TakeOrderV3 event missing block number");
-                    }
-                    Err(e) => {
-                        error!("Error in take event stream during startup: {e}");
-                    }
+                if let Some(first_event) = handle_startup_take_event(result, &mut events) {
+                    return Some(first_event);
                 }
             }
-            () = &mut deadline => {
+            () = &mut deadline => return None,
+        }
+    }
+}
+
+fn handle_startup_clear_event(
+    result: Result<(ClearV3, Log), sol_types::Error>,
+    events: &mut Vec<(TradeEvent, Log)>,
+) -> Option<(Vec<(TradeEvent, Log)>, u64)> {
+    match result {
+        Ok((event, log)) => {
+            let Some(block_number) = log.block_number else {
+                error!("ClearV3 event missing block number");
                 return None;
-            }
+            };
+            events.push((TradeEvent::ClearV3(Box::new(event)), log));
+            Some((std::mem::take(events), block_number))
+        }
+        Err(e) => {
+            error!("Error in clear event stream during startup: {e}");
+            None
+        }
+    }
+}
+
+fn handle_startup_take_event(
+    result: Result<(TakeOrderV3, Log), sol_types::Error>,
+    events: &mut Vec<(TradeEvent, Log)>,
+) -> Option<(Vec<(TradeEvent, Log)>, u64)> {
+    match result {
+        Ok((event, log)) => {
+            let Some(block_number) = log.block_number else {
+                error!("TakeOrderV3 event missing block number");
+                return None;
+            };
+            events.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
+            Some((std::mem::take(events), block_number))
+        }
+        Err(e) => {
+            error!("Error in take event stream during startup: {e}");
+            None
         }
     }
 }
@@ -1183,6 +1295,22 @@ mod tests {
         Direction, MockExecutorConfig, OrderState, OrderStatus, Shares, SupportedExecutor, Symbol,
         TryIntoExecutor,
     };
+
+    fn abort_all_conductor_tasks(conductor: Conductor) {
+        if let Some(handle) = conductor.executor_maintenance {
+            handle.abort();
+        }
+
+        if let Some(handle) = conductor.rebalancer {
+            handle.abort();
+        }
+
+        conductor.order_poller.abort();
+        conductor.dex_event_receiver.abort();
+        conductor.event_processor.abort();
+        conductor.position_checker.abort();
+        conductor.queue_processor.abort();
+    }
 
     #[tokio::test]
     async fn test_event_enqueued_when_trade_conversion_returns_none() {
@@ -2356,7 +2484,7 @@ mod tests {
         assert!(!conductor.position_checker.is_finished());
         assert!(!conductor.queue_processor.is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -2433,7 +2561,7 @@ mod tests {
             "ConductorBuilder should return quickly, took: {elapsed:?}"
         );
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
@@ -2457,7 +2585,7 @@ mod tests {
                 .spawn();
 
         assert!(conductor.rebalancer.is_none());
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
@@ -2491,7 +2619,7 @@ mod tests {
         assert!(conductor.rebalancer.is_some());
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
@@ -2524,7 +2652,7 @@ mod tests {
         let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_ref.is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -2564,7 +2692,7 @@ mod tests {
 
         assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
 
-        conductor.abort_all();
+        abort_all_conductor_tasks(conductor);
     }
 
     #[test]

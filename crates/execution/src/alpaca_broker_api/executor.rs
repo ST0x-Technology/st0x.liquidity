@@ -132,7 +132,7 @@ mod tests {
         }
     }
 
-    fn create_account_mock(server: &MockServer) -> httpmock::Mock {
+    fn create_account_mock(server: &MockServer) -> httpmock::Mock<'_> {
         server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/trading/accounts/test_account_123/account");
