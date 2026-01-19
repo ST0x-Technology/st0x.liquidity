@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
@@ -89,7 +89,7 @@ fn build_onchain_trade_command(
         amount,
         direction,
         price_usdc,
-        block_number: 0,
+        block_number: None,
         block_timestamp: row.created_at,
         gas_used: None,
         pyth_price: None,
@@ -289,7 +289,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            super::MigrationError::InvalidSymbol(_)
+            super::MigrationError::EmptySymbol(_)
         ));
     }
 
@@ -345,6 +345,35 @@ mod tests {
             result.unwrap_err(),
             super::MigrationError::InvalidDecimal(_)
         ));
+    }
+
+    #[test]
+    fn test_build_onchain_trade_command_uses_none_for_block_number() {
+        use crate::onchain_trade::OnChainTradeCommand;
+        use chrono::Utc;
+
+        let row = super::OnchainTradeRow {
+            tx_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+                .to_string(),
+            log_index: 0,
+            symbol: "AAPL".to_string(),
+            amount: 10.0,
+            direction: "BUY".to_string(),
+            price_usdc: 150.50,
+            created_at: Utc::now(),
+        };
+
+        let command = super::build_onchain_trade_command(&row).unwrap();
+
+        match command {
+            OnChainTradeCommand::Migrate { block_number, .. } => {
+                assert_eq!(
+                    block_number, None,
+                    "Migrated trades should have block_number: None"
+                );
+            }
+            _ => panic!("Expected Migrate command"),
+        }
     }
 
     #[tokio::test]

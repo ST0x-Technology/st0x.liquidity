@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use st0x_broker::{OrderState, Symbol};
+use st0x_execution::{OrderState, Symbol};
 
 use crate::offchain::execution::OffchainExecution;
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
@@ -41,7 +41,7 @@ pub(crate) async fn acknowledge_onchain_fill(
         log_index: trade.log_index,
     };
     let amount = FractionalShares(Decimal::try_from(trade.amount)?);
-    let price_usdc = Decimal::try_from(trade.price_usdc)?;
+    let price_usdc = Decimal::try_from(trade.price.value())?;
 
     let block_timestamp =
         trade
@@ -81,13 +81,13 @@ pub(crate) async fn place_offchain_order(
     );
     let shares = FractionalShares(Decimal::from(execution.shares.value()));
     let direction = execution.direction;
-    let broker = execution.broker;
+    let executor = execution.executor;
 
     let command = PositionCommand::PlaceOffChainOrder {
         execution_id,
         shares,
         direction,
-        broker,
+        executor,
     };
 
     context
@@ -173,12 +173,11 @@ pub(crate) async fn fail_offchain_order(
 mod tests {
     use alloy::primitives::fixed_bytes;
     use chrono::Utc;
-    use st0x_broker::{Direction, SupportedBroker};
-
-    use crate::onchain::io::TokenizedEquitySymbol;
-    use crate::test_utils::setup_test_db;
+    use st0x_execution::{Direction, SupportedExecutor};
 
     use super::*;
+    use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
+    use crate::test_utils::setup_test_db;
 
     #[tokio::test]
     async fn test_acknowledge_onchain_fill_success() {
@@ -199,7 +198,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
@@ -248,7 +247,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -281,9 +280,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: st0x_execution::Shares::new(10).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -296,7 +295,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
@@ -335,9 +334,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: st0x_execution::Shares::new(10).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
                 order_id: "12345".to_string(),
                 price_cents: 15025,
@@ -354,7 +353,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
@@ -399,9 +398,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: st0x_execution::Shares::new(10).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -414,7 +413,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
@@ -456,9 +455,9 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: st0x_execution::Shares::new(10).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -480,9 +479,9 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: st0x_broker::Shares::new(10).unwrap(),
+            shares: st0x_execution::Shares::new(10).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 

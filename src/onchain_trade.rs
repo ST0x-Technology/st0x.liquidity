@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, Symbol};
+use st0x_execution::{Direction, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
@@ -16,7 +16,7 @@ pub(crate) struct OnChainTrade {
     pub(crate) amount: Decimal,
     pub(crate) direction: Direction,
     pub(crate) price_usdc: Decimal,
-    pub(crate) block_number: u64,
+    pub(crate) block_number: Option<u64>,
     pub(crate) block_timestamp: DateTime<Utc>,
     pub(crate) filled_at: DateTime<Utc>,
     pub(crate) enrichment: Option<Enrichment>,
@@ -73,7 +73,7 @@ impl OnChainTrade {
                 amount: *amount,
                 direction: *direction,
                 price_usdc: *price_usdc,
-                block_number: *block_number,
+                block_number: Some(*block_number),
                 block_timestamp: *block_timestamp,
                 filled_at: *filled_at,
                 enrichment: None,
@@ -245,7 +245,7 @@ pub(crate) enum OnChainTradeCommand {
         amount: Decimal,
         direction: Direction,
         price_usdc: Decimal,
-        block_number: u64,
+        block_number: Option<u64>,
         block_timestamp: DateTime<Utc>,
         gas_used: Option<u64>,
         pyth_price: Option<PythPrice>,
@@ -271,7 +271,7 @@ pub(crate) enum OnChainTradeEvent {
         amount: Decimal,
         direction: Direction,
         price_usdc: Decimal,
-        block_number: u64,
+        block_number: Option<u64>,
         block_timestamp: DateTime<Utc>,
         gas_used: Option<u64>,
         pyth_price: Option<PythPrice>,
@@ -478,7 +478,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             gas_used: Some(50000),
             pyth_price: Some(pyth_price),
@@ -504,7 +504,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             gas_used: None,
             pyth_price: None,
@@ -634,7 +634,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             filled_at: now,
             enrichment: None,
@@ -682,7 +682,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             gas_used: Some(50000),
             pyth_price: Some(pyth_price),
@@ -712,7 +712,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             gas_used: None,
             pyth_price: None,
@@ -763,7 +763,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             gas_used: None,
             pyth_price: None,
@@ -787,7 +787,7 @@ mod tests {
                 assert_eq!(amount, &dec!(10.5));
                 assert_eq!(direction, &Direction::Buy);
                 assert_eq!(price_usdc, &dec!(150.25));
-                assert_eq!(block_number, &12345);
+                assert_eq!(block_number, &Some(12345));
                 assert!(gas_used.is_none());
                 assert!(pyth_price.is_none());
             }
@@ -813,7 +813,7 @@ mod tests {
             amount: dec!(10.5),
             direction: Direction::Buy,
             price_usdc: dec!(150.25),
-            block_number: 12345,
+            block_number: Some(12345),
             block_timestamp: now,
             gas_used: Some(50000),
             pyth_price: Some(pyth_price.clone()),
@@ -857,7 +857,7 @@ mod tests {
             amount: dec!(5.0),
             direction: Direction::Sell,
             price_usdc: dec!(160.00),
-            block_number: 12346,
+            block_number: Some(12346),
             block_timestamp: now,
             gas_used: None,
             pyth_price: None,

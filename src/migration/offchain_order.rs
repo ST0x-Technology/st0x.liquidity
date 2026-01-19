@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::{SupportedBroker, Symbol};
+use st0x_execution::{SupportedExecutor, Symbol};
 use tracing::info;
 
 use super::{ExecutionMode, MigrationError};
@@ -129,7 +129,7 @@ fn build_offchain_order_command(
         symbol,
         shares: FractionalShares(shares),
         direction,
-        broker: SupportedBroker::Schwab,
+        executor: SupportedExecutor::Schwab,
         status: migrated_status,
         broker_order_id,
         price_cents,

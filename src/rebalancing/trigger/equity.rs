@@ -3,13 +3,12 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use st0x_execution::Symbol;
 use tokio::sync::RwLock;
 
+use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 use crate::symbol::cache::SymbolCache;
-use st0x_broker::Symbol;
-
-use super::TriggeredOperation;
 
 /// Why an equity trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +118,7 @@ mod tests {
     use alloy::primitives::TxHash;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_broker::Direction;
+    use st0x_execution::Direction;
 
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};

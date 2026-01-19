@@ -126,7 +126,7 @@ impl HyperDxConfig {
             .with_level(true);
 
         let default_filter = format!(
-            "st0x_hedge={},st0x_broker={}",
+            "st0x_hedge={},st0x_execution={}",
             self.log_level, self.log_level
         );
 

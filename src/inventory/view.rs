@@ -13,7 +13,7 @@ use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
-use st0x_broker::{Direction, Symbol};
+use st0x_execution::{Direction, Symbol};
 
 /// Error type for inventory view operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
