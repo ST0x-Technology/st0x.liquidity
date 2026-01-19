@@ -2,6 +2,9 @@ mod offchain_order;
 mod onchain_trade;
 mod position;
 mod schwab_auth;
+mod startup;
+
+pub(crate) use startup::run_startup_check;
 
 use alloy::primitives::FixedBytes;
 use clap::{Parser, ValueEnum};
@@ -80,7 +83,7 @@ pub struct MigrationEnv {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum MigrationError {
+pub(crate) enum MigrationError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -578,10 +581,9 @@ mod tests {
         insert_test_trade(&pool, tx3, 0, "GOOGL", 3.0, "BUY", 2800.00).await;
 
         sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short)
+             VALUES (?, ?, ?)",
             "AAPL",
-            10.0,
             10.0,
             0.0
         )
@@ -590,10 +592,9 @@ mod tests {
         .unwrap();
 
         sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short)
+             VALUES (?, ?, ?)",
             "TSLA",
-            -5.0,
             0.0,
             5.0
         )

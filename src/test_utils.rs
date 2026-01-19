@@ -1,7 +1,7 @@
 use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
-use crate::onchain::io::TokenizedEquitySymbol;
+use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 use alloy::primitives::{LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
@@ -116,7 +116,7 @@ impl OnchainTradeBuilder {
                 symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
                 amount: 1.0,
                 direction: Direction::Buy,
-                price_usdc: 150.0,
+                price: Usdc::new(150.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: None,
@@ -143,7 +143,7 @@ impl OnchainTradeBuilder {
 
     #[must_use]
     pub(crate) fn with_price(mut self, price: f64) -> Self {
-        self.trade.price_usdc = price;
+        self.trade.price = Usdc::new(price).unwrap();
         self
     }
 

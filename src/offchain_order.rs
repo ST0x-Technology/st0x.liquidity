@@ -16,6 +16,12 @@ pub(crate) struct ExecutionId(pub(crate) i64);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerOrderId(pub(crate) String);
 
+impl BrokerOrderId {
+    pub(crate) fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PriceCents(pub(crate) u64);
 

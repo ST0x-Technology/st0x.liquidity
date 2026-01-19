@@ -51,7 +51,6 @@ impl std::ops::Mul<Decimal> for FractionalShares {
 }
 
 impl FractionalShares {
-    #[cfg(test)]
     pub(crate) const ONE: Self = Self(Decimal::ONE);
 
     pub(crate) fn abs(self) -> Self {

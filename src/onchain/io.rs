@@ -43,7 +43,8 @@ impl Shares {
 }
 
 /// Represents a validated USDC amount (non-negative)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+#[sqlx(transparent)]
 pub(crate) struct Usdc(f64);
 
 impl Usdc {

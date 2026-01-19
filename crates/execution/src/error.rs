@@ -15,6 +15,8 @@ pub enum PersistenceError {
     MissingExecutionId,
     #[error("Invalid symbol in database: {0}")]
     InvalidSymbol(String),
+    #[error("Row not found for update: execution_id={execution_id}")]
+    RowNotFound { execution_id: i64 },
 }
 
 impl From<crate::ExecutionError> for PersistenceError {
