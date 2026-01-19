@@ -56,4 +56,7 @@ pub enum AlpacaBrokerApiError {
         order_id: uuid::Uuid,
         status: String,
     },
+
+    #[error("Internal error: calendar was non-empty but iteration returned None")]
+    CalendarIterationInvariantViolation,
 }

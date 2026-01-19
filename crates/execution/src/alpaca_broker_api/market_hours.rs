@@ -68,7 +68,10 @@ async fn check_market_status(
         return Ok(MarketStatus::NotTradingDay { next_day });
     }
 
-    let today_calendar = calendar.into_iter().next().expect("checked non-empty");
+    let today_calendar = calendar
+        .into_iter()
+        .next()
+        .ok_or(AlpacaBrokerApiError::CalendarIterationInvariantViolation)?;
     let now_et_time = now_et.time();
 
     if now_et_time < today_calendar.open {
