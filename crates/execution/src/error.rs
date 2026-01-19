@@ -17,13 +17,15 @@ pub enum PersistenceError {
     InvalidSymbol(String),
     #[error("Row not found for update: execution_id={execution_id}")]
     RowNotFound { execution_id: i64 },
+    #[error("Execution error: {0}")]
+    Execution(#[source] Box<crate::ExecutionError>),
 }
 
 impl From<crate::ExecutionError> for PersistenceError {
     fn from(err: crate::ExecutionError) -> Self {
         match err {
             crate::ExecutionError::Database(db_err) => Self::Database(db_err),
-            other => Self::InvalidTradeStatus(format!("ExecutionError: {other}")),
+            other => Self::Execution(Box::new(other)),
         }
     }
 }

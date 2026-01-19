@@ -92,8 +92,8 @@ pub(crate) enum EventProcessingError {
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
     Schwab(#[from] SchwabError),
-    #[error("Broker error: {0}")]
-    Broker(#[from] ExecutionError),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
 }
@@ -127,8 +127,8 @@ pub(crate) enum OnChainError {
     Persistence(#[from] PersistenceError),
     #[error("Alloy error: {0}")]
     Alloy(#[from] AlloyError),
-    #[error("Broker error: {0}")]
-    Broker(#[from] ExecutionError),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
     #[error("Event queue error: {0}")]
     EventQueue(#[from] EventQueueError),
     #[error("Order status parse error: {0}")]
