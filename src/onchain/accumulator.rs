@@ -1,6 +1,6 @@
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
-use st0x_broker::{Direction, OrderState, PersistenceError, Shares, SupportedBroker, Symbol};
+use st0x_execution::{Direction, OrderState, PersistenceError, Shares, SupportedExecutor, Symbol};
 use tracing::info;
 
 use super::OnchainTrade;
@@ -11,7 +11,6 @@ use crate::onchain::position_calculator::{
     AccumulationBucket, ConversionError, PositionCalculator,
 };
 use crate::trade_execution_link::TradeExecutionLink;
-use st0x_execution::{Direction, OrderState, PersistenceError, Shares, SupportedExecutor, Symbol};
 
 const STALE_EXECUTION_MINUTES: i32 = 10;
 
@@ -683,7 +682,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -715,7 +714,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(1).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -2159,7 +2158,7 @@ mod tests {
         let TradeProcessingResult {
             execution: _,
             cleaned_up_executions,
-        } = process_onchain_trade(&mut sql_tx, trade, SupportedBroker::Schwab)
+        } = process_onchain_trade(&mut sql_tx, trade, SupportedExecutor::Schwab)
             .await
             .unwrap();
         sql_tx.commit().await.unwrap();
@@ -2256,7 +2255,7 @@ mod tests {
             (actual_net - (-0.5)).abs() < f64::EPSILON,
             "actual net (long - short) should be -0.5"
         );
-        let executions = check_all_accumulated_positions(&pool, SupportedBroker::Schwab)
+        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
             .await
             .unwrap();
 
@@ -2332,7 +2331,7 @@ mod tests {
 
         // Now run check_all_accumulated_positions - should NOT create additional
         // executions since there's already a pending one (and net is now 0.5 < 1.0)
-        let executions = check_all_accumulated_positions(&pool, SupportedBroker::Schwab)
+        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
             .await
             .unwrap();
 

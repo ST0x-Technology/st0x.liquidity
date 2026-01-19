@@ -131,10 +131,10 @@ async fn handle_order_status_command<W: Write>(
         auth: schwab_auth.clone(),
         pool: pool.clone(),
     };
-    let broker = schwab_config.try_into_broker().await?;
+    let executor = schwab_config.try_into_executor().await?;
 
     let order_id_typed = order_id.to_string();
-    match broker.get_order_status(&order_id_typed).await {
+    match executor.get_order_status(&order_id_typed).await {
         Ok(order_state) => {
             info!("Order status retrieved successfully: {order_state:?}");
             writeln!(stdout, "📊 Order Status for {order_id}:")?;

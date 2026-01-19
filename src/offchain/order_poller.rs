@@ -1,7 +1,7 @@
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
-use st0x_broker::{Broker, OrderState, OrderStatus, PersistenceError};
+use st0x_execution::{Executor, OrderState, OrderStatus, PersistenceError};
 use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info};
@@ -12,7 +12,6 @@ use super::execution::{
 use crate::dual_write::DualWriteContext;
 use crate::error::{OnChainError, OrderPollingError};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id};
-use st0x_execution::{Executor, OrderState, OrderStatus, PersistenceError};
 
 #[derive(Debug, Clone)]
 pub struct OrderPollerConfig {
@@ -199,7 +198,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             symbol: execution.symbol.clone(),
             shares: execution.shares,
             direction: execution.direction,
-            broker: execution.broker,
+            executor: execution.executor,
             state: order_state.clone(),
         };
 
@@ -306,7 +305,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_broker::{Direction, MockBroker, Shares, SupportedBroker, Symbol};
+    use st0x_execution::{Direction, MockExecutor, Shares, SupportedExecutor, Symbol};
 
     use super::*;
     use crate::offchain_order::BrokerOrderId;
@@ -343,7 +342,7 @@ mod tests {
     async fn setup_offchain_order_aggregate(
         dual_write_context: &DualWriteContext,
         execution: &OffchainExecution,
-        symbol: &st0x_broker::Symbol,
+        symbol: &st0x_execution::Symbol,
         order_id: &str,
     ) {
         crate::dual_write::place_order(dual_write_context, execution)
@@ -367,10 +366,10 @@ mod tests {
     async fn test_handle_filled_order_executes_dual_write_commands() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = st0x_broker::MockBroker::default();
+        let broker = MockExecutor::default();
         let config = OrderPollerConfig::default();
 
-        let symbol = st0x_broker::Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
         let shares = Shares::new(10).unwrap();
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "AAPL0x", 10.0).await;
@@ -385,7 +384,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -396,7 +395,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -449,10 +448,10 @@ mod tests {
     async fn test_handle_failed_order_executes_dual_write_commands() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = st0x_broker::MockBroker::default();
+        let broker = MockExecutor::default();
         let config = OrderPollerConfig::default();
 
-        let symbol = st0x_broker::Symbol::new("TSLA").unwrap();
+        let symbol = Symbol::new("TSLA").unwrap();
         let shares = Shares::new(5).unwrap();
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "TSLA0x", 5.0).await;
@@ -467,7 +466,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Sell,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -478,7 +477,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -590,7 +589,7 @@ mod tests {
     async fn test_handle_filled_order_clears_pending_execution_id_and_symbol_lock() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockBroker::default();
+        let broker = MockExecutor::default();
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("BMNR").unwrap();
@@ -609,7 +608,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -620,7 +619,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 

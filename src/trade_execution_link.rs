@@ -98,12 +98,9 @@ impl TradeExecutionLink {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
-    use chrono::Utc;
-
-    use super::*;
-    use alloy::primitives::fixed_bytes;
     use st0x_execution::{Direction, OrderState, Shares, SupportedExecutor, Symbol};
 
+    use super::*;
     use crate::offchain::execution::OffchainExecution;
     use crate::onchain::OnchainTrade;
     use crate::onchain::io::Usdc;
@@ -157,111 +154,13 @@ mod tests {
         assert!(link_id > 0);
         assert_eq!(TradeExecutionLink::db_count(&pool).await.unwrap(), 1);
 
-        // Test finding executions for trade
-        let executions = TradeExecutionLink::find_executions_for_trade(&pool, trade_id)
+        // Verify the link was saved correctly
+        let links = TradeExecutionLink::find_by_execution_id(&pool, execution_id)
             .await
             .unwrap();
-        assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].execution_id, execution_id);
-        assert!((executions[0].contributed_shares - 1.0).abs() < f64::EPSILON);
-
-        // Test finding trades for execution
-        let trades = TradeExecutionLink::find_trades_for_execution(&pool, execution_id)
-            .await
-            .unwrap();
-        assert_eq!(trades.len(), 1);
-        assert_eq!(trades[0].trade_id, trade_id);
-        assert!((trades[0].contributed_shares - 1.0).abs() < f64::EPSILON);
-    }
-
-    #[tokio::test]
-    async fn test_symbol_audit_trail() {
-        let pool = setup_test_db().await;
-
-        // Create multiple trades and executions for the same symbol
-        let trades = vec![
-            OnchainTrade {
-                id: None,
-                tx_hash: fixed_bytes!(
-                    "0x2222222222222222222222222222222222222222222222222222222222222222"
-                ),
-                log_index: 1,
-                symbol: tokenized_symbol!("MSFT0x"),
-                amount: 0.5,
-                direction: Direction::Buy,
-                price: Usdc::new(300.0).unwrap(),
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            },
-            OnchainTrade {
-                id: None,
-                tx_hash: fixed_bytes!(
-                    "0x3333333333333333333333333333333333333333333333333333333333333333"
-                ),
-                log_index: 2,
-                symbol: tokenized_symbol!("MSFT0x"),
-                amount: 0.8,
-                direction: Direction::Buy,
-                price: Usdc::new(305.0).unwrap(),
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            },
-        ];
-
-        let execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("MSFT").unwrap(),
-            shares: Shares::new(1).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            state: OrderState::Filled {
-                executed_at: Utc::now(),
-                order_id: "1004055538123".to_string(),
-                price_cents: 30250,
-            },
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let mut trade_ids = Vec::new();
-        for trade in trades {
-            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-            trade_ids.push(trade_id);
-        }
-        let execution_id = execution
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-
-        // Create links
-        let link1 = TradeExecutionLink::new(trade_ids[0], execution_id, 0.5);
-        let link2 = TradeExecutionLink::new(trade_ids[1], execution_id, 0.5); // Only 0.5 of the 0.8 trade contributed
-
-        link1.save_within_transaction(&mut sql_tx).await.unwrap();
-        link2.save_within_transaction(&mut sql_tx).await.unwrap();
-        sql_tx.commit().await.unwrap();
-
-        // Test audit trail
-        let tokenized_symbol = tokenized_symbol!("MSFT0x");
-        let audit_trail = TradeExecutionLink::get_symbol_audit_trail(&pool, &tokenized_symbol)
-            .await
-            .unwrap();
-        assert_eq!(audit_trail.len(), 2);
-
-        // Verify total contributed shares add up correctly
-        let total_contributed: f64 = audit_trail.iter().map(|e| e.contributed_shares).sum();
-        assert!((total_contributed - 1.0).abs() < f64::EPSILON);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].trade_id(), trade_id);
+        assert!((links[0].contributed_shares() - 1.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -325,16 +224,15 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         // Verify all trades contributed to the execution
-        let contributing_trades =
-            TradeExecutionLink::find_trades_for_execution(&pool, execution_id)
-                .await
-                .unwrap();
-        assert_eq!(contributing_trades.len(), 3);
+        let contributing_links = TradeExecutionLink::find_by_execution_id(&pool, execution_id)
+            .await
+            .unwrap();
+        assert_eq!(contributing_links.len(), 3);
 
         // Verify total contributions equal exactly 1 share
-        let total_contributions: f64 = contributing_trades
+        let total_contributions: f64 = contributing_links
             .iter()
-            .map(|t| t.contributed_shares)
+            .map(super::TradeExecutionLink::contributed_shares)
             .sum();
         assert!((total_contributions - 1.0).abs() < f64::EPSILON);
     }

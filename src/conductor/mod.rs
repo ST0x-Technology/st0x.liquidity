@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
-use st0x_broker::{Broker, BrokerError, MarketOrder, SupportedBroker, Symbol};
+use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
@@ -32,7 +32,6 @@ use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 pub(crate) use builder::ConductorBuilder;
-use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 pub(crate) struct Conductor {
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
@@ -1885,7 +1884,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -1930,7 +1929,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_calls_confirm_submission() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AMZN").unwrap();
@@ -1944,7 +1943,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -1955,7 +1954,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2001,7 +2000,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_updates_legacy_table_to_submitted() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("BMNR").unwrap();
@@ -2015,7 +2014,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2039,7 +2038,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2096,7 +2095,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_stores_correct_order_id() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
@@ -2110,7 +2109,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Sell,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2121,7 +2120,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2158,7 +2157,7 @@ mod tests {
     #[tokio::test]
     async fn test_order_poller_can_find_orders_after_execution() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("NVDA").unwrap();
@@ -2172,7 +2171,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2183,7 +2182,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2195,7 +2194,7 @@ mod tests {
             &pool,
             Some(symbol.clone()),
             OrderStatus::Submitted,
-            Some(SupportedBroker::DryRun),
+            Some(SupportedExecutor::DryRun),
         )
         .await
         .unwrap();
@@ -2213,7 +2212,7 @@ mod tests {
             &pool,
             Some(symbol.clone()),
             OrderStatus::Submitted,
-            Some(SupportedBroker::DryRun),
+            Some(SupportedExecutor::DryRun),
         )
         .await
         .unwrap();
@@ -2242,7 +2241,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_dual_write_consistency() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOGL").unwrap();
@@ -2256,7 +2255,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2267,7 +2266,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
