@@ -3,7 +3,7 @@
 //! Coordinates between `AlpacaWalletService`, `CctpBridge`, `VaultService`, and the
 //! `UsdcRebalance` aggregate to execute USDC transfers between Alpaca and Base.
 
-use alloy::primitives::{Address, Bytes, TxHash, U256};
+use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
@@ -14,7 +14,7 @@ use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{BurnReceipt, CctpBridge};
+use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -114,10 +114,9 @@ where
         let burn_amount = usdc_to_u256(amount)?;
         let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
-        let attestation = self.poll_attestation(id, &burn_receipt).await?;
+        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
 
-        self.execute_cctp_mint(id, &burn_receipt, attestation)
-            .await?;
+        self.execute_cctp_mint(id, attestation_response).await?;
 
         self.deposit_to_vault(id, burn_receipt.amount).await?;
 
@@ -218,7 +217,11 @@ where
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_ethereum(amount, self.market_maker_wallet)
+            .burn(
+                BridgeDirection::EthereumToBase,
+                amount,
+                self.market_maker_wallet,
+            )
             .await
         {
             Ok(r) => r,
@@ -236,15 +239,11 @@ where
             }
         };
 
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
         self.cqrs
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
-                    cctp_nonce,
                 },
             )
             .await?;
@@ -258,9 +257,13 @@ where
         &self,
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
-    ) -> Result<Bytes, UsdcRebalanceManagerError> {
-        let attestation = match self.cctp_bridge.poll_attestation(burn_receipt.hash).await {
-            Ok(a) => a,
+    ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
+        let response = match self
+            .cctp_bridge
+            .poll_attestation(BridgeDirection::EthereumToBase, burn_receipt.tx)
+            .await
+        {
+            Ok(r) => r,
             Err(e) => {
                 warn!("Attestation polling failed: {e}");
                 self.cqrs
@@ -279,25 +282,29 @@ where
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation.to_vec(),
+                    attestation: response.attestation.to_vec(),
+                    cctp_nonce: response.nonce_as_u64()?,
                 },
             )
             .await?;
 
         info!("Circle attestation received");
-        Ok(attestation)
+        Ok(response)
     }
 
-    #[instrument(skip(self, burn_receipt, attestation), fields(?id, burn_tx = %burn_receipt.tx))]
+    #[instrument(skip(self, attestation_response), fields(?id))]
     async fn execute_cctp_mint(
         &self,
         id: &UsdcRebalanceId,
-        burn_receipt: &BurnReceipt,
-        attestation: Bytes,
+        attestation_response: AttestationResponse,
     ) -> Result<TxHash, UsdcRebalanceManagerError> {
         let mint_tx = match self
             .cctp_bridge
-            .mint_on_base(burn_receipt.message.clone(), attestation)
+            .mint(
+                BridgeDirection::EthereumToBase,
+                attestation_response.message,
+                attestation_response.attestation,
+            )
             .await
         {
             Ok(tx) => tx,
@@ -395,12 +402,12 @@ where
 
         let burn_receipt = self.execute_cctp_burn_on_base(id, amount_u256).await?;
 
-        let attestation = self
+        let attestation_response = self
             .poll_attestation_for_base_burn(id, &burn_receipt)
             .await?;
 
         let mint_tx = self
-            .execute_cctp_mint_on_ethereum(id, &burn_receipt, attestation)
+            .execute_cctp_mint_on_ethereum(id, attestation_response)
             .await?;
 
         self.poll_and_confirm_alpaca_deposit(id, mint_tx).await?;
@@ -452,7 +459,11 @@ where
     ) -> Result<BurnReceipt, UsdcRebalanceManagerError> {
         let burn_receipt = match self
             .cctp_bridge
-            .burn_on_base(amount, self.market_maker_wallet)
+            .burn(
+                BridgeDirection::BaseToEthereum,
+                amount,
+                self.market_maker_wallet,
+            )
             .await
         {
             Ok(r) => r,
@@ -470,15 +481,11 @@ where
             }
         };
 
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
         self.cqrs
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
-                    cctp_nonce,
                 },
             )
             .await?;
@@ -492,9 +499,13 @@ where
         &self,
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
-    ) -> Result<Bytes, UsdcRebalanceManagerError> {
-        let attestation = match self.cctp_bridge.poll_attestation(burn_receipt.hash).await {
-            Ok(a) => a,
+    ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
+        let response = match self
+            .cctp_bridge
+            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
+            .await
+        {
+            Ok(r) => r,
             Err(e) => {
                 warn!("Attestation polling failed: {e}");
                 self.cqrs
@@ -513,25 +524,29 @@ where
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: attestation.to_vec(),
+                    attestation: response.attestation.to_vec(),
+                    cctp_nonce: response.nonce_as_u64()?,
                 },
             )
             .await?;
 
         info!("Circle attestation received for Base burn");
-        Ok(attestation)
+        Ok(response)
     }
 
-    #[instrument(skip(self, burn_receipt, attestation), fields(?id, burn_tx = %burn_receipt.tx))]
+    #[instrument(skip(self, attestation_response), fields(?id))]
     async fn execute_cctp_mint_on_ethereum(
         &self,
         id: &UsdcRebalanceId,
-        burn_receipt: &BurnReceipt,
-        attestation: Bytes,
+        attestation_response: AttestationResponse,
     ) -> Result<TxHash, UsdcRebalanceManagerError> {
         let mint_tx = match self
             .cctp_bridge
-            .mint_on_ethereum(burn_receipt.message.clone(), attestation)
+            .mint(
+                BridgeDirection::BaseToEthereum,
+                attestation_response.message,
+                attestation_response.attestation,
+            )
             .await
         {
             Ok(tx) => tx,
@@ -780,7 +795,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        let cctp_bridge = CctpBridge::new(ethereum, base);
+        let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
 
         let vault_service = VaultService::new(provider, ORDERBOOK_ADDRESS);
 

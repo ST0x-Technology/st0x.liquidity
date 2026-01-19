@@ -122,6 +122,7 @@ ts-rs = { version = "11.1.0", features = [
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
+rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error", version = "0.1.0" }
 
 [dev-dependencies]
 httpmock.workspace = true
