@@ -1,3 +1,4 @@
+use chrono::{NaiveDate, NaiveTime};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -7,9 +8,17 @@ mod executor;
 mod market_hours;
 mod order;
 
-pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
 pub use executor::AlpacaBrokerApi;
 pub use order::{ConversionDirection, CryptoOrderResponse};
+
+/// Terminal failure states for crypto orders
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoOrderFailureReason {
+    Canceled,
+    Expired,
+    Rejected,
+}
 
 #[derive(Debug, Error)]
 pub enum AlpacaBrokerApiError {
@@ -45,16 +54,16 @@ pub enum AlpacaBrokerApiError {
         status: AccountStatus,
     },
 
-    #[error("Failed to parse calendar data: {0}")]
-    CalendarParse(String),
+    #[error("Ambiguous datetime when constructing calendar time: {date} {time}")]
+    AmbiguousDateTime { date: NaiveDate, time: NaiveTime },
 
     #[error("No trading days found between {from} and {to}")]
-    NoTradingDaysFound { from: String, to: String },
+    NoTradingDaysFound { from: NaiveDate, to: NaiveDate },
 
-    #[error("Crypto order {order_id} failed with status: {status}")]
+    #[error("Crypto order {order_id} failed: {reason:?}")]
     CryptoOrderFailed {
-        order_id: uuid::Uuid,
-        status: String,
+        order_id: Uuid,
+        reason: CryptoOrderFailureReason,
     },
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]

@@ -397,12 +397,22 @@ pub(crate) async fn poll_crypto_order_until_filled(
 
         match order.status {
             BrokerOrderStatus::Filled => return Ok(order),
-            BrokerOrderStatus::Canceled
-            | BrokerOrderStatus::Expired
-            | BrokerOrderStatus::Rejected => {
+            BrokerOrderStatus::Canceled => {
                 return Err(AlpacaBrokerApiError::CryptoOrderFailed {
                     order_id,
-                    status: format!("{:?}", order.status),
+                    reason: super::CryptoOrderFailureReason::Canceled,
+                });
+            }
+            BrokerOrderStatus::Expired => {
+                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
+                    order_id,
+                    reason: super::CryptoOrderFailureReason::Expired,
+                });
+            }
+            BrokerOrderStatus::Rejected => {
+                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
+                    order_id,
+                    reason: super::CryptoOrderFailureReason::Rejected,
                 });
             }
             _ => {
