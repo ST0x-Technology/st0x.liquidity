@@ -6,16 +6,18 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::CqrsFramework;
 use cqrs_es::persist::PersistedEventStore;
+use cqrs_es::{CqrsFramework, Query};
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
 use std::sync::Arc;
+use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
 use tracing::info;
 
-use st0x_broker::alpaca::AlpacaAuthEnv;
-use tokio::task::JoinHandle;
+use crate::dashboard::{EventBroadcaster, ServerMessage};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
@@ -27,12 +29,13 @@ use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
-use crate::equity_redemption::RedemptionEventStore;
+use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::inventory::InventoryView;
+use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::symbol::cache::SymbolCache;
-use crate::tokenized_equity_mint::MintEventStore;
-use crate::usdc_rebalance::UsdcEventStore;
+use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
+use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -67,9 +70,10 @@ type ConfiguredRebalancer<BP> = Rebalancer<
 pub(crate) async fn spawn_rebalancer<BP>(
     pool: SqlitePool,
     config: &RebalancingConfig,
-    alpaca_auth: &AlpacaAuthEnv,
+    alpaca_auth: &AlpacaTradingApiAuthEnv,
     base_provider: BP,
     symbol_cache: SymbolCache,
+    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -80,7 +84,7 @@ where
     let services =
         Services::new(config, alpaca_auth, &ethereum_wallet, signer, base_provider).await?;
 
-    let rebalancer = services.into_rebalancer(pool, config, symbol_cache);
+    let rebalancer = services.into_rebalancer(pool, config, symbol_cache, event_broadcast);
 
     let handle = tokio::spawn(async move {
         rebalancer.run().await;
@@ -113,7 +117,7 @@ where
 {
     async fn new(
         config: &RebalancingConfig,
-        alpaca_auth: &AlpacaAuthEnv,
+        alpaca_auth: &AlpacaTradingApiAuthEnv,
         ethereum_wallet: &EthereumWallet,
         signer: PrivateKeySigner,
         base_provider: BP,
@@ -183,6 +187,7 @@ where
         pool: SqlitePool,
         config: &RebalancingConfig,
         symbol_cache: SymbolCache,
+        event_broadcast: Option<broadcast::Sender<ServerMessage>>,
     ) -> ConfiguredRebalancer<BP> {
         const OPERATION_CHANNEL_CAPACITY: usize = 100;
 
@@ -206,7 +211,7 @@ where
             PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
         let mint_cqrs = Arc::new(CqrsFramework::new(
             mint_store,
-            vec![Box::new(trigger.clone())],
+            build_mint_queries(trigger.clone(), event_broadcast.clone()),
             (),
         ));
 
@@ -214,12 +219,16 @@ where
             PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
         let redemption_cqrs = Arc::new(CqrsFramework::new(
             redemption_store,
-            vec![Box::new(trigger.clone())],
+            build_redemption_queries(trigger.clone(), event_broadcast.clone()),
             (),
         ));
 
         let usdc_store = PersistedEventStore::new_event_store(SqliteEventRepository::new(pool));
-        let usdc_cqrs = Arc::new(CqrsFramework::new(usdc_store, vec![Box::new(trigger)], ()));
+        let usdc_cqrs = Arc::new(CqrsFramework::new(
+            usdc_store,
+            build_usdc_queries(trigger, event_broadcast),
+            (),
+        ));
 
         let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
 
@@ -244,6 +253,28 @@ where
         )
     }
 }
+
+macro_rules! build_queries {
+    ($name:ident, $aggregate:ty) => {
+        fn $name(
+            trigger: Arc<RebalancingTrigger>,
+            event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+        ) -> Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> {
+            let mut queries: Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> =
+                vec![Box::new(trigger)];
+
+            if let Some(sender) = event_broadcast {
+                queries.push(Box::new(EventBroadcaster::new(sender)));
+            }
+
+            queries
+        }
+    };
+}
+
+build_queries!(build_mint_queries, TokenizedEquityMint);
+build_queries!(build_redemption_queries, EquityRedemption);
+build_queries!(build_usdc_queries, UsdcRebalance);
 
 #[cfg(test)]
 mod tests {
@@ -430,6 +461,6 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        let _rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default());
+        let _rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default(), None);
     }
 }

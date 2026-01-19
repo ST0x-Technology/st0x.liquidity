@@ -10,7 +10,7 @@ use cqrs_es::{AggregateContext, EventStore};
 use rust_decimal::Decimal;
 use sqlite_es::{SqliteEventRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::{error, info, warn};
 
 use super::{ExecutionMode, MigrationError};
@@ -83,15 +83,7 @@ async fn check_onchain_trades(pool: &SqlitePool) -> Result<(), StartupCheckError
     let stats = get_aggregate_stats(pool, "OnChainTrade", "onchain_trades").await?;
 
     if stats.needs_migration() {
-        info!(
-            "OnChainTrade: {} legacy records, 0 events - running migration",
-            stats.legacy_count
-        );
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        super::onchain_trade::migrate_onchain_trades(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("OnChainTrade migration complete");
+        run_onchain_trades_migration(pool, &stats).await?;
     } else if stats.needs_consistency_check() {
         info!(
             "OnChainTrade: {} legacy records, {} events - checking consistency",
@@ -105,6 +97,22 @@ async fn check_onchain_trades(pool: &SqlitePool) -> Result<(), StartupCheckError
         );
     }
 
+    Ok(())
+}
+
+async fn run_onchain_trades_migration(
+    pool: &SqlitePool,
+    stats: &AggregateStats,
+) -> Result<(), StartupCheckError> {
+    info!(
+        "OnChainTrade: {} legacy records, 0 events - running migration",
+        stats.legacy_count
+    );
+
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    super::onchain_trade::migrate_onchain_trades(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("OnChainTrade migration complete");
     Ok(())
 }
 
@@ -133,15 +141,7 @@ async fn check_positions(pool: &SqlitePool) -> Result<(), StartupCheckError> {
     let stats = get_aggregate_stats(pool, "Position", "trade_accumulators").await?;
 
     if stats.needs_migration() {
-        info!(
-            "Position: {} legacy records, 0 events - running migration",
-            stats.legacy_count
-        );
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        super::position::migrate_positions(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("Position migration complete");
+        run_positions_migration(pool, &stats).await?;
     } else if stats.needs_consistency_check() {
         info!(
             "Position: {} legacy records, {} events - checking consistency",
@@ -155,6 +155,22 @@ async fn check_positions(pool: &SqlitePool) -> Result<(), StartupCheckError> {
         );
     }
 
+    Ok(())
+}
+
+async fn run_positions_migration(
+    pool: &SqlitePool,
+    stats: &AggregateStats,
+) -> Result<(), StartupCheckError> {
+    info!(
+        "Position: {} legacy records, 0 events - running migration",
+        stats.legacy_count
+    );
+
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    super::position::migrate_positions(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("Position migration complete");
     Ok(())
 }
 
@@ -186,76 +202,110 @@ async fn verify_positions_consistency(pool: &SqlitePool) {
     >::new_event_store(repo);
 
     for legacy in legacy_positions {
-        let Ok(symbol) = Symbol::new(&legacy.symbol) else {
-            warn!(
-                "Position consistency check: invalid symbol in legacy data: {}",
-                legacy.symbol
-            );
-            continue;
-        };
+        verify_single_position(
+            &store,
+            &legacy.symbol,
+            legacy.accumulated_long,
+            legacy.accumulated_short,
+        )
+        .await;
+    }
+}
 
-        let aggregate_id = Position::aggregate_id(&symbol);
-        let aggregate_context = match store.load_aggregate(&aggregate_id).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                error!(
-                    "Position consistency check: failed to load ES state for {}: {e}",
-                    legacy.symbol
-                );
-                continue;
-            }
-        };
+async fn verify_single_position(
+    store: &PersistedEventStore<
+        SqliteEventRepository,
+        Lifecycle<Position, ArithmeticError<FractionalShares>>,
+    >,
+    symbol_str: &str,
+    accumulated_long: f64,
+    accumulated_short: f64,
+) {
+    let Some((position, legacy_long, legacy_short)) =
+        load_position_for_verification(store, symbol_str, accumulated_long, accumulated_short)
+            .await
+    else {
+        return;
+    };
 
-        let es_state = aggregate_context.aggregate();
+    let legacy_net = legacy_long - legacy_short;
 
-        let Lifecycle::Live(position) = es_state else {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} exists in legacy but ES state is not Live",
-                legacy.symbol
-            );
-            continue;
-        };
+    check_field_match(symbol_str, "net_position", position.net.0, legacy_net);
+    check_field_match(
+        symbol_str,
+        "accumulated_long",
+        position.accumulated_long.0,
+        legacy_long,
+    );
+    check_field_match(
+        symbol_str,
+        "accumulated_short",
+        position.accumulated_short.0,
+        legacy_short,
+    );
+}
 
-        let Ok(legacy_long) = Decimal::try_from(legacy.accumulated_long) else {
-            warn!(
-                symbol = %legacy.symbol,
-                raw_value = legacy.accumulated_long,
-                "Position consistency check: invalid accumulated_long value, skipping"
-            );
-            continue;
-        };
+async fn load_position_for_verification(
+    store: &PersistedEventStore<
+        SqliteEventRepository,
+        Lifecycle<Position, ArithmeticError<FractionalShares>>,
+    >,
+    symbol_str: &str,
+    accumulated_long: f64,
+    accumulated_short: f64,
+) -> Option<(Position, Decimal, Decimal)> {
+    let position = load_es_position(store, symbol_str).await?;
+    let legacy_long = parse_legacy_decimal(symbol_str, "accumulated_long", accumulated_long)?;
+    let legacy_short = parse_legacy_decimal(symbol_str, "accumulated_short", accumulated_short)?;
+    Some((position, legacy_long, legacy_short))
+}
 
-        let Ok(legacy_short) = Decimal::try_from(legacy.accumulated_short) else {
-            warn!(
-                symbol = %legacy.symbol,
-                raw_value = legacy.accumulated_short,
-                "Position consistency check: invalid accumulated_short value, skipping"
-            );
-            continue;
-        };
+async fn load_es_position(
+    store: &PersistedEventStore<
+        SqliteEventRepository,
+        Lifecycle<Position, ArithmeticError<FractionalShares>>,
+    >,
+    symbol_str: &str,
+) -> Option<Position> {
+    let Ok(symbol) = Symbol::new(symbol_str) else {
+        warn!("Position consistency check: invalid symbol in legacy data: {symbol_str}");
+        return None;
+    };
 
-        let legacy_net = legacy_long - legacy_short;
-
-        if position.net.0 != legacy_net {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} net_position: ES={} legacy={}",
-                legacy.symbol, position.net.0, legacy_net
-            );
+    let aggregate_id = Position::aggregate_id(&symbol);
+    let aggregate_context = match store.load_aggregate(&aggregate_id).await {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            error!("Position consistency check: failed to load ES state for {symbol_str}: {e}");
+            return None;
         }
+    };
 
-        if position.accumulated_long.0 != legacy_long {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} accumulated_long: ES={} legacy={}",
-                legacy.symbol, position.accumulated_long.0, legacy_long
-            );
-        }
+    let Lifecycle::Live(position) = aggregate_context.aggregate() else {
+        error!(
+            "CONSISTENCY MISMATCH: Position {symbol_str} exists in legacy but ES state is not Live"
+        );
+        return None;
+    };
 
-        if position.accumulated_short.0 != legacy_short {
-            error!(
-                "CONSISTENCY MISMATCH: Position {} accumulated_short: ES={} legacy={}",
-                legacy.symbol, position.accumulated_short.0, legacy_short
-            );
-        }
+    Some(position.clone())
+}
+
+fn parse_legacy_decimal(symbol_str: &str, field: &str, value: f64) -> Option<Decimal> {
+    Decimal::try_from(value).map_or_else(
+        |_| {
+            warn!(symbol = %symbol_str, raw_value = value, "Position consistency check: invalid {field} value, skipping");
+            None
+        },
+        Some,
+    )
+}
+
+fn check_field_match(symbol: &str, field: &str, es_value: Decimal, legacy_value: Decimal) {
+    if es_value != legacy_value {
+        error!(
+            "CONSISTENCY MISMATCH: Position {symbol} {field}: ES={es_value} legacy={legacy_value}"
+        );
     }
 }
 
@@ -263,15 +313,7 @@ async fn check_offchain_orders(pool: &SqlitePool) -> Result<(), StartupCheckErro
     let stats = get_aggregate_stats(pool, "OffchainOrder", "offchain_trades").await?;
 
     if stats.needs_migration() {
-        info!(
-            "OffchainOrder: {} legacy records, 0 events - running migration",
-            stats.legacy_count
-        );
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        super::offchain_order::migrate_offchain_orders(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("OffchainOrder migration complete");
+        run_offchain_orders_migration(pool, &stats).await?;
     } else if stats.needs_consistency_check() {
         info!(
             "OffchainOrder: {} legacy records, {} events - checking consistency",
@@ -285,6 +327,22 @@ async fn check_offchain_orders(pool: &SqlitePool) -> Result<(), StartupCheckErro
         );
     }
 
+    Ok(())
+}
+
+async fn run_offchain_orders_migration(
+    pool: &SqlitePool,
+    stats: &AggregateStats,
+) -> Result<(), StartupCheckError> {
+    info!(
+        "OffchainOrder: {} legacy records, 0 events - running migration",
+        stats.legacy_count
+    );
+
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    super::offchain_order::migrate_offchain_orders(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("OffchainOrder migration complete");
     Ok(())
 }
 
@@ -324,12 +382,7 @@ async fn check_schwab_auth(
             .await?;
 
     if event_count == 0 && legacy_count > 0 {
-        info!("SchwabAuth: legacy record exists, 0 events - running migration");
-
-        let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
-        super::schwab_auth::migrate_schwab_auth(pool, &cqrs, ExecutionMode::Commit).await?;
-
-        info!("SchwabAuth migration complete");
+        run_schwab_auth_migration(pool, encryption_key).await?;
     } else {
         info!(
             "SchwabAuth: {} legacy records, {} events - no migration needed",
@@ -337,6 +390,19 @@ async fn check_schwab_auth(
         );
     }
 
+    Ok(())
+}
+
+async fn run_schwab_auth_migration(
+    pool: &SqlitePool,
+    encryption_key: FixedBytes<32>,
+) -> Result<(), StartupCheckError> {
+    info!("SchwabAuth: legacy record exists, 0 events - running migration");
+
+    let cqrs = sqlite_cqrs(pool.clone(), vec![], encryption_key);
+    super::schwab_auth::migrate_schwab_auth(pool, &cqrs, ExecutionMode::Commit).await?;
+
+    info!("SchwabAuth migration complete");
     Ok(())
 }
 
@@ -553,5 +619,76 @@ mod tests {
         assert_eq!(onchain_count, 1);
         assert_eq!(position_count, 1);
         assert_eq!(offchain_count, 1);
+    }
+
+    #[test]
+    fn aggregate_stats_needs_migration_when_legacy_exists_and_no_events() {
+        let stats = AggregateStats {
+            legacy_count: 5,
+            event_count: 0,
+        };
+        assert!(stats.needs_migration());
+        assert!(!stats.needs_consistency_check());
+    }
+
+    #[test]
+    fn aggregate_stats_needs_consistency_check_when_both_exist() {
+        let stats = AggregateStats {
+            legacy_count: 5,
+            event_count: 5,
+        };
+        assert!(!stats.needs_migration());
+        assert!(stats.needs_consistency_check());
+    }
+
+    #[test]
+    fn aggregate_stats_no_action_when_no_legacy_data() {
+        let stats = AggregateStats {
+            legacy_count: 0,
+            event_count: 0,
+        };
+        assert!(!stats.needs_migration());
+        assert!(!stats.needs_consistency_check());
+    }
+
+    #[test]
+    fn aggregate_stats_no_action_when_only_events() {
+        let stats = AggregateStats {
+            legacy_count: 0,
+            event_count: 10,
+        };
+        assert!(!stats.needs_migration());
+        assert!(!stats.needs_consistency_check());
+    }
+
+    #[test]
+    fn parse_legacy_decimal_valid_value() {
+        let result = parse_legacy_decimal("AAPL", "accumulated_long", 10.5);
+        assert_eq!(result, Some(Decimal::try_from(10.5).unwrap()));
+    }
+
+    #[test]
+    fn parse_legacy_decimal_handles_nan() {
+        let result = parse_legacy_decimal("AAPL", "accumulated_long", f64::NAN);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_legacy_decimal_handles_infinity() {
+        let result = parse_legacy_decimal("AAPL", "accumulated_long", f64::INFINITY);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_field_match_equal_values_no_panic() {
+        let value = Decimal::try_from(10.5).unwrap();
+        check_field_match("AAPL", "net_position", value, value);
+    }
+
+    #[test]
+    fn check_field_match_different_values_logs_error() {
+        let es_value = Decimal::try_from(10.5).unwrap();
+        let legacy_value = Decimal::try_from(11.0).unwrap();
+        check_field_match("AAPL", "net_position", es_value, legacy_value);
     }
 }

@@ -5,7 +5,7 @@ services:
     container_name: schwarbot
     command: ["./server"]
     environment:
-      - BROKER=${SCHWAB_BROKER}
+      - EXECUTOR=${SCHWAB_EXECUTOR}
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/schwab.db
       - ENCRYPTION_KEY
@@ -23,7 +23,7 @@ services:
     container_name: alpacabot
     command: ["./server"]
     environment:
-      - BROKER=${ALPACA_BROKER}
+      - EXECUTOR=${ALPACA_EXECUTOR}
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:
@@ -62,6 +62,30 @@ services:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
       - grafana
+    restart: unless-stopped
+
+  dashboard-schwab:
+    image: ${DASHBOARD_IMAGE}
+    pull_policy: ${PULL_POLICY}
+    container_name: dashboard-schwab
+    ports:
+      - "8080:80"
+    environment:
+      - BACKEND_HOST=schwarbot
+    depends_on:
+      - schwarbot
+    restart: unless-stopped
+
+  dashboard-alpaca:
+    image: ${DASHBOARD_IMAGE}
+    pull_policy: ${PULL_POLICY}
+    container_name: dashboard-alpaca
+    ports:
+      - "8081:80"
+    environment:
+      - BACKEND_HOST=alpacabot
+    depends_on:
+      - alpacabot
     restart: unless-stopped
 
   grafana:

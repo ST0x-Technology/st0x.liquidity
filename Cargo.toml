@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/broker"]
+members = [".", "crates/execution"]
 resolver = "2"
 
 [workspace.package]
@@ -71,6 +71,7 @@ opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.30.0"
 tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
+rust_decimal = { version = "1.38.0", features = ["serde"] }
 
 [package]
 name = "st0x-hedge"
@@ -83,7 +84,7 @@ anyhow = "1.0.98"
 async-trait.workspace = true
 cqrs-es.workspace = true
 sqlite-es.workspace = true
-st0x-broker = { path = "crates/broker" }
+st0x-execution = { path = "crates/execution" }
 backon.workspace = true
 clap.workspace = true
 dotenvy = "0.15.7"
@@ -109,12 +110,18 @@ rand.workspace = true
 rocket = { version = "0.5.1", features = ["json"] }
 chrono-tz.workspace = true
 aes-gcm = "0.10.3"
-rust_decimal = "1.38.0"
+rust_decimal.workspace = true
 num-traits.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
+ts-rs = { version = "11.1.0", features = [
+  "chrono",
+  "chrono-impl",
+  "serde-compat",
+] }
+rocket_ws = "0.1.1"
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -122,10 +129,15 @@ serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
+tokio-tungstenite = "0.28.0"
 
 [[bin]]
 name = "migrate_to_events"
 path = "src/bin/migrate_to_events.rs"
+
+[[bin]]
+name = "validate_config"
+path = "src/bin/validate_config.rs"
 
 [lints]
 workspace = true

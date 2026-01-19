@@ -1,17 +1,17 @@
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
-use st0x_broker::{Broker, OrderState, OrderStatus, PersistenceError};
+use st0x_execution::{Executor, OrderState, OrderStatus, PersistenceError, Symbol};
 use std::time::Duration;
 use tokio::time::{Interval, interval};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::execution::{
     OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
 };
 use crate::dual_write::DualWriteContext;
 use crate::error::{OnChainError, OrderPollingError};
-use crate::lock::{clear_execution_lease, clear_pending_execution_id};
+use crate::lock::{clear_execution_lease, clear_pending_execution_id, renew_execution_lease};
 
 #[derive(Debug, Clone)]
 pub struct OrderPollerConfig {
@@ -28,19 +28,19 @@ impl Default for OrderPollerConfig {
     }
 }
 
-pub struct OrderStatusPoller<B: Broker> {
+pub struct OrderStatusPoller<E: Executor> {
     config: OrderPollerConfig,
     pool: SqlitePool,
     interval: Interval,
-    broker: B,
+    executor: E,
     dual_write_context: DualWriteContext,
 }
 
-impl<B: Broker> OrderStatusPoller<B> {
+impl<E: Executor> OrderStatusPoller<E> {
     pub fn new(
         config: OrderPollerConfig,
         pool: SqlitePool,
-        broker: B,
+        executor: E,
         dual_write_context: DualWriteContext,
     ) -> Self {
         let interval = interval(config.polling_interval);
@@ -49,7 +49,7 @@ impl<B: Broker> OrderStatusPoller<B> {
             config,
             pool,
             interval,
-            broker,
+            executor,
             dual_write_context,
         }
     }
@@ -73,12 +73,12 @@ impl<B: Broker> OrderStatusPoller<B> {
     async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
         debug!("Starting polling cycle for submitted orders");
 
-        let broker = self.broker.to_supported_broker();
+        let executor_type = self.executor.to_supported_executor();
         let submitted_executions = find_executions_by_symbol_status_and_broker(
             &self.pool,
             None,
             OrderStatus::Submitted,
-            Some(broker),
+            Some(executor_type),
         )
         .await?;
 
@@ -114,47 +114,61 @@ impl<B: Broker> OrderStatusPoller<B> {
             return Ok(());
         };
 
-        let order_id = match &execution.state {
-            OrderState::Pending => {
-                debug!("Execution {execution_id} is PENDING but no order_id yet");
-                return Ok(());
-            }
-            OrderState::Submitted { order_id } | OrderState::Filled { order_id, .. } => {
-                order_id.clone()
-            }
-            OrderState::Failed { .. } => {
-                debug!("Execution {execution_id} already failed, skipping poll");
-                return Ok(());
-            }
+        let Some(order_id) = extract_order_id(execution_id, &execution.state) else {
+            warn!(
+                execution_id = execution_id,
+                symbol = %execution.symbol,
+                state = ?execution.state,
+                "Missing order_id for polled execution"
+            );
+            return Ok(());
         };
 
         let parsed_order_id = self
-            .broker
+            .executor
             .parse_order_id(&order_id)
-            .map_err(|e| OrderPollingError::Broker(Box::new(e)))?;
+            .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
 
         let order_state = self
-            .broker
+            .executor
             .get_order_status(&parsed_order_id)
             .await
-            .map_err(|e| OrderPollingError::Broker(Box::new(e)))?;
+            .map_err(|e| OrderPollingError::Executor(Box::new(e)))?;
 
-        match &order_state {
-            OrderState::Filled { .. } => {
-                self.handle_filled_order(execution_id, &order_state).await?;
-            }
-            OrderState::Failed { .. } => {
-                self.handle_failed_order(execution_id, &order_state).await?;
-            }
+        self.process_order_state(execution_id, &order_id, &order_state, &execution.symbol)
+            .await
+    }
+
+    async fn process_order_state(
+        &self,
+        execution_id: i64,
+        order_id: &str,
+        order_state: &OrderState,
+        symbol: &Symbol,
+    ) -> Result<(), OrderPollingError> {
+        match order_state {
+            OrderState::Filled { .. } => self.handle_filled_order(execution_id, order_state).await,
+            OrderState::Failed { .. } => self.handle_failed_order(execution_id, order_state).await,
             OrderState::Pending | OrderState::Submitted { .. } => {
                 debug!(
-                    "Order {order_id} (execution {execution_id}) still pending with state: {:?}",
-                    order_state
+                    "Order {order_id} (execution {execution_id}) still pending with state: {order_state:?}"
                 );
+
+                let mut tx = self.pool.begin().await?;
+                let renewed = renew_execution_lease(&mut tx, symbol).await?;
+                tx.commit().await?;
+
+                if renewed {
+                    debug!(
+                        execution_id,
+                        %symbol,
+                        "Renewed execution lease for pending order"
+                    );
+                }
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     async fn handle_filled_order(
@@ -162,48 +176,41 @@ impl<B: Broker> OrderStatusPoller<B> {
         execution_id: i64,
         order_state: &OrderState,
     ) -> Result<(), OrderPollingError> {
-        let new_status = order_state.clone();
-
-        let mut tx = self.pool.begin().await?;
-
-        let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
-            error!("Execution {execution_id} not found in database");
-            return Err(OrderPollingError::OnChain(OnChainError::Persistence(
-                PersistenceError::InvalidTradeStatus("Execution not found".to_string()),
-            )));
+        let OrderState::Filled { price_cents, .. } = order_state else {
+            error!(
+                execution_id = execution_id,
+                ?order_state,
+                "handle_filled_order called with non-Filled order state"
+            );
+            return Ok(());
         };
 
-        new_status.store_update(&mut tx, execution_id).await?;
+        let execution = self.finalize_order(execution_id, order_state).await?;
 
-        clear_pending_execution_id(&mut tx, &execution.symbol).await?;
-
-        clear_execution_lease(&mut tx, &execution.symbol).await?;
-
-        tx.commit().await?;
-
-        if let OrderState::Filled { price_cents, .. } = order_state {
-            info!(
-                "Updated execution {execution_id} to FILLED with price: {} cents and cleared locks for symbol: {}",
-                price_cents, execution.symbol
-            );
-        } else {
-            info!(
-                "Updated execution {execution_id} to FILLED and cleared locks for symbol: {}",
-                execution.symbol
-            );
-        }
+        log_filled_order(execution_id, *price_cents, &execution);
 
         let execution_with_state = OffchainExecution {
             id: Some(execution_id),
             symbol: execution.symbol.clone(),
             shares: execution.shares,
             direction: execution.direction,
-            broker: execution.broker,
+            executor: execution.executor,
             state: order_state.clone(),
         };
 
+        self.execute_filled_order_dual_write(execution_id, &execution_with_state)
+            .await;
+
+        Ok(())
+    }
+
+    async fn execute_filled_order_dual_write(
+        &self,
+        execution_id: i64,
+        execution_with_state: &OffchainExecution,
+    ) {
         if let Err(e) =
-            crate::dual_write::record_fill(&self.dual_write_context, &execution_with_state).await
+            crate::dual_write::record_fill(&self.dual_write_context, execution_with_state).await
         {
             error!(
                 "Failed to execute OffchainOrder::CompleteFill command for execution {execution_id}: {e}"
@@ -212,18 +219,16 @@ impl<B: Broker> OrderStatusPoller<B> {
 
         if let Err(e) = crate::dual_write::complete_offchain_order(
             &self.dual_write_context,
-            &execution_with_state,
-            &execution.symbol,
+            execution_with_state,
+            &execution_with_state.symbol,
         )
         .await
         {
             error!(
                 "Failed to execute Position::CompleteOffChainOrder command for execution {execution_id}, symbol {}: {e}",
-                execution.symbol
+                execution_with_state.symbol
             );
         }
-
-        Ok(())
     }
 
     async fn handle_failed_order(
@@ -231,37 +236,23 @@ impl<B: Broker> OrderStatusPoller<B> {
         execution_id: i64,
         order_state: &OrderState,
     ) -> Result<(), OrderPollingError> {
-        let new_status = order_state.clone();
+        let execution = self.finalize_order(execution_id, order_state).await?;
+        let symbol = &execution.symbol;
+        info!("Updated execution {execution_id} to FAILED and cleared locks for symbol: {symbol}");
 
-        let mut tx = self.pool.begin().await?;
+        let error_message = extract_error_message(order_state);
+        self.execute_failed_order_dual_write(execution_id, symbol, error_message)
+            .await;
 
-        let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
-            error!("Execution {execution_id} not found in database");
-            return Err(OrderPollingError::OnChain(OnChainError::Persistence(
-                PersistenceError::InvalidTradeStatus("Execution not found".to_string()),
-            )));
-        };
+        Ok(())
+    }
 
-        new_status.store_update(&mut tx, execution_id).await?;
-
-        clear_pending_execution_id(&mut tx, &execution.symbol).await?;
-
-        clear_execution_lease(&mut tx, &execution.symbol).await?;
-
-        tx.commit().await?;
-
-        info!(
-            "Updated execution {execution_id} to FAILED and cleared locks for symbol: {}",
-            execution.symbol
-        );
-
-        let error_message = match order_state {
-            OrderState::Failed { error_reason, .. } => error_reason
-                .clone()
-                .unwrap_or_else(|| "Order failed with no error reason".to_string()),
-            _ => "Unknown failure reason".to_string(),
-        };
-
+    async fn execute_failed_order_dual_write(
+        &self,
+        execution_id: i64,
+        symbol: &Symbol,
+        error_message: String,
+    ) {
         if let Err(e) = crate::dual_write::mark_failed(
             &self.dual_write_context,
             execution_id,
@@ -277,18 +268,39 @@ impl<B: Broker> OrderStatusPoller<B> {
         if let Err(e) = crate::dual_write::fail_offchain_order(
             &self.dual_write_context,
             execution_id,
-            &execution.symbol,
+            symbol,
             error_message,
         )
         .await
         {
             error!(
-                "Failed to execute Position::FailOffChainOrder command for execution {execution_id}, symbol {}: {e}",
-                execution.symbol
+                "Failed to execute Position::FailOffChainOrder command for execution {execution_id}, symbol {symbol}: {e}"
             );
         }
+    }
 
-        Ok(())
+    async fn finalize_order(
+        &self,
+        execution_id: i64,
+        order_state: &OrderState,
+    ) -> Result<OffchainExecution, OrderPollingError> {
+        let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
+            error!("Execution {execution_id} not found in database");
+            return Err(OrderPollingError::OnChain(OnChainError::Persistence(
+                PersistenceError::ExecutionNotFound(execution_id),
+            )));
+        };
+
+        let mut tx = self.pool.begin().await?;
+        order_state
+            .clone()
+            .store_update(&mut tx, execution_id)
+            .await?;
+        clear_pending_execution_id(&mut tx, &execution.symbol).await?;
+        clear_execution_lease(&mut tx, &execution.symbol).await?;
+        tx.commit().await?;
+
+        Ok(execution)
     }
 
     async fn add_jittered_delay(&self) {
@@ -302,10 +314,45 @@ impl<B: Broker> OrderStatusPoller<B> {
     }
 }
 
+fn extract_error_message(order_state: &OrderState) -> String {
+    match order_state {
+        OrderState::Failed { error_reason, .. } => error_reason
+            .clone()
+            .unwrap_or_else(|| "Order failed with no error reason".to_string()),
+        _ => "Unknown failure reason".to_string(),
+    }
+}
+
+fn extract_order_id(execution_id: i64, state: &OrderState) -> Option<String> {
+    match state {
+        OrderState::Pending => {
+            debug!("Execution {execution_id} is PENDING but no order_id yet");
+            None
+        }
+        OrderState::Submitted { order_id } | OrderState::Filled { order_id, .. } => {
+            Some(order_id.clone())
+        }
+        OrderState::Failed { .. } => {
+            debug!("Execution {execution_id} already failed, skipping poll");
+            None
+        }
+    }
+}
+
+fn log_filled_order(execution_id: i64, price_cents: u64, execution: &OffchainExecution) {
+    let symbol = &execution.symbol;
+    info!(
+        execution_id,
+        price_cents,
+        %symbol,
+        "Updated execution to FILLED and cleared locks"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_broker::{Direction, MockBroker, Shares, SupportedBroker, Symbol};
+    use st0x_execution::{Direction, MockExecutor, Shares, SupportedExecutor, Symbol};
 
     use super::*;
     use crate::offchain_order::BrokerOrderId;
@@ -342,7 +389,7 @@ mod tests {
     async fn setup_offchain_order_aggregate(
         dual_write_context: &DualWriteContext,
         execution: &OffchainExecution,
-        symbol: &st0x_broker::Symbol,
+        symbol: &st0x_execution::Symbol,
         order_id: &str,
     ) {
         crate::dual_write::place_order(dual_write_context, execution)
@@ -366,10 +413,10 @@ mod tests {
     async fn test_handle_filled_order_executes_dual_write_commands() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = st0x_broker::MockBroker::default();
+        let broker = MockExecutor::default();
         let config = OrderPollerConfig::default();
 
-        let symbol = st0x_broker::Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
         let shares = Shares::new(10).unwrap();
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "AAPL0x", 10.0).await;
@@ -384,7 +431,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -395,7 +442,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -448,10 +495,10 @@ mod tests {
     async fn test_handle_failed_order_executes_dual_write_commands() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = st0x_broker::MockBroker::default();
+        let broker = MockExecutor::default();
         let config = OrderPollerConfig::default();
 
-        let symbol = st0x_broker::Symbol::new("TSLA").unwrap();
+        let symbol = Symbol::new("TSLA").unwrap();
         let shares = Shares::new(5).unwrap();
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "TSLA0x", 5.0).await;
@@ -466,7 +513,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Sell,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -477,7 +524,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -579,6 +626,38 @@ mod tests {
         assert_eq!(lock_count, 0, "symbol_locks should be cleared");
     }
 
+    #[tokio::test]
+    async fn test_finalize_order_returns_execution_not_found_error_for_missing_execution() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockExecutor::default();
+        let config = OrderPollerConfig::default();
+
+        let poller = OrderStatusPoller::new(config, pool, broker, dual_write_context);
+
+        let nonexistent_execution_id = 99999;
+        let filled_state = OrderState::Filled {
+            order_id: "ORD999".to_string(),
+            price_cents: 10000,
+            executed_at: Utc::now(),
+        };
+
+        let result = poller
+            .handle_filled_order(nonexistent_execution_id, &filled_state)
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OrderPollingError::OnChain(OnChainError::Persistence(
+                    PersistenceError::ExecutionNotFound(99999)
+                ))
+            ),
+            "Expected ExecutionNotFound(99999), got: {err:?}"
+        );
+    }
+
     /// Reproduces the production recovery scenario:
     /// - Execution is SUBMITTED with order_id
     /// - pending_execution_id is set in trade_accumulators
@@ -589,7 +668,7 @@ mod tests {
     async fn test_handle_filled_order_clears_pending_execution_id_and_symbol_lock() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let broker = MockBroker::default();
+        let broker = MockExecutor::default();
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("BMNR").unwrap();
@@ -608,7 +687,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -619,7 +698,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -652,5 +731,117 @@ mod tests {
         assert_eq!(legacy_row.status, "FILLED");
         assert_eq!(legacy_row.order_id, Some(order_id.to_string()));
         assert_eq!(legacy_row.price_cents, Some(3181));
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_order_renews_execution_lease() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockExecutor::default();
+        let config = OrderPollerConfig::default();
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let shares = Shares::new(10).unwrap();
+
+        // Create execution in SUBMITTED state
+        let mut tx = pool.begin().await.unwrap();
+        let submitted_state = OrderState::Submitted {
+            order_id: "ORD123".to_string(),
+        };
+        let execution_id = submitted_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Buy,
+                SupportedExecutor::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // Set up a symbol lock with an old timestamp (10 minutes ago)
+        let symbol_str = symbol.to_string();
+        sqlx::query(
+            "INSERT INTO symbol_locks (symbol, locked_at) VALUES (?1, datetime('now', '-10 minutes'))",
+        )
+        .bind(&symbol_str)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Verify the lock has old timestamp
+        let old_lock_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM symbol_locks WHERE symbol = ?1 AND locked_at < datetime('now', '-5 minutes')",
+            symbol_str
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            old_lock_count, 1,
+            "Lock should have old timestamp before processing"
+        );
+
+        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+
+        // Process order state as still Submitted - should renew the lease
+        poller
+            .process_order_state(execution_id, "ORD123", &submitted_state, &symbol)
+            .await
+            .expect("process_order_state should succeed");
+
+        // Verify the lock timestamp was renewed (now recent, not old)
+        let renewed_lock_count: i64 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM symbol_locks WHERE symbol = ?1 AND locked_at > datetime('now', '-1 minute')",
+            symbol_str
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            renewed_lock_count, 1,
+            "Lock should have recent timestamp after processing pending order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_process_pending_order_without_lock_does_not_fail() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let broker = MockExecutor::default();
+        let config = OrderPollerConfig::default();
+
+        let symbol = Symbol::new("MSFT").unwrap();
+        let shares = Shares::new(5).unwrap();
+
+        // Create execution in SUBMITTED state but no symbol lock
+        let mut tx = pool.begin().await.unwrap();
+        let submitted_state = OrderState::Submitted {
+            order_id: "ORD456".to_string(),
+        };
+        let execution_id = submitted_state
+            .store(
+                &mut tx,
+                &symbol,
+                shares,
+                Direction::Sell,
+                SupportedExecutor::Schwab,
+            )
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
+
+        // Processing should succeed even without a lock (renewal returns false but doesn't error)
+        let result = poller
+            .process_order_state(execution_id, "ORD456", &submitted_state, &symbol)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "process_order_state should not fail when no lock exists"
+        );
     }
 }

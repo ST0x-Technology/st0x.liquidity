@@ -7,7 +7,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 

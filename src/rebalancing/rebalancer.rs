@@ -15,7 +15,7 @@ use crate::equity_redemption::RedemptionAggregateId;
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 
 /// Receives triggered rebalancing operations and dispatches them to managers.
 pub(crate) struct Rebalancer<M, R, U>
@@ -114,37 +114,29 @@ where
     }
 
     async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
-        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
-
         let amount = match shares_to_u256_18_decimals(quantity) {
-            Ok(a) => a,
+            Ok(amount) => amount,
             Err(e) => {
-                error!(%symbol, error = %e, "Failed to convert quantity to U256");
+                error!(
+                    %symbol,
+                    ?quantity,
+                    error = %e,
+                    "Redemption operation failed: share conversion error"
+                );
                 return;
             }
         };
 
-        info!(
-            %symbol,
-            ?quantity,
-            %token,
-            %amount,
-            aggregate_id = %aggregate_id.0,
-            "Executing redemption operation"
-        );
+        let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
-        match self
+        log_redemption_start(&symbol, quantity, token, amount, &aggregate_id);
+
+        let result = self
             .redemption_manager
             .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-            .await
-        {
-            Ok(()) => {
-                info!(%symbol, "Redemption operation completed successfully");
-            }
-            Err(e) => {
-                error!(%symbol, error = %e, "Redemption operation failed");
-            }
-        }
+            .await;
+
+        log_redemption_result(&symbol, result);
     }
 
     async fn execute_usdc_alpaca_to_base(&self, amount: crate::threshold::Usdc) {
@@ -175,6 +167,30 @@ where
                 error!(error = %e, "USDC Base to Alpaca rebalance failed");
             }
         }
+    }
+}
+
+fn log_redemption_start(
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    token: Address,
+    amount: U256,
+    aggregate_id: &RedemptionAggregateId,
+) {
+    info!(
+        %symbol,
+        ?quantity,
+        %token,
+        %amount,
+        aggregate_id = %aggregate_id.0,
+        "Executing redemption operation"
+    );
+}
+
+fn log_redemption_result<E: std::fmt::Display>(symbol: &Symbol, result: Result<(), E>) {
+    match result {
+        Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
+        Err(e) => error!(%symbol, error = %e, "Redemption operation failed"),
     }
 }
 

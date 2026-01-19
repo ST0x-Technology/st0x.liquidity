@@ -6,27 +6,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  docker-build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Build Docker image
-        run: docker build .
-
   rainix:
     env:
       DATABASE_URL: "sqlite:schwab.db"
@@ -50,7 +29,6 @@ jobs:
           docker-images: false
           swap-storage: false
 
-
       - uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -70,7 +48,7 @@ jobs:
           # if there's no cache hit, restore a cache by this prefix
           restore-prefixes-first-match: nix-${{ runner.os }}-
           # collect garbage until the Nix store size (in bytes) is at most this number
-          gc-max-store-size-linux: 10G
+          gc-max-store-size-linux: 5G
 
       - run: nix run .#prepSolArtifacts
       - run: nix flake check
@@ -79,3 +57,53 @@ jobs:
       - run: nix develop -c sqlx migrate run
       - name: Run ${{ matrix.task }}
         run: nix develop -c ${{ matrix.task }}
+
+  dashboard:
+    env:
+      DATABASE_URL: "sqlite:schwab.db"
+
+    runs-on: ubuntu-latest
+    steps:
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: false
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: nixbuild/nix-quick-install-action@v30
+        with:
+          nix_conf: |
+            keep-env-derivations = true
+            keep-outputs = true
+
+      - name: Restore and save Nix store
+        uses: nix-community/cache-nix-action@v6
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+          gc-max-store-size-linux: 5G
+
+      - run: nix run .#prepSolArtifacts
+
+      - name: Install dependencies
+        run: nix develop -c bun install --cwd dashboard
+      - name: Generate TypeScript types
+        env:
+          DATABASE_URL: "sqlite:schwab.db"
+        run: |
+          nix develop -c sqlx db create
+          nix develop -c sqlx migrate run
+          nix develop -c cargo run --bin codegen
+
+      - name: Type check
+        run: nix develop -c bun run --cwd dashboard check
+      - name: Lint
+        run: nix develop -c bun run --cwd dashboard lint
+      - name: Test
+        run: nix develop -c bun run --cwd dashboard test:run
+      - name: Build
+        run: nix develop -c bun run --cwd dashboard build
