@@ -6,6 +6,14 @@ This file provides guidance to AI agents working with code in this repository.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
 the limit, condense explanations without removing any rules.
 
+## Communication
+
+- **Do not run commands to "show" output to the user.** The CLI interface
+  truncates output and the user cannot see full command results. If you need the
+  user to review something, stop and explicitly ask them to look at it (e.g.,
+  "please review the changes in src/foo.rs"). Do not run `git diff` or similar
+  commands expecting the user to see the output - they won't.
+
 ## Plan & Review
 
 ### Before starting work
@@ -76,25 +84,25 @@ minimize delta exposure through automated hedging.
 This project uses a Cargo workspace with:
 
 - **Root crate (`st0x-hedge`)**: Main arbitrage bot application
-- **Broker crate (`st0x-broker`)**: Standalone broker abstraction library
+- **Execution crate (`st0x-execution`)**: Trade execution abstraction library
 
 ### Building & Running
 
 - `cargo build` - Build all workspace members
 - `cargo build -p st0x-hedge` - Build main crate only
-- `cargo build -p st0x-broker` - Build broker crate only
+- `cargo build -p st0x-execution` - Build execution crate only
 - `cargo run --bin server` - Run the main arbitrage bot
 - `cargo run --bin cli -- auth` - Run the authentication flow for Charles Schwab
   OAuth setup
 - `cargo run --bin cli -- test -t AAPL -q 100 -d buy` - Test trading
-  functionality with mock broker
+  functionality with mocked execution
 - `cargo run --bin cli` - Run the command-line interface for manual operations
 
 ### Testing
 
-- `cargo test -q` - Run all tests (both main and broker crates)
+- `cargo test -q` - Run all tests (both main and execution crates)
 - `cargo test -q --lib` - Run library tests only
-- `cargo test -p st0x-broker -q` - Run broker crate tests only
+- `cargo test -p st0x-execution -q` - Run execution crate tests only
 - `cargo test -p st0x-hedge -q` - Run main crate tests only
 - `cargo test -q <test_name>` - Run specific test
 
@@ -130,14 +138,12 @@ resolution and feature selection.
 - `cargo clippy --all-targets --all-features -- -D clippy::all` - Run Clippy for
   linting
 - `cargo fmt` - Format code
-- `cargo-tarpaulin --skip-clean --out Html` - Generate test coverage report
 
 ### Nix Development Environment
 
 - `nix develop` - Enter development shell with all dependencies
 - `nix run .#prepSolArtifacts` - Build Solidity artifacts for orderbook
   interface
-- `nix run .#checkTestCoverage` - Generate test coverage report
 
 ## Development Workflow Notes
 
@@ -159,30 +165,30 @@ This pattern ensures changes are reviewable before being applied.
 
 ## Architecture Overview
 
-### Broker Abstraction Layer
+### Execution Abstraction Layer
 
-**Design Principle**: The application uses a generic broker trait to support
+**Design Principle**: The application uses a generic `Executor` trait to support
 multiple trading platforms while maintaining type safety and zero-cost
 abstractions.
 
 **Key Architecture Points**:
 
-- Generic `Broker` trait with associated types (`Error`, `OrderId`, `Config`)
-- Main crate stays broker-agnostic via trait; broker-specific logic in
-  `st0x-broker` crate
+- Generic `Executor` trait with associated types (`Error`, `OrderId`, `Config`)
+- Main crate stays execution-agnostic via trait; execution-specific logic in
+  `st0x-execution` crate
 - Newtypes (`Symbol`, `Shares`, `Direction`) and enums prevent invalid states
-- Supported brokers: SchwabBroker (production), AlpacaBroker (production),
-  TestBroker (mock)
+- Supported implementations: SchwabExecutor, AlpacaTradingApi, AlpacaBrokerApi,
+  MockExecutor
 
 **Benefits**:
 
-- Zero changes to core bot logic when adding brokers
+- Zero changes to core bot logic when adding new implementations
 - Type safety via compile-time verification
-- Independent testing per broker
+- Independent testing per implementation
 - Zero-cost abstractions via generics (no dynamic dispatch)
 
-For detailed broker implementation requirements, module organization, and adding
-new brokers, see @crates/broker/AGENTS.md
+For detailed implementation requirements and module organization, see
+@crates/execution/AGENTS.md
 
 ### Core Event Processing Flow
 
@@ -284,6 +290,22 @@ Environment variables (can be set via `.env` file):
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `SchwabError`) with proper propagation
+- **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
+  cqrs-es framework for event sourcing. **NEVER write directly to the `events`
+  table**. This is strictly forbidden and violates the CQRS architecture:
+  - **FORBIDDEN**: Direct INSERT statements into the `events` table
+  - **FORBIDDEN**: Manual sequence number management for events
+  - **FORBIDDEN**: Bypassing the CqrsFramework to write events
+  - **REQUIRED**: Always use `CqrsFramework::execute()` or
+    `CqrsFramework::execute_with_metadata()` to emit events
+  - **REQUIRED**: Events must be emitted through aggregate commands that
+    generate domain events
+  - The cqrs-es framework handles event persistence, sequence numbers, aggregate
+    loading, and consistency guarantees
+  - Direct table writes break aggregate consistency, event ordering, and the
+    event sourcing pattern
+  - If you see existing code writing directly to `events` table, that code is
+    incorrect and should be refactored to use CqrsFramework
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -298,6 +320,13 @@ Environment variables (can be set via `.env` file):
   constraints and proper normalization to ensure data consistency at the
   database level. Align database schemas with type modeling principles where
   possible
+- **No Denormalized Columns**: Never store values that can be computed from
+  other columns. Denormalized data inevitably becomes stale when the source
+  columns are updated but the derived column is forgotten. Always compute
+  derived values on-demand in queries (e.g., use
+  `ABS(accumulated_long - accumulated_short) >= 1.0` instead of storing a
+  separate `net_position` column). If performance requires caching, use database
+  views or generated columns that auto-update, never manually-maintained columns
 - **Functional Programming Patterns**: Favor FP and ADT patterns over OOP
   patterns. Avoid unnecessary encapsulation, inheritance hierarchies, or
   getter/setter patterns that don't make sense with Rust's algebraic data types.
@@ -354,10 +383,64 @@ Environment variables (can be set via `.env` file):
   e.g. imports required only inside a tests module should be done in the module
   and not hidden behind #[cfg(test)] at the top of the file
 - **Error Handling**: Avoid `unwrap()` even post-validation since validation
-  logic changes might leave panics in the codebase. Use `thiserror` with
-  `#[from]` attributes for automatic error conversion, then use the `?` operator
-  for propagation. Do NOT use `.map_err()` when `#[from]` can handle the
-  conversion automatically.
+  logic changes might leave panics in the codebase
+- **CRITICAL: Error Type Design**: **NEVER create error variants with opaque
+  String values that throw away type information**. This is strictly forbidden
+  and violates our error handling principles:
+  - **FORBIDDEN**: `SomeError(String)` - throws away all type information
+  - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
+  - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
+    interpolation
+  - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
+    preserve all type information
+  - **REQUIRED**: Each error variant must preserve the complete error chain with
+    `#[source]`
+  - **REQUIRED**: Discover error variants as needed during implementation, not
+    preemptively
+  - **Principle**: Error types must enable debugging and preserve all context -
+    opaque strings make debugging impossible
+  - Example of **FORBIDDEN** pattern:
+    ```rust
+    // ❌ CATASTROPHICALLY BAD - Destroys all type information
+    #[derive(Debug, thiserror::Error)]
+    pub enum MyError {
+        #[error("Aggregate error: {0}")]
+        AggregateError(String),  // WRONG: No way to know what failed
+        #[error("Processing failed: {0}")]
+        ProcessingError(String), // WRONG: Loses error chain
+    }
+
+    // Code that creates these errors (FORBIDDEN):
+    some_operation().map_err(|e| MyError::AggregateError(e.to_string()))?;
+    ```
+  - Example of **CORRECT** pattern:
+    ```rust
+    // ✅ CORRECT - Preserves all type information
+    #[derive(Debug, thiserror::Error)]
+    pub enum MyError {
+        #[error("CQRS aggregate error: {0}")]
+        Aggregate(#[from] cqrs_es::AggregateError<OtherError>),
+        #[error("Database error: {0}")]
+        Database(#[from] sqlx::Error),
+        #[error("Specific business rule violation")]
+        BusinessRuleViolation {
+            field: String,
+            value: Decimal,
+            #[source]
+            cause: ValidationError,
+        },
+    }
+
+    // With #[from], this works automatically:
+    some_operation()?;  // Auto-converts via From trait
+    ```
+  - When adding new error variants:
+    1. Only add variants when you encounter actual errors during implementation
+    2. Use `#[from]` for error types from external crates
+    3. Use `#[source]` for wrapped errors in struct variants
+    4. Never use `.to_string()`, `.map_err(|e| Foo(e.to_string()))`, or similar
+       patterns
+    5. If an error needs context, use a struct variant with fields + `#[source]`
 - **Silent Early Returns**: Never silently return in error/mismatch cases.
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
@@ -471,31 +554,9 @@ async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
 6. **Database Constraints**: Let database constraints fail rather than masking
    violations
 
-#### Required Error Types
-
-Every financial operation must have proper error types that preserve context:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum FinancialError {
-    #[error("Value {value} exceeds maximum allowed {max_allowed}")]
-    ValueTooLarge { value: u64, max_allowed: u64 },
-
-    #[error("Arithmetic overflow in operation: {operation}")]
-    ArithmeticOverflow { operation: String },
-
-    #[error("Precision loss detected: {original} -> {converted}")]
-    PrecisionLoss { original: String, converted: String },
-
-    #[error("Invalid price format: '{input}'")]
-    InvalidPrice { input: String, #[source] source: DecimalError },
-}
-```
-
-**Remember: In financial applications, it is ALWAYS better for the system to
-fail fast with a clear error than to continue with potentially corrupted data.
-Silent data corruption in financial systems can lead to massive losses,
-regulatory violations, and complete system failure.**
+**Remember: In financial applications, ALWAYS fail fast with clear errors rather
+than continue with potentially corrupted data. Silent data corruption leads to
+massive losses and regulatory violations.**
 
 ### CRITICAL: Security and Secrets Management
 
@@ -540,19 +601,8 @@ read your .env file which contains sensitive credentials. May I have permission
 to read it?"
 ```
 
-#### Alternative Approaches
-
-When debugging configuration issues, prefer these approaches:
-
-1. **Ask the user** to verify specific environment variables are set
-2. **Request sanitized output** where sensitive values are redacted
-3. **Check example files** like `.env.example` instead of the actual `.env`
-4. **Review code** that uses the configuration rather than the configuration
-   itself
-
-**Remember: Protecting secrets is critical for application security. Always
-respect the sensitivity of credential files and never access them without
-explicit permission.**
+**Alternatives**: Ask user to verify env vars are set, request sanitized output,
+check `.env.example` instead of `.env`, or review code that uses configuration.
 
 ### Testing Strategy
 
@@ -581,48 +631,14 @@ Tests should verify our application logic, not just language features. Avoid
 tests that only exercise struct construction or field access without testing any
 business logic.
 
-##### ❌ Bad: Testing language features instead of our code
-
-```rust
-#[test]
-fn test_order_poller_config_custom() {
-    let config = OrderPollerConfig {
-        polling_interval: Duration::from_secs(30),
-        max_jitter: Duration::from_secs(10),
-    };
-
-    assert_eq!(config.polling_interval, Duration::from_secs(30));
-    assert_eq!(config.max_jitter, Duration::from_secs(10));
-}
-```
-
-This test creates a struct and verifies field assignments, but doesn't test any
-of our code logic - it only tests Rust's struct field assignment mechanism.
-
-##### ✅ Good: Testing actual business logic
-
-```rust
-#[test]
-fn test_order_poller_respects_jitter_bounds() {
-    let config = OrderPollerConfig {
-        polling_interval: Duration::from_secs(60),
-        max_jitter: Duration::from_secs(10),
-    };
-    
-    let actual_delay = config.calculate_next_poll_delay();
-    
-    assert!(actual_delay >= Duration::from_secs(60));
-    assert!(actual_delay <= Duration::from_secs(70));
-}
-```
-
-This test verifies that our jitter calculation logic works correctly within
-expected bounds.
+❌ Bad: Testing struct field assignments (just tests Rust, not our code). ✅
+Good: Testing actual business logic like `config.calculate_next_poll_delay()`
+returning values within expected bounds.
 
 ### Workflow Best Practices
 
 - **Always run tests, clippy, and formatters before handing over a piece of
-  work**
+  work** (skip if only documentation/markdown files were changed)
   - Run tests first, as changing tests can break clippy
   - Run clippy next, as fixing linting errors can break formatting
   - Deny warnings when running clippy
@@ -761,62 +777,18 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
 #### Bad Comment Examples
 
 ```rust
-// ❌ Redundant - the function name says this
-// Spawn background token refresh task
-spawn_automatic_token_refresh(pool, env);
-
-// ❌ Obvious from context
-// Store test tokens
-let tokens = SchwabTokens { /* ... */ };
-tokens.store(&pool).await.unwrap();
-
-// ❌ Just restating the code
-// Mock account hash endpoint
-let mock = server.mock(|when, then| {
-    when.method(GET).path("/trader/v1/accounts/accountNumbers");
-    // ...
-});
-
-// ❌ Test section markers that add no value
-// 1. Test token refresh integration
-let result = refresh_tokens(&pool).await;
-
-// ❌ Explaining what the code obviously does
-// Execute the order
-execute_schwab_order(env, pool, trade).await;
-
-// ❌ Obvious variable assignments
-// Create a trade
-let trade = Trade { /* ... */ };
-
-// ❌ Test setup that's clear from code structure
-// Verify mocks were called
-mock.assert();
-
-// ❌ Obvious control flow
-// Save trade to DB
-trade.try_save_to_db(&pool).await?;
-```
-
-#### Function Documentation
-
-Use Rust doc comments (`///`) for public APIs:
-
-```rust
-/// Validates Schwab authentication tokens and refreshes if needed.
-/// 
-/// Returns `SchwabError::RefreshTokenExpired` if the refresh token
-/// has expired and manual re-authentication is required.
-pub async fn refresh_if_needed(pool: &SqlitePool) -> Result<bool, SchwabError> {
+// ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
+// ❌ Obvious from context: // Store test tokens
+// ❌ Just restating code: // Mock account hash endpoint
+// ❌ Test section markers: // 1. Test token refresh integration
+// ❌ Obvious operations: // Execute the order, // Create a trade, // Verify mocks
 ```
 
 #### Comment Maintenance
 
-- Remove comments when refactoring makes them obsolete
-- Update comments when changing the logic they describe
-- If a comment is needed to explain what code does, consider refactoring for
-  clarity
-- Keep comments concise and focused on the "why" rather than the "what"
+Use `///` doc comments for public APIs. Remove/update comments when refactoring.
+If a comment is needed to explain what code does, consider refactoring instead.
+Keep comments focused on "why" rather than "what".
 
 ### Code style
 
@@ -883,37 +855,14 @@ fn row_to_execution(row: ExecutionRow) -> Result<TradeExecution, Error> {
 ```
 
 This pattern applies across the entire workspace, including both the main crate
-and sub-crates like `st0x-broker`.
+and sub-crates like `st0x-execution`.
 
 #### Use `.unwrap` over boolean result assertions in tests
 
-Instead of
-
-```rust
-assert!(result.is_err());
-assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
-```
-
-or
-
-```rust
-assert!(result.is_ok());
-assert_eq!(result.unwrap(), "refreshed_access_token");
-```
-
-Write
-
-```rust
-assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
-```
-
-and
-
-```rust
-assert_eq!(result.unwrap(), "refreshed_access_token");
-```
-
-so that if we get an unexpected result value, we immediately see the value.
+Instead of `assert!(result.is_err()); assert!(matches!(...))`, write
+`assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));` directly.
+Similarly, instead of `assert!(result.is_ok()); assert_eq!(...)`, write
+`assert_eq!(result.unwrap(), "expected_value");` so unexpected values are shown.
 
 #### Type modeling examples
 
@@ -999,40 +948,13 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 ##### Use early returns:
 
-Instead of
-
 ```rust
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    if let Some(data) = data {
-        if !data.is_empty() {
-            if data.len() > 5 {
-                Ok(data.to_uppercase())
-            } else {
-                Err(Error::TooShort)
-            }
-        } else {
-            Err(Error::Empty)
-        }
-    } else {
-        Err(Error::None)
-    }
-}
-```
-
-Write
-
-```rust
+// ❌ Nested: if let Some(data) = data { if !data.is_empty() { if data.len() > 5 { ... } } }
+// ✅ Flat with early returns:
 fn process_data(data: Option<&str>) -> Result<String, Error> {
     let data = data.ok_or(Error::None)?;
-    
-    if data.is_empty() {
-        return Err(Error::Empty);
-    }
-    
-    if data.len() <= 5 {
-        return Err(Error::TooShort);
-    }
-    
+    if data.is_empty() { return Err(Error::Empty); }
+    if data.len() <= 5 { return Err(Error::TooShort); }
     Ok(data.to_uppercase())
 }
 ```
@@ -1056,37 +978,15 @@ Break deeply nested event processing into helper functions with clear names.
 ##### Use pattern matching with guards:
 
 ```rust
-// Instead of nested if-let
-if let Some(data) = input {
-    if state == State::Ready && data.is_valid() {
-        process(data)
-    } else { Err(Error::Invalid) }
-} else { Err(Error::NoData) }
-
-// Write
-match (input, state) {
-    (Some(data), State::Ready) if data.is_valid() => process(data),
-    (Some(_), State::Ready) => Err(Error::InvalidData),
-    _ => Err(Error::NoData),
-}
+// ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
+// ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
 ```
 
 ##### Prefer iterator chains over nested loops:
 
 ```rust
-// Instead of imperative loops
-let mut results = Vec::new();
-for trade in &trades {
-    if trade.is_valid() {
-        results.push(process_trade(trade)?);
-    }
-}
-
-// Write functional chains
-trades.iter()
-    .filter(|t| t.is_valid())
-    .map(process_trade)
-    .collect::<Result<Vec<_>, _>>()
+// ❌ Imperative: let mut results = Vec::new(); for t in &trades { if t.is_valid() { results.push(...) } }
+// ✅ Functional: trades.iter().filter(|t| t.is_valid()).map(process_trade).collect::<Result<Vec<_>, _>>()
 ```
 
 #### Struct field access
@@ -1094,40 +994,7 @@ trades.iter()
 Avoid creating unnecessary constructors or getters when they don't add logic
 beyond setting/getting field values. Use public fields directly instead.
 
-##### Prefer direct field access:
-
-```rust
-pub struct SchwabTokens {
-    pub access_token: String,
-    pub access_token_fetched_at: DateTime<Utc>,
-    pub refresh_token: String,
-    pub refresh_token_fetched_at: DateTime<Utc>,
-}
-
-// Create with struct literal syntax
-let tokens = SchwabTokens {
-    access_token: "token123".to_string(),
-    access_token_fetched_at: Utc::now(),
-    refresh_token: "refresh456".to_string(),
-    refresh_token_fetched_at: Utc::now(),
-};
-
-// Access fields directly
-println!("Token: {}", tokens.access_token);
-```
-
-##### Avoid unnecessary constructors and getters:
-
-```rust
-// Don't create these unless they add meaningful logic
-impl SchwabTokens {
-    // Unnecessary - just sets fields without additional logic
-    pub fn new(access_token: String, /* ... */) -> Self { /* ... */ }
-    
-    // Unnecessary - just returns field value
-    pub fn access_token(&self) -> &str { &self.access_token }
-}
-```
-
-This preserves argument clarity and avoids losing information about what each
-field represents.
+Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
+and access fields directly (`tokens.access_token`). Don't create `fn new()`
+constructors or `fn field(&self)` getters unless they add meaningful logic
+beyond setting/getting field values.

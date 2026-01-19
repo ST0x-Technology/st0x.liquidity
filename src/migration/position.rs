@@ -1,7 +1,7 @@
 use rust_decimal::{Decimal, prelude::One};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::{info, warn};
 
 use super::{ExecutionMode, MigrationError};
@@ -13,7 +13,6 @@ use crate::threshold::ExecutionThreshold;
 #[derive(sqlx::FromRow)]
 struct PositionRow {
     symbol: String,
-    net_position: f64,
     accumulated_long: f64,
     accumulated_short: f64,
     pending_execution_id: Option<i64>,
@@ -25,7 +24,7 @@ pub async fn migrate_positions(
     execution: ExecutionMode,
 ) -> Result<usize, MigrationError> {
     let rows = sqlx::query_as::<_, PositionRow>(
-        "SELECT symbol, net_position, accumulated_long, accumulated_short, pending_execution_id
+        "SELECT symbol, accumulated_long, accumulated_short, pending_execution_id
          FROM trade_accumulators
          ORDER BY symbol ASC",
     )
@@ -41,50 +40,62 @@ pub async fn migrate_positions(
         .count();
 
     for (idx, row) in rows.into_iter().enumerate() {
-        let processed = idx + 1;
-        if processed % 100 == 0 {
-            info!("Migrating positions: {processed}/{total}");
-        }
-
-        if let Some(exec_id) = row.pending_execution_id {
-            warn!(
-                "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
-                row.symbol
-            );
-        }
-
-        let symbol = Symbol::new(&row.symbol)?;
-        let aggregate_id = Position::aggregate_id(&symbol);
-
-        let net_position = Decimal::try_from(row.net_position)?;
-        let accumulated_long = Decimal::try_from(row.accumulated_long)?;
-        let accumulated_short = Decimal::try_from(row.accumulated_short)?;
-
-        let command = PositionCommand::Migrate {
-            symbol,
-            net_position: FractionalShares(net_position),
-            accumulated_long: FractionalShares(accumulated_long),
-            accumulated_short: FractionalShares(accumulated_short),
-            threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
-        };
-
-        match execution {
-            ExecutionMode::Commit => {
-                cqrs.execute(&aggregate_id, command).await?;
-            }
-            ExecutionMode::DryRun => {}
-        }
+        log_progress(idx + 1, total);
+        migrate_single_position(cqrs, row, execution).await?;
     }
 
     info!("Migrated {total} positions, {pending_count} with pending executions");
     Ok(total)
 }
 
+fn log_progress(processed: usize, total: usize) {
+    if processed % 100 == 0 {
+        info!("Migrating positions: {processed}/{total}");
+    }
+}
+
+async fn migrate_single_position(
+    cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    row: PositionRow,
+    execution: ExecutionMode,
+) -> Result<(), MigrationError> {
+    if let Some(exec_id) = row.pending_execution_id {
+        warn!(
+            "Position {} has pending execution {exec_id} - will be reconciled in dual-write phase",
+            row.symbol
+        );
+    }
+
+    let symbol = Symbol::new(&row.symbol)?;
+    let aggregate_id = Position::aggregate_id(&symbol);
+
+    let accumulated_long = Decimal::try_from(row.accumulated_long)?;
+    let accumulated_short = Decimal::try_from(row.accumulated_short)?;
+    let net_position = accumulated_long - accumulated_short;
+
+    let command = PositionCommand::Migrate {
+        symbol,
+        net_position: FractionalShares(net_position),
+        accumulated_long: FractionalShares(accumulated_long),
+        accumulated_short: FractionalShares(accumulated_short),
+        threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
+    };
+
+    match execution {
+        ExecutionMode::Commit => {
+            cqrs.execute(&aggregate_id, command).await?;
+        }
+        ExecutionMode::DryRun => {}
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
-    use st0x_broker::Symbol;
+    use st0x_execution::Symbol;
 
     use super::{ExecutionMode, migrate_positions};
     use crate::position::Position;
@@ -98,7 +109,6 @@ mod tests {
     async fn insert_test_position(
         pool: &SqlitePool,
         symbol: &str,
-        net_position: f64,
         accumulated_long: f64,
         accumulated_short: f64,
         pending_execution_id: Option<i64>,
@@ -107,15 +117,13 @@ mod tests {
             "
             INSERT INTO trade_accumulators (
                 symbol,
-                net_position,
                 accumulated_long,
                 accumulated_short,
                 pending_execution_id
             )
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?)
             ",
             symbol,
-            net_position,
             accumulated_long,
             accumulated_short,
             pending_execution_id
@@ -142,7 +150,7 @@ mod tests {
         let pool = create_test_pool().await;
         let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
+        insert_test_position(&pool, "AAPL", 10.0, 4.5, None).await;
 
         let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
@@ -167,9 +175,9 @@ mod tests {
         let pool = create_test_pool().await;
         let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
-        insert_test_position(&pool, "TSLA", -2.0, 3.0, 5.0, None).await;
-        insert_test_position(&pool, "MSFT", 0.0, 0.0, 0.0, None).await;
+        insert_test_position(&pool, "AAPL", 10.0, 4.5, None).await;
+        insert_test_position(&pool, "TSLA", 3.0, 5.0, None).await;
+        insert_test_position(&pool, "MSFT", 0.0, 0.0, None).await;
 
         let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
@@ -205,7 +213,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, Some(execution_id)).await;
+        insert_test_position(&pool, "AAPL", 10.0, 4.5, Some(execution_id)).await;
 
         let count = migrate_positions(&pool, &cqrs, ExecutionMode::Commit)
             .await
@@ -230,7 +238,7 @@ mod tests {
         let pool = create_test_pool().await;
         let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        insert_test_position(&pool, "AAPL", 5.5, 10.0, 4.5, None).await;
+        insert_test_position(&pool, "AAPL", 10.0, 4.5, None).await;
 
         let count = migrate_positions(&pool, &cqrs, ExecutionMode::DryRun)
             .await
@@ -253,7 +261,6 @@ mod tests {
         sqlx::query(
             "CREATE TABLE trade_accumulators (
                 symbol TEXT PRIMARY KEY NOT NULL,
-                net_position REAL NOT NULL DEFAULT 0.0,
                 accumulated_long REAL NOT NULL DEFAULT 0.0,
                 accumulated_short REAL NOT NULL DEFAULT 0.0,
                 pending_execution_id INTEGER,
@@ -268,15 +275,13 @@ mod tests {
             "
             INSERT INTO trade_accumulators (
                 symbol,
-                net_position,
                 accumulated_long,
                 accumulated_short
             )
-            VALUES (?, ?, ?, ?)
+            VALUES (?, ?, ?)
             ",
         )
         .bind("")
-        .bind(5.5)
         .bind(10.0)
         .bind(4.5)
         .execute(&pool)
@@ -288,7 +293,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            super::MigrationError::InvalidSymbol(_)
+            super::MigrationError::EmptySymbol(_)
         ));
     }
 }

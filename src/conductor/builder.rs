@@ -7,10 +7,12 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use st0x_broker::Broker;
+use st0x_execution::Executor;
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::dual_write::DualWriteContext;
 use crate::env::Config;
+use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
 
@@ -23,22 +25,23 @@ type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error
 type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
-struct CommonFields<P, B> {
+struct CommonFields<P, E> {
     config: Config,
     pool: SqlitePool,
     cache: SymbolCache,
     provider: P,
-    broker: B,
+    executor: E,
+    dual_write_context: DualWriteContext,
 }
 
 pub(crate) struct Initial;
 
-pub(crate) struct WithBrokerMaintenance {
-    broker_maintenance: Option<JoinHandle<()>>,
+pub(crate) struct WithExecutorMaintenance {
+    executor_maintenance: Option<JoinHandle<()>>,
 }
 
 pub(crate) struct WithDexStreams {
-    broker_maintenance: Option<JoinHandle<()>>,
+    executor_maintenance: Option<JoinHandle<()>>,
     clear_stream: ClearStream,
     take_stream: TakeStream,
     event_sender: UnboundedSender<(TradeEvent, Log)>,
@@ -46,20 +49,21 @@ pub(crate) struct WithDexStreams {
     rebalancer: Option<JoinHandle<()>>,
 }
 
-pub(crate) struct ConductorBuilder<P, B, State> {
-    common: CommonFields<P, B>,
+pub(crate) struct ConductorBuilder<P, E, State> {
+    common: CommonFields<P, E>,
     state: State,
 }
 
-impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
-    ConductorBuilder<P, B, Initial>
+impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
+    ConductorBuilder<P, E, Initial>
 {
     pub(crate) fn new(
         config: Config,
         pool: SqlitePool,
         cache: SymbolCache,
         provider: P,
-        broker: B,
+        executor: E,
+        dual_write_context: DualWriteContext,
     ) -> Self {
         Self {
             common: CommonFields {
@@ -67,25 +71,28 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
                 pool,
                 cache,
                 provider,
-                broker,
+                executor,
+                dual_write_context,
             },
             state: Initial,
         }
     }
 
-    pub(crate) fn with_broker_maintenance(
+    pub(crate) fn with_executor_maintenance(
         self,
-        broker_maintenance: Option<JoinHandle<()>>,
-    ) -> ConductorBuilder<P, B, WithBrokerMaintenance> {
+        executor_maintenance: Option<JoinHandle<()>>,
+    ) -> ConductorBuilder<P, E, WithExecutorMaintenance> {
         ConductorBuilder {
             common: self.common,
-            state: WithBrokerMaintenance { broker_maintenance },
+            state: WithExecutorMaintenance {
+                executor_maintenance,
+            },
         }
     }
 }
 
-impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
-    ConductorBuilder<P, B, WithBrokerMaintenance>
+impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
+    ConductorBuilder<P, E, WithExecutorMaintenance>
 {
     pub(crate) fn with_dex_event_streams(
         self,
@@ -97,14 +104,14 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         + Unpin
         + Send
         + 'static,
-    ) -> ConductorBuilder<P, B, WithDexStreams> {
+    ) -> ConductorBuilder<P, E, WithDexStreams> {
         let (event_sender, event_receiver) =
             tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();
 
         ConductorBuilder {
             common: self.common,
             state: WithDexStreams {
-                broker_maintenance: self.state.broker_maintenance,
+                executor_maintenance: self.state.executor_maintenance,
                 clear_stream: Box::new(clear_stream),
                 take_stream: Box::new(take_stream),
                 event_sender,
@@ -115,8 +122,11 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
     }
 }
 
-impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
-    ConductorBuilder<P, B, WithDexStreams>
+impl<P, E> ConductorBuilder<P, E, WithDexStreams>
+where
+    P: Provider + Clone + Send + 'static,
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
 {
     pub(crate) fn with_rebalancer(mut self, rebalancer: JoinHandle<()>) -> Self {
         self.state.rebalancer = Some(rebalancer);
@@ -126,16 +136,16 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
     pub(crate) fn spawn(self) -> Conductor {
         info!("Starting conductor orchestration");
 
-        let broker_maintenance = self.state.broker_maintenance;
+        let executor_maintenance = self.state.executor_maintenance;
         let rebalancer = self.state.rebalancer;
 
-        log_optional_task_status("broker maintenance", broker_maintenance.is_some());
+        log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
         let order_poller = spawn_order_poller(
             &self.common.config,
             &self.common.pool,
-            self.common.broker.clone(),
+            self.common.executor.clone(),
         );
         let dex_event_receiver = spawn_onchain_event_receiver(
             self.state.event_sender,
@@ -145,11 +155,12 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         let event_processor =
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
-            self.common.broker.clone(),
+            self.common.executor.clone(),
             self.common.pool.clone(),
+            self.common.dual_write_context.clone(),
         );
         let queue_processor = spawn_queue_processor(
-            self.common.broker,
+            self.common.executor,
             &self.common.config,
             &self.common.pool,
             &self.common.cache,
@@ -157,7 +168,7 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         );
 
         Conductor {
-            broker_maintenance,
+            executor_maintenance,
             order_poller,
             dex_event_receiver,
             event_processor,

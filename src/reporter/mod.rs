@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::{error, info};
 
 use crate::symbol::Symbol;
-use st0x_broker::Direction;
+use st0x_execution::Direction;
 
 mod pnl;
 
@@ -392,34 +392,51 @@ pub async fn run(env: ReporterEnv) -> anyhow::Result<()> {
     let pool = env.get_sqlite_pool().await?;
     let interval = env.processing_interval();
 
+    initialize_reporter(&pool, interval).await?;
+    run_processing_loop(&pool, interval).await;
+    info!("Reporter shutdown complete");
+
+    Ok(())
+}
+
+async fn initialize_reporter(pool: &SqlitePool, interval: Duration) -> anyhow::Result<()> {
     info!("Starting P&L reporter");
-    sqlx::migrate!().run(&pool).await?;
+    sqlx::migrate!().run(pool).await?;
 
     info!(
         "Reporter initialized with processing interval: {}s",
         interval.as_secs()
     );
 
+    Ok(())
+}
+
+async fn run_processing_loop(pool: &SqlitePool, interval: Duration) {
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
-                match result {
-                    Ok(()) => info!("Shutdown signal received"),
-                    Err(e) => error!("Error receiving shutdown signal: {e}"),
-                }
+                log_shutdown_signal(result);
                 break;
             }
             () = tokio::time::sleep(interval) => {
-                match process_iteration(&pool).await {
-                    Ok(count) => info!("Processed {count} new trades"),
-                    Err(e) => error!("Processing error: {e}"),
-                }
+                log_processing_result(process_iteration(pool).await);
             }
         }
     }
+}
 
-    info!("Reporter shutdown complete");
-    Ok(())
+fn log_shutdown_signal(result: std::io::Result<()>) {
+    match result {
+        Ok(()) => info!("Shutdown signal received"),
+        Err(e) => error!("Error receiving shutdown signal: {e}"),
+    }
+}
+
+fn log_processing_result(result: anyhow::Result<usize>) {
+    match result {
+        Ok(count) => info!("Processed {count} new trades"),
+        Err(e) => error!("Processing error: {e}"),
+    }
 }
 
 #[cfg(test)]

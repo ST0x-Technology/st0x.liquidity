@@ -2,6 +2,9 @@ mod offchain_order;
 mod onchain_trade;
 mod position;
 mod schwab_auth;
+mod startup;
+
+pub(crate) use startup::run_startup_check;
 
 use alloy::primitives::FixedBytes;
 use clap::{Parser, ValueEnum};
@@ -18,7 +21,8 @@ use offchain_order::migrate_offchain_orders;
 use onchain_trade::migrate_onchain_trades;
 use position::migrate_positions;
 use schwab_auth::migrate_schwab_auth;
-use st0x_broker::schwab::{EncryptionError, SchwabAuthError};
+use st0x_execution::schwab::{EncryptionError, SchwabAuthError};
+use st0x_execution::{EmptySymbolError, InvalidDirectionError};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -79,15 +83,15 @@ pub struct MigrationEnv {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum MigrationError {
+pub(crate) enum MigrationError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Invalid symbol: {0}")]
-    InvalidSymbol(#[from] st0x_broker::BrokerError),
+    #[error(transparent)]
+    EmptySymbol(#[from] EmptySymbolError),
     #[error("Invalid decimal conversion: {0}")]
     InvalidDecimal(#[from] rust_decimal::Error),
     #[error("Invalid direction: {0}")]
-    InvalidDirection(#[from] st0x_broker::InvalidDirectionError),
+    InvalidDirection(#[from] InvalidDirectionError),
     #[error("Invalid order status: {0}")]
     InvalidOrderStatus(#[from] InvalidMigratedOrderStatus),
     #[error("Negative price in cents: {0}")]
@@ -149,7 +153,15 @@ pub async fn run_migration(
     pool: &SqlitePool,
     env: &MigrationEnv,
 ) -> anyhow::Result<MigrationSummary> {
-    match env.execution {
+    log_migration_start(env.execution);
+    check_all_aggregate_events(pool, env).await?;
+    safety_prompt(env.confirmation)?;
+    maybe_clean_events(pool, env).await?;
+    execute_migrations(pool, env).await
+}
+
+fn log_migration_start(execution: ExecutionMode) {
+    match execution {
         ExecutionMode::DryRun => {
             info!("Starting migration in DRY-RUN mode - no events will be persisted");
         }
@@ -157,18 +169,30 @@ pub async fn run_migration(
             info!("Starting migration...");
         }
     }
+}
 
+async fn check_all_aggregate_events(
+    pool: &SqlitePool,
+    env: &MigrationEnv,
+) -> Result<(), MigrationError> {
     check_existing_events(pool, "OnChainTrade", env.confirmation, env.clean).await?;
     check_existing_events(pool, "Position", env.confirmation, env.clean).await?;
     check_existing_events(pool, "OffchainOrder", env.confirmation, env.clean).await?;
     check_existing_events(pool, "SchwabAuth", env.confirmation, env.clean).await?;
+    Ok(())
+}
 
-    safety_prompt(env.confirmation)?;
-
+async fn maybe_clean_events(pool: &SqlitePool, env: &MigrationEnv) -> Result<(), MigrationError> {
     if matches!(env.clean, CleanMode::Delete) {
         clean_events(pool, env.confirmation).await?;
     }
+    Ok(())
+}
 
+async fn execute_migrations(
+    pool: &SqlitePool,
+    env: &MigrationEnv,
+) -> anyhow::Result<MigrationSummary> {
     let onchain_trade_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let position_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
     let offchain_order_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
@@ -577,10 +601,9 @@ mod tests {
         insert_test_trade(&pool, tx3, 0, "GOOGL", 3.0, "BUY", 2800.00).await;
 
         sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short)
+             VALUES (?, ?, ?)",
             "AAPL",
-            10.0,
             10.0,
             0.0
         )
@@ -589,10 +612,9 @@ mod tests {
         .unwrap();
 
         sqlx::query!(
-            "INSERT INTO trade_accumulators (symbol, net_position, accumulated_long, accumulated_short)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short)
+             VALUES (?, ?, ?)",
             "TSLA",
-            -5.0,
             0.0,
             5.0
         )

@@ -17,13 +17,14 @@ markets by providing continuous two-sided liquidity.
 
 ## Features
 
-- **Multi-Broker Support**: Hedge through Charles Schwab, Alpaca Markets, or
-  dry-run mode
+- **Multiple Brokerages**: Execute hedges through Charles Schwab, Alpaca Trading
+  API (individual accounts), Alpaca Broker API (managed accounts), or dry-run
+  mode for testing
 - **Real-Time Hedging**: WebSocket-based monitoring for near instant execution
   when onchain liquidity is taken
 - **Fractional Share Batching**: Accumulates fractional onchain trades until
-  whole shares can be executed (required for Schwab; used uniformly across
-  brokers in current implementation)
+  whole shares can be executed (required for Schwab; used uniformly across all
+  brokerages in current implementation)
 - **Complete Audit Trail**: Database tracking linking every onchain trade to
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
@@ -100,9 +101,9 @@ Verify your setup:
 cargo build
 ```
 
-### Step 2: Broker Setup
+### Step 2: Brokerage Setup
 
-Choose one broker and complete its setup:
+Choose a brokerage and complete its setup:
 
 #### Option A: Charles Schwab
 
@@ -157,7 +158,7 @@ ORDERBOOK=0x... # Raindex orderbook contract address
 ORDER_OWNER=0x... # Order owner address to monitor
 DEPLOYMENT_BLOCK=... # Block number where orderbook was deployed
 
-# Broker credentials (from Step 2)
+# Brokerage API credentials (from Step 2)
 # Add either Schwab OR Alpaca credentials based on your choice
 ```
 
@@ -174,7 +175,7 @@ sqlx db create
 sqlx migrate run
 ```
 
-**Note**: If you plan to run both broker instances via Docker Compose, you must
+**Note**: If you plan to run both bot instances via Docker Compose, you must
 create both databases before starting the containers:
 
 ```bash
@@ -205,21 +206,146 @@ sufficient.
 
 ### Step 6: Run the Bot
 
-Start the arbitrage bot with your chosen broker:
+Start the arbitrage bot with your chosen brokerage:
 
 ```bash
 # Charles Schwab
-cargo run --bin server -- --broker schwab
+cargo run --bin server -- --executor schwab
 
-# Alpaca Markets
-cargo run --bin server -- --broker alpaca
+# Alpaca Trading API
+cargo run --bin server -- --executor alpaca-trading-api
+
+# Alpaca Broker API (for managed accounts)
+cargo run --bin server -- --executor alpaca-broker-api
 
 # Dry-run mode (testing without real trades)
-cargo run --bin server -- --broker dry-run
+cargo run --bin server -- --executor dry-run
 ```
 
 The bot will now monitor blockchain events and execute offsetting trades
 automatically.
+
+## Data Migration (One-Time)
+
+**Note**: This section applies if you're migrating from a pre-CQRS/ES version of
+the system. New installations can skip this section.
+
+The `migrate_to_events` binary converts legacy CRUD data to event-sourced
+aggregates. This is a one-time operation required before enabling the
+event-sourced system.
+
+### When to Run Migration
+
+- Migrating from legacy CRUD tables (`onchain_trades`, `trade_accumulators`,
+  `offchain_trades`, `schwab_auth`)
+- Before enabling event-sourced aggregates in production
+- After completing database setup but before running the bot
+
+### Prerequisites
+
+1. **Create database backup**:
+   ```bash
+   cp data/schwab.db data/schwab.db.backup
+   ```
+
+2. **Ensure database migrations are current**:
+   ```bash
+   sqlx migrate run
+   ```
+
+### Migration Workflow
+
+**1. Dry run (preview without persisting):**
+
+```bash
+cargo run --bin migrate_to_events -- --execution dry-run
+```
+
+This shows what would be migrated without actually writing events. Review the
+output for:
+
+- Number of trades, positions, orders to migrate
+- Any warnings about pending executions
+- Expected event counts
+
+**2. Run migration:**
+
+```bash
+cargo run --bin migrate_to_events
+```
+
+You'll be prompted to:
+
+- Confirm you've created a database backup
+- Confirm if existing events are detected (if re-running)
+
+The migration will log progress every 100 items and show a summary:
+
+```
+Migration complete:
+  OnChainTrade: 1523
+  Position: 12
+  OffchainOrder: 1498
+  SchwabAuth: migrated
+```
+
+**3. Verify migration (optional but recommended):**
+
+```bash
+# Check event counts
+sqlite3 data/schwab.db "SELECT aggregate_type, COUNT(*) FROM events GROUP BY aggregate_type;"
+```
+
+### Options
+
+| Flag             | Values                           | Description                                                    |
+| ---------------- | -------------------------------- | -------------------------------------------------------------- |
+| `--execution`    | `commit` (default), `dry-run`    | Whether to persist events or just preview                      |
+| `--confirmation` | `interactive` (default), `force` | Whether to prompt for confirmations or skip prompts            |
+| `--clean`        | `preserve` (default), `delete`   | Whether to keep existing events or delete all before migrating |
+| `--database-url` | Path                             | SQLite database path (or set `DATABASE_URL` env var)           |
+
+### Common Scenarios
+
+**Re-run migration after fixing data:**
+
+```bash
+# Clean all events and re-migrate
+cargo run --bin migrate_to_events -- --clean delete --confirmation force
+```
+
+**Automated/CI usage:**
+
+```bash
+# Skip all prompts
+cargo run --bin migrate_to_events -- --confirmation force
+```
+
+**Migration from different database:**
+
+```bash
+cargo run --bin migrate_to_events -- --database-url sqlite:path/to/other.db
+```
+
+### Troubleshooting
+
+**"Events detected for OnChainTrade. Continue? [y/N]"**
+
+- Already migrated. Use `--confirmation force` to proceed anyway
+- Or use `--clean delete` to remove existing events and re-migrate
+
+**Migration fails with data validation error:**
+
+- Migration uses fail-fast behavior for data integrity
+- Check error message for specific issue (invalid symbol, negative amount, etc.)
+- Fix source data in legacy tables and re-run
+
+**Rollback:**
+
+```bash
+# Restore from backup
+mv data/schwab.db.backup data/schwab.db
+```
 
 ## Docker Deployment
 
@@ -312,7 +438,7 @@ to the `metrics_pnl` table, which is optimized for Grafana visualization.
 - **Precision Trade-off**: Slight precision loss from internal Decimal
   calculations is acceptable for analytics dashboards
 - **Source of Truth**: Full precision maintained in `onchain_trades` and
-  `schwab_executions` tables for auditing and reconciliation
+  `offchain_trades` tables for auditing and reconciliation
 - **FIFO Accounting**: Maintains in-memory inventory state per symbol, rebuilt
   on startup by replaying all trades
 - **Composite Checkpoint**: Resumes from the last
@@ -341,7 +467,7 @@ src/
 ├── offchain_order.rs   # OffChain order aggregate (CQRS/ES)
 ├── onchain/            # Blockchain event processing
 ├── offchain/           # Off-chain order execution
-├── conductor/          # Trade accumulation and broker orchestration
+├── conductor/          # Trade accumulation and execution orchestration
 ├── reporter/           # FIFO P&L calculation and metrics
 ├── symbol/             # Token symbol caching and locking
 ├── alpaca_wallet/      # Alpaca cryptocurrency wallet management
@@ -357,17 +483,18 @@ data/                   # SQLite databases (created at runtime)
 └── alpaca.db           # Alpaca instance database
 ```
 
-### `st0x-broker` (Broker Abstraction Library)
+### `st0x-execution` (Trade Execution Library)
 
-Standalone library providing unified broker trait:
+Standalone library for executing trades across different brokerages:
 
 ```
 src/
-├── lib.rs              # Broker trait and shared types
-├── schwab/             # Charles Schwab integration (with auth/ submodule)
-├── alpaca/             # Alpaca Markets integration
-├── order/              # Shared order types (MarketOrder, OrderState)
-└── mock.rs             # Mock broker for testing
+├── lib.rs                 # Executor trait, domain types, exports
+├── schwab/                # Charles Schwab integration (with auth/ submodule)
+├── alpaca_trading_api/    # Alpaca Trading API integration
+├── alpaca_broker_api/     # Alpaca Broker API integration (managed accounts)
+├── order/                 # Shared order types (MarketOrder, OrderState)
+└── mock.rs                # Mock implementation for testing
 ```
 
 ## Development
@@ -383,7 +510,7 @@ cargo test -q
 
 # Run specific crate tests
 cargo test -p st0x-hedge -q
-cargo test -p st0x-broker -q
+cargo test -p st0x-execution -q
 ```
 
 ### Code Quality
@@ -397,9 +524,6 @@ cargo clippy --all-targets --all-features -- -D clippy::all
 
 # Run static analysis
 rainix-rs-static
-
-# Generate test coverage
-nix run .#checkTestCoverage
 ```
 
 ## Documentation
@@ -446,7 +570,7 @@ Every trade gets a row in `metrics_pnl`:
 ### Example: Market Making tAAPL
 
 This example demonstrates P&L calculation across both venues (onchain Raindex
-and offchain Schwab).
+and offchain execution).
 
 | Step | Source   | Side | Qty | Price   | Lots Consumed (FIFO)           | Realized P&L Calculation                            | Realized P&L | Cum P&L    | Net Pos | Inventory After                      | Notes                                        |
 | ---- | -------- | ---- | --- | ------- | ------------------------------ | --------------------------------------------------- | ------------ | ---------- | ------- | ------------------------------------ | -------------------------------------------- |
@@ -471,7 +595,7 @@ and offchain Schwab).
 3. **Parse Trade**: Extract details (symbol, amount, direction, price) from
    blockchain events
 4. **Accumulate**: Batch fractional positions in database until ≥1.0 shares
-5. **Hedge**: Execute offsetting market order on traditional broker to reduce
+5. **Hedge**: Execute offsetting market order on traditional brokerage to reduce
    exposure
 6. **Track**: Maintain complete audit trail linking onchain fills to offchain
    hedges
@@ -481,6 +605,6 @@ onchain order price and offchain hedge execution price) while hedging
 directional exposure.
 
 **Note**: While Alpaca Markets supports fractional share trading (minimum $1
-worth), the current implementation uses uniform batching logic for all brokers.
-This may be reconfigured in the future to allow immediate fractional execution
-when using Alpaca.
+worth), the current implementation uses uniform batching logic for all
+brokerages. This may be reconfigured in the future to allow immediate fractional
+execution when using Alpaca.

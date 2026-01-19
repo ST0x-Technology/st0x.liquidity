@@ -5,10 +5,10 @@ use std::fmt;
 use std::str::FromStr;
 
 use crate::error::{OnChainError, TradeValidationError};
-use st0x_broker::{Direction, Symbol};
+use st0x_execution::{Direction, Symbol};
 
-/// Macro to create a TokenizedEquitySymbol.
-/// This macro provides a convenient way to create tokenized equity symbols.
+/// Test-only macro to create a TokenizedEquitySymbol.
+#[cfg(test)]
 #[macro_export]
 macro_rules! tokenized_symbol {
     ($symbol:expr) => {
@@ -16,14 +16,12 @@ macro_rules! tokenized_symbol {
     };
 }
 
-// The macro is available via the crate::tokenized_symbol path
-
-/// Macro to create a Symbol.
-/// This macro provides a convenient way to create symbols.
+/// Test-only macro to create a Symbol.
+#[cfg(test)]
 #[macro_export]
 macro_rules! symbol {
     ($symbol:expr) => {
-        st0x_broker::Symbol::new($symbol).unwrap()
+        st0x_execution::Symbol::new($symbol).unwrap()
     };
 }
 
@@ -45,7 +43,8 @@ impl Shares {
 }
 
 /// Represents a validated USDC amount (non-negative)
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, sqlx::Type)]
+#[sqlx(transparent)]
 pub(crate) struct Usdc(f64);
 
 impl Usdc {
@@ -238,17 +237,17 @@ fn determine_schwab_trade_details(
     onchain_output_symbol: &str,
 ) -> Result<(Symbol, Direction), OnChainError> {
     // USDC input + tokenized stock output = sold tokenized stock onchain
-    if onchain_input_symbol == "USDC" {
-        if let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_output_symbol) {
-            return Ok((tokenized.base().clone(), Direction::Sell));
-        }
+    if onchain_input_symbol == "USDC"
+        && let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_output_symbol)
+    {
+        return Ok((tokenized.base().clone(), Direction::Sell));
     }
 
     // tokenized stock input + USDC output = bought tokenized stock onchain
-    if onchain_output_symbol == "USDC" {
-        if let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_input_symbol) {
-            return Ok((tokenized.base().clone(), Direction::Buy));
-        }
+    if onchain_output_symbol == "USDC"
+        && let Ok(tokenized) = TokenizedEquitySymbol::parse(onchain_input_symbol)
+    {
+        return Ok((tokenized.base().clone(), Direction::Buy));
     }
 
     Err(TradeValidationError::InvalidSymbolConfiguration(
@@ -297,13 +296,13 @@ mod tests {
         // These fail because after stripping the marker, we're left with an empty string
         // which fails Symbol validation with "Symbol cannot be empty"
         let error = TokenizedEquitySymbol::parse("0x").unwrap_err();
-        assert!(matches!(error, OnChainError::Broker(_)));
+        assert!(matches!(error, OnChainError::EmptySymbol(_)));
 
         let error = TokenizedEquitySymbol::parse("s1").unwrap_err();
-        assert!(matches!(error, OnChainError::Broker(_)));
+        assert!(matches!(error, OnChainError::EmptySymbol(_)));
 
         let error = TokenizedEquitySymbol::parse("t").unwrap_err();
-        assert!(matches!(error, OnChainError::Broker(_)));
+        assert!(matches!(error, OnChainError::EmptySymbol(_)));
     }
 
     #[test]
