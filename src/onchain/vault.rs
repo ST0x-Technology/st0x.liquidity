@@ -14,10 +14,12 @@
 use alloy::primitives::{Address, B256, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::signers::Signer;
+use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 
 use crate::bindings::IOrderBookV5;
 use crate::cctp::Evm;
+use crate::error_decoding::handle_contract_error;
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
@@ -32,6 +34,8 @@ pub(crate) enum VaultError {
     Transaction(#[from] alloy::providers::PendingTransactionError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
+    #[error("Contract reverted: {0}")]
+    Revert(#[from] AbiDecodedErrorType),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
     #[error("Amount cannot be zero")]
@@ -103,12 +107,16 @@ where
 
         let tasks = Vec::new();
 
-        let receipt = contract
+        let pending = match contract
             .deposit3(token, vault_id.0, amount_float.get_inner(), tasks)
             .send()
-            .await?
-            .get_receipt()
-            .await?;
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
+
+        let receipt = pending.get_receipt().await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -144,12 +152,16 @@ where
 
         let tasks = Vec::new();
 
-        let receipt = contract
+        let pending = match contract
             .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
             .send()
-            .await?
-            .get_receipt()
-            .await?;
+            .await
+        {
+            Ok(pending) => pending,
+            Err(e) => return Err(handle_contract_error(e).await),
+        };
+
+        let receipt = pending.get_receipt().await?;
 
         Ok(receipt.transaction_hash)
     }
