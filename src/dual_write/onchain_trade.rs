@@ -45,7 +45,7 @@ pub(crate) async fn witness_trade(
 mod tests {
     use alloy::primitives::fixed_bytes;
     use chrono::Utc;
-    use st0x_broker::Direction;
+    use st0x_execution::Direction;
 
     use super::*;
     use crate::onchain::io::{TokenizedEquitySymbol, Usdc};

@@ -1,8 +1,8 @@
 use sqlx::SqlitePool;
 
 use crate::error::OnChainError;
-use st0x_broker::{
-    Direction, OrderState, OrderStatus, PersistenceError, Shares, SupportedBroker, Symbol,
+use st0x_execution::{
+    Direction, OrderState, OrderStatus, PersistenceError, Shares, SupportedExecutor, Symbol,
 };
 
 #[derive(sqlx::FromRow)]
@@ -34,7 +34,7 @@ fn row_to_execution(
     }: ExecutionRow,
 ) -> Result<OffchainExecution, OnChainError> {
     let parsed_direction = direction.parse()?;
-    let parsed_broker = broker.parse()?;
+    let parsed_executor = broker.parse()?;
     let status_enum = status.parse()?;
     let parsed_state = OrderState::from_db_row(status_enum, order_id, price_cents, executed_at)
         .map_err(|e| {
@@ -50,7 +50,7 @@ fn row_to_execution(
         symbol: Symbol::new(symbol)?,
         shares: Shares::new(shares_u64)?,
         direction: parsed_direction,
-        broker: parsed_broker,
+        executor: parsed_executor,
         state: parsed_state,
     })
 }
@@ -61,7 +61,7 @@ pub(crate) struct OffchainExecution {
     pub(crate) symbol: Symbol,
     pub(crate) shares: Shares,
     pub(crate) direction: Direction,
-    pub(crate) broker: SupportedBroker,
+    pub(crate) executor: SupportedExecutor,
     pub(crate) state: OrderState,
 }
 
@@ -69,7 +69,7 @@ pub(crate) async fn find_executions_by_symbol_status_and_broker(
     pool: &SqlitePool,
     symbol: Option<Symbol>,
     status: OrderStatus,
-    broker: Option<SupportedBroker>,
+    broker: Option<SupportedExecutor>,
 ) -> Result<Vec<OffchainExecution>, OnChainError> {
     let status_str = status.as_str();
 
@@ -246,7 +246,7 @@ impl OffchainExecution {
                 &self.symbol,
                 self.shares,
                 self.direction,
-                self.broker,
+                self.executor,
             )
             .await
     }
@@ -257,7 +257,7 @@ mod tests {
     use super::*;
     use crate::test_utils::{OffchainExecutionBuilder, setup_test_db};
     use chrono::Utc;
-    use st0x_broker::OrderState;
+    use st0x_execution::OrderState;
 
     #[tokio::test]
     async fn test_offchain_execution_save_and_find() {
@@ -290,7 +290,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(50).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -299,7 +299,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Shares::new(25).unwrap(),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
                 executed_at: Utc::now(),
                 order_id: "1004055538123".to_string(),
@@ -312,7 +312,7 @@ mod tests {
             symbol: Symbol::new("MSFT").unwrap(),
             shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -369,119 +369,115 @@ mod tests {
         ));
     }
 
+    async fn save_execution(pool: &SqlitePool, execution: OffchainExecution) -> i64 {
+        let mut sql_tx = pool.begin().await.unwrap();
+        let id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+        id
+    }
+
+    async fn find_by_executor(
+        pool: &SqlitePool,
+        executor: SupportedExecutor,
+    ) -> Vec<OffchainExecution> {
+        find_executions_by_symbol_status_and_broker(
+            pool,
+            None,
+            OrderStatus::Pending,
+            Some(executor),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn make_execution(
+        symbol: &str,
+        shares: u64,
+        direction: Direction,
+        executor: SupportedExecutor,
+    ) -> OffchainExecution {
+        OffchainExecution {
+            id: None,
+            symbol: Symbol::new(symbol).unwrap(),
+            shares: Shares::new(shares).unwrap(),
+            direction,
+            executor,
+            state: OrderState::Pending,
+        }
+    }
+
     #[tokio::test]
     async fn test_database_tracks_different_brokers() {
         let pool = setup_test_db().await;
 
-        let schwab_execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(100).unwrap(),
-            direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
-            state: OrderState::Pending,
-        };
+        let schwab_id = save_execution(
+            &pool,
+            make_execution("AAPL", 100, Direction::Buy, SupportedExecutor::Schwab),
+        )
+        .await;
+        let alpaca_id = save_execution(
+            &pool,
+            make_execution(
+                "TSLA",
+                50,
+                Direction::Sell,
+                SupportedExecutor::AlpacaTradingApi,
+            ),
+        )
+        .await;
+        let dry_run_id = save_execution(
+            &pool,
+            make_execution("MSFT", 25, Direction::Buy, SupportedExecutor::DryRun),
+        )
+        .await;
 
-        let alpaca_execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("TSLA").unwrap(),
-            shares: Shares::new(50).unwrap(),
-            direction: Direction::Sell,
-            broker: SupportedBroker::Alpaca,
-            state: OrderState::Pending,
-        };
-
-        let dry_run_execution = OffchainExecution {
-            id: None,
-            symbol: Symbol::new("MSFT").unwrap(),
-            shares: Shares::new(25).unwrap(),
-            direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
-            state: OrderState::Pending,
-        };
-
-        let mut sql_tx1 = pool.begin().await.unwrap();
-        let schwab_id = schwab_execution
-            .save_within_transaction(&mut sql_tx1)
-            .await
-            .unwrap();
-        sql_tx1.commit().await.unwrap();
-
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let alpaca_id = alpaca_execution
-            .save_within_transaction(&mut sql_tx2)
-            .await
-            .unwrap();
-        sql_tx2.commit().await.unwrap();
-
-        let mut sql_tx3 = pool.begin().await.unwrap();
-        let dry_run_id = dry_run_execution
-            .save_within_transaction(&mut sql_tx3)
-            .await
-            .unwrap();
-        sql_tx3.commit().await.unwrap();
-
-        let schwab_retrieved = find_execution_by_id(&pool, schwab_id)
+        let schwab = find_execution_by_id(&pool, schwab_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(schwab_retrieved.broker, SupportedBroker::Schwab);
-        assert_eq!(schwab_retrieved.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(schwab_retrieved.shares, Shares::new(100).unwrap());
+        assert_eq!(schwab.executor, SupportedExecutor::Schwab);
+        assert_eq!(schwab.symbol, Symbol::new("AAPL").unwrap());
 
-        let alpaca_retrieved = find_execution_by_id(&pool, alpaca_id)
+        let alpaca = find_execution_by_id(&pool, alpaca_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(alpaca_retrieved.broker, SupportedBroker::Alpaca);
-        assert_eq!(alpaca_retrieved.symbol, Symbol::new("TSLA").unwrap());
-        assert_eq!(alpaca_retrieved.shares, Shares::new(50).unwrap());
+        assert_eq!(alpaca.executor, SupportedExecutor::AlpacaTradingApi);
+        assert_eq!(alpaca.symbol, Symbol::new("TSLA").unwrap());
 
-        let dry_run_retrieved = find_execution_by_id(&pool, dry_run_id)
+        let dry_run = find_execution_by_id(&pool, dry_run_id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(dry_run_retrieved.broker, SupportedBroker::DryRun);
-        assert_eq!(dry_run_retrieved.symbol, Symbol::new("MSFT").unwrap());
-        assert_eq!(dry_run_retrieved.shares, Shares::new(25).unwrap());
+        assert_eq!(dry_run.executor, SupportedExecutor::DryRun);
+        assert_eq!(dry_run.symbol, Symbol::new("MSFT").unwrap());
 
-        let all_pending =
+        let all =
             find_executions_by_symbol_status_and_broker(&pool, None, OrderStatus::Pending, None)
                 .await
                 .unwrap();
-        assert_eq!(all_pending.len(), 3);
+        assert_eq!(all.len(), 3);
 
-        let schwab_only = find_executions_by_symbol_status_and_broker(
-            &pool,
-            None,
-            OrderStatus::Pending,
-            Some(SupportedBroker::Schwab),
-        )
-        .await
-        .unwrap();
-        assert_eq!(schwab_only.len(), 1);
-        assert_eq!(schwab_only[0].broker, SupportedBroker::Schwab);
-
-        let alpaca_only = find_executions_by_symbol_status_and_broker(
-            &pool,
-            None,
-            OrderStatus::Pending,
-            Some(SupportedBroker::Alpaca),
-        )
-        .await
-        .unwrap();
-        assert_eq!(alpaca_only.len(), 1);
-        assert_eq!(alpaca_only[0].broker, SupportedBroker::Alpaca);
-
-        let dry_run_only = find_executions_by_symbol_status_and_broker(
-            &pool,
-            None,
-            OrderStatus::Pending,
-            Some(SupportedBroker::DryRun),
-        )
-        .await
-        .unwrap();
-        assert_eq!(dry_run_only.len(), 1);
-        assert_eq!(dry_run_only[0].broker, SupportedBroker::DryRun);
+        assert_eq!(
+            find_by_executor(&pool, SupportedExecutor::Schwab)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            find_by_executor(&pool, SupportedExecutor::AlpacaTradingApi)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            find_by_executor(&pool, SupportedExecutor::DryRun)
+                .await
+                .len(),
+            1
+        );
     }
 }

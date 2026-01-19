@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, SupportedBroker, Symbol};
+use st0x_execution::{Direction, SupportedExecutor, Symbol};
 use tracing::error;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
@@ -31,14 +31,14 @@ pub(crate) enum OffchainOrder {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
     },
     Submitted {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         broker_order_id: BrokerOrderId,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
@@ -48,7 +48,7 @@ pub(crate) enum OffchainOrder {
         shares: FractionalShares,
         shares_filled: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         broker_order_id: BrokerOrderId,
         avg_price_cents: PriceCents,
         placed_at: DateTime<Utc>,
@@ -59,7 +59,7 @@ pub(crate) enum OffchainOrder {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         broker_order_id: BrokerOrderId,
         price_cents: PriceCents,
         placed_at: DateTime<Utc>,
@@ -70,7 +70,7 @@ pub(crate) enum OffchainOrder {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         error: String,
         placed_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
@@ -132,7 +132,7 @@ impl OffchainOrder {
             symbol,
             shares,
             direction,
-            broker,
+            executor,
             placed_at,
         } = order
         else {
@@ -146,7 +146,7 @@ impl OffchainOrder {
             symbol: symbol.clone(),
             shares: *shares,
             direction: *direction,
-            broker: *broker,
+            executor: *executor,
             broker_order_id: broker_order_id.clone(),
             placed_at: *placed_at,
             submitted_at,
@@ -165,7 +165,7 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 broker_order_id,
                 placed_at,
                 submitted_at,
@@ -174,7 +174,7 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 broker_order_id,
                 placed_at,
                 submitted_at,
@@ -184,7 +184,7 @@ impl OffchainOrder {
                 shares: *shares,
                 shares_filled,
                 direction: *direction,
-                broker: *broker,
+                executor: *executor,
                 broker_order_id: broker_order_id.clone(),
                 avg_price_cents,
                 placed_at: *placed_at,
@@ -212,7 +212,7 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 broker_order_id,
                 placed_at,
                 submitted_at,
@@ -221,7 +221,7 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 broker_order_id,
                 placed_at,
                 submitted_at,
@@ -230,7 +230,7 @@ impl OffchainOrder {
                 symbol: symbol.clone(),
                 shares: *shares,
                 direction: *direction,
-                broker: *broker,
+                executor: *executor,
                 broker_order_id: broker_order_id.clone(),
                 price_cents,
                 placed_at: *placed_at,
@@ -258,14 +258,14 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 placed_at,
             }
             | Self::Submitted {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 placed_at,
                 ..
             }
@@ -273,14 +273,14 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 placed_at,
                 ..
             } => Ok(Self::Failed {
                 symbol: symbol.clone(),
                 shares: *shares,
                 direction: *direction,
-                broker: *broker,
+                executor: *executor,
                 error: error.to_string(),
                 placed_at: *placed_at,
                 failed_at,
@@ -299,13 +299,13 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 placed_at,
             } => Ok(Self::Pending {
                 symbol: symbol.clone(),
                 shares: *shares,
                 direction: *direction,
-                broker: *broker,
+                executor: *executor,
                 placed_at: *placed_at,
             }),
 
@@ -313,7 +313,7 @@ impl OffchainOrder {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 status,
                 broker_order_id,
                 price_cents,
@@ -324,14 +324,14 @@ impl OffchainOrder {
                     symbol: symbol.clone(),
                     shares: *shares,
                     direction: *direction,
-                    broker: *broker,
+                    executor: *executor,
                     placed_at: executed_at.unwrap_or(*migrated_at),
                 }),
                 MigratedOrderStatus::Submitted => Ok(Self::Submitted {
                     symbol: symbol.clone(),
                     shares: *shares,
                     direction: *direction,
-                    broker: *broker,
+                    executor: *executor,
                     broker_order_id: broker_order_id
                         .clone()
                         .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
@@ -342,7 +342,7 @@ impl OffchainOrder {
                     symbol: symbol.clone(),
                     shares: *shares,
                     direction: *direction,
-                    broker: *broker,
+                    executor: *executor,
                     broker_order_id: broker_order_id
                         .clone()
                         .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
@@ -355,7 +355,7 @@ impl OffchainOrder {
                     symbol: symbol.clone(),
                     shares: *shares,
                     direction: *direction,
-                    broker: *broker,
+                    executor: *executor,
                     error: error.clone(),
                     placed_at: *migrated_at,
                     failed_at: executed_at.unwrap_or(*migrated_at),
@@ -400,7 +400,7 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
                     symbol,
                     shares,
                     direction,
-                    broker,
+                    executor,
                     status,
                     broker_order_id,
                     price_cents,
@@ -410,7 +410,7 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
                 symbol: symbol.clone(),
                 shares: *shares,
                 direction: *direction,
-                broker: *broker,
+                executor: *executor,
                 status: status.clone(),
                 broker_order_id: broker_order_id.clone(),
                 price_cents: *price_cents,
@@ -424,13 +424,13 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
                     symbol,
                     shares,
                     direction,
-                    broker,
+                    executor,
                 },
             ) => Ok(vec![OffchainOrderEvent::Placed {
                 symbol: symbol.clone(),
                 shares: *shares,
                 direction: *direction,
-                broker: *broker,
+                executor: *executor,
                 placed_at: Utc::now(),
             }]),
 
@@ -536,7 +536,7 @@ pub(crate) enum OffchainOrderView {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         status: ExecutionStatus,
         broker_order_id: Option<BrokerOrderId>,
         price_cents: Option<PriceCents>,
@@ -568,7 +568,7 @@ impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 status,
                 broker_order_id,
                 price_cents,
@@ -587,7 +587,7 @@ impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
                     symbol: symbol.clone(),
                     shares: *shares,
                     direction: *direction,
-                    broker: *broker,
+                    executor: *executor,
                     status,
                     broker_order_id: broker_order_id.clone(),
                     price_cents: *price_cents,
@@ -599,7 +599,7 @@ impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
                 symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 placed_at,
             } => {
                 self.handle_placed(
@@ -607,7 +607,7 @@ impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
                     symbol.clone(),
                     *shares,
                     *direction,
-                    *broker,
+                    *executor,
                     *placed_at,
                 );
             }
@@ -639,7 +639,7 @@ impl OffchainOrderView {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
     ) {
         *self = Self::Execution {
@@ -647,7 +647,7 @@ impl OffchainOrderView {
             symbol,
             shares,
             direction,
-            broker,
+            executor,
             status: ExecutionStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -743,7 +743,7 @@ pub(crate) enum OffchainOrderCommand {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         status: MigratedOrderStatus,
         broker_order_id: Option<BrokerOrderId>,
         price_cents: Option<PriceCents>,
@@ -753,7 +753,7 @@ pub(crate) enum OffchainOrderCommand {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
     },
     ConfirmSubmission {
         broker_order_id: BrokerOrderId,
@@ -818,7 +818,7 @@ pub(crate) enum OffchainOrderEvent {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         status: MigratedOrderStatus,
         broker_order_id: Option<BrokerOrderId>,
         price_cents: Option<PriceCents>,
@@ -829,7 +829,7 @@ pub(crate) enum OffchainOrderEvent {
         symbol: Symbol,
         shares: FractionalShares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
         placed_at: DateTime<Utc>,
     },
     Submitted {
@@ -884,7 +884,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
         };
 
         let events = order.handle(command, &()).await.unwrap();
@@ -906,7 +906,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
         });
 
@@ -914,7 +914,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
         };
 
         let result = order.handle(command, &()).await;
@@ -928,7 +928,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             price_cents: PriceCents(15000),
             placed_at: Utc::now(),
@@ -940,7 +940,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
         };
 
         let result = order.handle(command, &()).await;
@@ -954,7 +954,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             error: "Market closed".to_string(),
             placed_at: Utc::now(),
             failed_at: Utc::now(),
@@ -964,7 +964,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
         };
 
         let result = order.handle(command, &()).await;
@@ -978,7 +978,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
         });
 
@@ -1021,7 +1021,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1045,7 +1045,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1079,7 +1079,7 @@ mod tests {
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(50)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             avg_price_cents: PriceCents(15000),
             placed_at: Utc::now(),
@@ -1111,7 +1111,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1141,7 +1141,7 @@ mod tests {
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(75)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             avg_price_cents: PriceCents(15000),
             placed_at: Utc::now(),
@@ -1171,7 +1171,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
         });
 
@@ -1190,7 +1190,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             price_cents: PriceCents(15000),
             placed_at: Utc::now(),
@@ -1213,7 +1213,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
         });
 
@@ -1240,7 +1240,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1269,7 +1269,7 @@ mod tests {
             shares: FractionalShares(dec!(100)),
             shares_filled: FractionalShares(dec!(50)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             avg_price_cents: PriceCents(15000),
             placed_at: Utc::now(),
@@ -1299,7 +1299,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             price_cents: PriceCents(15000),
             placed_at: Utc::now(),
@@ -1324,7 +1324,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -1348,7 +1348,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
             price_cents: None,
@@ -1372,7 +1372,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
             broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
             price_cents: Some(PriceCents(15000)),
@@ -1396,7 +1396,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Failed {
                 error: "Insufficient funds".to_string(),
             },
@@ -1424,7 +1424,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(100.5)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -1450,7 +1450,7 @@ mod tests {
             symbol: view_symbol,
             shares,
             direction,
-            broker,
+            executor,
             status,
             broker_order_id,
             price_cents,
@@ -1465,7 +1465,7 @@ mod tests {
         assert_eq!(view_symbol, symbol);
         assert_eq!(shares, FractionalShares(dec!(100.5)));
         assert_eq!(direction, Direction::Buy);
-        assert_eq!(broker, SupportedBroker::Schwab);
+        assert_eq!(executor, SupportedExecutor::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
         assert_eq!(broker_order_id, None);
         assert_eq!(price_cents, None);
@@ -1483,7 +1483,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(50.0)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Alpaca,
+            executor: SupportedExecutor::AlpacaTradingApi,
             status: MigratedOrderStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
             price_cents: None,
@@ -1533,7 +1533,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(25.75)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
             broker_order_id: Some(BrokerOrderId("ORD456".to_string())),
             price_cents: Some(PriceCents(45025)),
@@ -1583,7 +1583,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(10.0)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Alpaca,
+            executor: SupportedExecutor::AlpacaTradingApi,
             status: MigratedOrderStatus::Failed {
                 error: "Insufficient funds".to_string(),
             },
@@ -1634,7 +1634,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(75.25)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at,
         };
 
@@ -1653,7 +1653,7 @@ mod tests {
             symbol: view_symbol,
             shares,
             direction,
-            broker,
+            executor,
             status,
             broker_order_id,
             price_cents,
@@ -1668,7 +1668,7 @@ mod tests {
         assert_eq!(view_symbol, symbol);
         assert_eq!(shares, FractionalShares(dec!(75.25)));
         assert_eq!(direction, Direction::Buy);
-        assert_eq!(broker, SupportedBroker::Schwab);
+        assert_eq!(executor, SupportedExecutor::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
         assert_eq!(broker_order_id, None);
         assert_eq!(price_cents, None);
@@ -1688,7 +1688,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(50.0)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Alpaca,
+            executor: SupportedExecutor::AlpacaTradingApi,
             status: ExecutionStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -1735,7 +1735,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(100.0)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: ExecutionStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD999".to_string())),
             price_cents: None,
@@ -1777,7 +1777,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(30.0)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Alpaca,
+            executor: SupportedExecutor::AlpacaTradingApi,
             status: ExecutionStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD111".to_string())),
             price_cents: None,
@@ -1826,7 +1826,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(200.0)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: ExecutionStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD222".to_string())),
             price_cents: None,
@@ -1955,7 +1955,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(100.0)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -1984,7 +1984,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(50.0)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Alpaca,
+            executor: SupportedExecutor::AlpacaTradingApi,
             placed_at: chrono::Utc::now(),
         };
 
@@ -2023,7 +2023,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -2038,7 +2038,7 @@ mod tests {
                 symbol: evt_symbol,
                 shares,
                 direction,
-                broker,
+                executor,
                 status,
                 broker_order_id,
                 price_cents,
@@ -2048,7 +2048,7 @@ mod tests {
                 assert_eq!(evt_symbol, &symbol);
                 assert_eq!(shares.0, dec!(100));
                 assert_eq!(direction, &Direction::Buy);
-                assert_eq!(broker, &SupportedBroker::Schwab);
+                assert_eq!(executor, &SupportedExecutor::Schwab);
                 assert!(matches!(status, MigratedOrderStatus::Pending));
                 assert!(broker_order_id.is_none());
                 assert!(price_cents.is_none());
@@ -2068,7 +2068,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -2089,7 +2089,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
             price_cents: None,
@@ -2110,7 +2110,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
             broker_order_id: Some(BrokerOrderId("ORD456".to_string())),
             price_cents: Some(PriceCents(20000)),
@@ -2131,7 +2131,7 @@ mod tests {
             symbol,
             shares: FractionalShares(dec!(50)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Failed {
                 error: "Insufficient funds".to_string(),
             },
@@ -2155,7 +2155,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
         });
 
@@ -2163,7 +2163,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(50)),
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
@@ -2187,7 +2187,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             placed_at: Utc::now(),
         });
 

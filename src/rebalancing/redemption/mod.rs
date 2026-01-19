@@ -10,7 +10,7 @@ pub(crate) mod mock;
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use thiserror::Error;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;

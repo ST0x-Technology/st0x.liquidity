@@ -1,7 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::OrderStatus;
-use crate::{BrokerError, Direction, Shares, SupportedBroker, Symbol};
+use crate::{Direction, ExecutionError, Shares, SupportedExecutor, Symbol};
 
 /// Database fields extracted from OrderState for storage
 #[derive(Debug)]
@@ -46,25 +46,19 @@ impl OrderState {
         order_id: Option<String>,
         price_cents: Option<i64>,
         executed_at: Option<chrono::NaiveDateTime>,
-    ) -> Result<Self, BrokerError> {
+    ) -> Result<Self, ExecutionError> {
         match status {
             OrderStatus::Pending => Ok(Self::Pending),
             OrderStatus::Submitted => {
-                let order_id = order_id.ok_or_else(|| BrokerError::InvalidOrder {
-                    reason: "SUBMITTED requires order_id".to_string(),
-                })?;
+                let order_id = order_id.ok_or(ExecutionError::MissingOrderId { status })?;
                 Ok(Self::Submitted { order_id })
             }
             OrderStatus::Filled => {
-                let order_id = order_id.ok_or_else(|| BrokerError::InvalidOrder {
-                    reason: "FILLED requires order_id".to_string(),
-                })?;
-                let price_cents = price_cents.ok_or_else(|| BrokerError::InvalidOrder {
-                    reason: "FILLED requires price_cents".to_string(),
-                })?;
-                let executed_at = executed_at.ok_or_else(|| BrokerError::InvalidOrder {
-                    reason: "FILLED requires executed_at".to_string(),
-                })?;
+                let order_id = order_id.ok_or(ExecutionError::MissingOrderId { status })?;
+                let price_cents =
+                    price_cents.ok_or(ExecutionError::MissingPriceCents { status })?;
+                let executed_at =
+                    executed_at.ok_or(ExecutionError::MissingExecutedAt { status })?;
                 Ok(Self::Filled {
                     executed_at: Utc.from_utc_datetime(&executed_at),
                     order_id,
@@ -72,9 +66,7 @@ impl OrderState {
                 })
             }
             OrderStatus::Failed => {
-                let failed_at = executed_at.ok_or_else(|| BrokerError::InvalidOrder {
-                    reason: "FAILED requires executed_at timestamp".to_string(),
-                })?;
+                let failed_at = executed_at.ok_or(ExecutionError::MissingExecutedAt { status })?;
                 Ok(Self::Failed {
                     failed_at: Utc.from_utc_datetime(&failed_at),
                     error_reason: None, // We don't store error_reason in database yet
@@ -119,7 +111,7 @@ impl OrderState {
         symbol: &Symbol,
         shares: Shares,
         direction: Direction,
-        broker: SupportedBroker,
+        executor: SupportedExecutor,
     ) -> Result<i64, crate::PersistenceError> {
         let status_str = self.status().as_str();
         let db_fields = self.to_db_fields()?;
@@ -127,7 +119,7 @@ impl OrderState {
         let symbol_str = symbol.to_string();
         let shares_i64 = i64::from(shares.value());
         let direction_str = direction.as_str();
-        let broker_str = broker.to_string();
+        let executor_str = executor.to_string();
 
         let result = sqlx::query!(
             r#"
@@ -146,7 +138,7 @@ impl OrderState {
             symbol_str,
             shares_i64,
             direction_str,
-            broker_str,
+            executor_str,
             db_fields.order_id,
             db_fields.price_cents,
             status_str,
@@ -158,7 +150,7 @@ impl OrderState {
         Ok(result.last_insert_rowid())
     }
 
-    pub(crate) fn to_db_fields(&self) -> Result<OrderStateDbFields, BrokerError> {
+    pub(crate) fn to_db_fields(&self) -> Result<OrderStateDbFields, ExecutionError> {
         match self {
             Self::Pending => Ok(OrderStateDbFields {
                 order_id: None,
@@ -265,7 +257,12 @@ mod tests {
     #[test]
     fn test_from_db_row_submitted_missing_order_id() {
         let result = OrderState::from_db_row(OrderStatus::Submitted, None, None, None);
-        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MissingOrderId {
+                status: OrderStatus::Submitted
+            }
+        ));
     }
 
     #[test]
@@ -273,7 +270,12 @@ mod tests {
         let timestamp = Utc::now().naive_utc();
         let result =
             OrderState::from_db_row(OrderStatus::Filled, None, Some(15000), Some(timestamp));
-        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MissingOrderId {
+                status: OrderStatus::Filled
+            }
+        ));
     }
 
     #[test]
@@ -285,7 +287,12 @@ mod tests {
             None,
             Some(timestamp),
         );
-        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MissingPriceCents {
+                status: OrderStatus::Filled
+            }
+        ));
     }
 
     #[test]
@@ -296,13 +303,23 @@ mod tests {
             Some(15000),
             None,
         );
-        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MissingExecutedAt {
+                status: OrderStatus::Filled
+            }
+        ));
     }
 
     #[test]
     fn test_from_db_row_failed_missing_executed_at() {
         let result = OrderState::from_db_row(OrderStatus::Failed, None, None, None);
-        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecutionError::MissingExecutedAt {
+                status: OrderStatus::Failed
+            }
+        ));
     }
 
     #[test]
