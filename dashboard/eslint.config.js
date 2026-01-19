@@ -56,7 +56,7 @@ export default [
       '@typescript-eslint/prefer-optional-chain': 'error',
       '@typescript-eslint/strict-boolean-expressions': 'error',
       '@typescript-eslint/switch-exhaustiveness-check': 'error',
-      'no-console': 'warn',
+      'no-console': 'off',
       eqeqeq: ['error', 'always'],
       'prefer-const': 'error',
       'no-var': 'error',
@@ -92,6 +92,13 @@ export default [
       'svelte/no-at-html-tags': 'error',
       'svelte/require-each-key': 'error',
       'svelte/valid-each-key': 'error',
+      'svelte/no-reactive-reassign': 'error',
+      'svelte/no-immutable-reactive-statements': 'error',
+      'svelte/no-reactive-literals': 'error',
+      // Disabled: gives false positives with Tailwind CSS utility classes
+      'svelte/no-unused-class-name': 'off',
+      'svelte/require-optimized-style-attribute': 'error',
+      'svelte/require-stores-init': 'error',
       'func-style': ['error', 'expression']
     }
   },

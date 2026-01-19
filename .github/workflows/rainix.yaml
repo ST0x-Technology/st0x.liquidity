@@ -103,8 +103,7 @@ jobs:
         run: nix develop -c bun run --cwd dashboard check
       - name: Lint
         run: nix develop -c bun run --cwd dashboard lint
-      # TODO: uncomment when test files are added in feat/dashboard-components
-      # - name: Test
-      #   run: nix develop -c bun run --cwd dashboard test:run
+      - name: Test
+        run: nix develop -c bun run --cwd dashboard test:run
       - name: Build
         run: nix develop -c bun run --cwd dashboard build
