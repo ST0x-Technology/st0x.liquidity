@@ -1,7 +1,7 @@
 use rust_decimal::{Decimal, prelude::One};
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::{info, warn};
 
 use super::{ExecutionMode, MigrationError};
@@ -83,7 +83,7 @@ pub async fn migrate_positions(
 mod tests {
     use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
-    use st0x_broker::Symbol;
+    use st0x_execution::Symbol;
 
     use super::{ExecutionMode, migrate_positions};
     use crate::position::Position;
@@ -281,7 +281,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            super::MigrationError::InvalidSymbol(_)
+            super::MigrationError::EmptySymbol(_)
         ));
     }
 }

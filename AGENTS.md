@@ -84,25 +84,25 @@ minimize delta exposure through automated hedging.
 This project uses a Cargo workspace with:
 
 - **Root crate (`st0x-hedge`)**: Main arbitrage bot application
-- **Broker crate (`st0x-broker`)**: Standalone broker abstraction library
+- **Execution crate (`st0x-execution`)**: Trade execution abstraction library
 
 ### Building & Running
 
 - `cargo build` - Build all workspace members
 - `cargo build -p st0x-hedge` - Build main crate only
-- `cargo build -p st0x-broker` - Build broker crate only
+- `cargo build -p st0x-execution` - Build execution crate only
 - `cargo run --bin server` - Run the main arbitrage bot
 - `cargo run --bin cli -- auth` - Run the authentication flow for Charles Schwab
   OAuth setup
 - `cargo run --bin cli -- test -t AAPL -q 100 -d buy` - Test trading
-  functionality with mock broker
+  functionality with mocked execution
 - `cargo run --bin cli` - Run the command-line interface for manual operations
 
 ### Testing
 
-- `cargo test -q` - Run all tests (both main and broker crates)
+- `cargo test -q` - Run all tests (both main and execution crates)
 - `cargo test -q --lib` - Run library tests only
-- `cargo test -p st0x-broker -q` - Run broker crate tests only
+- `cargo test -p st0x-execution -q` - Run execution crate tests only
 - `cargo test -p st0x-hedge -q` - Run main crate tests only
 - `cargo test -q <test_name>` - Run specific test
 
@@ -138,14 +138,12 @@ resolution and feature selection.
 - `cargo clippy --all-targets --all-features -- -D clippy::all` - Run Clippy for
   linting
 - `cargo fmt` - Format code
-- `cargo-tarpaulin --skip-clean --out Html` - Generate test coverage report
 
 ### Nix Development Environment
 
 - `nix develop` - Enter development shell with all dependencies
 - `nix run .#prepSolArtifacts` - Build Solidity artifacts for orderbook
   interface
-- `nix run .#checkTestCoverage` - Generate test coverage report
 
 ## Development Workflow Notes
 
@@ -167,30 +165,30 @@ This pattern ensures changes are reviewable before being applied.
 
 ## Architecture Overview
 
-### Broker Abstraction Layer
+### Execution Abstraction Layer
 
-**Design Principle**: The application uses a generic broker trait to support
+**Design Principle**: The application uses a generic `Executor` trait to support
 multiple trading platforms while maintaining type safety and zero-cost
 abstractions.
 
 **Key Architecture Points**:
 
-- Generic `Broker` trait with associated types (`Error`, `OrderId`, `Config`)
-- Main crate stays broker-agnostic via trait; broker-specific logic in
-  `st0x-broker` crate
+- Generic `Executor` trait with associated types (`Error`, `OrderId`, `Config`)
+- Main crate stays execution-agnostic via trait; execution-specific logic in
+  `st0x-execution` crate
 - Newtypes (`Symbol`, `Shares`, `Direction`) and enums prevent invalid states
-- Supported brokers: SchwabBroker (production), AlpacaBroker (production),
-  TestBroker (mock)
+- Supported implementations: SchwabExecutor, AlpacaTradingApi, AlpacaBrokerApi,
+  MockExecutor
 
 **Benefits**:
 
-- Zero changes to core bot logic when adding brokers
+- Zero changes to core bot logic when adding new implementations
 - Type safety via compile-time verification
-- Independent testing per broker
+- Independent testing per implementation
 - Zero-cost abstractions via generics (no dynamic dispatch)
 
-For detailed broker implementation requirements, module organization, and adding
-new brokers, see @crates/broker/AGENTS.md
+For detailed implementation requirements and module organization, see
+@crates/execution/AGENTS.md
 
 ### Core Event Processing Flow
 
@@ -640,7 +638,7 @@ returning values within expected bounds.
 ### Workflow Best Practices
 
 - **Always run tests, clippy, and formatters before handing over a piece of
-  work**
+  work** (skip if only documentation/markdown files were changed)
   - Run tests first, as changing tests can break clippy
   - Run clippy next, as fixing linting errors can break formatting
   - Deny warnings when running clippy
@@ -857,7 +855,7 @@ fn row_to_execution(row: ExecutionRow) -> Result<TradeExecution, Error> {
 ```
 
 This pattern applies across the entire workspace, including both the main crate
-and sub-crates like `st0x-broker`.
+and sub-crates like `st0x-execution`.
 
 #### Use `.unwrap` over boolean result assertions in tests
 

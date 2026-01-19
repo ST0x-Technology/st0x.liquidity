@@ -1,18 +1,17 @@
+use apca::Client;
 use apca::api::v2::{order, orders};
-use apca::{Client, RequestError};
 use chrono::Utc;
 use num_traits::ToPrimitive;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::{
-    BrokerError, Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Shares, Symbol,
-};
+use super::AlpacaTradingApiError;
+use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Shares, Symbol};
 
 pub(super) async fn place_market_order(
     client: &Client,
     market_order: MarketOrder,
-) -> Result<OrderPlacement<String>, BrokerError> {
+) -> Result<OrderPlacement<String>, AlpacaTradingApiError> {
     debug!(
         "Placing Alpaca market order: {} {} shares of {}",
         market_order.direction, market_order.shares, market_order.symbol
@@ -37,23 +36,7 @@ pub(super) async fn place_market_order(
         order::Amount::quantity(market_order.shares.value()),
     );
 
-    let order_response = client
-        .issue::<order::Create>(&order_request)
-        .await
-        .map_err(|e| match e {
-            RequestError::Endpoint(endpoint_error) => {
-                BrokerError::AlpacaRequest(format!("Order placement failed: {endpoint_error}"))
-            }
-            RequestError::Hyper(hyper_error) => {
-                BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
-            }
-            RequestError::HyperUtil(hyper_util_error) => {
-                BrokerError::AlpacaRequest(format!("HTTP util error: {hyper_util_error}"))
-            }
-            RequestError::Io(io_error) => {
-                BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
-            }
-        })?;
+    let order_response = client.issue::<order::Create>(&order_request).await?;
 
     let order_id = order_response.id.to_string();
 
@@ -69,35 +52,17 @@ pub(super) async fn place_market_order(
 pub(super) async fn get_order_status(
     client: &Client,
     order_id: &str,
-) -> Result<OrderUpdate<String>, BrokerError> {
+) -> Result<OrderUpdate<String>, AlpacaTradingApiError> {
     debug!("Querying Alpaca order status for order ID: {}", order_id);
 
-    let order_uuid = Uuid::parse_str(order_id)
-        .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid order ID format: {e}")))?;
+    let order_uuid = Uuid::parse_str(order_id)?;
 
     let alpaca_order_id = order::Id(order_uuid);
 
-    let order_response =
-        client
-            .issue::<order::Get>(&alpaca_order_id)
-            .await
-            .map_err(|e| match e {
-                RequestError::Endpoint(endpoint_error) => BrokerError::AlpacaRequest(format!(
-                    "Order status query failed: {endpoint_error}"
-                )),
-                RequestError::Hyper(hyper_error) => {
-                    BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
-                }
-                RequestError::HyperUtil(hyper_util_error) => {
-                    BrokerError::AlpacaRequest(format!("HTTP util error: {hyper_util_error}"))
-                }
-                RequestError::Io(io_error) => {
-                    BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
-                }
-            })?;
+    let order_response = client.issue::<order::Get>(&alpaca_order_id).await?;
 
     let symbol = Symbol::new(order_response.symbol.clone())
-        .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid symbol: {e}")))?;
+        .map_err(|e| AlpacaTradingApiError::InvalidOrder(e.to_string()))?;
 
     let shares = extract_shares_from_amount(&order_response.amount)?;
 
@@ -123,7 +88,7 @@ pub(super) async fn get_order_status(
 
 pub(super) async fn poll_pending_orders(
     client: &Client,
-) -> Result<Vec<OrderUpdate<String>>, BrokerError> {
+) -> Result<Vec<OrderUpdate<String>>, AlpacaTradingApiError> {
     debug!("Polling all pending Alpaca orders");
 
     let request = orders::ListReq {
@@ -132,29 +97,13 @@ pub(super) async fn poll_pending_orders(
         ..Default::default()
     };
 
-    let alpaca_orders = client
-        .issue::<orders::List>(&request)
-        .await
-        .map_err(|e| match e {
-            RequestError::Endpoint(endpoint_error) => {
-                BrokerError::AlpacaRequest(format!("Order listing failed: {endpoint_error}"))
-            }
-            RequestError::Hyper(hyper_error) => {
-                BrokerError::AlpacaRequest(format!("HTTP error: {hyper_error}"))
-            }
-            RequestError::HyperUtil(hyper_util_error) => {
-                BrokerError::AlpacaRequest(format!("HTTP util error: {hyper_util_error}"))
-            }
-            RequestError::Io(io_error) => {
-                BrokerError::AlpacaRequest(format!("IO error: {io_error}"))
-            }
-        })?;
+    let alpaca_orders = client.issue::<orders::List>(&request).await?;
 
     let order_updates = alpaca_orders
         .into_iter()
         .map(|alpaca_order| {
             let symbol = Symbol::new(alpaca_order.symbol.clone())
-                .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid symbol: {e}")))?;
+                .map_err(|e| AlpacaTradingApiError::InvalidOrder(e.to_string()))?;
 
             let shares = extract_shares_from_amount(&alpaca_order.amount)?;
 
@@ -177,7 +126,7 @@ pub(super) async fn poll_pending_orders(
                 price_cents,
             })
         })
-        .collect::<Result<Vec<_>, BrokerError>>()?;
+        .collect::<Result<Vec<_>, AlpacaTradingApiError>>()?;
 
     debug!("Found {} pending orders", order_updates.len());
     Ok(order_updates)
@@ -226,18 +175,16 @@ fn map_alpaca_status_to_order_status(status: order::Status) -> OrderStatus {
 }
 
 /// Extracts price in cents from Alpaca order
-fn extract_price_cents_from_order(order: &order::Order) -> Result<Option<u64>, BrokerError> {
+fn extract_price_cents_from_order(
+    order: &order::Order,
+) -> Result<Option<u64>, AlpacaTradingApiError> {
     if let Some(avg_fill_price) = &order.average_fill_price {
         let price_str = format!("{avg_fill_price}");
-        let price_f64 = price_str
-            .parse::<f64>()
-            .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid fill price: {e}")))?;
-
+        let price_f64 = price_str.parse::<f64>()?;
         let price_cents_float = (price_f64 * 100.0).round();
-
-        let price_cents = price_cents_float.to_u64().ok_or_else(|| {
-            BrokerError::AlpacaRequest(format!("Invalid price value: {price_f64}"))
-        })?;
+        let price_cents = price_cents_float
+            .to_u64()
+            .ok_or(AlpacaTradingApiError::PriceConversion(price_f64))?;
 
         Ok(Some(price_cents))
     } else {
@@ -246,20 +193,13 @@ fn extract_price_cents_from_order(order: &order::Order) -> Result<Option<u64>, B
 }
 
 /// Extracts shares from Alpaca Amount enum
-fn extract_shares_from_amount(amount: &order::Amount) -> Result<Shares, BrokerError> {
+fn extract_shares_from_amount(amount: &order::Amount) -> Result<Shares, AlpacaTradingApiError> {
     match amount {
         order::Amount::Quantity { quantity } => {
-            let qty_u64 = quantity
-                .to_string()
-                .parse::<u64>()
-                .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid quantity: {e}")))?;
-
-            Shares::new(qty_u64)
-                .map_err(|e| BrokerError::AlpacaRequest(format!("Invalid shares: {e}")))
+            let qty_u64 = quantity.to_string().parse::<u64>()?;
+            Shares::new(qty_u64).map_err(|e| AlpacaTradingApiError::InvalidOrder(e.to_string()))
         }
-        order::Amount::Notional { notional: _ } => Err(BrokerError::AlpacaRequest(
-            "Notional orders are not supported - cannot determine exact share quantity".to_string(),
-        )),
+        order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
     }
 }
 
@@ -439,7 +379,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, BrokerError::AlpacaRequest(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -467,7 +407,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, BrokerError::AlpacaRequest(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -494,7 +434,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, BrokerError::AlpacaRequest(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -917,7 +857,7 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, BrokerError::AlpacaRequest(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
     }
 
     #[tokio::test]
@@ -942,6 +882,6 @@ mod tests {
 
         mock.assert();
         let error = result.unwrap_err();
-        assert!(matches!(error, BrokerError::AlpacaRequest(_)));
+        assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
     }
 }

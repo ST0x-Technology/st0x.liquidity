@@ -2712,7 +2712,7 @@ submodules because auth is a complex domain with distinct commands, events, and
 views).
 
 ```text
-Cargo.toml                        - Workspace definition (st0x-hedge + crates/broker)
+Cargo.toml                        - Workspace definition (st0x-hedge + crates/execution)
 src/                              - Main st0x-hedge library crate
   lib.rs                          - Library exports, CQRS setup
   bin/
@@ -2727,7 +2727,7 @@ src/                              - Main st0x-hedge library crate
   queue.rs                        - Event queue for idempotent processing
   onchain/                        - Blockchain event processing
   offchain/                       - Off-chain order execution
-  conductor/                      - Trade accumulation and broker orchestration
+  conductor/                      - Trade accumulation and execution orchestration
   reporter/                       - FIFO P&L calculation and metrics
   symbol/                         - Token symbol caching and locking
   alpaca_wallet/                  - Alpaca cryptocurrency wallet management
@@ -2735,16 +2735,17 @@ src/                              - Main st0x-hedge library crate
   env.rs                          - Environment configuration
   cctp.rs                         - Cross-chain token bridge (Circle CCTP)
 crates/
-  broker/                         - Broker abstraction library
+  execution/                      - Trade execution library
     src/
-      lib.rs                      - Broker trait and shared types
+      lib.rs                      - Executor trait and shared types
       order/                      - Shared order types
       schwab/
-        mod.rs                    - SchwabBroker, SchwabAuthEnv, SchwabError
+        mod.rs                    - SchwabExecutor, SchwabAuthEnv, SchwabError
         auth/                     - CQRS submodule (cmd.rs, event.rs, view.rs, oauth.rs)
-        broker.rs, order.rs, etc. - Private implementation
-      alpaca/                     - Alpaca broker implementation
-      mock.rs                     - Mock broker for testing
+        executor.rs, order.rs, etc. - Private implementation
+      alpaca_trading_api/         - Alpaca Trading API implementation
+      alpaca_broker_api/          - Alpaca Broker API implementation
+      mock.rs                     - Mock implementation for testing
 ```
 
 ### **Dependencies**

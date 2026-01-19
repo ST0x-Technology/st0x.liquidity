@@ -46,8 +46,8 @@ if [ "$PROD_MODE" = true ]; then
 
   export DOCKER_IMAGE="registry.digitalocean.com/${REGISTRY_NAME}/schwarbot:${SHORT_SHA}"
   export PULL_POLICY="always"
-  export SCHWAB_BROKER="schwab"
-  export ALPACA_BROKER="alpaca"
+  export SCHWAB_EXECUTOR="schwab"
+  export ALPACA_EXECUTOR="alpaca-trading-api"
 else
   echo "==> Local/debug mode: building image locally"
 
@@ -55,8 +55,8 @@ else
   export DATA_VOLUME_PATH="./data"
   export PULL_POLICY="never"
   export GRAFANA_ADMIN_PASSWORD="admin"
-  export SCHWAB_BROKER="dry-run"
-  export ALPACA_BROKER="alpaca"
+  export SCHWAB_EXECUTOR="dry-run"
+  export ALPACA_EXECUTOR="dry-run"
 
   # Ensure data directory exists for local development
   mkdir -p "${DATA_VOLUME_PATH}"
@@ -78,11 +78,11 @@ fi
 echo "==> Generating docker-compose.yaml"
 
 # shellcheck disable=SC2016  # Single quotes intentional - pass literal var names to envsubst
-envsubst '$DOCKER_IMAGE $DATA_VOLUME_PATH $PULL_POLICY $GRAFANA_ADMIN_PASSWORD $SCHWAB_BROKER $ALPACA_BROKER' < docker-compose.template.yaml > docker-compose.yaml
+envsubst '$DOCKER_IMAGE $DATA_VOLUME_PATH $PULL_POLICY $GRAFANA_ADMIN_PASSWORD $SCHWAB_EXECUTOR $ALPACA_EXECUTOR' < docker-compose.template.yaml > docker-compose.yaml
 
 echo "==> docker-compose.yaml generated successfully"
 echo "    DOCKER_IMAGE=$DOCKER_IMAGE"
 echo "    DATA_VOLUME_PATH=$DATA_VOLUME_PATH"
 echo "    PULL_POLICY=$PULL_POLICY"
-echo "    SCHWAB_BROKER=$SCHWAB_BROKER"
-echo "    ALPACA_BROKER=$ALPACA_BROKER"
+echo "    SCHWAB_EXECUTOR=$SCHWAB_EXECUTOR"
+echo "    ALPACA_EXECUTOR=$ALPACA_EXECUTOR"

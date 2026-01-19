@@ -4,7 +4,7 @@ use alloy::primitives::TxHash;
 use cqrs_es::AggregateError;
 use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
-use st0x_broker::PersistenceError;
+use st0x_execution::PersistenceError;
 
 use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain_order::{NegativePriceCents, OffchainOrder, OffchainOrderError};

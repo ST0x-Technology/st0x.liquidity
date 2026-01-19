@@ -1,7 +1,7 @@
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::BrokerError;
+use crate::ExecutionError;
 
 /// Deserialize orderId from Schwab API as int64 and convert to string for database compatibility.
 ///
@@ -92,13 +92,13 @@ impl OrderStatusResponse {
     }
 
     /// Convert price to cents for database storage
-    pub(crate) fn price_in_cents(&self) -> Result<Option<u64>, BrokerError> {
+    pub(crate) fn price_in_cents(&self) -> Result<Option<u64>, ExecutionError> {
         self.calculate_weighted_average_price()
             .map(|price| {
                 (price * 100.0)
                     .round()
                     .to_u64()
-                    .ok_or(BrokerError::PriceConversion { price })
+                    .ok_or(ExecutionError::PriceConversion { price })
             })
             .transpose()
     }

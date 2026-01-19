@@ -41,8 +41,8 @@ pub use telemetry::{TelemetryError, TelemetryGuard};
 pub mod test_utils;
 
 use crate::env::{BrokerConfig, Config};
-use st0x_broker::schwab::{SchwabConfig, SchwabError};
-use st0x_broker::{Broker, BrokerError, MockBrokerConfig, TryIntoBroker};
+use st0x_execution::schwab::{SchwabConfig, SchwabError};
+use st0x_execution::{ExecutionError, Executor, MockExecutorConfig, TryIntoExecutor};
 
 pub async fn launch(config: Config) -> anyhow::Result<()> {
     let launch_span = info_span!("launch");
@@ -116,10 +116,10 @@ async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
                 break Ok(());
             }
             Err(e) => {
-                if let Some(broker_error) = e.downcast_ref::<BrokerError>() {
+                if let Some(execution_error) = e.downcast_ref::<ExecutionError>() {
                     if matches!(
-                        broker_error,
-                        BrokerError::Schwab(SchwabError::RefreshTokenExpired)
+                        execution_error,
+                        ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
                     ) {
                         warn!(
                             "Refresh token expired, retrying in {} seconds",
@@ -141,37 +141,71 @@ async fn run(config: Config, pool: SqlitePool) -> anyhow::Result<()> {
 async fn run_bot_session(config: &Config, pool: &SqlitePool) -> anyhow::Result<()> {
     match &config.broker {
         BrokerConfig::DryRun => {
-            info!("Initializing test broker for dry-run mode");
-            let broker = MockBrokerConfig.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
+            info!("Initializing test executor for dry-run mode");
+            let executor = MockExecutorConfig.try_into_executor().await?;
+            Box::pin(run_with_executor(
+                config.clone(),
+                pool.clone(),
+                executor,
+                None,
+            ))
+            .await
         }
         BrokerConfig::Schwab(schwab_auth) => {
-            info!("Initializing Schwab broker");
+            info!("Initializing Schwab executor");
             let schwab_config = SchwabConfig {
                 auth: schwab_auth.clone(),
                 pool: pool.clone(),
             };
-            let broker = schwab_config.try_into_broker().await?;
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
+            let executor = schwab_config.try_into_executor().await?;
+            Box::pin(run_with_executor(
+                config.clone(),
+                pool.clone(),
+                executor,
+                None,
+            ))
+            .await
         }
-        BrokerConfig::Alpaca(alpaca_auth) => {
-            info!("Initializing Alpaca broker");
-            let broker = alpaca_auth.clone().try_into_broker().await?;
+        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+            info!("Initializing Alpaca Trading API executor");
+            let executor = alpaca_auth.clone().try_into_executor().await?;
 
-            Box::pin(run_with_broker(config.clone(), pool.clone(), broker, None)).await
+            Box::pin(run_with_executor(
+                config.clone(),
+                pool.clone(),
+                executor,
+                None,
+            ))
+            .await
+        }
+        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+            info!("Initializing Alpaca Broker API executor");
+            let executor = alpaca_auth.clone().try_into_executor().await?;
+
+            Box::pin(run_with_executor(
+                config.clone(),
+                pool.clone(),
+                executor,
+                None,
+            ))
+            .await
         }
     }
 }
 
-async fn run_with_broker<B: Broker + Clone + Send + 'static>(
+async fn run_with_executor<E>(
     config: Config,
     pool: SqlitePool,
-    broker: B,
+    executor: E,
     rebalancer: Option<JoinHandle<()>>,
-) -> anyhow::Result<()> {
-    let broker_maintenance = broker.run_broker_maintenance().await;
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    error::EventProcessingError: From<E::Error>,
+{
+    let executor_maintenance = executor.run_executor_maintenance().await;
 
-    conductor::run_market_hours_loop(broker, config, pool, broker_maintenance, rebalancer).await
+    conductor::run_market_hours_loop(executor, config, pool, executor_maintenance, rebalancer).await
 }
 
 #[cfg(test)]

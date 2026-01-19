@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use st0x_broker::OrderState;
+use st0x_execution::OrderState;
 use tracing::info;
 
 use crate::offchain::execution::OffchainExecution;
@@ -23,7 +23,7 @@ pub(crate) async fn place_order(
         symbol: execution.symbol.clone(),
         shares: FractionalShares(Decimal::from(execution.shares.value())),
         direction: execution.direction,
-        broker: execution.broker,
+        executor: execution.executor,
     };
 
     context
@@ -116,7 +116,7 @@ pub(crate) async fn mark_failed(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_broker::{Direction, Shares, SupportedBroker, Symbol};
+    use st0x_execution::{Direction, Shares, SupportedExecutor, Symbol};
 
     use super::*;
     use crate::test_utils::setup_test_db;
@@ -132,7 +132,7 @@ mod tests {
             symbol: symbol.clone(),
             shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -169,7 +169,7 @@ mod tests {
             symbol,
             shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -197,7 +197,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -208,7 +208,7 @@ mod tests {
             symbol,
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -256,7 +256,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -267,7 +267,7 @@ mod tests {
             symbol,
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
                 order_id: "ORD456".to_string(),
                 price_cents: 15025,
@@ -308,7 +308,7 @@ mod tests {
             symbol,
             shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -332,7 +332,7 @@ mod tests {
             symbol,
             shares: Shares::new(10).unwrap(),
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -366,7 +366,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -377,7 +377,7 @@ mod tests {
             symbol,
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
                 order_id: "ORD789".to_string(),
                 price_cents: 15000,
@@ -422,7 +422,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -433,7 +433,7 @@ mod tests {
             symbol,
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -481,7 +481,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Sell,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -492,7 +492,7 @@ mod tests {
             symbol,
             shares,
             direction: Direction::Sell,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -542,7 +542,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -591,7 +591,7 @@ mod tests {
             symbol,
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 
@@ -640,7 +640,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::Schwab,
+                SupportedExecutor::Schwab,
             )
             .await
             .unwrap();
@@ -651,7 +651,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::Schwab,
+            executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
         };
 

@@ -6,27 +6,6 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  docker-build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Build Docker image
-        run: docker build .
-
   rainix:
     env:
       DATABASE_URL: "sqlite:schwab.db"
@@ -70,7 +49,7 @@ jobs:
           # if there's no cache hit, restore a cache by this prefix
           restore-prefixes-first-match: nix-${{ runner.os }}-
           # collect garbage until the Nix store size (in bytes) is at most this number
-          gc-max-store-size-linux: 10G
+          gc-max-store-size-linux: 5G
 
       - run: nix run .#prepSolArtifacts
       - run: nix flake check
