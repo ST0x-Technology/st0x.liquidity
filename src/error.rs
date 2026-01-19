@@ -4,6 +4,8 @@
 use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
@@ -23,6 +25,8 @@ pub(crate) enum TradeValidationError {
     NoLogIndex,
     #[error("No block number found in log")]
     NoBlockNumber,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
     #[error("Invalid IO index: {0}")]
     InvalidIndex(#[from] FromUintError<usize>),
     #[error("No input found at index: {0}")]
@@ -90,8 +94,12 @@ pub(crate) enum EventProcessingError {
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
     Schwab(#[from] SchwabError),
-    #[error("Broker error: {0}")]
-    Broker(#[from] ExecutionError),
+    #[error("Alpaca Broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Alpaca Trading API error: {0}")]
+    AlpacaTradingApi(#[from] AlpacaTradingApiError),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
 }
@@ -125,8 +133,8 @@ pub(crate) enum OnChainError {
     Persistence(#[from] PersistenceError),
     #[error("Alloy error: {0}")]
     Alloy(#[from] AlloyError),
-    #[error("Broker error: {0}")]
-    Broker(#[from] ExecutionError),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
     #[error("Event queue error: {0}")]
     EventQueue(#[from] EventQueueError),
     #[error("Order status parse error: {0}")]

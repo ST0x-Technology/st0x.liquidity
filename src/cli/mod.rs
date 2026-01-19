@@ -291,6 +291,13 @@ pub enum Commands {
     /// Shows mint and redemption requests for the Alpaca account.
     /// Useful for debugging tokenization status without creating new requests.
     AlpacaTokenizationRequests,
+
+    /// Check the status of a Schwab order by order ID
+    OrderStatus {
+        /// The Schwab order ID to check
+        #[arg(long = "order-id")]
+        order_id: String,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -370,6 +377,9 @@ enum SimpleCommand {
     AlpacaConvert {
         direction: ConvertDirection,
         amount: Usdc,
+    },
+    OrderStatus {
+        order_id: String,
     },
 }
 
@@ -492,6 +502,7 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
             quantity,
             token,
         }),
+        Commands::OrderStatus { order_id } => Ok(SimpleCommand::OrderStatus { order_id }),
     }
 }
 
@@ -529,17 +540,20 @@ async fn run_simple_command<W: Write>(
         SimpleCommand::AlpacaDeposit { amount } => {
             alpaca_wallet::alpaca_deposit_command(stdout, amount, config).await
         }
-        SimpleCommand::AlpacaWithdraw { amount, to_address } => {
-            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, config).await
-        }
         SimpleCommand::AlpacaWhitelist { address } => {
             alpaca_wallet::alpaca_whitelist_command(stdout, address, config).await
+        }
+        SimpleCommand::AlpacaWithdraw { amount, to_address } => {
+            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, config).await
         }
         SimpleCommand::AlpacaTransfers => {
             alpaca_wallet::alpaca_transfers_command(stdout, config).await
         }
         SimpleCommand::AlpacaConvert { direction, amount } => {
             alpaca_wallet::alpaca_convert_command(stdout, direction, amount, config).await
+        }
+        SimpleCommand::OrderStatus { order_id } => {
+            trading::order_status_command(stdout, &order_id, config, pool).await
         }
     }
 }
@@ -616,7 +630,7 @@ mod tests {
     use httpmock::MockServer;
     use serde_json::json;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens};
-    use st0x_execution::{OrderStatus, Shares};
+    use st0x_execution::{Direction, OrderStatus, Shares};
     use std::str::FromStr;
 
     use super::*;
@@ -627,7 +641,6 @@ mod tests {
     use crate::onchain::EvmEnv;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
-    use crate::tokenized_symbol;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -2031,56 +2044,5 @@ mod tests {
             "transfer-usdc to-alpaca should succeed: {:?}",
             result.err()
         );
-    }
-
-    #[tokio::test]
-    async fn test_onchain_trade_database_duplicate_detection() {
-        let pool = setup_test_db().await;
-
-        let tx_hash =
-            fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-
-        let trade1 = OnchainTrade {
-            id: None,
-            tx_hash,
-            log_index: 42,
-            symbol: tokenized_symbol!("GOOG0x"),
-            amount: 2.5,
-            direction: Direction::Buy,
-            price_usdc: 20000.0,
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let trade2 = trade1.clone();
-
-        let mut sql_tx1 = pool.begin().await.unwrap();
-        let first_result = trade1.save_within_transaction(&mut sql_tx1).await;
-        assert!(first_result.is_ok(), "First save should succeed");
-        sql_tx1.commit().await.unwrap();
-
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let second_result = trade2.save_within_transaction(&mut sql_tx2).await;
-        assert!(
-            second_result.is_err(),
-            "Second save should fail due to duplicate (tx_hash, log_index)"
-        );
-        sql_tx2.rollback().await.unwrap();
-
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 42)
-            .await
-            .unwrap();
-
-        assert_eq!(trade.tx_hash, tx_hash);
-        assert_eq!(trade.log_index, 42);
-        assert_eq!(trade.symbol.to_string(), "GOOG0x");
-        assert!((trade.amount - 2.5).abs() < f64::EPSILON);
-        assert!((trade.price_usdc - 20000.0).abs() < f64::EPSILON);
     }
 }

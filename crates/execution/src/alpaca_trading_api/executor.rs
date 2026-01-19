@@ -127,7 +127,7 @@ mod tests {
         }
     }
 
-    fn create_account_mock(server: &MockServer) -> httpmock::Mock {
+    fn create_account_mock(server: &MockServer) -> httpmock::Mock<'_> {
         server.mock(|when, then| {
             when.method(GET).path("/v2/account");
             then.status(200)

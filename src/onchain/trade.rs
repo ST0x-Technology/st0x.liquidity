@@ -11,7 +11,7 @@ use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmEnv;
-use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails};
+use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
 use st0x_execution::Direction;
@@ -30,7 +30,7 @@ pub struct OnchainTrade {
     pub(crate) symbol: TokenizedEquitySymbol,
     pub(crate) amount: f64,
     pub(crate) direction: Direction,
-    pub(crate) price_usdc: f64,
+    pub(crate) price: Usdc,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) gas_used: Option<u64>,
@@ -80,7 +80,7 @@ impl OnchainTrade {
             symbol_str,
             self.amount,
             direction_str,
-            self.price_usdc,
+            self.price,
             block_timestamp_naive,
             gas_used_i64,
             effective_gas_price_i64,
@@ -146,7 +146,7 @@ impl OnchainTrade {
             symbol: row.symbol.parse::<TokenizedEquitySymbol>().unwrap(),
             amount: row.amount,
             direction,
-            price_usdc: row.price_usdc,
+            price: Usdc::new(row.price_usdc).expect("db price_usdc should be non-negative"),
             block_timestamp: row
                 .block_timestamp
                 .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
@@ -250,6 +250,8 @@ impl OnchainTrade {
             }
         };
 
+        let price = Usdc::new(price_per_share_usdc)?;
+
         let trade = Self {
             id: None,
             tx_hash,
@@ -257,7 +259,7 @@ impl OnchainTrade {
             symbol: tokenized_symbol,
             amount: trade_details.equity_amount().value(),
             direction: trade_details.direction(),
-            price_usdc: price_per_share_usdc,
+            price,
             #[allow(clippy::cast_possible_wrap)]
             block_timestamp: log
                 .block_timestamp
@@ -387,13 +389,14 @@ fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{Address, U256, fixed_bytes, uint};
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use rain_math_float::Float;
+
     use super::*;
     use crate::onchain::EvmEnv;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::{Address, U256, fixed_bytes, uint};
-    use alloy::providers::{ProviderBuilder, mock::Asserter};
-    use rain_math_float::Float;
 
     #[tokio::test]
     async fn test_onchain_trade_save_within_transaction_and_find() {
@@ -408,7 +411,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.0,
             direction: Direction::Sell,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: DateTime::from_timestamp(1_672_531_200, 0), // Jan 1, 2023 00:00:00 UTC
             created_at: None,
             gas_used: Some(21000),
@@ -434,7 +437,7 @@ mod tests {
         assert_eq!(found.symbol, trade.symbol);
         assert!((found.amount - trade.amount).abs() < f64::EPSILON);
         assert_eq!(found.direction, trade.direction);
-        assert!((found.price_usdc - trade.price_usdc).abs() < f64::EPSILON);
+        assert_eq!(found.price, trade.price);
         assert_eq!(found.block_timestamp, trade.block_timestamp);
         assert_eq!(found.gas_used, trade.gas_used);
         assert_eq!(found.effective_gas_price, trade.effective_gas_price);
@@ -586,7 +589,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.0,
             direction: Direction::Buy,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: DateTime::from_timestamp(1_672_531_800, 0), // Jan 1, 2023 00:10:00 UTC
             created_at: None,
             gas_used: Some(50000), // Complex contract interaction
@@ -627,7 +630,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.0,
             direction: Direction::Buy,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -761,7 +764,7 @@ mod tests {
                     .unwrap(),
                 amount: 10.0,
                 direction: Direction::Buy,
-                price_usdc: 150.0,
+                price: Usdc::new(150.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: None,

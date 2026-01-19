@@ -97,12 +97,13 @@ impl TradeExecutionLink {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::primitives::fixed_bytes;
     use st0x_execution::{Direction, OrderState, Shares, SupportedExecutor, Symbol};
 
+    use super::*;
     use crate::offchain::execution::OffchainExecution;
     use crate::onchain::OnchainTrade;
+    use crate::onchain::io::Usdc;
     use crate::test_utils::setup_test_db;
     use crate::tokenized_symbol;
 
@@ -119,7 +120,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -152,6 +153,88 @@ mod tests {
 
         assert!(link_id > 0);
         assert_eq!(TradeExecutionLink::db_count(&pool).await.unwrap(), 1);
+
+        // Verify the link was saved correctly
+        let links = TradeExecutionLink::find_by_execution_id(&pool, execution_id)
+            .await
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].trade_id(), trade_id);
+        assert!((links[0].contributed_shares() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_trades_single_execution() {
+        let pool = setup_test_db().await;
+
+        // Simulate multiple small trades that together trigger one execution
+        let trades = vec![(0.3, 1u64), (0.4, 2u64), (0.5, 3u64)];
+
+        let execution = OffchainExecution {
+            id: None,
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let mut trade_ids = Vec::new();
+
+        for (amount, log_index) in trades {
+            let trade = OnchainTrade {
+                id: None,
+                tx_hash: fixed_bytes!(
+                    "0x4444444444444444444444444444444444444444444444444444444444444444"
+                ),
+                log_index,
+                symbol: tokenized_symbol!("AAPL0x"),
+                amount,
+                direction: Direction::Sell,
+                price: Usdc::new(150.0).unwrap(),
+                block_timestamp: None,
+                created_at: None,
+                gas_used: None,
+                effective_gas_price: None,
+                pyth_price: None,
+                pyth_confidence: None,
+                pyth_exponent: None,
+                pyth_publish_time: None,
+            };
+            let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
+            trade_ids.push(trade_id);
+        }
+
+        let execution_id = execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+
+        // Create links showing how each trade contributed
+        let links = vec![
+            TradeExecutionLink::new(trade_ids[0], execution_id, 0.3),
+            TradeExecutionLink::new(trade_ids[1], execution_id, 0.4),
+            TradeExecutionLink::new(trade_ids[2], execution_id, 0.3), // Only 0.3 of the 0.5 contributed to this execution
+        ];
+
+        for link in links {
+            link.save_within_transaction(&mut sql_tx).await.unwrap();
+        }
+        sql_tx.commit().await.unwrap();
+
+        // Verify all trades contributed to the execution
+        let contributing_links = TradeExecutionLink::find_by_execution_id(&pool, execution_id)
+            .await
+            .unwrap();
+        assert_eq!(contributing_links.len(), 3);
+
+        // Verify total contributions equal exactly 1 share
+        let total_contributions: f64 = contributing_links
+            .iter()
+            .map(super::TradeExecutionLink::contributed_shares)
+            .sum();
+        assert!((total_contributions - 1.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -167,7 +250,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.0,
             direction: Direction::Buy,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,

@@ -117,6 +117,12 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
 rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
+ts-rs = { version = "11.1.0", features = [
+  "chrono",
+  "chrono-impl",
+  "serde-compat",
+] }
+rocket_ws = "0.1.1"
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -124,10 +130,15 @@ serial_test.workspace = true
 rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
+tokio-tungstenite = "0.28.0"
 
 [[bin]]
 name = "migrate_to_events"
 path = "src/bin/migrate_to_events.rs"
+
+[[bin]]
+name = "validate_config"
+path = "src/bin/validate_config.rs"
 
 [lints]
 workspace = true

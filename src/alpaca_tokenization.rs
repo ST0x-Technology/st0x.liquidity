@@ -303,6 +303,22 @@ pub(crate) enum AlpacaTokenizationError {
     PollTimeout { elapsed: Duration },
 }
 
+fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> AlpacaTokenizationError {
+    match status {
+        StatusCode::FORBIDDEN => {
+            if message.contains("insufficient") || message.contains("position") {
+                AlpacaTokenizationError::InsufficientPosition { symbol }
+            } else {
+                AlpacaTokenizationError::UnsupportedAccount
+            }
+        }
+        StatusCode::UNPROCESSABLE_ENTITY => {
+            AlpacaTokenizationError::InvalidParameters { details: message }
+        }
+        _ => AlpacaTokenizationError::ApiError { status, message },
+    }
+}
+
 /// Client for Alpaca's tokenization API and redemption transfers.
 struct AlpacaTokenizationClient<P>
 where
@@ -396,40 +412,21 @@ where
             .await?;
 
         let status = response.status();
-        debug!(status = %status, "Received tokenization response");
 
         if status.is_success() {
             let body = response.text().await?;
-            debug!(body = %body, "Tokenization response body");
-
             let tokenization_request: TokenizationRequest =
                 serde_json::from_str(&body).map_err(|e| {
                     error!(body = %body, error = %e, "Failed to deserialize tokenization response");
                     e
                 })?;
-
             debug!(request_id = %tokenization_request.id.0, "Mint request created");
             return Ok(tokenization_request);
         }
 
         let message = response.text().await?;
         warn!(status = %status, message = %message, "Tokenization request failed");
-
-        match status {
-            StatusCode::FORBIDDEN => {
-                if message.contains("insufficient") || message.contains("position") {
-                    Err(AlpacaTokenizationError::InsufficientPosition {
-                        symbol: request.underlying_symbol,
-                    })
-                } else {
-                    Err(AlpacaTokenizationError::UnsupportedAccount)
-                }
-            }
-            StatusCode::UNPROCESSABLE_ENTITY => {
-                Err(AlpacaTokenizationError::InvalidParameters { details: message })
-            }
-            _ => Err(AlpacaTokenizationError::ApiError { status, message }),
-        }
+        Err(map_mint_error(status, message, request.underlying_symbol))
     }
 
     /// List tokenization requests with optional filtering.

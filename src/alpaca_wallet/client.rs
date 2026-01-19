@@ -43,6 +43,12 @@ pub enum AlpacaWalletError {
         tx_hash: TxHash,
         elapsed: std::time::Duration,
     },
+    #[error("Invalid status transition for deposit {tx_hash}: {previous:?} -> {next:?}")]
+    InvalidDepositTransition {
+        tx_hash: TxHash,
+        previous: TransferStatus,
+        next: TransferStatus,
+    },
 }
 
 pub struct AlpacaWalletClient {

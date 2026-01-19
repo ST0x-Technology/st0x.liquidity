@@ -3,7 +3,7 @@
 
   inputs = {
     rainix.url =
-      "github:rainprotocol/rainix?rev=560ee6ec35b72a2e6c669745b4af33997b2979fb";
+      "github:rainprotocol/rainix?rev=49c4a3e151f232953e1c2370ab526f74c25eb6d2";
     flake-utils.url = "github:numtide/flake-utils";
   };
 
@@ -31,7 +31,7 @@
             name = "prep-docker-compose";
             additionalBuildInputs = [ pkgs.gettext pkgs.docker ];
             body = ''
-              exec ./prep-docker-compose.sh "$@"
+              exec ./.github/workflows/prep-docker-compose.sh "$@"
             '';
           };
         };
@@ -41,6 +41,7 @@
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           buildInputs = with pkgs;
             [
+              bun
               sqlx-cli
               cargo-expand
               cargo-chef

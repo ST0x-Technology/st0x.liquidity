@@ -77,7 +77,6 @@ const TOKENIZED_EQUITY_SCALE: Decimal =
     Decimal::from_parts(2_808_348_672, 232_830_643, 0, false, 0);
 
 impl FractionalShares {
-    #[cfg(test)]
     pub(crate) const ONE: Self = Self(Decimal::ONE);
 
     pub(crate) fn abs(self) -> Self {

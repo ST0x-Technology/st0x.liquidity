@@ -16,6 +16,12 @@ pub(crate) struct ExecutionId(pub(crate) i64);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct BrokerOrderId(pub(crate) String);
 
+impl BrokerOrderId {
+    pub(crate) fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PriceCents(pub(crate) u64);
 
@@ -434,17 +440,9 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
 
             (Err(e), _) => Err(e.into()),
 
-            (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => match order
-            {
-                OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
-                    broker_order_id: broker_order_id.clone(),
-                    submitted_at: Utc::now(),
-                }]),
-                OffchainOrder::Submitted { .. }
-                | OffchainOrder::PartiallyFilled { .. }
-                | OffchainOrder::Filled { .. }
-                | OffchainOrder::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
-            },
+            (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => {
+                handle_confirm_submission(order, broker_order_id)
+            }
 
             (
                 Ok(order),
@@ -491,6 +489,34 @@ impl Aggregate for Lifecycle<OffchainOrder, Never> {
                 }
             },
         }
+    }
+}
+
+fn handle_confirm_submission(
+    order: &OffchainOrder,
+    broker_order_id: &BrokerOrderId,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    match order {
+        OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
+            broker_order_id: broker_order_id.clone(),
+            submitted_at: Utc::now(),
+        }]),
+        OffchainOrder::Submitted {
+            broker_order_id: existing_id,
+            ..
+        } => {
+            if existing_id == broker_order_id {
+                Ok(vec![])
+            } else {
+                Err(OffchainOrderError::ConflictingBrokerOrderId {
+                    existing: existing_id.clone(),
+                    attempted: broker_order_id.clone(),
+                })
+            }
+        }
+        OffchainOrder::PartiallyFilled { .. }
+        | OffchainOrder::Filled { .. }
+        | OffchainOrder::Failed { .. } => Err(OffchainOrderError::AlreadySubmitted),
     }
 }
 
@@ -699,6 +725,14 @@ pub(crate) enum OffchainOrderError {
     AlreadyCompleted,
     #[error("Cannot submit order: order has already been submitted")]
     AlreadySubmitted,
+    #[error(
+        "Cannot confirm submission: order already submitted with different broker_order_id \
+         (existing: {existing:?}, attempted: {attempted:?})"
+    )]
+    ConflictingBrokerOrderId {
+        existing: BrokerOrderId,
+        attempted: BrokerOrderId,
+    },
     #[error(transparent)]
     State(#[from] LifecycleError<Never>),
 }
@@ -982,7 +1016,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_submit_twice() {
+    async fn test_submit_with_different_order_id_fails() {
         let order = Lifecycle::Live(OffchainOrder::Submitted {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: FractionalShares(dec!(100)),
@@ -999,7 +1033,10 @@ mod tests {
 
         let result = order.handle(command, &()).await;
 
-        assert!(matches!(result, Err(OffchainOrderError::AlreadySubmitted)));
+        assert!(matches!(
+            result,
+            Err(OffchainOrderError::ConflictingBrokerOrderId { .. })
+        ));
     }
 
     #[tokio::test]
@@ -2136,5 +2173,54 @@ mod tests {
         let result = order.handle(command, &()).await;
 
         assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+    }
+
+    /// Bug: ConfirmSubmission is not idempotent, blocking recovery after partial
+    /// dual-write failures.
+    ///
+    /// If ES write succeeds but legacy write fails, retrying with the same
+    /// broker_order_id fails with AlreadySubmitted. System stuck in inconsistent
+    /// state with no programmatic recovery path.
+    #[tokio::test]
+    async fn test_confirm_submission_not_idempotent_blocks_retry_recovery() {
+        let mut order = Lifecycle::Live(OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            placed_at: Utc::now(),
+        });
+
+        let broker_order_id = BrokerOrderId("ORD-SAME-123".to_string());
+
+        let command = OffchainOrderCommand::ConfirmSubmission {
+            broker_order_id: broker_order_id.clone(),
+        };
+        let events = order.handle(command, &()).await.unwrap();
+        assert_eq!(events.len(), 1);
+        order.apply(events[0].clone());
+
+        let Lifecycle::Live(OffchainOrder::Submitted {
+            broker_order_id: stored_id,
+            ..
+        }) = &order
+        else {
+            panic!("Expected Submitted state");
+        };
+        assert_eq!(stored_id, &broker_order_id);
+
+        let retry_command = OffchainOrderCommand::ConfirmSubmission {
+            broker_order_id: broker_order_id.clone(),
+        };
+
+        let retry_result = order.handle(retry_command, &()).await;
+
+        let events = retry_result
+            .expect("Retry with same broker_order_id should succeed for idempotent behavior");
+
+        assert!(
+            events.is_empty(),
+            "Idempotent retry should return empty events vec, got {events:?}"
+        );
     }
 }

@@ -20,6 +20,90 @@ use crate::symbol::cache::SymbolCache;
 
 use super::auth::ensure_schwab_authentication;
 
+pub(super) async fn order_status_command<W: Write>(
+    stdout: &mut W,
+    order_id: &str,
+    config: &Config,
+    pool: &SqlitePool,
+) -> anyhow::Result<()> {
+    writeln!(stdout, "🔍 Checking order status for ID: {order_id}")?;
+
+    let state = get_broker_order_status(config, pool, order_id, stdout).await?;
+
+    match state {
+        OrderState::Pending => {
+            writeln!(stdout, "⏳ Order Status: PENDING")?;
+            writeln!(
+                stdout,
+                "   The order has been created but not yet submitted."
+            )?;
+        }
+        OrderState::Submitted { order_id } => {
+            writeln!(stdout, "📤 Order Status: SUBMITTED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(
+                stdout,
+                "   The order has been submitted and is waiting to be filled."
+            )?;
+        }
+        OrderState::Filled {
+            executed_at,
+            order_id,
+            price_cents,
+        } => {
+            let dollars = price_cents / 100;
+            let cents = price_cents % 100;
+            writeln!(stdout, "✅ Order Status: FILLED")?;
+            writeln!(stdout, "   Order ID: {order_id}")?;
+            writeln!(stdout, "   Executed At: {executed_at}")?;
+            writeln!(stdout, "   Fill Price: ${dollars}.{cents:02}")?;
+        }
+        OrderState::Failed {
+            failed_at,
+            error_reason,
+        } => {
+            writeln!(stdout, "❌ Order Status: FAILED")?;
+            writeln!(stdout, "   Failed At: {failed_at}")?;
+            if let Some(reason) = error_reason {
+                writeln!(stdout, "   Reason: {reason}")?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn get_broker_order_status<W: Write>(
+    config: &Config,
+    pool: &SqlitePool,
+    order_id: &str,
+    stdout: &mut W,
+) -> anyhow::Result<OrderState> {
+    match &config.broker {
+        BrokerConfig::Schwab(schwab_auth) => {
+            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
+            let schwab_config = SchwabConfig {
+                auth: schwab_auth.clone(),
+                pool: pool.clone(),
+            };
+            let broker = schwab_config.try_into_executor().await?;
+            Ok(broker.get_order_status(&order_id.to_string()).await?)
+        }
+        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            Ok(broker.get_order_status(&order_id.to_string()).await?)
+        }
+        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            Ok(broker.get_order_status(&order_id.to_string()).await?)
+        }
+        BrokerConfig::DryRun => {
+            let broker = MockExecutorConfig.try_into_executor().await?;
+            Ok(broker.get_order_status(&order_id.to_string()).await?)
+        }
+    }
+}
+
 pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
     quantity: u64,
@@ -187,7 +271,7 @@ pub(super) async fn process_found_trade<W: Write>(
     .await?;
     sql_tx.commit().await?;
 
-    if let Some(execution) = execution {
+    if let Some(execution) = execution.execution {
         let execution_id = execution
             .id
             .ok_or_else(|| anyhow::anyhow!("OffchainExecution missing ID after accumulation"))?;
@@ -244,7 +328,7 @@ fn display_trade_details<W: Write>(
     writeln!(
         stdout,
         "   Price per Share: ${:.2}",
-        onchain_trade.price_usdc
+        onchain_trade.price.value()
     )?;
     Ok(())
 }

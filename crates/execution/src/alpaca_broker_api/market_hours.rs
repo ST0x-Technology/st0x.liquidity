@@ -49,6 +49,61 @@ where
         .ok_or_else(|| serde::de::Error::custom(format!("invalid time: {s}")))
 }
 
+enum MarketStatus {
+    NotTradingDay { next_day: CalendarDay },
+    BeforeOpen { today: CalendarDay },
+    AfterClose { next_day: CalendarDay },
+    Open { today: CalendarDay },
+}
+
+async fn check_market_status(
+    client: &AlpacaBrokerApiClient,
+    now_et: chrono::DateTime<chrono_tz::Tz>,
+) -> Result<MarketStatus, AlpacaBrokerApiError> {
+    let today = now_et.date_naive();
+    let calendar = get_calendar(client, today, today).await?;
+
+    if calendar.is_empty() {
+        let next_day = find_next_trading_day(client, today).await?;
+        return Ok(MarketStatus::NotTradingDay { next_day });
+    }
+
+    let today_calendar = calendar.into_iter().next().expect("checked non-empty");
+    let now_et_time = now_et.time();
+
+    if now_et_time < today_calendar.open {
+        return Ok(MarketStatus::BeforeOpen {
+            today: today_calendar,
+        });
+    }
+
+    if now_et_time >= today_calendar.close {
+        let tomorrow = today + chrono::Duration::days(1);
+        let next_day = find_next_trading_day(client, tomorrow).await?;
+        return Ok(MarketStatus::AfterClose { next_day });
+    }
+
+    Ok(MarketStatus::Open {
+        today: today_calendar,
+    })
+}
+
+async fn wait_for_next_session(
+    day: &CalendarDay,
+    now: chrono::DateTime<Utc>,
+    reason: &str,
+) -> Result<(), AlpacaBrokerApiError> {
+    let wait_duration = duration_until_session_start(day, now)?;
+    info!(
+        next_trading_day = %day.date,
+        open = %day.open,
+        wait_secs = wait_duration.as_secs(),
+        "{reason}"
+    );
+    tokio::time::sleep(wait_duration).await;
+    Ok(())
+}
+
 /// Waits until regular market hours are open and returns the duration until
 /// the market closes.
 ///
@@ -60,66 +115,33 @@ pub(super) async fn wait_until_market_open(
     loop {
         let now = Utc::now();
         let now_et = now.with_timezone(&New_York);
-        let today = now_et.date_naive();
 
-        let calendar = get_calendar(client, today, today).await?;
-
-        if calendar.is_empty() {
-            let next_trading_day = find_next_trading_day(client, today).await?;
-            let wait_duration = duration_until_session_start(&next_trading_day, now)?;
-
-            info!(
-                next_trading_day = %next_trading_day.date,
-                open = %next_trading_day.open,
-                wait_secs = wait_duration.as_secs(),
-                "Today is not a trading day, waiting for next session"
-            );
-
-            tokio::time::sleep(wait_duration).await;
-            continue;
+        match check_market_status(client, now_et).await? {
+            MarketStatus::NotTradingDay { next_day } => {
+                wait_for_next_session(
+                    &next_day,
+                    now,
+                    "Today is not a trading day, waiting for next session",
+                )
+                .await?;
+            }
+            MarketStatus::BeforeOpen { today } => {
+                wait_for_next_session(&today, now, "Before market open, waiting").await?;
+            }
+            MarketStatus::AfterClose { next_day } => {
+                wait_for_next_session(&next_day, now, "After market close, waiting for next day")
+                    .await?;
+            }
+            MarketStatus::Open { today } => {
+                let duration = duration_until_session_end(&today, now)?;
+                debug!(
+                    close = %today.close,
+                    duration_secs = duration.as_secs(),
+                    "Market is open"
+                );
+                return Ok(duration);
+            }
         }
-
-        let today_calendar = &calendar[0];
-        let now_et_time = now_et.time();
-
-        if now_et_time < today_calendar.open {
-            let wait_duration = duration_until_session_start(today_calendar, now)?;
-
-            info!(
-                open = %today_calendar.open,
-                wait_secs = wait_duration.as_secs(),
-                "Before market open, waiting"
-            );
-
-            tokio::time::sleep(wait_duration).await;
-            continue;
-        }
-
-        if now_et_time >= today_calendar.close {
-            let tomorrow = today + chrono::Duration::days(1);
-            let next_trading_day = find_next_trading_day(client, tomorrow).await?;
-            let wait_duration = duration_until_session_start(&next_trading_day, now)?;
-
-            info!(
-                next_trading_day = %next_trading_day.date,
-                open = %next_trading_day.open,
-                wait_secs = wait_duration.as_secs(),
-                "After market close, waiting for next day"
-            );
-
-            tokio::time::sleep(wait_duration).await;
-            continue;
-        }
-
-        let duration = duration_until_session_end(today_calendar, now)?;
-
-        debug!(
-            close = %today_calendar.close,
-            duration_secs = duration.as_secs(),
-            "Market is open"
-        );
-
-        return Ok(duration);
     }
 }
 

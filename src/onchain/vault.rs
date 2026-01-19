@@ -138,35 +138,7 @@ where
         }
     }
 
-    /// Deposits tokens to a Rain OrderBook vault.
-    ///
-    /// Handles ERC20 approval automatically if the current allowance is insufficient.
-    ///
-    /// # Parameters
-    ///
-    /// * `token` - ERC20 token address to deposit
-    /// * `vault_id` - Target vault identifier
-    /// * `amount` - Amount of tokens to deposit (in token's base units)
-    /// * `decimals` - Token decimals for float conversion
-    ///
-    /// # Errors
-    ///
-    /// Returns `VaultError::ZeroAmount` if amount is zero.
-    /// Returns `VaultError::Float` if amount cannot be converted to float format.
-    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
-    pub(crate) async fn deposit(
-        &self,
-        token: Address,
-        vault_id: VaultId,
-        amount: U256,
-        decimals: u8,
-    ) -> Result<TxHash, VaultError> {
-        if amount.is_zero() {
-            return Err(VaultError::ZeroAmount);
-        }
-
-        debug!(%token, ?vault_id, %amount, decimals, "Starting deposit");
-
+    async fn ensure_token_approval(&self, token: Address, amount: U256) -> Result<(), VaultError> {
         let owner = self.account.signer.address();
         let token_contract = IERC20::new(token, self.account.provider.clone());
 
@@ -186,16 +158,32 @@ where
             info!(tx = %approval_receipt.transaction_hash, "Approval confirmed");
         }
 
-        let amount_float = Float::from_fixed_decimal(amount, decimals)?;
-        debug!(float = ?amount_float.get_inner(), "Converted amount to float");
+        Ok(())
+    }
 
+    /// Deposits tokens to a Rain OrderBook vault.
+    ///
+    /// Handles ERC20 approval automatically if the current allowance is insufficient.
+    pub(crate) async fn deposit(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, VaultError> {
+        if amount.is_zero() {
+            return Err(VaultError::ZeroAmount);
+        }
+
+        debug!(%token, ?vault_id, %amount, decimals, "Starting deposit");
+
+        self.ensure_token_approval(token, amount).await?;
+
+        let amount_float = Float::from_fixed_decimal(amount, decimals)?;
         let contract = IOrderBookV5::new(self.orderbook, self.account.provider.clone());
 
-        let tasks = Vec::new();
-
-        debug!("Sending deposit3 transaction");
         let pending = match contract
-            .deposit3(token, vault_id.0, amount_float.get_inner(), tasks)
+            .deposit3(token, vault_id.0, amount_float.get_inner(), Vec::new())
             .send()
             .await
         {
@@ -209,20 +197,20 @@ where
         Ok(receipt.transaction_hash)
     }
 
+    fn parse_withdraw_event(
+        receipt: &alloy::rpc::types::TransactionReceipt,
+    ) -> Result<U256, VaultError> {
+        let withdraw_event = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| IOrderBookV5::WithdrawV2::decode_log(log.as_ref()).ok())
+            .ok_or(VaultError::WithdrawEventNotFound)?;
+
+        Ok(withdraw_event.withdrawAmountUint256)
+    }
+
     /// Withdraws tokens from a Rain OrderBook vault.
-    ///
-    /// # Parameters
-    ///
-    /// * `token` - ERC20 token address to withdraw
-    /// * `vault_id` - Source vault identifier
-    /// * `target_amount` - Target amount of tokens to withdraw (in token's base units)
-    /// * `decimals` - Token decimals for float conversion
-    ///
-    /// # Errors
-    ///
-    /// Returns `VaultError::ZeroAmount` if target_amount is zero.
-    /// Returns `VaultError::Float` if amount cannot be converted to float format.
-    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
     pub(crate) async fn withdraw(
         &self,
         token: Address,
@@ -237,15 +225,10 @@ where
         debug!(%token, ?vault_id, %target_amount, decimals, "Starting withdraw");
 
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
-        debug!(float = ?amount_float.get_inner(), "Converted amount to float");
-
         let contract = IOrderBookV5::new(self.orderbook, self.account.provider.clone());
 
-        let tasks = Vec::new();
-
-        debug!("Sending withdraw3 transaction");
         let pending = match contract
-            .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
+            .withdraw3(token, vault_id.0, amount_float.get_inner(), Vec::new())
             .send()
             .await
         {
@@ -254,19 +237,7 @@ where
         };
 
         let receipt = pending.get_receipt().await?;
-
-        // Parse WithdrawV2 event to verify actual withdrawn amount
-        // OrderBook.withdraw3 takes min(targetAmount, vaultBalance), so it can withdraw 0
-        let withdraw_event = receipt
-            .inner
-            .logs()
-            .iter()
-            .find_map(|log| IOrderBookV5::WithdrawV2::decode_log(log.as_ref()).ok())
-            .ok_or(VaultError::WithdrawEventNotFound)?;
-
-        // withdrawAmountUint256 is the actual amount withdrawn in token base units
-        let actual_withdrawn = withdraw_event.withdrawAmountUint256;
-        debug!(%actual_withdrawn, %target_amount, "Withdraw event parsed");
+        let actual_withdrawn = Self::parse_withdraw_event(&receipt)?;
 
         if actual_withdrawn < target_amount {
             return Err(VaultError::InsufficientBalance {
