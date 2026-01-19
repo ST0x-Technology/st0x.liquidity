@@ -10,6 +10,7 @@ use tracing::info;
 use st0x_broker::Broker;
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
@@ -29,6 +30,7 @@ struct CommonFields<P, B> {
     cache: SymbolCache,
     provider: P,
     broker: B,
+    dual_write_context: DualWriteContext,
 }
 
 pub(crate) struct Initial;
@@ -60,6 +62,7 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         cache: SymbolCache,
         provider: P,
         broker: B,
+        dual_write_context: DualWriteContext,
     ) -> Self {
         Self {
             common: CommonFields {
@@ -68,6 +71,7 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
                 cache,
                 provider,
                 broker,
+                dual_write_context,
             },
             state: Initial,
         }
@@ -147,6 +151,7 @@ impl<P: Provider + Clone + Send + 'static, B: Broker + Clone + Send + 'static>
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.broker.clone(),
             self.common.pool.clone(),
+            self.common.dual_write_context.clone(),
         );
         let queue_processor = spawn_queue_processor(
             self.common.broker,
