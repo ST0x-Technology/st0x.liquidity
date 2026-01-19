@@ -68,7 +68,10 @@ async fn check_market_status(
         return Ok(MarketStatus::NotTradingDay { next_day });
     }
 
-    let today_calendar = calendar.into_iter().next().expect("checked non-empty");
+    let today_calendar = calendar
+        .into_iter()
+        .next()
+        .ok_or(AlpacaBrokerApiError::CalendarIterationInvariantViolation)?;
     let now_et_time = now_et.time();
 
     if now_et_time < today_calendar.open {
@@ -156,9 +159,9 @@ async fn find_next_trading_day(
     calendar
         .into_iter()
         .next()
-        .ok_or_else(|| AlpacaBrokerApiError::NoTradingDaysFound {
-            from: from_date.format("%Y-%m-%d").to_string(),
-            to: to_date.format("%Y-%m-%d").to_string(),
+        .ok_or(AlpacaBrokerApiError::NoTradingDaysFound {
+            from: from_date,
+            to: to_date,
         })
 }
 
@@ -187,11 +190,9 @@ fn duration_until_session_start(
     let session_start_et = New_York
         .from_local_datetime(&session_start_naive)
         .single()
-        .ok_or_else(|| {
-            AlpacaBrokerApiError::CalendarParse(format!(
-                "Ambiguous datetime: {} {}",
-                day.date, day.open
-            ))
+        .ok_or(AlpacaBrokerApiError::AmbiguousDateTime {
+            date: day.date,
+            time: day.open,
         })?;
     let session_start_utc = session_start_et.with_timezone(&Utc);
 
@@ -204,17 +205,13 @@ fn duration_until_session_end(
     day: &CalendarDay,
     now: chrono::DateTime<Utc>,
 ) -> Result<std::time::Duration, AlpacaBrokerApiError> {
-    let now_et = now.with_timezone(&New_York);
-    let date = now_et.date_naive();
-    let session_end_naive = date.and_time(day.close);
+    let session_end_naive = day.date.and_time(day.close);
     let session_end_et = New_York
         .from_local_datetime(&session_end_naive)
         .single()
-        .ok_or_else(|| {
-            AlpacaBrokerApiError::CalendarParse(format!(
-                "Ambiguous datetime: {} {}",
-                day.date, day.close
-            ))
+        .ok_or(AlpacaBrokerApiError::AmbiguousDateTime {
+            date: day.date,
+            time: day.close,
         })?;
     let session_end_utc = session_end_et.with_timezone(&Utc);
 

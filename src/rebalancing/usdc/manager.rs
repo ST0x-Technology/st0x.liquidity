@@ -114,10 +114,9 @@ where
         let burn_amount = usdc_to_u256(amount)?;
         let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
-        let response = self.poll_attestation(id, &burn_receipt).await?;
+        let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
 
-        self.execute_cctp_mint(id, burn_receipt.tx, response)
-            .await?;
+        self.execute_cctp_mint(id, attestation_response).await?;
 
         self.deposit_to_vault(id, burn_receipt.amount).await?;
 
@@ -240,15 +239,11 @@ where
             }
         };
 
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
         self.cqrs
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
-                    cctp_nonce,
                 },
             )
             .await?;
@@ -288,6 +283,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.attestation.to_vec(),
+                    cctp_nonce: response.nonce_as_u64()?,
                 },
             )
             .await?;
@@ -296,19 +292,18 @@ where
         Ok(response)
     }
 
-    #[instrument(skip(self, response), fields(?id, burn_tx = %burn_tx))]
+    #[instrument(skip(self, attestation_response), fields(?id))]
     async fn execute_cctp_mint(
         &self,
         id: &UsdcRebalanceId,
-        burn_tx: TxHash,
-        response: AttestationResponse,
+        attestation_response: AttestationResponse,
     ) -> Result<TxHash, UsdcRebalanceManagerError> {
         let mint_tx = match self
             .cctp_bridge
             .mint(
                 BridgeDirection::EthereumToBase,
-                response.message,
-                response.attestation,
+                attestation_response.message,
+                attestation_response.attestation,
             )
             .await
         {
@@ -407,12 +402,12 @@ where
 
         let burn_receipt = self.execute_cctp_burn_on_base(id, amount_u256).await?;
 
-        let response = self
+        let attestation_response = self
             .poll_attestation_for_base_burn(id, &burn_receipt)
             .await?;
 
         let mint_tx = self
-            .execute_cctp_mint_on_ethereum(id, burn_receipt.tx, response)
+            .execute_cctp_mint_on_ethereum(id, attestation_response)
             .await?;
 
         self.poll_and_confirm_alpaca_deposit(id, mint_tx).await?;
@@ -486,15 +481,11 @@ where
             }
         };
 
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
         self.cqrs
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
-                    cctp_nonce,
                 },
             )
             .await?;
@@ -534,6 +525,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.attestation.to_vec(),
+                    cctp_nonce: response.nonce_as_u64()?,
                 },
             )
             .await?;
@@ -542,19 +534,18 @@ where
         Ok(response)
     }
 
-    #[instrument(skip(self, response), fields(?id, burn_tx = %burn_tx))]
+    #[instrument(skip(self, attestation_response), fields(?id))]
     async fn execute_cctp_mint_on_ethereum(
         &self,
         id: &UsdcRebalanceId,
-        burn_tx: TxHash,
-        response: AttestationResponse,
+        attestation_response: AttestationResponse,
     ) -> Result<TxHash, UsdcRebalanceManagerError> {
         let mint_tx = match self
             .cctp_bridge
             .mint(
                 BridgeDirection::BaseToEthereum,
-                response.message,
-                response.attestation,
+                attestation_response.message,
+                attestation_response.attestation,
             )
             .await
         {
@@ -708,7 +699,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use uuid::Uuid;
+    use uuid::uuid;
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
@@ -751,10 +742,13 @@ mod tests {
         (anvil, endpoint, private_key)
     }
 
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
     fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
         let client = AlpacaWalletClient::new(
             server.base_url(),
-            AlpacaAccountId::new(Uuid::nil()),
+            TEST_ACCOUNT_ID,
             "test_key".to_string(),
             "test_secret".to_string(),
         );
@@ -801,7 +795,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        let cctp_bridge = CctpBridge::new(ethereum, base);
+        let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
 
         let vault_service = VaultService::new(provider, ORDERBOOK_ADDRESS);
 
@@ -853,7 +847,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/00000000-0000-0000-0000-000000000000/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -899,7 +893,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/00000000-0000-0000-0000-000000000000/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([{
@@ -952,7 +946,7 @@ mod tests {
 
         let whitelist_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/accounts/00000000-0000-0000-0000-000000000000/wallets/whitelists");
+                .path("/v1/accounts/904837e3-3b76-47ec-b432-046db621571b/wallets/whitelists");
             then.status(500).body("Internal Server Error");
         });
 

@@ -9,8 +9,8 @@ use std::io::Write;
 
 use crate::bindings::IERC20;
 use crate::cctp::{
-    BridgeDirection, CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE,
-    USDC_ETHEREUM,
+    BridgeDirection, CctpBridge, CctpError, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
+    USDC_BASE, USDC_ETHEREUM,
 };
 use crate::env::Config;
 use crate::rebalancing::RebalancingConfig;
@@ -83,7 +83,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
     writeln!(stdout, "   Wallet: {wallet}")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer.clone());
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer.clone())?;
 
     let direction = from.to_bridge_direction();
 
@@ -112,7 +112,7 @@ fn build_cctp_bridge<BP: Provider + Clone>(
     rebalancing: &RebalancingConfig,
     base_provider: BP,
     signer: PrivateKeySigner,
-) -> CctpBridge<impl Provider + Clone, impl Provider + Clone> {
+) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, CctpError> {
     let owner = signer.address();
 
     let ethereum_provider = ProviderBuilder::new()
@@ -166,7 +166,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer);
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer)?;
 
     // Use the V2 API which returns both message and attestation from tx hash
     let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;

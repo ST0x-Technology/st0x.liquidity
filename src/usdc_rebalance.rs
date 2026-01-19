@@ -154,9 +154,13 @@ pub(crate) enum UsdcRebalanceCommand {
     /// Confirm successful withdrawal from source. Valid only from `Withdrawing` state.
     ConfirmWithdrawal,
     /// Record the CCTP burn transaction. Valid only from `WithdrawalComplete` state.
-    InitiateBridging { burn_tx: TxHash, cctp_nonce: u64 },
+    InitiateBridging { burn_tx: TxHash },
     /// Record the Circle attestation. Valid only from `Bridging` state.
-    ReceiveAttestation { attestation: Vec<u8> },
+    /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
+    ReceiveAttestation {
+        attestation: Vec<u8>,
+        cctp_nonce: u64,
+    },
     /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
     ConfirmBridging { mint_tx: TxHash },
     /// Start deposit to destination. Valid only from `Bridged` state.
@@ -191,15 +195,16 @@ pub(crate) enum UsdcRebalanceEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
-    /// CCTP burn transaction submitted. Records burn hash and nonce for attestation lookup.
+    /// CCTP burn transaction submitted. Records burn hash for attestation lookup.
     BridgingInitiated {
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
         burned_at: DateTime<Utc>,
     },
     /// Circle attestation received. Enables minting on destination chain.
+    /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
     BridgeAttestationReceived {
         attestation: Vec<u8>,
+        cctp_nonce: u64,
         attested_at: DateTime<Utc>,
     },
     /// CCTP mint transaction confirmed on destination chain.
@@ -283,11 +288,11 @@ pub(crate) enum UsdcRebalance {
         failed_at: DateTime<Utc>,
     },
     /// CCTP bridging has been initiated (burn transaction submitted)
+    /// Note: cctp_nonce is not available here - it's only known after attestation.
     Bridging {
         direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
         initiated_at: DateTime<Utc>,
         burned_at: DateTime<Utc>,
     },
@@ -386,14 +391,14 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
 
             UsdcRebalanceCommand::FailWithdrawal { reason } => self.handle_fail_withdrawal(reason),
 
-            UsdcRebalanceCommand::InitiateBridging {
-                burn_tx,
-                cctp_nonce,
-            } => self.handle_initiate_bridging(burn_tx, *cctp_nonce),
-
-            UsdcRebalanceCommand::ReceiveAttestation { attestation } => {
-                self.handle_receive_attestation(attestation)
+            UsdcRebalanceCommand::InitiateBridging { burn_tx } => {
+                self.handle_initiate_bridging(burn_tx)
             }
+
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation,
+                cctp_nonce,
+            } => self.handle_receive_attestation(attestation, *cctp_nonce),
 
             UsdcRebalanceCommand::ConfirmBridging { mint_tx } => {
                 self.handle_confirm_bridging(mint_tx)
@@ -484,7 +489,6 @@ impl Lifecycle<UsdcRebalance, Never> {
     fn handle_initiate_bridging(
         &self,
         burn_tx: &TxHash,
-        cctp_nonce: u64,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
@@ -495,7 +499,6 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(UsdcRebalance::WithdrawalComplete { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::BridgingInitiated {
                     burn_tx_hash: *burn_tx,
-                    cctp_nonce,
                     burned_at: Utc::now(),
                 }])
             }
@@ -520,6 +523,7 @@ impl Lifecycle<UsdcRebalance, Never> {
     fn handle_receive_attestation(
         &self,
         attestation: &[u8],
+        cctp_nonce: u64,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
@@ -532,6 +536,7 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(UsdcRebalance::Bridging { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::BridgeAttestationReceived {
                     attestation: attestation.to_vec(),
+                    cctp_nonce,
                     attested_at: Utc::now(),
                 }])
             }
@@ -595,18 +600,20 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::WithdrawalFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingNotInitiated),
 
-            Ok(
-                UsdcRebalance::Bridging {
-                    burn_tx_hash,
-                    cctp_nonce,
-                    ..
-                }
-                | UsdcRebalance::Attested {
-                    burn_tx_hash,
-                    cctp_nonce,
-                    ..
-                },
-            ) => Ok(vec![UsdcRebalanceEvent::BridgingFailed {
+            Ok(UsdcRebalance::Bridging { burn_tx_hash, .. }) => {
+                Ok(vec![UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: Some(*burn_tx_hash),
+                    cctp_nonce: None,
+                    reason: reason.to_string(),
+                    failed_at: Utc::now(),
+                }])
+            }
+
+            Ok(UsdcRebalance::Attested {
+                burn_tx_hash,
+                cctp_nonce,
+                ..
+            }) => Ok(vec![UsdcRebalanceEvent::BridgingFailed {
                 burn_tx_hash: Some(*burn_tx_hash),
                 cctp_nonce: Some(*cctp_nonce),
                 reason: reason.to_string(),
@@ -739,13 +746,13 @@ impl UsdcRebalance {
             }
             UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash,
-                cctp_nonce,
                 burned_at,
-            } => current.apply_bridging_initiated(*burn_tx_hash, *cctp_nonce, *burned_at),
+            } => current.apply_bridging_initiated(*burn_tx_hash, *burned_at),
             UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation,
+                cctp_nonce,
                 attested_at,
-            } => current.apply_attestation_received(attestation, *attested_at),
+            } => current.apply_attestation_received(attestation, *cctp_nonce, *attested_at),
             UsdcRebalanceEvent::Bridged {
                 mint_tx_hash,
                 minted_at,
@@ -831,7 +838,6 @@ impl UsdcRebalance {
     fn apply_bridging_initiated(
         &self,
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
         burned_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::WithdrawalComplete {
@@ -851,7 +857,6 @@ impl UsdcRebalance {
             direction: direction.clone(),
             amount: *amount,
             burn_tx_hash,
-            cctp_nonce,
             initiated_at: *initiated_at,
             burned_at,
         })
@@ -860,13 +865,13 @@ impl UsdcRebalance {
     fn apply_attestation_received(
         &self,
         attestation: &[u8],
+        cctp_nonce: u64,
         attested_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::Bridging {
             direction,
             amount,
             burn_tx_hash,
-            cctp_nonce,
             initiated_at,
             ..
         } = self
@@ -881,7 +886,7 @@ impl UsdcRebalance {
             direction: direction.clone(),
             amount: *amount,
             burn_tx_hash: *burn_tx_hash,
-            cctp_nonce: *cctp_nonce,
+            cctp_nonce,
             attestation: attestation.to_vec(),
             initiated_at: *initiated_at,
             attested_at,
@@ -1584,13 +1589,11 @@ mod tests {
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
 
         let events = aggregate
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce,
                 },
                 &(),
             )
@@ -1600,7 +1603,6 @@ mod tests {
         assert_eq!(events.len(), 1);
         let UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: event_tx_hash,
-            cctp_nonce: event_nonce,
             ..
         } = &events[0]
         else {
@@ -1608,7 +1610,6 @@ mod tests {
         };
 
         assert_eq!(*event_tx_hash, burn_tx_hash);
-        assert_eq!(*event_nonce, cctp_nonce);
 
         aggregate.apply(events.into_iter().next().unwrap());
 
@@ -1616,7 +1617,6 @@ mod tests {
             direction,
             amount,
             burn_tx_hash: state_tx_hash,
-            cctp_nonce: state_nonce,
             initiated_at: state_initiated_at,
             ..
         }) = aggregate
@@ -1627,7 +1627,6 @@ mod tests {
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(amount, Usdc(dec!(1000.00)));
         assert_eq!(state_tx_hash, burn_tx_hash);
-        assert_eq!(state_nonce, cctp_nonce);
         assert_eq!(state_initiated_at, initiated_at);
     }
 
@@ -1641,7 +1640,6 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -1671,7 +1669,6 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -1706,7 +1703,6 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -1738,7 +1734,6 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
@@ -1746,7 +1741,6 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce: 99999,
                 },
                 &(),
             )
@@ -1767,7 +1761,6 @@ mod tests {
         let burned_at = Utc::now();
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
 
         view.update(&EventEnvelope {
             aggregate_id: "rebalance-123".to_string(),
@@ -1793,7 +1786,6 @@ mod tests {
             sequence: 3,
             payload: UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash,
-                cctp_nonce,
                 burned_at,
             },
             metadata: HashMap::new(),
@@ -1803,7 +1795,6 @@ mod tests {
             direction,
             amount,
             burn_tx_hash: view_tx_hash,
-            cctp_nonce: view_nonce,
             initiated_at: view_initiated_at,
             burned_at: view_burned_at,
         }) = view
@@ -1814,7 +1805,6 @@ mod tests {
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(amount, Usdc(dec!(1000.00)));
         assert_eq!(view_tx_hash, burn_tx_hash);
-        assert_eq!(view_nonce, cctp_nonce);
         assert_eq!(view_initiated_at, initiated_at);
         assert_eq!(view_burned_at, burned_at);
     }
@@ -1842,7 +1832,6 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce,
             burned_at: Utc::now(),
         });
 
@@ -1852,6 +1841,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: attestation.clone(),
+                    cctp_nonce,
                 },
                 &(),
             )
@@ -1900,6 +1890,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -1927,6 +1918,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -1958,6 +1950,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -1990,6 +1983,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![0x01, 0x02],
+                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -2021,12 +2015,12 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -2034,6 +2028,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: vec![0x03, 0x04],
+                    cctp_nonce: 99999,
                 },
                 &(),
             )
@@ -2082,7 +2077,6 @@ mod tests {
             sequence: 3,
             payload: UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash,
-                cctp_nonce,
                 burned_at,
             },
             metadata: HashMap::new(),
@@ -2093,6 +2087,7 @@ mod tests {
             sequence: 4,
             payload: UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: attestation.clone(),
+                cctp_nonce,
                 attested_at,
             },
             metadata: HashMap::new(),
@@ -2143,13 +2138,13 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce,
             burned_at: Utc::now(),
         });
 
         let attestation = vec![0x01, 0x02, 0x03, 0x04];
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: attestation.clone(),
+            cctp_nonce,
             attested_at: Utc::now(),
         });
 
@@ -2218,7 +2213,6 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
@@ -2258,11 +2252,9 @@ mod tests {
 
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce,
             burned_at: Utc::now(),
         });
 
@@ -2288,7 +2280,8 @@ mod tests {
         };
 
         assert_eq!(*event_burn_tx, Some(burn_tx_hash));
-        assert_eq!(*event_nonce, Some(cctp_nonce));
+        // cctp_nonce is None when failing from Bridging state (nonce not yet known)
+        assert_eq!(*event_nonce, None);
         assert_eq!(reason, "CCTP timeout");
 
         aggregate.apply(events.into_iter().next().unwrap());
@@ -2309,7 +2302,8 @@ mod tests {
         assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(*amount, Usdc(dec!(1000.00)));
         assert_eq!(*state_burn_tx, Some(burn_tx_hash));
-        assert_eq!(*state_nonce, Some(cctp_nonce));
+        // cctp_nonce is None when failing from Bridging state (nonce not yet known)
+        assert_eq!(*state_nonce, None);
         assert_eq!(state_reason, "CCTP timeout");
         assert_eq!(*state_initiated_at, initiated_at);
     }
@@ -2337,12 +2331,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce,
             attested_at: Utc::now(),
         });
 
@@ -2368,6 +2362,7 @@ mod tests {
         };
 
         assert_eq!(*event_burn_tx, Some(burn_tx_hash));
+        // cctp_nonce is Some when failing from Attested state (nonce known from attestation)
         assert_eq!(*event_nonce, Some(cctp_nonce));
         assert_eq!(reason, "Mint transaction failed");
 
@@ -2388,6 +2383,7 @@ mod tests {
         assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(*amount, Usdc(dec!(1000.00)));
         assert_eq!(*state_burn_tx, Some(burn_tx_hash));
+        // cctp_nonce is Some when failing from Attested state (nonce known from attestation)
         assert_eq!(*state_nonce, Some(cctp_nonce));
         assert_eq!(state_reason, "Mint transaction failed");
     }
@@ -2410,11 +2406,9 @@ mod tests {
 
         let burn_tx_hash =
             fixed_bytes!("0xabababababababababababababababababababababababababababababababab");
-        let cctp_nonce = 98765u64;
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce,
             burned_at: Utc::now(),
         });
 
@@ -2442,10 +2436,10 @@ mod tests {
             Some(burn_tx_hash),
             "Burn tx hash should be preserved in failure event"
         );
+        // cctp_nonce is None when failing from Bridging state (not yet known)
         assert_eq!(
-            *event_nonce,
-            Some(cctp_nonce),
-            "CCTP nonce should be preserved in failure event"
+            *event_nonce, None,
+            "CCTP nonce should be None when failing from Bridging state"
         );
     }
 
@@ -2469,12 +2463,12 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -2522,12 +2516,12 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -2573,13 +2567,12 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: Some(burn_tx_hash),
-            cctp_nonce: Some(12345),
+            cctp_nonce: None, // nonce unknown when failing from Bridging state
             reason: "First failure".to_string(),
             failed_at: Utc::now(),
         });
@@ -2638,7 +2631,6 @@ mod tests {
             sequence: 3,
             payload: UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash,
-                cctp_nonce,
                 burned_at,
             },
             metadata: HashMap::new(),
@@ -2649,6 +2641,7 @@ mod tests {
             sequence: 4,
             payload: UsdcRebalanceEvent::BridgeAttestationReceived {
                 attestation: vec![0x01, 0x02],
+                cctp_nonce,
                 attested_at,
             },
             metadata: HashMap::new(),
@@ -2694,7 +2687,6 @@ mod tests {
         let failed_at = Utc::now();
         let burn_tx_hash =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
-        let cctp_nonce = 12345u64;
 
         view.update(&EventEnvelope {
             aggregate_id: "rebalance-123".to_string(),
@@ -2720,7 +2712,6 @@ mod tests {
             sequence: 3,
             payload: UsdcRebalanceEvent::BridgingInitiated {
                 burn_tx_hash,
-                cctp_nonce,
                 burned_at,
             },
             metadata: HashMap::new(),
@@ -2731,7 +2722,7 @@ mod tests {
             sequence: 4,
             payload: UsdcRebalanceEvent::BridgingFailed {
                 burn_tx_hash: Some(burn_tx_hash),
-                cctp_nonce: Some(cctp_nonce),
+                cctp_nonce: None, // nonce unknown when failing from Bridging state
                 reason: "CCTP service unavailable".to_string(),
                 failed_at,
             },
@@ -2754,7 +2745,8 @@ mod tests {
         assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(*amount, Usdc(dec!(1000.00)));
         assert_eq!(*view_burn_tx, Some(burn_tx_hash));
-        assert_eq!(*view_nonce, Some(cctp_nonce));
+        // nonce unknown when failing from Bridging state
+        assert_eq!(*view_nonce, None);
         assert_eq!(reason, "CCTP service unavailable");
         assert_eq!(*view_initiated_at, initiated_at);
         assert_eq!(*view_failed_at, failed_at);
@@ -2784,12 +2776,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -2869,12 +2861,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -2945,12 +2937,12 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -2994,12 +2986,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -3071,12 +3063,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -3119,12 +3111,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -3206,12 +3198,12 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
 
         aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01, 0x02],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
 
@@ -3296,7 +3288,6 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -3310,6 +3301,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: attestation.clone(),
+                    cctp_nonce: 12345,
                 },
                 &(),
             )
@@ -3406,7 +3398,6 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_tx_hash,
-                    cctp_nonce: 67890,
                 },
                 &(),
             )
@@ -3418,7 +3409,10 @@ mod tests {
         let attestation = vec![0x11, 0x22, 0x33, 0x44];
         let events = aggregate
             .handle(
-                UsdcRebalanceCommand::ReceiveAttestation { attestation },
+                UsdcRebalanceCommand::ReceiveAttestation {
+                    attestation,
+                    cctp_nonce: 67890,
+                },
                 &(),
             )
             .await
@@ -3502,15 +3496,9 @@ mod tests {
                 .is_err()
         );
         assert!(
-            agg.handle(
-                UsdcRebalanceCommand::InitiateBridging {
-                    burn_tx,
-                    cctp_nonce: 1
-                },
-                &()
-            )
-            .await
-            .is_err()
+            agg.handle(UsdcRebalanceCommand::InitiateBridging { burn_tx }, &())
+                .await
+                .is_err()
         );
     }
 
@@ -3533,12 +3521,11 @@ mod tests {
         });
         agg.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: burn_tx,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::BridgingFailed {
             burn_tx_hash: Some(burn_tx),
-            cctp_nonce: Some(12345),
+            cctp_nonce: None, // nonce unknown when failing from Bridging state
             reason: "Bridge failed".to_string(),
             failed_at: Utc::now(),
         });
@@ -3546,7 +3533,8 @@ mod tests {
         assert!(
             agg.handle(
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: vec![0x01]
+                    attestation: vec![0x01],
+                    cctp_nonce: 12345,
                 },
                 &()
             )
@@ -3579,11 +3567,11 @@ mod tests {
         });
         agg.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: burn_tx,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::Bridged {
@@ -3626,11 +3614,11 @@ mod tests {
         });
         agg.apply(UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: burn_tx,
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
             attestation: vec![0x01],
+            cctp_nonce: 12345,
             attested_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::Bridged {

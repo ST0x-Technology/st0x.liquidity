@@ -27,13 +27,13 @@
 //!
 //! ```rust,ignore
 //! // Create bridge instance
-//! let ethereum = EvmAccount::new(ethereum_provider, ethereum_signer);
-//! let base = EvmAccount::new(base_provider, base_signer);
+//! let ethereum = Evm::new(ethereum_provider, owner, usdc, token_messenger, message_transmitter);
+//! let base = Evm::new(base_provider, owner, usdc, token_messenger, message_transmitter);
 //! let bridge = CctpBridge::new(ethereum, base);
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
 //! let amount = U256::from(1_000_000); // 1 USDC
-//! let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
+//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
 //! ```
 //!
 //! ## CCTP V2 Fast Transfer
@@ -48,6 +48,9 @@
 mod evm;
 
 pub(crate) use evm::Evm;
+
+use std::mem::size_of;
+use std::time::Duration;
 
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
@@ -125,12 +128,14 @@ const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
 const FAST_TRANSFER_THRESHOLD: u32 = 1000;
 
 /// Receipt from burning USDC on the source chain.
+///
+/// Note: The nonce is NOT included here because in CCTP V2, the MessageSent event
+/// contains a placeholder nonce (bytes32(0)). The real nonce is only available after
+/// receiving the attestation from Circle's API, which fills in the actual value.
 #[derive(Debug)]
 pub(crate) struct BurnReceipt {
     /// Transaction hash of the burn transaction
     pub(crate) tx: TxHash,
-    /// CCTP message nonce (extracted from message bytes at index 12-44)
-    pub(crate) nonce: FixedBytes<32>,
     /// Amount of USDC burned (in smallest unit, 6 decimals for USDC)
     pub(crate) amount: U256,
 }
@@ -139,15 +144,65 @@ pub(crate) struct BurnReceipt {
 ///
 /// Contains both the CCTP message bytes and the Circle attestation signature,
 /// which together are required to call `receiveMessage()` on the destination chain.
+///
+/// The nonce is extracted from the attested message, NOT from the original MessageSent
+/// event (which contains a placeholder bytes32(0) in CCTP V2).
 #[derive(Debug)]
 pub(crate) struct AttestationResponse {
     /// CCTP message bytes from the attestation API.
-    /// This should match the message from the burn transaction but is
-    /// returned by Circle's API for consistency.
+    /// Unlike the MessageSent event message, this contains the real nonce
+    /// filled in by Circle's attestation service.
     pub(crate) message: Bytes,
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
     pub(crate) attestation: Bytes,
+    /// The real CCTP nonce extracted from the attested message.
+    /// This is the authoritative nonce value, not the placeholder from MessageSent.
+    pub(crate) nonce: FixedBytes<32>,
+}
+
+impl AttestationResponse {
+    /// Returns the nonce as a u64 by taking the last 8 bytes.
+    ///
+    /// CCTP nonces are 32 bytes but the significant portion fits in u64 for our use case.
+    /// Returns an error if the first 24 bytes are non-zero, indicating the nonce exceeds u64.
+    pub(crate) fn nonce_as_u64(&self) -> Result<u64, CctpError> {
+        let bytes: &[u8; 32] = self.nonce.as_ref();
+        let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
+
+        if padding.iter().any(|&b| b != 0) {
+            return Err(CctpError::NonceOverflow { nonce: self.nonce });
+        }
+
+        Ok(u64::from_be_bytes(value.try_into()?))
+    }
+}
+
+// CCTP V2 message layout (see lib/evm-cctp-contracts/src/messages/v2/MessageV2.sol):
+// - Bytes 0-3: version (4 bytes)
+// - Bytes 4-7: source domain (4 bytes)
+// - Bytes 8-11: destination domain (4 bytes)
+// - Bytes 12-43: nonce (32 bytes) <- we extract this
+// - Bytes 44+: remaining message data
+// Minimum length required: 44 bytes (to include the full nonce)
+const NONCE_INDEX: usize = 12;
+const NONCE_SIZE: usize = size_of::<FixedBytes<32>>();
+const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + NONCE_SIZE;
+
+/// Extracts the 32-byte nonce from a CCTP V2 message.
+///
+/// Used to extract the real nonce from the attested message returned by Circle's API.
+/// The nonce in the original MessageSent event is always bytes32(0) in CCTP V2.
+fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpError> {
+    if message.len() < MIN_MESSAGE_LENGTH {
+        return Err(CctpError::MessageTooShort {
+            length: message.len(),
+        });
+    }
+
+    Ok(FixedBytes::<32>::from_slice(
+        &message[NONCE_INDEX..NONCE_INDEX + 32],
+    ))
 }
 
 /// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
@@ -215,6 +270,10 @@ pub(crate) enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
+    #[error("Nonce exceeds u64: upper 24 bytes are non-zero")]
+    NonceOverflow { nonce: FixedBytes<32> },
+    #[error("Slice conversion error: {0}")]
+    SliceConversion(#[from] std::array::TryFromSliceError),
 }
 
 /// Errors specific to attestation polling from Circle's API.
@@ -253,35 +312,17 @@ where
     EP: Provider + Clone,
     BP: Provider + Clone,
 {
-    pub(crate) fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Self {
-        Self {
+    pub(crate) fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Result<Self, CctpError> {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        Ok(Self {
             ethereum,
             base,
-            http_client: reqwest::Client::new(),
+            http_client,
             circle_api_base: CIRCLE_API_BASE.to_string(),
-        }
-    }
-
-    /// Creates a bridge configured for mainnet (Ethereum <-> Base).
-    ///
-    /// The `owner` address should be the account that will sign transactions
-    /// (typically obtained from a signer via `.address()`).
-    pub(crate) fn mainnet(ethereum_provider: EP, base_provider: BP, owner: Address) -> Self {
-        let ethereum = Evm::new(
-            ethereum_provider,
-            owner,
-            USDC_ETHEREUM,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-        let base = Evm::new(
-            base_provider,
-            owner,
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-        Self::new(ethereum, base)
+        })
     }
 
     async fn query_fast_transfer_fee(
@@ -398,13 +439,13 @@ where
                 .as_ref()
                 .ok_or(AttestationError::MissingField { field: "message" })?;
 
-            Ok(AttestationResponse {
-                message: Bytes::from(alloy::hex::decode(message_hex)?),
-                attestation: Bytes::from(alloy::hex::decode(attestation_hex)?),
-            })
+            let message = Bytes::from(alloy::hex::decode(message_hex)?);
+            let attestation = Bytes::from(alloy::hex::decode(attestation_hex)?);
+
+            Ok((message, attestation))
         };
 
-        fetch_attestation
+        let (message, attestation) = fetch_attestation
             .retry(backoff)
             .notify(|err, dur| match err {
                 AttestationError::Pending { status } => {
@@ -419,7 +460,15 @@ where
             .map_err(|err| CctpError::AttestationTimeout {
                 attempts: MAX_ATTEMPTS,
                 source: err,
-            })
+            })?;
+
+        let nonce = extract_nonce_from_message(&message)?;
+
+        Ok(AttestationResponse {
+            message,
+            attestation,
+            nonce,
+        })
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
@@ -477,6 +526,7 @@ mod tests {
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
     use httpmock::prelude::*;
+    use proptest::prelude::*;
     use rand::Rng;
 
     use super::*;
@@ -525,7 +575,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        Ok(CctpBridge::new(ethereum, base))
+        Ok(CctpBridge::new(ethereum, base)?)
     }
 
     #[tokio::test]
@@ -879,7 +929,7 @@ mod tests {
             MESSAGE_TRANSMITTER_V2,
         );
 
-        Ok(CctpBridge::new(ethereum, base))
+        Ok(CctpBridge::new(ethereum, base)?)
     }
 
     #[tokio::test]
@@ -1408,7 +1458,7 @@ mod tests {
                 self.base.message_transmitter,
             );
 
-            Ok(CctpBridge::new(ethereum, base)
+            Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
         }
 
@@ -1663,5 +1713,111 @@ mod tests {
             err.to_string().contains("ECDSA: invalid signature"),
             "got: {err}"
         );
+    }
+
+    fn build_nonce_message(header: &[u8], nonce: [u8; 32], trailer: &[u8]) -> Vec<u8> {
+        use itertools::Itertools;
+
+        header
+            .iter()
+            .copied()
+            .chain(nonce)
+            .chain(trailer.iter().copied())
+            .collect_vec()
+    }
+
+    #[test]
+    fn extract_nonce_from_empty_message_returns_message_too_short() {
+        let err = extract_nonce_from_message(&[]).unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::MessageTooShort { length: 0 }),
+            "Expected MessageTooShort with length 0, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn extract_nonce_from_short_message_returns_message_too_short() {
+        let message = [0u8; 43]; // One byte short of minimum
+
+        let err = extract_nonce_from_message(&message).unwrap_err();
+
+        assert!(
+            matches!(err, CctpError::MessageTooShort { length: 43 }),
+            "Expected MessageTooShort with length 43, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn extract_nonce_from_minimum_length_message_succeeds() {
+        let expected_nonce: [u8; 32] = core::array::from_fn(|i| {
+            u8::try_from(i + 1).expect("index 0..31 + 1 always fits in u8")
+        });
+        let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &[]);
+
+        let nonce = extract_nonce_from_message(&message).unwrap();
+
+        assert_eq!(nonce, FixedBytes::from(expected_nonce));
+    }
+
+    #[test]
+    fn extract_nonce_from_longer_message_succeeds() {
+        let expected_nonce = [0xFF; 32];
+        let message = build_nonce_message(&[0u8; NONCE_INDEX], expected_nonce, &[0u8; 56]);
+
+        let nonce = extract_nonce_from_message(&message).unwrap();
+
+        assert_eq!(nonce, FixedBytes::from(expected_nonce));
+    }
+
+    #[test]
+    fn extract_nonce_ignores_bytes_before_nonce_index() {
+        let expected_nonce = [0x00; 32];
+        let message = build_nonce_message(&[0xAB; NONCE_INDEX], expected_nonce, &[]);
+
+        let nonce = extract_nonce_from_message(&message).unwrap();
+
+        assert_eq!(nonce, FixedBytes::from(expected_nonce));
+    }
+
+    proptest! {
+        #[test]
+        fn short_messages_always_fail(len in 0..MIN_MESSAGE_LENGTH) {
+            let message = vec![0u8; len];
+
+            let err = extract_nonce_from_message(&message).unwrap_err();
+
+            match err {
+                CctpError::MessageTooShort { length } => prop_assert_eq!(length, len),
+                other => prop_assert!(false, "Expected MessageTooShort, got: {:?}", other),
+            }
+        }
+
+        #[test]
+        fn valid_messages_always_extract_correct_nonce(
+            header in prop::collection::vec(any::<u8>(), NONCE_INDEX),
+            nonce in any::<[u8; 32]>(),
+            trailer_len in 0usize..100,
+        ) {
+            let trailer = vec![0u8; trailer_len];
+            let message = build_nonce_message(&header, nonce, &trailer);
+
+            let extracted = extract_nonce_from_message(&message).unwrap();
+
+            prop_assert_eq!(extracted, FixedBytes::from(nonce));
+        }
+
+        #[test]
+        fn nonce_extraction_is_independent_of_surrounding_bytes(
+            header in prop::collection::vec(any::<u8>(), NONCE_INDEX),
+            nonce in any::<[u8; 32]>(),
+            trailer in prop::collection::vec(any::<u8>(), 0..100),
+        ) {
+            let message = build_nonce_message(&header, nonce, &trailer);
+
+            let extracted = extract_nonce_from_message(&message).unwrap();
+
+            prop_assert_eq!(extracted, FixedBytes::from(nonce));
+        }
     }
 }

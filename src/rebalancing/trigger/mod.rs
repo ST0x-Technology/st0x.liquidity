@@ -1193,7 +1193,6 @@ mod tests {
     fn make_usdc_bridging_initiated() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::BridgingInitiated {
             burn_tx_hash: TxHash::random(),
-            cctp_nonce: 12345,
             burned_at: Utc::now(),
         }
     }

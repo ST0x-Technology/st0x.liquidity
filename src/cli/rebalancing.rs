@@ -200,7 +200,7 @@ where
         MESSAGE_TRANSMITTER_V2,
     );
 
-    let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp));
+    let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
     let vault_service = Arc::new(VaultService::new(
         base_provider_with_wallet,
         config.evm.orderbook,
