@@ -516,19 +516,16 @@ pub(crate) async fn check_all_accumulated_positions(
 ) -> Result<Vec<OffchainExecution>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
 
-    // Query all symbols with net position >= 1.0 shares absolute value
-    // and no pending execution
     let ready_symbols = sqlx::query!(
         r#"
         SELECT
             symbol,
-            net_position,
             accumulated_long,
             accumulated_short,
-            pending_execution_id
+            (accumulated_long - accumulated_short) as "net_position!: f64"
         FROM trade_accumulators
         WHERE pending_execution_id IS NULL
-          AND ABS(net_position) >= 1.0
+          AND ABS(accumulated_long - accumulated_short) >= 1.0
         ORDER BY last_updated ASC
         "#
     )
@@ -547,7 +544,6 @@ pub(crate) async fn check_all_accumulated_positions(
 
     let mut executions = Vec::new();
 
-    // Process each symbol individually to respect locking
     for row in ready_symbols {
         let symbol = Symbol::new(&row.symbol)?;
         info!(
@@ -644,6 +640,7 @@ mod tests {
     use crate::dual_write::DualWriteContext;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::offchain_order::{BrokerOrderId, OffchainOrder, OffchainOrderCommand};
+    use crate::onchain::io::Usdc;
     use crate::position::{Position, PositionCommand};
     use crate::symbol;
     use crate::test_utils::setup_test_db;
@@ -659,7 +656,7 @@ mod tests {
             symbol: symbol.parse().unwrap(),
             amount: 1.5,
             direction: Direction::Buy,
-            price_usdc: 250.0,
+            price: Usdc::new(250.0).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(48000),
@@ -765,7 +762,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(45000),
@@ -798,7 +795,7 @@ mod tests {
             symbol: tokenized_symbol!("MSFT0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 300.0,
+            price: Usdc::new(300.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(52000),
@@ -833,7 +830,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.3,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(43000),
@@ -856,7 +853,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.4,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(44000),
@@ -879,7 +876,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.4,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(46000),
@@ -915,7 +912,7 @@ mod tests {
             symbol: tokenized_symbol!("INVALID0x"),
             amount: 1.0,
             direction: Direction::Buy,
-            price_usdc: 100.0,
+            price: Usdc::new(100.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(48000),
@@ -944,7 +941,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(47000),
@@ -975,7 +972,7 @@ mod tests {
             symbol: tokenized_symbol!("MSFT0x"),
             amount: 1.5,
             direction: Direction::Buy,
-            price_usdc: 300.0,
+            price: Usdc::new(300.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(49000),
@@ -1023,7 +1020,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(51000),
@@ -1077,7 +1074,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.8,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(42000),
@@ -1097,7 +1094,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.3,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(43500),
@@ -1171,7 +1168,7 @@ mod tests {
             symbol: tokenized_symbol!(symbol),
             amount,
             direction: Direction::Sell,
-            price_usdc: 15000.0,
+            price: Usdc::new(15000.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -1251,7 +1248,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(46500),
@@ -1295,7 +1292,7 @@ mod tests {
                 symbol: tokenized_symbol!("MSFT0x"),
                 amount: 0.3,
                 direction: Direction::Buy,
-                price_usdc: 300.0,
+                price: Usdc::new(300.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: Some(41000),
@@ -1314,7 +1311,7 @@ mod tests {
                 symbol: tokenized_symbol!("MSFT0x"),
                 amount: 0.4,
                 direction: Direction::Buy,
-                price_usdc: 305.0,
+                price: Usdc::new(305.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: Some(42500),
@@ -1333,7 +1330,7 @@ mod tests {
                 symbol: tokenized_symbol!("MSFT0x"),
                 amount: 0.5,
                 direction: Direction::Buy,
-                price_usdc: 310.0,
+                price: Usdc::new(310.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: Some(44000),
@@ -1401,7 +1398,7 @@ mod tests {
                 symbol: tokenized_symbol!("AAPL0x"),
                 amount: 0.4, // Below threshold
                 direction: Direction::Sell,
-                price_usdc: 150.0,
+                price: Usdc::new(150.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: Some(40000),
@@ -1420,7 +1417,7 @@ mod tests {
                 symbol: tokenized_symbol!("AAPL0x"),
                 amount: 0.8, // Combined: 0.4 + 0.8 = 1.2, triggers execution of 1 share
                 direction: Direction::Sell,
-                price_usdc: 155.0,
+                price: Usdc::new(155.0).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: Some(41500),
@@ -1486,7 +1483,7 @@ mod tests {
             symbol: tokenized_symbol!("TSLA0x"),
             amount: 1.2,
             direction: Direction::Buy,
-            price_usdc: 800.0,
+            price: Usdc::new(800.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(47500),
@@ -1532,7 +1529,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Buy,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(48500),
@@ -1552,7 +1549,7 @@ mod tests {
             symbol: tokenized_symbol!("MSFT0x"), // Different symbol
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 155.0,
+            price: Usdc::new(155.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(49500),
@@ -1644,7 +1641,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(50000),
@@ -1740,7 +1737,7 @@ mod tests {
             symbol: tokenized_symbol!("NVDA0x"),
             amount: 1.5,
             direction: Direction::Sell,
-            price_usdc: 140.0,
+            price: Usdc::new(140.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(51000),
@@ -1953,7 +1950,7 @@ mod tests {
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.8,
             direction: Direction::Sell,
-            price_usdc: 150.0,
+            price: Usdc::new(150.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(43200),
@@ -2058,7 +2055,7 @@ mod tests {
             symbol: tokenized_symbol!("GME0x"),
             amount: 0.6,
             direction: Direction::Sell,
-            price_usdc: 120.0,
+            price: Usdc::new(120.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(39000),
@@ -2078,7 +2075,7 @@ mod tests {
             symbol: tokenized_symbol!("GMEs1"),
             amount: 0.3,
             direction: Direction::Sell,
-            price_usdc: 100.0,
+            price: Usdc::new(100.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(40500),
@@ -2098,7 +2095,7 @@ mod tests {
             symbol: tokenized_symbol!("tGME"),
             amount: 0.2,
             direction: Direction::Sell,
-            price_usdc: 110.0,
+            price: Usdc::new(110.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: Some(41000),
@@ -2256,6 +2253,127 @@ mod tests {
                 .iter()
                 .any(|e| e == "PositionEvent::OffChainOrderFailed"),
             "Expected PositionEvent::OffChainOrderFailed, got {position_events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_all_accumulated_positions_uses_computed_net_not_stored_column() {
+        let pool = setup_test_db().await;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO trade_accumulators (
+                symbol,
+                accumulated_long,
+                accumulated_short,
+                pending_execution_id,
+                last_updated
+            )
+            VALUES ('SPLG', 6.0, 6.5, NULL, CURRENT_TIMESTAMP)
+            "#
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let row = sqlx::query!(
+            "SELECT accumulated_long, accumulated_short
+             FROM trade_accumulators
+             WHERE symbol = 'SPLG'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let actual_net = row.accumulated_long - row.accumulated_short;
+        assert!(
+            (actual_net - (-0.5)).abs() < f64::EPSILON,
+            "actual net (long - short) should be -0.5"
+        );
+        let executions = check_all_accumulated_positions(&pool, SupportedBroker::Schwab)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            executions.len(),
+            0,
+            "No execution should be created since actual accumulated net is -0.5 < 1.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_all_accumulated_positions_finds_position_above_threshold() {
+        let pool = setup_test_db().await;
+
+        // Use process_trade_with_tx to properly insert onchain trades and update
+        // accumulators. We need trades that sum to net >= 1.0.
+        let trade1 = OnchainTrade {
+            id: None,
+            tx_hash: fixed_bytes!(
+                "0xaaaa111111111111111111111111111111111111111111111111111111111111"
+            ),
+            log_index: 1,
+            symbol: tokenized_symbol!("NVDA0x"),
+            amount: 0.8,
+            direction: Direction::Sell,
+            price: Usdc::new(500.0).unwrap(),
+            block_timestamp: None,
+            created_at: None,
+            gas_used: Some(40000),
+            effective_gas_price: Some(1_000_000_000),
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        let result = process_trade_with_tx(&pool, trade1).await.unwrap();
+        assert!(result.is_none()); // 0.8 < 1.0, no execution yet
+
+        let trade2 = OnchainTrade {
+            id: None,
+            tx_hash: fixed_bytes!(
+                "0xbbbb222222222222222222222222222222222222222222222222222222222222"
+            ),
+            log_index: 1,
+            symbol: tokenized_symbol!("NVDA0x"),
+            amount: 0.7,
+            direction: Direction::Sell,
+            price: Usdc::new(510.0).unwrap(),
+            block_timestamp: None,
+            created_at: None,
+            gas_used: Some(40000),
+            effective_gas_price: Some(1_000_000_000),
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        // This trade should trigger an execution (0.8 + 0.7 = 1.5 >= 1.0)
+        let result = process_trade_with_tx(&pool, trade2).await.unwrap();
+        assert!(result.is_some());
+
+        // Verify the execution was created. accumulated_short is 0.5 because
+        // 1.0 share was consumed by the execution (1.5 - 1.0 = 0.5).
+        let (calc, pending_id) = find_by_symbol(&pool, "NVDA").await.unwrap().unwrap();
+        assert!(
+            (calc.accumulated_short - 0.5).abs() < f64::EPSILON,
+            "accumulated_short={}, expected 0.5 (1.5 - 1.0 executed)",
+            calc.accumulated_short
+        );
+        assert!(pending_id.is_some());
+
+        // Now run check_all_accumulated_positions - should NOT create additional
+        // executions since there's already a pending one (and net is now 0.5 < 1.0)
+        let executions = check_all_accumulated_positions(&pool, SupportedBroker::Schwab)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            executions.len(),
+            0,
+            "No new execution since one is already pending and net is below threshold"
         );
     }
 }

@@ -66,6 +66,12 @@ pub enum Commands {
     },
     /// Perform Charles Schwab OAuth authentication flow
     Auth,
+    /// Check the status of a Schwab order by order ID
+    OrderStatus {
+        /// The Schwab order ID to check
+        #[arg(long = "order-id")]
+        order_id: String,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -113,6 +119,74 @@ pub async fn run_command(config: Config, command: Commands) -> anyhow::Result<()
     run_command_with_writers(config, command, &pool, &mut std::io::stdout()).await
 }
 
+async fn handle_order_status_command<W: Write>(
+    order_id: &str,
+    schwab_auth: &SchwabAuthEnv,
+    pool: &SqlitePool,
+    stdout: &mut W,
+) -> anyhow::Result<()> {
+    info!("Checking order status for order_id={order_id}");
+
+    let schwab_config = SchwabConfig {
+        auth: schwab_auth.clone(),
+        pool: pool.clone(),
+    };
+    let broker = schwab_config.try_into_broker().await?;
+
+    let order_id_typed = order_id.to_string();
+    match broker.get_order_status(&order_id_typed).await {
+        Ok(order_state) => {
+            info!("Order status retrieved successfully: {order_state:?}");
+            writeln!(stdout, "📊 Order Status for {order_id}:")?;
+            format_order_state(stdout, order_state)?;
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to get order status: {e:?}");
+            writeln!(stdout, "❌ Failed to get order status: {e}")?;
+            Err(e.into())
+        }
+    }
+}
+
+fn format_order_state<W: Write>(stdout: &mut W, order_state: OrderState) -> anyhow::Result<()> {
+    match order_state {
+        OrderState::Pending => {
+            writeln!(stdout, "   Status: PENDING (not yet submitted)")?;
+        }
+        OrderState::Submitted { order_id: oid } => {
+            writeln!(stdout, "   Status: SUBMITTED")?;
+            writeln!(stdout, "   Order ID: {oid}")?;
+            writeln!(stdout, "   The order is working and waiting to be filled.")?;
+        }
+        OrderState::Filled {
+            executed_at,
+            order_id: oid,
+            price_cents,
+        } => {
+            writeln!(stdout, "   Status: FILLED ✅")?;
+            writeln!(stdout, "   Order ID: {oid}")?;
+            writeln!(stdout, "   Executed At: {executed_at}")?;
+            writeln!(
+                stdout,
+                "   Fill Price: ${:.2}",
+                f64::from(u32::try_from(price_cents)?) / 100.0
+            )?;
+        }
+        OrderState::Failed {
+            failed_at,
+            error_reason,
+        } => {
+            writeln!(stdout, "   Status: FAILED ❌")?;
+            writeln!(stdout, "   Failed At: {failed_at}")?;
+            if let Some(reason) = error_reason {
+                writeln!(stdout, "   Reason: {reason}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_command_with_writers<W: Write>(
     config: Config,
     command: Commands,
@@ -130,6 +204,14 @@ async fn run_command_with_writers<W: Write>(
             handle_process_tx_command(&config, pool, stdout, tx_hash).await?;
         }
         Commands::Auth => handle_auth_command(&config, pool, stdout).await?,
+        Commands::OrderStatus { order_id } => {
+            let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
+                anyhow::bail!("OrderStatus command is only supported for Schwab broker")
+            };
+
+            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
+            handle_order_status_command(&order_id, schwab_auth, pool, stdout).await?;
+        }
     }
 
     info!("CLI operation completed successfully");
@@ -540,7 +622,7 @@ fn display_trade_details<W: Write>(
     writeln!(
         stdout,
         "   Price per Share: ${:.2}",
-        onchain_trade.price_usdc
+        onchain_trade.price.value()
     )?;
     Ok(())
 }
@@ -553,6 +635,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmEnv;
+    use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::get_test_order;
     use crate::test_utils::setup_test_db;
@@ -566,9 +649,8 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_broker::Direction;
-    use st0x_broker::OrderStatus;
     use st0x_broker::schwab::SchwabAuthEnv;
+    use st0x_broker::{Direction, OrderStatus, Shares, Symbol};
     use std::str::FromStr;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -1782,14 +1864,14 @@ mod tests {
         // Executions are now in SUBMITTED status with order_id stored for order status polling
         let executions = find_executions_by_symbol_status_and_broker(
             &pool,
-            Some(st0x_broker::Symbol::new("AAPL").unwrap()),
+            Some(Symbol::new("AAPL").unwrap()),
             OrderStatus::Submitted,
             None,
         )
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, st0x_broker::Shares::new(9).unwrap());
+        assert_eq!(executions[0].shares, Shares::new(9).unwrap());
         assert_eq!(executions[0].direction, Direction::Buy);
 
         // Verify order_id was stored in database
@@ -1962,6 +2044,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_order_status_command_shows_filled_order() {
+        let server = MockServer::start();
+        let config = create_test_config_for_cli(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/trader/v1/accounts/accountNumbers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "accountNumber": "123456789",
+                    "hashValue": "ABC123DEF456"
+                }]));
+        });
+
+        let order_status_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/trader/v1/accounts/ABC123DEF456/orders/1005070742758");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "orderId": 1_005_070_742_758_i64,
+                    "status": "FILLED",
+                    "filledQuantity": 1.0,
+                    "remainingQuantity": 0.0,
+                    "enteredTime": "2026-01-07T14:30:14+0000",
+                    "closeTime": "2026-01-07T14:30:14+0000",
+                    "orderActivityCollection": [{
+                        "activityType": "EXECUTION",
+                        "executionLegs": [{
+                            "quantity": 1.0,
+                            "price": 31.81,
+                            "time": "2026-01-07T14:30:14+0000"
+                        }]
+                    }]
+                }));
+        });
+
+        let mut stdout = Vec::new();
+        let result = handle_order_status_command(
+            "1005070742758",
+            get_schwab_auth_from_config(&config),
+            &pool,
+            &mut stdout,
+        )
+        .await;
+
+        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
+        account_mock.assert();
+        order_status_mock.assert();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("FILLED"),
+            "Output should show FILLED status"
+        );
+        assert!(
+            output.contains("31.81"),
+            "Output should show fill price $31.81"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_status_command_shows_failed_order() {
+        let server = MockServer::start();
+        let config = create_test_config_for_cli(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/trader/v1/accounts/accountNumbers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "accountNumber": "123456789",
+                    "hashValue": "ABC123DEF456"
+                }]));
+        });
+
+        let order_status_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/trader/v1/accounts/ABC123DEF456/orders/999999");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "orderId": 999_999_i64,
+                    "status": "REJECTED",
+                    "filledQuantity": 0.0,
+                    "remainingQuantity": 1.0,
+                    "enteredTime": "2026-01-07T14:30:14+0000",
+                    "closeTime": "2026-01-07T14:30:14+0000"
+                }));
+        });
+
+        let mut stdout = Vec::new();
+        let result = handle_order_status_command(
+            "999999",
+            get_schwab_auth_from_config(&config),
+            &pool,
+            &mut stdout,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        account_mock.assert();
+        order_status_mock.assert();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("FAILED"),
+            "Output should show FAILED status"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_order_status_command_handles_not_found() {
+        let server = MockServer::start();
+        let config = create_test_config_for_cli(&server);
+        let pool = setup_test_db().await;
+        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+
+        let account_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/trader/v1/accounts/accountNumbers");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "accountNumber": "123456789",
+                    "hashValue": "ABC123DEF456"
+                }]));
+        });
+
+        let order_status_mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/trader/v1/accounts/ABC123DEF456/orders/NONEXISTENT");
+            then.status(404)
+                .header("content-type", "application/json")
+                .body("Order not found");
+        });
+
+        let mut stdout = Vec::new();
+        let result = handle_order_status_command(
+            "NONEXISTENT",
+            get_schwab_auth_from_config(&config),
+            &pool,
+            &mut stdout,
+        )
+        .await;
+
+        assert!(result.is_err());
+        account_mock.assert();
+        order_status_mock.assert();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Failed to get order status"),
+            "Output should show error message"
+        );
+    }
+
+    #[tokio::test]
     async fn test_onchain_trade_database_duplicate_detection() {
         let pool = setup_test_db().await;
 
@@ -1975,7 +2221,7 @@ mod tests {
             symbol: tokenized_symbol!("GOOG0x"),
             amount: 2.5,
             direction: Direction::Buy,
-            price_usdc: 20000.0,
+            price: Usdc::new(20000.0).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,
@@ -2011,6 +2257,79 @@ mod tests {
         assert_eq!(trade.log_index, 42);
         assert_eq!(trade.symbol.to_string(), "GOOG0x");
         assert!((trade.amount - 2.5).abs() < f64::EPSILON);
-        assert!((trade.price_usdc - 20000.0).abs() < f64::EPSILON);
+        assert_eq!(trade.price, Usdc::new(20000.0).unwrap());
+    }
+
+    #[test]
+    fn format_order_state_pending() {
+        let mut output = Vec::new();
+        format_order_state(&mut output, OrderState::Pending).unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("PENDING"));
+    }
+
+    #[test]
+    fn format_order_state_submitted() {
+        let mut output = Vec::new();
+        format_order_state(
+            &mut output,
+            OrderState::Submitted {
+                order_id: "ORD123".to_string(),
+            },
+        )
+        .unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("SUBMITTED"));
+        assert!(output_str.contains("ORD123"));
+    }
+
+    #[test]
+    fn format_order_state_filled() {
+        let mut output = Vec::new();
+        format_order_state(
+            &mut output,
+            OrderState::Filled {
+                executed_at: Utc::now(),
+                order_id: "ORD456".to_string(),
+                price_cents: 15050,
+            },
+        )
+        .unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("FILLED"));
+        assert!(output_str.contains("ORD456"));
+        assert!(output_str.contains("$150.50"));
+    }
+
+    #[test]
+    fn format_order_state_failed_with_reason() {
+        let mut output = Vec::new();
+        format_order_state(
+            &mut output,
+            OrderState::Failed {
+                failed_at: Utc::now(),
+                error_reason: Some("Insufficient funds".to_string()),
+            },
+        )
+        .unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("FAILED"));
+        assert!(output_str.contains("Insufficient funds"));
+    }
+
+    #[test]
+    fn format_order_state_failed_without_reason() {
+        let mut output = Vec::new();
+        format_order_state(
+            &mut output,
+            OrderState::Failed {
+                failed_at: Utc::now(),
+                error_reason: None,
+            },
+        )
+        .unwrap();
+        let output_str = String::from_utf8(output).unwrap();
+        assert!(output_str.contains("FAILED"));
+        assert!(!output_str.contains("Reason:"));
     }
 }
