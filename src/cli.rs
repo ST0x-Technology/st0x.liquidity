@@ -11,12 +11,12 @@ use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
 use alloy::primitives::B256;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use st0x_broker::schwab::{
+use st0x_execution::schwab::{
     SchwabAuthEnv, SchwabConfig, SchwabError, SchwabTokens, extract_code_from_url,
 };
-use st0x_broker::{
-    Broker, Direction, MarketOrder, MockBrokerConfig, OrderPlacement, OrderState, Shares, Symbol,
-    TryIntoBroker,
+use st0x_execution::{
+    Direction, Executor, MarketOrder, MockExecutorConfig, OrderPlacement, OrderState, Shares,
+    Symbol, TryIntoExecutor,
 };
 
 #[derive(Debug, Error)]
@@ -131,10 +131,10 @@ async fn handle_order_status_command<W: Write>(
         auth: schwab_auth.clone(),
         pool: pool.clone(),
     };
-    let broker = schwab_config.try_into_broker().await?;
+    let executor = schwab_config.try_into_executor().await?;
 
     let order_id_typed = order_id.to_string();
-    match broker.get_order_status(&order_id_typed).await {
+    match executor.get_order_status(&order_id_typed).await {
         Ok(order_state) => {
             info!("Order status retrieved successfully: {order_state:?}");
             writeln!(stdout, "📊 Order Status for {order_id}:")?;
@@ -418,7 +418,7 @@ async fn execute_order_with_writers<W: Write>(
         auth: schwab_auth.clone(),
         pool: pool.clone(),
     };
-    let broker = schwab_config.try_into_broker().await?;
+    let broker = schwab_config.try_into_executor().await?;
 
     let market_order = MarketOrder {
         symbol: Symbol::new(ticker.clone())?,
@@ -498,7 +498,7 @@ async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 async fn execute_broker_order<W: Write>(
     config: &Config,
     pool: &SqlitePool,
-    market_order: st0x_broker::MarketOrder,
+    market_order: MarketOrder,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &config.broker {
@@ -509,7 +509,7 @@ async fn execute_broker_order<W: Write>(
                 auth: schwab_auth.clone(),
                 pool: pool.clone(),
             };
-            let broker = schwab_config.try_into_broker().await?;
+            let broker = schwab_config.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -518,20 +518,31 @@ async fn execute_broker_order<W: Write>(
             )?;
             Ok(placement)
         }
-        BrokerConfig::Alpaca(alpaca_auth) => {
-            writeln!(stdout, "🔄 Executing Alpaca order...")?;
-            let broker = alpaca_auth.clone().try_into_broker().await?;
+        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+            writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
-                "✅ Alpaca order placed with ID: {}",
+                "✅ Alpaca Trading API order placed with ID: {}",
+                placement.order_id
+            )?;
+            Ok(placement)
+        }
+        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+            writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
+            let broker = alpaca_auth.clone().try_into_executor().await?;
+            let placement = broker.place_market_order(market_order).await?;
+            writeln!(
+                stdout,
+                "✅ Alpaca Broker API order placed with ID: {}",
                 placement.order_id
             )?;
             Ok(placement)
         }
         BrokerConfig::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
-            let broker = MockBrokerConfig.try_into_broker().await?;
+            let broker = MockExecutorConfig.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -560,7 +571,7 @@ async fn process_found_trade<W: Write>(
     } = accumulator::process_onchain_trade(
         &mut sql_tx,
         onchain_trade,
-        config.broker.to_supported_broker(),
+        config.broker.to_supported_executor(),
     )
     .await?;
     sql_tx.commit().await?;
@@ -572,7 +583,7 @@ async fn process_found_trade<W: Write>(
         writeln!(
             stdout,
             "✅ Trade triggered execution for {:?} (ID: {execution_id})",
-            config.broker.to_supported_broker()
+            config.broker.to_supported_executor()
         )?;
 
         let market_order = MarketOrder {
@@ -649,8 +660,8 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_broker::schwab::SchwabAuthEnv;
-    use st0x_broker::{Direction, OrderStatus, Shares, Symbol};
+    use st0x_execution::schwab::SchwabAuthEnv;
+    use st0x_execution::{Direction, OrderStatus};
     use std::str::FromStr;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -813,7 +824,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            st0x_broker::schwab::SchwabError::RefreshTokenExpired
+            SchwabError::RefreshTokenExpired
         ));
     }
 
@@ -1065,7 +1076,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            st0x_broker::schwab::SchwabError::RefreshTokenExpired
+            SchwabError::RefreshTokenExpired
         ));
 
         let mut stdout_buffer = Vec::new();

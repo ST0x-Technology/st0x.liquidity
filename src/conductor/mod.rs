@@ -12,7 +12,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 
-use st0x_broker::{Broker, BrokerError, MarketOrder, SupportedBroker, Symbol};
+use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::dashboard::ServerMessage;
@@ -36,7 +36,7 @@ use crate::symbol::lock::get_symbol_lock;
 pub(crate) use builder::ConductorBuilder;
 
 pub(crate) struct Conductor {
-    pub(crate) broker_maintenance: Option<JoinHandle<()>>,
+    pub(crate) executor_maintenance: Option<JoinHandle<()>>,
     pub(crate) order_poller: JoinHandle<()>,
     pub(crate) dex_event_receiver: JoinHandle<()>,
     pub(crate) event_processor: JoinHandle<()>,
@@ -45,28 +45,32 @@ pub(crate) struct Conductor {
     pub(crate) rebalancer: Option<JoinHandle<()>>,
 }
 
-pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
-    broker: B,
+pub(crate) async fn run_market_hours_loop<E>(
+    executor: E,
     config: Config,
     pool: SqlitePool,
-    broker_maintenance: Option<JoinHandle<()>>,
+    executor_maintenance: Option<JoinHandle<()>>,
     rebalancer: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     const RERUN_DELAY_SECS: u64 = 10;
 
-    let timeout = broker
+    let timeout = executor
         .wait_until_market_open()
         .await
         .map_err(|e| anyhow::anyhow!("Market hours check failed: {e}"))?;
 
     log_market_status(timeout);
 
-    let mut conductor = match start_conductor(
+    let mut conductor = match Conductor::start(
         &config,
         &pool,
-        &broker,
-        broker_maintenance,
+        executor.clone(),
+        executor_maintenance,
         rebalancer,
         event_sender.clone(),
     )
@@ -74,15 +78,22 @@ pub(crate) async fn run_market_hours_loop<B: Broker + Clone + Send + 'static>(
     {
         Ok(c) => c,
         Err(e) => {
-            return retry_after_failure(broker, config, pool, e, RERUN_DELAY_SECS, event_sender)
+            return retry_after_failure(executor, config, pool, e, RERUN_DELAY_SECS, event_sender)
                 .await;
         }
     };
 
     info!("Market opened, conductor running");
 
-    run_conductor_until_market_close(&mut conductor, broker, config, pool, timeout, event_sender)
-        .await
+    run_conductor_until_market_close(
+        &mut conductor,
+        executor,
+        config,
+        pool,
+        timeout,
+        event_sender,
+    )
+    .await
 }
 
 fn log_market_status(timeout: Duration) {
@@ -94,39 +105,24 @@ fn log_market_status(timeout: Duration) {
     }
 }
 
-async fn start_conductor<B: Broker + Clone + Send + 'static>(
-    config: &Config,
-    pool: &SqlitePool,
-    broker: &B,
-    broker_maintenance: Option<JoinHandle<()>>,
-    rebalancer: Option<JoinHandle<()>>,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<Conductor> {
-    Conductor::start(
-        config,
-        pool,
-        broker.clone(),
-        broker_maintenance,
-        rebalancer,
-        event_sender,
-    )
-    .await
-}
-
-async fn retry_after_failure<B: Broker + Clone + Send + 'static>(
-    broker: B,
+async fn retry_after_failure<E>(
+    executor: E,
     config: Config,
     pool: SqlitePool,
     error: anyhow::Error,
     delay_secs: u64,
     event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     error!("Failed to start conductor: {error}, retrying in {delay_secs} seconds");
     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
 
-    let new_maintenance = broker.run_broker_maintenance().await;
+    let new_maintenance = executor.run_executor_maintenance().await;
     Box::pin(run_market_hours_loop(
-        broker,
+        executor,
         config,
         pool,
         new_maintenance,
@@ -136,20 +132,24 @@ async fn retry_after_failure<B: Broker + Clone + Send + 'static>(
     .await
 }
 
-async fn run_conductor_until_market_close<B: Broker + Clone + Send + 'static>(
+async fn run_conductor_until_market_close<E>(
     conductor: &mut Conductor,
-    broker: B,
+    executor: E,
     config: Config,
     pool: SqlitePool,
     timeout: Duration,
     event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     tokio::select! {
         result = conductor.wait_for_completion() => {
             handle_conductor_completion(conductor, result)
         }
         () = tokio::time::sleep(timeout) => {
-            handle_market_close(conductor, broker, config, pool, event_sender).await
+            handle_market_close(conductor, executor, config, pool, event_sender).await
         }
     }
 }
@@ -164,7 +164,7 @@ fn handle_conductor_completion(
     conductor.event_processor.abort();
     conductor.position_checker.abort();
     conductor.queue_processor.abort();
-    if let Some(ref handle) = conductor.broker_maintenance {
+    if let Some(ref handle) = conductor.executor_maintenance {
         handle.abort();
     }
     if let Some(ref handle) = conductor.rebalancer {
@@ -175,19 +175,23 @@ fn handle_conductor_completion(
     Ok(())
 }
 
-async fn handle_market_close<B: Broker + Clone + Send + 'static>(
+async fn handle_market_close<E>(
     conductor: &mut Conductor,
-    broker: B,
+    executor: E,
     config: Config,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     info!("Market closed, shutting down trading tasks");
     conductor.abort_trading_tasks();
-    let next_maintenance = conductor.broker_maintenance.take();
+    let next_maintenance = conductor.executor_maintenance.take();
     info!("Trading tasks shutdown, DEX events buffering");
     Box::pin(run_market_hours_loop(
-        broker,
+        executor,
         config,
         pool,
         next_maintenance,
@@ -198,14 +202,18 @@ async fn handle_market_close<B: Broker + Clone + Send + 'static>(
 }
 
 impl Conductor {
-    pub(crate) async fn start<B: Broker + Clone + Send + 'static>(
+    pub(crate) async fn start<E>(
         config: &Config,
         pool: &SqlitePool,
-        broker: B,
-        broker_maintenance: Option<JoinHandle<()>>,
+        executor: E,
+        executor_maintenance: Option<JoinHandle<()>>,
         rebalancer: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<Self>
+    where
+        E: Executor + Clone + Send + 'static,
+        EventProcessingError: From<E::Error>,
+    {
         let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
         let provider = ProviderBuilder::new().connect_ws(ws).await?;
         let cache = SymbolCache::default();
@@ -223,7 +231,7 @@ impl Conductor {
 
         // Spawn rebalancer with the provider if configured
         let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
-            (Some(rebalancing_config), BrokerConfig::Alpaca(alpaca_auth), None) => {
+            (Some(rebalancing_config), BrokerConfig::AlpacaTradingApi(alpaca_auth), None) => {
                 info!("Initializing rebalancing infrastructure");
                 Some(
                     spawn_rebalancer(
@@ -245,10 +253,10 @@ impl Conductor {
             pool.clone(),
             cache,
             provider,
-            broker,
+            executor,
             dual_write_context,
         )
-        .with_broker_maintenance(broker_maintenance)
+        .with_executor_maintenance(executor_maintenance)
         .with_dex_event_streams(clear_stream, take_stream);
 
         if let Some(rebalancer_handle) = rebalancer {
@@ -260,7 +268,7 @@ impl Conductor {
 
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
         let maintenance_task =
-            wait_for_optional_task(&mut self.broker_maintenance, "Broker maintenance");
+            wait_for_optional_task(&mut self.executor_maintenance, "Executor maintenance");
         let rebalancer_task = wait_for_optional_task(&mut self.rebalancer, "Rebalancer");
 
         let ((), (), poller, dex, processor, position, queue) = tokio::join!(
@@ -314,10 +322,10 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
     }
 }
 
-fn spawn_order_poller<B: Broker + Clone + Send + 'static>(
+fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     config: &Config,
     pool: &SqlitePool,
-    broker: B,
+    executor: E,
 ) -> JoinHandle<()> {
     let poller_config = config.get_order_poller_config();
     info!(
@@ -326,7 +334,7 @@ fn spawn_order_poller<B: Broker + Clone + Send + 'static>(
     );
 
     let dual_write_context = DualWriteContext::new(pool.clone());
-    let poller = OrderStatusPoller::new(poller_config, pool.clone(), broker, dual_write_context);
+    let poller = OrderStatusPoller::new(poller_config, pool.clone(), executor, dual_write_context);
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
             error!("Order poller failed: {e}");
@@ -371,16 +379,18 @@ fn spawn_event_processor(
     })
 }
 
-fn spawn_queue_processor<
-    P: Provider + Clone + Send + 'static,
-    B: Broker + Clone + Send + 'static,
->(
-    broker: B,
+fn spawn_queue_processor<P, E>(
+    executor: E,
     config: &Config,
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    P: Provider + Clone + Send + 'static,
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     info!("Starting queue processor service");
     let config_clone = config.clone();
     let pool_clone = pool.clone();
@@ -389,7 +399,7 @@ fn spawn_queue_processor<
 
     tokio::spawn(async move {
         run_queue_processor(
-            &broker,
+            &executor,
             &config_clone,
             &pool_clone,
             &cache_clone,
@@ -400,11 +410,15 @@ fn spawn_queue_processor<
     })
 }
 
-fn spawn_periodic_accumulated_position_check<B: Broker + Clone + Send + 'static>(
-    broker: B,
+fn spawn_periodic_accumulated_position_check<E>(
+    executor: E,
     pool: SqlitePool,
     dual_write_context: DualWriteContext,
-) -> JoinHandle<()> {
+) -> JoinHandle<()>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     info!("Starting periodic accumulated position checker");
 
     tokio::spawn(async move {
@@ -417,7 +431,7 @@ fn spawn_periodic_accumulated_position_check<B: Broker + Clone + Send + 'static>
             interval.tick().await;
             debug!("Running periodic accumulated position check");
             if let Err(e) =
-                check_and_execute_accumulated_positions(&broker, &pool, &dual_write_context).await
+                check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
             {
                 error!("Periodic accumulated position check failed: {e}");
             }
@@ -539,25 +553,29 @@ async fn process_live_event(
     Ok(())
 }
 
-async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
-    broker: &B,
+async fn run_queue_processor<P, E>(
+    executor: &E,
     config: &Config,
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
     dual_write_context: &DualWriteContext,
-) {
+) where
+    P: Provider + Clone,
+    E: Executor + Clone,
+    EventProcessingError: From<E::Error>,
+{
     info!("Starting queue processor service");
 
     let feed_id_cache = FeedIdCache::default();
 
     log_unprocessed_event_count(pool).await;
 
-    let broker_type = broker.to_supported_broker();
+    let executor_type = executor.to_supported_executor();
 
     loop {
         let result = process_next_queued_event(
-            broker_type,
+            executor_type,
             config,
             pool,
             cache,
@@ -567,7 +585,7 @@ async fn run_queue_processor<P: Provider + Clone, B: Broker + Clone>(
         )
         .await;
 
-        handle_queue_processing_result(broker, pool, dual_write_context, result).await;
+        handle_queue_processing_result(executor, pool, dual_write_context, result).await;
     }
 }
 
@@ -581,17 +599,20 @@ async fn log_unprocessed_event_count(pool: &SqlitePool) {
     }
 }
 
-async fn handle_queue_processing_result<B: Broker + Clone>(
-    broker: &B,
+async fn handle_queue_processing_result<E>(
+    executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
     result: Result<Option<OffchainExecution>, EventProcessingError>,
-) {
+) where
+    E: Executor + Clone,
+    EventProcessingError: From<E::Error>,
+{
     match result {
         Ok(Some(execution)) => {
             if let Some(exec_id) = execution.id
                 && let Err(e) =
-                    execute_pending_offchain_execution(broker, pool, dual_write_context, exec_id)
+                    execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
                         .await
             {
                 error!("Failed to execute offchain order {exec_id}: {e}");
@@ -607,7 +628,7 @@ async fn handle_queue_processing_result<B: Broker + Clone>(
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn process_next_queued_event<P: Provider + Clone>(
-    broker_type: SupportedBroker,
+    executor_type: SupportedExecutor,
     config: &Config,
     pool: &SqlitePool,
     cache: &SymbolCache,
@@ -630,7 +651,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     };
 
     process_valid_trade(
-        broker_type,
+        executor_type,
         pool,
         &queued_event,
         event_id,
@@ -727,7 +748,7 @@ async fn handle_filtered_event(
     level = tracing::Level::INFO
 )]
 async fn process_valid_trade(
-    broker_type: SupportedBroker,
+    executor_type: SupportedExecutor,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
@@ -755,7 +776,7 @@ async fn process_valid_trade(
     );
 
     process_trade_within_transaction(
-        broker_type,
+        executor_type,
         pool,
         queued_event,
         event_id,
@@ -930,7 +951,7 @@ async fn execute_fail_stale_offchain(
 }
 
 async fn process_trade_within_transaction(
-    broker_type: SupportedBroker,
+    executor_type: SupportedExecutor,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
@@ -950,7 +971,7 @@ async fn process_trade_within_transaction(
     let TradeProcessingResult {
         execution,
         cleaned_up_executions,
-    } = accumulator::process_onchain_trade(&mut sql_tx, trade.clone(), broker_type)
+    } = accumulator::process_onchain_trade(&mut sql_tx, trade.clone(), executor_type)
         .await
         .map_err(|e| {
             error!(
@@ -1025,13 +1046,17 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'static>(
-    broker: &B,
+async fn check_and_execute_accumulated_positions<E>(
+    executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
-) -> Result<(), EventProcessingError> {
-    let broker_type = broker.to_supported_broker();
-    let executions = check_all_accumulated_positions(pool, broker_type).await?;
+) -> Result<(), EventProcessingError>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    let executor_type = executor.to_supported_executor();
+    let executions = check_all_accumulated_positions(pool, executor_type).await?;
 
     if executions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1055,11 +1080,11 @@ async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'sta
         );
 
         let pool_clone = pool.clone();
-        let broker_clone = broker.clone();
+        let executor_clone = executor.clone();
         let dual_write_clone = dual_write_context.clone();
         tokio::spawn(async move {
             if let Err(e) = execute_pending_offchain_execution(
-                &broker_clone,
+                &executor_clone,
                 &pool_clone,
                 &dual_write_clone,
                 execution_id,
@@ -1082,23 +1107,27 @@ async fn check_and_execute_accumulated_positions<B: Broker + Clone + Send + 'sta
     Ok(())
 }
 
-/// Maps database symbols to current broker-recognized tickers.
+/// Maps database symbols to current executor-recognized tickers.
 /// Handles corporate actions like SPLG → SPYM rename (Oct 31, 2025).
 /// Remove once proper tSPYM tokens are issued onchain.
-fn to_broker_ticker(symbol: &Symbol) -> Result<Symbol, BrokerError> {
+fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
     match symbol.to_string().as_str() {
         "SPLG" => Symbol::new("SPYM"),
         _ => Ok(symbol.clone()),
     }
 }
 
-#[tracing::instrument(skip(broker, pool, dual_write_context), level = tracing::Level::INFO)]
-async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
-    broker: &B,
+#[tracing::instrument(skip(executor, pool, dual_write_context), level = tracing::Level::INFO)]
+async fn execute_pending_offchain_execution<E>(
+    executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
     execution_id: i64,
-) -> Result<(), EventProcessingError> {
+) -> Result<(), EventProcessingError>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
     let execution = find_execution_by_id(pool, execution_id)
         .await?
         .ok_or_else(|| {
@@ -1110,14 +1139,12 @@ async fn execute_pending_offchain_execution<B: Broker + Clone + Send + 'static>(
     info!("Executing offchain order: {execution:?}");
 
     let market_order = MarketOrder {
-        symbol: to_broker_ticker(&execution.symbol)?,
+        symbol: to_executor_ticker(&execution.symbol)?,
         shares: execution.shares,
         direction: execution.direction,
     };
 
-    let placement = broker.place_market_order(market_order).await.map_err(|e| {
-        EventProcessingError::AccumulatorProcessing(format!("Order placement failed: {e}"))
-    })?;
+    let placement = executor.place_market_order(market_order).await?;
 
     info!("Order placed with ID: {}", placement.order_id);
 
@@ -1264,13 +1291,13 @@ mod tests {
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
-    use st0x_broker::{
-        Direction, MockBrokerConfig, OrderState, OrderStatus, Shares, SupportedBroker, Symbol,
-        TryIntoBroker,
+    use st0x_execution::{
+        Direction, MockExecutorConfig, OrderState, OrderStatus, Shares, SupportedExecutor, Symbol,
+        TryIntoExecutor,
     };
 
     fn abort_all_conductor_tasks(conductor: Conductor) {
-        if let Some(handle) = conductor.broker_maintenance {
+        if let Some(handle) = conductor.executor_maintenance {
             handle.abort();
         }
 
@@ -1434,10 +1461,13 @@ mod tests {
             .await
             {
                 let mut sql_tx = pool.begin().await.unwrap();
-                let TradeProcessingResult { .. } =
-                    accumulator::process_onchain_trade(&mut sql_tx, trade, SupportedBroker::DryRun)
-                        .await
-                        .unwrap();
+                let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
+                    &mut sql_tx,
+                    trade,
+                    SupportedExecutor::DryRun,
+                )
+                .await
+                .unwrap();
                 sql_tx.commit().await.unwrap();
             }
         }
@@ -1891,7 +1921,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let result = process_next_queued_event(
-            SupportedBroker::DryRun,
+            SupportedExecutor::DryRun,
             &config,
             &pool,
             &cache,
@@ -1911,11 +1941,11 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_not_found() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let result =
-            execute_pending_offchain_execution(&broker, &pool, &dual_write_context, 99999).await;
+            execute_pending_offchain_execution(&executor, &pool, &dual_write_context, 99999).await;
         assert!(matches!(
             result.unwrap_err(),
             EventProcessingError::AccumulatorProcessing(_)
@@ -2003,7 +2033,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2048,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_calls_confirm_submission() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AMZN").unwrap();
@@ -2062,7 +2092,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2073,7 +2103,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2119,7 +2149,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_updates_legacy_table_to_submitted() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("BMNR").unwrap();
@@ -2133,7 +2163,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2157,7 +2187,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2214,7 +2244,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_stores_correct_order_id() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
@@ -2228,7 +2258,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Sell,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2239,7 +2269,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Sell,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2276,7 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn test_order_poller_can_find_orders_after_execution() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("NVDA").unwrap();
@@ -2290,7 +2320,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2301,7 +2331,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2313,7 +2343,7 @@ mod tests {
             &pool,
             Some(symbol.clone()),
             OrderStatus::Submitted,
-            Some(SupportedBroker::DryRun),
+            Some(SupportedExecutor::DryRun),
         )
         .await
         .unwrap();
@@ -2331,7 +2361,7 @@ mod tests {
             &pool,
             Some(symbol.clone()),
             OrderStatus::Submitted,
-            Some(SupportedBroker::DryRun),
+            Some(SupportedExecutor::DryRun),
         )
         .await
         .unwrap();
@@ -2360,7 +2390,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_dual_write_consistency() {
         let pool = setup_test_db().await;
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOGL").unwrap();
@@ -2374,7 +2404,7 @@ mod tests {
                 &symbol,
                 shares,
                 Direction::Buy,
-                SupportedBroker::DryRun,
+                SupportedExecutor::DryRun,
             )
             .await
             .unwrap();
@@ -2385,7 +2415,7 @@ mod tests {
             symbol: symbol.clone(),
             shares,
             direction: Direction::Buy,
-            broker: SupportedBroker::DryRun,
+            executor: SupportedExecutor::DryRun,
             state: OrderState::Pending,
         };
 
@@ -2440,12 +2470,12 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .spawn();
 
@@ -2470,12 +2500,12 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .spawn();
 
@@ -2515,12 +2545,12 @@ mod tests {
 
         let start_time = std::time::Instant::now();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .spawn();
 
@@ -2545,12 +2575,12 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .spawn();
 
@@ -2569,7 +2599,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let rebalancer_handle = tokio::spawn(async {
@@ -2580,8 +2610,8 @@ mod tests {
         });
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .with_rebalancer(rebalancer_handle)
                 .spawn();
@@ -2603,7 +2633,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let rebalancer_handle = tokio::spawn(async {
@@ -2613,8 +2643,8 @@ mod tests {
         });
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .with_rebalancer(rebalancer_handle)
                 .spawn();
@@ -2638,7 +2668,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let broker = MockBrokerConfig.try_into_broker().await.unwrap();
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let rebalancer_handle = tokio::spawn(async {
@@ -2648,8 +2678,8 @@ mod tests {
         });
 
         let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, broker, dual_write_context)
-                .with_broker_maintenance(None)
+            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
+                .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .with_rebalancer(rebalancer_handle)
                 .spawn();
@@ -2666,16 +2696,16 @@ mod tests {
     }
 
     #[test]
-    fn test_to_broker_ticker_splg_maps_to_spym() {
+    fn test_to_executor_ticker_splg_maps_to_spym() {
         let splg = Symbol::new("SPLG").unwrap();
-        assert_eq!(to_broker_ticker(&splg).unwrap().to_string(), "SPYM");
+        assert_eq!(to_executor_ticker(&splg).unwrap().to_string(), "SPYM");
     }
 
     #[test]
-    fn test_to_broker_ticker_other_symbols_unchanged() {
+    fn test_to_executor_ticker_other_symbols_unchanged() {
         for ticker in ["AAPL", "NVDA", "MSTR", "IAU", "COIN"] {
             let symbol = Symbol::new(ticker).unwrap();
-            assert_eq!(to_broker_ticker(&symbol).unwrap().to_string(), ticker);
+            assert_eq!(to_executor_ticker(&symbol).unwrap().to_string(), ticker);
         }
     }
 }

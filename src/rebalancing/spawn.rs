@@ -10,15 +10,14 @@ use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{CqrsFramework, Query};
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tokio::sync::{RwLock, mpsc};
+use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
-
-use st0x_broker::alpaca::AlpacaAuthEnv;
-use tokio::task::JoinHandle;
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
@@ -71,7 +70,7 @@ type ConfiguredRebalancer<BP> = Rebalancer<
 pub(crate) async fn spawn_rebalancer<BP>(
     pool: SqlitePool,
     config: &RebalancingConfig,
-    alpaca_auth: &AlpacaAuthEnv,
+    alpaca_auth: &AlpacaTradingApiAuthEnv,
     base_provider: BP,
     symbol_cache: SymbolCache,
     event_broadcast: Option<broadcast::Sender<ServerMessage>>,
@@ -118,7 +117,7 @@ where
 {
     async fn new(
         config: &RebalancingConfig,
-        alpaca_auth: &AlpacaAuthEnv,
+        alpaca_auth: &AlpacaTradingApiAuthEnv,
         ethereum_wallet: &EthereumWallet,
         signer: PrivateKeySigner,
         base_provider: BP,

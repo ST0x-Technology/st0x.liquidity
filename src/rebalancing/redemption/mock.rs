@@ -2,7 +2,7 @@
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

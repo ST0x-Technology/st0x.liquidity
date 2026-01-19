@@ -10,7 +10,7 @@ use cqrs_es::{AggregateContext, EventStore};
 use rust_decimal::Decimal;
 use sqlite_es::{SqliteEventRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
-use st0x_broker::Symbol;
+use st0x_execution::Symbol;
 use tracing::{error, info, warn};
 
 use super::{ExecutionMode, MigrationError};

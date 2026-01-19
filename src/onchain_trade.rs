@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_broker::{Direction, Symbol};
+use st0x_execution::{Direction, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
