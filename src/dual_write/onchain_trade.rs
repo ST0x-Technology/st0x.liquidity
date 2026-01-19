@@ -14,7 +14,7 @@ pub(crate) async fn witness_trade(
 
     let symbol = trade.symbol.base().clone();
     let amount = Decimal::try_from(trade.amount)?;
-    let price_usdc = Decimal::try_from(trade.price_usdc)?;
+    let price_usdc = Decimal::try_from(trade.price.value())?;
 
     let block_timestamp =
         trade
@@ -45,12 +45,11 @@ pub(crate) async fn witness_trade(
 mod tests {
     use alloy::primitives::fixed_bytes;
     use chrono::Utc;
-    use st0x_broker::Direction;
-
-    use crate::onchain::io::TokenizedEquitySymbol;
-    use crate::test_utils::setup_test_db;
+    use st0x_execution::Direction;
 
     use super::*;
+    use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
+    use crate::test_utils::setup_test_db;
 
     #[tokio::test]
     async fn test_witness_trade_success() {
@@ -66,7 +65,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
@@ -124,7 +123,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
@@ -168,7 +167,7 @@ mod tests {
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
             amount: 10.5,
             direction: Direction::Buy,
-            price_usdc: 150.25,
+            price: Usdc::new(150.25).unwrap(),
             block_timestamp: None,
             created_at: None,
             gas_used: None,

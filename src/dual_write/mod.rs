@@ -4,6 +4,7 @@ use alloy::primitives::TxHash;
 use cqrs_es::AggregateError;
 use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
+use st0x_execution::PersistenceError;
 
 use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain_order::{NegativePriceCents, OffchainOrder, OffchainOrderError};
@@ -26,6 +27,8 @@ pub(crate) use position::{
 pub(crate) enum DualWriteError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("Integer conversion error: {0}")]
@@ -52,6 +55,7 @@ pub(crate) enum DualWriteError {
 
 #[derive(Clone)]
 pub(crate) struct DualWriteContext {
+    pool: SqlitePool,
     onchain_trade: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
     position: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>>,
     offchain_order: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
@@ -60,10 +64,15 @@ pub(crate) struct DualWriteContext {
 impl DualWriteContext {
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self {
+            pool: pool.clone(),
             onchain_trade: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             position: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             offchain_order: Arc::new(sqlite_cqrs(pool, vec![], ())),
         }
+    }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     pub(crate) fn onchain_trade_framework(&self) -> &SqliteCqrs<Lifecycle<OnChainTrade, Never>> {
