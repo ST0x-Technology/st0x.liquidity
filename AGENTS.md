@@ -152,6 +152,19 @@ resolution and feature selection.
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
   the interactive view, e.g. `git --no-pager diff`
 
+### Updating GitHub Issues
+
+When updating GitHub issue bodies (especially the roadmap issue #2):
+
+1. Save the current body to a local `.md` file:
+   `gh issue view <number> --repo ST0x-Technology/st0x.liquidity --json body -q '.body' > roadmap-issue-2.md`
+2. Edit the file using the `Edit` tool (so changes are visible for review)
+3. Apply the update:
+   `gh issue edit <number> --repo ST0x-Technology/st0x.liquidity --body-file roadmap-issue-2.md`
+4. Delete the temp file
+
+This pattern ensures changes are reviewable before being applied.
+
 ## Architecture Overview
 
 ### Broker Abstraction Layer
@@ -220,80 +233,21 @@ new brokers, see @crates/broker/AGENTS.md
 
 ### Database Schema & Idempotency
 
-**SQLite Tables:**
+**Key tables** (see migrations for full schema):
 
-- `onchain_trades`: Immutable blockchain trade records
-
-  - `id`: Primary key (auto-increment)
-  - `tx_hash`: Transaction hash (66 chars, 0x-prefixed)
-  - `log_index`: Event log index (non-negative)
-  - `symbol`: Asset symbol (non-empty string)
-  - `amount`: Trade quantity (positive real number)
-  - `direction`: Trade direction ('BUY' or 'SELL')
-  - `price_usdc`: Price in USDC (positive real number)
-  - `created_at`: Timestamp (default CURRENT_TIMESTAMP)
-  - Unique constraint: `(tx_hash, log_index)`
-
-- `schwab_executions`: Schwab order execution tracking
-
-  - `id`: Primary key (auto-increment)
-  - `symbol`: Asset symbol (non-empty string)
-  - `shares`: Whole shares executed (positive integer)
-  - `direction`: Execution direction ('BUY' or 'SELL')
-  - `order_id`: Schwab order ID (nullable, non-empty if present)
-  - `price_cents`: Execution price in cents (nullable, non-negative)
-  - `status`: Execution status ('PENDING', 'COMPLETED', 'FAILED')
-  - `executed_at`: Execution timestamp (nullable)
-  - Check constraints ensure consistent status transitions
-
+- `onchain_trades`: Immutable blockchain trade records, keyed by
+  `(tx_hash, log_index)`
+- `schwab_executions`: Order execution tracking with status transitions
 - `trade_accumulators`: Unified position tracking per symbol
-
-  - `symbol`: Primary key (non-empty string)
-  - `accumulated_long`: Fractional shares for buying (non-negative)
-  - `accumulated_short`: Fractional shares for selling (non-negative)
-  - `pending_execution_id`: Reference to pending execution (nullable)
-  - `last_updated`: Last update timestamp (default CURRENT_TIMESTAMP)
-
-- `trade_execution_links`: Many-to-many audit trail
-
-  - `id`: Primary key (auto-increment)
-  - `trade_id`: Foreign key to onchain_trades
-  - `execution_id`: Foreign key to schwab_executions
-  - `contributed_shares`: Fractional shares contributed (positive)
-  - `created_at`: Link creation timestamp
-  - Unique constraint: `(trade_id, execution_id)`
-
-- `schwab_auth`: OAuth token storage (sensitive data)
-
-  - `id`: Primary key (constrained to 1 for singleton)
-  - `access_token`: Current access token
-  - `access_token_fetched_at`: Access token timestamp
-  - `refresh_token`: Current refresh token
-  - `refresh_token_fetched_at`: Refresh token timestamp
-
-- `event_queue`: Idempotent event processing queue
-
-  - `id`: Primary key (auto-increment)
-  - `tx_hash`: Transaction hash (66 chars, 0x-prefixed)
-  - `log_index`: Event log index (non-negative)
-  - `block_number`: Block number (non-negative)
-  - `event_data`: JSON serialized event (non-empty)
-  - `processed`: Processing status (boolean, default false)
-  - `created_at`: Queue entry timestamp
-  - `processed_at`: Processing completion timestamp (nullable)
-  - Unique constraint: `(tx_hash, log_index)`
-
+- `trade_execution_links`: Many-to-many audit trail between trades and
+  executions
+- `schwab_auth`: OAuth token storage (singleton)
+- `event_queue`: Idempotent event processing queue, keyed by
+  `(tx_hash, log_index)`
 - `symbol_locks`: Per-symbol execution concurrency control
 
-  - `symbol`: Primary key (non-empty string)
-  - `locked_at`: Lock acquisition timestamp
-
-**Idempotency Controls:**
-
-- Uses `(tx_hash, log_index)` as unique identifier to prevent duplicate trade
-  execution
-- Trade status tracking: pending → completed/failed
-- Retry logic with exponential backoff for failed trades
+**Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
+tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
@@ -602,31 +556,9 @@ async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
 6. **Database Constraints**: Let database constraints fail rather than masking
    violations
 
-#### Required Error Types
-
-Every financial operation must have proper error types that preserve context:
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum FinancialError {
-    #[error("Value {value} exceeds maximum allowed {max_allowed}")]
-    ValueTooLarge { value: u64, max_allowed: u64 },
-
-    #[error("Arithmetic overflow in operation: {operation}")]
-    ArithmeticOverflow { operation: String },
-
-    #[error("Precision loss detected: {original} -> {converted}")]
-    PrecisionLoss { original: String, converted: String },
-
-    #[error("Invalid price format: '{input}'")]
-    InvalidPrice { input: String, #[source] source: DecimalError },
-}
-```
-
-**Remember: In financial applications, it is ALWAYS better for the system to
-fail fast with a clear error than to continue with potentially corrupted data.
-Silent data corruption in financial systems can lead to massive losses,
-regulatory violations, and complete system failure.**
+**Remember: In financial applications, ALWAYS fail fast with clear errors rather
+than continue with potentially corrupted data. Silent data corruption leads to
+massive losses and regulatory violations.**
 
 ### CRITICAL: Security and Secrets Management
 
@@ -671,19 +603,8 @@ read your .env file which contains sensitive credentials. May I have permission
 to read it?"
 ```
 
-#### Alternative Approaches
-
-When debugging configuration issues, prefer these approaches:
-
-1. **Ask the user** to verify specific environment variables are set
-2. **Request sanitized output** where sensitive values are redacted
-3. **Check example files** like `.env.example` instead of the actual `.env`
-4. **Review code** that uses the configuration rather than the configuration
-   itself
-
-**Remember: Protecting secrets is critical for application security. Always
-respect the sensitivity of credential files and never access them without
-explicit permission.**
+**Alternatives**: Ask user to verify env vars are set, request sanitized output,
+check `.env.example` instead of `.env`, or review code that uses configuration.
 
 ### Testing Strategy
 
@@ -712,43 +633,9 @@ Tests should verify our application logic, not just language features. Avoid
 tests that only exercise struct construction or field access without testing any
 business logic.
 
-##### ❌ Bad: Testing language features instead of our code
-
-```rust
-#[test]
-fn test_order_poller_config_custom() {
-    let config = OrderPollerConfig {
-        polling_interval: Duration::from_secs(30),
-        max_jitter: Duration::from_secs(10),
-    };
-
-    assert_eq!(config.polling_interval, Duration::from_secs(30));
-    assert_eq!(config.max_jitter, Duration::from_secs(10));
-}
-```
-
-This test creates a struct and verifies field assignments, but doesn't test any
-of our code logic - it only tests Rust's struct field assignment mechanism.
-
-##### ✅ Good: Testing actual business logic
-
-```rust
-#[test]
-fn test_order_poller_respects_jitter_bounds() {
-    let config = OrderPollerConfig {
-        polling_interval: Duration::from_secs(60),
-        max_jitter: Duration::from_secs(10),
-    };
-    
-    let actual_delay = config.calculate_next_poll_delay();
-    
-    assert!(actual_delay >= Duration::from_secs(60));
-    assert!(actual_delay <= Duration::from_secs(70));
-}
-```
-
-This test verifies that our jitter calculation logic works correctly within
-expected bounds.
+❌ Bad: Testing struct field assignments (just tests Rust, not our code). ✅
+Good: Testing actual business logic like `config.calculate_next_poll_delay()`
+returning values within expected bounds.
 
 ### Workflow Best Practices
 
@@ -892,62 +779,18 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
 #### Bad Comment Examples
 
 ```rust
-// ❌ Redundant - the function name says this
-// Spawn background token refresh task
-spawn_automatic_token_refresh(pool, env);
-
-// ❌ Obvious from context
-// Store test tokens
-let tokens = SchwabTokens { /* ... */ };
-tokens.store(&pool).await.unwrap();
-
-// ❌ Just restating the code
-// Mock account hash endpoint
-let mock = server.mock(|when, then| {
-    when.method(GET).path("/trader/v1/accounts/accountNumbers");
-    // ...
-});
-
-// ❌ Test section markers that add no value
-// 1. Test token refresh integration
-let result = refresh_tokens(&pool).await;
-
-// ❌ Explaining what the code obviously does
-// Execute the order
-execute_schwab_order(env, pool, trade).await;
-
-// ❌ Obvious variable assignments
-// Create a trade
-let trade = Trade { /* ... */ };
-
-// ❌ Test setup that's clear from code structure
-// Verify mocks were called
-mock.assert();
-
-// ❌ Obvious control flow
-// Save trade to DB
-trade.try_save_to_db(&pool).await?;
-```
-
-#### Function Documentation
-
-Use Rust doc comments (`///`) for public APIs:
-
-```rust
-/// Validates Schwab authentication tokens and refreshes if needed.
-/// 
-/// Returns `SchwabError::RefreshTokenExpired` if the refresh token
-/// has expired and manual re-authentication is required.
-pub async fn refresh_if_needed(pool: &SqlitePool) -> Result<bool, SchwabError> {
+// ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
+// ❌ Obvious from context: // Store test tokens
+// ❌ Just restating code: // Mock account hash endpoint
+// ❌ Test section markers: // 1. Test token refresh integration
+// ❌ Obvious operations: // Execute the order, // Create a trade, // Verify mocks
 ```
 
 #### Comment Maintenance
 
-- Remove comments when refactoring makes them obsolete
-- Update comments when changing the logic they describe
-- If a comment is needed to explain what code does, consider refactoring for
-  clarity
-- Keep comments concise and focused on the "why" rather than the "what"
+Use `///` doc comments for public APIs. Remove/update comments when refactoring.
+If a comment is needed to explain what code does, consider refactoring instead.
+Keep comments focused on "why" rather than "what".
 
 ### Code style
 
@@ -1018,33 +861,10 @@ and sub-crates like `st0x-broker`.
 
 #### Use `.unwrap` over boolean result assertions in tests
 
-Instead of
-
-```rust
-assert!(result.is_err());
-assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
-```
-
-or
-
-```rust
-assert!(result.is_ok());
-assert_eq!(result.unwrap(), "refreshed_access_token");
-```
-
-Write
-
-```rust
-assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
-```
-
-and
-
-```rust
-assert_eq!(result.unwrap(), "refreshed_access_token");
-```
-
-so that if we get an unexpected result value, we immediately see the value.
+Instead of `assert!(result.is_err()); assert!(matches!(...))`, write
+`assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));` directly.
+Similarly, instead of `assert!(result.is_ok()); assert_eq!(...)`, write
+`assert_eq!(result.unwrap(), "expected_value");` so unexpected values are shown.
 
 #### Type modeling examples
 
@@ -1130,40 +950,13 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 ##### Use early returns:
 
-Instead of
-
 ```rust
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    if let Some(data) = data {
-        if !data.is_empty() {
-            if data.len() > 5 {
-                Ok(data.to_uppercase())
-            } else {
-                Err(Error::TooShort)
-            }
-        } else {
-            Err(Error::Empty)
-        }
-    } else {
-        Err(Error::None)
-    }
-}
-```
-
-Write
-
-```rust
+// ❌ Nested: if let Some(data) = data { if !data.is_empty() { if data.len() > 5 { ... } } }
+// ✅ Flat with early returns:
 fn process_data(data: Option<&str>) -> Result<String, Error> {
     let data = data.ok_or(Error::None)?;
-    
-    if data.is_empty() {
-        return Err(Error::Empty);
-    }
-    
-    if data.len() <= 5 {
-        return Err(Error::TooShort);
-    }
-    
+    if data.is_empty() { return Err(Error::Empty); }
+    if data.len() <= 5 { return Err(Error::TooShort); }
     Ok(data.to_uppercase())
 }
 ```
@@ -1187,37 +980,15 @@ Break deeply nested event processing into helper functions with clear names.
 ##### Use pattern matching with guards:
 
 ```rust
-// Instead of nested if-let
-if let Some(data) = input {
-    if state == State::Ready && data.is_valid() {
-        process(data)
-    } else { Err(Error::Invalid) }
-} else { Err(Error::NoData) }
-
-// Write
-match (input, state) {
-    (Some(data), State::Ready) if data.is_valid() => process(data),
-    (Some(_), State::Ready) => Err(Error::InvalidData),
-    _ => Err(Error::NoData),
-}
+// ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
+// ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
 ```
 
 ##### Prefer iterator chains over nested loops:
 
 ```rust
-// Instead of imperative loops
-let mut results = Vec::new();
-for trade in &trades {
-    if trade.is_valid() {
-        results.push(process_trade(trade)?);
-    }
-}
-
-// Write functional chains
-trades.iter()
-    .filter(|t| t.is_valid())
-    .map(process_trade)
-    .collect::<Result<Vec<_>, _>>()
+// ❌ Imperative: let mut results = Vec::new(); for t in &trades { if t.is_valid() { results.push(...) } }
+// ✅ Functional: trades.iter().filter(|t| t.is_valid()).map(process_trade).collect::<Result<Vec<_>, _>>()
 ```
 
 #### Struct field access
@@ -1225,40 +996,7 @@ trades.iter()
 Avoid creating unnecessary constructors or getters when they don't add logic
 beyond setting/getting field values. Use public fields directly instead.
 
-##### Prefer direct field access:
-
-```rust
-pub struct SchwabTokens {
-    pub access_token: String,
-    pub access_token_fetched_at: DateTime<Utc>,
-    pub refresh_token: String,
-    pub refresh_token_fetched_at: DateTime<Utc>,
-}
-
-// Create with struct literal syntax
-let tokens = SchwabTokens {
-    access_token: "token123".to_string(),
-    access_token_fetched_at: Utc::now(),
-    refresh_token: "refresh456".to_string(),
-    refresh_token_fetched_at: Utc::now(),
-};
-
-// Access fields directly
-println!("Token: {}", tokens.access_token);
-```
-
-##### Avoid unnecessary constructors and getters:
-
-```rust
-// Don't create these unless they add meaningful logic
-impl SchwabTokens {
-    // Unnecessary - just sets fields without additional logic
-    pub fn new(access_token: String, /* ... */) -> Self { /* ... */ }
-    
-    // Unnecessary - just returns field value
-    pub fn access_token(&self) -> &str { &self.access_token }
-}
-```
-
-This preserves argument clarity and avoids losing information about what each
-field represents.
+Use struct literal syntax directly (`SchwabTokens { access_token: "...", ... }`)
+and access fields directly (`tokens.access_token`). Don't create `fn new()`
+constructors or `fn field(&self)` getters unless they add meaningful logic
+beyond setting/getting field values.
