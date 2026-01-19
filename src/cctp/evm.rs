@@ -12,29 +12,6 @@ use super::{
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
 
-// CCTP V2 message layout (see lib/evm-cctp-contracts/src/messages/v2/MessageV2.sol):
-// - Bytes 0-3: version (4 bytes)
-// - Bytes 4-7: source domain (4 bytes)
-// - Bytes 8-11: destination domain (4 bytes)
-// - Bytes 12-43: nonce (32 bytes) <- we extract this
-// - Bytes 44+: remaining message data
-// Minimum length required: 44 bytes (to include the full nonce)
-const NONCE_INDEX: usize = 12;
-const MIN_MESSAGE_LENGTH: usize = NONCE_INDEX + 32;
-
-/// Extracts the 32-byte nonce from a CCTP V2 message.
-fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpError> {
-    if message.len() < MIN_MESSAGE_LENGTH {
-        return Err(CctpError::MessageTooShort {
-            length: message.len(),
-        });
-    }
-
-    Ok(FixedBytes::<32>::from_slice(
-        &message[NONCE_INDEX..NONCE_INDEX + 32],
-    ))
-}
-
 /// EVM chain connection with contract instances for CCTP operations.
 pub(crate) struct Evm<P>
 where
@@ -124,19 +101,17 @@ where
 
         let receipt = pending.get_receipt().await?;
 
-        let message_sent_event = receipt
+        if !receipt
             .inner
             .logs()
             .iter()
-            .find_map(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).ok())
-            .ok_or(CctpError::MessageSentEventNotFound)?;
-
-        let message = message_sent_event.message.clone();
-        let nonce = extract_nonce_from_message(&message)?;
+            .any(|log| MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).is_ok())
+        {
+            return Err(CctpError::MessageSentEventNotFound);
+        }
 
         Ok(BurnReceipt {
             tx: receipt.transaction_hash,
-            nonce,
             amount,
         })
     }
@@ -170,118 +145,5 @@ where
     #[cfg(test)]
     pub(super) fn token_messenger(&self) -> &TokenMessengerV2::TokenMessengerV2Instance<P> {
         &self.token_messenger
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alloy::primitives::FixedBytes;
-    use itertools::Itertools;
-    use proptest::prelude::*;
-
-    use super::{CctpError, MIN_MESSAGE_LENGTH, NONCE_INDEX, extract_nonce_from_message};
-
-    fn build_message(header: &[u8], nonce: [u8; 32], trailer: &[u8]) -> Vec<u8> {
-        header
-            .iter()
-            .copied()
-            .chain(nonce)
-            .chain(trailer.iter().copied())
-            .collect_vec()
-    }
-
-    #[test]
-    fn extract_nonce_from_empty_message_returns_message_too_short() {
-        let err = extract_nonce_from_message(&[]).unwrap_err();
-
-        assert!(
-            matches!(err, CctpError::MessageTooShort { length: 0 }),
-            "Expected MessageTooShort with length 0, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn extract_nonce_from_short_message_returns_message_too_short() {
-        let message = [0u8; 43]; // One byte short of minimum
-
-        let err = extract_nonce_from_message(&message).unwrap_err();
-
-        assert!(
-            matches!(err, CctpError::MessageTooShort { length: 43 }),
-            "Expected MessageTooShort with length 43, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn extract_nonce_from_minimum_length_message_succeeds() {
-        let expected_nonce: [u8; 32] = core::array::from_fn(|i| {
-            u8::try_from(i + 1).expect("index 0..31 + 1 always fits in u8")
-        });
-        let message = build_message(&[0u8; NONCE_INDEX], expected_nonce, &[]);
-
-        let nonce = extract_nonce_from_message(&message).unwrap();
-
-        assert_eq!(nonce, FixedBytes::from(expected_nonce));
-    }
-
-    #[test]
-    fn extract_nonce_from_longer_message_succeeds() {
-        let expected_nonce = [0xFF; 32];
-        let message = build_message(&[0u8; NONCE_INDEX], expected_nonce, &[0u8; 56]);
-
-        let nonce = extract_nonce_from_message(&message).unwrap();
-
-        assert_eq!(nonce, FixedBytes::from(expected_nonce));
-    }
-
-    #[test]
-    fn extract_nonce_ignores_bytes_before_nonce_index() {
-        let expected_nonce = [0x00; 32];
-        let message = build_message(&[0xAB; NONCE_INDEX], expected_nonce, &[]);
-
-        let nonce = extract_nonce_from_message(&message).unwrap();
-
-        assert_eq!(nonce, FixedBytes::from(expected_nonce));
-    }
-
-    proptest! {
-        #[test]
-        fn short_messages_always_fail(len in 0..MIN_MESSAGE_LENGTH) {
-            let message = vec![0u8; len];
-
-            let err = extract_nonce_from_message(&message).unwrap_err();
-
-            match err {
-                CctpError::MessageTooShort { length } => prop_assert_eq!(length, len),
-                other => prop_assert!(false, "Expected MessageTooShort, got: {:?}", other),
-            }
-        }
-
-        #[test]
-        fn valid_messages_always_extract_correct_nonce(
-            header in prop::collection::vec(any::<u8>(), NONCE_INDEX),
-            nonce in any::<[u8; 32]>(),
-            trailer_len in 0usize..100,
-        ) {
-            let trailer = vec![0u8; trailer_len];
-            let message = build_message(&header, nonce, &trailer);
-
-            let extracted = extract_nonce_from_message(&message).unwrap();
-
-            prop_assert_eq!(extracted, FixedBytes::from(nonce));
-        }
-
-        #[test]
-        fn nonce_extraction_is_independent_of_surrounding_bytes(
-            header in prop::collection::vec(any::<u8>(), NONCE_INDEX),
-            nonce in any::<[u8; 32]>(),
-            trailer in prop::collection::vec(any::<u8>(), 0..100),
-        ) {
-            let message = build_message(&header, nonce, &trailer);
-
-            let extracted = extract_nonce_from_message(&message).unwrap();
-
-            prop_assert_eq!(extracted, FixedBytes::from(nonce));
-        }
     }
 }

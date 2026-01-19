@@ -239,15 +239,11 @@ where
             }
         };
 
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
         self.cqrs
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
-                    cctp_nonce,
                 },
             )
             .await?;
@@ -287,6 +283,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.attestation.to_vec(),
+                    cctp_nonce: response.nonce_as_u64(),
                 },
             )
             .await?;
@@ -484,15 +481,11 @@ where
             }
         };
 
-        let nonce_bytes = burn_receipt.nonce.as_slice();
-        let cctp_nonce = u64::from_be_bytes(nonce_bytes[24..32].try_into().unwrap_or([0u8; 8]));
-
         self.cqrs
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::InitiateBridging {
                     burn_tx: burn_receipt.tx,
-                    cctp_nonce,
                 },
             )
             .await?;
@@ -532,6 +525,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
                     attestation: response.attestation.to_vec(),
+                    cctp_nonce: response.nonce_as_u64(),
                 },
             )
             .await?;
