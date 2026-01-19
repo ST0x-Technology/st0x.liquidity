@@ -477,7 +477,7 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
-        // Acquire a lease and immediately set it to be 10 minutes old
+        // Acquire a lease and immediately set it to be older than LOCK_TIMEOUT_MINUTES (15)
         let mut sql_tx = pool.begin().await.unwrap();
         let acquired = try_acquire_execution_lease(&mut sql_tx, &symbol)
             .await
@@ -486,7 +486,7 @@ mod tests {
         sql_tx.commit().await.unwrap();
 
         sqlx::query(
-            "UPDATE symbol_locks SET locked_at = datetime('now', '-10 minutes') WHERE symbol = ?1",
+            "UPDATE symbol_locks SET locked_at = datetime('now', '-20 minutes') WHERE symbol = ?1",
         )
         .bind(symbol.to_string())
         .execute(&pool)
