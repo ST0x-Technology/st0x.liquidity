@@ -64,30 +64,6 @@ services:
       - grafana
     restart: unless-stopped
 
-  dashboard-schwab:
-    image: ${DASHBOARD_IMAGE}
-    pull_policy: ${PULL_POLICY}
-    container_name: dashboard-schwab
-    ports:
-      - "8080:80"
-    environment:
-      - BACKEND_HOST=schwarbot
-    depends_on:
-      - schwarbot
-    restart: unless-stopped
-
-  dashboard-alpaca:
-    image: ${DASHBOARD_IMAGE}
-    pull_policy: ${PULL_POLICY}
-    container_name: dashboard-alpaca
-    ports:
-      - "8081:80"
-    environment:
-      - BACKEND_HOST=alpacabot
-    depends_on:
-      - alpacabot
-    restart: unless-stopped
-
   grafana:
     build:
       context: .
