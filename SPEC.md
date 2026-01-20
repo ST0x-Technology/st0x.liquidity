@@ -1890,7 +1890,14 @@ enum UsdcRebalanceEvent {
     crypto wallet, must convert to USD buying power for trading)
   - Conversion uses USDC/USD crypto trading pair on Alpaca (market orders)
   - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
-  - Conversion orders fill immediately (market orders with high liquidity)
+  - Market orders are near-instant but NOT guaranteed to fill immediately
+  - Slippage: ~17bps observed in live tests (reduces effective USD received)
+  - Partial fills: The system polls until the order is fully filled. Market
+    orders for USDC/USD are expected to fill completely due to high liquidity.
+    If an order enters a terminal failed state before full fill, the conversion
+    fails and requires manual intervention.
+  - Minimum withdrawal threshold ($51) accounts for slippage to ensure $50
+    minimum is met after conversion
   - ConversionFailed is a terminal state (requires manual intervention)
   - ConversionComplete is terminal for BaseToAlpaca direction
 - Alpaca withdrawals/deposits are asynchronous: initiate with API call (get
