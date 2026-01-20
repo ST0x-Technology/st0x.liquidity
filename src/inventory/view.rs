@@ -498,6 +498,7 @@ impl InventoryView {
             (
                 UsdcRebalanceEvent::DepositConfirmed {
                     deposit_confirmed_at,
+                    ..
                 },
                 _,
             ) => self.update_usdc(
@@ -1395,8 +1396,9 @@ mod tests {
         }
     }
 
-    fn make_deposit_confirmed_event() -> UsdcRebalanceEvent {
+    fn make_deposit_confirmed_event(direction: RebalanceDirection) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::DepositConfirmed {
+            direction,
             deposit_confirmed_at: Utc::now(),
         }
     }
@@ -1491,15 +1493,11 @@ mod tests {
     #[test]
     fn apply_usdc_deposit_confirmed_updates_last_rebalancing() {
         let view = make_usdc_view(1100, 0, 900, 0);
-        let event = make_deposit_confirmed_event();
+        let direction = RebalanceDirection::AlpacaToBase;
+        let event = make_deposit_confirmed_event(direction.clone());
 
         let updated = view
-            .apply_usdc_rebalance_event(
-                &event,
-                &RebalanceDirection::AlpacaToBase,
-                usdc(100),
-                Utc::now(),
-            )
+            .apply_usdc_rebalance_event(&event, &direction, usdc(100), Utc::now())
             .unwrap();
 
         assert!(updated.usdc.last_rebalancing.is_some());
@@ -1535,7 +1533,7 @@ mod tests {
 
         let after_confirmed = after_bridged
             .apply_usdc_rebalance_event(
-                &make_deposit_confirmed_event(),
+                &make_deposit_confirmed_event(direction.clone()),
                 &direction,
                 amount,
                 Utc::now(),
@@ -1574,7 +1572,7 @@ mod tests {
 
         let after_confirmed = after_bridged
             .apply_usdc_rebalance_event(
-                &make_deposit_confirmed_event(),
+                &make_deposit_confirmed_event(direction.clone()),
                 &direction,
                 amount,
                 Utc::now(),

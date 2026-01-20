@@ -1929,9 +1929,9 @@ mod tests {
 
         // Poll returns expired
         let _get_mock = server.mock(|when, then| {
-            when.method(GET).path(format!(
+            when.method(GET).path(
                 "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/61e7b016-9c91-4a97-b912-615c9d365c9d"
-            ));
+            );
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

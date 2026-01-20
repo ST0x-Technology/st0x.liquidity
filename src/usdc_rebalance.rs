@@ -279,8 +279,12 @@ pub(crate) enum UsdcRebalanceEvent {
         deposit_ref: TransferRef,
         deposit_initiated_at: DateTime<Utc>,
     },
-    /// Deposit completed successfully. Terminal success state.
-    DepositConfirmed { deposit_confirmed_at: DateTime<Utc> },
+    /// Deposit completed successfully. Terminal success state for AlpacaToBase.
+    /// For BaseToAlpaca, post-deposit conversion (USDC->USD) still required.
+    DepositConfirmed {
+        direction: RebalanceDirection,
+        deposit_confirmed_at: DateTime<Utc>,
+    },
     /// Deposit failed. Preserves deposit reference when available.
     DepositFailed {
         deposit_ref: Option<TransferRef>,
@@ -899,8 +903,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::Bridged { .. },
             ) => Err(UsdcRebalanceError::DepositNotInitiated),
 
-            Ok(UsdcRebalance::DepositInitiated { .. }) => {
+            Ok(UsdcRebalance::DepositInitiated { direction, .. }) => {
                 Ok(vec![UsdcRebalanceEvent::DepositConfirmed {
+                    direction: direction.clone(),
                     deposit_confirmed_at: Utc::now(),
                 }])
             }
@@ -1003,8 +1008,9 @@ impl UsdcRebalance {
                 deposit_initiated_at,
             } => current.apply_deposit_initiated(deposit_ref, *deposit_initiated_at),
             UsdcRebalanceEvent::DepositConfirmed {
+                direction,
                 deposit_confirmed_at,
-            } => current.apply_deposit_confirmed(*deposit_confirmed_at),
+            } => current.apply_deposit_confirmed(direction, *deposit_confirmed_at),
             UsdcRebalanceEvent::DepositFailed {
                 deposit_ref,
                 reason,
@@ -1327,6 +1333,7 @@ impl UsdcRebalance {
 
     fn apply_deposit_confirmed(
         &self,
+        event_direction: &RebalanceDirection,
         deposit_confirmed_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::DepositInitiated {
@@ -1343,6 +1350,11 @@ impl UsdcRebalance {
                 event: "DepositConfirmed".to_string(),
             });
         };
+
+        debug_assert_eq!(
+            direction, event_direction,
+            "Event direction must match state direction"
+        );
 
         Ok(Self::DepositConfirmed {
             direction: direction.clone(),
@@ -3977,6 +3989,7 @@ mod tests {
             deposit_initiated_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             deposit_confirmed_at: Utc::now(),
         });
 
@@ -4504,6 +4517,7 @@ mod tests {
             deposit_initiated_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
             deposit_confirmed_at: Utc::now(),
         });
 
@@ -4567,6 +4581,7 @@ mod tests {
             deposit_initiated_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             deposit_confirmed_at: Utc::now(),
         });
 
@@ -4641,6 +4656,7 @@ mod tests {
             deposit_initiated_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
             deposit_confirmed_at: Utc::now(),
         });
 
