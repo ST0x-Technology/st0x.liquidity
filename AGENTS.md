@@ -688,6 +688,13 @@ that cannot be expressed through code structure alone.
 - Describing function signatures (use doc comments instead)
 - Adding obvious test setup descriptions
 - Marking code sections that are clear from structure
+- **Referencing internal task tracking or ephemeral context**: NEVER leave
+  comments like `// Task 7: ...`, `// TODO from ticket XYZ`,
+  `// Part of sprint 5 work`, or any reference to task numbers, issue trackers,
+  todo lists, or session context that won't exist for future readers. These
+  comments are meaningless to PR reviewers, future maintainers, and anyone
+  without access to your internal state. If the code needs explanation, explain
+  WHAT it does and WHY - not which task number led to writing it.
 
 #### Good Comment Examples
 
