@@ -511,15 +511,50 @@ impl RebalancingTrigger {
     fn has_terminal_usdc_rebalance_event(
         events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
     ) -> bool {
-        events.iter().any(|envelope| {
+        // All failure events are terminal regardless of direction
+        let has_failure = events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
-                UsdcRebalanceEvent::DepositConfirmed { .. }
-                    | UsdcRebalanceEvent::WithdrawalFailed { .. }
+                UsdcRebalanceEvent::WithdrawalFailed { .. }
                     | UsdcRebalanceEvent::BridgingFailed { .. }
                     | UsdcRebalanceEvent::DepositFailed { .. }
+                    | UsdcRebalanceEvent::ConversionFailed { .. }
             )
-        })
+        });
+
+        if has_failure {
+            return true;
+        }
+
+        // Check if conversion is involved in this flow
+        let has_conversion = events.iter().any(|envelope| {
+            matches!(
+                envelope.payload,
+                UsdcRebalanceEvent::ConversionInitiated { .. }
+            )
+        });
+
+        // Extract direction from Initiated event
+        let direction = Self::extract_usdc_rebalance_info(events).map(|(dir, _)| dir);
+
+        match (direction, has_conversion) {
+            // BaseToAlpaca with conversion: ConversionConfirmed is terminal
+            (Some(RebalanceDirection::BaseToAlpaca), true) => events.iter().any(|envelope| {
+                matches!(
+                    envelope.payload,
+                    UsdcRebalanceEvent::ConversionConfirmed { .. }
+                )
+            }),
+            // All other cases: DepositConfirmed is terminal
+            // - AlpacaToBase with/without conversion
+            // - BaseToAlpaca without conversion (backward compatibility)
+            _ => events.iter().any(|envelope| {
+                matches!(
+                    envelope.payload,
+                    UsdcRebalanceEvent::DepositConfirmed { .. }
+                )
+            }),
+        }
     }
 
     async fn apply_usdc_rebalance_event_to_inventory(
@@ -557,6 +592,8 @@ mod tests {
     use st0x_execution::Direction;
     use std::collections::HashMap;
     use std::sync::atomic::Ordering;
+
+    use uuid::Uuid;
 
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
@@ -1227,6 +1264,31 @@ mod tests {
         }
     }
 
+    fn make_usdc_conversion_initiated(
+        direction: RebalanceDirection,
+        amount: Usdc,
+    ) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionInitiated {
+            direction,
+            amount,
+            order_id: Uuid::new_v4(),
+            initiated_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_conversion_confirmed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionConfirmed {
+            converted_at: Utc::now(),
+        }
+    }
+
+    fn make_usdc_conversion_failed() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::ConversionFailed {
+            reason: "Order rejected".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
     fn make_usdc_rebalance_envelope(
         event: UsdcRebalanceEvent,
     ) -> EventEnvelope<Lifecycle<UsdcRebalance, Never>> {
@@ -1345,6 +1407,153 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_bridged()),
         ];
 
+        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn conversion_failed_is_terminal_for_alpaca_to_base() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_conversion_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn conversion_failed_is_terminal_for_base_to_alpaca() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_conversion_failed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn conversion_confirmed_is_terminal_for_base_to_alpaca_with_conversion() {
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn deposit_confirmed_is_not_terminal_for_base_to_alpaca_with_conversion() {
+        // When BaseToAlpaca has conversion initiated, DepositConfirmed is NOT terminal
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+        ];
+
+        // ConversionConfirmed hasn't happened yet, so not terminal
+        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn deposit_confirmed_is_terminal_for_base_to_alpaca_without_conversion() {
+        // For backward compatibility: BaseToAlpaca without conversion uses DepositConfirmed
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::BaseToAlpaca,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_confirmed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn deposit_confirmed_is_terminal_for_alpaca_to_base_with_conversion() {
+        // For AlpacaToBase with conversion, DepositConfirmed is still terminal
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_deposit_confirmed()),
+        ];
+
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn conversion_confirmed_is_not_terminal_for_alpaca_to_base() {
+        // For AlpacaToBase, ConversionConfirmed is NOT terminal (flow continues)
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+        ];
+
+        // No Initiated event yet (no direction known), not terminal
+        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &events
+        ));
+    }
+
+    #[test]
+    fn conversion_confirmed_not_terminal_when_direction_unknown() {
+        // Edge case: ConversionConfirmed without Initiated event
+        let events = vec![
+            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
+                RebalanceDirection::AlpacaToBase,
+                usdc(1000),
+            )),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+        ];
+
+        // Direction not extracted (no Initiated), defaults to checking DepositConfirmed
         assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
             &events
         ));

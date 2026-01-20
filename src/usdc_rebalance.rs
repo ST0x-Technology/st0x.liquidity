@@ -525,7 +525,6 @@ impl Lifecycle<UsdcRebalance, Never> {
 
     fn handle_confirm_conversion(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::ConversionNotInitiated),
             Ok(UsdcRebalance::Converting { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::ConversionConfirmed {
                     converted_at: Utc::now(),
@@ -534,8 +533,8 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(
                 UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
             ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
-            Ok(_) => Err(UsdcRebalanceError::ConversionNotInitiated),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
         }
     }
 
@@ -544,7 +543,6 @@ impl Lifecycle<UsdcRebalance, Never> {
         reason: &str,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::ConversionNotInitiated),
             Ok(UsdcRebalance::Converting { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::ConversionFailed {
                     reason: reason.to_string(),
@@ -554,8 +552,8 @@ impl Lifecycle<UsdcRebalance, Never> {
             Ok(
                 UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
             ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
-            Ok(_) => Err(UsdcRebalanceError::ConversionNotInitiated),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
         }
     }
 
@@ -564,7 +562,6 @@ impl Lifecycle<UsdcRebalance, Never> {
         order_id: Uuid,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::DepositNotConfirmed),
             Ok(UsdcRebalance::DepositConfirmed {
                 direction, amount, ..
             }) => {
@@ -578,8 +575,8 @@ impl Lifecycle<UsdcRebalance, Never> {
                     initiated_at: Utc::now(),
                 }])
             }
-            Ok(_) => Err(UsdcRebalanceError::DepositNotConfirmed),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::DepositNotConfirmed),
         }
     }
 
@@ -621,17 +618,11 @@ impl Lifecycle<UsdcRebalance, Never> {
 
     fn handle_confirm_withdrawal(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             Ok(UsdcRebalance::Withdrawing { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
                 }])
             }
-            Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. },
-            ) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             Ok(
                 UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
@@ -643,7 +634,8 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::DepositConfirmed { .. }
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
 
@@ -652,18 +644,12 @@ impl Lifecycle<UsdcRebalance, Never> {
         reason: &str,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             Ok(UsdcRebalance::Withdrawing { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::WithdrawalFailed {
                     reason: reason.to_string(),
                     failed_at: Utc::now(),
                 }])
             }
-            Ok(
-                UsdcRebalance::Converting { .. }
-                | UsdcRebalance::ConversionComplete { .. }
-                | UsdcRebalance::ConversionFailed { .. },
-            ) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             Ok(
                 UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
@@ -675,7 +661,8 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::DepositConfirmed { .. }
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
 

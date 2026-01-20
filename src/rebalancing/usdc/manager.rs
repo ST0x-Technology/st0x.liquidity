@@ -793,7 +793,9 @@ mod tests {
     use uuid::uuid;
 
     use st0x_execution::Executor;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{
+        AlpacaBrokerApiAuthEnv, AlpacaBrokerApiError, AlpacaBrokerApiMode, CryptoOrderFailureReason,
+    };
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
@@ -1296,8 +1298,15 @@ mod tests {
             TEST_VAULT_ID,
         );
 
-        // Mock the conversion order - USD to USDC is a "buy" on USDC/USD
+        // Mock the conversion order placement (POST)
         let order_mock = create_conversion_order_mock(&server, "1000");
+        // Mock the polling endpoint (convert_usdc_usd always polls after placement)
+        let _get_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "1000",
+        );
 
         let id = UsdcRebalanceId::new("conversion-test-001");
         let amount = Usdc(dec!(1000));
@@ -1312,7 +1321,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_usdc_to_usd_conversion_places_sell_order() {
+    async fn test_execute_usdc_to_usd_conversion_requires_deposit_confirmed_state() {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
@@ -1335,18 +1344,30 @@ mod tests {
             TEST_VAULT_ID,
         );
 
-        // Mock the conversion order - USDC to USD is a "sell" on USDC/USD
-        let order_mock = create_conversion_order_mock(&server, "500");
+        // Mock the conversion order - will be called but CQRS command will fail
+        let _order_mock = create_conversion_order_mock(&server, "500");
+        let _get_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "500",
+        );
 
         let id = UsdcRebalanceId::new("conversion-test-002");
         let amount = Usdc(dec!(500));
 
+        // execute_usdc_to_usd_conversion requires aggregate to be in DepositConfirmed state
+        // (after a BaseToAlpaca deposit completes). With a fresh aggregate, it should fail.
         let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
 
-        order_mock.assert();
         assert!(
-            result.is_ok(),
-            "Expected successful conversion, got: {result:?}"
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::Aggregate(
+                    AggregateError::UserError(UsdcRebalanceError::DepositNotConfirmed)
+                ))
+            ),
+            "Expected DepositNotConfirmed error when aggregate not in correct state, got: {result:?}"
         );
     }
 
