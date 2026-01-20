@@ -694,4 +694,48 @@ mod tests {
             "Expected direction in output, got: {output}"
         );
     }
+
+    #[test]
+    fn cli_broker_mode_sandbox_when_sandbox_auth() {
+        let alpaca_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+        };
+
+        let broker_mode = if alpaca_auth.is_sandbox() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_mode,
+            AlpacaBrokerApiMode::Sandbox,
+            "Sandbox auth should yield Sandbox broker mode"
+        );
+    }
+
+    #[test]
+    fn cli_broker_mode_production_when_production_auth() {
+        let alpaca_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
+        };
+
+        let broker_mode = if alpaca_auth.is_sandbox() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_mode,
+            AlpacaBrokerApiMode::Production,
+            "Production auth should yield Production broker mode"
+        );
+    }
 }

@@ -514,4 +514,81 @@ mod tests {
 
         let _rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default(), None);
     }
+
+    #[test]
+    fn broker_mode_sandbox_when_paper_trading() {
+        let auth = AlpacaTradingApiAuthEnv {
+            alpaca_api_key: "test_key".to_string(),
+            alpaca_api_secret: "test_secret".to_string(),
+            alpaca_trading_mode: st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Paper,
+        };
+
+        let broker_api_mode = if auth.is_paper_trading() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_api_mode,
+            AlpacaBrokerApiMode::Sandbox,
+            "Paper trading should map to Sandbox mode"
+        );
+    }
+
+    #[test]
+    fn broker_mode_production_when_live_trading() {
+        let auth = AlpacaTradingApiAuthEnv {
+            alpaca_api_key: "test_key".to_string(),
+            alpaca_api_secret: "test_secret".to_string(),
+            alpaca_trading_mode: st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Live,
+        };
+
+        let broker_api_mode = if auth.is_paper_trading() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_api_mode,
+            AlpacaBrokerApiMode::Production,
+            "Live trading should map to Production mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_auth_failure_returns_spawn_error() {
+        let server = MockServer::start();
+
+        // Mock account endpoint to return 401 unauthorized
+        let _account_mock = server.mock(|when, then| {
+            when.method(GET).path_contains("/trading/accounts/");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(json!({"message": "Invalid API credentials"}));
+        });
+
+        let config = make_config();
+        let broker_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "invalid_key".to_string(),
+            alpaca_broker_api_secret: "invalid_secret".to_string(),
+            alpaca_account_id: config.alpaca_account_id.to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+        };
+
+        let result = AlpacaBrokerApi::try_from_config(broker_auth).await;
+
+        assert!(
+            result.is_err(),
+            "Expected auth failure to return error, got: {result:?}"
+        );
+
+        // Verify the error can be converted to SpawnRebalancerError
+        let spawn_error: SpawnRebalancerError = result.unwrap_err().into();
+        assert!(
+            matches!(spawn_error, SpawnRebalancerError::AlpacaBrokerApi(_)),
+            "Expected AlpacaBrokerApi error variant, got: {spawn_error:?}"
+        );
+    }
 }

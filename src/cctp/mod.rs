@@ -510,7 +510,7 @@ where
     }
 
     #[cfg(test)]
-    fn with_circle_api_base(mut self, base_url: String) -> Self {
+    pub(crate) fn with_circle_api_base(mut self, base_url: String) -> Self {
         self.circle_api_base = base_url;
         self
     }

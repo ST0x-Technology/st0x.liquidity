@@ -588,21 +588,30 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use alloy::primitives::fixed_bytes;
     use alloy::primitives::{TxHash, address};
     use chrono::Utc;
+    use cqrs_es::mem_store::MemStore;
+    use cqrs_es::{CqrsFramework, Query};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use st0x_execution::Direction;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
-
+    use tokio::sync::mpsc;
     use uuid::Uuid;
 
+    use super::*;
+    use crate::alpaca_wallet::AlpacaTransferId;
+    use crate::lifecycle::Lifecycle;
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
+    use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
-    use crate::usdc_rebalance::TransferRef;
+    use crate::usdc_rebalance::{
+        RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
+    };
     use alloy::primitives::{Address, U256};
 
     fn make_trigger() -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
@@ -1864,5 +1873,470 @@ mod tests {
                 "Expected Clap error, got {result:?}"
             );
         });
+    }
+
+    type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;
+    type UsdcRebalanceMemStore = MemStore<UsdcRebalanceLifecycle>;
+
+    /// Spy query that records all dispatched events for verification.
+    struct EventCapturingQuery {
+        captured_events: Arc<tokio::sync::Mutex<Vec<UsdcRebalanceEvent>>>,
+        terminal_detection_results: Arc<tokio::sync::Mutex<Vec<bool>>>,
+    }
+
+    impl EventCapturingQuery {
+        fn new() -> Self {
+            Self {
+                captured_events: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                terminal_detection_results: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Query<UsdcRebalanceLifecycle> for EventCapturingQuery {
+        async fn dispatch(
+            &self,
+            _aggregate_id: &str,
+            events: &[EventEnvelope<UsdcRebalanceLifecycle>],
+        ) {
+            let mut captured = self.captured_events.lock().await;
+            for envelope in events {
+                captured.push(envelope.payload.clone());
+            }
+
+            let is_terminal = RebalancingTrigger::has_terminal_usdc_rebalance_event(events);
+            self.terminal_detection_results
+                .lock()
+                .await
+                .push(is_terminal);
+        }
+    }
+
+    fn create_test_cqrs_with_query(
+        query: Arc<EventCapturingQuery>,
+    ) -> CqrsFramework<UsdcRebalanceLifecycle, UsdcRebalanceMemStore> {
+        let store = MemStore::default();
+        CqrsFramework::new(store, vec![Box::new(query)], ())
+    }
+
+    #[tokio::test]
+    async fn terminal_detection_identifies_deposit_confirmed_alone_for_base_to_alpaca() {
+        let spy = Arc::new(EventCapturingQuery::new());
+        let cqrs = create_test_cqrs_with_query(Arc::clone(&spy));
+
+        let aggregate_id = "base-to-alpaca-001";
+        let tx_hash =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        // Execute full BaseToAlpaca flow - each command triggers a dispatch with only
+        // the new event(s), so terminal detection must work without seeing history
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc(dec!(500)),
+                withdrawal: TransferRef::OnchainTx(tx_hash),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![1, 2, 3],
+                cctp_nonce: 12345,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(tx_hash),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+
+        // Our terminal detection receives only DepositConfirmed (not the full history)
+        // and must correctly identify this as terminal for BaseToAlpaca without conversion
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        assert!(
+            *terminal_results.last().unwrap(),
+            "has_terminal_usdc_rebalance_event must identify DepositConfirmed alone as terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_detection_identifies_deposit_confirmed_alone_for_alpaca_to_base() {
+        let spy = Arc::new(EventCapturingQuery::new());
+        let cqrs = create_test_cqrs_with_query(Arc::clone(&spy));
+
+        let aggregate_id = "alpaca-to-base-001";
+        let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![1, 2, 3],
+                cctp_nonce: 67890,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(tx_hash),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        assert!(
+            *terminal_results.last().unwrap(),
+            "has_terminal_usdc_rebalance_event must identify DepositConfirmed alone as terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_detection_identifies_withdrawal_failed_alone() {
+        let spy = Arc::new(EventCapturingQuery::new());
+        let cqrs = create_test_cqrs_with_query(Arc::clone(&spy));
+
+        let aggregate_id = "withdrawal-failed-test";
+        let transfer_id = AlpacaTransferId::from(uuid::Uuid::new_v4());
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(100)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::FailWithdrawal {
+                reason: "Test failure".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        assert!(
+            *terminal_results.last().unwrap(),
+            "WithdrawalFailed should be terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_detection_identifies_bridging_failed_alone() {
+        let spy = Arc::new(EventCapturingQuery::new());
+        let cqrs = create_test_cqrs_with_query(Arc::clone(&spy));
+
+        let aggregate_id = "bridging-failed-test";
+        let transfer_id = crate::alpaca_wallet::AlpacaTransferId::from(uuid::Uuid::new_v4());
+        let tx_hash =
+            fixed_bytes!("0x3333333333333333333333333333333333333333333333333333333333333333");
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(100)),
+                withdrawal: TransferRef::AlpacaId(transfer_id),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::FailBridging {
+                reason: "Bridge timeout".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        assert!(
+            *terminal_results.last().unwrap(),
+            "has_terminal_usdc_rebalance_event must identify BridgingFailed alone as terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_detection_identifies_conversion_failed_alone() {
+        let spy = Arc::new(EventCapturingQuery::new());
+        let cqrs = create_test_cqrs_with_query(Arc::clone(&spy));
+
+        let aggregate_id = "conversion-failed-test";
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(100)),
+                order_id: uuid::Uuid::new_v4(),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::FailConversion {
+                reason: "Order rejected".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        assert!(
+            *terminal_results.last().unwrap(),
+            "has_terminal_usdc_rebalance_event must identify ConversionFailed alone as terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
+        let (sender, _receiver) = mpsc::channel(10);
+        let inventory = Arc::new(tokio::sync::RwLock::new(
+            InventoryView::default().with_usdc(Usdc(dec!(5000)), Usdc(dec!(5000))),
+        ));
+        let symbol_cache = crate::symbol::cache::SymbolCache::default();
+        let config = RebalancingTriggerConfig {
+            equity_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+            usdc_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.2),
+            },
+        };
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            config,
+            symbol_cache,
+            inventory,
+            sender,
+        ));
+
+        // Set in_progress flag
+        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        // Dispatch events including Initiated (required for dispatch to process)
+        // and terminal DepositConfirmed
+        let tx_hash =
+            fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
+        let events = vec![
+            EventEnvelope {
+                aggregate_id: "test-clear-001".to_string(),
+                sequence: 1,
+                payload: UsdcRebalanceEvent::Initiated {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000)),
+                    withdrawal_ref: TransferRef::OnchainTx(tx_hash),
+                    initiated_at: chrono::Utc::now(),
+                },
+                metadata: HashMap::new(),
+            },
+            EventEnvelope {
+                aggregate_id: "test-clear-001".to_string(),
+                sequence: 7,
+                payload: UsdcRebalanceEvent::DepositConfirmed {
+                    deposit_confirmed_at: chrono::Utc::now(),
+                },
+                metadata: HashMap::new(),
+            },
+        ];
+
+        Query::<UsdcRebalanceLifecycle>::dispatch(trigger.as_ref(), "test-clear-001", &events)
+            .await;
+
+        // Verify in_progress flag was cleared
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "usdc_in_progress should be cleared after terminal event dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_detection_identifies_conversion_confirmed_alone_for_base_to_alpaca() {
+        let spy = Arc::new(EventCapturingQuery::new());
+        let cqrs = create_test_cqrs_with_query(Arc::clone(&spy));
+
+        let aggregate_id = "conversion-base-to-alpaca-001";
+        let tx_hash =
+            fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc(dec!(500)),
+                withdrawal: TransferRef::OnchainTx(tx_hash),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateBridging { burn_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![1, 2, 3],
+                cctp_nonce: 99999,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(tx_hash),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+
+        // Now start post-deposit conversion (USDC to USD)
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: uuid::Uuid::new_v4(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Our terminal detection receives only the latest event(s) per dispatch
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        let deposit_confirmed_idx = 6;
+        assert!(
+            terminal_results[deposit_confirmed_idx],
+            "has_terminal_usdc_rebalance_event must identify DepositConfirmed as terminal"
+        );
+
+        let conversion_initiated_idx = 7;
+        assert!(
+            !terminal_results[conversion_initiated_idx],
+            "has_terminal_usdc_rebalance_event must NOT identify ConversionInitiated as terminal"
+        );
+
+        drop(terminal_results);
+        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmConversion)
+            .await
+            .unwrap();
+
+        let terminal_results = spy.terminal_detection_results.lock().await;
+        assert!(
+            *terminal_results.last().unwrap(),
+            "has_terminal_usdc_rebalance_event must identify ConversionConfirmed alone as terminal"
+        );
     }
 }
