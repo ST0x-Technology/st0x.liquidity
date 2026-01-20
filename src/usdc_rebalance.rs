@@ -228,7 +228,12 @@ pub(crate) enum UsdcRebalanceEvent {
         initiated_at: DateTime<Utc>,
     },
     /// Conversion completed successfully.
-    ConversionConfirmed { converted_at: DateTime<Utc> },
+    /// Includes direction so terminal detection works with incremental dispatch
+    /// (cqrs-es Query::dispatch only receives newly committed events, not full history).
+    ConversionConfirmed {
+        direction: RebalanceDirection,
+        converted_at: DateTime<Utc>,
+    },
     /// Conversion failed.
     ConversionFailed {
         reason: String,
@@ -533,8 +538,9 @@ impl Lifecycle<UsdcRebalance, Never> {
 
     fn handle_confirm_conversion(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Ok(UsdcRebalance::Converting { .. }) => {
+            Ok(UsdcRebalance::Converting { direction, .. }) => {
                 Ok(vec![UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: direction.clone(),
                     converted_at: Utc::now(),
                 }])
             }
@@ -959,7 +965,7 @@ impl UsdcRebalance {
         current: &Self,
     ) -> Result<Self, LifecycleError<Never>> {
         match event {
-            UsdcRebalanceEvent::ConversionConfirmed { converted_at } => {
+            UsdcRebalanceEvent::ConversionConfirmed { converted_at, .. } => {
                 current.apply_conversion_confirmed(*converted_at)
             }
             UsdcRebalanceEvent::ConversionFailed { reason, failed_at } => {
@@ -4126,6 +4132,7 @@ mod tests {
         });
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             converted_at: Utc::now(),
         });
 
@@ -4221,6 +4228,7 @@ mod tests {
         });
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             converted_at: Utc::now(),
         });
 
@@ -4253,6 +4261,7 @@ mod tests {
         });
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             converted_at: Utc::now(),
         });
 
@@ -4302,6 +4311,7 @@ mod tests {
         });
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             converted_at: Utc::now(),
         });
 
@@ -4388,7 +4398,10 @@ mod tests {
         view.update(&EventEnvelope {
             aggregate_id: "rebalance-123".to_string(),
             sequence: 2,
-            payload: UsdcRebalanceEvent::ConversionConfirmed { converted_at },
+            payload: UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                converted_at,
+            },
             metadata: HashMap::new(),
         });
 
@@ -4663,6 +4676,7 @@ mod tests {
     #[test]
     fn test_from_event_rejects_conversion_confirmed_as_init() {
         let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
             converted_at: Utc::now(),
         };
 

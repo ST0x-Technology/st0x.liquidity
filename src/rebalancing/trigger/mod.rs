@@ -511,50 +511,54 @@ impl RebalancingTrigger {
     fn has_terminal_usdc_rebalance_event(
         events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
     ) -> bool {
-        // All failure events are terminal regardless of direction
-        let has_failure = events.iter().any(|envelope| {
+        // IMPORTANT: This function must work with incremental dispatch - cqrs-es 0.4
+        // only sends newly committed events to Query::dispatch, not full history.
+        //
+        // Terminal events:
+        // - All failure events (always terminal)
+        // - ConversionConfirmed with BaseToAlpaca direction (post-deposit conversion complete)
+        // - DepositConfirmed (terminal unless post-deposit conversion follows)
+        //
+        // The direction in ConversionInitiated tells us if conversion is pre or post deposit:
+        // - ConversionInitiated(AlpacaToBase) = pre-withdrawal, deposit is still terminal
+        // - ConversionInitiated(BaseToAlpaca) = post-deposit, deposit is NOT terminal
+
+        // Check if post-deposit conversion is part of this batch
+        // (BaseToAlpaca conversion means flow continues after deposit)
+        let has_post_deposit_conversion = events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
+                UsdcRebalanceEvent::ConversionInitiated {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                }
+            )
+        });
+
+        for envelope in events {
+            match &envelope.payload {
+                // All failure events are terminal regardless of direction
+                // ConversionConfirmed(BaseToAlpaca) is also terminal (post-deposit conversion complete)
                 UsdcRebalanceEvent::WithdrawalFailed { .. }
-                    | UsdcRebalanceEvent::BridgingFailed { .. }
-                    | UsdcRebalanceEvent::DepositFailed { .. }
-                    | UsdcRebalanceEvent::ConversionFailed { .. }
-            )
-        });
+                | UsdcRebalanceEvent::BridgingFailed { .. }
+                | UsdcRebalanceEvent::DepositFailed { .. }
+                | UsdcRebalanceEvent::ConversionFailed { .. }
+                | UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                } => return true,
 
-        if has_failure {
-            return true;
+                // DepositConfirmed is terminal unless post-deposit conversion follows
+                UsdcRebalanceEvent::DepositConfirmed { .. } if !has_post_deposit_conversion => {
+                    return true;
+                }
+
+                // All other events are not terminal
+                _ => {}
+            }
         }
 
-        // Check if conversion is involved in this flow
-        let has_conversion = events.iter().any(|envelope| {
-            matches!(
-                envelope.payload,
-                UsdcRebalanceEvent::ConversionInitiated { .. }
-            )
-        });
-
-        // Extract direction from Initiated event
-        let direction = Self::extract_usdc_rebalance_info(events).map(|(dir, _)| dir);
-
-        match (direction, has_conversion) {
-            // BaseToAlpaca with conversion: ConversionConfirmed is terminal
-            (Some(RebalanceDirection::BaseToAlpaca), true) => events.iter().any(|envelope| {
-                matches!(
-                    envelope.payload,
-                    UsdcRebalanceEvent::ConversionConfirmed { .. }
-                )
-            }),
-            // All other cases: DepositConfirmed is terminal
-            // - AlpacaToBase with/without conversion
-            // - BaseToAlpaca without conversion (backward compatibility)
-            _ => events.iter().any(|envelope| {
-                matches!(
-                    envelope.payload,
-                    UsdcRebalanceEvent::DepositConfirmed { .. }
-                )
-            }),
-        }
+        false
     }
 
     async fn apply_usdc_rebalance_event_to_inventory(
@@ -1276,8 +1280,9 @@ mod tests {
         }
     }
 
-    fn make_usdc_conversion_confirmed() -> UsdcRebalanceEvent {
+    fn make_usdc_conversion_confirmed(direction: RebalanceDirection) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionConfirmed {
+            direction,
             converted_at: Utc::now(),
         }
     }
@@ -1459,7 +1464,9 @@ mod tests {
                 RebalanceDirection::BaseToAlpaca,
                 usdc(1000),
             )),
-            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed(
+                RebalanceDirection::BaseToAlpaca,
+            )),
         ];
 
         assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
@@ -1512,7 +1519,9 @@ mod tests {
                 RebalanceDirection::AlpacaToBase,
                 usdc(1000),
             )),
-            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed(
+                RebalanceDirection::AlpacaToBase,
+            )),
             make_usdc_rebalance_envelope(make_usdc_initiated(
                 RebalanceDirection::AlpacaToBase,
                 usdc(1000),
@@ -1533,29 +1542,87 @@ mod tests {
                 RebalanceDirection::AlpacaToBase,
                 usdc(1000),
             )),
-            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
+            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed(
+                RebalanceDirection::AlpacaToBase,
+            )),
         ];
 
-        // No Initiated event yet (no direction known), not terminal
+        // For AlpacaToBase, ConversionConfirmed is NOT terminal (flow continues to withdrawal)
         assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
             &events
         ));
     }
 
     #[test]
-    fn conversion_confirmed_not_terminal_when_direction_unknown() {
-        // Edge case: ConversionConfirmed without Initiated event
-        let events = vec![
-            make_usdc_rebalance_envelope(make_usdc_conversion_initiated(
-                RebalanceDirection::AlpacaToBase,
-                usdc(1000),
-            )),
-            make_usdc_rebalance_envelope(make_usdc_conversion_confirmed()),
-        ];
+    fn conversion_confirmed_not_terminal_for_alpaca_to_base_incremental() {
+        // Simulates incremental dispatch: only ConversionConfirmed for AlpacaToBase
+        // For AlpacaToBase, ConversionConfirmed is NOT terminal - flow continues
+        let events = vec![make_usdc_rebalance_envelope(
+            make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase),
+        )];
 
         // Direction not extracted (no Initiated), defaults to checking DepositConfirmed
         assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
             &events
+        ));
+    }
+
+    // CRITICAL: Tests for incremental dispatch behavior (cqrs-es 0.4 only sends newly committed events)
+    //
+    // In cqrs-es, Query::dispatch receives only the events from the current command execution,
+    // NOT the full aggregate history. This means terminal detection must work with partial event slices.
+
+    #[test]
+    fn incremental_dispatch_conversion_confirmed_alone_is_terminal_for_base_to_alpaca() {
+        // Simulates cqrs-es incremental dispatch: only ConversionConfirmed arrives
+        // (the Initiated and ConversionInitiated events were dispatched in earlier calls)
+        //
+        // For BaseToAlpaca flow, ConversionConfirmed IS the terminal event.
+        // With direction embedded in the event, we can detect this even when it's the only event.
+        let events = vec![make_usdc_rebalance_envelope(
+            make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca),
+        )];
+
+        assert!(
+            RebalancingTrigger::has_terminal_usdc_rebalance_event(&events),
+            "ConversionConfirmed alone should be detected as terminal for BaseToAlpaca"
+        );
+    }
+
+    #[test]
+    fn incremental_dispatch_deposit_confirmed_alone_is_terminal() {
+        // Simulates cqrs-es incremental dispatch: only DepositConfirmed arrives
+        // This should always be terminal (it's the success case for AlpacaToBase
+        // and for BaseToAlpaca without conversion)
+        let events = vec![make_usdc_rebalance_envelope(make_usdc_deposit_confirmed())];
+
+        assert!(
+            RebalancingTrigger::has_terminal_usdc_rebalance_event(&events),
+            "DepositConfirmed alone should be detected as terminal"
+        );
+    }
+
+    #[test]
+    fn incremental_dispatch_failure_events_alone_are_terminal() {
+        // Failure events should always be terminal regardless of what else is in the slice
+        let withdrawal_failed = vec![make_usdc_rebalance_envelope(make_usdc_withdrawal_failed())];
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &withdrawal_failed
+        ));
+
+        let bridging_failed = vec![make_usdc_rebalance_envelope(make_usdc_bridging_failed())];
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &bridging_failed
+        ));
+
+        let deposit_failed = vec![make_usdc_rebalance_envelope(make_usdc_deposit_failed())];
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &deposit_failed
+        ));
+
+        let conversion_failed = vec![make_usdc_rebalance_envelope(make_usdc_conversion_failed())];
+        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
+            &conversion_failed
         ));
     }
 
