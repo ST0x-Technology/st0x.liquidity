@@ -1,11 +1,199 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use num_traits::ToPrimitive;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AlpacaBrokerApiClient, BrokerOrderStatus, OrderRequest, OrderSide};
-use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate};
+use super::client::AlpacaBrokerApiClient;
+use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Shares, Symbol};
+
+/// Order side
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum OrderSide {
+    Buy,
+    Sell,
+}
+
+/// Order status from Alpaca Broker API
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum BrokerOrderStatus {
+    New,
+    PendingNew,
+    PartiallyFilled,
+    Filled,
+    DoneForDay,
+    Canceled,
+    Expired,
+    Replaced,
+    PendingCancel,
+    PendingReplace,
+    Rejected,
+    Suspended,
+    Calculated,
+    Stopped,
+    AcceptedForBidding,
+    Accepted,
+}
+
+/// Direction for USDC/USD conversion
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionDirection {
+    /// Convert USDC to USD buying power (sell USDC/USD)
+    UsdcToUsd,
+    /// Convert USD buying power to USDC (buy USDC/USD)
+    UsdToUsdc,
+}
+
+/// Order request for placing market orders
+#[derive(Debug, Serialize)]
+pub(super) struct OrderRequest {
+    #[serde(serialize_with = "serialize_symbol")]
+    pub symbol: Symbol,
+    #[serde(rename = "qty", serialize_with = "serialize_shares")]
+    pub quantity: Shares,
+    pub side: OrderSide,
+    #[serde(rename = "type")]
+    pub order_type: &'static str,
+    pub time_in_force: &'static str,
+    pub extended_hours: bool,
+}
+
+fn serialize_symbol<S>(symbol: &Symbol, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&symbol.to_string())
+}
+
+// serde's serialize_with requires the field to be passed by reference
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_shares<S>(shares: &Shares, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&shares.value().to_string())
+}
+
+/// Order response from the Alpaca Broker API
+#[derive(Debug, Deserialize)]
+pub(super) struct OrderResponse {
+    pub id: Uuid,
+    pub symbol: Symbol,
+    #[serde(rename = "qty", deserialize_with = "deserialize_shares_from_string")]
+    pub quantity: Shares,
+    #[serde(
+        rename = "filled_qty",
+        default,
+        deserialize_with = "deserialize_optional_decimal"
+    )]
+    pub filled_quantity: Option<Decimal>,
+    pub side: OrderSide,
+    pub status: BrokerOrderStatus,
+    #[serde(
+        rename = "filled_avg_price",
+        default,
+        deserialize_with = "deserialize_optional_price"
+    )]
+    pub filled_average_price: Option<f64>,
+}
+
+/// Order request for crypto trading (e.g., USDC/USD conversion).
+/// Uses decimal quantity and trading pair symbol format.
+#[derive(Debug, Serialize)]
+pub(crate) struct CryptoOrderRequest {
+    /// Trading pair symbol (e.g., "USDCUSD" for USDC/USD)
+    pub symbol: String,
+    /// Quantity of the base asset (e.g., USDC amount)
+    #[serde(rename = "qty")]
+    pub quantity: Decimal,
+    pub side: OrderSide,
+    #[serde(rename = "type")]
+    pub order_type: &'static str,
+    pub time_in_force: &'static str,
+}
+
+/// Response from a crypto order placement
+#[derive(Debug, Clone, Deserialize)]
+pub struct CryptoOrderResponse {
+    pub id: Uuid,
+    pub symbol: String,
+    #[serde(rename = "qty", deserialize_with = "deserialize_decimal_from_string")]
+    pub quantity: Decimal,
+    status: BrokerOrderStatus,
+    #[serde(
+        rename = "filled_avg_price",
+        default,
+        deserialize_with = "deserialize_optional_price"
+    )]
+    pub filled_average_price: Option<f64>,
+    #[serde(
+        rename = "filled_qty",
+        default,
+        deserialize_with = "deserialize_optional_decimal"
+    )]
+    pub filled_quantity: Option<Decimal>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl CryptoOrderResponse {
+    /// Returns the status as a display-friendly string.
+    pub fn status_display(&self) -> &'static str {
+        match self.status {
+            BrokerOrderStatus::Filled => "filled",
+            BrokerOrderStatus::New => "new",
+            BrokerOrderStatus::PendingNew => "pending_new",
+            BrokerOrderStatus::PartiallyFilled => "partially_filled",
+            BrokerOrderStatus::Canceled => "canceled",
+            BrokerOrderStatus::Expired => "expired",
+            BrokerOrderStatus::Rejected => "rejected",
+            BrokerOrderStatus::Accepted => "accepted",
+            _ => "other",
+        }
+    }
+}
+
+fn deserialize_decimal_from_string<'de, D>(deserializer: D) -> Result<Decimal, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    s.parse::<Decimal>().map_err(serde::de::Error::custom)
+}
+
+fn deserialize_shares_from_string<'de, D>(deserializer: D) -> Result<Shares, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    let value: u64 = s.parse().map_err(serde::de::Error::custom)?;
+    Shares::new(value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_price<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    opt.map_or(Ok(None), |s| {
+        s.parse::<f64>().map(Some).map_err(serde::de::Error::custom)
+    })
+}
+
+fn deserialize_optional_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt: Option<String> = Option::deserialize(deserializer)?;
+    opt.map_or(Ok(None), |s| {
+        s.parse::<Decimal>()
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    })
+}
 
 pub(super) async fn place_market_order(
     client: &AlpacaBrokerApiClient,
@@ -27,6 +215,8 @@ pub(super) async fn place_market_order(
         side,
         order_type: "market",
         time_in_force: "day",
+        // Alpaca only allows extended_hours=true for limit orders, not market orders
+        extended_hours: false,
     };
 
     let response = client.place_order(&request).await?;
@@ -161,13 +351,91 @@ fn convert_price_to_cents(price: Option<f64>) -> Result<Option<u64>, AlpacaBroke
     })
 }
 
+/// Convert USDC to/from USD on Alpaca.
+///
+/// This uses the USDC/USD trading pair:
+/// - To convert USDC to USD buying power: sell USDC/USD
+/// - To convert USD buying power to USDC: buy USDC/USD
+pub(crate) async fn convert_usdc_usd(
+    client: &AlpacaBrokerApiClient,
+    amount: Decimal,
+    direction: ConversionDirection,
+) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    let side = match direction {
+        ConversionDirection::UsdcToUsd => OrderSide::Sell,
+        ConversionDirection::UsdToUsdc => OrderSide::Buy,
+    };
+
+    debug!(
+        "Placing USDC/USD conversion order: {} {} USDC",
+        if side == OrderSide::Sell {
+            "sell"
+        } else {
+            "buy"
+        },
+        amount
+    );
+
+    let request = CryptoOrderRequest {
+        symbol: "USDCUSD".to_string(),
+        quantity: amount,
+        side,
+        order_type: "market",
+        time_in_force: "gtc",
+    };
+
+    client.place_crypto_order(&request).await
+}
+
+/// Poll for a crypto order's status until it reaches a terminal state.
+pub(crate) async fn poll_crypto_order_until_filled(
+    client: &AlpacaBrokerApiClient,
+    order_id: Uuid,
+) -> Result<CryptoOrderResponse, AlpacaBrokerApiError> {
+    loop {
+        let order = client.get_crypto_order(order_id).await?;
+
+        match order.status {
+            BrokerOrderStatus::Filled => return Ok(order),
+            BrokerOrderStatus::Canceled => {
+                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
+                    order_id,
+                    reason: super::CryptoOrderFailureReason::Canceled,
+                });
+            }
+            BrokerOrderStatus::Expired => {
+                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
+                    order_id,
+                    reason: super::CryptoOrderFailureReason::Expired,
+                });
+            }
+            BrokerOrderStatus::Rejected => {
+                return Err(AlpacaBrokerApiError::CryptoOrderFailed {
+                    order_id,
+                    reason: super::CryptoOrderFailureReason::Rejected,
+                });
+            }
+            _ => {
+                debug!(
+                    order_id = %order_id,
+                    status = ?order.status,
+                    "Crypto order still pending, waiting..."
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
-    use crate::{Shares, Symbol};
+    use std::str::FromStr;
+
     use httpmock::prelude::*;
     use serde_json::json;
+
+    use super::*;
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
 
     fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthEnv {
         AlpacaBrokerApiAuthEnv {
@@ -191,7 +459,8 @@ mod tests {
                     "qty": "100",
                     "side": "buy",
                     "type": "market",
-                    "time_in_force": "day"
+                    "time_in_force": "day",
+                    "extended_hours": false
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -235,7 +504,8 @@ mod tests {
                     "qty": "50",
                     "side": "sell",
                     "type": "market",
-                    "time_in_force": "day"
+                    "time_in_force": "day",
+                    "extended_hours": false
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -484,6 +754,117 @@ mod tests {
         assert_eq!(
             map_broker_status_to_order_status(BrokerOrderStatus::Rejected),
             OrderStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_convert_usdc_to_usd() {
+        let server = MockServer::start();
+        let config = create_test_config(&server.base_url());
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders")
+                .json_body(json!({
+                    "symbol": "USDCUSD",
+                    "qty": "1000.50",
+                    "side": "sell",
+                    "type": "market",
+                    "time_in_force": "gtc"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "USDCUSD",
+                    "qty": "1000.50",
+                    "side": "sell",
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": "1000.50",
+                    "created_at": "2025-01-06T12:00:00Z"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let amount = Decimal::from_str("1000.50").unwrap();
+
+        let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd).await;
+
+        mock.assert();
+        let order = result.unwrap();
+        assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
+        assert_eq!(order.symbol, "USDCUSD");
+        assert_eq!(order.quantity, Decimal::from_str("1000.50").unwrap());
+        assert_eq!(order.status_display(), "filled");
+    }
+
+    #[tokio::test]
+    async fn test_convert_usd_to_usdc() {
+        let server = MockServer::start();
+        let config = create_test_config(&server.base_url());
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders")
+                .json_body(json!({
+                    "symbol": "USDCUSD",
+                    "qty": "500",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "gtc"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": "500",
+                    "side": "buy",
+                    "status": "filled",
+                    "filled_avg_price": "0.9999",
+                    "filled_qty": "500",
+                    "created_at": "2025-01-06T12:30:00Z"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let amount = Decimal::from_str("500").unwrap();
+
+        let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc).await;
+
+        mock.assert();
+        let order = result.unwrap();
+        assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
+        assert_eq!(order.symbol, "USDCUSD");
+        assert_eq!(order.quantity, Decimal::from_str("500").unwrap());
+        assert_eq!(order.status_display(), "filled");
+    }
+
+    #[test]
+    fn test_crypto_order_response_status_display() {
+        let make_order = |status: BrokerOrderStatus| CryptoOrderResponse {
+            id: Uuid::new_v4(),
+            symbol: "USDCUSD".to_string(),
+            quantity: Decimal::from(100),
+            status,
+            filled_average_price: None,
+            filled_quantity: None,
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            make_order(BrokerOrderStatus::Filled).status_display(),
+            "filled"
+        );
+        assert_eq!(make_order(BrokerOrderStatus::New).status_display(), "new");
+        assert_eq!(
+            make_order(BrokerOrderStatus::Rejected).status_display(),
+            "rejected"
+        );
+        assert_eq!(
+            make_order(BrokerOrderStatus::Canceled).status_display(),
+            "canceled"
         );
     }
 }

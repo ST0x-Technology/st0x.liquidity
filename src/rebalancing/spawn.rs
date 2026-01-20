@@ -90,8 +90,7 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
-    )
-    .await?;
+    )?;
 
     let rebalancer = services.into_rebalancer(pool, config, symbol_cache, event_broadcast);
 
@@ -124,7 +123,7 @@ impl<BP> Services<BP>
 where
     BP: Provider + Clone + 'static,
 {
-    async fn new(
+    fn new(
         config: &RebalancingConfig,
         alpaca_auth: &AlpacaTradingApiAuthEnv,
         ethereum_wallet: &EthereumWallet,
@@ -139,20 +138,19 @@ where
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             alpaca_api_base_url.clone(),
+            config.alpaca_account_id,
             alpaca_auth.alpaca_api_key.clone(),
             alpaca_auth.alpaca_api_secret.clone(),
             base_provider.clone(),
             config.redemption_wallet,
         ));
 
-        let wallet = Arc::new(
-            AlpacaWalletService::new(
-                alpaca_api_base_url,
-                alpaca_auth.alpaca_api_key.clone(),
-                alpaca_auth.alpaca_api_secret.clone(),
-            )
-            .await?,
-        );
+        let wallet = Arc::new(AlpacaWalletService::new(
+            alpaca_api_base_url,
+            config.alpaca_account_id,
+            alpaca_auth.alpaca_api_key.clone(),
+            alpaca_auth.alpaca_api_secret.clone(),
+        ));
 
         let ethereum_evm = Evm::new(
             ethereum_provider,
@@ -285,8 +283,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
 
-    use crate::alpaca_wallet::{AlpacaWalletService, create_account_mock};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
+    use uuid::uuid;
 
     fn make_config() -> RebalancingConfig {
         RebalancingConfig {
@@ -308,6 +307,7 @@ mod tests {
             usdc_vault_id: b256!(
                 "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
+            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
         }
     }
 
@@ -385,7 +385,7 @@ mod tests {
         assert!(result.is_err(), "Expected zero private key to fail parsing");
     }
 
-    async fn make_services_with_mock_wallet(
+    fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
     ) -> (Services<impl Provider + Clone + 'static>, RebalancingConfig) {
         let anvil = Anvil::new().spawn();
@@ -401,19 +401,19 @@ mod tests {
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url().parse().unwrap(),
+            config.alpaca_account_id,
             "test_key".into(),
             "test_secret".into(),
             base_provider.clone(),
             config.redemption_wallet,
         ));
 
-        let _account_mock = create_account_mock(server, "test-account-id");
-
-        let wallet = Arc::new(
-            AlpacaWalletService::new(server.base_url(), "test_key".into(), "test_secret".into())
-                .await
-                .unwrap(),
-        );
+        let wallet = Arc::new(AlpacaWalletService::new(
+            server.base_url(),
+            config.alpaca_account_id,
+            "test_key".into(),
+            "test_secret".into(),
+        ));
 
         let owner = signer.address();
 
@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn into_rebalancer_constructs_without_panic() {
         let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server).await;
+        let (services, config) = make_services_with_mock_wallet(&server);
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();

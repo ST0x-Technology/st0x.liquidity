@@ -1,13 +1,24 @@
+use chrono::{NaiveDate, NaiveTime};
 use thiserror::Error;
 use uuid::Uuid;
 
 mod auth;
+mod client;
 mod executor;
 mod market_hours;
 mod order;
 
 pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
 pub use executor::AlpacaBrokerApi;
+pub use order::{ConversionDirection, CryptoOrderResponse};
+
+/// Terminal failure states for crypto orders
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoOrderFailureReason {
+    Canceled,
+    Expired,
+    Rejected,
+}
 
 #[derive(Debug, Error)]
 pub enum AlpacaBrokerApiError {
@@ -21,22 +32,6 @@ pub enum AlpacaBrokerApiError {
     ApiError {
         status: reqwest::StatusCode,
         body: String,
-    },
-
-    #[error(
-        "Inconsistent market data: market is open but next_close ({next_close}) is not in the future (now: {now})"
-    )]
-    MarketOpenButCloseInPast {
-        next_close: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
-    },
-
-    #[error(
-        "Inconsistent market data: market is closed but next_open ({next_open}) is not in the future (now: {now})"
-    )]
-    MarketClosedButOpenInPast {
-        next_open: chrono::DateTime<chrono::Utc>,
-        now: chrono::DateTime<chrono::Utc>,
     },
 
     #[error(
@@ -58,4 +53,19 @@ pub enum AlpacaBrokerApiError {
         account_id: Uuid,
         status: AccountStatus,
     },
+
+    #[error("Ambiguous datetime when constructing calendar time: {date} {time}")]
+    AmbiguousDateTime { date: NaiveDate, time: NaiveTime },
+
+    #[error("No trading days found between {from} and {to}")]
+    NoTradingDaysFound { from: NaiveDate, to: NaiveDate },
+
+    #[error("Crypto order {order_id} failed: {reason:?}")]
+    CryptoOrderFailed {
+        order_id: Uuid,
+        reason: CryptoOrderFailureReason,
+    },
+
+    #[error("Internal error: calendar was non-empty but iteration returned None")]
+    CalendarIterationInvariantViolation,
 }

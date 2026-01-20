@@ -426,7 +426,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
                     "ETHEREUM_PRIVATE_KEY",
@@ -480,7 +483,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -537,7 +543,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -591,7 +600,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -656,7 +668,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -717,7 +732,10 @@ pub mod tests {
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
-                ("ALPACA_ACCOUNT_ID", Some("test_account_id")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
                 (
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
