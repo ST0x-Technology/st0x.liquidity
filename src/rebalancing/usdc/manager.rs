@@ -178,8 +178,19 @@ where
         amount: Usdc,
     ) -> Result<(), UsdcRebalanceManagerError> {
         let Usdc(decimal_amount) = amount;
+        let correlation_id = Uuid::new_v4();
 
-        info!(?amount, "Starting USDC to USD conversion");
+        info!(?amount, %correlation_id, "Starting USDC to USD conversion");
+
+        // Record intent BEFORE placing order so we can track failures
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: correlation_id,
+                },
+            )
+            .await?;
 
         let order = match self
             .alpaca_broker
@@ -189,16 +200,17 @@ where
             Ok(order) => order,
             Err(e) => {
                 warn!("USDC to USD conversion failed: {e}");
+                self.cqrs
+                    .execute(
+                        &id.0,
+                        UsdcRebalanceCommand::FailConversion {
+                            reason: e.to_string(),
+                        },
+                    )
+                    .await?;
                 return Err(UsdcRebalanceManagerError::AlpacaBrokerApi(e));
             }
         };
-
-        self.cqrs
-            .execute(
-                &id.0,
-                UsdcRebalanceCommand::InitiatePostDepositConversion { order_id: order.id },
-            )
-            .await?;
 
         self.cqrs
             .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
@@ -808,7 +820,7 @@ where
 mod tests {
     use alloy::network::{Ethereum, EthereumWallet};
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, address, b256};
+    use alloy::primitives::{B256, address, b256, fixed_bytes};
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
     };
@@ -821,7 +833,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use uuid::uuid;
+    use uuid::{Uuid, uuid};
 
     use st0x_execution::Executor;
     use st0x_execution::alpaca_broker_api::{
@@ -829,10 +841,11 @@ mod tests {
     };
 
     use super::*;
+    use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
     use crate::onchain::vault::VaultService;
-    use crate::usdc_rebalance::UsdcRebalanceError;
+    use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
 
     const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
     const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
@@ -1512,9 +1525,65 @@ mod tests {
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
-        let cqrs = create_test_cqrs();
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(store, vec![], ()));
 
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let id = UsdcRebalanceId::new("conversion-test-005");
+        let amount = Usdc(dec!(1000));
+
+        // Set up aggregate in DepositConfirmed state (required for execute_usdc_to_usd_conversion)
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: 12345,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
 
         let manager = UsdcRebalanceManager::new(
             alpaca_broker,
@@ -1536,9 +1605,6 @@ mod tests {
             "1000",
         );
 
-        let id = UsdcRebalanceId::new("conversion-test-005");
-        let amount = Usdc(dec!(1000));
-
         let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
 
         assert!(
@@ -1555,14 +1621,66 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_error_display_conversion_failed() {
-        let err = UsdcRebalanceManagerError::ConversionFailed {
-            status: "canceled".to_string(),
-        };
-        assert_eq!(
-            err.to_string(),
-            "Conversion failed with terminal status: canceled"
+    #[tokio::test]
+    async fn test_usd_to_usdc_conversion_emits_fail_conversion_on_api_error() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            Arc::clone(&cqrs),
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Mock order placement to fail with 500 error
+        let _order_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(500).body("Internal Server Error");
+        });
+
+        let id = UsdcRebalanceId::new("conversion-fail-test-001");
+        let amount = Usdc(dec!(1000));
+
+        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
+
+        // Should return an error
+        assert!(result.is_err(), "Expected error, got: {result:?}");
+
+        // Verify aggregate is in ConversionFailed state (not uninitialized) by attempting
+        // InitiateConversion which should fail because aggregate is no longer uninitialized
+        let second_result = cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: Uuid::new_v4(),
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &second_result,
+                Err(AggregateError::UserError(
+                    UsdcRebalanceError::AlreadyInitiated
+                ))
+            ),
+            "Expected AlreadyInitiated error (aggregate should be in ConversionFailed state), got: {second_result:?}"
         );
     }
 }

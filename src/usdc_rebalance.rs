@@ -612,6 +612,17 @@ impl Lifecycle<UsdcRebalance, Never> {
                         state: "ConversionComplete with different direction".to_string(),
                     });
                 }
+
+                if amount != *conv_amount {
+                    return Err(UsdcRebalanceError::InvalidCommand {
+                        command: "Initiate".to_string(),
+                        state: format!(
+                            "ConversionComplete with amount mismatch: expected {}, got {}",
+                            conv_amount.0, amount.0
+                        ),
+                    });
+                }
+
                 Ok(vec![UsdcRebalanceEvent::Initiated {
                     direction: direction.clone(),
                     amount: *conv_amount,
@@ -4275,6 +4286,44 @@ mod tests {
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(amount, Usdc(dec!(1000.00)));
         assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
+    }
+
+    #[tokio::test]
+    async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            converted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(999.00)), // Different amount than conversion
+                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(UsdcRebalanceError::InvalidCommand { command, state })
+                    if command == "Initiate" && state.contains("amount mismatch")
+            ),
+            "Expected InvalidCommand error with amount mismatch, got: {result:?}"
+        );
     }
 
     #[test]
