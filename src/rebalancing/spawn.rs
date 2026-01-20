@@ -19,7 +19,9 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
-use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiError};
+use st0x_execution::alpaca_broker_api::{
+    AlpacaBrokerApiAuthEnv, AlpacaBrokerApiError, AlpacaBrokerApiMode,
+};
 use st0x_execution::{AlpacaBrokerApi, Executor};
 
 use super::usdc::UsdcRebalanceManager;
@@ -152,15 +154,24 @@ where
             config.redemption_wallet,
         ));
 
-        // Wallet service uses Broker API, not Trading API
-        // Broker API URL is derived from trading mode to ensure consistency
-        let broker_api_base_url = if alpaca_auth.is_paper_trading() {
-            "https://broker-api.sandbox.alpaca.markets"
+        // Broker API mode is derived from trading mode to ensure consistency
+        let broker_api_mode = if alpaca_auth.is_paper_trading() {
+            AlpacaBrokerApiMode::Sandbox
         } else {
-            "https://broker-api.alpaca.markets"
+            AlpacaBrokerApiMode::Production
         };
+
+        let broker_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: alpaca_auth.alpaca_api_key.clone(),
+            alpaca_broker_api_secret: alpaca_auth.alpaca_api_secret.clone(),
+            alpaca_account_id: config.alpaca_account_id.to_string(),
+            alpaca_broker_api_mode: broker_api_mode,
+        };
+        let broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
+
+        // Wallet service uses Broker API, not Trading API
         let wallet = Arc::new(AlpacaWalletService::new(
-            broker_api_base_url.to_string(),
+            broker_auth.base_url().to_string(),
             config.alpaca_account_id,
             alpaca_auth.alpaca_api_key.clone(),
             alpaca_auth.alpaca_api_secret.clone(),
@@ -187,6 +198,7 @@ where
 
         Ok(Self {
             tokenization,
+            broker,
             wallet,
             cctp,
             vault,
@@ -247,6 +259,7 @@ where
             Arc::new(RedemptionManager::new(self.tokenization, redemption_cqrs));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
+            self.broker,
             self.wallet,
             self.cctp,
             self.vault,
@@ -289,6 +302,9 @@ build_queries!(build_usdc_queries, UsdcRebalance);
 
 #[cfg(test)]
 mod tests {
+    use httpmock::Method::GET;
+    use serde_json::json;
+
     use super::*;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{address, b256};
@@ -400,7 +416,7 @@ mod tests {
         assert!(result.is_err(), "Expected zero private key to fail parsing");
     }
 
-    fn make_services_with_mock_wallet(
+    async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
     ) -> (Services<impl Provider + Clone + 'static>, RebalancingConfig) {
         let anvil = Anvil::new().spawn();
@@ -422,6 +438,32 @@ mod tests {
             base_provider.clone(),
             config.redemption_wallet,
         ));
+
+        // Mock the broker account verification endpoint
+        let _account_mock = server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/{}/account",
+                config.alpaca_account_id
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": config.alpaca_account_id.to_string(),
+                    "status": "ACTIVE"
+                }));
+        });
+
+        let broker_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test_key".to_string(),
+            alpaca_broker_api_secret: "test_secret".to_string(),
+            alpaca_account_id: config.alpaca_account_id.to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+        };
+        let broker = Arc::new(
+            AlpacaBrokerApi::try_from_config(broker_auth)
+                .await
+                .expect("Failed to create test broker API"),
+        );
 
         let wallet = Arc::new(AlpacaWalletService::new(
             server.base_url(),
@@ -453,6 +495,7 @@ mod tests {
 
         let services = Services {
             tokenization,
+            broker,
             wallet,
             cctp,
             vault,
@@ -464,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn into_rebalancer_constructs_without_panic() {
         let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server);
+        let (services, config) = make_services_with_mock_wallet(&server).await;
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();

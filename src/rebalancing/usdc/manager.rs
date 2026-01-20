@@ -1,7 +1,7 @@
 //! UsdcRebalanceManager orchestrates the USDC rebalancing workflow.
 //!
-//! Coordinates between `AlpacaWalletService`, `CctpBridge`, `VaultService`, and the
-//! `UsdcRebalance` aggregate to execute USDC transfers between Alpaca and Base.
+//! Coordinates between `AlpacaBrokerApi`, `AlpacaWalletService`, `CctpBridge`, `VaultService`,
+//! and the `UsdcRebalance` aggregate to execute USDC transfers between Alpaca and Base.
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
@@ -21,6 +21,8 @@ use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
+use st0x_execution::AlpacaBrokerApi;
+use st0x_execution::alpaca_broker_api::ConversionDirection;
 
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
@@ -33,6 +35,7 @@ where
     BP: Provider + Clone,
     ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
+    alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
     vault: Arc<VaultService<BP>>,
@@ -69,6 +72,7 @@ where
     ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
 {
     pub(crate) fn new(
+        alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
         vault: Arc<VaultService<BP>>,
@@ -77,6 +81,7 @@ where
         vault_id: VaultId,
     ) -> Self {
         Self {
+            alpaca_broker,
             alpaca_wallet,
             cctp_bridge,
             vault,
@@ -84,6 +89,92 @@ where
             market_maker_wallet,
             vault_id,
         }
+    }
+
+    /// Converts USD buying power to USDC in the crypto wallet.
+    ///
+    /// Used at the start of AlpacaToBase flow, before withdrawal.
+    /// Places a buy order on USDC/USD and polls until filled.
+    #[instrument(skip(self), fields(?id, ?amount))]
+    pub(crate) async fn execute_usd_to_usdc_conversion(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        let Usdc(decimal_amount) = amount;
+
+        info!(?amount, "Starting USD to USDC conversion");
+
+        let order = match self
+            .alpaca_broker
+            .convert_usdc_usd(decimal_amount, ConversionDirection::UsdToUsdc)
+            .await
+        {
+            Ok(order) => order,
+            Err(e) => {
+                warn!("USD to USDC conversion failed: {e}");
+                return Err(UsdcRebalanceManagerError::AlpacaBrokerApi(e));
+            }
+        };
+
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: order.id,
+                },
+            )
+            .await?;
+
+        self.cqrs
+            .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
+            .await?;
+
+        info!(order_id = %order.id, "USD to USDC conversion completed");
+        Ok(())
+    }
+
+    /// Converts USDC to USD buying power.
+    ///
+    /// Used at the end of BaseToAlpaca flow, after deposit is confirmed.
+    /// Places a sell order on USDC/USD and polls until filled.
+    #[instrument(skip(self), fields(?id, ?amount))]
+    pub(crate) async fn execute_usdc_to_usd_conversion(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<(), UsdcRebalanceManagerError> {
+        let Usdc(decimal_amount) = amount;
+
+        info!(?amount, "Starting USDC to USD conversion");
+
+        let order = match self
+            .alpaca_broker
+            .convert_usdc_usd(decimal_amount, ConversionDirection::UsdcToUsd)
+            .await
+        {
+            Ok(order) => order,
+            Err(e) => {
+                warn!("USDC to USD conversion failed: {e}");
+                return Err(UsdcRebalanceManagerError::AlpacaBrokerApi(e));
+            }
+        };
+
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiatePostDepositConversion { order_id: order.id },
+            )
+            .await?;
+
+        self.cqrs
+            .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
+            .await?;
+
+        info!(order_id = %order.id, "USDC to USD conversion completed");
+        Ok(())
     }
 
     /// Executes the full Alpaca to Base rebalancing workflow.
@@ -701,6 +792,9 @@ mod tests {
 
     use uuid::uuid;
 
+    use st0x_execution::Executor;
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
@@ -744,6 +838,34 @@ mod tests {
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
+
+    fn create_broker_account_mock(server: &MockServer) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE"
+                }));
+        })
+    }
+
+    async fn create_test_broker_service(server: &MockServer) -> AlpacaBrokerApi {
+        let _account_mock = create_broker_account_mock(server);
+
+        let auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test_key".to_string(),
+            alpaca_broker_api_secret: "test_secret".to_string(),
+            alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+        };
+
+        AlpacaBrokerApi::try_from_config(auth)
+            .await
+            .expect("Failed to create test broker API")
+    }
 
     fn create_test_wallet_service(server: &MockServer) -> AlpacaWalletService {
         let client = AlpacaWalletClient::new(
@@ -829,6 +951,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
@@ -837,6 +960,7 @@ mod tests {
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
@@ -875,6 +999,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
@@ -883,6 +1008,7 @@ mod tests {
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
@@ -928,6 +1054,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
@@ -936,6 +1063,7 @@ mod tests {
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
@@ -1009,6 +1137,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
@@ -1017,6 +1146,7 @@ mod tests {
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
@@ -1044,6 +1174,7 @@ mod tests {
         let server = MockServer::start();
         let (_anvil, endpoint, private_key) = setup_anvil();
 
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
         let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
         let (provider, signer) = create_test_provider(&endpoint, &private_key);
         let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
@@ -1052,6 +1183,7 @@ mod tests {
         let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
 
         let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
             alpaca_wallet,
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
@@ -1073,6 +1205,312 @@ mod tests {
                 ))
             ),
             "Expected Aggregate(UserError(BridgingNotInitiated)) error, got: {result:?}"
+        );
+    }
+
+    fn create_conversion_order_mock<'a>(
+        server: &'a MockServer,
+        amount: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": amount,
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": amount,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        })
+    }
+
+    fn create_conversion_order_pending_mock<'a>(
+        server: &'a MockServer,
+        amount: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                    "symbol": "USDCUSD",
+                    "qty": amount,
+                    "status": "new",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        })
+    }
+
+    fn create_get_order_mock<'a>(
+        server: &'a MockServer,
+        order_id: &str,
+        status: &str,
+        amount: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "USDCUSD",
+                    "qty": amount,
+                    "status": status,
+                    "filled_avg_price": if status == "filled" { Some("1.0001") } else { None },
+                    "filled_qty": if status == "filled" { Some(amount) } else { None },
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn test_execute_usd_to_usdc_conversion_places_buy_order() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Mock the conversion order - USD to USDC is a "buy" on USDC/USD
+        let order_mock = create_conversion_order_mock(&server, "1000");
+
+        let id = UsdcRebalanceId::new("conversion-test-001");
+        let amount = Usdc(dec!(1000));
+
+        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
+
+        order_mock.assert();
+        assert!(
+            result.is_ok(),
+            "Expected successful conversion, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_usdc_to_usd_conversion_places_sell_order() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Mock the conversion order - USDC to USD is a "sell" on USDC/USD
+        let order_mock = create_conversion_order_mock(&server, "500");
+
+        let id = UsdcRebalanceId::new("conversion-test-002");
+        let amount = Usdc(dec!(500));
+
+        let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
+
+        order_mock.assert();
+        assert!(
+            result.is_ok(),
+            "Expected successful conversion, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversion_polls_until_filled() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Order starts as pending
+        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+
+        // First poll returns filled
+        let _get_mock_1 = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "filled",
+            "1000",
+        );
+
+        let id = UsdcRebalanceId::new("conversion-test-003");
+        let amount = Usdc(dec!(1000));
+
+        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
+
+        assert!(
+            result.is_ok(),
+            "Expected successful conversion after polling, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversion_fails_on_canceled_order() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Order starts as pending
+        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+
+        // Poll returns canceled
+        let _get_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "canceled",
+            "1000",
+        );
+
+        let id = UsdcRebalanceId::new("conversion-test-004");
+        let amount = Usdc(dec!(1000));
+
+        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::AlpacaBrokerApi(
+                    AlpacaBrokerApiError::CryptoOrderFailed {
+                        reason: CryptoOrderFailureReason::Canceled,
+                        ..
+                    }
+                ))
+            ),
+            "Expected CryptoOrderFailed with Canceled reason, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conversion_fails_on_rejected_order() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Order starts as pending then gets rejected
+        let _place_mock = create_conversion_order_pending_mock(&server, "1000");
+
+        let _get_mock = create_get_order_mock(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "rejected",
+            "1000",
+        );
+
+        let id = UsdcRebalanceId::new("conversion-test-005");
+        let amount = Usdc(dec!(1000));
+
+        let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UsdcRebalanceManagerError::AlpacaBrokerApi(
+                    AlpacaBrokerApiError::CryptoOrderFailed {
+                        reason: CryptoOrderFailureReason::Rejected,
+                        ..
+                    }
+                ))
+            ),
+            "Expected CryptoOrderFailed with Rejected reason, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_error_display_conversion_failed() {
+        let err = UsdcRebalanceManagerError::ConversionFailed {
+            status: "canceled".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Conversion failed with terminal status: canceled"
         );
     }
 }

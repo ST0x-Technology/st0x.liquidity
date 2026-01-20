@@ -18,33 +18,30 @@ use crate::cctp::CctpError;
 use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 
 #[derive(Debug, Error)]
 pub(crate) enum UsdcRebalanceManagerError {
     #[error("Alpaca wallet error: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
-
+    #[error("Alpaca broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] CctpError),
-
     #[error("Vault error: {0}")]
     Vault(#[from] VaultError),
-
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<UsdcRebalanceError>),
-
     #[error("Withdrawal failed with terminal status: {status}")]
     WithdrawalFailed { status: String },
-
     #[error("Deposit failed with terminal status: {status}")]
     DepositFailed { status: String },
-
+    #[error("Conversion failed with terminal status: {status}")]
+    ConversionFailed { status: String },
     #[error("Invalid amount: {0}")]
     InvalidAmount(String),
-
     #[error("Arithmetic overflow: {0}")]
     ArithmeticOverflow(String),
-
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
 }
