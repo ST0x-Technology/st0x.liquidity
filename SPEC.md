@@ -1833,7 +1833,9 @@ enum UsdcRebalanceEvent {
         order_id: Uuid,
         initiated_at: DateTime<Utc>,
     },
-    ConversionConfirmed { converted_at: DateTime<Utc> },
+    // direction: Required for incremental dispatch terminal detection
+    // (cqrs-es Query::dispatch only receives newly committed events)
+    ConversionConfirmed { direction: RebalanceDirection, converted_at: DateTime<Utc> },
     ConversionFailed { reason: String, failed_at: DateTime<Utc> },
 
     // Withdrawal events
