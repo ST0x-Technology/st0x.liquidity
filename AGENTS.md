@@ -542,6 +542,13 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
   conversion logic
 - **Testing Principle**: Only cover happy paths with all components working and
   connected in integration tests and cover everything in unit tests
+- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: Tests
+  exist to verify the system works correctly. If code is broken or incomplete,
+  tests MUST assert the correct expected behavior and FAIL until the code is
+  fixed. NEVER write tests that assert incorrect behavior with comments like
+  "documenting the gap" or "will fix later". A failing test is the correct way
+  to flag broken code - it forces the issue to be addressed. Tests that pass
+  while asserting wrong behavior are worse than no tests at all.
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
