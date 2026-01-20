@@ -89,8 +89,9 @@ messages just for the sake of it; when they point out issues, they expect action
 (usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
 context).
 
-This prevents wasted time on undirected exploration and ensures alignment on the
-implementation strategy.
+**CRITICAL: Re-evaluate all work when a pattern is identified.** When the user
+points out a mistake, immediately: (1) fix it, (2) re-evaluate ALL session work
+for similar issues, (3) proactively fix all instances without being asked.
 
 ### When user action is required
 
@@ -756,53 +757,8 @@ Organize code within modules by importance and visibility:
 This organization pattern makes the module's public interface clear at a glance
 and keeps implementation details appropriately subordinate.
 
-**Example of good module organization (note that comments are just for
-illustration, in real code we wouldn't leave those):**
-
-```rust
-// Public struct definition
-pub(crate) struct TradeExecution {
-    pub(crate) id: Option<i64>,
-    pub(crate) symbol: Symbol,
-    pub(crate) shares: Shares,
-}
-
-// Implementation block right after type definition
-impl TradeExecution {
-    pub(crate) async fn save(&self, pool: &SqlitePool) -> Result<i64, Error> {
-        // Implementation
-    }
-}
-
-// Public function that uses helper functions
-pub(crate) async fn find_executions_by_status(
-    pool: &SqlitePool,
-    status: OrderStatus,
-) -> Result<Vec<TradeExecution>, Error> {
-    let rows = query_by_status(pool, status.as_str()).await?;
-    rows.into_iter().map(row_to_execution).collect()
-}
-
-// Another public function (standalone)
-pub(crate) async fn find_execution_by_id(
-    pool: &SqlitePool,
-    id: i64,
-) -> Result<Option<TradeExecution>, Error> {
-    // Implementation
-}
-
-// Private helper functions used by find_executions_by_status
-async fn query_by_status(
-    pool: &SqlitePool,
-    status: &str,
-) -> Result<Vec<ExecutionRow>, sqlx::Error> {
-    // SQL query implementation
-}
-
-fn row_to_execution(row: ExecutionRow) -> Result<TradeExecution, Error> {
-    // Conversion logic
-}
-```
+**Example:** Public types first -> impl blocks -> public functions -> private
+helpers.
 
 This pattern applies across the entire workspace, including both the main crate
 and sub-crates like `st0x-execution`.
