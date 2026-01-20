@@ -506,7 +506,10 @@ impl InventoryView {
             ),
 
             (
-                UsdcRebalanceEvent::WithdrawalConfirmed { .. }
+                UsdcRebalanceEvent::ConversionInitiated { .. }
+                | UsdcRebalanceEvent::ConversionConfirmed { .. }
+                | UsdcRebalanceEvent::ConversionFailed { .. }
+                | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
                 | UsdcRebalanceEvent::WithdrawalFailed { .. }
                 | UsdcRebalanceEvent::BridgingInitiated { .. }
                 | UsdcRebalanceEvent::BridgeAttestationReceived { .. }

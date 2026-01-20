@@ -19,6 +19,8 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiError};
+use st0x_execution::{AlpacaBrokerApi, Executor};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
@@ -45,6 +47,8 @@ pub(crate) enum SpawnRebalancerError {
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
     #[error("failed to create Alpaca wallet service: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
+    #[error("failed to create Alpaca broker API: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] crate::cctp::CctpError),
 }
@@ -92,7 +96,8 @@ where
         signer.address(),
         base_provider,
         orderbook,
-    )?;
+    )
+    .await?;
 
     let rebalancer = services.into_rebalancer(pool, config, symbol_cache, event_broadcast);
 
@@ -116,6 +121,7 @@ where
     BP: Provider + Clone,
 {
     tokenization: Arc<AlpacaTokenizationService<BP>>,
+    broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
     vault: Arc<VaultService<BP>>,
@@ -125,7 +131,7 @@ impl<BP> Services<BP>
 where
     BP: Provider + Clone + 'static,
 {
-    fn new(
+    async fn new(
         config: &RebalancingConfig,
         alpaca_auth: &AlpacaTradingApiAuthEnv,
         ethereum_wallet: &EthereumWallet,
