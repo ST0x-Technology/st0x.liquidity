@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
+use uuid::Uuid;
 
 use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
@@ -95,6 +96,16 @@ where
     ///
     /// Used at the start of AlpacaToBase flow, before withdrawal.
     /// Places a buy order on USDC/USD and polls until filled.
+    ///
+    /// # Event Sourcing Flow
+    ///
+    /// 1. Record intent via `InitiateConversion` (aggregate enters `Converting` state)
+    /// 2. Place Alpaca order
+    /// 3. If order fails: emit `FailConversion` (aggregate enters `ConversionFailed` state)
+    /// 4. If order succeeds: emit `ConfirmConversion` (aggregate enters `ConversionComplete` state)
+    ///
+    /// The `order_id` in `InitiateConversion` is a correlation UUID generated upfront,
+    /// not the actual Alpaca order ID.
     #[instrument(skip(self), fields(?id, ?amount))]
     pub(crate) async fn execute_usd_to_usdc_conversion(
         &self,
@@ -102,8 +113,21 @@ where
         amount: Usdc,
     ) -> Result<(), UsdcRebalanceManagerError> {
         let Usdc(decimal_amount) = amount;
+        let correlation_id = Uuid::new_v4();
 
-        info!(?amount, "Starting USD to USDC conversion");
+        info!(?amount, %correlation_id, "Starting USD to USDC conversion");
+
+        // Record intent BEFORE placing order so we can track failures
+        self.cqrs
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: correlation_id,
+                },
+            )
+            .await?;
 
         let order = match self
             .alpaca_broker
@@ -113,20 +137,17 @@ where
             Ok(order) => order,
             Err(e) => {
                 warn!("USD to USDC conversion failed: {e}");
+                self.cqrs
+                    .execute(
+                        &id.0,
+                        UsdcRebalanceCommand::FailConversion {
+                            reason: e.to_string(),
+                        },
+                    )
+                    .await?;
                 return Err(UsdcRebalanceManagerError::AlpacaBrokerApi(e));
             }
         };
-
-        self.cqrs
-            .execute(
-                &id.0,
-                UsdcRebalanceCommand::InitiateConversion {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount,
-                    order_id: order.id,
-                },
-            )
-            .await?;
 
         self.cqrs
             .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
@@ -140,6 +161,16 @@ where
     ///
     /// Used at the end of BaseToAlpaca flow, after deposit is confirmed.
     /// Places a sell order on USDC/USD and polls until filled.
+    ///
+    /// # Event Sourcing Flow
+    ///
+    /// 1. Record intent via `InitiatePostDepositConversion` (aggregate enters `Converting` state)
+    /// 2. Place Alpaca order
+    /// 3. If order fails: emit `FailConversion` (aggregate enters `ConversionFailed` state)
+    /// 4. If order succeeds: emit `ConfirmConversion` (aggregate enters `ConversionComplete` state)
+    ///
+    /// The `order_id` in `InitiatePostDepositConversion` is a correlation UUID generated upfront,
+    /// not the actual Alpaca order ID.
     #[instrument(skip(self), fields(?id, ?amount))]
     pub(crate) async fn execute_usdc_to_usd_conversion(
         &self,

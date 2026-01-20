@@ -36,8 +36,6 @@ pub(crate) enum UsdcRebalanceManagerError {
     WithdrawalFailed { status: String },
     #[error("Deposit failed with terminal status: {status}")]
     DepositFailed { status: String },
-    #[error("Conversion failed with terminal status: {status}")]
-    ConversionFailed { status: String },
     #[error("Invalid amount: {0}")]
     InvalidAmount(String),
     #[error("Arithmetic overflow: {0}")]

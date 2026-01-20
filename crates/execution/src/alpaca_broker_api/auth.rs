@@ -9,7 +9,7 @@ pub enum AlpacaBrokerApiMode {
     Sandbox,
     /// Production environment (real money)
     Production,
-    /// Mock mode for testing (available via `test-support` feature or in tests)
+    /// Mock mode for testing (available via `mock` feature or in tests)
     #[cfg(any(test, feature = "mock"))]
     #[clap(skip)]
     Mock(String),

@@ -159,10 +159,17 @@ pub(crate) enum UsdcRebalanceError {
 ///
 /// Commands are validated against the current state before being processed.
 /// Invalid commands return appropriate errors without mutating state.
+///
+/// # Conversion Commands
+///
+/// There are two conversion commands because conversion happens at different points in each flow:
+/// - **AlpacaToBase**: Convert USD→USDC BEFORE withdrawal (need USDC for CCTP bridge)
+/// - **BaseToAlpaca**: Convert USDC→USD AFTER deposit (USDC arrives in crypto wallet)
 #[derive(Debug, Clone)]
 pub(crate) enum UsdcRebalanceCommand {
-    /// Start a new rebalancing operation with conversion (AlpacaToBase direction).
-    /// Valid only from `Uninitialized` state. Starts USD->USDC conversion.
+    /// Start pre-withdrawal conversion for AlpacaToBase direction.
+    /// Converts USD buying power to USDC before withdrawal to Alpaca's crypto wallet.
+    /// Valid only from `Uninitialized` state.
     InitiateConversion {
         direction: RebalanceDirection,
         amount: Usdc,
@@ -172,8 +179,9 @@ pub(crate) enum UsdcRebalanceCommand {
     ConfirmConversion,
     /// Record conversion failure. Valid only from `Converting` state.
     FailConversion { reason: String },
-    /// Start post-deposit conversion (BaseToAlpaca direction only).
-    /// Valid only from `DepositConfirmed` state. Starts USDC->USD conversion.
+    /// Start post-deposit conversion for BaseToAlpaca direction.
+    /// Converts USDC (deposited via CCTP) to USD buying power for trading.
+    /// Valid only from `DepositConfirmed` state.
     InitiatePostDepositConversion { order_id: Uuid },
     /// Start a new rebalancing operation. Valid only from `Uninitialized` state or
     /// `ConversionComplete` state (for AlpacaToBase direction).
