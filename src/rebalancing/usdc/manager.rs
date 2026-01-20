@@ -188,6 +188,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: correlation_id,
+                    amount,
                 },
             )
             .await?;

@@ -2320,6 +2320,7 @@ mod tests {
             aggregate_id,
             UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: uuid::Uuid::new_v4(),
+                amount: Usdc(dec!(500)),
             },
         )
         .await

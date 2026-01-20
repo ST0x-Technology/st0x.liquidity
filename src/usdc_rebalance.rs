@@ -120,6 +120,9 @@ pub(crate) enum UsdcRebalanceError {
     /// Wrong direction for post-deposit conversion
     #[error("Post-deposit conversion is only valid for BaseToAlpaca direction")]
     WrongDirectionForPostDepositConversion,
+    /// Conversion amount doesn't match aggregate deposit amount
+    #[error("Conversion amount mismatch: aggregate has {expected}, command provided {provided}")]
+    ConversionAmountMismatch { expected: Usdc, provided: Usdc },
     /// Withdrawal has not been initiated yet
     #[error("Withdrawal has not been initiated")]
     WithdrawalNotInitiated,
@@ -179,7 +182,8 @@ pub(crate) enum UsdcRebalanceCommand {
     /// Start post-deposit conversion for BaseToAlpaca direction.
     /// Converts USDC (deposited via CCTP) to USD buying power for trading.
     /// Valid only from `DepositConfirmed` state.
-    InitiatePostDepositConversion { order_id: Uuid },
+    /// Amount must match the aggregate's deposit amount for consistency.
+    InitiatePostDepositConversion { order_id: Uuid, amount: Usdc },
     /// Start a new rebalancing operation. Valid only from `Uninitialized` state or
     /// `ConversionComplete` state (for AlpacaToBase direction).
     Initiate {
@@ -476,8 +480,8 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
 
             UsdcRebalanceCommand::FailConversion { reason } => self.handle_fail_conversion(reason),
 
-            UsdcRebalanceCommand::InitiatePostDepositConversion { order_id } => {
-                self.handle_initiate_post_deposit_conversion(*order_id)
+            UsdcRebalanceCommand::InitiatePostDepositConversion { order_id, amount } => {
+                self.handle_initiate_post_deposit_conversion(*order_id, *amount)
             }
 
             UsdcRebalanceCommand::Initiate {
@@ -575,6 +579,7 @@ impl Lifecycle<UsdcRebalance, Never> {
     fn handle_initiate_post_deposit_conversion(
         &self,
         order_id: Uuid,
+        command_amount: Usdc,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
             Ok(UsdcRebalance::DepositConfirmed {
@@ -583,6 +588,14 @@ impl Lifecycle<UsdcRebalance, Never> {
                 if *direction != RebalanceDirection::BaseToAlpaca {
                     return Err(UsdcRebalanceError::WrongDirectionForPostDepositConversion);
                 }
+
+                if command_amount != *amount {
+                    return Err(UsdcRebalanceError::ConversionAmountMismatch {
+                        expected: *amount,
+                        provided: command_amount,
+                    });
+                }
+
                 Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
                     direction: direction.clone(),
                     amount: *amount,
@@ -4523,7 +4536,10 @@ mod tests {
 
         let events = aggregate
             .handle(
-                UsdcRebalanceCommand::InitiatePostDepositConversion { order_id },
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id,
+                    amount: Usdc(dec!(1000.00)),
+                },
                 &(),
             )
             .await
@@ -4589,6 +4605,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: Uuid::new_v4(),
+                    amount: Usdc(dec!(1000.00)),
                 },
                 &(),
             )
@@ -4608,6 +4625,7 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::InitiatePostDepositConversion {
                     order_id: Uuid::new_v4(),
+                    amount: Usdc(dec!(1000.00)),
                 },
                 &(),
             )
@@ -4617,6 +4635,67 @@ mod tests {
             result.unwrap_err(),
             UsdcRebalanceError::DepositNotConfirmed
         ));
+    }
+
+    #[tokio::test]
+    async fn test_initiate_post_deposit_conversion_rejects_mismatched_amount() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+            initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            burned_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            cctp_nonce: 12345,
+            attested_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            deposit_initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            deposit_confirmed_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: Uuid::new_v4(),
+                    amount: Usdc(dec!(500.00)),
+                },
+                &(),
+            )
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                UsdcRebalanceError::ConversionAmountMismatch { expected, provided }
+                    if *expected == Usdc(dec!(1000.00)) && *provided == Usdc(dec!(500.00))
+            ),
+            "Expected ConversionAmountMismatch with expected=1000 and provided=500, got: {err:?}"
+        );
     }
 
     #[tokio::test]
