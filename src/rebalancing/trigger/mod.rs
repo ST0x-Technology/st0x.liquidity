@@ -516,37 +516,27 @@ impl RebalancingTrigger {
         //
         // Terminal events:
         // - All failure events (always terminal)
-        // - ConversionConfirmed with BaseToAlpaca direction (post-deposit conversion complete)
-        // - DepositConfirmed with AlpacaToBase direction (no post-deposit conversion needed)
+        // - ConversionConfirmed(BaseToAlpaca) - post-deposit conversion complete
+        // - DepositConfirmed(AlpacaToBase) - no post-deposit conversion needed
         //
         // Non-terminal for BaseToAlpaca:
         // - DepositConfirmed(BaseToAlpaca) - still needs post-deposit conversion (USDC->USD)
 
         for envelope in events {
             match &envelope.payload {
-                // All failure events are terminal regardless of direction
+                // Terminal events: all failures + successful terminal states
                 UsdcRebalanceEvent::WithdrawalFailed { .. }
                 | UsdcRebalanceEvent::BridgingFailed { .. }
                 | UsdcRebalanceEvent::DepositFailed { .. }
-                | UsdcRebalanceEvent::ConversionFailed { .. } => return true,
-
-                // ConversionConfirmed(BaseToAlpaca) is terminal (post-deposit conversion complete)
-                UsdcRebalanceEvent::ConversionConfirmed {
+                | UsdcRebalanceEvent::ConversionFailed { .. }
+                | UsdcRebalanceEvent::ConversionConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     ..
-                } => return true,
-
-                // DepositConfirmed(AlpacaToBase) is terminal - no post-deposit conversion needed
-                UsdcRebalanceEvent::DepositConfirmed {
+                }
+                | UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     ..
                 } => return true,
-
-                // DepositConfirmed(BaseToAlpaca) is NOT terminal - needs post-deposit conversion
-                UsdcRebalanceEvent::DepositConfirmed {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    ..
-                } => {}
 
                 // All other events are not terminal
                 _ => {}
