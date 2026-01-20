@@ -116,13 +116,13 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 tracing-opentelemetry.workspace = true
+rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error" }
 ts-rs = { version = "11.1.0", features = [
   "chrono",
   "chrono-impl",
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
-rain-error-decoding = { git = "https://github.com/rainlanguage/rain.error", version = "0.1.0" }
 
 [dev-dependencies]
 httpmock.workspace = true

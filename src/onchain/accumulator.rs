@@ -147,9 +147,12 @@ pub(crate) async fn find_by_symbol(
     pool: &SqlitePool,
     symbol: &str,
 ) -> Result<Option<(PositionCalculator, Option<i64>)>, OnChainError> {
-    let row = sqlx::query!("SELECT * FROM trade_accumulators WHERE symbol = ?1", symbol)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query!(
+        "SELECT accumulated_long, accumulated_short, pending_execution_id FROM trade_accumulators WHERE symbol = ?1",
+        symbol
+    )
+    .fetch_optional(pool)
+    .await?;
 
     Ok(row.map(|row| {
         let calculator =
@@ -164,7 +167,7 @@ async fn get_or_create_within_transaction(
 ) -> Result<PositionCalculator, OnChainError> {
     let symbol_str = symbol.to_string();
     let row = sqlx::query!(
-        "SELECT * FROM trade_accumulators WHERE symbol = ?1",
+        "SELECT accumulated_long, accumulated_short FROM trade_accumulators WHERE symbol = ?1",
         symbol_str
     )
     .fetch_optional(&mut **sql_tx)

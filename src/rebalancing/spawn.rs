@@ -76,6 +76,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
     alpaca_auth: &AlpacaTradingApiAuthEnv,
     base_provider: BP,
     symbol_cache: SymbolCache,
+    orderbook: Address,
     event_broadcast: Option<broadcast::Sender<ServerMessage>>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
@@ -90,6 +91,7 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
+        orderbook,
     )?;
 
     let rebalancer = services.into_rebalancer(pool, config, symbol_cache, event_broadcast);
@@ -129,15 +131,14 @@ where
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
+        orderbook: Address,
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
             .connect_http(config.ethereum_rpc_url.clone());
 
-        let alpaca_api_base_url = alpaca_auth.base_url();
-
         let tokenization = Arc::new(AlpacaTokenizationService::new(
-            alpaca_api_base_url.clone(),
+            alpaca_auth.base_url(),
             config.alpaca_account_id,
             alpaca_auth.alpaca_api_key.clone(),
             alpaca_auth.alpaca_api_secret.clone(),
@@ -145,8 +146,15 @@ where
             config.redemption_wallet,
         ));
 
+        // Wallet service uses Broker API, not Trading API
+        // Broker API URL is derived from trading mode to ensure consistency
+        let broker_api_base_url = if alpaca_auth.is_paper_trading() {
+            "https://broker-api.sandbox.alpaca.markets"
+        } else {
+            "https://broker-api.alpaca.markets"
+        };
         let wallet = Arc::new(AlpacaWalletService::new(
-            alpaca_api_base_url,
+            broker_api_base_url.to_string(),
             config.alpaca_account_id,
             alpaca_auth.alpaca_api_key.clone(),
             alpaca_auth.alpaca_api_secret.clone(),
@@ -169,7 +177,7 @@ where
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
-        let vault = Arc::new(VaultService::new(base_provider, config.base_orderbook));
+        let vault = Arc::new(VaultService::new(base_provider, orderbook));
 
         Ok(Self {
             tokenization,
@@ -282,10 +290,12 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use sqlx::SqlitePool;
+    use uuid::Uuid;
 
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
-    use uuid::uuid;
+
+    const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_config() -> RebalancingConfig {
         RebalancingConfig {
@@ -297,17 +307,16 @@ mod tests {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
-            redemption_wallet: address!("1234567890123456789012345678901234567890"),
-            market_maker_wallet: address!("aabbccddaabbccddaabbccddaabbccddaabbccdd"),
+            redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
+            market_maker_wallet: address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
             ethereum_private_key: b256!(
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             ),
-            base_orderbook: address!("abcdefabcdefabcdefabcdefabcdefabcdefabcd"),
             usdc_vault_id: b256!(
-                "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+                "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
-            alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
+            alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
         }
     }
 
@@ -378,7 +387,7 @@ mod tests {
 
     #[test]
     fn private_key_signer_from_zero_bytes_fails() {
-        let zero_key = b256!("0000000000000000000000000000000000000000000000000000000000000000");
+        let zero_key = b256!("0x0000000000000000000000000000000000000000000000000000000000000000");
 
         let result = PrivateKeySigner::from_bytes(&zero_key);
 
@@ -400,7 +409,7 @@ mod tests {
             .connect_http(config.ethereum_rpc_url.clone());
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
-            server.base_url().parse().unwrap(),
+            server.base_url(),
             config.alpaca_account_id,
             "test_key".into(),
             "test_secret".into(),
@@ -434,7 +443,7 @@ mod tests {
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
-        let vault = Arc::new(VaultService::new(base_provider, config.base_orderbook));
+        let vault = Arc::new(VaultService::new(base_provider, TEST_ORDERBOOK));
 
         let services = Services {
             tokenization,

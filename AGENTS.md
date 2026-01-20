@@ -57,8 +57,30 @@ When the user asks a question or challenges your approach:
 4. **Never assume silence or a question means approval to change direction.**
    Explicit confirmation is required before abandoning one approach for another.
 
+### When issues are pointed out
+
+When the user points out an issue, bug, or problem - fix it immediately. Do not
+ask "Want me to fix this?" or "Should I address this?". The user never sends
+messages just for the sake of it; when they point out issues, they expect action
+(usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
+context).
+
 This prevents wasted time on undirected exploration and ensures alignment on the
 implementation strategy.
+
+### When user action is required
+
+**CRITICAL**: The user is not reading every word of your output - they are
+monitoring your actions. When you need the user to do something (run a command,
+check output, provide input), you must ensure they see the request:
+
+- If you are **blocked** and cannot proceed without user action, STOP after
+  stating what you need. Do not continue working on other tasks.
+- If you are **not blocked**, you can continue working, but when you're ready to
+  stop, clearly state what you need from the user at the end of your response.
+
+The user checks your output when they see you've stopped. If you give them a
+command mid-response and keep working, they will miss it.
 
 ### Before creating a PR
 
@@ -88,9 +110,17 @@ This project uses a Cargo workspace with:
 
 ### Building & Running
 
-- `cargo build` - Build all workspace members
-- `cargo build -p st0x-hedge` - Build main crate only
-- `cargo build -p st0x-execution` - Build execution crate only
+**CRITICAL: NEVER use `cargo build` for verification.** It's slower than
+`cargo check` and less useful than `cargo test` or `cargo clippy`. Use:
+
+- `cargo check` for fast compilation verification
+- `cargo test` for verification with test coverage
+- `cargo clippy` for verification with linting
+
+Only use `cargo build` when you actually need the build artifacts (e.g., final
+verification before a release, or when the user explicitly asks to run the
+binary).
+
 - `cargo run --bin server` - Run the main arbitrage bot
 - `cargo run --bin cli -- auth` - Run the authentication flow for Charles Schwab
   OAuth setup
@@ -149,6 +179,10 @@ resolution and feature selection.
 
 - When running `git diff`, make sure to add `--no-pager` to avoid opening it in
   the interactive view, e.g. `git --no-pager diff`
+- **CRITICAL: NEVER run `cargo run` unless explicitly asked by the user.** If
+  you want to understand CLI commands or configuration options, read the code.
+  If you want to test functionality, write proper tests. There is never a reason
+  to run the application speculatively.
 
 ### Updating GitHub Issues
 
@@ -445,6 +479,11 @@ Environment variables (can be set via `.env` file):
   Always log a warning or error with context before early returns in `let-else`
   or similar patterns. Silent failures hide bugs and make debugging nearly
   impossible
+- **No Duplicate Values in Debug Output**: Never hardcode values that exist
+  elsewhere in the implementation (URLs, paths, constants, config values, etc.)
+  into debug/log statements. These duplicates will inevitably drift out of sync
+  with the real implementation, misleading debugging efforts instead of helping
+  them. Always log the actual runtime value being used, not a hardcoded copy
 - **Visibility Levels**: Always keep visibility levels as restrictive as
   possible (prefer `pub(crate)` over `pub`, private over `pub(crate)`) to enable
   better dead code detection by the compiler and tooling. This makes the
@@ -624,6 +663,13 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
 - **Test Quality**: Never write tests that only exercise language features
   without testing our application logic. Tests should verify actual business
   logic, not just struct field assignments or basic language operations
+- **Property-Based Testing**: Use `proptest` for property-based tests whenever
+  there are clear invariants to verify. Property tests are excellent for:
+  - Parsing/serialization roundtrips
+  - Boundary conditions (e.g., message length validation)
+  - Invariants that should hold for all inputs (e.g., extracted data matches
+    input regardless of surrounding bytes)
+  - Numeric operations where edge cases are hard to enumerate manually
 
 #### Writing Meaningful Tests
 
@@ -637,12 +683,13 @@ returning values within expected bounds.
 
 ### Workflow Best Practices
 
-- **Always run tests, clippy, and formatters before handing over a piece of
-  work** (skip if only documentation/markdown files were changed)
-  - Run tests first, as changing tests can break clippy
-  - Run clippy next, as fixing linting errors can break formatting
-  - Deny warnings when running clippy
-  - Always run `cargo fmt` last to ensure clean code formatting
+- **Always run verification steps before handing over a piece of work** (skip if
+  only documentation/markdown files were changed). Run them in this order to
+  fail fast:
+  1. `cargo check` - fastest, catches compilation errors first
+  2. `cargo test -q` - only run after check passes
+  3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
+  4. `cargo fmt` - always run last to ensure clean formatting
 
 #### CRITICAL: Lint Policy
 
@@ -864,6 +911,36 @@ Instead of `assert!(result.is_err()); assert!(matches!(...))`, write
 Similarly, instead of `assert!(result.is_ok()); assert_eq!(...)`, write
 `assert_eq!(result.unwrap(), "expected_value");` so unexpected values are shown.
 
+#### Assertions must be specific
+
+Test assertions must check for the exact expected behavior, not vague
+alternatives. Never use `||` in assertions to accept multiple possible outcomes
+unless those outcomes are genuinely equivalent.
+
+```rust
+// ❌ BAD - Lazy, accepts vaguely similar outcomes
+assert!(
+    output.contains("Failed") || output.contains("❌"),
+    "Output should indicate failure"
+);
+
+// ❌ BAD - Too permissive, doesn't verify actual behavior
+assert!(result.is_some());
+
+// ✅ GOOD - Checks for exact expected output
+assert!(
+    output.contains("❌ Failed to place order"),
+    "Expected failure message, got: {output}"
+);
+
+// ✅ GOOD - Verifies specific value
+assert_eq!(result.unwrap().order_id, "12345");
+```
+
+If you find yourself writing `||` in an assertion, ask: are these outcomes
+actually equivalent? If not, you probably don't understand what the code should
+do, and need to investigate before writing the test.
+
 #### Type modeling examples
 
 **Principle**: Choose the type representation that most accurately models the
@@ -946,7 +1023,7 @@ Prefer flat code over deeply nested blocks to improve readability and
 maintainability. This includes test modules - do NOT nest submodules inside
 `mod tests`. Put all tests directly in the `tests` module.
 
-##### Use early returns:
+##### Techniques for flat code:
 
 ```rust
 // ❌ Nested: if let Some(data) = data { if !data.is_empty() { if data.len() > 5 { ... } } }

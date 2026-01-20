@@ -142,8 +142,6 @@ where
             .await
     }
 
-    // TODO(#224): Remove #[allow(dead_code)] when CLI is integrated (PR #190)
-    #[allow(dead_code)]
     /// List all tokenization requests.
     pub(crate) async fn list_requests(
         &self,
@@ -399,7 +397,7 @@ where
         debug!(
             url = %url,
             symbol = %request.underlying_symbol,
-            quantity = ?request.quantity,
+            quantity = %request.quantity,
             wallet = %request.wallet,
             "Sending tokenization mint request"
         );

@@ -8,7 +8,7 @@ mod executor;
 mod market_hours;
 mod order;
 
-pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
+pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
 pub use order::{ConversionDirection, CryptoOrderResponse};
 

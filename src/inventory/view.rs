@@ -250,6 +250,19 @@ impl InventoryView {
         self
     }
 
+    /// Sets USDC inventory with specified available balances (zero inflight).
+    #[cfg(test)]
+    pub(crate) fn with_usdc(self, onchain_available: Usdc, offchain_available: Usdc) -> Self {
+        Self {
+            usdc: Inventory {
+                onchain: VenueBalance::new(onchain_available, Usdc(Decimal::ZERO)),
+                offchain: VenueBalance::new(offchain_available, Usdc(Decimal::ZERO)),
+                last_rebalancing: None,
+            },
+            ..self
+        }
+    }
+
     fn update_equity(
         self,
         symbol: &Symbol,

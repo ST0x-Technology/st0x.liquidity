@@ -114,6 +114,9 @@ impl BridgeDirection {
 pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
+pub(crate) const USDC_ETHEREUM_SEPOLIA: Address =
+    address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
+
 pub(crate) const TOKEN_MESSENGER_V2: Address =
     address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 pub(crate) const MESSAGE_TRANSMITTER_V2: Address =
@@ -215,7 +218,17 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 /// # Example
 ///
 /// ```rust,ignore
-/// let bridge = CctpBridge::new(ethereum_evm, base_evm);
+/// let ethereum = Evm::new(
+///     eth_provider, owner, USDC_ETHEREUM,
+///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+/// );
+/// let base = Evm::new(
+///     base_provider, owner, USDC_BASE,
+///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+/// );
+/// let bridge = CctpBridge::new(ethereum, base);
+///
+/// let amount = U256::from(1_000_000); // 1 USDC
 /// let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
 /// ```
 pub(crate) struct CctpBridge<EP, BP>
@@ -533,7 +546,8 @@ mod tests {
     ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
     {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let wallet = EthereumWallet::from(signer.clone());
+        let owner = signer.address();
+        let wallet = EthereumWallet::from(signer);
 
         let ethereum_provider = ProviderBuilder::new()
             .wallet(wallet.clone())
@@ -544,8 +558,6 @@ mod tests {
             .wallet(wallet)
             .connect(base_endpoint)
             .await?;
-
-        let owner = signer.address();
 
         let ethereum = Evm::new(
             ethereum_provider,
@@ -742,8 +754,7 @@ mod tests {
         .unwrap();
 
         let amount = U256::from(1_000_000u64);
-        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
-        let owner = signer.address();
+        let owner = bridge.ethereum.owner();
         let spender = *bridge.ethereum.token_messenger().address();
 
         let initial_allowance = bridge
@@ -787,8 +798,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
-        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
-        let owner = signer.address();
+        let owner = bridge.ethereum.owner();
         let spender = *bridge.ethereum.token_messenger().address();
 
         bridge
@@ -843,8 +853,7 @@ mod tests {
 
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
-        let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
-        let owner = signer.address();
+        let owner = bridge.ethereum.owner();
         let spender = *bridge.ethereum.token_messenger().address();
 
         bridge
@@ -891,7 +900,8 @@ mod tests {
     ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, Box<dyn std::error::Error>>
     {
         let signer = PrivateKeySigner::from_bytes(private_key)?;
-        let wallet = EthereumWallet::from(signer.clone());
+        let owner = signer.address();
+        let wallet = EthereumWallet::from(signer);
 
         let ethereum_provider = ProviderBuilder::new()
             .wallet(wallet.clone())
@@ -902,8 +912,6 @@ mod tests {
             .wallet(wallet)
             .connect(base_endpoint)
             .await?;
-
-        let owner = signer.address();
 
         let ethereum = Evm::new(
             ethereum_provider,
@@ -941,8 +949,7 @@ mod tests {
         .unwrap();
 
         let amount = U256::from(1_000_000u64);
-        let signer = PrivateKeySigner::from_bytes(&base_key).unwrap();
-        let owner = signer.address();
+        let owner = bridge.base.owner();
         let spender = *bridge.base.token_messenger().address();
 
         let initial_allowance = bridge
@@ -984,8 +991,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
-        let signer = PrivateKeySigner::from_bytes(&base_key).unwrap();
-        let owner = signer.address();
+        let owner = bridge.base.owner();
         let spender = *bridge.base.token_messenger().address();
 
         bridge
@@ -1038,8 +1044,7 @@ mod tests {
 
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
-        let signer = PrivateKeySigner::from_bytes(&base_key).unwrap();
-        let owner = signer.address();
+        let owner = bridge.base.owner();
         let spender = *bridge.base.token_messenger().address();
 
         bridge
@@ -1424,7 +1429,8 @@ mod tests {
             Box<dyn std::error::Error>,
         > {
             let signer = PrivateKeySigner::from_bytes(&self.deployer_key)?;
-            let wallet = EthereumWallet::from(signer.clone());
+            let owner = signer.address();
+            let wallet = EthereumWallet::from(signer);
 
             let ethereum_provider = ProviderBuilder::new()
                 .wallet(wallet.clone())
@@ -1435,8 +1441,6 @@ mod tests {
                 .wallet(wallet)
                 .connect(&self.base_endpoint)
                 .await?;
-
-            let owner = signer.address();
 
             let ethereum = Evm::new(
                 ethereum_provider,
@@ -1536,8 +1540,7 @@ mod tests {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
-        let signer = PrivateKeySigner::from_bytes(&cctp.deployer_key).unwrap();
-        let recipient = signer.address();
+        let recipient = bridge.base.owner();
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
@@ -1560,8 +1563,7 @@ mod tests {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
-        let signer = PrivateKeySigner::from_bytes(&cctp.deployer_key).unwrap();
-        let recipient = signer.address();
+        let recipient = bridge.ethereum.owner();
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
@@ -1584,8 +1586,7 @@ mod tests {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
-        let signer = PrivateKeySigner::from_bytes(&cctp.deployer_key).unwrap();
-        let recipient = signer.address();
+        let recipient = bridge.base.owner();
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
@@ -1615,8 +1616,7 @@ mod tests {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
-        let signer = PrivateKeySigner::from_bytes(&cctp.deployer_key).unwrap();
-        let recipient = signer.address();
+        let recipient = bridge.ethereum.owner();
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
@@ -1646,8 +1646,7 @@ mod tests {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
-        let signer = PrivateKeySigner::from_bytes(&cctp.deployer_key).unwrap();
-        let recipient = signer.address();
+        let recipient = bridge.ethereum.owner();
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
@@ -1685,8 +1684,7 @@ mod tests {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
-        let signer = PrivateKeySigner::from_bytes(&cctp.deployer_key).unwrap();
-        let recipient = signer.address();
+        let recipient = bridge.base.owner();
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge

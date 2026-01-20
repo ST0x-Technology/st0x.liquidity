@@ -32,6 +32,7 @@ pub(crate) use status::PollingConfig;
 pub(crate) use transfer::{
     AlpacaAccountId, AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus,
 };
+pub(crate) use whitelist::WhitelistStatus;
 
 /// Service facade for Alpaca crypto wallet operations.
 ///
@@ -134,8 +135,6 @@ impl AlpacaWalletService {
         status::poll_deposit_by_tx_hash(&self.client, tx_hash, &self.polling_config).await
     }
 
-    // TODO(#224): Remove #[allow(dead_code)] when CLI is integrated (PR #190)
-    #[allow(dead_code)]
     pub(crate) async fn get_wallet_address(
         &self,
         asset: &TokenSymbol,
@@ -144,8 +143,6 @@ impl AlpacaWalletService {
         self.client.get_wallet_address(asset, network).await
     }
 
-    // TODO(#224): Remove #[allow(dead_code)] when CLI is integrated (PR #190)
-    #[allow(dead_code)]
     pub(crate) async fn create_whitelist_entry(
         &self,
         address: &Address,
@@ -157,8 +154,6 @@ impl AlpacaWalletService {
             .await
     }
 
-    // TODO(#224): Remove #[allow(dead_code)] when CLI is integrated (PR #190)
-    #[allow(dead_code)]
     /// Gets all whitelisted addresses for this account.
     pub(crate) async fn get_whitelisted_addresses(
         &self,
@@ -166,8 +161,6 @@ impl AlpacaWalletService {
         self.client.get_whitelisted_addresses().await
     }
 
-    // TODO(#224): Remove #[allow(dead_code)] when CLI is integrated (PR #190)
-    #[allow(dead_code)]
     /// Lists all transfers for this account.
     pub(crate) async fn list_all_transfers(&self) -> Result<Vec<Transfer>, AlpacaWalletError> {
         transfer::list_all_transfers(&self.client).await

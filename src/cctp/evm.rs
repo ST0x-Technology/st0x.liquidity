@@ -138,6 +138,11 @@ where
     }
 
     #[cfg(test)]
+    pub(super) fn owner(&self) -> Address {
+        self.owner
+    }
+
+    #[cfg(test)]
     pub(super) fn usdc(&self) -> &IERC20::IERC20Instance<P> {
         &self.usdc
     }

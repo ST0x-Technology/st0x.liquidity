@@ -5,7 +5,7 @@ use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
-use tracing::error;
+use tracing::{error, warn};
 
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
@@ -306,7 +306,7 @@ impl OnchainTrade {
             .collect();
 
         if trades.len() > 1 {
-            tracing::warn!(
+            warn!(
                 "Found {} potential trades in the tx with hash {tx_hash}, returning first match",
                 trades.len()
             );
@@ -389,7 +389,7 @@ fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, fixed_bytes, uint};
+    use alloy::primitives::{Address, U256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
 
@@ -707,8 +707,8 @@ mod tests {
         let feed_id_cache = FeedIdCache::default();
         let env = EvmEnv {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
-            orderbook: alloy::primitives::Address::ZERO,
-            order_owner: alloy::primitives::Address::ZERO,
+            orderbook: Address::ZERO,
+            order_owner: Address::ZERO,
             deployment_block: 0,
         };
 
