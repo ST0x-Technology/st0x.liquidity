@@ -3,6 +3,11 @@ name = "st0x-execution"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+# Enable mock mode for testing from downstream crates
+mock = []
+
 [dependencies]
 alloy.workspace = true
 async-trait.workspace = true

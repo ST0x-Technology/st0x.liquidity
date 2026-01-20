@@ -9,8 +9,8 @@ pub enum AlpacaBrokerApiMode {
     Sandbox,
     /// Production environment (real money)
     Production,
-    /// Mock mode for testing (test-only)
-    #[cfg(test)]
+    /// Mock mode for testing (available via `test-support` feature or in tests)
+    #[cfg(any(test, feature = "mock"))]
     #[clap(skip)]
     Mock(String),
 }
@@ -20,7 +20,7 @@ impl AlpacaBrokerApiMode {
         match self {
             Self::Sandbox => "https://broker-api.sandbox.alpaca.markets",
             Self::Production => "https://broker-api.alpaca.markets",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "mock"))]
             Self::Mock(url) => url,
         }
     }
