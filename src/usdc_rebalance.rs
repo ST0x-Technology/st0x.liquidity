@@ -1435,16 +1435,9 @@ impl View<Self> for Lifecycle<UsdcRebalance, Never> {
 mod tests {
     use super::*;
     use alloy::primitives::fixed_bytes;
-    use cqrs_es::CqrsFramework;
-    use cqrs_es::persist::PersistedEventStore;
     use rust_decimal_macros::dec;
-    use sqlite_es::SqliteEventRepository;
     use std::collections::HashMap;
     use uuid::Uuid;
-
-    use crate::test_utils::setup_test_db;
-
-    type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {
