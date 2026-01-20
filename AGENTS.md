@@ -19,9 +19,9 @@ the limit, condense explanations without removing any rules.
 
 ## Communication
 
-- **Do not run commands to "show" output to the user.** The CLI interface
-  truncates output. If you need the user to review something, explicitly ask
-  them to look at it. Do not run `git diff` expecting the user to see output.
+- **Do not run commands to "show" output to the user.** The CLI truncates
+  output. If you need the user to review something, explicitly ask them to look
+  at it. Do not run `git diff` expecting the user to see output.
 
 ## Planning Hierarchy
 
