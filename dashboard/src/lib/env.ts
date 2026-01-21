@@ -29,5 +29,6 @@ const getDefaultWsUrl = (broker: Broker): string => {
 
 export const getWebSocketUrl = (broker: Broker): string => {
   const envKey = broker === 'schwab' ? 'PUBLIC_SCHWAB_WS_URL' : 'PUBLIC_ALPACA_WS_URL'
-  return env[envKey] ?? getDefaultWsUrl(broker)
+  const val = env[envKey]?.trim()
+  return val !== undefined && val !== '' ? val : getDefaultWsUrl(broker)
 }
