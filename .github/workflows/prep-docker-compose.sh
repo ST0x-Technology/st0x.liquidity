@@ -66,13 +66,15 @@ else
   mkdir -p "${DATA_VOLUME_PATH}"
 
   if [ "$SKIP_BUILD" = false ]; then
-    # Build Docker image with debug profile
+    # Build Docker images with debug profile
     if ! command -v docker &> /dev/null; then
       echo "ERROR: docker command not found. Please install Docker."
       exit 1
     fi
-    echo "==> Building Docker image with debug profile..."
+    echo "==> Building schwarbot image with debug profile..."
     docker build --build-arg BUILD_PROFILE=debug -t "${DOCKER_IMAGE}" .
+    echo "==> Building dashboard image..."
+    docker build -t "${DASHBOARD_IMAGE}" dashboard/
   else
     echo "==> Skipping Docker image build (--skip-build)"
   fi
