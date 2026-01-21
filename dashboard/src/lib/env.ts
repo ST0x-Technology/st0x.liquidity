@@ -20,7 +20,7 @@ const isLocalDev = (): boolean => {
 
 const getDefaultWsUrl = (broker: Broker): string => {
   if (isLocalDev()) {
-    return `ws://localhost:${LOCAL_DEV_PORTS[broker]}/api/ws`
+    return `ws://localhost:${String(LOCAL_DEV_PORTS[broker])}/api/ws`
   }
 
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
