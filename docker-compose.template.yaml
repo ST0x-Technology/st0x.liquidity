@@ -89,5 +89,16 @@ services:
       - ./grafana-datasource.yaml:/otel-lgtm/grafana/conf/provisioning/datasources/sqlite.yaml:ro
     restart: unless-stopped
 
+  dashboard:
+    image: ${DASHBOARD_IMAGE}
+    pull_policy: ${PULL_POLICY}
+    container_name: dashboard
+    ports:
+      - "80:80"
+    depends_on:
+      - schwarbot
+      - alpacabot
+    restart: unless-stopped
+
 volumes:
   grafana-data:
