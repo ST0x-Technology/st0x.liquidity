@@ -31,36 +31,20 @@ The project uses a strict document hierarchy:
    before implementation.
 2. **GitHub Issues / Roadmap (#2)** - Downstream from spec. Describe problems,
    not solutions.
-3. **PLAN.md** - Downstream from issues. Per-feature implementation plans.
+3. **Planning** - Downstream from issues. Implementation plans before coding.
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
 
-**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → write
-PLAN.md → get approval.
+**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → plan
+the implementation.
 
 ## Plan & Review
-
-### Before starting work
-
-- Write a comprehensive step-by-step plan to PLAN.md with each task having a
-  corresponding section and a list of subtasks as checkboxes inside of it
-- The task sections should follow the format `## Task N. <TASK NAME>`
-- The plan should be a detailed implementation plan and the reasoning behind the
-  design decisions
-- Do not include timelines in the plan as they tend to be inaccurate
-- Remain focused on the task at hand, do not include unrelated improvements or
-  premature optimizations
-- Once you write the plan, ask me to review it. Do not continue until I approve
-  the plan.
 
 ### While implementing
 
 - **CRITICAL: All new or modified logic MUST have corresponding test coverage.**
   Do not move on from a piece of code until tests are written. This is
   non-negotiable.
-- You should update PLAN.md every time you complete a section
-- Upon completing a planned task, add detailed descriptions of the changes you
-  made to ease the review process
 
 ### Handling questions and approach changes
 
@@ -106,15 +90,6 @@ check output, provide input), you must ensure they see the request:
 
 The user checks your output when they see you've stopped. If you give them a
 command mid-response and keep working, they will miss it.
-
-### Before creating a PR
-
-- **CRITICAL**: Delete PLAN.md before submitting changes for review
-- PLAN.md is a transient development file that should ONLY exist on development
-  branches
-- PLAN.md should NEVER appear in pull requests or be merged to main/master
-- The plan is for development tracking only - final documentation goes in commit
-  messages, docstrings, and permanent markdown documents
 
 ## Project Overview
 
@@ -174,6 +149,11 @@ binary).
 `sqlx migrate add
 <migration_name>` to create migrations. This ensures proper
 timestamping and sequencing.
+
+**CRITICAL: New worktrees require database setup.** When working in a new git
+worktree, you will encounter sqlx compile errors like "unable to open database
+file". Fix this by running `sqlx db reset -y` to create and migrate the local
+database before running any cargo commands.
 
 ### Dependency Management
 

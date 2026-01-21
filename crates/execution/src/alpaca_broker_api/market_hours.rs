@@ -13,9 +13,9 @@ use super::client::AlpacaBrokerApiClient;
 pub(super) struct CalendarDay {
     #[serde(deserialize_with = "deserialize_date")]
     pub date: NaiveDate,
-    #[serde(deserialize_with = "deserialize_hhmm_time")]
+    #[serde(deserialize_with = "deserialize_time")]
     pub open: NaiveTime,
-    #[serde(deserialize_with = "deserialize_hhmm_time")]
+    #[serde(deserialize_with = "deserialize_time")]
     pub close: NaiveTime,
 }
 
@@ -27,26 +27,12 @@ where
     NaiveDate::parse_from_str(&s, "%Y-%m-%d").map_err(serde::de::Error::custom)
 }
 
-fn deserialize_hhmm_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
+fn deserialize_time<'de, D>(deserializer: D) -> Result<NaiveTime, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    if s.len() != 4 {
-        return Err(serde::de::Error::custom(format!(
-            "expected HHMM format, got: {s}"
-        )));
-    }
-
-    let hour: u32 = s[0..2]
-        .parse()
-        .map_err(|_| serde::de::Error::custom(format!("invalid hour in: {s}")))?;
-    let min: u32 = s[2..4]
-        .parse()
-        .map_err(|_| serde::de::Error::custom(format!("invalid minute in: {s}")))?;
-
-    NaiveTime::from_hms_opt(hour, min, 0)
-        .ok_or_else(|| serde::de::Error::custom(format!("invalid time: {s}")))
+    NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
 }
 
 enum MarketStatus {
@@ -260,8 +246,8 @@ mod tests {
                 .json_body(json!([
                     {
                         "date": "2025-01-06",
-                        "open": "0930",
-                        "close": "1600"
+                        "open": "09:30",
+                        "close": "16:00"
                     }
                 ]));
         });
@@ -336,8 +322,8 @@ mod tests {
                 .json_body(json!([
                     {
                         "date": "2025-01-06",
-                        "open": "0930",
-                        "close": "1600"
+                        "open": "09:30",
+                        "close": "16:00"
                     }
                 ]));
         });
@@ -353,6 +339,66 @@ mod tests {
         assert_eq!(
             calendar[0].close,
             NaiveTime::from_hms_opt(16, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_calendar_day_deserializes_real_api_format() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "09:30",
+            "close": "16:00"
+        }"#;
+
+        let day: CalendarDay = serde_json::from_str(json).unwrap();
+
+        assert_eq!(day.date, NaiveDate::from_ymd_opt(2025, 1, 6).unwrap());
+        assert_eq!(day.open, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
+        assert_eq!(day.close, NaiveTime::from_hms_opt(16, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_day_rejects_hhmm_format_without_colon() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "0930",
+            "close": "1600"
+        }"#;
+
+        let err = serde_json::from_str::<CalendarDay>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid"),
+            "expected parse error for missing colon, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_calendar_day_rejects_invalid_hour() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "25:30",
+            "close": "16:00"
+        }"#;
+
+        let err = serde_json::from_str::<CalendarDay>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected out of range error for hour 25, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_calendar_day_rejects_invalid_minute() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "09:60",
+            "close": "16:00"
+        }"#;
+
+        let err = serde_json::from_str::<CalendarDay>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected out of range error for minute 60, got: {err}"
         );
     }
 }
