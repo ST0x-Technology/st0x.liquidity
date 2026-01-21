@@ -11,7 +11,7 @@ services:
       - DATABASE_URL=sqlite:///data/schwab.db
       - ENCRYPTION_KEY
     env_file:
-      - .env
+      - .env.schwab
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -30,7 +30,7 @@ services:
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:
-      - .env
+      - .env.alpaca
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -45,7 +45,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:///data/schwab.db
     env_file:
-      - .env
+      - .env.schwab
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -60,7 +60,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:
-      - .env
+      - .env.alpaca
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
