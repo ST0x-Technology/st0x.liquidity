@@ -1070,7 +1070,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: address!("0x0000000000000000000000000000000000000000"),
+                order_owner: Some(address!("0x0000000000000000000000000000000000000000")),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -1707,7 +1707,7 @@ mod tests {
         );
 
         let mut config = config;
-        config.evm.order_owner = mock_data.order_owner;
+        config.evm.order_owner = Some(mock_data.order_owner);
 
         let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
 
@@ -1790,7 +1790,7 @@ mod tests {
         );
 
         let mut config = config;
-        config.evm.order_owner = mock_data.order_owner;
+        config.evm.order_owner = Some(mock_data.order_owner);
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)

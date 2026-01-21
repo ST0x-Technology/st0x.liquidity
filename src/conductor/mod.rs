@@ -679,6 +679,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     feed_id_cache: &FeedIdCache,
 ) -> Result<Option<OnchainTrade>, EventProcessingError> {
     let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, queued_event);
+    let order_owner = config.order_owner()?;
 
     let onchain_trade = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => {
@@ -689,6 +690,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
                 *clear_event.clone(),
                 reconstructed_log,
                 feed_id_cache,
+                order_owner,
             )
             .await?
         }
@@ -698,7 +700,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
                 provider,
                 *take_event.clone(),
                 reconstructed_log,
-                config.evm.order_owner,
+                order_owner,
                 feed_id_cache,
             )
             .await?
@@ -1451,6 +1453,7 @@ mod tests {
                 ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
 
             let feed_id_cache = FeedIdCache::default();
+            let order_owner = config.order_owner().unwrap();
             if let Ok(Some(trade)) = OnchainTrade::try_from_clear_v3(
                 &config.evm,
                 &cache,
@@ -1458,6 +1461,7 @@ mod tests {
                 *boxed_clear_event,
                 log,
                 &feed_id_cache,
+                order_owner,
             )
             .await
             {

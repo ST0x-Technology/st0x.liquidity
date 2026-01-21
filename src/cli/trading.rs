@@ -160,8 +160,18 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 ) -> anyhow::Result<()> {
     let evm_env = &config.evm;
     let feed_id_cache = FeedIdCache::new();
+    let order_owner = config.order_owner()?;
 
-    match OnchainTrade::try_from_tx_hash(tx_hash, provider, cache, evm_env, &feed_id_cache).await {
+    match OnchainTrade::try_from_tx_hash(
+        tx_hash,
+        provider,
+        cache,
+        evm_env,
+        &feed_id_cache,
+        order_owner,
+    )
+    .await
+    {
         Ok(Some(onchain_trade)) => {
             process_found_trade(onchain_trade, config, pool, stdout).await?;
         }
@@ -355,7 +365,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,

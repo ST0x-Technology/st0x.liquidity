@@ -108,7 +108,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
-                order_owner: address!("0x2222222222222222222222222222222222222222"),
+                order_owner: Some(address!("0x2222222222222222222222222222222222222222")),
                 deployment_block: 0,
             },
             order_polling_interval: 15,

@@ -14,6 +14,7 @@ use st0x_execution::{
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
+use crate::env::ConfigError;
 use crate::onchain::position_calculator::ConversionError;
 
 /// Business logic validation errors for trade processing rules.
@@ -118,6 +119,8 @@ pub(crate) enum EventProcessingError {
     Execution(#[from] ExecutionError),
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
+    #[error("Config error: {0}")]
+    Config(#[from] ConfigError),
 }
 
 /// Order polling errors for order status monitoring.

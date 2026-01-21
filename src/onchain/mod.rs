@@ -20,7 +20,7 @@ pub struct EvmEnv {
     #[clap(short = 'b', long, env)]
     pub orderbook: Address,
     #[clap(short, long, env)]
-    pub order_owner: Address,
+    pub order_owner: Option<Address>,
     #[clap(short = 'd', long, env)]
     pub deployment_block: u64,
 }
