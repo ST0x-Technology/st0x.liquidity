@@ -102,7 +102,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Build Docker image
+      - name: Build Docker images
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
@@ -110,6 +110,11 @@ jobs:
           docker build \
             -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:$SHORT_SHA \
             -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:latest .
+
+          docker build \
+            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:$SHORT_SHA \
+            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:latest \
+            dashboard/
 
       - name: Install doctl
         if: github.ref == 'refs/heads/master'
@@ -138,11 +143,13 @@ jobs:
           echo "GRAFANA_DATASOURCE_YAML=$(base64 -w 0 grafana-datasource.yaml)" >> $GITHUB_ENV
           echo "PREP_SCRIPT=$(base64 -w 0 .github/workflows/prep-docker-compose.sh)" >> $GITHUB_ENV
 
-      - name: Push image to DO Registry
+      - name: Push images to DO Registry
         if: github.ref == 'refs/heads/master'
         run: |
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:${{ env.SHORT_SHA }}
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:latest
+          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:${{ env.SHORT_SHA }}
+          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:latest
 
       - name: Deploy to Droplet
         if: github.ref == 'refs/heads/master'
@@ -343,6 +350,7 @@ jobs:
             check_container_running "grafana" "Grafana"
             check_container_running "reporter-schwab" "Reporter-schwab"
             check_container_running "reporter-alpaca" "Reporter-alpaca"
+            check_container_running "dashboard" "Dashboard"
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - All containers confirmed running" | tee -a "${DEPLOY_LOG}"
 
@@ -355,6 +363,7 @@ jobs:
             docker compose logs alpacabot 2>&1 | tee -a "${DOCKER_LOG}"
             docker compose logs reporter-schwab 2>&1 | tee -a "${DOCKER_LOG}"
             docker compose logs reporter-alpaca 2>&1 | tee -a "${DOCKER_LOG}"
+            docker compose logs dashboard 2>&1 | tee -a "${DOCKER_LOG}"
 
             check_container_logs "schwarbot" "Schwarbot"
             check_container_logs "alpacabot" "Alpacabot"
@@ -365,6 +374,10 @@ jobs:
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Cleaning up old images..." | tee -a "${DEPLOY_LOG}"
             log_exec docker image prune -f
             docker images "registry.digitalocean.com/${REGISTRY_NAME}/schwarbot" \
+              --format "table {{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}" | \
+              tail -n +2 | head -n -3 | awk '{print $1":"$2}' | \
+              xargs -r docker rmi 2>&1 | tee -a "${DEPLOY_LOG}" || true
+            docker images "registry.digitalocean.com/${REGISTRY_NAME}/dashboard" \
               --format "table {{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}" | \
               tail -n +2 | head -n -3 | awk '{print $1":"$2}' | \
               xargs -r docker rmi 2>&1 | tee -a "${DEPLOY_LOG}" || true
