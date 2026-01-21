@@ -236,9 +236,6 @@ pub enum Commands {
         /// Number of shares to tokenize (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Wallet address to receive tokens (defaults to MARKET_MAKER_WALLET from env)
-        #[arg(short = 'w', long = "wallet")]
-        wallet: Option<Address>,
         /// Token contract address (to verify balance after tokenization)
         #[arg(short = 't', long = "token")]
         token: Address,
@@ -402,7 +399,6 @@ enum ProviderCommand {
     AlpacaTokenize {
         symbol: Symbol,
         quantity: FractionalShares,
-        wallet: Option<Address>,
         token: Address,
     },
     AlpacaRedeem {
@@ -474,12 +470,10 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::AlpacaTokenize {
             symbol,
             quantity,
-            wallet,
             token,
         } => Err(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            wallet,
             token,
         }),
         Commands::AlpacaRedeem {
@@ -587,13 +581,10 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            wallet,
             token,
         } => {
-            rebalancing::alpaca_tokenize_command(
-                stdout, symbol, quantity, wallet, token, config, provider,
-            )
-            .await
+            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, token, config, provider)
+                .await
         }
         ProviderCommand::AlpacaRedeem {
             symbol,

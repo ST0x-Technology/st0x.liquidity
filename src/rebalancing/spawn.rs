@@ -88,7 +88,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
 where
     BP: Provider + Clone + Send + Sync + 'static,
 {
-    let signer = PrivateKeySigner::from_bytes(&config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
 
     let services = Services::new(
@@ -101,7 +101,14 @@ where
     )
     .await?;
 
-    let rebalancer = services.into_rebalancer(pool, config, symbol_cache, event_broadcast);
+    let market_maker_wallet = signer.address();
+    let rebalancer = services.into_rebalancer(
+        pool,
+        config,
+        symbol_cache,
+        event_broadcast,
+        market_maker_wallet,
+    );
 
     let handle = tokio::spawn(async move {
         rebalancer.run().await;
@@ -211,6 +218,7 @@ where
         config: &RebalancingConfig,
         symbol_cache: SymbolCache,
         event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+        market_maker_wallet: Address,
     ) -> ConfiguredRebalancer<BP> {
         const OPERATION_CHANNEL_CAPACITY: usize = 100;
 
@@ -264,7 +272,7 @@ where
             self.cctp,
             self.vault,
             usdc_cqrs,
-            config.market_maker_wallet,
+            market_maker_wallet,
             VaultId(config.usdc_vault_id),
         ));
 
@@ -330,9 +338,8 @@ mod tests {
                 deviation: dec!(0.15),
             },
             redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
-            market_maker_wallet: address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
-            ethereum_private_key: b256!(
+            evm_private_key: b256!(
                 "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             ),
             usdc_vault_id: b256!(
@@ -399,7 +406,7 @@ mod tests {
     fn private_key_signer_from_valid_bytes_succeeds() {
         let config = make_config();
 
-        let result = PrivateKeySigner::from_bytes(&config.ethereum_private_key);
+        let result = PrivateKeySigner::from_bytes(&config.evm_private_key);
 
         assert!(
             result.is_ok(),
@@ -423,7 +430,7 @@ mod tests {
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let config = make_config();
-        let signer = PrivateKeySigner::from_bytes(&config.ethereum_private_key).unwrap();
+        let signer = PrivateKeySigner::from_bytes(&config.evm_private_key).unwrap();
         let ethereum_wallet = EthereumWallet::from(signer.clone());
 
         let ethereum_provider = ProviderBuilder::new()
@@ -512,7 +519,14 @@ mod tests {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
 
-        let _rebalancer = services.into_rebalancer(pool, &config, SymbolCache::default(), None);
+        let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
+        let _rebalancer = services.into_rebalancer(
+            pool,
+            &config,
+            SymbolCache::default(),
+            None,
+            market_maker_wallet,
+        );
     }
 
     #[test]

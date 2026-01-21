@@ -35,7 +35,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -139,7 +139,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -246,7 +246,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let sender_address = signer.address();
     let target_address = address.unwrap_or(sender_address);
 
@@ -487,10 +487,9 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: Some(RebalancingConfig {
-                ethereum_private_key: B256::ZERO,
+                evm_private_key: B256::ZERO,
                 ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
                 usdc_vault_id: B256::ZERO,
-                market_maker_wallet: Address::ZERO,
                 redemption_wallet: Address::ZERO,
                 alpaca_account_id,
                 equity_threshold: ImbalanceThreshold {

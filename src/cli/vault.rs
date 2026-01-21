@@ -29,7 +29,7 @@ pub(super) async fn vault_deposit_command<
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -97,7 +97,7 @@ pub(super) async fn vault_withdraw_command<
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 

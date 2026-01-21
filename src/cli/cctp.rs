@@ -41,7 +41,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-bridge requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
     let wallet = signer.address();
 
     let amount_u256 = if all {
@@ -156,7 +156,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-recover requires rebalancing configuration"))?;
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
 
     let direction = source_chain.to_bridge_direction();
     let dest_chain = match source_chain {
@@ -197,7 +197,7 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("reset-allowance requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
     let wallet = EthereumWallet::from(signer.clone());
     let owner = signer.address();
 
@@ -296,10 +296,9 @@ mod tests {
     fn create_config_with_rebalancing() -> Config {
         let mut config = create_config_without_rebalancing();
         config.rebalancing = Some(RebalancingConfig {
-            ethereum_private_key: B256::ZERO,
+            evm_private_key: B256::ZERO,
             ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
-            market_maker_wallet: Address::ZERO,
             redemption_wallet: Address::ZERO,
             alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             equity_threshold: ImbalanceThreshold {
