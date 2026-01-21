@@ -12,7 +12,8 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use st0x_execution::Symbol;
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+use st0x_execution::{AlpacaBrokerApi, Executor, Symbol};
 
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
@@ -169,14 +170,23 @@ where
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_provider(base_provider);
 
-    let broker_url = if alpaca_auth.is_sandbox() {
-        "https://broker-api.sandbox.alpaca.markets"
+    let broker_mode = if alpaca_auth.is_sandbox() {
+        AlpacaBrokerApiMode::Sandbox
     } else {
-        "https://broker-api.alpaca.markets"
+        AlpacaBrokerApiMode::Production
     };
 
+    let broker_auth = AlpacaBrokerApiAuthEnv {
+        alpaca_broker_api_key: alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_broker_api_secret: alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_account_id: rebalancing_config.alpaca_account_id.to_string(),
+        alpaca_broker_api_mode: broker_mode,
+    };
+
+    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
+
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-        broker_url.into(),
+        broker_auth.base_url().to_string(),
         rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_broker_api_key.clone(),
         alpaca_auth.alpaca_broker_api_secret.clone(),
@@ -210,6 +220,7 @@ where
     let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));
 
     let rebalance_manager = UsdcRebalanceManager::new(
+        alpaca_broker,
         alpaca_wallet,
         bridge,
         vault_service,
@@ -681,6 +692,50 @@ mod tests {
         assert!(
             output.contains("Alpaca -> Raindex"),
             "Expected direction in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn cli_broker_mode_sandbox_when_sandbox_auth() {
+        let alpaca_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+        };
+
+        let broker_mode = if alpaca_auth.is_sandbox() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_mode,
+            AlpacaBrokerApiMode::Sandbox,
+            "Sandbox auth should yield Sandbox broker mode"
+        );
+    }
+
+    #[test]
+    fn cli_broker_mode_production_when_production_auth() {
+        let alpaca_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
+        };
+
+        let broker_mode = if alpaca_auth.is_sandbox() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_mode,
+            AlpacaBrokerApiMode::Production,
+            "Production auth should yield Production broker mode"
         );
     }
 }

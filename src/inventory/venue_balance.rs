@@ -60,12 +60,12 @@ where
     }
 
     #[cfg(test)]
-    fn available(self) -> T {
+    pub(super) fn available(self) -> T {
         self.available
     }
 
     #[cfg(test)]
-    fn inflight(self) -> T {
+    pub(super) fn inflight(self) -> T {
         self.inflight
     }
 }

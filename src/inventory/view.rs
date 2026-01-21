@@ -498,6 +498,7 @@ impl InventoryView {
             (
                 UsdcRebalanceEvent::DepositConfirmed {
                     deposit_confirmed_at,
+                    ..
                 },
                 _,
             ) => self.update_usdc(
@@ -506,7 +507,10 @@ impl InventoryView {
             ),
 
             (
-                UsdcRebalanceEvent::WithdrawalConfirmed { .. }
+                UsdcRebalanceEvent::ConversionInitiated { .. }
+                | UsdcRebalanceEvent::ConversionConfirmed { .. }
+                | UsdcRebalanceEvent::ConversionFailed { .. }
+                | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
                 | UsdcRebalanceEvent::WithdrawalFailed { .. }
                 | UsdcRebalanceEvent::BridgingInitiated { .. }
                 | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
@@ -1392,8 +1396,9 @@ mod tests {
         }
     }
 
-    fn make_deposit_confirmed_event() -> UsdcRebalanceEvent {
+    fn make_deposit_confirmed_event(direction: RebalanceDirection) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::DepositConfirmed {
+            direction,
             deposit_confirmed_at: Utc::now(),
         }
     }
@@ -1488,15 +1493,11 @@ mod tests {
     #[test]
     fn apply_usdc_deposit_confirmed_updates_last_rebalancing() {
         let view = make_usdc_view(1100, 0, 900, 0);
-        let event = make_deposit_confirmed_event();
+        let direction = RebalanceDirection::AlpacaToBase;
+        let event = make_deposit_confirmed_event(direction.clone());
 
         let updated = view
-            .apply_usdc_rebalance_event(
-                &event,
-                &RebalanceDirection::AlpacaToBase,
-                usdc(100),
-                Utc::now(),
-            )
+            .apply_usdc_rebalance_event(&event, &direction, usdc(100), Utc::now())
             .unwrap();
 
         assert!(updated.usdc.last_rebalancing.is_some());
@@ -1532,7 +1533,7 @@ mod tests {
 
         let after_confirmed = after_bridged
             .apply_usdc_rebalance_event(
-                &make_deposit_confirmed_event(),
+                &make_deposit_confirmed_event(direction.clone()),
                 &direction,
                 amount,
                 Utc::now(),
@@ -1571,7 +1572,7 @@ mod tests {
 
         let after_confirmed = after_bridged
             .apply_usdc_rebalance_event(
-                &make_deposit_confirmed_event(),
+                &make_deposit_confirmed_event(direction.clone()),
                 &direction,
                 amount,
                 Utc::now(),
@@ -1715,5 +1716,157 @@ mod tests {
             view.check_usdc_imbalance(&threshold("0.5", "0.3"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn apply_conversion_initiated_updates_timestamp_only() {
+        let now = Utc::now();
+        let before = now - chrono::Duration::hours(1);
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: before,
+        };
+
+        let event = UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(500)),
+            order_id: uuid::Uuid::new_v4(),
+            initiated_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                Usdc(dec!(500)),
+                now,
+            )
+            .unwrap();
+
+        // Timestamp should be updated
+        assert_eq!(updated.last_updated, now);
+
+        // USDC balances should NOT change for conversion events
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(0)));
+    }
+
+    #[test]
+    fn apply_conversion_confirmed_updates_timestamp_only() {
+        let now = Utc::now();
+        let before = now - chrono::Duration::hours(1);
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: before,
+        };
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::BaseToAlpaca,
+                Usdc(dec!(500)),
+                now,
+            )
+            .unwrap();
+
+        // Timestamp should be updated
+        assert_eq!(updated.last_updated, now);
+
+        // USDC balances should NOT change for conversion events
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
+    }
+
+    #[test]
+    fn apply_conversion_failed_updates_timestamp_only() {
+        let now = Utc::now();
+        let before = now - chrono::Duration::hours(1);
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: before,
+        };
+
+        let event = UsdcRebalanceEvent::ConversionFailed {
+            reason: "Order rejected".to_string(),
+            failed_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                Usdc(dec!(500)),
+                now,
+            )
+            .unwrap();
+
+        // Timestamp should be updated
+        assert_eq!(updated.last_updated, now);
+
+        // USDC balances should NOT change for conversion failure
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
+    }
+
+    #[test]
+    fn conversion_events_do_not_affect_usdc_inflight() {
+        let now = Utc::now();
+
+        // Start with some inflight (simulating mid-rebalance)
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(400)), Usdc(dec!(100))), // 100 inflight
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Conversion events should not modify inflight amounts
+        let event = UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(100)),
+            order_id: uuid::Uuid::new_v4(),
+            initiated_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                Usdc(dec!(100)),
+                now,
+            )
+            .unwrap();
+
+        // Inflight should remain unchanged - conversion is a separate concern from bridging
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(400)));
     }
 }

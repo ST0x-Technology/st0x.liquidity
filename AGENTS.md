@@ -6,13 +6,37 @@ This file provides guidance to AI agents working with code in this repository.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
 the limit, condense explanations without removing any rules.
 
+## Ownership Principles
+
+**CRITICAL: Take full ownership. Never deflect responsibility.**
+
+- **Fix all problems immediately** - regardless of who introduced them. Never
+  say "this is a pre-existing issue" as justification for not fixing it.
+- **Meet ALL constraints** - when editing a file with size limits, ensure the
+  ENTIRE file meets the limit, not just your additions.
+- **No warnings or errors pass through** - CI and review catch everything. If
+  you see a warning/error, it's your responsibility to fix it now.
+
 ## Communication
 
-- **Do not run commands to "show" output to the user.** The CLI interface
-  truncates output and the user cannot see full command results. If you need the
-  user to review something, stop and explicitly ask them to look at it (e.g.,
-  "please review the changes in src/foo.rs"). Do not run `git diff` or similar
-  commands expecting the user to see the output - they won't.
+- **Do not run commands to "show" output to the user.** The CLI truncates
+  output. If you need the user to review something, explicitly ask them to look
+  at it. Do not run `git diff` expecting the user to see output.
+
+## Planning Hierarchy
+
+The project uses a strict document hierarchy:
+
+1. **SPEC.md** - Source of truth for system behavior. Features documented here
+   before implementation.
+2. **GitHub Issues / Roadmap (#2)** - Downstream from spec. Describe problems,
+   not solutions.
+3. **PLAN.md** - Downstream from issues. Per-feature implementation plans.
+4. **Tests** - Downstream from plan. Written before implementation (TDD).
+5. **Implementation** - Makes the tests pass.
+
+**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → write
+PLAN.md → get approval.
 
 ## Plan & Review
 
@@ -65,8 +89,9 @@ messages just for the sake of it; when they point out issues, they expect action
 (usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
 context).
 
-This prevents wasted time on undirected exploration and ensures alignment on the
-implementation strategy.
+**CRITICAL: Re-evaluate all work when a pattern is identified.** When the user
+points out a mistake, immediately: (1) fix it, (2) re-evaluate ALL session work
+for similar issues, (3) proactively fix all instances without being asked.
 
 ### When user action is required
 
@@ -387,28 +412,8 @@ Environment variables (can be set via `.env` file):
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
-  - Example of correct import organization:
-    ```rust
-    use std::sync::Arc;
-    use alloy::primitives::{Address, B256};
-    use cqrs_es::{CqrsFramework, EventStore};
-    use serde::{Deserialize, Serialize};
-
-    use crate::account::ClientId;
-    use crate::mint::TokenizationRequestId;
-    use super::{Mint, MintCommand};
-    ```
-  - Example of **INCORRECT** import organization:
-    ```rust
-    // ❌ WRONG - Three groups, internal imports mixed with external
-    use std::sync::Arc;
-
-    use alloy::primitives::{Address, B256};
-    use crate::account::ClientId;  // Internal import in wrong place
-    use cqrs_es::CqrsFramework;
-
-    use super::Mint;
-    ```
+  - Example: `use std::sync::Arc; use alloy::primitives::Address;` [blank line]
+    `use crate::foo::Bar; use super::Baz;`
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
   module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
@@ -433,41 +438,6 @@ Environment variables (can be set via `.env` file):
     preemptively
   - **Principle**: Error types must enable debugging and preserve all context -
     opaque strings make debugging impossible
-  - Example of **FORBIDDEN** pattern:
-    ```rust
-    // ❌ CATASTROPHICALLY BAD - Destroys all type information
-    #[derive(Debug, thiserror::Error)]
-    pub enum MyError {
-        #[error("Aggregate error: {0}")]
-        AggregateError(String),  // WRONG: No way to know what failed
-        #[error("Processing failed: {0}")]
-        ProcessingError(String), // WRONG: Loses error chain
-    }
-
-    // Code that creates these errors (FORBIDDEN):
-    some_operation().map_err(|e| MyError::AggregateError(e.to_string()))?;
-    ```
-  - Example of **CORRECT** pattern:
-    ```rust
-    // ✅ CORRECT - Preserves all type information
-    #[derive(Debug, thiserror::Error)]
-    pub enum MyError {
-        #[error("CQRS aggregate error: {0}")]
-        Aggregate(#[from] cqrs_es::AggregateError<OtherError>),
-        #[error("Database error: {0}")]
-        Database(#[from] sqlx::Error),
-        #[error("Specific business rule violation")]
-        BusinessRuleViolation {
-            field: String,
-            value: Decimal,
-            #[source]
-            cause: ValidationError,
-        },
-    }
-
-    // With #[from], this works automatically:
-    some_operation()?;  // Auto-converts via From trait
-    ```
   - When adding new error variants:
     1. Only add variants when you encounter actual errors during implementation
     2. Use `#[from]` for error types from external crates
@@ -508,77 +478,6 @@ errors, or masks failures in any way. This includes but is not limited to:
 **ALL financial operations must use explicit error handling with proper error
 propagation. Here are examples of forbidden patterns and their correct
 alternatives:**
-
-#### Numeric Conversions
-
-```rust
-// ❌ CATASTROPHICALLY DANGEROUS - Silent data corruption
-const fn shares_to_db_i64(value: u64) -> i64 {
-    if value > i64::MAX as u64 {
-        i64::MAX  // WRONG: Silently caps at wrong value
-    } else {
-        value as i64
-    }
-}
-
-// ✅ CORRECT - Explicit conversion with proper error handling
-fn shares_to_db_i64(value: u64) -> Result<i64, ConversionError> {
-    value.try_into()
-        .map_err(|_| ConversionError::ValueTooLarge {
-            value,
-            max_allowed: i64::MAX as u64
-        })
-}
-```
-
-#### String Parsing
-
-```rust
-// ❌ DANGEROUS - Hides conversion errors
-fn parse_price(input: &str) -> f64 {
-    input.parse().unwrap_or(0.0)  // WRONG
-}
-
-// ✅ CORRECT - Parse with explicit error
-fn parse_price(input: &str) -> Result<Decimal, ParseError> {
-    Decimal::from_str(input).map_err(|e| ParseError::InvalidPrice { input: input.to_string(), source: e })
-}
-```
-
-#### Precision-Critical Arithmetic
-
-```rust
-// ❌ DANGEROUS - Silent precision loss
-fn convert_to_cents(dollars: f64) -> i64 {
-    (dollars * 100.0) as i64  // WRONG: Truncates
-}
-
-// ✅ CORRECT - Checked arithmetic
-fn convert_to_cents(dollars: Decimal) -> Result<i64, ArithmeticError> {
-    let cents = dollars.checked_mul(Decimal::from(100)).ok_or(ArithmeticError::Overflow)?;
-    if cents.fract() != Decimal::ZERO {
-        return Err(ArithmeticError::FractionalCents { value: cents });
-    }
-    cents.to_i64().ok_or(ArithmeticError::ConversionFailed { value: cents })
-}
-```
-
-#### Database Constraints
-
-```rust
-// ❌ DANGEROUS - Masks constraint violations
-async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
-    let safe = amount.min(Decimal::MAX).max(Decimal::ZERO);  // WRONG
-    sqlx::query!("INSERT INTO trades (amount) VALUES (?)", safe).execute(pool).await?;
-    Ok(())
-}
-
-// ✅ CORRECT - Let constraints fail naturally
-async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
-    sqlx::query!("INSERT INTO trades (amount) VALUES (?)", amount).execute(pool).await?;
-    Ok(())
-}
-```
 
 #### Error Categories That Must Fail Fast
 
@@ -631,15 +530,6 @@ The following files MUST NOT be read without explicit user permission:
 2. **Explain why** you need to read it
 3. **Wait for confirmation** before proceeding
 
-**Example of correct behavior:**
-
-```
-User: "Why isn't the bot connecting to Schwab?"
-Assistant: "I can help debug this. To check the configuration, I would need to
-read your .env file which contains sensitive credentials. May I have permission
-to read it?"
-```
-
 **Alternatives**: Ask user to verify env vars are set, request sanitized output,
 check `.env.example` instead of `.env`, or review code that uses configuration.
 
@@ -653,6 +543,13 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
   conversion logic
 - **Testing Principle**: Only cover happy paths with all components working and
   connected in integration tests and cover everything in unit tests
+- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: Tests
+  exist to verify the system works correctly. If code is broken or incomplete,
+  tests MUST assert the correct expected behavior and FAIL until the code is
+  fixed. NEVER write tests that assert incorrect behavior with comments like
+  "documenting the gap" or "will fix later". A failing test is the correct way
+  to flag broken code - it forces the issue to be addressed. Tests that pass
+  while asserting wrong behavior are worse than no tests at all.
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
@@ -792,6 +689,13 @@ that cannot be expressed through code structure alone.
 - Describing function signatures (use doc comments instead)
 - Adding obvious test setup descriptions
 - Marking code sections that are clear from structure
+- **Referencing internal task tracking or ephemeral context**: NEVER leave
+  comments like `// Task 7: ...`, `// TODO from ticket XYZ`,
+  `// Part of sprint 5 work`, or any reference to task numbers, issue trackers,
+  todo lists, or session context that won't exist for future readers. These
+  comments are meaningless to PR reviewers, future maintainers, and anyone
+  without access to your internal state. If the code needs explanation, explain
+  WHAT it does and WHY - not which task number led to writing it.
 
 #### Good Comment Examples
 
@@ -853,53 +757,8 @@ Organize code within modules by importance and visibility:
 This organization pattern makes the module's public interface clear at a glance
 and keeps implementation details appropriately subordinate.
 
-**Example of good module organization (note that comments are just for
-illustration, in real code we wouldn't leave those):**
-
-```rust
-// Public struct definition
-pub(crate) struct TradeExecution {
-    pub(crate) id: Option<i64>,
-    pub(crate) symbol: Symbol,
-    pub(crate) shares: Shares,
-}
-
-// Implementation block right after type definition
-impl TradeExecution {
-    pub(crate) async fn save(&self, pool: &SqlitePool) -> Result<i64, Error> {
-        // Implementation
-    }
-}
-
-// Public function that uses helper functions
-pub(crate) async fn find_executions_by_status(
-    pool: &SqlitePool,
-    status: OrderStatus,
-) -> Result<Vec<TradeExecution>, Error> {
-    let rows = query_by_status(pool, status.as_str()).await?;
-    rows.into_iter().map(row_to_execution).collect()
-}
-
-// Another public function (standalone)
-pub(crate) async fn find_execution_by_id(
-    pool: &SqlitePool,
-    id: i64,
-) -> Result<Option<TradeExecution>, Error> {
-    // Implementation
-}
-
-// Private helper functions used by find_executions_by_status
-async fn query_by_status(
-    pool: &SqlitePool,
-    status: &str,
-) -> Result<Vec<ExecutionRow>, sqlx::Error> {
-    // SQL query implementation
-}
-
-fn row_to_execution(row: ExecutionRow) -> Result<TradeExecution, Error> {
-    // Conversion logic
-}
-```
+**Example:** Public types first -> impl blocks -> public functions -> private
+helpers.
 
 This pattern applies across the entire workspace, including both the main crate
 and sub-crates like `st0x-execution`.

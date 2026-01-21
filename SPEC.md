@@ -1642,11 +1642,21 @@ orderbook vaults via Circle CCTP bridge.
 
 **Aggregate ID**: Random UUID generated when rebalancing is initiated
 
-**States**:
+**Lifecycle Pattern**: This aggregate uses the `Lifecycle<T, E>` wrapper pattern
+(see `src/lifecycle.rs`). The `Lifecycle` wrapper provides:
+
+- `Uninitialized` - No events applied yet (default state)
+- `Live(UsdcRebalance)` - Normal operational state
+- `Failed { error, last_valid_state }` - Error state for recovery
+
+The inner `UsdcRebalance` enum contains only business states - the
+`Uninitialized` state is provided by the wrapper, not the inner type.
+
+**Supporting Types**:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum RebalancingDirection {
+enum RebalanceDirection {
     AlpacaToBase,
     BaseToAlpaca,
 }
@@ -1659,48 +1669,75 @@ enum TransferRef {
     AlpacaId(AlpacaTransferId),
     OnchainTx(TxHash),
 }
+```
 
+**States** (wrapped by `Lifecycle<UsdcRebalance, Never>`):
+
+```rust
 enum UsdcRebalance {
-    NotStarted,
-    WithdrawalInitiated {
-        direction: RebalancingDirection,
+    // Conversion phase (USD/USDC trading on Alpaca)
+    Converting {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        initiated_at: DateTime<Utc>,
+    },
+    ConversionComplete {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        initiated_at: DateTime<Utc>,
+        converted_at: DateTime<Utc>,
+    },
+    ConversionFailed {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
+
+    // Withdrawal phase
+    Withdrawing {
+        direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
-    WithdrawalConfirmed {
-        direction: RebalancingDirection,
+    WithdrawalComplete {
+        direction: RebalanceDirection,
         amount: Usdc,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     },
     WithdrawalFailed {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         reason: String,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
-    BridgingInitiated {
-        direction: RebalancingDirection,
+
+    // Bridging phase (CCTP cross-chain transfer)
+    Bridging {
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
-        cctp_nonce: u64,
         initiated_at: DateTime<Utc>,
         burned_at: DateTime<Utc>,
     },
-    BridgeAttestationReceived {
-        direction: RebalancingDirection,
+    Attested {
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: u64,
-        attestation: Bytes,
+        attestation: Vec<u8>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
     Bridged {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -1708,7 +1745,7 @@ enum UsdcRebalance {
         minted_at: DateTime<Utc>,
     },
     BridgingFailed {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<u64>,
@@ -1716,8 +1753,10 @@ enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
+
+    // Deposit phase
     DepositInitiated {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -1726,7 +1765,7 @@ enum UsdcRebalance {
         deposit_initiated_at: DateTime<Utc>,
     },
     DepositConfirmed {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -1734,7 +1773,7 @@ enum UsdcRebalance {
         deposit_confirmed_at: DateTime<Utc>,
     },
     DepositFailed {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -1750,35 +1789,36 @@ enum UsdcRebalance {
 
 ```rust
 enum UsdcRebalanceCommand {
+    // Conversion commands (AlpacaToBase: pre-withdrawal, BaseToAlpaca: post-deposit)
+    InitiateConversion {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+    },
+    ConfirmConversion,
+    FailConversion { reason: String },
+    // Post-deposit conversion for BaseToAlpaca direction only
+    InitiatePostDepositConversion { order_id: Uuid },
+
+    // Withdrawal commands
     Initiate {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         withdrawal: TransferRef,
     },
     ConfirmWithdrawal,
-    InitiateBridging {
-        burn_tx: TxHash,
-        cctp_nonce: u64,
-    },
-    ReceiveAttestation {
-        attestation: Bytes,
-    },
-    ConfirmBridging {
-        mint_tx: TxHash,
-    },
-    InitiateDeposit {
-        deposit: TransferRef,
-    },
+    FailWithdrawal { reason: String },
+
+    // Bridging commands
+    InitiateBridging { burn_tx: TxHash },
+    ReceiveAttestation { attestation: Vec<u8>, cctp_nonce: u64 },
+    ConfirmBridging { mint_tx: TxHash },
+    FailBridging { reason: String },
+
+    // Deposit commands
+    InitiateDeposit { deposit: TransferRef },
     ConfirmDeposit,
-    FailWithdrawal {
-        reason: String,
-    },
-    FailBridging {
-        reason: String,
-    },
-    FailDeposit {
-        reason: String,
-    },
+    FailDeposit { reason: String },
 }
 ```
 
@@ -1786,26 +1826,33 @@ enum UsdcRebalanceCommand {
 
 ```rust
 enum UsdcRebalanceEvent {
+    // Conversion events
+    ConversionInitiated {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        initiated_at: DateTime<Utc>,
+    },
+    // direction: Required for incremental dispatch terminal detection
+    // (cqrs-es Query::dispatch only receives newly committed events)
+    ConversionConfirmed { direction: RebalanceDirection, converted_at: DateTime<Utc> },
+    ConversionFailed { reason: String, failed_at: DateTime<Utc> },
+
+    // Withdrawal events
     Initiated {
-        direction: RebalancingDirection,
+        direction: RebalanceDirection,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
     },
-    WithdrawalConfirmed {
-        confirmed_at: DateTime<Utc>,
-    },
-    WithdrawalFailed {
-        reason: String,
-        failed_at: DateTime<Utc>,
-    },
-    BridgingInitiated {
-        burn_tx_hash: TxHash,
-        cctp_nonce: u64,
-        burned_at: DateTime<Utc>,
-    },
+    WithdrawalConfirmed { confirmed_at: DateTime<Utc> },
+    WithdrawalFailed { reason: String, failed_at: DateTime<Utc> },
+
+    // Bridging events (cctp_nonce comes from attestation, not burn tx)
+    BridgingInitiated { burn_tx_hash: TxHash, burned_at: DateTime<Utc> },
     BridgeAttestationReceived {
-        attestation: Bytes,
+        attestation: Vec<u8>,
+        cctp_nonce: u64,
         attested_at: DateTime<Utc>,
     },
     Bridged {
@@ -1837,6 +1884,24 @@ enum UsdcRebalanceEvent {
 
 - Direction determines source and destination (AlpacaToBase: Ethereum mainnet ->
   Base, BaseToAlpaca: Base -> Ethereum mainnet)
+- **USDC/USD Conversion**:
+  - AlpacaToBase requires USD-to-USDC conversion BEFORE withdrawal (trading uses
+    USD buying power, but CCTP bridge operates on USDC in Alpaca's crypto
+    wallet)
+  - BaseToAlpaca requires USDC-to-USD conversion AFTER deposit (USDC arrives in
+    crypto wallet, must convert to USD buying power for trading)
+  - Conversion uses USDC/USD crypto trading pair on Alpaca (market orders)
+  - Crypto trading is available 24/7 on Alpaca (no market hours restrictions)
+  - Market orders are near-instant but NOT guaranteed to fill immediately
+  - Slippage: ~17bps observed in live tests (reduces effective USD received)
+  - Partial fills: The system polls until the order is fully filled. Market
+    orders for USDC/USD are expected to fill completely due to high liquidity.
+    If an order enters a terminal failed state before full fill, the conversion
+    fails and requires manual intervention.
+  - Minimum withdrawal threshold ($51) accounts for slippage to ensure $50
+    minimum is met after conversion
+  - ConversionFailed is a terminal state (requires manual intervention)
+  - ConversionComplete is terminal for BaseToAlpaca direction
 - Alpaca withdrawals/deposits are asynchronous: initiate with API call (get
   transfer_id), poll status until COMPLETE
 - Onchain transactions are asynchronous: submit tx (get tx_hash), wait for block
@@ -1848,7 +1913,8 @@ enum UsdcRebalanceEvent {
   no websocket option available)
 - Bridge mint transaction requires valid attestation
 - Bridge mint transaction must be confirmed before destination deposit
-- Destination deposit must be confirmed to complete rebalancing
+- Destination deposit must be confirmed to complete rebalancing (for
+  AlpacaToBase) or before post-deposit conversion (for BaseToAlpaca)
 - Can mark failed from any non-terminal state
 - Each rebalancing has unique UUID allowing multiple parallel operations
 
@@ -1866,18 +1932,20 @@ enum UsdcRebalanceEvent {
 
 Alpaca to Base:
 
-1. Initiate USDC withdrawal from Alpaca (get transfer_id)
-2. Poll Alpaca API until withdrawal status is COMPLETE
-3. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
-4. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
+1. **Convert USD to USDC**: Place market sell order on USDC/USD pair (buy USDC)
+2. Poll Alpaca until conversion order is filled
+3. Initiate USDC withdrawal from Alpaca (get transfer_id)
+4. Poll Alpaca API until withdrawal status is COMPLETE
+5. Query Circle's `/v2/burn/USDC/fees` API for current fast transfer fee
+6. Submit depositForBurn() tx on Ethereum TokenMessenger (domain 0 -> domain 6)
    with minFinalityThreshold=1000 and calculated maxFee for fast transfer
-5. Wait for burn tx confirmation and extract CCTP nonce from event logs
-6. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
+7. Wait for burn tx confirmation and extract CCTP nonce from event logs
+8. Poll Circle attestation service for signature using CCTP nonce (~20 seconds
    for fast transfer)
-7. Submit receiveMessage() tx on Base MessageTransmitter with attestation
-8. Wait for mint tx confirmation (~8 seconds on Base)
-9. Submit deposit tx to Rain orderbook vault on Base
-10. Wait for deposit tx confirmation
+9. Submit receiveMessage() tx on Base MessageTransmitter with attestation
+10. Wait for mint tx confirmation (~8 seconds on Base)
+11. Submit deposit tx to Rain orderbook vault on Base
+12. Wait for deposit tx confirmation
 
 Base to Alpaca:
 
@@ -1893,6 +1961,9 @@ Base to Alpaca:
 8. Wait for mint tx confirmation (~20 seconds on Ethereum)
 9. Initiate USDC deposit to Alpaca (get transfer_id)
 10. Poll Alpaca API until deposit status is COMPLETE
+11. **Convert USDC to USD**: Place market sell order on USDC/USD pair (sell
+    USDC)
+12. Poll Alpaca until conversion order is filled
 
 **Fast Transfer Benefits**:
 

@@ -68,6 +68,7 @@ use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
+use uuid::Uuid;
 
 use crate::alpaca_wallet::AlpacaTransferId;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
@@ -107,6 +108,21 @@ pub(crate) enum UsdcRebalanceError {
     /// Attempted to initiate when already in progress
     #[error("Rebalancing has already been initiated")]
     AlreadyInitiated,
+    /// Conversion has not been initiated yet
+    #[error("Conversion has not been initiated")]
+    ConversionNotInitiated,
+    /// Conversion has already completed or failed
+    #[error("Conversion has already completed")]
+    ConversionAlreadyCompleted,
+    /// Deposit has not been confirmed yet (required for post-deposit conversion)
+    #[error("Deposit has not been confirmed yet")]
+    DepositNotConfirmed,
+    /// Wrong direction for post-deposit conversion
+    #[error("Post-deposit conversion is only valid for BaseToAlpaca direction")]
+    WrongDirectionForPostDepositConversion,
+    /// Conversion amount doesn't match aggregate deposit amount
+    #[error("Conversion amount mismatch: aggregate has {expected}, command provided {provided}")]
+    ConversionAmountMismatch { expected: Usdc, provided: Usdc },
     /// Withdrawal has not been initiated yet
     #[error("Withdrawal has not been initiated")]
     WithdrawalNotInitiated,
@@ -143,9 +159,33 @@ pub(crate) enum UsdcRebalanceError {
 ///
 /// Commands are validated against the current state before being processed.
 /// Invalid commands return appropriate errors without mutating state.
+///
+/// # Conversion Commands
+///
+/// There are two conversion commands because conversion happens at different points in each flow:
+/// - **AlpacaToBase**: Convert USD→USDC BEFORE withdrawal (need USDC for CCTP bridge)
+/// - **BaseToAlpaca**: Convert USDC→USD AFTER deposit (USDC arrives in crypto wallet)
 #[derive(Debug, Clone)]
 pub(crate) enum UsdcRebalanceCommand {
-    /// Start a new rebalancing operation. Valid only from `Uninitialized` state.
+    /// Start pre-withdrawal conversion for AlpacaToBase direction.
+    /// Converts USD buying power to USDC before withdrawal to Alpaca's crypto wallet.
+    /// Valid only from `Uninitialized` state.
+    InitiateConversion {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+    },
+    /// Confirm successful conversion. Valid only from `Converting` state.
+    ConfirmConversion,
+    /// Record conversion failure. Valid only from `Converting` state.
+    FailConversion { reason: String },
+    /// Start post-deposit conversion for BaseToAlpaca direction.
+    /// Converts USDC (deposited via CCTP) to USD buying power for trading.
+    /// Valid only from `DepositConfirmed` state.
+    /// Amount must match the aggregate's deposit amount for consistency.
+    InitiatePostDepositConversion { order_id: Uuid, amount: Usdc },
+    /// Start a new rebalancing operation. Valid only from `Uninitialized` state or
+    /// `ConversionComplete` state (for AlpacaToBase direction).
     Initiate {
         direction: RebalanceDirection,
         amount: Usdc,
@@ -181,6 +221,25 @@ pub(crate) enum UsdcRebalanceCommand {
 /// Each event carries only the data relevant to that state transition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum UsdcRebalanceEvent {
+    /// Conversion operation started (USD<->USDC). Records direction, amount, and order ID.
+    ConversionInitiated {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        initiated_at: DateTime<Utc>,
+    },
+    /// Conversion completed successfully.
+    /// Includes direction so terminal detection works with incremental dispatch
+    /// (cqrs-es Query::dispatch only receives newly committed events, not full history).
+    ConversionConfirmed {
+        direction: RebalanceDirection,
+        converted_at: DateTime<Utc>,
+    },
+    /// Conversion failed.
+    ConversionFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
     /// Rebalancing operation started. Records direction, amount, and withdrawal reference.
     Initiated {
         direction: RebalanceDirection,
@@ -224,8 +283,12 @@ pub(crate) enum UsdcRebalanceEvent {
         deposit_ref: TransferRef,
         deposit_initiated_at: DateTime<Utc>,
     },
-    /// Deposit completed successfully. Terminal success state.
-    DepositConfirmed { deposit_confirmed_at: DateTime<Utc> },
+    /// Deposit completed successfully. Terminal success state for AlpacaToBase.
+    /// For BaseToAlpaca, post-deposit conversion (USDC->USD) still required.
+    DepositConfirmed {
+        direction: RebalanceDirection,
+        deposit_confirmed_at: DateTime<Utc>,
+    },
     /// Deposit failed. Preserves deposit reference when available.
     DepositFailed {
         deposit_ref: Option<TransferRef>,
@@ -237,6 +300,9 @@ pub(crate) enum UsdcRebalanceEvent {
 impl DomainEvent for UsdcRebalanceEvent {
     fn event_type(&self) -> String {
         match self {
+            Self::ConversionInitiated { .. } => "UsdcRebalanceEvent::ConversionInitiated",
+            Self::ConversionConfirmed { .. } => "UsdcRebalanceEvent::ConversionConfirmed",
+            Self::ConversionFailed { .. } => "UsdcRebalanceEvent::ConversionFailed",
             Self::Initiated { .. } => "UsdcRebalanceEvent::Initiated",
             Self::WithdrawalConfirmed { .. } => "UsdcRebalanceEvent::WithdrawalConfirmed",
             Self::WithdrawalFailed { .. } => "UsdcRebalanceEvent::WithdrawalFailed",
@@ -264,6 +330,29 @@ impl DomainEvent for UsdcRebalanceEvent {
 /// Each variant contains exactly the data valid for that state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum UsdcRebalance {
+    /// USD/USDC conversion has been initiated (AlpacaToBase: USD->USDC, BaseToAlpaca: USDC->USD)
+    Converting {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        initiated_at: DateTime<Utc>,
+    },
+    /// Conversion has completed, ready for next phase
+    ConversionComplete {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        initiated_at: DateTime<Utc>,
+        converted_at: DateTime<Utc>,
+    },
+    /// Conversion has failed (terminal state)
+    ConversionFailed {
+        direction: RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        reason: String,
+        initiated_at: DateTime<Utc>,
+        failed_at: DateTime<Utc>,
+    },
     /// Withdrawal from source has been initiated
     Withdrawing {
         direction: RebalanceDirection,
@@ -381,6 +470,20 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match &command {
+            UsdcRebalanceCommand::InitiateConversion {
+                direction,
+                amount,
+                order_id,
+            } => self.handle_initiate_conversion(direction, *amount, *order_id),
+
+            UsdcRebalanceCommand::ConfirmConversion => self.handle_confirm_conversion(),
+
+            UsdcRebalanceCommand::FailConversion { reason } => self.handle_fail_conversion(reason),
+
+            UsdcRebalanceCommand::InitiatePostDepositConversion { order_id, amount } => {
+                self.handle_initiate_post_deposit_conversion(*order_id, *amount)
+            }
+
             UsdcRebalanceCommand::Initiate {
                 direction,
                 amount,
@@ -418,6 +521,93 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
 }
 
 impl Lifecycle<UsdcRebalance, Never> {
+    fn handle_initiate_conversion(
+        &self,
+        direction: &RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized) => {
+                Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
+                    direction: direction.clone(),
+                    amount,
+                    order_id,
+                    initiated_at: Utc::now(),
+                }])
+            }
+            Ok(_) => Err(UsdcRebalanceError::AlreadyInitiated),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_confirm_conversion(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Ok(UsdcRebalance::Converting { direction, .. }) => {
+                Ok(vec![UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: direction.clone(),
+                    converted_at: Utc::now(),
+                }])
+            }
+            Ok(
+                UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
+            ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
+        }
+    }
+
+    fn handle_fail_conversion(
+        &self,
+        reason: &str,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Ok(UsdcRebalance::Converting { .. }) => {
+                Ok(vec![UsdcRebalanceEvent::ConversionFailed {
+                    reason: reason.to_string(),
+                    failed_at: Utc::now(),
+                }])
+            }
+            Ok(
+                UsdcRebalance::ConversionComplete { .. } | UsdcRebalance::ConversionFailed { .. },
+            ) => Err(UsdcRebalanceError::ConversionAlreadyCompleted),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::ConversionNotInitiated),
+        }
+    }
+
+    fn handle_initiate_post_deposit_conversion(
+        &self,
+        order_id: Uuid,
+        command_amount: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self.live() {
+            Ok(UsdcRebalance::DepositConfirmed {
+                direction, amount, ..
+            }) => {
+                if *direction != RebalanceDirection::BaseToAlpaca {
+                    return Err(UsdcRebalanceError::WrongDirectionForPostDepositConversion);
+                }
+
+                if command_amount != *amount {
+                    return Err(UsdcRebalanceError::ConversionAmountMismatch {
+                        expected: *amount,
+                        provided: command_amount,
+                    });
+                }
+
+                Ok(vec![UsdcRebalanceEvent::ConversionInitiated {
+                    direction: direction.clone(),
+                    amount: *amount,
+                    order_id,
+                    initiated_at: Utc::now(),
+                }])
+            }
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::DepositNotConfirmed),
+        }
+    }
+
     fn handle_initiate(
         &self,
         direction: &RebalanceDirection,
@@ -431,6 +621,35 @@ impl Lifecycle<UsdcRebalance, Never> {
                 withdrawal_ref: withdrawal.clone(),
                 initiated_at: Utc::now(),
             }]),
+            Ok(UsdcRebalance::ConversionComplete {
+                direction: conv_direction,
+                amount: conv_amount,
+                ..
+            }) => {
+                if direction != conv_direction {
+                    return Err(UsdcRebalanceError::InvalidCommand {
+                        command: "Initiate".to_string(),
+                        state: "ConversionComplete with different direction".to_string(),
+                    });
+                }
+
+                if amount != *conv_amount {
+                    return Err(UsdcRebalanceError::InvalidCommand {
+                        command: "Initiate".to_string(),
+                        state: format!(
+                            "ConversionComplete with amount mismatch: expected {}, got {}",
+                            conv_amount.0, amount.0
+                        ),
+                    });
+                }
+
+                Ok(vec![UsdcRebalanceEvent::Initiated {
+                    direction: direction.clone(),
+                    amount: *conv_amount,
+                    withdrawal_ref: withdrawal.clone(),
+                    initiated_at: Utc::now(),
+                }])
+            }
             Ok(_) => Err(UsdcRebalanceError::AlreadyInitiated),
             Err(e) => Err(e.into()),
         }
@@ -438,7 +657,6 @@ impl Lifecycle<UsdcRebalance, Never> {
 
     fn handle_confirm_withdrawal(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             Ok(UsdcRebalance::Withdrawing { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::WithdrawalConfirmed {
                     confirmed_at: Utc::now(),
@@ -455,7 +673,8 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::DepositConfirmed { .. }
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
 
@@ -464,7 +683,6 @@ impl Lifecycle<UsdcRebalance, Never> {
         reason: &str,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(UsdcRebalanceError::WithdrawalNotInitiated),
             Ok(UsdcRebalance::Withdrawing { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::WithdrawalFailed {
                     reason: reason.to_string(),
@@ -482,7 +700,8 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::DepositConfirmed { .. }
                 | UsdcRebalance::DepositFailed { .. },
             ) => Err(UsdcRebalanceError::WithdrawalAlreadyCompleted),
-            Err(e) => Err(e.into()),
+            Err(e) if !matches!(e, LifecycleError::Uninitialized) => Err(e.into()),
+            _ => Err(UsdcRebalanceError::WithdrawalNotInitiated),
         }
     }
 
@@ -492,9 +711,13 @@ impl Lifecycle<UsdcRebalance, Never> {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
-            | Ok(UsdcRebalance::Withdrawing { .. } | UsdcRebalance::WithdrawalFailed { .. }) => {
-                Err(UsdcRebalanceError::WithdrawalNotConfirmed)
-            }
+            | Ok(
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
+                | UsdcRebalance::WithdrawalFailed { .. },
+            ) => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
 
             Ok(UsdcRebalance::WithdrawalComplete { .. }) => {
                 Ok(vec![UsdcRebalanceEvent::BridgingInitiated {
@@ -528,7 +751,10 @@ impl Lifecycle<UsdcRebalance, Never> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(
-                UsdcRebalance::Withdrawing { .. }
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
                 | UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingNotInitiated),
@@ -565,7 +791,10 @@ impl Lifecycle<UsdcRebalance, Never> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(
-                UsdcRebalance::Withdrawing { .. }
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
                 | UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
                 | UsdcRebalance::Bridging { .. },
@@ -595,7 +824,10 @@ impl Lifecycle<UsdcRebalance, Never> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(
-                UsdcRebalance::Withdrawing { .. }
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
                 | UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. },
             ) => Err(UsdcRebalanceError::BridgingNotInitiated),
@@ -639,7 +871,10 @@ impl Lifecycle<UsdcRebalance, Never> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(
-                UsdcRebalance::Withdrawing { .. }
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
                 | UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
                 | UsdcRebalance::Bridging { .. }
@@ -669,7 +904,10 @@ impl Lifecycle<UsdcRebalance, Never> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(
-                UsdcRebalance::Withdrawing { .. }
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
                 | UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
                 | UsdcRebalance::Bridging { .. }
@@ -678,8 +916,9 @@ impl Lifecycle<UsdcRebalance, Never> {
                 | UsdcRebalance::Bridged { .. },
             ) => Err(UsdcRebalanceError::DepositNotInitiated),
 
-            Ok(UsdcRebalance::DepositInitiated { .. }) => {
+            Ok(UsdcRebalance::DepositInitiated { direction, .. }) => {
                 Ok(vec![UsdcRebalanceEvent::DepositConfirmed {
+                    direction: direction.clone(),
                     deposit_confirmed_at: Utc::now(),
                 }])
             }
@@ -702,7 +941,10 @@ impl Lifecycle<UsdcRebalance, Never> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(
-                UsdcRebalance::Withdrawing { .. }
+                UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::Withdrawing { .. }
                 | UsdcRebalance::WithdrawalComplete { .. }
                 | UsdcRebalance::WithdrawalFailed { .. }
                 | UsdcRebalance::Bridging { .. }
@@ -738,6 +980,17 @@ impl UsdcRebalance {
         current: &Self,
     ) -> Result<Self, LifecycleError<Never>> {
         match event {
+            UsdcRebalanceEvent::ConversionConfirmed { converted_at, .. } => {
+                current.apply_conversion_confirmed(*converted_at)
+            }
+            UsdcRebalanceEvent::ConversionFailed { reason, failed_at } => {
+                current.apply_conversion_failed(reason, *failed_at)
+            }
+            UsdcRebalanceEvent::Initiated {
+                withdrawal_ref,
+                initiated_at,
+                ..
+            } => current.apply_initiated(withdrawal_ref, *initiated_at),
             UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at } => {
                 current.apply_withdrawal_confirmed(*confirmed_at)
             }
@@ -768,18 +1021,119 @@ impl UsdcRebalance {
                 deposit_initiated_at,
             } => current.apply_deposit_initiated(deposit_ref, *deposit_initiated_at),
             UsdcRebalanceEvent::DepositConfirmed {
+                direction,
                 deposit_confirmed_at,
-            } => current.apply_deposit_confirmed(*deposit_confirmed_at),
+            } => current.apply_deposit_confirmed(direction, *deposit_confirmed_at),
             UsdcRebalanceEvent::DepositFailed {
                 deposit_ref,
                 reason,
                 failed_at,
             } => current.apply_deposit_failed(deposit_ref.as_ref(), reason, *failed_at),
-            UsdcRebalanceEvent::Initiated { .. } => Err(LifecycleError::Mismatch {
-                state: format!("{current:?}"),
-                event: event.event_type(),
-            }),
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction,
+                amount,
+                order_id,
+                initiated_at,
+            } => current.apply_conversion_initiated(direction, *amount, *order_id, *initiated_at),
         }
+    }
+
+    fn apply_conversion_initiated(
+        &self,
+        direction: &RebalanceDirection,
+        amount: Usdc,
+        order_id: Uuid,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::DepositConfirmed { .. } = self else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: "ConversionInitiated".to_string(),
+            });
+        };
+
+        Ok(Self::Converting {
+            direction: direction.clone(),
+            amount,
+            order_id,
+            initiated_at,
+        })
+    }
+
+    fn apply_conversion_confirmed(
+        &self,
+        converted_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Converting {
+            direction,
+            amount,
+            initiated_at,
+            ..
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: "ConversionConfirmed".to_string(),
+            });
+        };
+
+        Ok(Self::ConversionComplete {
+            direction: direction.clone(),
+            amount: *amount,
+            initiated_at: *initiated_at,
+            converted_at,
+        })
+    }
+
+    fn apply_conversion_failed(
+        &self,
+        reason: &str,
+        failed_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::Converting {
+            direction,
+            amount,
+            order_id,
+            initiated_at,
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: "ConversionFailed".to_string(),
+            });
+        };
+
+        Ok(Self::ConversionFailed {
+            direction: direction.clone(),
+            amount: *amount,
+            order_id: *order_id,
+            reason: reason.to_string(),
+            initiated_at: *initiated_at,
+            failed_at,
+        })
+    }
+
+    fn apply_initiated(
+        &self,
+        withdrawal_ref: &TransferRef,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::ConversionComplete {
+            direction, amount, ..
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: "Initiated".to_string(),
+            });
+        };
+
+        Ok(Self::Withdrawing {
+            direction: direction.clone(),
+            amount: *amount,
+            withdrawal_ref: withdrawal_ref.clone(),
+            initiated_at,
+        })
     }
 
     fn apply_withdrawal_confirmed(
@@ -992,6 +1346,7 @@ impl UsdcRebalance {
 
     fn apply_deposit_confirmed(
         &self,
+        event_direction: &RebalanceDirection,
         deposit_confirmed_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::DepositInitiated {
@@ -1008,6 +1363,11 @@ impl UsdcRebalance {
                 event: "DepositConfirmed".to_string(),
             });
         };
+
+        debug_assert_eq!(
+            direction, event_direction,
+            "Event direction must match state direction"
+        );
 
         Ok(Self::DepositConfirmed {
             direction: direction.clone(),
@@ -1055,6 +1415,18 @@ impl UsdcRebalance {
     /// Create initial state from an initialization event.
     pub(crate) fn from_event(event: &UsdcRebalanceEvent) -> Result<Self, LifecycleError<Never>> {
         match event {
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction,
+                amount,
+                order_id,
+                initiated_at,
+            } => Ok(Self::Converting {
+                direction: direction.clone(),
+                amount: *amount,
+                order_id: *order_id,
+                initiated_at: *initiated_at,
+            }),
+
             UsdcRebalanceEvent::Initiated {
                 direction,
                 amount,
@@ -3630,6 +4002,7 @@ mod tests {
             deposit_initiated_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
             deposit_confirmed_at: Utc::now(),
         });
 
@@ -3650,5 +4023,778 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn test_initiate_conversion_from_uninitialized() {
+        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    order_id,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::ConversionInitiated {
+            direction,
+            amount,
+            order_id: event_order_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected ConversionInitiated event");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*event_order_id, order_id);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_conversion_twice() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(500.00)),
+                    order_id: Uuid::new_v4(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::AlreadyInitiated
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_confirm_conversion_from_converting_state() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at,
+        });
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            UsdcRebalanceEvent::ConversionConfirmed { .. }
+        ));
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let Lifecycle::Live(UsdcRebalance::ConversionComplete {
+            direction,
+            amount,
+            initiated_at: state_initiated_at,
+            ..
+        }) = aggregate
+        else {
+            panic!("Expected ConversionComplete state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(state_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_confirm_conversion_before_initiating() {
+        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        let result = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::ConversionNotInitiated
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_confirm_conversion_twice() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            converted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::ConversionAlreadyCompleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fail_conversion_from_converting_state() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let initiated_at = Utc::now();
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at,
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "Order rejected".to_string(),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::ConversionFailed { reason, .. } = &events[0] else {
+            panic!("Expected ConversionFailed event");
+        };
+        assert_eq!(reason, "Order rejected");
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let Lifecycle::Live(UsdcRebalance::ConversionFailed {
+            direction,
+            amount,
+            order_id: state_order_id,
+            reason: state_reason,
+            initiated_at: state_initiated_at,
+            ..
+        }) = aggregate
+        else {
+            panic!("Expected ConversionFailed state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(state_order_id, order_id);
+        assert_eq!(state_reason, "Order rejected");
+        assert_eq!(state_initiated_at, initiated_at);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_conversion_before_initiating() {
+        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "Test failure".to_string(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::ConversionNotInitiated
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_already_completed_conversion() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            converted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "Late failure".to_string(),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::ConversionAlreadyCompleted
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_initiate_withdrawal_after_conversion_complete() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            converted_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(1000.00)),
+                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], UsdcRebalanceEvent::Initiated { .. }));
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let Lifecycle::Live(UsdcRebalance::Withdrawing {
+            direction,
+            amount,
+            withdrawal_ref,
+            ..
+        }) = aggregate
+        else {
+            panic!("Expected Withdrawing state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
+    }
+
+    #[tokio::test]
+    async fn test_initiate_with_mismatched_amount_from_conversion_complete_fails() {
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            converted_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc(dec!(999.00)), // Different amount than conversion
+                    withdrawal: TransferRef::AlpacaId(transfer_id),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(UsdcRebalanceError::InvalidCommand { command, state })
+                    if command == "Initiate" && state.contains("amount mismatch")
+            ),
+            "Expected InvalidCommand error with amount mismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_view_tracks_conversion_initiation() {
+        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let initiated_at = Utc::now();
+
+        let event = UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        assert!(matches!(view, Lifecycle::Uninitialized));
+
+        view.update(&envelope);
+
+        let Lifecycle::Live(UsdcRebalance::Converting {
+            direction,
+            amount,
+            order_id: view_order_id,
+            initiated_at: view_initiated_at,
+        }) = view
+        else {
+            panic!("Expected Live(Converting) variant");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(view_order_id, order_id);
+        assert_eq!(view_initiated_at, initiated_at);
+    }
+
+    #[test]
+    fn test_view_tracks_conversion_confirmation() {
+        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let initiated_at = Utc::now();
+        let converted_at = Utc::now();
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 1,
+            payload: UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id,
+                initiated_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 2,
+            payload: UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                converted_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        let Lifecycle::Live(UsdcRebalance::ConversionComplete {
+            direction,
+            amount,
+            initiated_at: view_initiated_at,
+            converted_at: view_converted_at,
+        }) = view
+        else {
+            panic!("Expected ConversionComplete state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(view_initiated_at, initiated_at);
+        assert_eq!(view_converted_at, converted_at);
+    }
+
+    #[test]
+    fn test_view_tracks_conversion_failure() {
+        let mut view = Lifecycle::<UsdcRebalance, Never>::default();
+        let order_id = Uuid::new_v4();
+        let initiated_at = Utc::now();
+        let failed_at = Utc::now();
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 1,
+            payload: UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc(dec!(1000.00)),
+                order_id,
+                initiated_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        view.update(&EventEnvelope {
+            aggregate_id: "rebalance-123".to_string(),
+            sequence: 2,
+            payload: UsdcRebalanceEvent::ConversionFailed {
+                reason: "Order canceled".to_string(),
+                failed_at,
+            },
+            metadata: HashMap::new(),
+        });
+
+        let Lifecycle::Live(UsdcRebalance::ConversionFailed {
+            direction,
+            amount,
+            order_id: view_order_id,
+            reason,
+            initiated_at: view_initiated_at,
+            failed_at: view_failed_at,
+        }) = view
+        else {
+            panic!("Expected ConversionFailed state");
+        };
+
+        assert_eq!(direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(view_order_id, order_id);
+        assert_eq!(reason, "Order canceled");
+        assert_eq!(view_initiated_at, initiated_at);
+        assert_eq!(view_failed_at, failed_at);
+    }
+
+    #[tokio::test]
+    async fn test_initiate_post_deposit_conversion_from_deposit_confirmed() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let order_id = Uuid::new_v4();
+
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+            initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            burned_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            cctp_nonce: 12345,
+            attested_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            deposit_initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            deposit_confirmed_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id,
+                    amount: Usdc(dec!(1000.00)),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let UsdcRebalanceEvent::ConversionInitiated {
+            direction,
+            amount,
+            order_id: event_order_id,
+            ..
+        } = &events[0]
+        else {
+            panic!("Expected ConversionInitiated event");
+        };
+
+        assert_eq!(*direction, RebalanceDirection::BaseToAlpaca);
+        assert_eq!(*amount, Usdc(dec!(1000.00)));
+        assert_eq!(*event_order_id, order_id);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_post_deposit_conversion_for_alpaca_to_base() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            burned_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            cctp_nonce: 12345,
+            attested_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::OnchainTx(mint_tx),
+            deposit_initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            deposit_confirmed_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: Uuid::new_v4(),
+                    amount: Usdc(dec!(1000.00)),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::WrongDirectionForPostDepositConversion
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_initiate_post_deposit_conversion_before_deposit_confirmed() {
+        let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: Uuid::new_v4(),
+                    amount: Usdc(dec!(1000.00)),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceError::DepositNotConfirmed
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_initiate_post_deposit_conversion_rejects_mismatched_amount() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+            initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            burned_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            cctp_nonce: 12345,
+            attested_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            deposit_initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            deposit_confirmed_at: Utc::now(),
+        });
+
+        let result = aggregate
+            .handle(
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: Uuid::new_v4(),
+                    amount: Usdc(dec!(500.00)),
+                },
+                &(),
+            )
+            .await;
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                UsdcRebalanceError::ConversionAmountMismatch { expected, provided }
+                    if *expected == Usdc(dec!(1000.00)) && *provided == Usdc(dec!(500.00))
+            ),
+            "Expected ConversionAmountMismatch with expected=1000 and provided=500, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_base_to_alpaca_flow_with_post_deposit_conversion() {
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+        let order_id = Uuid::new_v4();
+
+        let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
+
+        aggregate.apply(UsdcRebalanceEvent::Initiated {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::OnchainTx(burn_tx),
+            initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::WithdrawalConfirmed {
+            confirmed_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: burn_tx,
+            burned_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::BridgeAttestationReceived {
+            attestation: vec![0x01],
+            cctp_nonce: 12345,
+            attested_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: mint_tx,
+            minted_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
+            deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            deposit_initiated_at: Utc::now(),
+        });
+        aggregate.apply(UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            deposit_confirmed_at: Utc::now(),
+        });
+
+        aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc(dec!(1000.00)),
+            order_id,
+            initiated_at: Utc::now(),
+        });
+
+        let events = aggregate
+            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            UsdcRebalanceEvent::ConversionConfirmed { .. }
+        ));
+
+        aggregate.apply(events.into_iter().next().unwrap());
+
+        let Lifecycle::Live(UsdcRebalance::ConversionComplete { direction, .. }) = aggregate else {
+            panic!("Expected ConversionComplete state");
+        };
+        assert_eq!(direction, RebalanceDirection::BaseToAlpaca);
+    }
+
+    #[test]
+    fn test_from_event_rejects_conversion_confirmed_as_init() {
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            converted_at: Utc::now(),
+        };
+
+        let result = UsdcRebalance::from_event(&event);
+
+        assert!(matches!(result, Err(LifecycleError::Mismatch { .. })));
+    }
+
+    #[test]
+    fn test_apply_transition_rejects_conversion_initiated_from_non_deposit_confirmed() {
+        let current = UsdcRebalance::Withdrawing {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        };
+
+        let event = UsdcRebalanceEvent::ConversionInitiated {
+            direction: RebalanceDirection::AlpacaToBase,
+            amount: Usdc(dec!(1000.00)),
+            order_id: Uuid::new_v4(),
+            initiated_at: Utc::now(),
+        };
+
+        let result = UsdcRebalance::apply_transition(&event, &current);
+
+        assert!(matches!(result, Err(LifecycleError::Mismatch { .. })));
     }
 }
