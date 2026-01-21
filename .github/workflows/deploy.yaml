@@ -68,7 +68,7 @@ jobs:
 
       - name: Setup database for sqlx
         env:
-          DATABASE_URL: sqlite:schwab.db
+          DATABASE_URL: sqlite:liquidity.db
         run: |
           nix develop -c sqlx db create
           nix develop -c sqlx migrate run
@@ -79,9 +79,10 @@ jobs:
           bash .github/workflows/generate-env.sh schwab > .env.schwab
           set -a; source .env.schwab; set +a
           # Set container-specific vars (from docker-compose)
+          # DATABASE_URL must point to the file created in setup step for sqlx compile-time checking
           export EXECUTOR=schwab
           export REBALANCING_ENABLED=false
-          export DATABASE_URL=":memory:"
+          export DATABASE_URL="sqlite:liquidity.db"
           nix develop -c cargo run -q --bin validate_config
 
       - name: Validate Alpaca container config
@@ -91,7 +92,7 @@ jobs:
           export EXECUTOR=alpaca-broker-api
           export ALPACA_BROKER_API_MODE=production
           export REBALANCING_ENABLED=true
-          export DATABASE_URL=":memory:"
+          export DATABASE_URL="sqlite:liquidity.db"
           nix develop -c cargo run -q --bin validate_config
 
   deploy:
