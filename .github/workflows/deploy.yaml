@@ -19,8 +19,6 @@ env:
   WS_RPC_URL: ${{ secrets.WS_RPC_URL }}
   SCHWAB_APP_KEY: ${{ secrets.APP_KEY }}
   SCHWAB_APP_SECRET: ${{ secrets.APP_SECRET }}
-  ALPACA_API_KEY: ${{ secrets.ALPACA_KEY }}
-  ALPACA_API_SECRET: ${{ secrets.ALPACA_SECRET }}
   ALPACA_BROKER_API_KEY: ${{ secrets.ALPACA_BROKER_API_KEY }}
   ALPACA_BROKER_API_SECRET: ${{ secrets.ALPACA_BROKER_API_SECRET }}
   ALPACA_ACCOUNT_ID: ${{ secrets.ALPACA_ACCOUNT_ID }}
@@ -28,6 +26,11 @@ env:
   HYPERDX_API_KEY: ${{ secrets.HYPERDX_API_KEY }}
   GRAFANA_ADMIN_PASSWORD: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
   DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+  # Rebalancing configuration (for Alpaca Broker API)
+  REDEMPTION_WALLET: ${{ secrets.REDEMPTION_WALLET }}
+  ETHEREUM_RPC_URL: ${{ secrets.ETHEREUM_RPC_URL }}
+  EVM_PRIVATE_KEY: ${{ secrets.EVM_PRIVATE_KEY }}
+  USDC_VAULT_ID: ${{ secrets.USDC_VAULT_ID }}
 
 jobs:
   validate:
@@ -65,16 +68,32 @@ jobs:
 
       - name: Setup database for sqlx
         env:
-          DATABASE_URL: sqlite:schwab.db
+          DATABASE_URL: sqlite:liquidity.db
         run: |
           nix develop -c sqlx db create
           nix develop -c sqlx migrate run
 
-      - name: Validate deployment config
-        env:
-          EXECUTOR: dry-run
-          DATABASE_URL: sqlite:schwab.db
-        run: nix develop -c cargo run -q --bin validate_config
+      - name: Validate Schwab container config
+        run: |
+          # Generate .env.schwab exactly like deployment does
+          bash .github/workflows/generate-env.sh schwab > .env.schwab
+          set -a; source .env.schwab; set +a
+          # Set container-specific vars (from docker-compose)
+          # DATABASE_URL must point to the file created in setup step for sqlx compile-time checking
+          export EXECUTOR=schwab
+          export REBALANCING_ENABLED=false
+          export DATABASE_URL="sqlite:liquidity.db"
+          nix develop -c cargo run -q --bin validate_config
+
+      - name: Validate Alpaca container config
+        run: |
+          bash .github/workflows/generate-env.sh alpaca > .env.alpaca
+          set -a; source .env.alpaca; set +a
+          export EXECUTOR=alpaca-broker-api
+          export ALPACA_BROKER_API_MODE=production
+          export REBALANCING_ENABLED=true
+          export DATABASE_URL="sqlite:liquidity.db"
+          nix develop -c cargo run -q --bin validate_config
 
   deploy:
     needs: validate
@@ -95,7 +114,7 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Build Docker image
+      - name: Build Docker images
         run: |
           SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
           echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_ENV
@@ -103,6 +122,11 @@ jobs:
           docker build \
             -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:$SHORT_SHA \
             -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:latest .
+
+          docker build \
+            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:$SHORT_SHA \
+            -t registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:latest \
+            dashboard/
 
       - name: Install doctl
         if: github.ref == 'refs/heads/master'
@@ -118,24 +142,27 @@ jobs:
         if: github.ref == 'refs/heads/master'
         run: |
           echo "Checking for required files..."
-          ls -la .env.example docker-compose.template.yaml Dockerfile.grafana grafana-datasource.yaml .github/workflows/prep-docker-compose.sh .github/workflows/generate-env.sh
+          ls -la .env.schwab.template .env.alpaca.template docker-compose.template.yaml Dockerfile.grafana grafana-datasource.yaml .github/workflows/prep-docker-compose.sh .github/workflows/generate-env.sh
           echo "File verification complete"
 
       - name: Encode file contents
         if: github.ref == 'refs/heads/master'
         run: |
-          echo "ENV_TEMPLATE=$(base64 -w 0 .env.example)" >> $GITHUB_ENV
+          echo "ENV_TEMPLATE_SCHWAB=$(base64 -w 0 .env.schwab.template)" >> $GITHUB_ENV
+          echo "ENV_TEMPLATE_ALPACA=$(base64 -w 0 .env.alpaca.template)" >> $GITHUB_ENV
           echo "GENERATE_ENV_SCRIPT=$(base64 -w 0 .github/workflows/generate-env.sh)" >> $GITHUB_ENV
           echo "DOCKER_COMPOSE_TEMPLATE=$(base64 -w 0 docker-compose.template.yaml)" >> $GITHUB_ENV
           echo "GRAFANA_DOCKERFILE=$(base64 -w 0 Dockerfile.grafana)" >> $GITHUB_ENV
           echo "GRAFANA_DATASOURCE_YAML=$(base64 -w 0 grafana-datasource.yaml)" >> $GITHUB_ENV
           echo "PREP_SCRIPT=$(base64 -w 0 .github/workflows/prep-docker-compose.sh)" >> $GITHUB_ENV
 
-      - name: Push image to DO Registry
+      - name: Push images to DO Registry
         if: github.ref == 'refs/heads/master'
         run: |
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:${{ env.SHORT_SHA }}
           docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/schwarbot:latest
+          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:${{ env.SHORT_SHA }}
+          docker push registry.digitalocean.com/${{ env.REGISTRY_NAME }}/dashboard:latest
 
       - name: Deploy to Droplet
         if: github.ref == 'refs/heads/master'
@@ -144,7 +171,7 @@ jobs:
           host: ${{ secrets.DROPLET_HOST }}
           username: root
           key: ${{ secrets.DROPLET_SSH_KEY }}
-          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,WS_RPC_URL,ORDERBOOK,ORDER_OWNER,DEPLOYMENT_BLOCK,SCHWAB_APP_KEY,SCHWAB_APP_SECRET,ALPACA_API_KEY,ALPACA_API_SECRET,ALPACA_BROKER_API_KEY,ALPACA_BROKER_API_SECRET,ALPACA_ACCOUNT_ID,ENCRYPTION_KEY,HYPERDX_API_KEY,ENV_TEMPLATE,GENERATE_ENV_SCRIPT,DOCKER_COMPOSE_TEMPLATE,GRAFANA_DOCKERFILE,GRAFANA_DATASOURCE_YAML,PREP_SCRIPT,GRAFANA_ADMIN_PASSWORD
+          envs: DIGITALOCEAN_ACCESS_TOKEN,REGISTRY_NAME,SHORT_SHA,WS_RPC_URL,ORDERBOOK,ORDER_OWNER,DEPLOYMENT_BLOCK,SCHWAB_APP_KEY,SCHWAB_APP_SECRET,ALPACA_BROKER_API_KEY,ALPACA_BROKER_API_SECRET,ALPACA_ACCOUNT_ID,ENCRYPTION_KEY,HYPERDX_API_KEY,ENV_TEMPLATE_SCHWAB,ENV_TEMPLATE_ALPACA,GENERATE_ENV_SCRIPT,DOCKER_COMPOSE_TEMPLATE,GRAFANA_DOCKERFILE,GRAFANA_DATASOURCE_YAML,PREP_SCRIPT,GRAFANA_ADMIN_PASSWORD,REDEMPTION_WALLET,ETHEREUM_RPC_URL,EVM_PRIVATE_KEY,USDC_VAULT_ID
           script: |
             set -euo pipefail
 
@@ -169,7 +196,7 @@ jobs:
               cd /mnt/volume_nyc3_01
 
               # Check if required backup files exist
-              if [ ! -f "docker-compose.yaml.backup" ] || [ ! -f ".env.backup" ]; then
+              if [ ! -f "docker-compose.yaml.backup" ] || [ ! -f ".env.schwab.backup" ] || [ ! -f ".env.alpaca.backup" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - No backup files found, cannot rollback (possibly first deployment)" | tee -a "${DEPLOY_LOG}" >&2
                 echo "$(date '+%Y-%m-%d %H:%M:%S') - Deployment failed without rollback capability" | tee -a "${DEPLOY_LOG}" >&2
                 exit 1
@@ -184,7 +211,8 @@ jobs:
               # Restore backed-up configuration
               echo "$(date '+%Y-%m-%d %H:%M:%S') - Restoring backed-up configuration..." | tee -a "${DEPLOY_LOG}"
               cp -p docker-compose.yaml.backup docker-compose.yaml
-              cp -p .env.backup .env
+              cp -p .env.schwab.backup .env.schwab
+              cp -p .env.alpaca.backup .env.alpaca
 
               # Conditionally restore grafana config files if backups exist
               if [ -f "grafana-datasource.yaml.backup" ]; then
@@ -256,10 +284,11 @@ jobs:
 
             # Backup current working configuration for rollback capability BEFORE overwriting
             cd /mnt/volume_nyc3_01
-            if [ -f "docker-compose.yaml" ] && [ -f ".env" ]; then
+            if [ -f "docker-compose.yaml" ] && [ -f ".env.schwab" ] && [ -f ".env.alpaca" ]; then
               echo "$(date '+%Y-%m-%d %H:%M:%S') - Backing up current configuration for rollback" | tee -a "${DEPLOY_LOG}"
               cp -p docker-compose.yaml docker-compose.yaml.backup
-              cp -p .env .env.backup
+              cp -p .env.schwab .env.schwab.backup
+              cp -p .env.alpaca .env.alpaca.backup
 
               # Also backup grafana config files if they exist
               [ -f "grafana-datasource.yaml" ] && cp -p grafana-datasource.yaml grafana-datasource.yaml.backup
@@ -297,19 +326,21 @@ jobs:
             # Ensure database directory exists and has proper permissions
             log_exec chmod 755 /mnt/volume_nyc3_01
 
-            # Create .env file for container configuration using .env.example as template
-            echo "$(date '+%Y-%m-%d %H:%M:%S') - Creating .env file from template" | tee -a "${DEPLOY_LOG}"
+            # Create .env files for container configuration using executor-specific templates
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - Creating .env files from templates" | tee -a "${DEPLOY_LOG}"
 
-            # Set deployment-specific values for .env file
+            # Set deployment-specific values for .env files
             export RUST_LOG="st0x_hedge=debug,st0x_broker=debug"
             export ENCRYPTION_KEY="${ENCRYPTION_KEY}"
             export GRAFANA_ADMIN_PASSWORD="${GRAFANA_ADMIN_PASSWORD}"
 
-            # Decode and run the generate-env script (ENV_TEMPLATE is already set)
+            # Decode and run the generate-env script for each executor
             echo "$GENERATE_ENV_SCRIPT" | base64 -d > /mnt/volume_nyc3_01/generate-env.sh
             chmod +x /mnt/volume_nyc3_01/generate-env.sh
-            ENV_TEMPLATE="$ENV_TEMPLATE" /mnt/volume_nyc3_01/generate-env.sh > /mnt/volume_nyc3_01/.env
-            chmod 600 /mnt/volume_nyc3_01/.env
+            ENV_TEMPLATE_SCHWAB="$ENV_TEMPLATE_SCHWAB" /mnt/volume_nyc3_01/generate-env.sh schwab > /mnt/volume_nyc3_01/.env.schwab
+            chmod 600 /mnt/volume_nyc3_01/.env.schwab
+            ENV_TEMPLATE_ALPACA="$ENV_TEMPLATE_ALPACA" /mnt/volume_nyc3_01/generate-env.sh alpaca > /mnt/volume_nyc3_01/.env.alpaca
+            chmod 600 /mnt/volume_nyc3_01/.env.alpaca
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting services with docker-compose" | tee -a "${DEPLOY_LOG}"
             if ! docker compose up -d 2>&1 | tee -a "${DEPLOY_LOG}"; then
@@ -336,6 +367,7 @@ jobs:
             check_container_running "grafana" "Grafana"
             check_container_running "reporter-schwab" "Reporter-schwab"
             check_container_running "reporter-alpaca" "Reporter-alpaca"
+            check_container_running "dashboard" "Dashboard"
 
             echo "$(date '+%Y-%m-%d %H:%M:%S') - All containers confirmed running" | tee -a "${DEPLOY_LOG}"
 
@@ -348,6 +380,7 @@ jobs:
             docker compose logs alpacabot 2>&1 | tee -a "${DOCKER_LOG}"
             docker compose logs reporter-schwab 2>&1 | tee -a "${DOCKER_LOG}"
             docker compose logs reporter-alpaca 2>&1 | tee -a "${DOCKER_LOG}"
+            docker compose logs dashboard 2>&1 | tee -a "${DOCKER_LOG}"
 
             check_container_logs "schwarbot" "Schwarbot"
             check_container_logs "alpacabot" "Alpacabot"
@@ -358,6 +391,10 @@ jobs:
             echo "$(date '+%Y-%m-%d %H:%M:%S') - Cleaning up old images..." | tee -a "${DEPLOY_LOG}"
             log_exec docker image prune -f
             docker images "registry.digitalocean.com/${REGISTRY_NAME}/schwarbot" \
+              --format "table {{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}" | \
+              tail -n +2 | head -n -3 | awk '{print $1":"$2}' | \
+              xargs -r docker rmi 2>&1 | tee -a "${DEPLOY_LOG}" || true
+            docker images "registry.digitalocean.com/${REGISTRY_NAME}/dashboard" \
               --format "table {{.Repository}}\t{{.Tag}}\t{{.CreatedAt}}" | \
               tail -n +2 | head -n -3 | awk '{print $1":"$2}' | \
               xargs -r docker rmi 2>&1 | tee -a "${DEPLOY_LOG}" || true

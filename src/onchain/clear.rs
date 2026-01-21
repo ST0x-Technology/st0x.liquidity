@@ -1,3 +1,4 @@
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};
 use alloy::sol_types::SolEvent;
@@ -22,6 +23,7 @@ impl OnchainTrade {
         event: ClearV3,
         log: Log,
         feed_id_cache: &FeedIdCache,
+        order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
         let ClearV3 {
             sender: _,
@@ -38,16 +40,12 @@ impl OnchainTrade {
             ..
         } = clear_config;
 
-        let alice_owner_matches = alice_order.owner == env.order_owner;
-        let bob_owner_matches = bob_order.owner == env.order_owner;
+        let alice_owner_matches = alice_order.owner == order_owner;
+        let bob_owner_matches = bob_order.owner == order_owner;
 
         debug!(
-            "ClearV3 owner comparison: alice.owner={:?}, bob.owner={:?}, env.order_owner={:?}, alice_matches={}, bob_matches={}",
-            alice_order.owner,
-            bob_order.owner,
-            env.order_owner,
-            alice_owner_matches,
-            bob_owner_matches
+            "ClearV3 owner comparison: alice.owner={:?}, bob.owner={:?}, order_owner={:?}, alice_matches={}, bob_matches={}",
+            alice_order.owner, bob_order.owner, order_owner, alice_owner_matches, bob_owner_matches
         );
 
         if !(alice_owner_matches || bob_owner_matches) {
@@ -57,7 +55,7 @@ impl OnchainTrade {
                 log.log_index.unwrap_or(0),
                 alice_order.owner,
                 bob_order.owner,
-                env.order_owner
+                order_owner
             );
             return Ok(None);
         }
@@ -245,7 +243,7 @@ mod tests {
         EvmEnv {
             ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
             orderbook: address!("0x1111111111111111111111111111111111111111"),
-            order_owner: get_test_order().owner,
+            order_owner: Some(get_test_order().owner),
             deployment_block: 1,
         }
     }
@@ -377,6 +375,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -457,6 +456,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -498,6 +498,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -533,6 +534,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -587,6 +589,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -658,6 +661,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -727,6 +731,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -801,6 +806,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -952,6 +958,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1021,6 +1028,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -1095,6 +1103,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1163,6 +1172,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1237,6 +1247,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();
@@ -1290,6 +1301,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -1342,6 +1354,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -1390,6 +1403,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -1445,6 +1459,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await;
 
@@ -1516,6 +1531,7 @@ mod tests {
             clear_event,
             clear_log,
             &feed_id_cache,
+            env.order_owner.unwrap(),
         )
         .await
         .unwrap();

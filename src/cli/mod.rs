@@ -236,9 +236,6 @@ pub enum Commands {
         /// Number of shares to tokenize (supports fractional shares)
         #[arg(short = 'q', long = "quantity")]
         quantity: FractionalShares,
-        /// Wallet address to receive tokens (defaults to MARKET_MAKER_WALLET from env)
-        #[arg(short = 'w', long = "wallet")]
-        wallet: Option<Address>,
         /// Token contract address (to verify balance after tokenization)
         #[arg(short = 't', long = "token")]
         token: Address,
@@ -402,7 +399,6 @@ enum ProviderCommand {
     AlpacaTokenize {
         symbol: Symbol,
         quantity: FractionalShares,
-        wallet: Option<Address>,
         token: Address,
     },
     AlpacaRedeem {
@@ -474,12 +470,10 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::AlpacaTokenize {
             symbol,
             quantity,
-            wallet,
             token,
         } => Err(ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            wallet,
             token,
         }),
         Commands::AlpacaRedeem {
@@ -587,13 +581,10 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
-            wallet,
             token,
         } => {
-            rebalancing::alpaca_tokenize_command(
-                stdout, symbol, quantity, wallet, token, config, provider,
-            )
-            .await
+            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, token, config, provider)
+                .await
         }
         ProviderCommand::AlpacaRedeem {
             symbol,
@@ -1079,7 +1070,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: address!("0x0000000000000000000000000000000000000000"),
+                order_owner: Some(address!("0x0000000000000000000000000000000000000000")),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -1716,7 +1707,7 @@ mod tests {
         );
 
         let mut config = config;
-        config.evm.order_owner = mock_data.order_owner;
+        config.evm.order_owner = Some(mock_data.order_owner);
 
         let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
 
@@ -1799,7 +1790,7 @@ mod tests {
         );
 
         let mut config = config;
-        config.evm.order_owner = mock_data.order_owner;
+        config.evm.order_owner = Some(mock_data.order_owner);
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)

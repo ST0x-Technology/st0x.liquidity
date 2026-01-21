@@ -1,3 +1,5 @@
+use alloy::primitives::Address;
+use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use sqlx::SqlitePool;
 use tracing::Level;
@@ -107,6 +109,10 @@ pub enum ConfigError {
     Rebalancing(#[from] RebalancingConfigError),
     #[error(transparent)]
     Clap(#[from] clap::Error),
+    #[error("ORDER_OWNER required when rebalancing is disabled")]
+    MissingOrderOwner,
+    #[error("failed to derive address from EVM_PRIVATE_KEY")]
+    PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -186,6 +192,10 @@ impl Env {
             None
         };
 
+        if rebalancing.is_none() && self.evm.order_owner.is_none() {
+            return Err(ConfigError::MissingOrderOwner);
+        }
+
         Ok(Config {
             database_url: self.database_url,
             log_level: self.log_level,
@@ -209,6 +219,18 @@ impl Config {
         OrderPollerConfig {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
             max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
+        }
+    }
+
+    pub(crate) fn order_owner(&self) -> Result<Address, ConfigError> {
+        match (&self.rebalancing, self.evm.order_owner) {
+            (Some(r), _) => {
+                let signer = PrivateKeySigner::from_bytes(&r.evm_private_key)
+                    .map_err(ConfigError::PrivateKeyDerivation)?;
+                Ok(signer.address())
+            }
+            (None, Some(addr)) => Ok(addr),
+            (None, None) => Err(ConfigError::MissingOrderOwner),
         }
     }
 }
@@ -244,7 +266,7 @@ pub mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
-                order_owner,
+                order_owner: Some(order_owner),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -438,7 +460,7 @@ pub mod tests {
                 ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -452,7 +474,6 @@ pub mod tests {
                 ),
                 // Explicitly unset to avoid env pollution
                 ("REDEMPTION_WALLET", None),
-                ("MARKET_MAKER_WALLET", None),
             ],
             || {
                 let args = vec![
@@ -501,11 +522,7 @@ pub mod tests {
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
                 (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
-                (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -553,7 +570,7 @@ pub mod tests {
     }
 
     #[test]
-    fn rebalancing_enabled_missing_ethereum_private_key_fails() {
+    fn rebalancing_enabled_missing_evm_private_key_fails() {
         temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
@@ -566,10 +583,6 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
@@ -581,7 +594,7 @@ pub mod tests {
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 // Explicitly unset to avoid env pollution
-                ("ETHEREUM_PRIVATE_KEY", None),
+                ("EVM_PRIVATE_KEY", None),
             ],
             || {
                 let args = vec![
@@ -609,7 +622,7 @@ pub mod tests {
                         result,
                         Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
                     ),
-                    "Expected clap error for missing ethereum_private_key, got {result:?}"
+                    "Expected clap error for missing evm_private_key, got {result:?}"
                 );
             },
         );
@@ -629,13 +642,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -697,13 +706,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -761,13 +766,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -811,6 +812,275 @@ pub mod tests {
                 assert_eq!(rebalancing.equity_threshold.deviation, Decimal::new(15, 2));
                 assert_eq!(rebalancing.usdc_threshold.target, Decimal::new(4, 1));
                 assert_eq!(rebalancing.usdc_threshold.deviation, Decimal::new(25, 2));
+            },
+        );
+    }
+
+    #[test]
+    fn schwab_without_order_owner_fails_with_missing_order_owner_error() {
+        temp_env::with_vars(
+            [
+                ("SCHWAB_APP_KEY", Some("test_key")),
+                ("SCHWAB_APP_SECRET", Some("test_secret")),
+                ("SCHWAB_REDIRECT_URI", Some("https://127.0.0.1")),
+                ("SCHWAB_BASE_URL", Some("https://test.com")),
+                ("SCHWAB_ACCOUNT_INDEX", Some("0")),
+                (
+                    "ENCRYPTION_KEY",
+                    Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                ),
+                // Explicitly unset ORDER_OWNER and REBALANCING_ENABLED
+                ("ORDER_OWNER", None::<&str>),
+                ("REBALANCING_ENABLED", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    // No --order-owner argument
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "schwab",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let result = env.into_config();
+                assert!(
+                    matches!(result, Err(ConfigError::MissingOrderOwner)),
+                    "Expected MissingOrderOwner error, got {result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn schwab_with_order_owner_succeeds() {
+        temp_env::with_vars(
+            [
+                ("SCHWAB_APP_KEY", Some("test_key")),
+                ("SCHWAB_APP_SECRET", Some("test_secret")),
+                ("SCHWAB_REDIRECT_URI", Some("https://127.0.0.1")),
+                ("SCHWAB_BASE_URL", Some("https://test.com")),
+                ("SCHWAB_ACCOUNT_INDEX", Some("0")),
+                (
+                    "ENCRYPTION_KEY",
+                    Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                ),
+                ("REBALANCING_ENABLED", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "schwab",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let order_owner = config.order_owner().unwrap();
+                assert_eq!(
+                    order_owner,
+                    address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_rebalancing_without_order_owner_derives_from_private_key() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                // Private key whose address is 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                // No ORDER_OWNER - should derive from EVM_PRIVATE_KEY
+                ("ORDER_OWNER", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    // No --order-owner argument
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let order_owner = config.order_owner().unwrap();
+                // Address derived from private key 0x...0001
+                assert_eq!(
+                    order_owner,
+                    address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_rebalancing_ignores_order_owner_env_var() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    // Set ORDER_OWNER explicitly - should be ignored when rebalancing enabled
+                    "--order-owner",
+                    "0xcccccccccccccccccccccccccccccccccccccccc",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let order_owner = config.order_owner().unwrap();
+                // Should return derived address, NOT the env var value
+                assert_eq!(
+                    order_owner,
+                    address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
+                    "Expected derived address, not env var. order_owner() should derive from EVM_PRIVATE_KEY when rebalancing is enabled."
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_rebalancing_with_invalid_private_key_fails_with_derivation_error() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                // Zero private key is invalid for secp256k1
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("ORDER_OWNER", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let result = config.order_owner();
+                assert!(
+                    matches!(result, Err(ConfigError::PrivateKeyDerivation(_))),
+                    "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
+                );
             },
         );
     }

@@ -1,4 +1,4 @@
-use alloy::primitives::B256;
+use alloy::primitives::{Address, B256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -284,6 +284,7 @@ impl OnchainTrade {
         cache: &SymbolCache,
         env: &EvmEnv,
         feed_id_cache: &FeedIdCache,
+        order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
         let receipt = provider
             .get_transaction_receipt(tx_hash)
@@ -313,8 +314,15 @@ impl OnchainTrade {
         }
 
         for log in trades {
-            if let Some(trade) =
-                try_convert_log_to_onchain_trade(log, &provider, cache, env, feed_id_cache).await?
+            if let Some(trade) = try_convert_log_to_onchain_trade(
+                log,
+                &provider,
+                cache,
+                env,
+                feed_id_cache,
+                order_owner,
+            )
+            .await?
             {
                 return Ok(Some(trade));
             }
@@ -338,6 +346,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     cache: &SymbolCache,
     env: &EvmEnv,
     feed_id_cache: &FeedIdCache,
+    order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
     let log_with_metadata = Log {
         inner: log.inner.clone(),
@@ -358,6 +367,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
             clear_event.data().clone(),
             log_with_metadata,
             feed_id_cache,
+            order_owner,
         )
         .await;
     }
@@ -368,7 +378,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
             &provider,
             take_order_event.data().clone(),
             log_with_metadata,
-            env.order_owner,
+            order_owner,
             feed_id_cache,
         )
         .await;
@@ -708,7 +718,7 @@ mod tests {
         let env = EvmEnv {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
-            order_owner: Address::ZERO,
+            order_owner: Some(Address::ZERO),
             deployment_block: 0,
         };
 
@@ -716,8 +726,15 @@ mod tests {
             fixed_bytes!("0x4444444444444444444444444444444444444444444444444444444444444444");
 
         // Mock returns empty response by default, simulating transaction not found
-        let result =
-            OnchainTrade::try_from_tx_hash(tx_hash, provider, &cache, &env, &feed_id_cache).await;
+        let result = OnchainTrade::try_from_tx_hash(
+            tx_hash,
+            provider,
+            &cache,
+            &env,
+            &feed_id_cache,
+            Address::ZERO,
+        )
+        .await;
 
         assert!(matches!(
             result.unwrap_err(),

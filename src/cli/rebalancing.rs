@@ -89,7 +89,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
 
-            let wallet = rebalancing_config.market_maker_wallet;
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let wallet = signer.address();
 
             writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
@@ -160,7 +161,7 @@ where
 
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
@@ -225,7 +226,7 @@ where
         bridge,
         vault_service,
         cqrs,
-        rebalancing_config.market_maker_wallet,
+        owner,
         VaultId(rebalancing_config.usdc_vault_id),
     );
 
@@ -259,7 +260,6 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
-    wallet: Option<Address>,
     token: Address,
     config: &Config,
     provider: P,
@@ -277,7 +277,8 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
-    let receiving_wallet = wallet.unwrap_or(rebalancing_config.market_maker_wallet);
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let receiving_wallet = signer.address();
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let erc20 = IERC20::new(token, provider.clone());
@@ -381,7 +382,7 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     let redemption_wallet = rebalancing_config.redemption_wallet;
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let provider_with_wallet = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(provider);
@@ -541,7 +542,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,

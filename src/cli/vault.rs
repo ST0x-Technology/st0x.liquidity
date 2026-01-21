@@ -29,7 +29,7 @@ pub(super) async fn vault_deposit_command<
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -97,7 +97,7 @@ pub(super) async fn vault_withdraw_command<
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let base_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -143,7 +143,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,

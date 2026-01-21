@@ -57,15 +57,12 @@ pub struct RebalancingEnv {
     /// Issuer's wallet for tokenized equity redemptions
     #[clap(long, env)]
     redemption_wallet: Address,
-    /// Our wallet for USDC operations (Alpaca withdrawals, CCTP bridging, vault deposits)
-    #[clap(long, env)]
-    market_maker_wallet: Address,
     /// Ethereum RPC URL for CCTP operations
     #[clap(long, env)]
     ethereum_rpc_url: Url,
-    /// Private key for signing Ethereum transactions
+    /// Private key for signing EVM transactions (used on both Ethereum and Base)
     #[clap(long, env)]
-    ethereum_private_key: B256,
+    evm_private_key: B256,
     /// Vault ID for USDC deposits to the Raindex vault
     #[clap(long, env)]
     usdc_vault_id: B256,
@@ -93,9 +90,8 @@ impl RebalancingConfig {
                 deviation: env.usdc_deviation,
             },
             redemption_wallet: env.redemption_wallet,
-            market_maker_wallet: env.market_maker_wallet,
             ethereum_rpc_url: env.ethereum_rpc_url,
-            ethereum_private_key: env.ethereum_private_key,
+            evm_private_key: env.evm_private_key,
             usdc_vault_id: env.usdc_vault_id,
             alpaca_account_id: env.alpaca_account_id,
         })
@@ -109,10 +105,8 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc_threshold: ImbalanceThreshold,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
-    /// Our wallet for USDC operations (Alpaca withdrawals, CCTP bridging, vault deposits).
-    pub(crate) market_maker_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) ethereum_private_key: B256,
+    pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
     /// Alpaca AP (Authorized Participant) account ID for Broker API operations.
     pub(crate) alpaca_account_id: AlpacaAccountId,
@@ -124,9 +118,8 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("equity_threshold", &self.equity_threshold)
             .field("usdc_threshold", &self.usdc_threshold)
             .field("redemption_wallet", &self.redemption_wallet)
-            .field("market_maker_wallet", &self.market_maker_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
-            .field("ethereum_private_key", &"[REDACTED]")
+            .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
             .finish()
@@ -1623,19 +1616,15 @@ mod tests {
         ));
     }
 
-    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 8] {
+    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 7] {
         [
             (
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
             ),
-            (
-                "MARKET_MAKER_WALLET",
-                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
-            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
-                "ETHEREUM_PRIVATE_KEY",
+                "EVM_PRIVATE_KEY",
                 Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
             ),
             ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -1677,13 +1666,9 @@ mod tests {
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
             ),
-            (
-                "MARKET_MAKER_WALLET",
-                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
-            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
-                "ETHEREUM_PRIVATE_KEY",
+                "EVM_PRIVATE_KEY",
                 Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
             ),
             ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -1719,13 +1704,9 @@ mod tests {
     fn from_env_missing_redemption_wallet_fails() {
         let vars = [
             ("REDEMPTION_WALLET", None),
-            (
-                "MARKET_MAKER_WALLET",
-                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
-            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
-                "ETHEREUM_PRIVATE_KEY",
+                "EVM_PRIVATE_KEY",
                 Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
             ),
             ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -1753,18 +1734,14 @@ mod tests {
     }
 
     #[test]
-    fn from_env_missing_ethereum_private_key_fails() {
+    fn from_env_missing_evm_private_key_fails() {
         let vars = [
             (
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
             ),
-            (
-                "MARKET_MAKER_WALLET",
-                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
-            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            ("ETHEREUM_PRIVATE_KEY", None),
+            ("EVM_PRIVATE_KEY", None),
             ("BASE_RPC_URL", Some("https://base.example.com")),
             (
                 "BASE_ORDERBOOK",
@@ -1793,13 +1770,9 @@ mod tests {
     fn from_env_invalid_address_format_fails() {
         let vars = [
             ("REDEMPTION_WALLET", Some("not-an-address")),
-            (
-                "MARKET_MAKER_WALLET",
-                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
-            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             (
-                "ETHEREUM_PRIVATE_KEY",
+                "EVM_PRIVATE_KEY",
                 Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
             ),
             ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -1833,12 +1806,8 @@ mod tests {
                 "REDEMPTION_WALLET",
                 Some("0x1234567890123456789012345678901234567890"),
             ),
-            (
-                "MARKET_MAKER_WALLET",
-                Some("0xaabbccddaabbccddaabbccddaabbccddaabbccdd"),
-            ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            ("ETHEREUM_PRIVATE_KEY", Some("not-a-valid-key")),
+            ("EVM_PRIVATE_KEY", Some("not-a-valid-key")),
             ("BASE_RPC_URL", Some("https://base.example.com")),
             (
                 "BASE_ORDERBOOK",

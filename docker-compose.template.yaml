@@ -6,11 +6,12 @@ services:
     command: ["./server"]
     environment:
       - EXECUTOR=${SCHWAB_EXECUTOR}
+      - REBALANCING_ENABLED=false
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/schwab.db
       - ENCRYPTION_KEY
     env_file:
-      - .env
+      - .env.schwab
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -24,10 +25,12 @@ services:
     command: ["./server"]
     environment:
       - EXECUTOR=${ALPACA_EXECUTOR}
+      - ALPACA_BROKER_API_MODE=${ALPACA_BROKER_API_MODE}
+      - REBALANCING_ENABLED=true
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:
-      - .env
+      - .env.alpaca
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -42,7 +45,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:///data/schwab.db
     env_file:
-      - .env
+      - .env.schwab
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -57,7 +60,7 @@ services:
     environment:
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:
-      - .env
+      - .env.alpaca
     volumes:
       - ${DATA_VOLUME_PATH}:/data
     depends_on:
@@ -84,6 +87,17 @@ services:
       - ${DATA_VOLUME_PATH}/schwab.db:/databases/schwab.db:ro
       - ${DATA_VOLUME_PATH}/alpaca.db:/databases/alpaca.db:ro
       - ./grafana-datasource.yaml:/otel-lgtm/grafana/conf/provisioning/datasources/sqlite.yaml:ro
+    restart: unless-stopped
+
+  dashboard:
+    image: ${DASHBOARD_IMAGE}
+    pull_policy: ${PULL_POLICY}
+    container_name: dashboard
+    ports:
+      - "80:80"
+    depends_on:
+      - schwarbot
+      - alpacabot
     restart: unless-stopped
 
 volumes:
