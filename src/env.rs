@@ -438,7 +438,7 @@ pub mod tests {
                 ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -452,7 +452,6 @@ pub mod tests {
                 ),
                 // Explicitly unset to avoid env pollution
                 ("REDEMPTION_WALLET", None),
-                ("MARKET_MAKER_WALLET", None),
             ],
             || {
                 let args = vec![
@@ -501,11 +500,7 @@ pub mod tests {
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
                 (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
-                (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -553,7 +548,7 @@ pub mod tests {
     }
 
     #[test]
-    fn rebalancing_enabled_missing_ethereum_private_key_fails() {
+    fn rebalancing_enabled_missing_evm_private_key_fails() {
         temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
@@ -566,10 +561,6 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
@@ -581,7 +572,7 @@ pub mod tests {
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 // Explicitly unset to avoid env pollution
-                ("ETHEREUM_PRIVATE_KEY", None),
+                ("EVM_PRIVATE_KEY", None),
             ],
             || {
                 let args = vec![
@@ -609,7 +600,7 @@ pub mod tests {
                         result,
                         Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
                     ),
-                    "Expected clap error for missing ethereum_private_key, got {result:?}"
+                    "Expected clap error for missing evm_private_key, got {result:?}"
                 );
             },
         );
@@ -629,13 +620,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -697,13 +684,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -761,13 +744,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
