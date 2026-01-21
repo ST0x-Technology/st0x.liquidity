@@ -32,8 +32,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    NaiveTime::parse_from_str(&s, "%H:%M")
-        .map_err(|e| serde::de::Error::custom(format!("invalid HH:MM time '{s}': {e}")))
+    NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
 }
 
 enum MarketStatus {
@@ -356,5 +355,50 @@ mod tests {
         assert_eq!(day.date, NaiveDate::from_ymd_opt(2025, 1, 6).unwrap());
         assert_eq!(day.open, NaiveTime::from_hms_opt(9, 30, 0).unwrap());
         assert_eq!(day.close, NaiveTime::from_hms_opt(16, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn test_calendar_day_rejects_hhmm_format_without_colon() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "0930",
+            "close": "1600"
+        }"#;
+
+        let err = serde_json::from_str::<CalendarDay>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid"),
+            "expected parse error for missing colon, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_calendar_day_rejects_invalid_hour() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "25:30",
+            "close": "16:00"
+        }"#;
+
+        let err = serde_json::from_str::<CalendarDay>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected out of range error for hour 25, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_calendar_day_rejects_invalid_minute() {
+        let json = r#"{
+            "date": "2025-01-06",
+            "open": "09:60",
+            "close": "16:00"
+        }"#;
+
+        let err = serde_json::from_str::<CalendarDay>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("out of range"),
+            "expected out of range error for minute 60, got: {err}"
+        );
     }
 }
