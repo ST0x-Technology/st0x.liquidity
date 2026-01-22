@@ -1963,4 +1963,109 @@ mod tests {
         assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(400)));
     }
+
+    #[test]
+    fn conversion_confirmed_base_to_alpaca_removes_usdc_from_offchain() {
+        // BUG TEST: For BaseToAlpaca flow, ConversionConfirmed (USDC->USD) should
+        // remove USDC from offchain. Currently, it just updates the timestamp.
+        //
+        // Scenario: After BaseToAlpaca deposit, we have 1000 USDC in offchain (Alpaca wallet).
+        // We convert 100 USDC to USD. Due to slippage (~17 bps), the filled amount
+        // might be slightly different, but for USDC->USD we're selling USDC so
+        // filled_amount represents the USDC sold (should be same as requested for full fills).
+        //
+        // After conversion, offchain should have 900 USDC (1000 - 100).
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Request: 100 USDC → USD conversion
+        // Filled: 100 USDC sold (full fill for market order)
+        let filled_amount = Usdc(dec!(100));
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            filled_amount,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::BaseToAlpaca,
+                Usdc(dec!(100)),
+                now,
+            )
+            .unwrap();
+
+        // Offchain should have 900 USDC (1000 - 100)
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "ConversionConfirmed(BaseToAlpaca) should remove filled_amount USDC from offchain"
+        );
+
+        // Onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn conversion_confirmed_alpaca_to_base_adds_usdc_to_offchain() {
+        // BUG TEST: For AlpacaToBase flow, ConversionConfirmed (USD->USDC) should
+        // add USDC to offchain. Currently, it just updates the timestamp.
+        //
+        // Scenario: We're converting USD to USDC before withdrawal.
+        // Request: 1000 USD worth of USDC
+        // Filled: 998.3 USDC (17 bps slippage - we got less USDC than expected)
+        //
+        // After conversion, offchain should increase by the filled_amount (998.3), not the requested.
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Request: 1000 USD → USDC conversion
+        // Filled: 998.3 USDC (slippage of ~17 bps)
+        let filled_amount = Usdc(dec!(998.3));
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            filled_amount,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                Usdc(dec!(1000)),
+                now,
+            )
+            .unwrap();
+
+        // Offchain should have 1998.3 USDC (1000 + 998.3)
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(1998.3)),
+            "ConversionConfirmed(AlpacaToBase) should add filled_amount USDC to offchain"
+        );
+
+        // Onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
 }
