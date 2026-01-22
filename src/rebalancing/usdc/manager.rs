@@ -7,6 +7,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
+use rust_decimal::Decimal;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
@@ -15,7 +16,7 @@ use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge};
+use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -97,6 +98,8 @@ where
     /// Used at the start of AlpacaToBase flow, before withdrawal.
     /// Places a buy order on USDC/USD and polls until filled.
     ///
+    /// Returns the actual filled USDC amount (may differ from requested due to slippage).
+    ///
     /// # Event Sourcing Flow
     ///
     /// 1. Record intent via `InitiateConversion` (aggregate enters `Converting` state)
@@ -111,7 +114,7 @@ where
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
-    ) -> Result<(), UsdcRebalanceManagerError> {
+    ) -> Result<Usdc, UsdcRebalanceManagerError> {
         let Usdc(decimal_amount) = amount;
         let correlation_id = Uuid::new_v4();
 
@@ -149,12 +152,21 @@ where
             }
         };
 
+        let filled_amount = order.filled_quantity.ok_or_else(|| {
+            UsdcRebalanceManagerError::MissingFilledQuantity { order_id: order.id }
+        })?;
+
         self.cqrs
             .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
             .await?;
 
-        info!(order_id = %order.id, "USD to USDC conversion completed");
-        Ok(())
+        info!(
+            order_id = %order.id,
+            requested = %amount.0,
+            filled = %filled_amount,
+            "USD to USDC conversion completed"
+        );
+        Ok(Usdc(filled_amount))
     }
 
     /// Converts USDC to USD buying power.
@@ -242,21 +254,22 @@ where
     ) -> Result<(), UsdcRebalanceManagerError> {
         info!(?amount, "Starting Alpaca to Base rebalance");
 
-        // Convert USD buying power to USDC before withdrawal
-        self.execute_usd_to_usdc_conversion(id, amount).await?;
+        // Convert USD to USDC - use actual filled amount for subsequent steps
+        let usdc_amount = self.execute_usd_to_usdc_conversion(id, amount).await?;
 
-        let transfer = self.initiate_alpaca_withdrawal(id, amount).await?;
+        let transfer = self.initiate_alpaca_withdrawal(id, usdc_amount).await?;
 
         self.poll_and_confirm_withdrawal(id, &transfer.id).await?;
 
-        let burn_amount = usdc_to_u256(amount)?;
+        let burn_amount = usdc_to_u256(usdc_amount)?;
         let burn_receipt = self.execute_cctp_burn(id, burn_amount).await?;
 
         let attestation_response = self.poll_attestation(id, &burn_receipt).await?;
 
-        self.execute_cctp_mint(id, attestation_response).await?;
+        // Use the actual minted amount (net of CCTP fee) for vault deposit
+        let mint_receipt = self.execute_cctp_mint(id, attestation_response).await?;
 
-        self.deposit_to_vault(id, burn_receipt.amount).await?;
+        self.deposit_to_vault(id, mint_receipt.amount).await?;
 
         self.confirm_deposit(id).await?;
 
@@ -435,8 +448,8 @@ where
         &self,
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
-    ) -> Result<TxHash, UsdcRebalanceManagerError> {
-        let mint_tx = match self
+    ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
+        let mint_receipt = match self
             .cctp_bridge
             .mint(
                 BridgeDirection::EthereumToBase,
@@ -445,7 +458,7 @@ where
             )
             .await
         {
-            Ok(tx) => tx,
+            Ok(receipt) => receipt,
             Err(e) => {
                 warn!("CCTP mint failed: {e}");
                 self.cqrs
@@ -461,11 +474,21 @@ where
         };
 
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint_receipt.tx,
+                },
+            )
             .await?;
 
-        info!(%mint_tx, "CCTP mint executed");
-        Ok(mint_tx)
+        info!(
+            mint_tx = %mint_receipt.tx,
+            amount = %mint_receipt.amount,
+            fee = %mint_receipt.fee_collected,
+            "CCTP mint executed"
+        );
+        Ok(mint_receipt)
     }
 
     #[instrument(skip(self), fields(?id, ?amount))]
@@ -544,14 +567,18 @@ where
             .poll_attestation_for_base_burn(id, &burn_receipt)
             .await?;
 
-        let mint_tx = self
+        // Use the actual minted amount (net of CCTP fee) for downstream operations
+        let mint_receipt = self
             .execute_cctp_mint_on_ethereum(id, attestation_response)
             .await?;
 
-        self.poll_and_confirm_alpaca_deposit(id, mint_tx).await?;
+        self.poll_and_confirm_alpaca_deposit(id, mint_receipt.tx)
+            .await?;
 
-        // Convert deposited USDC to USD buying power
-        self.execute_usdc_to_usd_conversion(id, amount).await?;
+        // Convert deposited USDC to USD buying power using actual received amount
+        let actual_amount = u256_to_usdc(mint_receipt.amount)?;
+        self.execute_usdc_to_usd_conversion(id, actual_amount)
+            .await?;
 
         info!("Base to Alpaca rebalance completed successfully");
         Ok(())
@@ -680,8 +707,8 @@ where
         &self,
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
-    ) -> Result<TxHash, UsdcRebalanceManagerError> {
-        let mint_tx = match self
+    ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
+        let mint_receipt = match self
             .cctp_bridge
             .mint(
                 BridgeDirection::BaseToEthereum,
@@ -690,7 +717,7 @@ where
             )
             .await
         {
-            Ok(tx) => tx,
+            Ok(receipt) => receipt,
             Err(e) => {
                 warn!("CCTP mint on Ethereum failed: {e}");
                 self.cqrs
@@ -706,11 +733,21 @@ where
         };
 
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx: mint_receipt.tx,
+                },
+            )
             .await?;
 
-        info!(%mint_tx, "CCTP mint on Ethereum executed");
-        Ok(mint_tx)
+        info!(
+            mint_tx = %mint_receipt.tx,
+            amount = %mint_receipt.amount,
+            fee = %mint_receipt.fee_collected,
+            "CCTP mint on Ethereum executed"
+        );
+        Ok(mint_receipt)
     }
 
     #[instrument(skip(self), fields(?id, %mint_tx))]
@@ -797,6 +834,13 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     let integer = scaled.trunc().to_string();
 
     Ok(U256::from_str_radix(&integer, 10)?)
+}
+
+/// Converts a U256 amount (with 6 decimals) to USDC decimal.
+fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcRebalanceManagerError> {
+    let amount_u128: u128 = amount.try_into()?;
+    let decimal = Decimal::from(amount_u128) / Decimal::from(1_000_000u64);
+    Ok(Usdc(decimal))
 }
 
 #[async_trait]
@@ -2184,6 +2228,80 @@ mod tests {
         assert!(
             withdrawal_result.is_ok(),
             "Initiate should succeed from ConversionComplete state, got: {withdrawal_result:?}"
+        );
+    }
+
+    /// Creates a mock where filled_qty differs from requested qty to simulate slippage.
+    fn create_get_order_mock_with_slippage<'a>(
+        server: &'a MockServer,
+        order_id: &str,
+        requested_qty: &str,
+        filled_qty: &str,
+    ) -> httpmock::Mock<'a> {
+        server.mock(|when, then| {
+            when.method(GET).path(format!(
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": order_id,
+                    "symbol": "USDCUSD",
+                    "qty": requested_qty,
+                    "status": "filled",
+                    "filled_avg_price": "1.0001",
+                    "filled_qty": filled_qty,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        })
+    }
+
+    #[tokio::test]
+    async fn usd_to_usdc_conversion_returns_actual_filled_amount() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, private_key) = setup_anvil();
+
+        let _account_mock = create_broker_account_mock(&server);
+        let alpaca_broker = Arc::new(create_test_broker_service(&server).await);
+        let alpaca_wallet = Arc::new(create_test_wallet_service(&server));
+        let (provider, signer) = create_test_provider(&endpoint, &private_key);
+        let (cctp_bridge, vault_service) = create_test_onchain_services(provider, &signer);
+        let cqrs = create_test_cqrs();
+
+        let market_maker_wallet = address!("0x1111111111111111111111111111111111111111");
+
+        let manager = UsdcRebalanceManager::new(
+            alpaca_broker,
+            alpaca_wallet,
+            Arc::new(cctp_bridge),
+            Arc::new(vault_service),
+            cqrs,
+            market_maker_wallet,
+            TEST_VAULT_ID,
+        );
+
+        // Request 1000, but only 999.5 fills due to slippage
+        let _order_mock = create_conversion_order_pending_mock(&server, "1000");
+        let _get_mock = create_get_order_mock_with_slippage(
+            &server,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d",
+            "1000",
+            "999.5",
+        );
+
+        let id = UsdcRebalanceId::new("slippage-test");
+        let requested_amount = Usdc(dec!(1000));
+
+        let filled_amount = manager
+            .execute_usd_to_usdc_conversion(&id, requested_amount)
+            .await
+            .unwrap();
+
+        // Should return the actual filled amount, not the requested amount
+        assert_eq!(
+            filled_amount,
+            Usdc(dec!(999.5)),
+            "Should return actual filled amount, not requested amount"
         );
     }
 }
