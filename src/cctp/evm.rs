@@ -1,13 +1,13 @@
 //! Single-chain CCTP operations.
 
-use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolEvent;
-use tracing::info;
+use tracing::{info, trace};
 
 use super::{
     BridgeDirection, BurnReceipt, CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2,
-    TokenMessengerV2,
+    MintReceipt, TokenMessengerV2,
 };
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
@@ -52,8 +52,9 @@ where
 
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
         let spender = *self.token_messenger.address();
-
         let allowance = self.usdc.allowance(self.owner, spender).call().await?;
+
+        trace!(%allowance, %amount, "Checking USDC allowance");
 
         if allowance < amount {
             let pending = match self.usdc.approve(spender, amount).send().await {
@@ -117,11 +118,15 @@ where
     }
 
     /// Claims USDC on this chain by submitting the attestation.
+    ///
+    /// Parses the `MintAndWithdraw` event from the transaction receipt to extract
+    /// the actual minted amount and fee collected. This is the source of truth
+    /// for what the recipient actually received.
     pub(super) async fn claim(
         &self,
         message: Bytes,
         attestation: Bytes,
-    ) -> Result<TxHash, CctpError> {
+    ) -> Result<MintReceipt, CctpError> {
         let pending = match self
             .message_transmitter
             .receiveMessage(message, attestation)
@@ -134,7 +139,24 @@ where
 
         let receipt = pending.get_receipt().await?;
 
-        Ok(receipt.transaction_hash)
+        let mint_event = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| TokenMessengerV2::MintAndWithdraw::decode_log(log.as_ref()).ok())
+            .ok_or(CctpError::MintAndWithdrawEventNotFound)?;
+
+        info!(
+            amount = %mint_event.amount,
+            fee_collected = %mint_event.feeCollected,
+            "Parsed MintAndWithdraw event"
+        );
+
+        Ok(MintReceipt {
+            tx: receipt.transaction_hash,
+            amount: mint_event.amount,
+            fee_collected: mint_event.feeCollected,
+        })
     }
 
     #[cfg(test)]

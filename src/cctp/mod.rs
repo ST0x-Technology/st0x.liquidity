@@ -138,8 +138,25 @@ const FAST_TRANSFER_THRESHOLD: u32 = 1000;
 pub(crate) struct BurnReceipt {
     /// Transaction hash of the burn transaction
     pub(crate) tx: TxHash,
-    /// Amount of USDC burned (in smallest unit, 6 decimals for USDC)
+    /// Amount of USDC burned (in smallest unit, 6 decimals for USDC).
+    /// This is the INPUT amount sent to the contract, NOT the amount received
+    /// on the destination chain (which is amount minus fee).
     pub(crate) amount: U256,
+}
+
+/// Receipt from minting USDC on the destination chain.
+///
+/// Contains the actual amounts from the `MintAndWithdraw` event, which is the
+/// source of truth for what was actually received after fee deduction.
+#[derive(Debug)]
+pub(crate) struct MintReceipt {
+    /// Transaction hash of the mint transaction
+    pub(crate) tx: TxHash,
+    /// Actual USDC minted to recipient (NET of fees).
+    /// This is what the recipient actually received.
+    pub(crate) amount: U256,
+    /// Actual fee collected by Circle for this transfer.
+    pub(crate) fee_collected: U256,
 }
 
 /// Response from Circle's attestation API for CCTP V2.
@@ -262,6 +279,8 @@ pub(crate) enum CctpError {
     },
     #[error("MessageSent event not found in transaction receipt")]
     MessageSentEventNotFound,
+    #[error("MintAndWithdraw event not found in transaction receipt")]
+    MintAndWithdrawEventNotFound,
     #[error("Message too short for nonce extraction: got {length} bytes, need at least 44")]
     MessageTooShort { length: usize },
     #[error("Fee calculation overflow")]
@@ -505,12 +524,15 @@ where
     }
 
     /// Mints USDC on the destination chain for the given bridge direction.
+    ///
+    /// Returns the actual minted amount and fee collected from the `MintAndWithdraw` event.
+    /// This is the source of truth for what the recipient actually received after fee deduction.
     pub(crate) async fn mint(
         &self,
         direction: BridgeDirection,
         message: Bytes,
         attestation: Bytes,
-    ) -> Result<TxHash, CctpError> {
+    ) -> Result<MintReceipt, CctpError> {
         match direction {
             BridgeDirection::EthereumToBase => self.base.claim(message, attestation).await,
             BridgeDirection::BaseToEthereum => self.ethereum.claim(message, attestation).await,
@@ -1610,7 +1632,7 @@ mod tests {
 
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
-        bridge
+        let mint_receipt = bridge
             .mint(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
@@ -1618,6 +1640,9 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert!(!mint_receipt.tx.is_zero());
+        assert_eq!(mint_receipt.amount, amount);
     }
 
     #[tokio::test]
@@ -1640,7 +1665,7 @@ mod tests {
 
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
-        bridge
+        let mint_receipt = bridge
             .mint(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
@@ -1648,6 +1673,87 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert!(!mint_receipt.tx.is_zero());
+        assert_eq!(mint_receipt.amount, amount);
+    }
+
+    #[tokio::test]
+    async fn claim_on_base_parses_mint_and_withdraw_event() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(2_500_000u64); // 2.5 USDC
+
+        let burn_receipt = bridge
+            .burn(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Call claim() directly on the Evm instance
+        let mint_receipt = bridge
+            .base
+            .claim(message_with_nonce, attestation)
+            .await
+            .unwrap();
+
+        assert!(!mint_receipt.tx.is_zero(), "tx hash should be set");
+        assert_eq!(
+            mint_receipt.amount, amount,
+            "amount should match burned amount"
+        );
+        assert_eq!(
+            mint_receipt.fee_collected,
+            U256::ZERO,
+            "fee should be 0 in mock"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_on_ethereum_parses_mint_and_withdraw_event() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(7_500_000u64); // 7.5 USDC
+
+        let burn_receipt = bridge
+            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, false)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        // Call claim() directly on the Evm instance
+        let mint_receipt = bridge
+            .ethereum
+            .claim(message_with_nonce, attestation)
+            .await
+            .unwrap();
+
+        assert!(!mint_receipt.tx.is_zero(), "tx hash should be set");
+        assert_eq!(
+            mint_receipt.amount, amount,
+            "amount should match burned amount"
+        );
+        assert_eq!(
+            mint_receipt.fee_collected,
+            U256::ZERO,
+            "fee should be 0 in mock"
+        );
     }
 
     #[tokio::test]
@@ -1838,5 +1944,149 @@ mod tests {
 
             prop_assert_eq!(extracted, FixedBytes::from(nonce));
         }
+    }
+
+    #[tokio::test]
+    async fn ensure_usdc_approval_approves_when_existing_allowance_is_lower() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let owner = bridge.ethereum.owner();
+        let spender = *bridge.ethereum.token_messenger().address();
+
+        // Check initial allowance is 0
+        let initial_allowance = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            initial_allowance,
+            U256::ZERO,
+            "Initial allowance should be 0"
+        );
+
+        // First burn sets allowance to 1 USDC
+        let small_amount = U256::from(1_000_000u64); // 1 USDC
+        bridge
+            .burn(BridgeDirection::EthereumToBase, small_amount, recipient)
+            .await
+            .unwrap();
+
+        // After burn, allowance should be consumed (0) since we approved exactly what we needed
+        let after_first_burn = bridge
+            .ethereum
+            .usdc()
+            .allowance(owner, spender)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(
+            after_first_burn,
+            U256::ZERO,
+            "Allowance should be 0 after burn consumed it"
+        );
+
+        // Second burn with larger amount should update allowance and succeed
+        let large_amount = U256::from(100_000_000u64); // 100 USDC
+        let receipt = bridge
+            .burn(BridgeDirection::EthereumToBase, large_amount, recipient)
+            .await
+            .unwrap();
+
+        assert!(!receipt.tx.is_zero(), "Second burn should succeed");
+        assert_eq!(receipt.amount, large_amount);
+    }
+
+    #[tokio::test]
+    async fn mint_returns_actual_amount_and_fee_from_mint_and_withdraw_event() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let burn_amount = U256::from(1_000_000u64); // 1 USDC
+
+        let burn_receipt = bridge
+            .burn(BridgeDirection::EthereumToBase, burn_amount, recipient)
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let mint_receipt = bridge
+            .mint(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce,
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // The MintAndWithdraw event should contain:
+        // - amount: actual USDC minted to recipient (net of fee)
+        // - fee_collected: the actual fee taken by Circle
+        //
+        // For the test mock contracts, there's no actual fee deduction,
+        // so amount should equal burn_amount and fee_collected should be 0.
+        // In production, amount = burn_amount - fee_collected.
+        assert!(!mint_receipt.tx.is_zero(), "Transaction hash should be set");
+        assert_eq!(
+            mint_receipt.amount, burn_amount,
+            "Minted amount should match burn amount in test (no fee in mock)"
+        );
+        assert_eq!(
+            mint_receipt.fee_collected,
+            U256::ZERO,
+            "Fee should be zero in mock contracts"
+        );
+    }
+
+    #[tokio::test]
+    async fn mint_returns_actual_amount_and_fee_for_base_to_ethereum_direction() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner();
+        let burn_amount = U256::from(5_000_000u64); // 5 USDC
+
+        let burn_receipt = bridge
+            .burn(BridgeDirection::BaseToEthereum, burn_amount, recipient)
+            .await
+            .unwrap();
+
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, false)
+            .await
+            .unwrap();
+
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let mint_receipt = bridge
+            .mint(
+                BridgeDirection::BaseToEthereum,
+                message_with_nonce,
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        assert!(!mint_receipt.tx.is_zero(), "Transaction hash should be set");
+        assert_eq!(
+            mint_receipt.amount, burn_amount,
+            "Minted amount should match burn amount in test (no fee in mock)"
+        );
+        assert_eq!(
+            mint_receipt.fee_collected,
+            U256::ZERO,
+            "Fee should be zero in mock contracts"
+        );
     }
 }

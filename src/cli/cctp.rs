@@ -100,10 +100,14 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
 
     writeln!(stdout, "\n3. Minting USDC on {dest:?}...")?;
-    let mint_tx = cctp_bridge
+    let mint_receipt = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
-    writeln!(stdout, "Bridge complete! Mint tx: {mint_tx}")?;
+    writeln!(
+        stdout,
+        "Bridge complete! Mint tx: {}\n  Amount received: {} (fee: {})",
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+    )?;
 
     Ok(())
 }
@@ -178,10 +182,14 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     )?;
 
     writeln!(stdout, "   Calling receiveMessage on {dest_chain:?}...")?;
-    let mint_tx = cctp_bridge
+    let mint_receipt = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
-    writeln!(stdout, "CCTP transfer recovered! Mint tx: {mint_tx}")?;
+    writeln!(
+        stdout,
+        "CCTP transfer recovered! Mint tx: {}\n  Amount received: {} (fee: {})",
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+    )?;
 
     Ok(())
 }
