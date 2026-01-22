@@ -202,13 +202,13 @@ impl Env {
             return Err(ConfigError::MissingOrderOwner);
         }
 
-        let execution_threshold = match self.executor {
-            // Schwab doesn't support fractional shares, so use 1 whole share threshold
-            SupportedExecutor::Schwab | SupportedExecutor::DryRun => {
-                ExecutionThreshold::whole_share()
-            }
-            // Alpaca supports fractional shares, so use dollar value threshold
-            SupportedExecutor::AlpacaTradingApi | SupportedExecutor::AlpacaBrokerApi => {
+        // Execution threshold is determined by broker capabilities:
+        // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
+        // - Alpaca requires $1 minimum for fractional trading, so use $1 dollar value threshold
+        // - DryRun uses shares threshold for testing
+        let execution_threshold = match &broker {
+            BrokerConfig::Schwab(_) | BrokerConfig::DryRun => ExecutionThreshold::whole_share(),
+            BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
                 ExecutionThreshold::DollarValue(Usdc(Decimal::ONE))
             }
         };

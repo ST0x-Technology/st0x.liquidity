@@ -18,7 +18,7 @@ use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
-use crate::error::EventProcessingError;
+use crate::error::{EventProcessingError, EventQueueError};
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::BrokerOrderId;
@@ -666,11 +666,9 @@ async fn process_next_queued_event<P: Provider + Clone>(
 }
 
 fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
-    queued_event.id.ok_or_else(|| {
-        EventProcessingError::Queue(crate::error::EventQueueError::Processing(
-            "Queued event missing ID".to_string(),
-        ))
-    })
+    queued_event
+        .id
+        .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
@@ -729,20 +727,14 @@ async fn handle_filtered_event(
         queued_event.log_index
     );
 
-    let mut sql_tx = pool.begin().await.map_err(|e| {
+    let mut sql_tx = pool.begin().await.inspect_err(|e| {
         error!("Failed to begin transaction for filtered event: {e}");
-        EventProcessingError::Queue(crate::error::EventQueueError::Processing(format!(
-            "Failed to begin transaction: {e}"
-        )))
     })?;
 
     mark_event_processed(&mut sql_tx, event_id).await?;
 
-    sql_tx.commit().await.map_err(|e| {
+    sql_tx.commit().await.inspect_err(|e| {
         error!("Failed to commit transaction for filtered event: {e}");
-        EventProcessingError::Queue(crate::error::EventQueueError::Processing(format!(
-            "Failed to commit transaction: {e}"
-        )))
     })?;
 
     Ok(None)

@@ -121,7 +121,6 @@ pub(crate) enum ExecutionThreshold {
 }
 
 impl ExecutionThreshold {
-    #[cfg(test)]
     pub(crate) fn shares(value: FractionalShares) -> Result<Self, InvalidThresholdError> {
         if value.is_negative() {
             return Err(InvalidThresholdError::NegativeShares(value));
@@ -134,7 +133,6 @@ impl ExecutionThreshold {
         Ok(Self::Shares(value))
     }
 
-    #[cfg(test)]
     pub(crate) fn dollar_value(value: Usdc) -> Result<Self, InvalidThresholdError> {
         if value.is_negative() {
             return Err(InvalidThresholdError::NegativeDollarValue(value));

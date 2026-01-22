@@ -11,7 +11,7 @@ use st0x_execution::{Direction, SupportedExecutor, Symbol};
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::shares::{ArithmeticError, FractionalShares, HasZero};
-use crate::threshold::ExecutionThreshold;
+use crate::threshold::{ExecutionThreshold, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -21,6 +21,7 @@ pub(crate) struct Position {
     pub(crate) accumulated_short: FractionalShares,
     pub(crate) pending_execution_id: Option<ExecutionId>,
     pub(crate) threshold: ExecutionThreshold,
+    pub(crate) last_price_usdc: Option<Decimal>,
     pub(crate) last_updated: Option<DateTime<Utc>>,
 }
 

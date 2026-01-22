@@ -28,17 +28,17 @@ pub enum PythError {
     #[error("No Pyth call found matching price feed ID {0}")]
     NoMatchingFeedId(B256),
     #[error("Failed to decode Pyth return data: {0}")]
-    DecodeError(String),
+    AbiDecode(#[from] alloy::sol_types::Error),
     #[error("Pyth response structure invalid: {0}")]
-    InvalidResponse(String),
+    InvalidResponse(&'static str),
     #[error("Trace is not CallTracer variant")]
     InvalidTraceVariant,
     #[error("Arithmetic overflow in price conversion")]
     ArithmeticOverflow,
     #[error("RPC error while fetching trace: {0}")]
-    RpcError(String),
+    Rpc(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Failed to convert Pyth data: {0}")]
-    ConversionFailed(String),
+    ConversionFailed(&'static str),
     #[error("Invalid timestamp value: {0}")]
     InvalidTimestamp(U256),
 }
@@ -67,9 +67,9 @@ impl PythPricing {
         let pyth_price = extract_pyth_price(tx_hash, &provider, symbol, feed_id_cache).await?;
 
         let price_decimal = pyth_price.to_decimal()?;
-        let price_f64 = price_decimal
-            .to_f64()
-            .ok_or_else(|| PythError::ConversionFailed("Price to f64 conversion failed".into()))?;
+        let price_f64 = price_decimal.to_f64().ok_or(PythError::ConversionFailed(
+            "Price to f64 conversion failed",
+        ))?;
 
         let confidence_f64 = scale_with_exponent(pyth_price.conf, pyth_price.expo)?;
 
@@ -115,9 +115,9 @@ fn scale_with_exponent(value: u64, exponent: i32) -> Result<f64, PythError> {
             .ok_or(PythError::ArithmeticOverflow)?
     };
 
-    scaled
-        .to_f64()
-        .ok_or_else(|| PythError::ConversionFailed("Decimal to f64 conversion failed".into()))
+    scaled.to_f64().ok_or(PythError::ConversionFailed(
+        "Decimal to f64 conversion failed",
+    ))
 }
 
 pub fn find_pyth_calls(trace: &GethTrace) -> Result<Vec<PythCall>, PythError> {
@@ -172,8 +172,7 @@ fn extract_price_feed_id(input: &Bytes) -> Option<B256> {
 }
 
 pub fn decode_pyth_price(output: &Bytes) -> Result<Price, PythError> {
-    let price = Price::abi_decode(output)
-        .map_err(|e| PythError::DecodeError(format!("ABI decode failed: {e}")))?;
+    let price = Price::abi_decode(output)?;
 
     Ok(price)
 }
@@ -184,7 +183,7 @@ impl Price {
 
         let result = if exponent >= 0 {
             let price_value = Decimal::from_i64(self.price)
-                .ok_or_else(|| PythError::InvalidResponse("price value too large".to_string()))?;
+                .ok_or(PythError::InvalidResponse("price value too large"))?;
 
             let multiplier = (0..exponent).try_fold(Decimal::from(1_i64), |acc, _| {
                 acc.checked_mul(Decimal::from(10_i64))
@@ -193,17 +192,17 @@ impl Price {
 
             price_value
                 .checked_mul(multiplier)
-                .ok_or(PythError::ArithmeticOverflow)
+                .ok_or(PythError::ArithmeticOverflow)?
         } else {
             let decimals = exponent
                 .checked_abs()
                 .ok_or(PythError::ArithmeticOverflow)?
                 .try_into()
-                .map_err(|_| PythError::InvalidResponse("exponent too large".to_string()))?;
+                .map_err(|_| PythError::InvalidResponse("exponent too large"))?;
 
             Decimal::try_new(self.price, decimals)
-                .map_err(|e| PythError::InvalidResponse(format!("failed to create decimal: {e}")))
-        }?;
+                .map_err(|_| PythError::InvalidResponse("failed to create decimal"))?
+        };
 
         Ok(result.normalize())
     }
@@ -325,7 +324,7 @@ where
     let trace = provider
         .debug_trace_transaction(tx_hash, options)
         .await
-        .map_err(|e| PythError::RpcError(e.to_string()))?;
+        .map_err(|e| PythError::Rpc(Box::new(e)))?;
 
     Ok(trace)
 }
@@ -609,7 +608,7 @@ mod tests {
         let malformed = Bytes::from(vec![0x01, 0x02, 0x03]);
         let result = decode_pyth_price(&malformed);
 
-        assert!(matches!(result, Err(PythError::DecodeError(_))));
+        assert!(matches!(result, Err(PythError::AbiDecode(_))));
     }
 
     #[test]

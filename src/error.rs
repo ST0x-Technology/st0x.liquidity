@@ -92,8 +92,16 @@ pub(crate) enum AlloyError {
 pub(crate) enum EventQueueError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Event queue error: {0}")]
-    Processing(String),
+    #[error("Log missing required field: {0}")]
+    MissingLogField(&'static str),
+    #[error("Queued event missing ID")]
+    MissingEventId,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
+    #[error("Event serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Invalid tx_hash format: {0}")]
+    InvalidTxHash(#[from] alloy::hex::FromHexError),
 }
 
 /// Event processing errors for live event handling.

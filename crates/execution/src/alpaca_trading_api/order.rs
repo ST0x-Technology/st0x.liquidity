@@ -61,8 +61,7 @@ pub(super) async fn get_order_status(
 
     let order_response = client.issue::<order::Get>(&alpaca_order_id).await?;
 
-    let symbol = Symbol::new(order_response.symbol.clone())
-        .map_err(|e| AlpacaTradingApiError::InvalidOrder(e.to_string()))?;
+    let symbol = Symbol::new(order_response.symbol.clone())?;
 
     let shares = extract_shares_from_amount(&order_response.amount)?;
 
@@ -102,8 +101,7 @@ pub(super) async fn poll_pending_orders(
     let order_updates = alpaca_orders
         .into_iter()
         .map(|alpaca_order| {
-            let symbol = Symbol::new(alpaca_order.symbol.clone())
-                .map_err(|e| AlpacaTradingApiError::InvalidOrder(e.to_string()))?;
+            let symbol = Symbol::new(alpaca_order.symbol.clone())?;
 
             let shares = extract_shares_from_amount(&alpaca_order.amount)?;
 
@@ -197,7 +195,7 @@ fn extract_shares_from_amount(amount: &order::Amount) -> Result<Shares, AlpacaTr
     match amount {
         order::Amount::Quantity { quantity } => {
             let qty_u64 = quantity.to_string().parse::<u64>()?;
-            Shares::new(qty_u64).map_err(|e| AlpacaTradingApiError::InvalidOrder(e.to_string()))
+            Ok(Shares::new(qty_u64)?)
         }
         order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
     }
