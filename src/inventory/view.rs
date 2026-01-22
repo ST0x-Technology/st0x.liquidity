@@ -127,7 +127,8 @@ where
     T: Add<Output = Result<T, ArithmeticError<T>>>
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy
-        + HasZero,
+        + HasZero
+        + PartialOrd,
 {
     fn add_onchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         Ok(Self {
@@ -201,6 +202,13 @@ where
         inflight_amount: T,
         actual_amount: T,
     ) -> Result<Self, InventoryError<T>> {
+        if actual_amount > inflight_amount {
+            return Err(InventoryError::ActualExceedsInflight {
+                actual: actual_amount,
+                inflight: inflight_amount,
+            });
+        }
+
         Ok(Self {
             offchain: self.offchain.confirm_inflight(inflight_amount)?,
             onchain: self.onchain.add_available(actual_amount)?,
@@ -215,6 +223,13 @@ where
         inflight_amount: T,
         actual_amount: T,
     ) -> Result<Self, InventoryError<T>> {
+        if actual_amount > inflight_amount {
+            return Err(InventoryError::ActualExceedsInflight {
+                actual: actual_amount,
+                inflight: inflight_amount,
+            });
+        }
+
         Ok(Self {
             onchain: self.onchain.confirm_inflight(inflight_amount)?,
             offchain: self.offchain.add_available(actual_amount)?,

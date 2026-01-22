@@ -285,6 +285,8 @@ pub(crate) enum CctpError {
     MessageTooShort { length: usize },
     #[error("Fee calculation overflow")]
     FeeCalculationOverflow,
+    #[error("Amount too large for fee calculation: {0}")]
+    AmountConversion(#[from] alloy::primitives::ruint::FromUintError<u128>),
     #[error("Fast transfer fee not available for {direction:?}")]
     FastTransferFeeNotAvailable { direction: BridgeDirection },
     #[error("Invalid hex encoding: {0}")]
@@ -385,8 +387,9 @@ where
 
         // Calculate maxFee: amount * fee_bps / 10000
         // Using Decimal arithmetic to handle fractional basis points
+        let amount_u128: u128 = amount.try_into()?;
         let amount_decimal =
-            Decimal::from_u128(amount.to::<u128>()).ok_or(CctpError::FeeCalculationOverflow)?;
+            Decimal::from_u128(amount_u128).ok_or(CctpError::FeeCalculationOverflow)?;
         let max_fee_decimal = amount_decimal * fast_fee / Decimal::from(10_000);
         let max_fee_rounded = max_fee_decimal.ceil();
         let max_fee = U256::from(
