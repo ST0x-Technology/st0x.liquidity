@@ -105,8 +105,10 @@ pub(crate) enum EventProcessingError {
     EnqueueClearV3(#[source] EventQueueError),
     #[error("Failed to enqueue TakeOrderV3 event: {0}")]
     EnqueueTakeOrderV3(#[source] EventQueueError),
-    #[error("Failed to process trade through accumulator: {0}")]
-    AccumulatorProcessing(String),
+    #[error("Database transaction error: {0}")]
+    Transaction(#[from] sqlx::Error),
+    #[error("Execution with ID {0} not found")]
+    ExecutionNotFound(i64),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
@@ -172,6 +174,12 @@ pub(crate) enum OnChainError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
+    #[error("Dual write error: {0}")]
+    DualWrite(#[from] crate::dual_write::DualWriteError),
+    #[error("Position error: {0}")]
+    Position(#[from] crate::position::PositionError),
+    #[error("Shares conversion error: {0}")]
+    SharesConversion(#[from] crate::shares::SharesConversionError),
 }
 
 impl From<sqlx::Error> for OnChainError {

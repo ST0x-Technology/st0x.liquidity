@@ -446,6 +446,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_alpaca() -> Config {
         Config {
@@ -463,6 +464,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -513,6 +515,7 @@ mod tests {
                     deviation: dec!(0.1),
                 },
             }),
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

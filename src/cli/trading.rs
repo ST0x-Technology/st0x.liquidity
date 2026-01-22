@@ -12,6 +12,7 @@ use st0x_execution::{
     Symbol, TryIntoExecutor,
 };
 
+use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
@@ -272,9 +273,26 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
+    let dual_write_context =
+        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
+
+    // Update Position aggregate first so threshold check sees current state
+    crate::dual_write::initialize_position(
+        &dual_write_context,
+        onchain_trade.symbol.base(),
+        config.execution_threshold,
+    )
+    .await
+    .ok(); // OK if already initialized
+
+    crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &onchain_trade)
+        .await
+        .ok(); // Best effort - may fail if missing timestamp
+
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
+        &dual_write_context,
         onchain_trade,
         config.broker.to_supported_executor(),
     )
@@ -354,6 +372,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::onchain::EvmEnv;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
+    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -380,6 +399,7 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

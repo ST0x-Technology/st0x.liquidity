@@ -533,6 +533,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::onchain::EvmEnv;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -550,6 +551,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

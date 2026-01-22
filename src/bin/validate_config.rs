@@ -28,5 +28,6 @@ fn error_kind(e: &ConfigError) -> &'static str {
         ConfigError::Clap(_) => "missing or invalid environment variable",
         ConfigError::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
         ConfigError::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
+        ConfigError::InvalidThreshold(_) => "invalid execution threshold",
     }
 }

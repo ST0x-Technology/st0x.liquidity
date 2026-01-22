@@ -227,7 +227,8 @@ impl Conductor {
 
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
 
-        let dual_write_context = DualWriteContext::new(pool.clone());
+        let dual_write_context =
+            DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
         // Spawn rebalancer with the provider if configured
         let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
@@ -334,7 +335,8 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_config.polling_interval, poller_config.max_jitter
     );
 
-    let dual_write_context = DualWriteContext::new(pool.clone());
+    let dual_write_context =
+        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
     let poller = OrderStatusPoller::new(poller_config, pool.clone(), executor, dual_write_context);
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
@@ -396,7 +398,8 @@ where
     let config_clone = config.clone();
     let pool_clone = pool.clone();
     let cache_clone = cache.clone();
-    let dual_write_context = DualWriteContext::new(pool.clone());
+    let dual_write_context =
+        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
     tokio::spawn(async move {
         run_queue_processor(
@@ -789,16 +792,6 @@ async fn process_valid_trade(
     .await
 }
 
-async fn execute_onchain_trade_dual_write(
-    dual_write_context: &DualWriteContext,
-    trade: &OnchainTrade,
-    block_number: u64,
-) {
-    execute_witness_trade(dual_write_context, trade, block_number).await;
-    execute_initialize_position(dual_write_context, trade).await;
-    execute_acknowledge_fill(dual_write_context, trade).await;
-}
-
 async fn execute_witness_trade(
     dual_write_context: &DualWriteContext,
     trade: &OnchainTrade,
@@ -822,7 +815,7 @@ async fn execute_initialize_position(dual_write_context: &DualWriteContext, trad
     match crate::dual_write::initialize_position(
         dual_write_context,
         base_symbol,
-        crate::threshold::ExecutionThreshold::whole_share(),
+        dual_write_context.execution_threshold(),
     )
     .await
     {
@@ -961,10 +954,14 @@ async fn process_trade_within_transaction(
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
-    let mut sql_tx = pool.begin().await.map_err(|e| {
-        error!("Failed to begin transaction for event processing: {e}");
-        EventProcessingError::AccumulatorProcessing(format!("Failed to begin transaction: {e}"))
-    })?;
+    // Update Position aggregate FIRST so threshold check sees current state
+    execute_initialize_position(dual_write_context, &trade).await;
+    execute_acknowledge_fill(dual_write_context, &trade).await;
+
+    let mut sql_tx = pool
+        .begin()
+        .await
+        .inspect_err(|e| error!("Failed to begin transaction for event processing: {e}"))?;
 
     info!(
         "Started transaction for atomic event processing: event_id={}, tx_hash={:?}, log_index={}",
@@ -974,17 +971,19 @@ async fn process_trade_within_transaction(
     let TradeProcessingResult {
         execution,
         cleaned_up_executions,
-    } = accumulator::process_onchain_trade(&mut sql_tx, trade.clone(), executor_type)
-        .await
-        .map_err(|e| {
-            error!(
-                "Failed to process trade through accumulator: {e}, tx_hash={:?}, log_index={}",
-                queued_event.tx_hash, queued_event.log_index
-            );
-            EventProcessingError::AccumulatorProcessing(format!(
-                "Failed to process trade through accumulator: {e}"
-            ))
-        })?;
+    } = accumulator::process_onchain_trade(
+        &mut sql_tx,
+        dual_write_context,
+        trade.clone(),
+        executor_type,
+    )
+    .await
+    .inspect_err(|e| {
+        error!(
+            "Failed to process trade through accumulator: {e}, tx_hash={:?}, log_index={}",
+            queued_event.tx_hash, queued_event.log_index
+        );
+    })?;
 
     mark_event_processed(&mut sql_tx, event_id)
         .await
@@ -993,12 +992,11 @@ async fn process_trade_within_transaction(
             EventProcessingError::Queue(e)
         })?;
 
-    sql_tx.commit().await.map_err(|e| {
+    sql_tx.commit().await.inspect_err(|e| {
         error!(
             "Failed to commit transaction for event processing: {e}, event_id={}, tx_hash={:?}",
             event_id, queued_event.tx_hash
         );
-        EventProcessingError::AccumulatorProcessing(format!("Failed to commit transaction: {e}"))
     })?;
 
     info!(
@@ -1006,7 +1004,8 @@ async fn process_trade_within_transaction(
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    execute_onchain_trade_dual_write(dual_write_context, &trade, queued_event.block_number).await;
+    // Record OnChainTrade event (Position already updated above)
+    execute_witness_trade(dual_write_context, &trade, queued_event.block_number).await;
 
     if let Some(ref exec) = execution {
         let base_symbol = trade.symbol.base();
@@ -1059,7 +1058,8 @@ where
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let executions = check_all_accumulated_positions(pool, executor_type).await?;
+    let executions =
+        check_all_accumulated_positions(pool, dual_write_context, executor_type).await?;
 
     if executions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1133,11 +1133,7 @@ where
 {
     let execution = find_execution_by_id(pool, execution_id)
         .await?
-        .ok_or_else(|| {
-            EventProcessingError::AccumulatorProcessing(format!(
-                "Execution with ID {execution_id} not found"
-            ))
-        })?;
+        .ok_or(EventProcessingError::ExecutionNotFound(execution_id))?;
 
     info!("Executing offchain order: {execution:?}");
 
@@ -1465,9 +1461,12 @@ mod tests {
             )
             .await
             {
+                let dual_write_context = DualWriteContext::new(pool.clone());
+
                 let mut sql_tx = pool.begin().await.unwrap();
                 let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
                     &mut sql_tx,
+                    &dual_write_context,
                     trade,
                     SupportedExecutor::DryRun,
                 )
@@ -1953,7 +1952,7 @@ mod tests {
             execute_pending_offchain_execution(&executor, &pool, &dual_write_context, 99999).await;
         assert!(matches!(
             result.unwrap_err(),
-            EventProcessingError::AccumulatorProcessing(_)
+            EventProcessingError::ExecutionNotFound(99999)
         ));
     }
 
@@ -1970,7 +1969,10 @@ mod tests {
         trade.direction = Direction::Buy;
         trade.block_timestamp = Some(chrono::Utc::now());
 
-        execute_onchain_trade_dual_write(&dual_write_context, &trade, 12345).await;
+        // Test the individual dual-write functions that were split out
+        execute_witness_trade(&dual_write_context, &trade, 12345).await;
+        execute_initialize_position(&dual_write_context, &trade).await;
+        execute_acknowledge_fill(&dual_write_context, &trade).await;
 
         // Verify OnChainTrade event was created
         let onchain_trade_events: Vec<String> = sqlx::query_scalar!(

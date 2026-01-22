@@ -1,13 +1,16 @@
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use tracing::Level;
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
+use crate::shares::FractionalShares;
 use crate::telemetry::HyperDxConfig;
+use crate::threshold::{ExecutionThreshold, Usdc};
 use st0x_execution::SupportedExecutor;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
@@ -113,6 +116,8 @@ pub enum ConfigError {
     MissingOrderOwner,
     #[error("failed to derive address from EVM_PRIVATE_KEY")]
     PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
+    #[error("Invalid execution threshold: {0}")]
+    InvalidThreshold(#[from] InvalidThresholdError),
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +131,7 @@ pub struct Config {
     pub(crate) broker: BrokerConfig,
     pub hyperdx: Option<HyperDxConfig>,
     pub(crate) rebalancing: Option<RebalancingConfig>,
+    pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -196,6 +202,17 @@ impl Env {
             return Err(ConfigError::MissingOrderOwner);
         }
 
+        let execution_threshold = match self.executor {
+            // Schwab doesn't support fractional shares, so use 1 whole share threshold
+            SupportedExecutor::Schwab | SupportedExecutor::DryRun => {
+                ExecutionThreshold::whole_share()
+            }
+            // Alpaca supports fractional shares, so use dollar value threshold
+            SupportedExecutor::AlpacaTradingApi | SupportedExecutor::AlpacaBrokerApi => {
+                ExecutionThreshold::DollarValue(Usdc(Decimal::ONE))
+            }
+        };
+
         Ok(Config {
             database_url: self.database_url,
             log_level: self.log_level,
@@ -206,6 +223,7 @@ impl Env {
             broker,
             hyperdx,
             rebalancing,
+            execution_threshold,
         })
     }
 }
@@ -248,13 +266,16 @@ pub fn setup_tracing(log_level: &LogLevel) {
 }
 
 #[cfg(test)]
-pub mod tests {
-    use super::*;
-    use crate::onchain::EvmEnv;
+pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use rust_decimal::Decimal;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
+
+    use super::*;
+    use crate::onchain::EvmEnv;
+    use crate::shares::FractionalShares;
+    use crate::threshold::{ExecutionThreshold, Usdc};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -281,6 +302,7 @@ pub mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -829,7 +851,6 @@ pub mod tests {
                     "ENCRYPTION_KEY",
                     Some("0000000000000000000000000000000000000000000000000000000000000000"),
                 ),
-                // Explicitly unset ORDER_OWNER and REBALANCING_ENABLED
                 ("ORDER_OWNER", None::<&str>),
                 ("REBALANCING_ENABLED", None::<&str>),
             ],
@@ -842,7 +863,6 @@ pub mod tests {
                     "ws://localhost:8545",
                     "--orderbook",
                     "0x1111111111111111111111111111111111111111",
-                    // No --order-owner argument
                     "--deployment-block",
                     "1",
                     "--executor",
@@ -898,6 +918,138 @@ pub mod tests {
                     order_owner,
                     address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn default_execution_threshold_is_one_share() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", None::<&str>),
+                ("EXECUTION_THRESHOLD_TYPE", None::<&str>),
+                ("EXECUTION_THRESHOLD_VALUE", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "dry-run",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+
+                assert_eq!(
+                    config.execution_threshold,
+                    ExecutionThreshold::shares(FractionalShares::ONE).unwrap()
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn dry_run_executor_uses_shares_threshold() {
+        temp_env::with_vars([("REBALANCING_ENABLED", None::<&str>)], || {
+            let args = vec![
+                "test",
+                "--db",
+                ":memory:",
+                "--ws-rpc-url",
+                "ws://localhost:8545",
+                "--orderbook",
+                "0x1111111111111111111111111111111111111111",
+                "--order-owner",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--deployment-block",
+                "1",
+                "--executor",
+                "dry-run",
+            ];
+
+            let env = Env::try_parse_from(args).unwrap();
+            let config = env.into_config().unwrap();
+
+            let expected = ExecutionThreshold::shares(FractionalShares::ONE).unwrap();
+            assert_eq!(config.execution_threshold, expected);
+        });
+    }
+
+    #[test]
+    fn alpaca_trading_api_executor_uses_dollar_threshold() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", None::<&str>),
+                ("ALPACA_API_KEY", Some("test-key")),
+                ("ALPACA_API_SECRET", Some("test-secret")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-trading-api",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+
+                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
+                assert_eq!(config.execution_threshold, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_broker_api_executor_uses_dollar_threshold() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", None::<&str>),
+                ("ALPACA_BROKER_API_KEY", Some("test-key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test-secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test-account-id")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+
+                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
+                assert_eq!(config.execution_threshold, expected);
             },
         );
     }

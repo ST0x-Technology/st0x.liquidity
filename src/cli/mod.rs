@@ -621,6 +621,7 @@ mod tests {
     use crate::onchain::EvmEnv;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
+    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -1085,6 +1086,7 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -1136,6 +1138,7 @@ mod tests {
                 "topics": [ClearV3::SIGNATURE_HASH],
                 "data": format!("0x{}", hex::encode(clear_event.into_log_data().data)),
                 "blockNumber": "0x64",
+                "blockTimestamp": "0x6553f100",
                 "transactionHash": tx_hash,
                 "transactionIndex": "0x0",
                 "logIndex": "0x0",
@@ -1171,7 +1174,7 @@ mod tests {
                 "0x1111111111111111111111111111111111111111111111111111111111111111"
             )),
             block_number: Some(100),
-            block_timestamp: None,
+            block_timestamp: Some(1_700_000_000),
             transaction_hash: Some(tx_hash),
             transaction_index: Some(0),
             log_index: Some(1),
