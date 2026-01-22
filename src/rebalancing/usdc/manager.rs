@@ -478,6 +478,8 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
+                    actual_amount: u256_to_usdc(mint_receipt.amount)?,
+                    fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
                 },
             )
             .await?;
@@ -737,6 +739,8 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
+                    actual_amount: u256_to_usdc(mint_receipt.amount)?,
+                    fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
                 },
             )
             .await?;
@@ -1646,9 +1650,16 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
-            .await
-            .unwrap();
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
+        )
+        .await
+        .unwrap();
 
         cqrs.execute(
             &id.0,
@@ -1915,9 +1926,16 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmBridging { mint_tx })
-            .await
-            .unwrap();
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
+        )
+        .await
+        .unwrap();
 
         cqrs.execute(
             &id.0,

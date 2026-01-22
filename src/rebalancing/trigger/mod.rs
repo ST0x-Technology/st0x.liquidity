@@ -1228,6 +1228,8 @@ mod tests {
     fn make_usdc_bridged() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         }
     }
@@ -1924,7 +1926,11 @@ mod tests {
 
         cqrs.execute(
             aggregate_id,
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
         )
         .await
         .unwrap();
@@ -1999,7 +2005,11 @@ mod tests {
 
         cqrs.execute(
             aggregate_id,
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
         )
         .await
         .unwrap();
@@ -2266,7 +2276,11 @@ mod tests {
 
         cqrs.execute(
             aggregate_id,
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
         )
         .await
         .unwrap();

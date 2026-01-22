@@ -1389,9 +1389,11 @@ mod tests {
         }
     }
 
-    fn make_bridged_event() -> UsdcRebalanceEvent {
+    fn make_bridged_event(actual_amount: Usdc, fee_collected: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
+            actual_amount,
+            fee_collected,
             minted_at: Utc::now(),
         }
     }
@@ -1452,7 +1454,7 @@ mod tests {
     #[test]
     fn apply_usdc_bridged_alpaca_to_base_transfers_to_onchain() {
         let view = make_usdc_view(1000, 0, 900, 100);
-        let event = make_bridged_event();
+        let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
             .apply_usdc_rebalance_event(
@@ -1471,7 +1473,7 @@ mod tests {
     #[test]
     fn apply_usdc_bridged_base_to_alpaca_transfers_to_offchain() {
         let view = make_usdc_view(900, 100, 1000, 0);
-        let event = make_bridged_event();
+        let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
             .apply_usdc_rebalance_event(
@@ -1519,7 +1521,12 @@ mod tests {
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .apply_usdc_rebalance_event(
+                &make_bridged_event(amount, Usdc(dec!(0))),
+                &direction,
+                amount,
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(
             after_bridged.usdc.onchain.total().unwrap().0,
@@ -1558,7 +1565,12 @@ mod tests {
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .apply_usdc_rebalance_event(
+                &make_bridged_event(amount, Usdc(dec!(0))),
+                &direction,
+                amount,
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(
             after_bridged.usdc.offchain.total().unwrap().0,
@@ -1831,6 +1843,52 @@ mod tests {
         // USDC balances should NOT change for conversion failure
         assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
+    }
+
+    #[test]
+    fn apply_usdc_bridged_uses_actual_amount_not_requested_amount() {
+        // BUG TEST: When CCTP fees are deducted, inventory should reflect actual received amount
+        // Request: 100 USDC, Fee: 0.01 USDC, Actual received: 99.99 USDC
+        let requested_amount = usdc(100);
+        let actual_amount = Usdc(dec!(99.99));
+        let fee_collected = Usdc(dec!(0.01));
+
+        // Start with 100 inflight (the requested amount)
+        let view = make_usdc_view(1000, 0, 900, 100);
+
+        // The Bridged event should contain the actual amount received
+        let event = UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: TxHash::random(),
+            minted_at: Utc::now(),
+            actual_amount,
+            fee_collected,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                requested_amount, // This should be ignored - event's actual_amount should be used
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Onchain should receive the ACTUAL amount (99.99), not the requested (100)
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().0,
+            dec!(1099.99),
+            "onchain should have 1000 + 99.99 (actual received), not 1000 + 100 (requested)"
+        );
+
+        // Offchain should have the fee deducted from total
+        // Started with 900 available + 100 inflight = 1000 total
+        // After bridge: 100 inflight consumed, but only 99.99 arrived at destination
+        // So offchain total is now 900 (the 0.01 fee was lost in transit)
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().0,
+            dec!(900),
+            "offchain should have 900 (inflight consumed)"
+        );
     }
 
     #[test]

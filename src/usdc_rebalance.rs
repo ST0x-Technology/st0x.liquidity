@@ -202,7 +202,14 @@ pub(crate) enum UsdcRebalanceCommand {
         cctp_nonce: u64,
     },
     /// Confirm the CCTP mint transaction. Valid only from `Attested` state.
-    ConfirmBridging { mint_tx: TxHash },
+    /// Includes actual amounts from the MintAndWithdraw event for accurate inventory tracking.
+    ConfirmBridging {
+        mint_tx: TxHash,
+        /// Actual USDC received (from MintAndWithdraw event)
+        actual_amount: Usdc,
+        /// CCTP fee collected (from MintAndWithdraw event)
+        fee_collected: Usdc,
+    },
     /// Start deposit to destination. Valid only from `Bridged` state.
     InitiateDeposit { deposit: TransferRef },
     /// Confirm successful deposit. Valid only from `DepositInitiated` state.
@@ -267,8 +274,13 @@ pub(crate) enum UsdcRebalanceEvent {
         attested_at: DateTime<Utc>,
     },
     /// CCTP mint transaction confirmed on destination chain.
+    /// Contains actual amount received (after CCTP fees) for accurate inventory tracking.
     Bridged {
         mint_tx_hash: TxHash,
+        /// Actual USDC received on destination chain (requested amount - CCTP fee)
+        actual_amount: Usdc,
+        /// CCTP fee collected during the bridge
+        fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
     /// Bridging failed. Preserves burn data when available for debugging.
@@ -398,7 +410,12 @@ pub(crate) enum UsdcRebalance {
     /// USDC has been minted on destination chain via CCTP
     Bridged {
         direction: RebalanceDirection,
+        /// Originally requested amount (before CCTP fee)
         amount: Usdc,
+        /// Actual USDC received on destination chain (from MintAndWithdraw event)
+        actual_amount: Usdc,
+        /// CCTP fee collected during the bridge (from MintAndWithdraw event)
+        fee_collected: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -503,9 +520,11 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
                 cctp_nonce,
             } => self.handle_receive_attestation(attestation, *cctp_nonce),
 
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx } => {
-                self.handle_confirm_bridging(mint_tx)
-            }
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                actual_amount,
+                fee_collected,
+            } => self.handle_confirm_bridging(mint_tx, *actual_amount, *fee_collected),
 
             UsdcRebalanceCommand::FailBridging { reason } => self.handle_fail_bridging(reason),
 
@@ -787,6 +806,8 @@ impl Lifecycle<UsdcRebalance, Never> {
     fn handle_confirm_bridging(
         &self,
         mint_tx: &TxHash,
+        actual_amount: Usdc,
+        fee_collected: Usdc,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
             Err(LifecycleError::Uninitialized)
@@ -802,6 +823,8 @@ impl Lifecycle<UsdcRebalance, Never> {
 
             Ok(UsdcRebalance::Attested { .. }) => Ok(vec![UsdcRebalanceEvent::Bridged {
                 mint_tx_hash: *mint_tx,
+                actual_amount,
+                fee_collected,
                 minted_at: Utc::now(),
             }]),
 
@@ -1008,8 +1031,10 @@ impl UsdcRebalance {
             } => current.apply_attestation_received(attestation, *cctp_nonce, *attested_at),
             UsdcRebalanceEvent::Bridged {
                 mint_tx_hash,
+                actual_amount,
+                fee_collected,
                 minted_at,
-            } => current.apply_bridged(*mint_tx_hash, *minted_at),
+            } => current.apply_bridged(*mint_tx_hash, *actual_amount, *fee_collected, *minted_at),
             UsdcRebalanceEvent::BridgingFailed {
                 burn_tx_hash,
                 cctp_nonce,
@@ -1250,6 +1275,8 @@ impl UsdcRebalance {
     fn apply_bridged(
         &self,
         mint_tx_hash: TxHash,
+        actual_amount: Usdc,
+        fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::Attested {
@@ -1269,6 +1296,8 @@ impl UsdcRebalance {
         Ok(Self::Bridged {
             direction: direction.clone(),
             amount: *amount,
+            actual_amount,
+            fee_collected,
             burn_tx_hash: *burn_tx_hash,
             mint_tx_hash,
             initiated_at: *initiated_at,
@@ -2527,6 +2556,8 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_tx_hash,
+                    actual_amount: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
                 },
                 &(),
             )
@@ -2594,6 +2625,8 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_tx_hash,
+                    actual_amount: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
                 },
                 &(),
             )
@@ -2848,6 +2881,8 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -2857,6 +2892,8 @@ mod tests {
                     mint_tx: fixed_bytes!(
                         "0x2222222222222222222222222222222222222222222222222222222222222222"
                     ),
+                    actual_amount: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
                 },
                 &(),
             )
@@ -2901,6 +2938,8 @@ mod tests {
             fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3024,6 +3063,8 @@ mod tests {
             sequence: 5,
             payload: UsdcRebalanceEvent::Bridged {
                 mint_tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
                 minted_at,
             },
             metadata: HashMap::new(),
@@ -3036,6 +3077,7 @@ mod tests {
             mint_tx_hash: view_mint_tx,
             initiated_at: view_initiated_at,
             minted_at: view_minted_at,
+            ..
         } = view.live().unwrap()
         else {
             panic!("Expected Bridged state");
@@ -3159,6 +3201,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3244,6 +3288,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3369,6 +3415,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3446,6 +3494,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3494,6 +3544,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3581,6 +3633,8 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
 
@@ -3688,6 +3742,8 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_tx_hash,
+                    actual_amount: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
                 },
                 &(),
             )
@@ -3798,6 +3854,8 @@ mod tests {
             .handle(
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_tx_hash,
+                    actual_amount: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
                 },
                 &(),
             )
@@ -3914,9 +3972,16 @@ mod tests {
             .is_err()
         );
         assert!(
-            agg.handle(UsdcRebalanceCommand::ConfirmBridging { mint_tx }, &())
-                .await
-                .is_err()
+            agg.handle(
+                UsdcRebalanceCommand::ConfirmBridging {
+                    mint_tx,
+                    actual_amount: Usdc(dec!(99.99)),
+                    fee_collected: Usdc(dec!(0.01)),
+                },
+                &(),
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -3948,6 +4013,8 @@ mod tests {
         });
         agg.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash: mint_tx,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::DepositInitiated {
@@ -3995,6 +4062,8 @@ mod tests {
         });
         agg.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash: mint_tx,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
         agg.apply(UsdcRebalanceEvent::DepositInitiated {
@@ -4523,6 +4592,8 @@ mod tests {
         });
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash: mint_tx,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
@@ -4590,6 +4661,8 @@ mod tests {
         });
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash: mint_tx,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
@@ -4666,6 +4739,8 @@ mod tests {
         });
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash: mint_tx,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
@@ -4728,6 +4803,8 @@ mod tests {
         });
         aggregate.apply(UsdcRebalanceEvent::Bridged {
             mint_tx_hash: mint_tx,
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         });
         aggregate.apply(UsdcRebalanceEvent::DepositInitiated {
