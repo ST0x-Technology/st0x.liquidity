@@ -542,9 +542,29 @@ impl InventoryView {
                 now,
             ),
 
+            // ConversionConfirmed affects offchain USDC:
+            // - AlpacaToBase (USD->USDC): Adds USDC to offchain (arrived in crypto wallet)
+            // - BaseToAlpaca (USDC->USD): Removes USDC from offchain (converted to USD)
+            (
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount,
+                    ..
+                },
+                _,
+            ) => self.update_usdc(|inv| inv.add_offchain_available(*filled_amount), now),
+
+            (
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    filled_amount,
+                    ..
+                },
+                _,
+            ) => self.update_usdc(|inv| inv.remove_offchain_available(*filled_amount), now),
+
             (
                 UsdcRebalanceEvent::ConversionInitiated { .. }
-                | UsdcRebalanceEvent::ConversionConfirmed { .. }
                 | UsdcRebalanceEvent::ConversionFailed { .. }
                 | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
                 | UsdcRebalanceEvent::WithdrawalFailed { .. }
@@ -1808,44 +1828,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_conversion_confirmed_updates_timestamp_only() {
-        let now = Utc::now();
-        let before = now - chrono::Duration::hours(1);
-
-        let view = InventoryView {
-            usdc: Inventory {
-                onchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
-                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
-                last_rebalancing: None,
-            },
-            equities: HashMap::new(),
-            last_updated: before,
-        };
-
-        let event = UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            converted_at: now,
-        };
-
-        let updated = view
-            .apply_usdc_rebalance_event(
-                &event,
-                &RebalanceDirection::BaseToAlpaca,
-                Usdc(dec!(500)),
-                now,
-            )
-            .unwrap();
-
-        // Timestamp should be updated
-        assert_eq!(updated.last_updated, now);
-
-        // USDC balances should NOT change for conversion events
-        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
-        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
-    }
-
-    #[test]
-    fn apply_conversion_failed_updates_timestamp_only() {
+    fn apply_conversion_failed_keeps_balances_unchanged() {
+        // ConversionFailed should not change any balances - it just updates timestamp.
+        // The conversion order failed, so no USDC was added/removed.
         let now = Utc::now();
         let before = now - chrono::Duration::hours(1);
 
@@ -1867,7 +1852,7 @@ mod tests {
         let updated = view
             .apply_usdc_rebalance_event(
                 &event,
-                &RebalanceDirection::AlpacaToBase,
+                &RebalanceDirection::BaseToAlpaca,
                 Usdc(dec!(500)),
                 now,
             )
@@ -1876,7 +1861,7 @@ mod tests {
         // Timestamp should be updated
         assert_eq!(updated.last_updated, now);
 
-        // USDC balances should NOT change for conversion failure
+        // USDC balances should NOT change for failed conversion
         assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
     }

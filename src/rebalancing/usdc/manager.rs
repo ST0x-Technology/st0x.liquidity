@@ -152,27 +152,34 @@ where
             }
         };
 
-        let filled_amount = order.filled_quantity.ok_or_else(|| {
+        let filled_qty = order.filled_quantity.ok_or_else(|| {
             UsdcRebalanceManagerError::MissingFilledQuantity { order_id: order.id }
         })?;
+        let filled_amount = Usdc(filled_qty);
 
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::ConfirmConversion { filled_amount },
+            )
             .await?;
 
         info!(
             order_id = %order.id,
             requested = %amount.0,
-            filled = %filled_amount,
+            filled = %filled_qty,
             "USD to USDC conversion completed"
         );
-        Ok(Usdc(filled_amount))
+        Ok(filled_amount)
     }
 
     /// Converts USDC to USD buying power.
     ///
     /// Used at the end of BaseToAlpaca flow, after deposit is confirmed.
     /// Places a sell order on USDC/USD and polls until filled.
+    ///
+    /// Returns the actual filled USDC amount (the USDC sold, which may differ from requested
+    /// if there's a partial fill).
     ///
     /// # Event Sourcing Flow
     ///
@@ -188,7 +195,7 @@ where
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
-    ) -> Result<(), UsdcRebalanceManagerError> {
+    ) -> Result<Usdc, UsdcRebalanceManagerError> {
         let Usdc(decimal_amount) = amount;
         let correlation_id = Uuid::new_v4();
 
@@ -225,12 +232,27 @@ where
             }
         };
 
+        let filled_amount = order.filled_quantity.ok_or_else(|| {
+            UsdcRebalanceManagerError::MissingFilledQuantity { order_id: order.id }
+        })?;
+        let filled_usdc = Usdc(filled_amount);
+
         self.cqrs
-            .execute(&id.0, UsdcRebalanceCommand::ConfirmConversion)
+            .execute(
+                &id.0,
+                UsdcRebalanceCommand::ConfirmConversion {
+                    filled_amount: filled_usdc,
+                },
+            )
             .await?;
 
-        info!(order_id = %order.id, "USDC to USD conversion completed");
-        Ok(())
+        info!(
+            order_id = %order.id,
+            requested = %amount.0,
+            filled = %filled_amount,
+            "USDC to USD conversion completed"
+        );
+        Ok(filled_usdc)
     }
 
     /// Executes the full Alpaca to Base rebalancing workflow.

@@ -176,7 +176,13 @@ pub(crate) enum UsdcRebalanceCommand {
         order_id: Uuid,
     },
     /// Confirm successful conversion. Valid only from `Converting` state.
-    ConfirmConversion,
+    /// Contains filled_amount for accurate inventory tracking.
+    ConfirmConversion {
+        /// Actual USDC amount from the conversion.
+        /// - AlpacaToBase (USD->USDC): USDC received
+        /// - BaseToAlpaca (USDC->USD): USDC sold
+        filled_amount: Usdc,
+    },
     /// Record conversion failure. Valid only from `Converting` state.
     FailConversion { reason: String },
     /// Start post-deposit conversion for BaseToAlpaca direction.
@@ -238,8 +244,13 @@ pub(crate) enum UsdcRebalanceEvent {
     /// Conversion completed successfully.
     /// Includes direction so terminal detection works with incremental dispatch
     /// (cqrs-es Query::dispatch only receives newly committed events, not full history).
+    /// Contains filled_amount for accurate inventory tracking (may differ from requested due to slippage).
     ConversionConfirmed {
         direction: RebalanceDirection,
+        /// Actual USDC amount from the conversion.
+        /// - AlpacaToBase (USD->USDC): USDC received
+        /// - BaseToAlpaca (USDC->USD): USDC sold
+        filled_amount: Usdc,
         converted_at: DateTime<Utc>,
     },
     /// Conversion failed.
@@ -352,7 +363,10 @@ pub(crate) enum UsdcRebalance {
     /// Conversion has completed, ready for next phase
     ConversionComplete {
         direction: RebalanceDirection,
+        /// Originally requested amount
         amount: Usdc,
+        /// Actual USDC amount from the conversion (may differ due to slippage)
+        filled_amount: Usdc,
         initiated_at: DateTime<Utc>,
         converted_at: DateTime<Utc>,
     },
@@ -493,7 +507,9 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
                 order_id,
             } => self.handle_initiate_conversion(direction, *amount, *order_id),
 
-            UsdcRebalanceCommand::ConfirmConversion => self.handle_confirm_conversion(),
+            UsdcRebalanceCommand::ConfirmConversion { filled_amount } => {
+                self.handle_confirm_conversion(*filled_amount)
+            }
 
             UsdcRebalanceCommand::FailConversion { reason } => self.handle_fail_conversion(reason),
 
@@ -560,11 +576,15 @@ impl Lifecycle<UsdcRebalance, Never> {
         }
     }
 
-    fn handle_confirm_conversion(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+    fn handle_confirm_conversion(
+        &self,
+        filled_amount: Usdc,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         match self.live() {
             Ok(UsdcRebalance::Converting { direction, .. }) => {
                 Ok(vec![UsdcRebalanceEvent::ConversionConfirmed {
                     direction: direction.clone(),
+                    filled_amount,
                     converted_at: Utc::now(),
                 }])
             }
@@ -642,7 +662,7 @@ impl Lifecycle<UsdcRebalance, Never> {
             }]),
             Ok(UsdcRebalance::ConversionComplete {
                 direction: conv_direction,
-                amount: conv_amount,
+                filled_amount: conv_filled_amount,
                 ..
             }) => {
                 if direction != conv_direction {
@@ -652,19 +672,20 @@ impl Lifecycle<UsdcRebalance, Never> {
                     });
                 }
 
-                if amount != *conv_amount {
+                // Compare against filled_amount (actual USDC from conversion), not requested amount
+                if amount != *conv_filled_amount {
                     return Err(UsdcRebalanceError::InvalidCommand {
                         command: "Initiate".to_string(),
                         state: format!(
                             "ConversionComplete with amount mismatch: expected {}, got {}",
-                            conv_amount.0, amount.0
+                            conv_filled_amount.0, amount.0
                         ),
                     });
                 }
 
                 Ok(vec![UsdcRebalanceEvent::Initiated {
                     direction: direction.clone(),
-                    amount: *conv_amount,
+                    amount: *conv_filled_amount,
                     withdrawal_ref: withdrawal.clone(),
                     initiated_at: Utc::now(),
                 }])
@@ -1003,9 +1024,11 @@ impl UsdcRebalance {
         current: &Self,
     ) -> Result<Self, LifecycleError<Never>> {
         match event {
-            UsdcRebalanceEvent::ConversionConfirmed { converted_at, .. } => {
-                current.apply_conversion_confirmed(*converted_at)
-            }
+            UsdcRebalanceEvent::ConversionConfirmed {
+                filled_amount,
+                converted_at,
+                ..
+            } => current.apply_conversion_confirmed(*filled_amount, *converted_at),
             UsdcRebalanceEvent::ConversionFailed { reason, failed_at } => {
                 current.apply_conversion_failed(reason, *failed_at)
             }
@@ -1087,6 +1110,7 @@ impl UsdcRebalance {
 
     fn apply_conversion_confirmed(
         &self,
+        filled_amount: Usdc,
         converted_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::Converting {
@@ -1105,6 +1129,7 @@ impl UsdcRebalance {
         Ok(Self::ConversionComplete {
             direction: direction.clone(),
             amount: *amount,
+            filled_amount,
             initiated_at: *initiated_at,
             converted_at,
         })
@@ -1144,7 +1169,9 @@ impl UsdcRebalance {
         initiated_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::ConversionComplete {
-            direction, amount, ..
+            direction,
+            filled_amount,
+            ..
         } = self
         else {
             return Err(LifecycleError::Mismatch {
@@ -1153,9 +1180,10 @@ impl UsdcRebalance {
             });
         };
 
+        // Use filled_amount (actual USDC from conversion), not original requested amount
         Ok(Self::Withdrawing {
             direction: direction.clone(),
-            amount: *amount,
+            amount: *filled_amount,
             withdrawal_ref: withdrawal_ref.clone(),
             initiated_at,
         })
@@ -4169,8 +4197,12 @@ mod tests {
             initiated_at,
         });
 
+        let filled_amount = Usdc(dec!(998)); // ~0.2% slippage
         let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .handle(
+                UsdcRebalanceCommand::ConfirmConversion { filled_amount },
+                &(),
+            )
             .await
             .unwrap();
 
@@ -4185,6 +4217,7 @@ mod tests {
         let Lifecycle::Live(UsdcRebalance::ConversionComplete {
             direction,
             amount,
+            filled_amount: state_filled,
             initiated_at: state_initiated_at,
             ..
         }) = aggregate
@@ -4194,6 +4227,7 @@ mod tests {
 
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(state_filled, filled_amount);
         assert_eq!(state_initiated_at, initiated_at);
     }
 
@@ -4202,7 +4236,12 @@ mod tests {
         let aggregate = Lifecycle::<UsdcRebalance, Never>::default();
 
         let result = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .handle(
+                UsdcRebalanceCommand::ConfirmConversion {
+                    filled_amount: Usdc(dec!(998)),
+                },
+                &(),
+            )
             .await;
 
         assert!(matches!(
@@ -4225,11 +4264,17 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::AlpacaToBase,
+            filled_amount: Usdc(dec!(998)),
             converted_at: Utc::now(),
         });
 
         let result = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .handle(
+                UsdcRebalanceCommand::ConfirmConversion {
+                    filled_amount: Usdc(dec!(998)),
+                },
+                &(),
+            )
             .await;
 
         assert!(matches!(
@@ -4321,6 +4366,7 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::AlpacaToBase,
+            filled_amount: Usdc(dec!(998)),
             converted_at: Utc::now(),
         });
 
@@ -4344,6 +4390,7 @@ mod tests {
         let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let filled_amount = Usdc(dec!(998)); // ~0.2% slippage
 
         aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
             direction: RebalanceDirection::AlpacaToBase,
@@ -4354,14 +4401,16 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::AlpacaToBase,
+            filled_amount,
             converted_at: Utc::now(),
         });
 
+        // Initiate must use filled_amount, not requested amount
         let events = aggregate
             .handle(
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc(dec!(1000.00)),
+                    amount: filled_amount,
                     withdrawal: TransferRef::AlpacaId(transfer_id),
                 },
                 &(),
@@ -4385,7 +4434,7 @@ mod tests {
         };
 
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
-        assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(amount, filled_amount);
         assert_eq!(withdrawal_ref, TransferRef::AlpacaId(transfer_id));
     }
 
@@ -4394,6 +4443,7 @@ mod tests {
         let mut aggregate = Lifecycle::<UsdcRebalance, Never>::default();
         let order_id = Uuid::new_v4();
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
+        let filled_amount = Usdc(dec!(998));
 
         aggregate.apply(UsdcRebalanceEvent::ConversionInitiated {
             direction: RebalanceDirection::AlpacaToBase,
@@ -4404,6 +4454,7 @@ mod tests {
 
         aggregate.apply(UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::AlpacaToBase,
+            filled_amount,
             converted_at: Utc::now(),
         });
 
@@ -4474,6 +4525,7 @@ mod tests {
         let order_id = Uuid::new_v4();
         let initiated_at = Utc::now();
         let converted_at = Utc::now();
+        let filled_amount = Usdc(dec!(998));
 
         view.update(&EventEnvelope {
             aggregate_id: "rebalance-123".to_string(),
@@ -4492,6 +4544,7 @@ mod tests {
             sequence: 2,
             payload: UsdcRebalanceEvent::ConversionConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
+                filled_amount,
                 converted_at,
             },
             metadata: HashMap::new(),
@@ -4500,6 +4553,7 @@ mod tests {
         let Lifecycle::Live(UsdcRebalance::ConversionComplete {
             direction,
             amount,
+            filled_amount: view_filled_amount,
             initiated_at: view_initiated_at,
             converted_at: view_converted_at,
         }) = view
@@ -4509,6 +4563,7 @@ mod tests {
 
         assert_eq!(direction, RebalanceDirection::AlpacaToBase);
         assert_eq!(amount, Usdc(dec!(1000.00)));
+        assert_eq!(view_filled_amount, filled_amount);
         assert_eq!(view_initiated_at, initiated_at);
         assert_eq!(view_converted_at, converted_at);
     }
@@ -4824,7 +4879,12 @@ mod tests {
         });
 
         let events = aggregate
-            .handle(UsdcRebalanceCommand::ConfirmConversion, &())
+            .handle(
+                UsdcRebalanceCommand::ConfirmConversion {
+                    filled_amount: Usdc(dec!(998)),
+                },
+                &(),
+            )
             .await
             .unwrap();
 
@@ -4846,6 +4906,7 @@ mod tests {
     fn test_from_event_rejects_conversion_confirmed_as_init() {
         let event = UsdcRebalanceEvent::ConversionConfirmed {
             direction: RebalanceDirection::BaseToAlpaca,
+            filled_amount: Usdc(dec!(998)),
             converted_at: Utc::now(),
         };
 
