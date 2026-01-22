@@ -233,13 +233,35 @@ defined in `migrations/20250703115746_trades.sql`.
 
 ### **CI/CD and Deployment**
 
-**Containerization:**
+This section specifies infrastructure, deployment, and secrets management
+requirements. The primary recommendation is a Nix-based approach that extends
+the team's existing Nix usage for development environments.
 
 - Docker containerization for consistent deployment with multi-stage builds
 - Simple CI/CD pipeline for automated builds and deployments
 - Health check endpoints for container orchestration
 - Environment-based configuration injection
 - Resource limits and restart policies for production deployment
+**1. Custom NixOS Images (nixos-generators):**
+
+Build reproducible DigitalOcean VM images directly from flake:
+
+```nix
+# flake.nix
+{
+  inputs.nixos-generators.url = "github:nix-community/nixos-generators";
+
+  outputs = { self, nixpkgs, nixos-generators, ... }: {
+    # Build with: nix build .#digitalOceanImage
+    packages.x86_64-linux.digitalOceanImage =
+      nixos-generators.nixosGenerate {
+        system = "x86_64-linux";
+        format = "do";  # DigitalOcean format
+        modules = [ ./nixos/base.nix ];
+      };
+  };
+}
+```
 
 ## **Crate Architecture**
 
