@@ -57,6 +57,8 @@ use alloy::providers::Provider;
 use alloy::sol;
 use backon::Retryable;
 use rain_error_decoding::AbiDecodedErrorType;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
@@ -303,8 +305,8 @@ pub(crate) enum AttestationError {
 struct FeeEntry {
     /// Finality threshold: 1000 = fast transfer, 2000 = standard transfer
     finality_threshold: u32,
-    /// Minimum fee in basis points (1 = 0.01%)
-    minimum_fee: u64,
+    /// Minimum fee in basis points (1 = 0.01%). May be fractional (e.g., 1.3).
+    minimum_fee: Decimal,
 }
 
 impl<EP, BP> CctpBridge<EP, BP>
@@ -358,15 +360,21 @@ where
 
         debug!(
             ?direction,
-            fast_fee_bps = fast_fee,
-            "Retrieved fast transfer fee"
+            %fast_fee,
+            "Retrieved fast transfer fee (bps)"
         );
 
         // Calculate maxFee: amount * fee_bps / 10000
-        let max_fee = amount
-            .checked_mul(U256::from(fast_fee))
-            .ok_or(CctpError::FeeCalculationOverflow)?
-            / U256::from(10000u64);
+        // Using Decimal arithmetic to handle fractional basis points
+        let amount_decimal =
+            Decimal::from_u128(amount.to::<u128>()).ok_or(CctpError::FeeCalculationOverflow)?;
+        let max_fee_decimal = amount_decimal * fast_fee / Decimal::from(10_000);
+        let max_fee_rounded = max_fee_decimal.ceil();
+        let max_fee = U256::from(
+            max_fee_rounded
+                .to_u128()
+                .ok_or(CctpError::FeeCalculationOverflow)?,
+        );
 
         Ok(max_fee)
     }
@@ -528,6 +536,7 @@ mod tests {
     use httpmock::prelude::*;
     use proptest::prelude::*;
     use rand::Rng;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -1778,6 +1787,16 @@ mod tests {
         let nonce = extract_nonce_from_message(&message).unwrap();
 
         assert_eq!(nonce, FixedBytes::from(expected_nonce));
+    }
+
+    #[test]
+    fn fee_entry_deserializes_float_minimum_fee() {
+        let json = r#"{"finalityThreshold": 1000, "minimumFee": 1.3}"#;
+
+        let entry: FeeEntry = serde_json::from_str(json).unwrap();
+
+        assert_eq!(entry.finality_threshold, 1000);
+        assert_eq!(entry.minimum_fee, dec!(1.3));
     }
 
     proptest! {
