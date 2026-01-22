@@ -237,11 +237,16 @@ This section specifies infrastructure, deployment, and secrets management
 requirements. The primary recommendation is a Nix-based approach that extends
 the team's existing Nix usage for development environments.
 
-- Docker containerization for consistent deployment with multi-stage builds
-- Simple CI/CD pipeline for automated builds and deployments
-- Health check endpoints for container orchestration
-- Environment-based configuration injection
-- Resource limits and restart policies for production deployment
+#### **Design Goals**
+
+- Declarative infrastructure management (eliminate DigitalOcean UI dependency)
+- Declarative secret management (eliminate GitHub Secrets UI dependency)
+- Easy addition of staging environments
+- Independent deployment and rollback of service subsets (6 services)
+- Balanced complexity: more robust than bash scripts, less than Kubernetes
+- Support potential future microservices architecture
+- Thin GitHub Actions workflows (invoke tools, no inline bash)
+- Unified, reusable approach via Nix where possible
 **1. Custom NixOS Images (nixos-generators):**
 
 Build reproducible DigitalOcean VM images directly from flake:
