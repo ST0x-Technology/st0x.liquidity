@@ -194,6 +194,34 @@ where
         })
     }
 
+    /// Transfer from offchain to onchain with fee: confirms `inflight_amount` from offchain
+    /// but only adds `actual_amount` to onchain. The difference is the fee lost in transit.
+    fn transfer_offchain_to_onchain_with_fee(
+        self,
+        inflight_amount: T,
+        actual_amount: T,
+    ) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.confirm_inflight(inflight_amount)?,
+            onchain: self.onchain.add_available(actual_amount)?,
+            ..self
+        })
+    }
+
+    /// Transfer from onchain to offchain with fee: confirms `inflight_amount` from onchain
+    /// but only adds `actual_amount` to offchain. The difference is the fee lost in transit.
+    fn transfer_onchain_to_offchain_with_fee(
+        self,
+        inflight_amount: T,
+        actual_amount: T,
+    ) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            onchain: self.onchain.confirm_inflight(inflight_amount)?,
+            offchain: self.offchain.add_available(actual_amount)?,
+            ..self
+        })
+    }
+
     fn with_last_rebalancing(self, timestamp: DateTime<Utc>) -> Self {
         Self {
             last_rebalancing: Some(timestamp),
@@ -488,12 +516,20 @@ impl InventoryView {
                 self.update_usdc(|inv| inv.move_onchain_to_inflight(amount), now)
             }
 
-            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::AlpacaToBase) => {
-                self.update_usdc(|inv| inv.transfer_offchain_inflight_to_onchain(amount), now)
-            }
-            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::BaseToAlpaca) => {
-                self.update_usdc(|inv| inv.transfer_onchain_inflight_to_offchain(amount), now)
-            }
+            (
+                UsdcRebalanceEvent::Bridged { actual_amount, .. },
+                RebalanceDirection::AlpacaToBase,
+            ) => self.update_usdc(
+                |inv| inv.transfer_offchain_to_onchain_with_fee(amount, *actual_amount),
+                now,
+            ),
+            (
+                UsdcRebalanceEvent::Bridged { actual_amount, .. },
+                RebalanceDirection::BaseToAlpaca,
+            ) => self.update_usdc(
+                |inv| inv.transfer_onchain_to_offchain_with_fee(amount, *actual_amount),
+                now,
+            ),
 
             (
                 UsdcRebalanceEvent::DepositConfirmed {

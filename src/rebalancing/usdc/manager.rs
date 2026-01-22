@@ -930,6 +930,72 @@ mod tests {
         Arc::new(CqrsFramework::new(store, vec![], ()))
     }
 
+    /// Advances aggregate through: Initiate -> ConfirmWithdrawal -> InitiateBridging ->
+    /// ReceiveAttestation -> ConfirmBridging -> InitiateDeposit -> ConfirmDeposit
+    async fn advance_to_deposit_confirmed_base_to_alpaca(
+        cqrs: &TestCqrs,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) {
+        let burn_tx =
+            fixed_bytes!("0xbbbb000000000000000000000000000000000000000000000000000000000001");
+        let mint_tx =
+            fixed_bytes!("0xbbbb111111111111111111111111111111111111111111111111111111111111");
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
+            .await
+            .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::InitiateBridging { burn_tx })
+            .await
+            .unwrap();
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: 99999,
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(
+            &id.0,
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+        )
+        .await
+        .unwrap();
+
+        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
+            .await
+            .unwrap();
+    }
+
     fn setup_anvil() -> (alloy::node_bindings::AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
         let endpoint = anvil.endpoint();
@@ -1892,63 +1958,7 @@ mod tests {
         let id = UsdcRebalanceId::new("base-to-alpaca-conversion-test");
         let amount = Usdc(dec!(1000));
 
-        let burn_tx =
-            fixed_bytes!("0xbbbb000000000000000000000000000000000000000000000000000000000001");
-        let mint_tx =
-            fixed_bytes!("0xbbbb111111111111111111111111111111111111111111111111111111111111");
-
-        cqrs.execute(
-            &id.0,
-            UsdcRebalanceCommand::Initiate {
-                direction: RebalanceDirection::BaseToAlpaca,
-                amount,
-                withdrawal: TransferRef::OnchainTx(burn_tx),
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmWithdrawal)
-            .await
-            .unwrap();
-
-        cqrs.execute(&id.0, UsdcRebalanceCommand::InitiateBridging { burn_tx })
-            .await
-            .unwrap();
-
-        cqrs.execute(
-            &id.0,
-            UsdcRebalanceCommand::ReceiveAttestation {
-                attestation: vec![0x01],
-                cctp_nonce: 99999,
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &id.0,
-            UsdcRebalanceCommand::ConfirmBridging {
-                mint_tx,
-                actual_amount: Usdc(dec!(99.99)),
-                fee_collected: Usdc(dec!(0.01)),
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(
-            &id.0,
-            UsdcRebalanceCommand::InitiateDeposit {
-                deposit: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
-            },
-        )
-        .await
-        .unwrap();
-
-        cqrs.execute(&id.0, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
 
         let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
 
