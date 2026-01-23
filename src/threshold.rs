@@ -145,13 +145,13 @@ impl ExecutionThreshold {
         Ok(Self::DollarValue(value))
     }
 
+    #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
         Self::Shares(FractionalShares::ONE)
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum InvalidThresholdError {
     #[error("Shares threshold cannot be negative: {0:?}")]
     NegativeShares(FractionalShares),

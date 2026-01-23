@@ -65,7 +65,7 @@ pub(crate) struct DualWriteContext {
 
 impl DualWriteContext {
     /// Creates a new context with the default threshold (1 share).
-    /// Used primarily in tests.
+    #[cfg(test)]
     pub(crate) fn new(pool: SqlitePool) -> Self {
         Self::with_threshold(pool, ExecutionThreshold::whole_share())
     }

@@ -132,6 +132,7 @@ proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
 st0x-execution = { path = "crates/execution", features = ["mock"] }
+tracing-test = "0.2.5"
 
 [[bin]]
 name = "migrate_to_events"

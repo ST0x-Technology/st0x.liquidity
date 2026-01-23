@@ -2707,4 +2707,100 @@ mod tests {
             assert_eq!(to_executor_ticker(&symbol).unwrap().to_string(), ticker);
         }
     }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_logs_info_when_event_is_filtered_out() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let feed_id_cache = FeedIdCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+        let log = crate::test_utils::get_test_log();
+
+        crate::queue::enqueue(&pool, &clear_event, &log)
+            .await
+            .unwrap();
+
+        let result = process_next_queued_event(
+            SupportedExecutor::DryRun,
+            &config,
+            &pool,
+            &cache,
+            &provider,
+            &feed_id_cache,
+            &dual_write_context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            logs_contain("Event filtered out"),
+            "Expected info log when event is filtered"
+        );
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_logs_event_type_when_processing() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let feed_id_cache = FeedIdCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+        let log = crate::test_utils::get_test_log();
+
+        crate::queue::enqueue(&pool, &clear_event, &log)
+            .await
+            .unwrap();
+
+        let result = process_next_queued_event(
+            SupportedExecutor::DryRun,
+            &config,
+            &pool,
+            &cache,
+            &provider,
+            &feed_id_cache,
+            &dual_write_context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(
+            logs_contain("ClearV3"),
+            "Expected log to mention event type"
+        );
+    }
 }

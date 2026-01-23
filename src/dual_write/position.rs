@@ -557,8 +557,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_position_reflects_accumulated_fills() {
-        use rust_decimal::Decimal;
-
         let pool = setup_test_db().await;
         let context = DualWriteContext::new(pool);
 
