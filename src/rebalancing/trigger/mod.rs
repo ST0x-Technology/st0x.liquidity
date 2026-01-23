@@ -30,6 +30,7 @@ use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
+use crate::vault::WrappedTokenRegistry;
 use crate::vault_registry::VaultRegistry;
 
 use crate::vault_registry::VaultRegistryError;
@@ -50,12 +51,6 @@ enum TokenAddressError {
 pub enum RebalancingConfigError {
     #[error("rebalancing requires Alpaca broker")]
     NotAlpacaBroker,
-    #[error(transparent)]
-    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
-    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
-    WalletCollision(Address),
-    #[error(transparent)]
-    Uuid(#[from] uuid::Error),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -66,18 +61,18 @@ pub(crate) enum UsdcRebalancingConfig {
     Disabled,
 }
 
-/// TOML fields for rebalancing configuration (without broker auth).
-///
-/// This struct is used when rebalancing config is part of a larger config
-/// where broker auth is provided separately.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// TOML fields for rebalancing configuration.
+/// Alpaca auth is NOT included here - it's derived from the broker config
+/// to eliminate duplication and ensure consistency.
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct RebalancingTomlFields {
-    pub(crate) equity: ImbalanceThreshold,
-    pub(crate) usdc: UsdcRebalancingConfig,
+    pub(crate) equity_threshold: ImbalanceThreshold,
+    pub(crate) usdc_threshold: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
+    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
 }
 
 /// Configuration for rebalancing operations.
@@ -96,41 +91,12 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Parsed from `alpaca_broker_auth.account_id` during construction.
+    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Alpaca Broker API authentication for rebalancing operations.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
-}
-
-impl RebalancingConfig {
-    /// Constructs RebalancingConfig from TOML fields and broker auth.
-    ///
-    /// Validates that the market maker wallet (derived from evm_private_key)
-    /// differs from the redemption_wallet.
-    pub(crate) fn from_toml_and_broker(
-        fields: RebalancingTomlFields,
-        broker_auth: AlpacaBrokerApiAuthConfig,
-    ) -> Result<Self, RebalancingConfigError> {
-        let signer = PrivateKeySigner::from_bytes(&fields.evm_private_key)?;
-        let market_maker_wallet = signer.address();
-
-        if market_maker_wallet == fields.redemption_wallet {
-            return Err(RebalancingConfigError::WalletCollision(market_maker_wallet));
-        }
-
-        let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
-
-        Ok(Self {
-            equity: fields.equity,
-            usdc: fields.usdc,
-            redemption_wallet: fields.redemption_wallet,
-            ethereum_rpc_url: fields.ethereum_rpc_url,
-            evm_private_key: fields.evm_private_key,
-            usdc_vault_id: fields.usdc_vault_id,
-            alpaca_account_id,
-            alpaca_broker_auth: broker_auth,
-        })
-    }
+    /// Registry of wrapped token configurations for ERC-4626 vault operations.
+    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
 }
 
 impl<'de> serde::Deserialize<'de> for RebalancingConfig {
@@ -148,6 +114,7 @@ impl<'de> serde::Deserialize<'de> for RebalancingConfig {
             usdc_vault_id: B256,
             alpaca_account_id: AlpacaAccountId,
             alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+            wrapped_token_registry: WrappedTokenRegistry,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -172,6 +139,7 @@ impl<'de> serde::Deserialize<'de> for RebalancingConfig {
             usdc_vault_id: raw.usdc_vault_id,
             alpaca_account_id: raw.alpaca_account_id,
             alpaca_broker_auth: raw.alpaca_broker_auth,
+            wrapped_token_registry: raw.wrapped_token_registry,
         })
     }
 }
@@ -187,6 +155,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
+            .field("wrapped_token_registry", &self.wrapped_token_registry)
             .finish()
     }
 }
@@ -392,11 +361,14 @@ impl RebalancingTrigger {
             }
         };
 
+        // TODO: Fetch vault ratio from VaultService for wrapped token support.
+        // For now, pass None which treats onchain amounts as unwrapped.
         equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
             token_address,
+            None,
         )
         .await
         .ok()
@@ -510,13 +482,13 @@ impl RebalancingTrigger {
             | TokenizedEquityMintEvent::TokensReceived {
                 symbol, quantity, ..
             }
-            | TokenizedEquityMintEvent::DepositedIntoRaindex {
+            | TokenizedEquityMintEvent::VaultDeposited {
                 symbol, quantity, ..
             }
-            | TokenizedEquityMintEvent::RaindexDepositFailed {
+            | TokenizedEquityMintEvent::VaultDepositFailed {
                 symbol, quantity, ..
             }
-            | TokenizedEquityMintEvent::Completed {
+            | TokenizedEquityMintEvent::MintCompleted {
                 symbol, quantity, ..
             } => (symbol, quantity),
         };
@@ -529,10 +501,10 @@ impl RebalancingTrigger {
         events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
-                TokenizedEquityMintEvent::Completed { .. }
+                TokenizedEquityMintEvent::MintCompleted { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
-                    | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
+                    | TokenizedEquityMintEvent::VaultDepositFailed { .. }
             )
         })
     }
@@ -582,7 +554,7 @@ impl RebalancingTrigger {
             matches!(
                 envelope.payload,
                 EquityRedemptionEvent::Completed { .. }
-                    | EquityRedemptionEvent::TransferFailed { .. }
+                    | EquityRedemptionEvent::SendFailed { .. }
                     | EquityRedemptionEvent::DetectionFailed { .. }
                     | EquityRedemptionEvent::RedemptionRejected { .. }
             )
@@ -708,14 +680,12 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::conductor::wire::test_cqrs;
-    use crate::equity_redemption::DetectionFailure;
     use crate::inventory::InventorySnapshotQuery;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::lifecycle::Lifecycle;
     use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
-    use crate::tokenization::TokenizationRequestStatus;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
@@ -1114,7 +1084,7 @@ mod tests {
     }
 
     fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::Completed {
+        TokenizedEquityMintEvent::MintCompleted {
             symbol: symbol.clone(),
             quantity,
             completed_at: Utc::now(),
@@ -1125,7 +1095,7 @@ mod tests {
         TokenizedEquityMintEvent::MintRejected {
             symbol: symbol.clone(),
             quantity,
-            status_code: None,
+            reason: "API timeout".to_string(),
             rejected_at: Utc::now(),
         }
     }
@@ -1134,7 +1104,7 @@ mod tests {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
             symbol: symbol.clone(),
             quantity,
-            last_status: TokenizationRequestStatus::Pending,
+            reason: "Transaction reverted".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -1422,7 +1392,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            failure: DetectionFailure::Timeout,
+            reason: "Alpaca timeout".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -1435,6 +1405,7 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
+            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         }
     }

@@ -449,6 +449,7 @@ mod tests {
     use crate::rebalancing::RebalancingConfig;
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::threshold::ExecutionThreshold;
+    use crate::vault::WrappedTokenRegistry;
 
     fn create_config_without_alpaca() -> Config {
         Config {
@@ -519,6 +520,7 @@ mod tests {
                     account_id: alpaca_account_id.to_string(),
                     mode: Some(AlpacaBrokerApiMode::Sandbox),
                 },
+                wrapped_token_registry: WrappedTokenRegistry::empty(),
             }),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
