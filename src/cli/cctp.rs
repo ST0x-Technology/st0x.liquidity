@@ -13,6 +13,7 @@ use crate::cctp::{
     USDC_BASE, USDC_ETHEREUM,
 };
 use crate::env::Config;
+use crate::onchain::http_client_with_retry;
 use crate::rebalancing::RebalancingConfig;
 use crate::threshold::Usdc;
 
@@ -47,8 +48,8 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     let amount_u256 = if all {
         let balance = match from {
             CctpChain::Ethereum => {
-                let provider =
-                    ProviderBuilder::new().connect_http(rebalancing.ethereum_rpc_url.clone());
+                let provider = ProviderBuilder::new()
+                    .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
                 IERC20::IERC20Instance::new(USDC_ETHEREUM, provider)
                     .balanceOf(wallet)
                     .call()
@@ -121,7 +122,7 @@ fn build_cctp_bridge<BP: Provider + Clone>(
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(rebalancing.ethereum_rpc_url.clone());
+        .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
     let base_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
@@ -223,7 +224,7 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         CctpChain::Ethereum => {
             let provider = ProviderBuilder::new()
                 .wallet(wallet)
-                .connect_http(rebalancing.ethereum_rpc_url.clone());
+                .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
             reset_allowance(stdout, usdc_address, owner, spender, &provider).await
         }
         CctpChain::Base => {

@@ -8,6 +8,7 @@ use std::io::Write;
 use crate::bindings::IERC20;
 use crate::cctp::USDC_BASE;
 use crate::env::Config;
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 
@@ -58,6 +59,7 @@ pub(super) async fn vault_deposit_command<
         .approve(config.evm.orderbook, amount_u256)
         .send()
         .await?
+        .with_required_confirmations(REQUIRED_CONFIRMATIONS)
         .get_receipt()
         .await?;
     writeln!(

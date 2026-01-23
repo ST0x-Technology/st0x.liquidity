@@ -37,6 +37,7 @@ use crate::cctp::{
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
@@ -150,7 +151,7 @@ where
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
-            .connect_http(config.ethereum_rpc_url.clone());
+            .connect_client(http_client_with_retry(config.ethereum_rpc_url.clone()));
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             alpaca_auth.base_url(),
@@ -487,7 +488,8 @@ mod tests {
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
@@ -495,10 +497,13 @@ mod tests {
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
-        let vault = Arc::new(VaultService::new(base_provider, TEST_ORDERBOOK));
+        let vault = Arc::new(
+            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
+        );
 
         let services = Services {
             tokenization,

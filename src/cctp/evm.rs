@@ -11,6 +11,7 @@ use super::{
 };
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 
 /// EVM chain connection with contract instances for CCTP operations.
 pub(crate) struct Evm<P>
@@ -53,7 +54,7 @@ where
             usdc: IERC20::new(usdc, provider.clone()),
             token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
             message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
-            required_confirmations: 3,
+            required_confirmations: REQUIRED_CONFIRMATIONS,
         }
     }
 
