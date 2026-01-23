@@ -25,6 +25,9 @@ where
     token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
     /// MessageTransmitterV2 contract instance for CCTP mints
     message_transmitter: MessageTransmitterV2::MessageTransmitterV2Instance<P>,
+    /// Number of confirmations to wait for approval transactions.
+    /// Higher values help with load-balanced RPC providers like dRPC.
+    required_confirmations: u64,
 }
 
 impl<P> Evm<P>
@@ -35,6 +38,9 @@ where
     ///
     /// The `owner` address should be the account that will sign transactions
     /// (typically obtained from a signer via `.address()`).
+    ///
+    /// Uses 3 confirmations by default for approval transactions to handle
+    /// load-balanced RPC providers. Use `with_required_confirmations` to override.
     pub(crate) fn new(
         provider: P,
         owner: Address,
@@ -47,7 +53,15 @@ where
             usdc: IERC20::new(usdc, provider.clone()),
             token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
             message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
+            required_confirmations: 3,
         }
+    }
+
+    /// Sets the number of confirmations to wait for approval transactions.
+    #[cfg(test)]
+    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
+        self.required_confirmations = confirmations;
+        self
     }
 
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
@@ -61,7 +75,13 @@ where
                 Ok(pending) => pending,
                 Err(e) => return Err(handle_contract_error(e).await),
             };
-            pending.get_receipt().await?;
+
+            // Wait for multiple confirmations to ensure state propagates across
+            // load-balanced RPC nodes before the subsequent burn transaction
+            pending
+                .with_required_confirmations(self.required_confirmations)
+                .get_receipt()
+                .await?;
         }
 
         Ok(())
