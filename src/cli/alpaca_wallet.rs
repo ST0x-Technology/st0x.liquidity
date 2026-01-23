@@ -417,9 +417,15 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         writeln!(stdout, "   Filled Quantity: {filled_qty}")?;
     }
     if let (Some(price), Some(qty)) = (order.filled_average_price, order.filled_quantity) {
-        let price_decimal = Decimal::try_from(price).unwrap_or_default();
-        let usd_amount = price_decimal * qty;
-        writeln!(stdout, "   USD Amount: ${usd_amount}")?;
+        match Decimal::try_from(price) {
+            Ok(price_decimal) => {
+                let usd_amount = price_decimal * qty;
+                writeln!(stdout, "   USD Amount: ${usd_amount}")?;
+            }
+            Err(e) => {
+                writeln!(stdout, "   USD Amount: (conversion error: {e})")?;
+            }
+        }
     }
     writeln!(stdout, "   Created: {}", order.created_at)?;
 
