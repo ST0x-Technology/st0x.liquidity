@@ -1228,6 +1228,8 @@ mod tests {
     fn make_usdc_bridged() -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
+            actual_amount: Usdc(dec!(99.99)),
+            fee_collected: Usdc(dec!(0.01)),
             minted_at: Utc::now(),
         }
     }
@@ -1268,9 +1270,13 @@ mod tests {
         }
     }
 
-    fn make_usdc_conversion_confirmed(direction: RebalanceDirection) -> UsdcRebalanceEvent {
+    fn make_usdc_conversion_confirmed(
+        direction: RebalanceDirection,
+        filled_amount: Usdc,
+    ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionConfirmed {
             direction,
+            filled_amount,
             converted_at: Utc::now(),
         }
     }
@@ -1462,6 +1468,7 @@ mod tests {
             )),
             make_usdc_rebalance_envelope(make_usdc_conversion_confirmed(
                 RebalanceDirection::BaseToAlpaca,
+                usdc(998), // ~0.2% slippage on USDC->USD
             )),
         ];
 
@@ -1522,10 +1529,11 @@ mod tests {
             )),
             make_usdc_rebalance_envelope(make_usdc_conversion_confirmed(
                 RebalanceDirection::AlpacaToBase,
+                usdc(998), // ~0.2% slippage on USD->USDC
             )),
             make_usdc_rebalance_envelope(make_usdc_initiated(
                 RebalanceDirection::AlpacaToBase,
-                usdc(1000),
+                usdc(998), // Uses filled amount from conversion
             )),
             make_usdc_rebalance_envelope(make_usdc_deposit_confirmed(
                 RebalanceDirection::AlpacaToBase,
@@ -1547,6 +1555,7 @@ mod tests {
             )),
             make_usdc_rebalance_envelope(make_usdc_conversion_confirmed(
                 RebalanceDirection::AlpacaToBase,
+                usdc(998), // ~0.2% slippage
             )),
         ];
 
@@ -1561,7 +1570,7 @@ mod tests {
         // Simulates incremental dispatch: only ConversionConfirmed for AlpacaToBase
         // For AlpacaToBase, ConversionConfirmed is NOT terminal - flow continues
         let events = vec![make_usdc_rebalance_envelope(
-            make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase),
+            make_usdc_conversion_confirmed(RebalanceDirection::AlpacaToBase, usdc(998)),
         )];
 
         // Direction not extracted (no Initiated), defaults to checking DepositConfirmed
@@ -1583,7 +1592,7 @@ mod tests {
         // For BaseToAlpaca flow, ConversionConfirmed IS the terminal event.
         // With direction embedded in the event, we can detect this even when it's the only event.
         let events = vec![make_usdc_rebalance_envelope(
-            make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca),
+            make_usdc_conversion_confirmed(RebalanceDirection::BaseToAlpaca, usdc(1000)),
         )];
 
         assert!(
@@ -1924,7 +1933,11 @@ mod tests {
 
         cqrs.execute(
             aggregate_id,
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
         )
         .await
         .unwrap();
@@ -1999,7 +2012,11 @@ mod tests {
 
         cqrs.execute(
             aggregate_id,
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
         )
         .await
         .unwrap();
@@ -2266,7 +2283,11 @@ mod tests {
 
         cqrs.execute(
             aggregate_id,
-            UsdcRebalanceCommand::ConfirmBridging { mint_tx: tx_hash },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx: tx_hash,
+                actual_amount: Usdc(dec!(99.99)),
+                fee_collected: Usdc(dec!(0.01)),
+            },
         )
         .await
         .unwrap();
@@ -2310,9 +2331,14 @@ mod tests {
         );
         drop(terminal_results);
 
-        cqrs.execute(aggregate_id, UsdcRebalanceCommand::ConfirmConversion)
-            .await
-            .unwrap();
+        cqrs.execute(
+            aggregate_id,
+            UsdcRebalanceCommand::ConfirmConversion {
+                filled_amount: Usdc(dec!(499)), // ~0.2% slippage
+            },
+        )
+        .await
+        .unwrap();
 
         assert!(
             spy.terminal_detection_results

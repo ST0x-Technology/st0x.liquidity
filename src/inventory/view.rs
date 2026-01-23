@@ -127,7 +127,8 @@ where
     T: Add<Output = Result<T, ArithmeticError<T>>>
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy
-        + HasZero,
+        + HasZero
+        + PartialOrd,
 {
     fn add_onchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         Ok(Self {
@@ -190,6 +191,48 @@ where
         Ok(Self {
             onchain: self.onchain.confirm_inflight(amount)?,
             offchain: self.offchain.add_available(amount)?,
+            ..self
+        })
+    }
+
+    /// Transfer from offchain to onchain with fee: confirms `inflight_amount` from offchain
+    /// but only adds `actual_amount` to onchain. The difference is the fee lost in transit.
+    fn transfer_offchain_to_onchain_with_fee(
+        self,
+        inflight_amount: T,
+        actual_amount: T,
+    ) -> Result<Self, InventoryError<T>> {
+        if actual_amount > inflight_amount {
+            return Err(InventoryError::ActualExceedsInflight {
+                actual: actual_amount,
+                inflight: inflight_amount,
+            });
+        }
+
+        Ok(Self {
+            offchain: self.offchain.confirm_inflight(inflight_amount)?,
+            onchain: self.onchain.add_available(actual_amount)?,
+            ..self
+        })
+    }
+
+    /// Transfer from onchain to offchain with fee: confirms `inflight_amount` from onchain
+    /// but only adds `actual_amount` to offchain. The difference is the fee lost in transit.
+    fn transfer_onchain_to_offchain_with_fee(
+        self,
+        inflight_amount: T,
+        actual_amount: T,
+    ) -> Result<Self, InventoryError<T>> {
+        if actual_amount > inflight_amount {
+            return Err(InventoryError::ActualExceedsInflight {
+                actual: actual_amount,
+                inflight: inflight_amount,
+            });
+        }
+
+        Ok(Self {
+            onchain: self.onchain.confirm_inflight(inflight_amount)?,
+            offchain: self.offchain.add_available(actual_amount)?,
             ..self
         })
     }
@@ -488,12 +531,20 @@ impl InventoryView {
                 self.update_usdc(|inv| inv.move_onchain_to_inflight(amount), now)
             }
 
-            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::AlpacaToBase) => {
-                self.update_usdc(|inv| inv.transfer_offchain_inflight_to_onchain(amount), now)
-            }
-            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::BaseToAlpaca) => {
-                self.update_usdc(|inv| inv.transfer_onchain_inflight_to_offchain(amount), now)
-            }
+            (
+                UsdcRebalanceEvent::Bridged { actual_amount, .. },
+                RebalanceDirection::AlpacaToBase,
+            ) => self.update_usdc(
+                |inv| inv.transfer_offchain_to_onchain_with_fee(amount, *actual_amount),
+                now,
+            ),
+            (
+                UsdcRebalanceEvent::Bridged { actual_amount, .. },
+                RebalanceDirection::BaseToAlpaca,
+            ) => self.update_usdc(
+                |inv| inv.transfer_onchain_to_offchain_with_fee(amount, *actual_amount),
+                now,
+            ),
 
             (
                 UsdcRebalanceEvent::DepositConfirmed {
@@ -506,9 +557,29 @@ impl InventoryView {
                 now,
             ),
 
+            // ConversionConfirmed affects offchain USDC:
+            // - AlpacaToBase (USD->USDC): Adds USDC to offchain (arrived in crypto wallet)
+            // - BaseToAlpaca (USDC->USD): Removes USDC from offchain (converted to USD)
+            (
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount,
+                    ..
+                },
+                _,
+            ) => self.update_usdc(|inv| inv.add_offchain_available(*filled_amount), now),
+
+            (
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    filled_amount,
+                    ..
+                },
+                _,
+            ) => self.update_usdc(|inv| inv.remove_offchain_available(*filled_amount), now),
+
             (
                 UsdcRebalanceEvent::ConversionInitiated { .. }
-                | UsdcRebalanceEvent::ConversionConfirmed { .. }
                 | UsdcRebalanceEvent::ConversionFailed { .. }
                 | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
                 | UsdcRebalanceEvent::WithdrawalFailed { .. }
@@ -1389,9 +1460,11 @@ mod tests {
         }
     }
 
-    fn make_bridged_event() -> UsdcRebalanceEvent {
+    fn make_bridged_event(actual_amount: Usdc, fee_collected: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
+            actual_amount,
+            fee_collected,
             minted_at: Utc::now(),
         }
     }
@@ -1452,7 +1525,7 @@ mod tests {
     #[test]
     fn apply_usdc_bridged_alpaca_to_base_transfers_to_onchain() {
         let view = make_usdc_view(1000, 0, 900, 100);
-        let event = make_bridged_event();
+        let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
             .apply_usdc_rebalance_event(
@@ -1471,7 +1544,7 @@ mod tests {
     #[test]
     fn apply_usdc_bridged_base_to_alpaca_transfers_to_offchain() {
         let view = make_usdc_view(900, 100, 1000, 0);
-        let event = make_bridged_event();
+        let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
             .apply_usdc_rebalance_event(
@@ -1519,7 +1592,12 @@ mod tests {
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .apply_usdc_rebalance_event(
+                &make_bridged_event(amount, Usdc(dec!(0))),
+                &direction,
+                amount,
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(
             after_bridged.usdc.onchain.total().unwrap().0,
@@ -1558,7 +1636,12 @@ mod tests {
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .apply_usdc_rebalance_event(
+                &make_bridged_event(amount, Usdc(dec!(0))),
+                &direction,
+                amount,
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(
             after_bridged.usdc.offchain.total().unwrap().0,
@@ -1760,44 +1843,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_conversion_confirmed_updates_timestamp_only() {
-        let now = Utc::now();
-        let before = now - chrono::Duration::hours(1);
-
-        let view = InventoryView {
-            usdc: Inventory {
-                onchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
-                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
-                last_rebalancing: None,
-            },
-            equities: HashMap::new(),
-            last_updated: before,
-        };
-
-        let event = UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            converted_at: now,
-        };
-
-        let updated = view
-            .apply_usdc_rebalance_event(
-                &event,
-                &RebalanceDirection::BaseToAlpaca,
-                Usdc(dec!(500)),
-                now,
-            )
-            .unwrap();
-
-        // Timestamp should be updated
-        assert_eq!(updated.last_updated, now);
-
-        // USDC balances should NOT change for conversion events
-        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
-        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
-    }
-
-    #[test]
-    fn apply_conversion_failed_updates_timestamp_only() {
+    fn apply_conversion_failed_keeps_balances_unchanged() {
+        // ConversionFailed should not change any balances - it just updates timestamp.
+        // The conversion order failed, so no USDC was added/removed.
         let now = Utc::now();
         let before = now - chrono::Duration::hours(1);
 
@@ -1819,7 +1867,7 @@ mod tests {
         let updated = view
             .apply_usdc_rebalance_event(
                 &event,
-                &RebalanceDirection::AlpacaToBase,
+                &RebalanceDirection::BaseToAlpaca,
                 Usdc(dec!(500)),
                 now,
             )
@@ -1828,9 +1876,55 @@ mod tests {
         // Timestamp should be updated
         assert_eq!(updated.last_updated, now);
 
-        // USDC balances should NOT change for conversion failure
+        // USDC balances should NOT change for failed conversion
         assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
+    }
+
+    #[test]
+    fn apply_usdc_bridged_uses_actual_amount_not_requested_amount() {
+        // BUG TEST: When CCTP fees are deducted, inventory should reflect actual received amount
+        // Request: 100 USDC, Fee: 0.01 USDC, Actual received: 99.99 USDC
+        let requested_amount = usdc(100);
+        let actual_amount = Usdc(dec!(99.99));
+        let fee_collected = Usdc(dec!(0.01));
+
+        // Start with 100 inflight (the requested amount)
+        let view = make_usdc_view(1000, 0, 900, 100);
+
+        // The Bridged event should contain the actual amount received
+        let event = UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: TxHash::random(),
+            minted_at: Utc::now(),
+            actual_amount,
+            fee_collected,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                requested_amount, // This should be ignored - event's actual_amount should be used
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Onchain should receive the ACTUAL amount (99.99), not the requested (100)
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().0,
+            dec!(1099.99),
+            "onchain should have 1000 + 99.99 (actual received), not 1000 + 100 (requested)"
+        );
+
+        // Offchain should have the fee deducted from total
+        // Started with 900 available + 100 inflight = 1000 total
+        // After bridge: 100 inflight consumed, but only 99.99 arrived at destination
+        // So offchain total is now 900 (the 0.01 fee was lost in transit)
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().0,
+            dec!(900),
+            "offchain should have 900 (inflight consumed)"
+        );
     }
 
     #[test]
@@ -1868,5 +1962,110 @@ mod tests {
         // Inflight should remain unchanged - conversion is a separate concern from bridging
         assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(400)));
+    }
+
+    #[test]
+    fn conversion_confirmed_base_to_alpaca_removes_usdc_from_offchain() {
+        // BUG TEST: For BaseToAlpaca flow, ConversionConfirmed (USDC->USD) should
+        // remove USDC from offchain. Currently, it just updates the timestamp.
+        //
+        // Scenario: After BaseToAlpaca deposit, we have 1000 USDC in offchain (Alpaca wallet).
+        // We convert 100 USDC to USD. Due to slippage (~17 bps), the filled amount
+        // might be slightly different, but for USDC->USD we're selling USDC so
+        // filled_amount represents the USDC sold (should be same as requested for full fills).
+        //
+        // After conversion, offchain should have 900 USDC (1000 - 100).
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Request: 100 USDC → USD conversion
+        // Filled: 100 USDC sold (full fill for market order)
+        let filled_amount = Usdc(dec!(100));
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            filled_amount,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::BaseToAlpaca,
+                Usdc(dec!(100)),
+                now,
+            )
+            .unwrap();
+
+        // Offchain should have 900 USDC (1000 - 100)
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "ConversionConfirmed(BaseToAlpaca) should remove filled_amount USDC from offchain"
+        );
+
+        // Onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn conversion_confirmed_alpaca_to_base_adds_usdc_to_offchain() {
+        // BUG TEST: For AlpacaToBase flow, ConversionConfirmed (USD->USDC) should
+        // add USDC to offchain. Currently, it just updates the timestamp.
+        //
+        // Scenario: We're converting USD to USDC before withdrawal.
+        // Request: 1000 USD worth of USDC
+        // Filled: 998.3 USDC (17 bps slippage - we got less USDC than expected)
+        //
+        // After conversion, offchain should increase by the filled_amount (998.3), not the requested.
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Request: 1000 USD → USDC conversion
+        // Filled: 998.3 USDC (slippage of ~17 bps)
+        let filled_amount = Usdc(dec!(998.3));
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            filled_amount,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                Usdc(dec!(1000)),
+                now,
+            )
+            .unwrap();
+
+        // Offchain should have 1998.3 USDC (1000 + 998.3)
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(1998.3)),
+            "ConversionConfirmed(AlpacaToBase) should add filled_amount USDC to offchain"
+        );
+
+        // Onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
     }
 }

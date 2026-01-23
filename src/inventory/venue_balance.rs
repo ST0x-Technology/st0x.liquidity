@@ -26,6 +26,8 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
+    #[error("actual amount {actual:?} exceeds inflight amount {inflight:?}")]
+    ActualExceedsInflight { actual: T, inflight: T },
     #[error(transparent)]
     Arithmetic(#[from] ArithmeticError<T>),
 }

@@ -723,6 +723,11 @@ Keep comments focused on "why" rather than "what".
 
 ### Code style
 
+#### ASCII only in code
+
+Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
+Unicode breaks vim navigation and grep workflows.
+
 #### Module Organization
 
 Organize code within modules by importance and visibility:
