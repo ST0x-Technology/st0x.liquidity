@@ -27,6 +27,7 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
+use crate::vault_registry::VaultRegistryQuery;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -63,6 +64,7 @@ pub(crate) struct RebalancingCqrsFrameworks {
 #[derive(Clone, Copy)]
 pub(crate) struct RebalancerAddresses {
     pub(crate) market_maker_wallet: Address,
+    pub(crate) orderbook: Address,
 }
 
 /// Spawns the rebalancing infrastructure.
@@ -106,7 +108,7 @@ where
 
 /// External service clients for rebalancing operations.
 ///
-/// Holds connections to Alpaca APIs, CCTP bridge, and Raindex services.
+/// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
 ///
 /// Generic over `BP` (Base Provider) to allow reusing the existing WebSocket
 /// connection from the main bot. The Ethereum provider uses a fixed HTTP type
@@ -115,6 +117,7 @@ struct Services<BP>
 where
     BP: Provider + Clone,
 {
+    tokenization: Arc<AlpacaTokenizationService<BP>>,
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
@@ -128,9 +131,9 @@ where
 {
     /// Creates the services needed for rebalancing.
     ///
-    /// RaindexService is passed in rather than created here because it's needed
-    /// for CQRS framework initialization in the conductor, which must happen
-    /// before spawn_rebalancer is called.
+    /// VaultService and AlpacaTokenizationService are passed in rather than
+    /// created here because they are needed for CQRS framework initialization in
+    /// the conductor, which must happen before spawn_rebalancer is called.
     async fn new(
         ctx: &RebalancingCtx,
         ethereum_wallet: &EthereumWallet,
@@ -163,6 +166,7 @@ where
         })?);
 
         Ok(Self {
+            tokenization,
             broker,
             wallet,
             cctp,
@@ -194,7 +198,7 @@ where
             self.broker,
             self.wallet,
             self.cctp,
-            self.raindex,
+            self.vault,
             frameworks.usdc,
             addresses.market_maker_wallet,
             RaindexVaultId(ctx.usdc_vault_id),
@@ -235,6 +239,7 @@ mod tests {
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::tokenization::alpaca::AlpacaTokenizationService;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::vault::WrappedTokenRegistry;
     use crate::vault_registry::VaultRegistry;
 
     /// Provider type returned by `ProviderBuilder::new().connect_http()` without wallet.
@@ -281,6 +286,7 @@ mod tests {
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             },
+            wrapped_token_registry: WrappedTokenRegistry::empty(),
         }
     }
 
@@ -439,6 +445,7 @@ mod tests {
         );
 
         let services = Services {
+            tokenization,
             broker,
             wallet,
             cctp,
@@ -496,6 +503,14 @@ mod tests {
         let usdc_cqrs = Arc::new(test_store(pool.clone(), ()));
 
         let redemption_cqrs = Arc::new(test_store(pool.clone(), mock_services));
+
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,

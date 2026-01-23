@@ -24,8 +24,13 @@ use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
-use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
+use crate::tokenized_equity_mint::{
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintEvent,
+};
+use crate::usdc_rebalance::{
+    RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
+};
+use crate::vault::WrappedTokenRegistry;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Why loading a token address from the vault registry failed.
@@ -42,12 +47,6 @@ enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
-    #[error(transparent)]
-    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
-    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
-    WalletCollision(Address),
-    #[error(transparent)]
-    Uuid(#[from] uuid::Error),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -72,6 +71,7 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
+    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -87,10 +87,12 @@ pub(crate) struct RebalancingCtx {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Parsed from `alpaca_broker_auth.account_id` during construction.
+    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Cloned from broker config - ensures consistency.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
+    /// Registry of wrapped token configurations for ERC-4626 vault operations.
+    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
 }
 
 impl RebalancingCtx {
@@ -120,6 +122,7 @@ impl RebalancingCtx {
             usdc_vault_id: config.usdc_vault_id,
             alpaca_account_id,
             alpaca_broker_auth: broker_auth,
+            wrapped_token_registry: config.wrapped_token_registry,
         })
     }
 }
@@ -136,6 +139,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
+            .field("wrapped_token_registry", &self.wrapped_token_registry)
             .finish()
     }
 }
@@ -333,11 +337,14 @@ impl RebalancingTrigger {
             }
         };
 
+        // TODO: Fetch vault ratio from VaultService for wrapped token support.
+        // For now, pass None which treats onchain amounts as unwrapped.
         equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
             token_address,
+            None,
         )
         .await
         .ok()
@@ -1219,7 +1226,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            failure: DetectionFailure::Timeout,
+            reason: "Alpaca timeout".to_string(),
             failed_at: Utc::now(),
         }
     }

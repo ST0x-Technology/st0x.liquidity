@@ -100,6 +100,12 @@ pub(crate) enum EquityRedemptionError {
     /// Transaction failed with a known tx hash
     #[error("Transaction failed: {tx_hash}")]
     TransactionFailed { tx_hash: TxHash },
+    /// Attempted to unwrap tokens when redemption is already in progress
+    #[error("Cannot unwrap tokens: redemption already in progress")]
+    CannotUnwrapAlreadyStarted,
+    /// Attempted to send tokens before unwrapping
+    #[error("Cannot send: tokens not unwrapped")]
+    TokensNotUnwrapped,
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -137,6 +143,8 @@ pub(crate) enum EquityRedemptionCommand {
         token: Address,
         amount: U256,
     },
+    /// Unwrap ERC-4626 wrapped tokens after vault withdrawal.
+    UnwrapTokens,
     /// Alpaca detected the token transfer.
     Detect {
         tokenization_request_id: TokenizationRequestId,
@@ -165,6 +173,12 @@ pub(crate) enum EquityRedemptionEvent {
         token: Address,
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
+    },
+    /// ERC-4626 wrapped tokens have been unwrapped.
+    TokensUnwrapped {
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
+        unwrapped_at: DateTime<Utc>,
     },
     /// Vault withdraw succeeded but transfer to redemption wallet failed.
     TransferFailed {
@@ -205,6 +219,9 @@ impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::VaultWithdrawn { .. } => "EquityRedemptionEvent::VaultWithdrawn".to_string(),
+            Self::TokensUnwrapped { .. } => {
+                "EquityRedemptionEvent::TokensUnwrapped".to_string()
+            }
             Self::TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
             Self::TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
             Self::DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
@@ -236,12 +253,25 @@ pub(crate) enum EquityRedemption {
         withdrawn_at: DateTime<Utc>,
     },
 
+    /// Wrapped tokens have been unwrapped, ready to send to Alpaca
+    TokensUnwrapped {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        unwrap_tx_hash: TxHash,
+        unwrapped_amount: U256,
+        withdrawn_at: DateTime<Utc>,
+        unwrapped_at: DateTime<Utc>,
+    },
+
     /// Tokens sent to Alpaca's redemption wallet
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         vault_withdraw_tx: TxHash,
+        unwrap_tx_hash: Option<TxHash>,
         redemption_wallet: Address,
         redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
@@ -341,32 +371,74 @@ impl EventSourced for EquityRedemption {
                 })
             }
 
-            TokensSent {
-                redemption_wallet,
-                redemption_tx,
-                sent_at,
+            TokensUnwrapped {
+                unwrap_tx_hash,
+                unwrapped_amount,
+                unwrapped_at,
             } => {
                 let Self::VaultWithdrawn {
                     symbol,
                     quantity,
                     token,
                     vault_withdraw_tx,
-                    ..
+                    withdrawn_at,
                 } = entity
                 else {
                     return Ok(None);
                 };
 
-                Some(Self::TokensSent {
+                Some(Self::TokensUnwrapped {
                     symbol: symbol.clone(),
                     quantity: *quantity,
                     token: *token,
                     vault_withdraw_tx: *vault_withdraw_tx,
+                    unwrap_tx_hash: *unwrap_tx_hash,
+                    unwrapped_amount: *unwrapped_amount,
+                    withdrawn_at: *withdrawn_at,
+                    unwrapped_at: *unwrapped_at,
+                })
+            }
+
+            TokensSent {
+                redemption_wallet,
+                redemption_tx,
+                sent_at,
+            } => match entity {
+                Self::VaultWithdrawn {
+                    symbol,
+                    quantity,
+                    token,
+                    vault_withdraw_tx,
+                    ..
+                } => Some(Self::TokensSent {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    vault_withdraw_tx: *vault_withdraw_tx,
+                    unwrap_tx_hash: None,
                     redemption_wallet: *redemption_wallet,
                     redemption_tx: *redemption_tx,
                     sent_at: *sent_at,
-                })
-            }
+                }),
+                Self::TokensUnwrapped {
+                    symbol,
+                    quantity,
+                    token,
+                    vault_withdraw_tx,
+                    unwrap_tx_hash,
+                    ..
+                } => Some(Self::TokensSent {
+                    symbol: symbol.clone(),
+                    quantity: *quantity,
+                    token: *token,
+                    vault_withdraw_tx: *vault_withdraw_tx,
+                    unwrap_tx_hash: Some(*unwrap_tx_hash),
+                    redemption_wallet: *redemption_wallet,
+                    redemption_tx: *redemption_tx,
+                    sent_at: *sent_at,
+                }),
+                _ => None,
+            },
 
             Detected {
                 tokenization_request_id,
@@ -537,7 +609,11 @@ impl EventSourced for EquityRedemption {
                     }
                 }
             }
-            Detect { .. } | FailDetection { .. } | Complete | RejectRedemption { .. } => {
+            UnwrapTokens
+            | Detect { .. }
+            | FailDetection { .. }
+            | Complete
+            | RejectRedemption { .. } => {
                 Err(EquityRedemptionError::NotStarted)
             }
         }
@@ -546,7 +622,7 @@ impl EventSourced for EquityRedemption {
     async fn transition(
         &self,
         command: Self::Command,
-        _services: &Self::Services,
+        services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         use EquityRedemptionCommand::*;
         use EquityRedemptionEvent::*;
@@ -557,6 +633,24 @@ impl EventSourced for EquityRedemption {
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
+            UnwrapTokens => match self {
+                Self::VaultWithdrawn { token, .. } => {
+                    let owner = services.unwrapper.owner();
+                    let (unwrap_tx_hash, unwrapped_amount) = services
+                        .unwrapper
+                        .unwrap(*token, U256::ZERO, owner, owner)
+                        .await?;
+                    Ok(vec![TokensUnwrapped {
+                        unwrap_tx_hash,
+                        unwrapped_amount,
+                        unwrapped_at: Utc::now(),
+                    }])
+                }
+                Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
+                Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
+                _ => Err(EquityRedemptionError::CannotUnwrapAlreadyStarted),
+            },
+
             Detect {
                 tokenization_request_id,
             } => match self {
@@ -564,7 +658,9 @@ impl EventSourced for EquityRedemption {
                     tokenization_request_id,
                     detected_at: Utc::now(),
                 }]),
-                Self::VaultWithdrawn { .. } => Err(EquityRedemptionError::TokensNotSent),
+                Self::VaultWithdrawn { .. } | Self::TokensUnwrapped { .. } => {
+                    Err(EquityRedemptionError::TokensNotSent)
+                }
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
@@ -575,16 +671,18 @@ impl EventSourced for EquityRedemption {
                     failure,
                     failed_at: Utc::now(),
                 }]),
-                Self::VaultWithdrawn { .. } => Err(EquityRedemptionError::TokensNotSent),
+                Self::VaultWithdrawn { .. } | Self::TokensUnwrapped { .. } => {
+                    Err(EquityRedemptionError::TokensNotSent)
+                }
                 Self::Pending { .. } => Err(EquityRedemptionError::AlreadyDetected),
                 Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
                 Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             },
 
             Complete => match self {
-                Self::VaultWithdrawn { .. } | Self::TokensSent { .. } => {
-                    Err(EquityRedemptionError::NotPending)
-                }
+                Self::VaultWithdrawn { .. }
+                | Self::TokensUnwrapped { .. }
+                | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPending),
                 Self::Pending { .. } => Ok(vec![Completed {
                     completed_at: Utc::now(),
                 }]),
@@ -593,9 +691,9 @@ impl EventSourced for EquityRedemption {
             },
 
             RejectRedemption { reason } => match self {
-                Self::VaultWithdrawn { .. } | Self::TokensSent { .. } => {
-                    Err(EquityRedemptionError::NotPendingForRejection)
-                }
+                Self::VaultWithdrawn { .. }
+                | Self::TokensUnwrapped { .. }
+                | Self::TokensSent { .. } => Err(EquityRedemptionError::NotPendingForRejection),
                 Self::Pending { .. } => Ok(vec![RedemptionRejected {
                     reason,
                     rejected_at: Utc::now(),
@@ -936,6 +1034,7 @@ mod tests {
             quantity: dec!(50.25),
             token: Address::random(),
             vault_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: None,
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
@@ -976,6 +1075,7 @@ mod tests {
             quantity: dec!(50.25),
             token: Address::random(),
             vault_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: None,
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
@@ -997,6 +1097,7 @@ mod tests {
             quantity: dec!(50.25),
             token: Address::random(),
             vault_withdraw_tx: TxHash::random(),
+            unwrap_tx_hash: None,
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
             sent_at: Utc::now(),

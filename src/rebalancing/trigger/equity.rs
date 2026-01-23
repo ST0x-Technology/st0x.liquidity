@@ -11,6 +11,7 @@ use st0x_execution::{FractionalShares, Symbol};
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
+use crate::vault::VaultRatio;
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u32 = 9;
@@ -83,15 +84,19 @@ impl Drop for InProgressGuard {
 ///
 /// Returns `Mint` if there's too much offchain equity that needs to be tokenized,
 /// or `Redemption` if there's too much onchain equity that needs to be redeemed.
+///
+/// When `vault_ratio` is provided, the onchain (wrapped) amounts are converted to
+/// unwrapped-equivalent for accurate imbalance detection.
 pub(super) async fn check_imbalance_and_build_operation(
     symbol: &Symbol,
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
     token_address: Address,
+    vault_ratio: Option<&VaultRatio>,
 ) -> Result<TriggeredOperation, EquityTriggerSkip> {
     let imbalance = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(symbol, threshold)
+        inventory.check_equity_imbalance(symbol, threshold, vault_ratio)
     };
 
     let Some(imbalance) = imbalance else {
@@ -281,6 +286,7 @@ mod tests {
             &threshold,
             &inventory,
             Address::ZERO,
+            None,
         )
         .await;
 
@@ -297,7 +303,7 @@ mod tests {
         };
 
         let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO)
+            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO, None)
                 .await;
 
         assert!(matches!(result, Ok(TriggeredOperation::Mint { .. })));
@@ -314,7 +320,7 @@ mod tests {
         };
 
         let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, token_address)
+            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, token_address, None)
                 .await;
 
         let Ok(TriggeredOperation::Redemption { token, .. }) = result else {

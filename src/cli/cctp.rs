@@ -272,6 +272,7 @@ mod tests {
     use crate::rebalancing::RebalancingCtx;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
+    use crate::vault::WrappedTokenRegistry;
 
     fn create_ctx_without_rebalancing() -> Ctx {
         Ctx {
@@ -315,6 +316,7 @@ mod tests {
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             },
+            wrapped_token_registry: WrappedTokenRegistry::empty(),
         });
         ctx
     }
