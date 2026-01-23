@@ -3,14 +3,18 @@
 mod equity;
 mod usdc;
 
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
+use chrono::Utc;
 use clap::Parser;
 use cqrs_es::{EventEnvelope, Query};
 use rust_decimal::Decimal;
-use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use st0x_execution::Symbol;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
@@ -25,8 +29,7 @@ use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
-use chrono::Utc;
-use st0x_execution::Symbol;
+use crate::vault::{WrappedTokenConfig, WrappedTokenRegistry};
 
 pub(crate) use equity::EquityTriggerSkip;
 
@@ -37,6 +40,16 @@ pub enum RebalancingConfigError {
     NotAlpacaBroker,
     #[error(transparent)]
     Clap(#[from] clap::Error),
+    #[error("failed to read wrapped tokens config file")]
+    WrappedTokensRead(#[source] std::io::Error),
+    #[error("failed to parse wrapped tokens config")]
+    WrappedTokensParse(#[source] serde_json::Error),
+}
+
+/// JSON structure for wrapped tokens config file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WrappedTokensFileConfig {
+    tokens: Vec<WrappedTokenConfig>,
 }
 
 /// Environment configuration for rebalancing (parsed via clap).
@@ -69,6 +82,10 @@ pub struct RebalancingEnv {
     /// Alpaca account ID (UUID) for Broker API wallet operations
     #[clap(long, env, value_parser = AlpacaAccountId::parse)]
     alpaca_account_id: AlpacaAccountId,
+    /// Path to JSON file containing wrapped token configurations (optional).
+    /// If not provided, no wrapped token support is enabled.
+    #[clap(long, env)]
+    wrapped_tokens_config: Option<PathBuf>,
 }
 
 impl RebalancingConfig {
@@ -79,6 +96,18 @@ impl RebalancingConfig {
         const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
 
         let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+
+        // Load wrapped tokens config from JSON file if path is provided
+        let wrapped_token_registry = match &env.wrapped_tokens_config {
+            Some(path) => {
+                let contents = std::fs::read_to_string(path)
+                    .map_err(RebalancingConfigError::WrappedTokensRead)?;
+                let config: WrappedTokensFileConfig = serde_json::from_str(&contents)
+                    .map_err(RebalancingConfigError::WrappedTokensParse)?;
+                WrappedTokenRegistry::new(config.tokens)
+            }
+            None => WrappedTokenRegistry::empty(),
+        };
 
         Ok(Self {
             equity_threshold: ImbalanceThreshold {
@@ -94,6 +123,7 @@ impl RebalancingConfig {
             evm_private_key: env.evm_private_key,
             usdc_vault_id: env.usdc_vault_id,
             alpaca_account_id: env.alpaca_account_id,
+            wrapped_token_registry,
         })
     }
 }
@@ -110,6 +140,8 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc_vault_id: B256,
     /// Alpaca AP (Authorized Participant) account ID for Broker API operations.
     pub(crate) alpaca_account_id: AlpacaAccountId,
+    /// Registry of wrapped token configurations for ERC-4626 vault operations.
+    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
 }
 
 impl std::fmt::Debug for RebalancingConfig {
@@ -122,6 +154,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
+            .field("wrapped_token_registry", &self.wrapped_token_registry)
             .finish()
     }
 }
@@ -311,6 +344,7 @@ impl RebalancingTrigger {
             &self.config.equity_threshold,
             &self.inventory,
             &self.symbol_cache,
+            None, // TODO: Pass actual VaultRatio in Phase 6 when VaultService is wired up
         )
         .await
         {

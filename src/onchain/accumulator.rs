@@ -96,7 +96,10 @@ pub(crate) async fn process_onchain_trade(
         Direction::Sell => AccumulationBucket::ShortExposure, // Sold stock -> short exposure
         Direction::Buy => AccumulationBucket::LongExposure,   // Bought stock -> long exposure
     };
-    calculator.add_trade(trade.amount, exposure_bucket);
+
+    // Use hedge_amount() which returns underlying-equivalent for wrapped tokens
+    let hedge_amount = trade.hedge_amount();
+    calculator.add_trade(hedge_amount, exposure_bucket);
 
     info!(
         symbol = %base_symbol,
@@ -104,7 +107,8 @@ pub(crate) async fn process_onchain_trade(
         accumulated_long = calculator.accumulated_long,
         accumulated_short = calculator.accumulated_short,
         exposure_bucket = ?exposure_bucket,
-        trade_amount = trade.amount,
+        onchain_amount = trade.amount,
+        hedge_amount = hedge_amount,
         "Updated calculator"
     );
 
@@ -795,6 +799,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         }
     }
 
@@ -927,6 +932,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
@@ -960,6 +966,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1000,6 +1007,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result1 = process_trade_with_tx(&pool, trade1).await.unwrap();
@@ -1023,6 +1031,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result2 = process_trade_with_tx(&pool, trade2).await.unwrap();
@@ -1046,6 +1055,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result3 = process_trade_with_tx(&pool, trade3).await.unwrap();
@@ -1087,6 +1097,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await;
@@ -1116,6 +1127,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1151,6 +1163,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1203,6 +1216,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // Attempt to add trade - should fail when trying to save execution due to unique constraint
@@ -1260,6 +1274,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let trade2 = OnchainTrade {
@@ -1280,6 +1295,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // Add first trade (should not trigger execution)
@@ -1346,6 +1362,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         }
     }
 
@@ -1426,6 +1443,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1465,6 +1483,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             },
             OnchainTrade {
                 id: None,
@@ -1484,6 +1503,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             },
             OnchainTrade {
                 id: None,
@@ -1503,6 +1523,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             },
         ];
 
@@ -1575,6 +1596,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             },
             OnchainTrade {
                 id: None,
@@ -1594,6 +1616,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             },
         ];
 
@@ -1649,6 +1672,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // Add trade and trigger execution
@@ -1696,6 +1720,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let sell_trade = OnchainTrade {
@@ -1716,6 +1741,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // Execute both trades
@@ -1804,6 +1830,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
@@ -1904,6 +1931,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
@@ -2122,6 +2150,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = process_trade_with_tx(&pool, aapl_trade).await.unwrap();
@@ -2233,6 +2262,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let trade_s1 = OnchainTrade {
@@ -2253,6 +2283,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let trade_t = OnchainTrade {
@@ -2273,6 +2304,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // Process first trade (GME0x) - should not trigger execution
@@ -2510,6 +2542,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = process_trade_with_tx(&pool, trade1).await.unwrap();
@@ -2533,6 +2566,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // This trade should trigger an execution (0.8 + 0.7 = 1.5 >= 1.0)

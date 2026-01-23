@@ -132,6 +132,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let execution = OffchainExecution {
@@ -204,6 +205,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             };
             let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
             trade_ids.push(trade_id);
@@ -262,6 +264,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let execution = OffchainExecution {

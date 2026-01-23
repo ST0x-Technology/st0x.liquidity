@@ -13,6 +13,7 @@ use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
+use crate::vault::VaultRatio;
 use st0x_execution::{Direction, Symbol};
 
 /// Error type for inventory view operations.
@@ -104,6 +105,57 @@ where
             let total = (onchain + offchain).ok()?;
             let target_onchain = (total * threshold.target).ok()?;
             let excess = (onchain - target_onchain).ok()?;
+
+            Some(Imbalance::TooMuchOnchain { excess })
+        } else {
+            None
+        }
+    }
+
+    /// Detects imbalance using a normalized onchain value.
+    ///
+    /// This is used when onchain balance is in wrapped tokens and needs to be
+    /// converted to unwrapped-equivalent before comparison with offchain balance.
+    ///
+    /// # Arguments
+    ///
+    /// * `threshold` - The imbalance threshold configuration
+    /// * `normalized_onchain` - The onchain balance converted to unwrapped-equivalent
+    ///
+    /// Returns `None` if balanced, has inflight operations, or total is zero.
+    fn detect_imbalance_normalized(
+        &self,
+        threshold: &ImbalanceThreshold,
+        normalized_onchain: T,
+    ) -> Option<Imbalance<T>> {
+        if self.has_inflight() {
+            return None;
+        }
+
+        let onchain_decimal: Decimal = normalized_onchain.into();
+        let offchain: Decimal = self.offchain.total().ok()?.into();
+        let total = onchain_decimal + offchain;
+
+        if total.is_zero() {
+            return None;
+        }
+
+        let ratio = onchain_decimal / total;
+        let lower = threshold.target - threshold.deviation;
+        let upper = threshold.target + threshold.deviation;
+
+        if ratio < lower {
+            let offchain_val = self.offchain.total().ok()?;
+            let total_val = (normalized_onchain + offchain_val).ok()?;
+            let target = (total_val * threshold.target).ok()?;
+            let excess = (target - normalized_onchain).ok()?;
+
+            Some(Imbalance::TooMuchOffchain { excess })
+        } else if ratio > upper {
+            let offchain_val = self.offchain.total().ok()?;
+            let total_val = (normalized_onchain + offchain_val).ok()?;
+            let target = (total_val * threshold.target).ok()?;
+            let excess = (normalized_onchain - target).ok()?;
 
             Some(Imbalance::TooMuchOnchain { excess })
         } else {
@@ -255,14 +307,36 @@ pub(crate) struct InventoryView {
 
 impl InventoryView {
     /// Checks a single equity for imbalance against the threshold.
+    ///
+    /// When `vault_ratio` is provided, the onchain balance is converted from wrapped
+    /// to unwrapped-equivalent before comparison with offchain balance. This ensures
+    /// correct imbalance detection when onchain tokens have accrued value through
+    /// stock splits or dividends.
+    ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
     pub(crate) fn check_equity_imbalance(
         &self,
         symbol: &Symbol,
         threshold: &ImbalanceThreshold,
+        vault_ratio: Option<&VaultRatio>,
     ) -> Option<Imbalance<FractionalShares>> {
         let inventory = self.equities.get(symbol)?;
-        inventory.detect_imbalance(threshold)
+
+        match vault_ratio {
+            Some(ratio) => {
+                // Convert onchain (wrapped) to unwrapped-equivalent
+                let onchain_wrapped = inventory.onchain.total().ok()?;
+                let onchain_equivalent = ratio
+                    .wrapped_to_unwrapped_fractional(onchain_wrapped)
+                    .ok()?;
+
+                inventory.detect_imbalance_normalized(threshold, onchain_equivalent)
+            }
+            None => {
+                // No ratio conversion needed
+                inventory.detect_imbalance(threshold)
+            }
+        }
     }
 
     /// Checks USDC inventory for imbalance against the threshold.
@@ -420,7 +494,8 @@ impl InventoryView {
         match event {
             // No balance changes for these events.
             TokenizedEquityMintEvent::MintRequested { .. }
-            | TokenizedEquityMintEvent::MintRejected { .. } => Ok(Self {
+            | TokenizedEquityMintEvent::MintRejected { .. }
+            | TokenizedEquityMintEvent::TokensWrapped { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
@@ -464,14 +539,16 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         match event {
-            EquityRedemptionEvent::TokensSent { .. } => {
-                self.update_equity(symbol, |inv| inv.move_onchain_to_inflight(quantity), now)
-            }
-
-            EquityRedemptionEvent::Detected { .. } => Ok(Self {
+            // No balance change - tokens unwrapped but still onchain until sent.
+            EquityRedemptionEvent::TokensUnwrapped { .. }
+            | EquityRedemptionEvent::Detected { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
+
+            EquityRedemptionEvent::TokensSent { .. } => {
+                self.update_equity(symbol, |inv| inv.move_onchain_to_inflight(quantity), now)
+            }
 
             EquityRedemptionEvent::DetectionFailed { .. } => {
                 // Tokens were sent but detection failed - keep inflight until resolved.
@@ -1737,7 +1814,7 @@ mod tests {
         let view = make_view(vec![(aapl.clone(), inventory(50, 0, 50, 0))]);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(view.check_equity_imbalance(&aapl, &thresh).is_none());
+        assert!(view.check_equity_imbalance(&aapl, &thresh, None).is_none());
     }
 
     #[test]
@@ -1746,7 +1823,7 @@ mod tests {
         let view = make_view(vec![(aapl.clone(), inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, None);
 
         assert!(matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })));
     }
@@ -1757,7 +1834,7 @@ mod tests {
         let view = make_view(vec![(aapl.clone(), inventory(20, 0, 80, 0))]);
         let thresh = threshold("0.5", "0.2");
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, None);
 
         assert!(matches!(imbalance, Some(Imbalance::TooMuchOffchain { .. })));
     }
@@ -1769,7 +1846,7 @@ mod tests {
         let view = make_view(vec![(aapl, inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(view.check_equity_imbalance(&msft, &thresh).is_none());
+        assert!(view.check_equity_imbalance(&msft, &thresh, None).is_none());
     }
 
     #[test]
@@ -1778,7 +1855,114 @@ mod tests {
         let view = make_view(vec![(aapl.clone(), inventory(60, 20, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
 
-        assert!(view.check_equity_imbalance(&aapl, &thresh).is_none());
+        assert!(view.check_equity_imbalance(&aapl, &thresh, None).is_none());
+    }
+
+    #[test]
+    fn check_equity_imbalance_with_one_to_one_ratio_same_as_no_ratio() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let view = make_view(vec![(aapl.clone(), inventory(80, 0, 20, 0))]);
+        let thresh = threshold("0.5", "0.2");
+        let ratio = crate::vault::VaultRatio::one_to_one();
+
+        let imbalance_no_ratio = view.check_equity_imbalance(&aapl, &thresh, None);
+        let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, Some(&ratio));
+
+        // Both should detect too much onchain with same excess
+        assert!(matches!(
+            imbalance_no_ratio,
+            Some(Imbalance::TooMuchOnchain { .. })
+        ));
+        assert!(matches!(
+            imbalance_with_ratio,
+            Some(Imbalance::TooMuchOnchain { .. })
+        ));
+    }
+
+    #[test]
+    fn check_equity_imbalance_with_1_05_ratio_converts_onchain() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        // 50 wrapped onchain, 50 offchain
+        // With 1.05 ratio: 50 wrapped = 52.5 unwrapped-equivalent
+        // Total = 52.5 + 50 = 102.5
+        // Ratio = 52.5 / 102.5 ≈ 0.512 (within 50% +/- 20% threshold)
+        let view = make_view(vec![(aapl.clone(), inventory(50, 0, 50, 0))]);
+        let thresh = threshold("0.5", "0.2");
+
+        // 1.05 ratio = 1_050_000_000_000_000_000
+        let assets_per_share = alloy::primitives::U256::from(1_050_000_000_000_000_000u64);
+        let ratio = crate::vault::VaultRatio::new(assets_per_share).unwrap();
+
+        // Without ratio: 50/100 = 0.5 (balanced)
+        let imbalance_no_ratio = view.check_equity_imbalance(&aapl, &thresh, None);
+        assert!(imbalance_no_ratio.is_none());
+
+        // With 1.05 ratio: 52.5/102.5 ≈ 0.512 (still balanced)
+        let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, Some(&ratio));
+        assert!(imbalance_with_ratio.is_none());
+    }
+
+    #[test]
+    fn check_equity_imbalance_with_high_ratio_changes_detection() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        // 65 wrapped onchain, 35 offchain
+        // Without ratio: 65% onchain (within 50% +/- 20% = 30%-70%)
+        let view = make_view(vec![(aapl.clone(), inventory(65, 0, 35, 0))]);
+        let thresh = threshold("0.5", "0.2");
+
+        // Without ratio: 65/100 = 0.65 (balanced, within threshold)
+        let imbalance_no_ratio = view.check_equity_imbalance(&aapl, &thresh, None);
+        assert!(imbalance_no_ratio.is_none());
+
+        // With 1.5 ratio: 65 wrapped = 97.5 unwrapped-equivalent
+        // Total = 97.5 + 35 = 132.5
+        // Ratio = 97.5 / 132.5 ≈ 0.736 (above 70% upper threshold!)
+        let assets_per_share = alloy::primitives::U256::from(1_500_000_000_000_000_000u64);
+        let ratio = crate::vault::VaultRatio::new(assets_per_share).unwrap();
+
+        let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, Some(&ratio));
+        assert!(
+            matches!(imbalance_with_ratio, Some(Imbalance::TooMuchOnchain { .. })),
+            "Expected TooMuchOnchain, got: {imbalance_with_ratio:?}"
+        );
+    }
+
+    #[test]
+    fn detect_imbalance_normalized_returns_none_when_balanced() {
+        let inv = inventory(50, 0, 50, 0);
+        let thresh = threshold("0.5", "0.2");
+
+        // Normalized onchain = 50 (same as raw)
+        let normalized = shares(50);
+        let result = inv.detect_imbalance_normalized(&thresh, normalized);
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn detect_imbalance_normalized_detects_too_much_onchain() {
+        let inv = inventory(50, 0, 50, 0);
+        let thresh = threshold("0.5", "0.2");
+
+        // Normalized onchain = 100 (double the raw wrapped amount)
+        // Total = 100 + 50 = 150, ratio = 100/150 ≈ 0.67 (within threshold)
+        // But if normalized = 120, ratio = 120/170 ≈ 0.71 (above 70%)
+        let normalized = shares(120);
+        let result = inv.detect_imbalance_normalized(&thresh, normalized);
+
+        assert!(matches!(result, Some(Imbalance::TooMuchOnchain { .. })));
+    }
+
+    #[test]
+    fn detect_imbalance_normalized_returns_none_when_inflight() {
+        let inv = inventory(50, 10, 50, 0);
+        let thresh = threshold("0.5", "0.2");
+
+        let normalized = shares(120);
+        let result = inv.detect_imbalance_normalized(&thresh, normalized);
+
+        // Even with high normalized value, inflight blocks detection
+        assert!(result.is_none());
     }
 
     #[test]

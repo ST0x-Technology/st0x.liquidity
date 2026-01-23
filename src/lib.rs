@@ -39,6 +39,7 @@ mod threshold;
 mod tokenized_equity_mint;
 mod trade_execution_link;
 mod usdc_rebalance;
+mod vault;
 
 pub use dashboard::export_bindings;
 pub use telemetry::{TelemetryError, TelemetryGuard};
@@ -174,15 +175,15 @@ async fn run(
                 break Ok(());
             }
             Err(e) => {
-                if let Some(execution_error) = e.downcast_ref::<ExecutionError>()
-                    && matches!(
+                if let Some(execution_error) = e.downcast_ref::<ExecutionError>() {
+                    if matches!(
                         execution_error,
                         ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
-                    )
-                {
-                    warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
-                    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-                    continue;
+                    ) {
+                        warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
+                        tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
+                        continue;
+                    }
                 }
 
                 error!("Bot session failed: {e}");

@@ -447,6 +447,7 @@ mod tests {
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
     use crate::threshold::ExecutionThreshold;
+    use crate::vault::WrappedTokenRegistry;
 
     fn create_config_without_alpaca() -> Config {
         Config {
@@ -514,6 +515,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
+                wrapped_token_registry: WrappedTokenRegistry::empty(),
             }),
             execution_threshold: ExecutionThreshold::whole_share(),
         }

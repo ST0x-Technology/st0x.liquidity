@@ -325,6 +325,7 @@ mod tests {
 
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
+    use crate::vault::WrappedTokenRegistry;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -347,6 +348,7 @@ mod tests {
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
             alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
+            wrapped_token_registry: WrappedTokenRegistry::empty(),
         }
     }
 

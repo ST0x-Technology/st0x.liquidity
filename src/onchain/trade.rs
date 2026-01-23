@@ -39,9 +39,21 @@ pub struct OnchainTrade {
     pub(crate) pyth_confidence: Option<f64>,
     pub(crate) pyth_exponent: Option<i32>,
     pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
+    /// For wrapped tokens, this is the underlying-equivalent amount for hedge calculations.
+    /// When set, the accumulator uses this instead of `amount` for position tracking.
+    /// This allows correct hedging when onchain amounts are in wrapped units.
+    pub(crate) underlying_amount: Option<f64>,
 }
 
 impl OnchainTrade {
+    /// Returns the amount to use for hedge calculations.
+    ///
+    /// For wrapped tokens, returns the underlying-equivalent amount.
+    /// For unwrapped tokens, returns the raw onchain amount.
+    pub(crate) fn hedge_amount(&self) -> f64 {
+        self.underlying_amount.unwrap_or(self.amount)
+    }
+
     pub async fn save_within_transaction(
         &self,
         sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -161,6 +173,7 @@ impl OnchainTrade {
             pyth_publish_time: row
                 .pyth_publish_time
                 .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
+            underlying_amount: None, // Not stored in DB, computed at processing time
         })
     }
 
@@ -271,6 +284,7 @@ impl OnchainTrade {
             pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
             pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
             pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
+            underlying_amount: None, // Set by VaultService for wrapped tokens
         };
 
         Ok(Some(trade))
@@ -430,6 +444,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -608,6 +623,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         // Insert first trade
@@ -649,6 +665,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -790,6 +807,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
+                underlying_amount: None,
             };
 
             let mut sql_tx = pool.begin().await.unwrap();

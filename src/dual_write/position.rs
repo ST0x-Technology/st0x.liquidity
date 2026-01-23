@@ -245,6 +245,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = acknowledge_onchain_fill(&context, &trade).await;
@@ -294,6 +295,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         let result = acknowledge_onchain_fill(&context, &trade).await;
@@ -342,6 +344,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         acknowledge_onchain_fill(&context, &trade).await.unwrap();
@@ -400,6 +403,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         acknowledge_onchain_fill(&context, &trade).await.unwrap();
@@ -460,6 +464,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: None,
         };
 
         acknowledge_onchain_fill(&context, &trade).await.unwrap();
