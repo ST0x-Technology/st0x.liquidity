@@ -18,6 +18,7 @@ use rain_math_float::Float;
 
 use crate::bindings::IOrderBookV5;
 use crate::error_decoding::handle_contract_error;
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
@@ -60,6 +61,7 @@ where
     P: Provider + Clone,
 {
     orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
+    required_confirmations: u64,
 }
 
 impl<P> VaultService<P>
@@ -69,7 +71,16 @@ where
     pub(crate) fn new(provider: P, orderbook: Address) -> Self {
         Self {
             orderbook: IOrderBookV5::new(orderbook, provider),
+            required_confirmations: REQUIRED_CONFIRMATIONS,
         }
+    }
+
+    /// Sets the number of confirmations to wait after transactions.
+    /// Use 1 for tests running against anvil (single-node, no sync delays).
+    #[cfg(test)]
+    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
+        self.required_confirmations = confirmations;
+        self
     }
 
     /// Deposits tokens to a Rain OrderBook vault.
@@ -155,7 +166,12 @@ where
             Err(e) => return Err(handle_contract_error(e).await),
         };
 
-        let receipt = pending.get_receipt().await?;
+        // Wait for confirmations to ensure state propagates across load-balanced
+        // RPC nodes before subsequent operations that depend on the withdrawal
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -454,7 +470,8 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address)
+            .with_required_confirmations(1);
 
         service
             .deposit(

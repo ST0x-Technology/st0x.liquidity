@@ -1096,7 +1096,8 @@ mod tests {
             USDC_ADDRESS,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let base = Evm::new(
             provider.clone(),
@@ -1104,11 +1105,13 @@ mod tests {
             USDC_ADDRESS,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
 
-        let vault_service = VaultService::new(provider, ORDERBOOK_ADDRESS);
+        let vault_service =
+            VaultService::new(provider, ORDERBOOK_ADDRESS).with_required_confirmations(1);
 
         (cctp_bridge, vault_service)
     }

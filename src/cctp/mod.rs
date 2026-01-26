@@ -599,7 +599,8 @@ mod tests {
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let base = Evm::new(
             base_provider,
@@ -607,7 +608,8 @@ mod tests {
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -953,7 +955,8 @@ mod tests {
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let base = Evm::new(
             base_provider,
@@ -961,7 +964,8 @@ mod tests {
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -1482,7 +1486,8 @@ mod tests {
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
-            );
+            )
+            .with_required_confirmations(1);
 
             let base = Evm::new(
                 base_provider,
@@ -1490,7 +1495,8 @@ mod tests {
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
-            );
+            )
+            .with_required_confirmations(1);
 
             Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
@@ -2091,5 +2097,24 @@ mod tests {
             U256::ZERO,
             "Fee should be zero in mock contracts"
         );
+    }
+
+    #[tokio::test]
+    async fn multiple_sequential_burns_on_base_succeed() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.ethereum.owner();
+        let amount = U256::from(25_000_000u64); // 25 USDC
+
+        for i in 1..=5 {
+            let receipt = bridge
+                .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+                .await
+                .unwrap();
+
+            assert!(!receipt.tx.is_zero(), "Burn {i}: tx hash should be set");
+            assert_eq!(receipt.amount, amount, "Burn {i}: amount should match");
+        }
     }
 }
