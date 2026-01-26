@@ -11,7 +11,7 @@ use crate::onchain::EvmEnv;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
 use crate::shares::FractionalShares;
 use crate::telemetry::HyperDxConfig;
-use crate::threshold::{ExecutionThreshold, Usdc};
+use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 use st0x_execution::SupportedExecutor;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
@@ -126,6 +126,8 @@ impl ConfigError {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::Clap(_) => "missing or invalid environment variable",
+            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
+            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
             Self::InvalidThreshold(_) => "invalid execution threshold",
         }
     }
@@ -250,9 +252,11 @@ impl Env {
         // - Alpaca requires $1 minimum for fractional trading, so use $1 dollar value threshold
         // - DryRun uses shares threshold for testing
         let execution_threshold = match &broker {
-            BrokerConfig::Schwab(_) | BrokerConfig::DryRun => ExecutionThreshold::whole_share(),
+            BrokerConfig::Schwab(_) | BrokerConfig::DryRun => {
+                ExecutionThreshold::shares(FractionalShares::ONE)?
+            }
             BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
-                ExecutionThreshold::DollarValue(Usdc(Decimal::ONE))
+                ExecutionThreshold::dollar_value(Usdc(Decimal::ONE))?
             }
         };
 
@@ -692,7 +696,7 @@ pub(crate) mod tests {
                         config_err,
                         ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-Expected clap error for missing evm_private_key, got {config_err:?}
+                    "Expected clap error for missing evm_private_key, got {config_err:?}"
                 );
             },
         );
@@ -918,10 +922,11 @@ Expected clap error for missing evm_private_key, got {config_err:?}
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
-                    matches!(result, Err(ConfigError::MissingOrderOwner)),
-                    "Expected MissingOrderOwner error, got {result:?}"
+                    matches!(config_err, ConfigError::MissingOrderOwner),
+                    "Expected MissingOrderOwner error, got {config_err:?}"
                 );
             },
         );
