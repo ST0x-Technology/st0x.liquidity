@@ -234,8 +234,9 @@ defined in `migrations/20250703115746_trades.sql`.
 ### **CI/CD and Deployment**
 
 This section specifies infrastructure, deployment, and secrets management
-requirements. The primary recommendation is a Nix-based approach that extends
-the team's existing Nix usage for development environments.
+requirements as well as potential ways to fulfil them. During the review
+process, one such approach should be chosen and the rest removed from the
+spec before merging to avoid confusing human and AI contributors.
 
 #### **Design Goals**
 
