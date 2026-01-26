@@ -13,6 +13,7 @@ use std::sync::RwLock;
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolEvent;
 
 use crate::bindings::{IERC20, IERC4626};
 
@@ -43,6 +44,15 @@ pub(crate) enum VaultError {
 
     #[error("Slippage exceeded: expected {expected}, got {actual}")]
     SlippageExceeded { expected: U256, actual: U256 },
+
+    #[error("Missing Deposit event in transaction receipt")]
+    MissingDepositEvent,
+
+    #[error("Missing Withdraw event in transaction receipt")]
+    MissingWithdrawEvent,
+
+    #[error("Failed to decode event log: {0}")]
+    EventDecode(#[from] alloy::sol_types::Error),
 }
 
 /// Service for managing ERC-4626 vault operations.
@@ -109,7 +119,7 @@ where
     ///
     /// # Returns
     ///
-    /// Transaction hash and the amount of wrapped shares received.
+    /// Transaction hash and the actual amount of wrapped shares received.
     pub(crate) async fn wrap(
         &self,
         wrapped_token: Address,
@@ -118,19 +128,28 @@ where
     ) -> Result<(TxHash, U256), VaultError> {
         let vault = IERC4626::new(wrapped_token, &self.provider);
 
-        // Preview the deposit to get expected shares
-        let expected_shares = vault.previewDeposit(unwrapped_amount).call().await?;
-
         // Execute the deposit
         let pending = vault.deposit(unwrapped_amount, receiver).send().await?;
 
         let receipt = pending.get_receipt().await?;
         let tx_hash = receipt.transaction_hash;
 
+        // Parse the Deposit event to get actual shares received
+        let actual_shares = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                IERC4626::Deposit::decode_log(log.as_ref())
+                    .ok()
+                    .map(|event| event.data.shares)
+            })
+            .ok_or(VaultError::MissingDepositEvent)?;
+
         // Invalidate cache since vault state changed
         self.cache.invalidate(&wrapped_token);
 
-        Ok((tx_hash, expected_shares))
+        Ok((tx_hash, actual_shares))
     }
 
     /// Unwraps tokens by redeeming from the ERC-4626 vault.
@@ -144,7 +163,7 @@ where
     ///
     /// # Returns
     ///
-    /// Transaction hash and the amount of underlying assets received.
+    /// Transaction hash and the actual amount of underlying assets received.
     pub(crate) async fn unwrap(
         &self,
         wrapped_token: Address,
@@ -154,19 +173,28 @@ where
     ) -> Result<(TxHash, U256), VaultError> {
         let vault = IERC4626::new(wrapped_token, &self.provider);
 
-        // Preview the redemption to get expected assets
-        let expected_assets = vault.previewRedeem(wrapped_amount).call().await?;
-
         // Execute the redemption
         let pending = vault.redeem(wrapped_amount, receiver, owner).send().await?;
 
         let receipt = pending.get_receipt().await?;
         let tx_hash = receipt.transaction_hash;
 
+        // Parse the Withdraw event to get actual assets received
+        let actual_assets = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| {
+                IERC4626::Withdraw::decode_log(log.as_ref())
+                    .ok()
+                    .map(|event| event.data.assets)
+            })
+            .ok_or(VaultError::MissingWithdrawEvent)?;
+
         // Invalidate cache since vault state changed
         self.cache.invalidate(&wrapped_token);
 
-        Ok((tx_hash, expected_assets))
+        Ok((tx_hash, actual_assets))
     }
 
     /// Ensures the vault has approval to spend the unwrapped tokens.

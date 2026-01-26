@@ -20,6 +20,9 @@ sol! {
 
     #[derive(serde::Serialize, serde::Deserialize)]
     interface IERC4626 {
+        event Deposit(address indexed sender, address indexed owner, uint256 assets, uint256 shares);
+        event Withdraw(address indexed sender, address indexed receiver, address indexed owner, uint256 assets, uint256 shares);
+
         function asset() external view returns (address);
         function totalAssets() external view returns (uint256);
         function convertToShares(uint256 assets) external view returns (uint256);

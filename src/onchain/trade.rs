@@ -195,9 +195,10 @@ impl OnchainTrade {
                 pyth_price,
                 pyth_confidence,
                 pyth_exponent,
-                pyth_publish_time
+                pyth_publish_time,
+                underlying_amount
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
             tx_hash_str,
             log_index_i64,
@@ -211,7 +212,8 @@ impl OnchainTrade {
             self.pyth_price,
             self.pyth_confidence,
             self.pyth_exponent,
-            self.pyth_publish_time
+            self.pyth_publish_time,
+            self.underlying_amount
         )
         .execute(&mut **sql_tx)
         .await?;
