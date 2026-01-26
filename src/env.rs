@@ -3,7 +3,8 @@ use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use tracing::Level;
+use std::process::ExitCode;
+use tracing::{Level, error, info};
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
@@ -107,7 +108,7 @@ impl From<&LogLevel> for Level {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
+pub(crate) enum ConfigError {
     #[error(transparent)]
     Rebalancing(#[from] RebalancingConfigError),
     #[error(transparent)]
@@ -118,6 +119,39 @@ pub enum ConfigError {
     PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
     #[error("Invalid execution threshold: {0}")]
     InvalidThreshold(#[from] InvalidThresholdError),
+}
+
+impl ConfigError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::Clap(_) => "missing or invalid environment variable",
+            Self::InvalidThreshold(_) => "invalid execution threshold",
+        }
+    }
+}
+
+/// Parses environment from command line and validates configuration.
+///
+/// Returns `ExitCode::SUCCESS` if valid, `ExitCode::FAILURE` otherwise.
+/// Logs success/failure via tracing.
+///
+/// This function is intended exclusively for the `validate_config` binary.
+/// Other code should use `Env::parse()` and `into_config()` directly.
+pub fn validate_config() -> ExitCode {
+    match Env::try_parse() {
+        Ok(env) => match env.into_config() {
+            Ok(_) => {
+                info!("Config validation passed");
+                ExitCode::SUCCESS
+            }
+            Err(_) => ExitCode::FAILURE,
+        },
+        Err(e) => {
+            error!(error = %e, "Config parsing failed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,7 +199,16 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn into_config(self) -> Result<Config, ConfigError> {
+    /// Parses environment variables into a validated Config.
+    ///
+    /// Logs the error kind via tracing on failure.
+    pub fn into_config(self) -> anyhow::Result<Config> {
+        Ok(self.into_config_inner().inspect_err(|e| {
+            error!(kind = e.kind(), "Config parsing failed");
+        })?)
+    }
+
+    fn into_config_inner(self) -> Result<Config, ConfigError> {
         let broker = match self.executor {
             SupportedExecutor::Schwab => {
                 let schwab_auth = SchwabAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
@@ -271,11 +314,12 @@ pub(crate) mod tests {
     use rust_decimal::Decimal;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::onchain::EvmEnv;
     use crate::shares::FractionalShares;
-    use crate::threshold::{ExecutionThreshold, Usdc};
+    use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -422,6 +466,7 @@ pub(crate) mod tests {
         });
     }
 
+    #[tracing_test::traced_test]
     #[test]
     fn rebalancing_enabled_with_schwab_fails() {
         temp_env::with_vars(
@@ -456,16 +501,16 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(
-                            RebalancingConfigError::NotAlpacaBroker
-                        ))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::NotAlpacaBroker)
                     ),
-                    "Expected NotAlpacaBroker error, got {result:?}"
+                    "Expected NotAlpacaBroker error, got {config_err:?}"
                 );
+                assert!(logs_contain("rebalancing configuration error"));
             },
         );
     }
@@ -517,13 +562,14 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-                    "Expected clap error for missing redemption_wallet, got {result:?}"
+                    "Expected clap error for missing redemption_wallet, got {config_err:?}"
                 );
             },
         );
@@ -579,13 +625,14 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-                    "Expected clap error for missing ethereum_rpc_url, got {result:?}"
+                    "Expected clap error for missing ethereum_rpc_url, got {config_err:?}"
                 );
             },
         );
@@ -638,13 +685,14 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-                    "Expected clap error for missing evm_private_key, got {result:?}"
+Expected clap error for missing evm_private_key, got {config_err:?}
                 );
             },
         );
@@ -1050,6 +1098,63 @@ pub(crate) mod tests {
 
                 let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
                 assert_eq!(config.execution_threshold, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn config_error_kind_rebalancing() {
+        let err = ConfigError::Rebalancing(RebalancingConfigError::NotAlpacaBroker);
+        assert_eq!(err.kind(), "rebalancing configuration error");
+    }
+
+    #[test]
+    fn config_error_kind_clap() {
+        let clap_err = clap::Command::new("test")
+            .arg(clap::Arg::new("required").required(true))
+            .try_get_matches_from(vec!["test"])
+            .unwrap_err();
+        let err = ConfigError::Clap(clap_err);
+        assert_eq!(err.kind(), "missing or invalid environment variable");
+    }
+
+    #[test]
+    fn config_error_kind_invalid_threshold() {
+        let err = ConfigError::InvalidThreshold(InvalidThresholdError::ZeroShares);
+        assert_eq!(err.kind(), "invalid execution threshold");
+    }
+
+    #[traced_test]
+    #[test]
+    fn into_config_logs_rebalancing_error_kind() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", Some("true")),
+                ("ALPACA_API_KEY", Some("test-key")),
+                ("ALPACA_API_SECRET", Some("test-secret")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-trading-api",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let result = env.into_config();
+
+                assert!(result.is_err());
+                assert!(logs_contain("rebalancing configuration error"));
             },
         );
     }

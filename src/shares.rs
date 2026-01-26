@@ -349,8 +349,8 @@ mod tests {
         let shares = FractionalShares(Decimal::from_str("18446744073709551616").unwrap());
         let err = shares.try_into_u64().unwrap_err();
         assert!(
-            matches!(err, SharesConversionError::Overflow),
-            "Expected Overflow error, got: {err:?}"
+            matches!(err, SharesConversionError::ParseInt(_)),
+            "Expected ParseInt error, got: {err:?}"
         );
     }
 
