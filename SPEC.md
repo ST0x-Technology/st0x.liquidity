@@ -266,6 +266,64 @@ spec before merging to avoid confusing human and AI contributors.
 - **Configuration sprawl:** Env vars scattered across multiple places, different vars required based on values of other vars that can be set in countless different places without any ultimate source of truth
 - **Deployment coupling:** Updating one service requires redeploying everything
 - **No staging:** Adding a staging environment would require significant manual work
+
+#### **Approaches**
+
+The following approaches address these pain points with different trade-offs.
+
+#### **Approach A: Nix-Maxxing (NixOS + deploy-rs + ragenix)**
+
+This approach extends the team's existing Nix usage for development environments
+to infrastructure, deployment, and secrets management.
+
+**Key Tools:**
+
+- **nixos-generators**: Builds custom NixOS VM images for cloud providers
+  (DigitalOcean, AWS, etc.). We build a base image with OS essentials, then
+  upload it to DigitalOcean Spaces for droplet provisioning.
+
+- **deploy-rs**: Deploys to NixOS (or non-NixOS) hosts via SSH. Supports two
+  activation types: `activate.nixos` for full system configs, `activate.custom`
+  for standalone packages. Key feature: "magic rollback" auto-reverts if SSH
+  connection is lost during activation (safety net, not a general rollback
+  mechanism).
+
+- **ragenix**: Rust CLI for age-encrypted secrets stored in git (drop-in
+  replacement for agenix with better validation). Secrets are encrypted with
+  public keys; at deployment, the target host decrypts using its SSH key.
+  Secrets appear at `/run/agenix/` in a tmpfs.
+
+**Architecture:**
+
+The approach separates stable infrastructure (base image) from frequently
+changing application code (service deployments):
+
+*Base NixOS image* (rebuilt occasionally when adding services or changing infra):
+- OS essentials: SSH, firewall, users
+- Systemd unit definitions for application services (pointing to deployment paths)
+- Grafana as a NixOS native service
+- Monitoring agents
+- ragenix integration for secret decryption
+
+*Per-service deploy-rs profiles* (deployed independently):
+- `server` - hedging bot (Schwab instance and Alpaca instance)
+- `reporter` - position reporter (Schwab instance and Alpaca instance)
+- `dashboard` - custom operations dashboard
+
+Each profile deploys its binary to a known path and restarts the corresponding
+systemd unit. This allows updating one service without touching others.
+
+*Configuration management*:
+- Single TOML config file per service containing all config (secrets and
+  non-secrets)
+- Files encrypted with ragenix, decrypted at activation to `/run/agenix/`
+- Services use `clap-config-file` crate to load config via `--config-file` flag
+- Secrets marked `config_only` so they cannot be passed via CLI args
+
+*Infrastructure*:
+- Terraform (standard HCL) for DigitalOcean resources
+- Nix wraps Terraform for reproducible execution (pinned version via flake.lock)
+- Remote state in DO Spaces with locking
 **CI/CD Credential Management:**
 
 Clear separation between build-time and runtime secrets:
