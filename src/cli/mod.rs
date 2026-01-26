@@ -7,6 +7,7 @@ mod rebalancing;
 mod trading;
 mod vault;
 
+use alloy::hex;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -15,6 +16,23 @@ use st0x_execution::{Direction, Symbol};
 use std::io::Write;
 use thiserror::Error;
 use tracing::info;
+
+/// Parse a hex string into B256, left-padding with zeros if shorter than 32 bytes.
+fn parse_vault_id(s: &str) -> Result<B256, String> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+
+    if s.len() > 64 {
+        return Err(format!(
+            "vault ID too long: {s} ({} hex chars, max 64)",
+            s.len()
+        ));
+    }
+
+    let padded = format!("{:0>64}", s);
+    let bytes = hex::decode(&padded).map_err(|e| format!("invalid hex: {e}"))?;
+
+    Ok(B256::from_slice(&bytes))
+}
 
 use crate::env::{Config, Env};
 use crate::shares::FractionalShares;
@@ -166,15 +184,26 @@ pub enum Commands {
     /// Useful for debugging transfer status and verifying deposits.
     AlpacaTransfers,
 
-    /// Deposit USDC into a Raindex vault
+    /// Deposit tokens into a Raindex vault
     ///
-    /// This command deposits USDC from your wallet into a Raindex OrderBook vault.
+    /// This command deposits ERC20 tokens from your wallet into a Raindex OrderBook vault.
     /// It handles ERC20 approval and the vault deposit in sequence.
-    /// Network is automatically determined from Alpaca trading mode.
     VaultDeposit {
-        /// Amount of USDC to deposit
+        /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount")]
-        amount: Usdc,
+        amount: rust_decimal::Decimal,
+
+        /// Token contract address
+        #[arg(short = 't', long = "token")]
+        token: Address,
+
+        /// Vault ID
+        #[arg(short = 'v', long = "vault-id")]
+        vault_id: B256,
+
+        /// Token decimals (e.g., 6 for USDC, 18 for most ERC20s)
+        #[arg(short = 'd', long = "decimals")]
+        decimals: u8,
     },
 
     /// Withdraw USDC from a Raindex vault
@@ -379,7 +408,10 @@ enum ProviderCommand {
         amount: Usdc,
     },
     VaultDeposit {
-        amount: Usdc,
+        amount: rust_decimal::Decimal,
+        token: Address,
+        vault_id: B256,
+        decimals: u8,
     },
     VaultWithdraw {
         amount: Usdc,
@@ -454,7 +486,17 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::TransferUsdc { direction, amount } => {
             Err(ProviderCommand::TransferUsdc { direction, amount })
         }
-        Commands::VaultDeposit { amount } => Err(ProviderCommand::VaultDeposit { amount }),
+        Commands::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => Err(ProviderCommand::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        }),
         Commands::VaultWithdraw { amount } => Err(ProviderCommand::VaultWithdraw { amount }),
         Commands::CctpBridge { amount, all, from } => {
             Err(ProviderCommand::CctpBridge { amount, all, from })
@@ -562,8 +604,16 @@ async fn run_provider_command<W: Write>(
             rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
                 .await
         }
-        ProviderCommand::VaultDeposit { amount } => {
-            vault::vault_deposit_command(stdout, amount, config, provider).await
+        ProviderCommand::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => {
+            vault::vault_deposit_command(
+                stdout, amount, token, vault_id, decimals, config, provider,
+            )
+            .await
         }
         ProviderCommand::VaultWithdraw { amount } => {
             vault::vault_withdraw_command(stdout, amount, config, provider).await
