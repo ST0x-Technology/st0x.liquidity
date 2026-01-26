@@ -249,6 +249,23 @@ spec before merging to avoid confusing human and AI contributors.
 - Balanced complexity: more robust than bash scripts, less complex than Kubernetes
 - Support potential future microservices architecture
 - Thin GitHub Actions workflows (invoke tools, no inline bash)
+
+#### **Current Setup and Pain Points**
+
+**Current infrastructure:**
+- Single DigitalOcean droplet running Ubuntu
+- Services deployed via Docker Compose
+- Deployment and rollback via bash scripts
+- Secrets stored in GitHub Secrets, injected as environment variables
+- Configuration scattered across multiple env var definitions
+
+**Pain points:**
+- **Manual infrastructure:** Droplet provisioning requires DigitalOcean UI
+- **Unreliable rollback:** Bash rollback scripts are brittle and feel unreliable
+- **Secret management friction:** Adding/updating secrets requires GitHub UI
+- **Configuration sprawl:** Env vars scattered across multiple places, different vars required based on values of other vars that can be set in countless different places without any ultimate source of truth
+- **Deployment coupling:** Updating one service requires redeploying everything
+- **No staging:** Adding a staging environment would require significant manual work
 **CI/CD Credential Management:**
 
 Clear separation between build-time and runtime secrets:
