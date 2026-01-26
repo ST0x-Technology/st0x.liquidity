@@ -235,24 +235,27 @@ defined in `migrations/20250703115746_trades.sql`.
 
 This section specifies infrastructure, deployment, and secrets management
 requirements as well as potential ways to fulfil them. During the review
-process, one such approach should be chosen and the rest removed from the
-spec before merging to avoid confusing human and AI contributors.
+process, one such approach should be chosen and the rest removed from the spec
+before merging to avoid confusing human and AI contributors.
 
 #### **Design Goals**
 
 - Declarative infrastructure management (eliminate DigitalOcean UI dependency)
 - Declarative secret management (eliminate GitHub Secrets UI dependency)
-- Structured configuration management (replace scattered env vars with validated config files)
+- Structured configuration management (replace scattered env vars with validated
+  config files)
 - Easy addition of staging environments
 - Independent service deployment and rollback
 - Reliable rollback mechanism (replace brittle rollback scripts)
-- Balanced complexity: more robust than bash scripts, less complex than Kubernetes
+- Balanced complexity: more robust than bash scripts, less complex than
+  Kubernetes
 - Support potential future microservices architecture
 - Thin GitHub Actions workflows (invoke tools, no inline bash)
 
 #### **Current Setup and Pain Points**
 
 **Current infrastructure:**
+
 - Single DigitalOcean droplet running Ubuntu
 - Services deployed via Docker Compose
 - Deployment and rollback via bash scripts
@@ -260,12 +263,22 @@ spec before merging to avoid confusing human and AI contributors.
 - Configuration scattered across multiple env var definitions
 
 **Pain points:**
+
+- **Fragile foundation:** The bash deployment scripts "kinda work" but feel
+  brittle - not a robust foundation to build serious production-grade systems
+  on. Adding a new env var with no default is stressful. Increasing deployment
+  complexity means touching scripts that only run in CI and haven't been
+  meaningfully tested.
 - **Manual infrastructure:** Droplet provisioning requires DigitalOcean UI
-- **Unreliable rollback:** Bash rollback scripts are brittle and feel unreliable
 - **Secret management friction:** Adding/updating secrets requires GitHub UI
-- **Configuration sprawl:** Env vars scattered across multiple places, different vars required based on values of other vars that can be set in countless different places without any ultimate source of truth
+- **Configuration sprawl:** Env vars scattered across multiple places, different
+  vars required based on values of other vars that can be set in countless
+  different places without any ultimate source of truth
 - **Deployment coupling:** Updating one service requires redeploying everything
-- **No staging:** Adding a staging environment would require significant manual work
+- **No staging:** Adding a staging environment would require significant manual
+  work
+- **Rollback uncertainty:** Rollback scripts exist but haven't been
+  battle-tested enough to trust them in an emergency
 
 #### **Approaches**
 
@@ -288,10 +301,13 @@ to infrastructure, deployment, and secrets management.
   connection is lost during activation (safety net, not a general rollback
   mechanism).
 
-- **ragenix**: Rust CLI for age-encrypted secrets stored in git (drop-in
-  replacement for agenix with better validation). Secrets are encrypted with
-  public keys; at deployment, the target host decrypts using its SSH key.
-  Secrets appear at `/run/agenix/` in a tmpfs.
+- **ragenix**: Age-encrypted secrets for NixOS, using existing SSH keys. CLI
+  encrypts secrets locally into `.age` files you commit to git. NixOS module
+  decrypts at activation using the host's SSH key, mounting secrets to
+  `/run/agenix/` (tmpfs - cleartext never hits disk or Nix store). No GPG, no
+  separate secret distribution - secrets deploy with `nixos-rebuild` like any
+  other config. Ragenix is a Rust drop-in for agenix but is less documented, so
+  it's best to follow agenix documentation but use ragenix instead.
 
 **Architecture:**
 
