@@ -242,11 +242,53 @@ the team's existing Nix usage for development environments.
 - Declarative infrastructure management (eliminate DigitalOcean UI dependency)
 - Declarative secret management (eliminate GitHub Secrets UI dependency)
 - Easy addition of staging environments
-- Independent deployment and rollback of service subsets (6 services)
-- Balanced complexity: more robust than bash scripts, less than Kubernetes
+- Independent service control
+- Balanced complexity: more robust than bash scripts, less complex than Kubernetes
 - Support potential future microservices architecture
 - Thin GitHub Actions workflows (invoke tools, no inline bash)
 - Unified, reusable approach via Nix where possible
+```text
+┌─────────────────────────────────────────────────────────────────┐
+│                    Nix Flake (Single Source of Truth)           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  packages.digitalOceanImage         Custom NixOS image build    │
+│  ├─ nixos-generators (do format)    ──────────────────────────► │
+│  ├─ Base OS + SSH + monitoring      Upload to DO Spaces         │
+│  └─ Stable, rarely changes                                      │
+│                                                                 │
+│  deploy.nodes.production            Runtime deployment          │
+│  ├─ 6 service profiles              (deploy-rs)                 │
+│  │   ├─ schwarbot                   ──────────────────────────► │
+│  │   ├─ alpacabot                   Per-service deploy/rollback │
+│  │   ├─ reporter-schwab             Automatic rollback          │
+│  │   ├─ reporter-alpaca                                         │
+│  │   ├─ grafana                                                 │
+│  │   └─ dashboard                                               │
+│                                                                 │
+│  age.secrets.*                      Encrypted secrets           │
+│  ├─ schwab-credentials.age          (ragenix CLI, agenix module)│
+│  ├─ alpaca-credentials.age          ──────────────────────────► │
+│  └─ encryption-key.age              Decrypt at activation       │
+│                                                                 │
+│  packages.tf-plan, tf-apply         Nix-wrapped Terraform       │
+│  └─ terraform/ (standard HCL)       ──────────────────────────► │
+│      ├─ main.tf                     Provision DO infrastructure │
+│      ├─ variables.tf                (pinned via flake.lock)     │
+│      └─ outputs.tf                                              │
+│                                                                 │
+│  devShells.default                  Reproducible dev environment│
+│  └─ terraform, doctl, deploy-rs     All tools pinned            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+**CI/CD Credential Management:**
+
+Clear separation between build-time and runtime secrets:
+
+| Secret Type | Storage                | When Used                          | Example                                          |
+| ----------- | ---------------------- | ---------------------------------- | ------------------------------------------------ |
+| Runtime     | ragenix (.age files)   | Decrypted on droplet at activation | Schwab API keys, Alpaca keys, DB encryption key  |
+| Build-time  | GitHub Secrets or OIDC | Used by CI during build/deploy     | DO API token, Spaces credentials, deploy SSH key |
 **1. Custom NixOS Images (nixos-generators):**
 
 Build reproducible DigitalOcean VM images directly from flake:
