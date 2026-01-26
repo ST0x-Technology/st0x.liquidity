@@ -1,5 +1,6 @@
 use alloy::primitives::U256;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
@@ -95,7 +96,9 @@ impl FractionalShares {
             return Err(SharesConversionError::FractionalValue(self.0));
         }
 
-        Ok(self.0.to_string().parse::<u64>()?)
+        self.0
+            .to_u64()
+            .ok_or(SharesConversionError::ExceedsU64Max(self.0))
     }
 
     /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
@@ -135,7 +138,7 @@ pub(crate) enum SharesConversionError {
     #[error("shares value too small to represent with 18 decimals: {0}")]
     Underflow(Decimal),
     #[error("shares value exceeds u64::MAX: {0}")]
-    ParseInt(#[from] std::num::ParseIntError),
+    ExceedsU64Max(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
     #[error("failed to parse U256: {0}")]
@@ -349,8 +352,8 @@ mod tests {
         let shares = FractionalShares(Decimal::from_str("18446744073709551616").unwrap());
         let err = shares.try_into_u64().unwrap_err();
         assert!(
-            matches!(err, SharesConversionError::ParseInt(_)),
-            "Expected ParseInt error, got: {err:?}"
+            matches!(err, SharesConversionError::ExceedsU64Max(_)),
+            "Expected ExceedsU64Max error, got: {err:?}"
         );
     }
 

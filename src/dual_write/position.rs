@@ -177,7 +177,7 @@ pub(crate) async fn fail_offchain_order(
 ///
 /// Returns `Ok(Some(position))` if the position exists and is in Live state.
 /// Returns `Ok(None)` if no position exists for this symbol (no events).
-/// Returns `Err` if there's a database or deserialization error.
+/// Returns `Err` if the aggregate is in a failed state or there's a database error.
 pub(crate) async fn load_position(
     context: &DualWriteContext,
     symbol: &Symbol,
@@ -195,7 +195,11 @@ pub(crate) async fn load_position(
 
     match aggregate {
         Lifecycle::Live(position) => Ok(Some(position.clone())),
-        Lifecycle::Uninitialized | Lifecycle::Failed { .. } => Ok(None),
+        Lifecycle::Uninitialized => Ok(None),
+        Lifecycle::Failed { error, .. } => Err(DualWriteError::PositionAggregateFailed {
+            aggregate_id,
+            error: error.clone(),
+        }),
     }
 }
 

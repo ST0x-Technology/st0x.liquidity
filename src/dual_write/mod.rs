@@ -6,7 +6,7 @@ use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::PersistenceError;
 
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::offchain_order::{NegativePriceCents, OffchainOrder, OffchainOrderError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
 use crate::position::{Position, PositionError};
@@ -52,6 +52,11 @@ pub(crate) enum DualWriteError {
     InvalidOrderState { execution_id: i64, expected: String },
     #[error("Negative price in cents: {0}")]
     NegativePriceCents(#[from] NegativePriceCents),
+    #[error("Position aggregate {aggregate_id} is in failed state: {error}")]
+    PositionAggregateFailed {
+        aggregate_id: String,
+        error: LifecycleError<ArithmeticError<FractionalShares>>,
+    },
 }
 
 #[derive(Clone)]

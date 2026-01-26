@@ -276,18 +276,12 @@ pub(super) async fn process_found_trade<W: Write>(
     let dual_write_context =
         DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
-    // Update Position aggregate first so threshold check sees current state
-    crate::dual_write::initialize_position(
+    update_position_aggregate(
         &dual_write_context,
-        onchain_trade.symbol.base(),
+        &onchain_trade,
         config.execution_threshold,
     )
-    .await
-    .ok(); // OK if already initialized
-
-    crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &onchain_trade)
-        .await
-        .ok(); // Best effort - may fail if missing timestamp
+    .await;
 
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
@@ -339,6 +333,43 @@ pub(super) async fn process_found_trade<W: Write>(
     }
 
     Ok(())
+}
+
+async fn update_position_aggregate(
+    dual_write_context: &DualWriteContext,
+    onchain_trade: &OnchainTrade,
+    execution_threshold: ExecutionThreshold,
+) {
+    if let Err(e) = crate::dual_write::initialize_position(
+        dual_write_context,
+        onchain_trade.symbol.base(),
+        execution_threshold,
+    )
+    .await
+    {
+        error!(
+            symbol = %onchain_trade.symbol.base(),
+            execution_threshold = ?execution_threshold,
+            tx_hash = %onchain_trade.tx_hash,
+            log_index = onchain_trade.log_index,
+            error = ?e,
+            "Failed to initialize position aggregate"
+        );
+    }
+
+    if let Err(e) =
+        crate::dual_write::acknowledge_onchain_fill(dual_write_context, onchain_trade).await
+    {
+        error!(
+            symbol = %onchain_trade.symbol.base(),
+            execution_threshold = ?execution_threshold,
+            tx_hash = %onchain_trade.tx_hash,
+            log_index = onchain_trade.log_index,
+            block_timestamp = ?onchain_trade.block_timestamp,
+            error = ?e,
+            "Failed to acknowledge onchain fill in position aggregate"
+        );
+    }
 }
 
 fn display_trade_details<W: Write>(

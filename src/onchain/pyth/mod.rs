@@ -41,6 +41,10 @@ pub enum PythError {
     ConversionFailed(&'static str),
     #[error("Invalid timestamp value: {0}")]
     InvalidTimestamp(U256),
+    #[error("Exponent conversion failed: {0}")]
+    ExponentConversion(#[from] std::num::TryFromIntError),
+    #[error("Decimal creation failed: {0}")]
+    DecimalCreation(#[from] rust_decimal::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -197,11 +201,9 @@ impl Price {
             let decimals = exponent
                 .checked_abs()
                 .ok_or(PythError::ArithmeticOverflow)?
-                .try_into()
-                .map_err(|_| PythError::InvalidResponse("exponent too large"))?;
+                .try_into()?;
 
-            Decimal::try_new(self.price, decimals)
-                .map_err(|_| PythError::InvalidResponse("failed to create decimal"))?
+            Decimal::try_new(self.price, decimals)?
         };
 
         Ok(result.normalize())

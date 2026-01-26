@@ -344,6 +344,10 @@ impl Position {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
                 let executable_shares = FractionalShares(self.net.abs().0.floor());
 
+                if executable_shares.0 == Decimal::ZERO {
+                    return Ok(None);
+                }
+
                 let direction = if self.net.0 > Decimal::ZERO {
                     Direction::Sell
                 } else {
