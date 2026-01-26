@@ -18,6 +18,7 @@ use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
+use crate::threshold::ExecutionThreshold;
 
 use super::auth::ensure_schwab_authentication;
 
