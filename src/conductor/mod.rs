@@ -614,13 +614,16 @@ async fn handle_queue_processing_result<E>(
 {
     match result {
         Ok(Some(execution)) => {
-            if let Some(exec_id) = execution.id {
-                if let Err(e) =
-                    execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
-                        .await
-                {
-                    error!("Failed to execute offchain order {exec_id}: {e}");
-                }
+            let Some(exec_id) = execution.id else {
+                error!("Offchain execution missing id; skipping execution");
+                return;
+            };
+
+            if let Err(e) =
+                execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
+                    .await
+            {
+                error!("Failed to execute offchain order {exec_id}: {e}");
             }
         }
         Ok(None) => sleep(Duration::from_millis(100)).await,
