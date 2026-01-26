@@ -346,17 +346,20 @@ async fn create_trade_execution_linkages(
     let zerox_suffix = format!("{base_str}0x");
     let s1_suffix = format!("{base_str}s1");
 
+    // Use COALESCE(underlying_amount, amount) to get the hedge amount:
+    // - For wrapped tokens: underlying_amount contains the underlying-equivalent
+    // - For unwrapped tokens: underlying_amount is NULL, falls back to amount
     let trade_rows = sqlx::query!(
         r#"
         SELECT
             ot.id as trade_id,
-            ot.amount as trade_amount,
+            COALESCE(ot.underlying_amount, ot.amount) as "hedge_amount!: f64",
             COALESCE(SUM(tel.contributed_shares), 0.0) as "already_allocated: f64"
         FROM onchain_trades ot
         LEFT JOIN trade_execution_links tel ON ot.id = tel.trade_id
         WHERE (ot.symbol = ?1 OR ot.symbol = ?2 OR ot.symbol = ?3) AND ot.direction = ?4
-        GROUP BY ot.id, ot.amount, ot.created_at
-        HAVING (ot.amount - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001  -- Has remaining allocation
+        GROUP BY ot.id, COALESCE(ot.underlying_amount, ot.amount), ot.created_at
+        HAVING (COALESCE(ot.underlying_amount, ot.amount) - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001
         ORDER BY ot.created_at ASC
         "#,
         t_prefix,
@@ -376,7 +379,7 @@ async fn create_trade_execution_linkages(
         }
 
         let already_allocated = row.already_allocated.unwrap_or(0.0);
-        let available_amount = row.trade_amount - already_allocated;
+        let available_amount = row.hedge_amount - already_allocated;
         if available_amount <= 0.001 {
             continue; // Trade fully allocated to previous executions
         }
