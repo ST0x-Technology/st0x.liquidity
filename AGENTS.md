@@ -145,6 +145,11 @@ binary).
 - `sqlx migrate add <migration_name>` - Create a new migration file
 - Database URL configured via `DATABASE_URL` environment variable
 
+**CRITICAL: If Rust build fails with sqlx macro errors like "unable to open
+database file" or "(code: 14)", run `sqlx db reset -y` to fix the database.**
+This is the proper solution - NEVER try workarounds like
+`DATABASE_URL=sqlite://:memory:` or other hacks.
+
 **CRITICAL: NEVER manually create migration files.** Always use
 `sqlx migrate add
 <migration_name>` to create migrations. This ensures proper

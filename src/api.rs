@@ -96,6 +96,7 @@ mod tests {
     use crate::env::{BrokerConfig, Config};
     use crate::onchain::EvmEnv;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
     use st0x_execution::schwab::SchwabAuthEnv;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -123,6 +124,7 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

@@ -1,5 +1,6 @@
 use alloy::primitives::U256;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
@@ -83,6 +84,23 @@ impl FractionalShares {
         Self(self.0.abs())
     }
 
+    /// Converts the whole number part to u64.
+    ///
+    /// Returns an error if the value is negative, has fractional parts, or exceeds u64::MAX.
+    pub(crate) fn try_into_u64(self) -> Result<u64, SharesConversionError> {
+        if self.0.is_sign_negative() {
+            return Err(SharesConversionError::NegativeValue(self.0));
+        }
+
+        if self.0.fract() != Decimal::ZERO {
+            return Err(SharesConversionError::FractionalValue(self.0));
+        }
+
+        self.0
+            .to_u64()
+            .ok_or(SharesConversionError::ExceedsU64Max(self.0))
+    }
+
     /// Converts to U256 with 18 decimal places (standard ERC20 decimals).
     ///
     /// Returns an error for negative values, underflow (values < 1e-18),
@@ -115,8 +133,12 @@ impl FractionalShares {
 pub(crate) enum SharesConversionError {
     #[error("shares value cannot be negative: {0}")]
     NegativeValue(Decimal),
+    #[error("shares value has fractional component: {0}")]
+    FractionalValue(Decimal),
     #[error("shares value too small to represent with 18 decimals: {0}")]
     Underflow(Decimal),
+    #[error("shares value exceeds u64::MAX: {0}")]
+    ExceedsU64Max(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
     #[error("failed to parse U256: {0}")]
@@ -254,45 +276,35 @@ mod tests {
     #[test]
     fn to_u256_18_decimals_zero_returns_zero() {
         let shares = FractionalShares(Decimal::ZERO);
-
         let result = shares.to_u256_18_decimals().unwrap();
-
         assert_eq!(result, U256::ZERO);
     }
 
     #[test]
     fn to_u256_18_decimals_one_returns_10_pow_18() {
         let shares = FractionalShares(Decimal::ONE);
-
         let result = shares.to_u256_18_decimals().unwrap();
-
         assert_eq!(result, U256::from_str("1000000000000000000").unwrap());
     }
 
     #[test]
     fn to_u256_18_decimals_fractional_value() {
         let shares = FractionalShares(Decimal::from_str("1.5").unwrap());
-
         let result = shares.to_u256_18_decimals().unwrap();
-
         assert_eq!(result, U256::from_str("1500000000000000000").unwrap());
     }
 
     #[test]
     fn to_u256_18_decimals_small_fractional_value() {
         let shares = FractionalShares(Decimal::from_str("0.000000000000000001").unwrap());
-
         let result = shares.to_u256_18_decimals().unwrap();
-
         assert_eq!(result, U256::from(1));
     }
 
     #[test]
     fn to_u256_18_decimals_negative_returns_error() {
         let shares = FractionalShares(Decimal::NEGATIVE_ONE);
-
         let err = shares.to_u256_18_decimals().unwrap_err();
-
         assert!(
             matches!(err, SharesConversionError::NegativeValue(_)),
             "Expected NegativeValue error, got: {err:?}"
@@ -303,12 +315,55 @@ mod tests {
     fn to_u256_18_decimals_underflow_returns_error() {
         // Value smaller than 1e-18 cannot be represented
         let shares = FractionalShares(Decimal::from_str("0.0000000000000000001").unwrap());
-
         let err = shares.to_u256_18_decimals().unwrap_err();
-
         assert!(
             matches!(err, SharesConversionError::Underflow(_)),
             "Expected Underflow error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_into_u64_positive_whole_number() {
+        let shares = FractionalShares(Decimal::from(5));
+        let result = shares.try_into_u64().unwrap();
+        assert_eq!(result, 5);
+    }
+
+    #[test]
+    fn try_into_u64_zero_returns_ok() {
+        let shares = FractionalShares(Decimal::ZERO);
+        let result = shares.try_into_u64().unwrap();
+        assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn try_into_u64_negative_returns_error() {
+        let shares = FractionalShares(Decimal::NEGATIVE_ONE);
+        let err = shares.try_into_u64().unwrap_err();
+        assert!(
+            matches!(err, SharesConversionError::NegativeValue(_)),
+            "Expected NegativeValue error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_into_u64_overflow_returns_error() {
+        // Value larger than u64::MAX (18446744073709551615)
+        let shares = FractionalShares(Decimal::from_str("18446744073709551616").unwrap());
+        let err = shares.try_into_u64().unwrap_err();
+        assert!(
+            matches!(err, SharesConversionError::ExceedsU64Max(_)),
+            "Expected ExceedsU64Max error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn try_into_u64_fractional_returns_error() {
+        let shares = FractionalShares(Decimal::from_str("5.5").unwrap());
+        let err = shares.try_into_u64().unwrap_err();
+        assert!(
+            matches!(err, SharesConversionError::FractionalValue(_)),
+            "Expected FractionalValue error, got: {err:?}"
         );
     }
 }

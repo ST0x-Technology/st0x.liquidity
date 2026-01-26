@@ -6,11 +6,12 @@ use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::PersistenceError;
 
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::offchain_order::{NegativePriceCents, OffchainOrder, OffchainOrderError};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeError};
 use crate::position::{Position, PositionError};
 use crate::shares::{ArithmeticError, FractionalShares};
+use crate::threshold::ExecutionThreshold;
 
 mod offchain_order;
 mod onchain_trade;
@@ -20,7 +21,7 @@ pub(crate) use offchain_order::{confirm_submission, mark_failed, place_order, re
 pub(crate) use onchain_trade::witness_trade;
 pub(crate) use position::{
     acknowledge_onchain_fill, complete_offchain_order, fail_offchain_order, initialize_position,
-    place_offchain_order,
+    load_position, place_offchain_order,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +52,11 @@ pub(crate) enum DualWriteError {
     InvalidOrderState { execution_id: i64, expected: String },
     #[error("Negative price in cents: {0}")]
     NegativePriceCents(#[from] NegativePriceCents),
+    #[error("Position aggregate {aggregate_id} is in failed state: {error}")]
+    PositionAggregateFailed {
+        aggregate_id: String,
+        error: LifecycleError<ArithmeticError<FractionalShares>>,
+    },
 }
 
 #[derive(Clone)]
@@ -59,16 +65,33 @@ pub(crate) struct DualWriteContext {
     onchain_trade: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
     position: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>>,
     offchain_order: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
+    execution_threshold: ExecutionThreshold,
 }
 
 impl DualWriteContext {
+    /// Creates a new context with the default threshold (1 share).
+    #[cfg(test)]
     pub(crate) fn new(pool: SqlitePool) -> Self {
+        Self::with_threshold(pool, ExecutionThreshold::whole_share())
+    }
+
+    /// Creates a new context with a specific execution threshold.
+    /// Used in production to pass through configuration.
+    pub(crate) fn with_threshold(
+        pool: SqlitePool,
+        execution_threshold: ExecutionThreshold,
+    ) -> Self {
         Self {
             pool: pool.clone(),
             onchain_trade: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             position: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             offchain_order: Arc::new(sqlite_cqrs(pool, vec![], ())),
+            execution_threshold,
         }
+    }
+
+    pub(crate) fn execution_threshold(&self) -> ExecutionThreshold {
+        self.execution_threshold
     }
 
     pub(crate) fn pool(&self) -> &SqlitePool {

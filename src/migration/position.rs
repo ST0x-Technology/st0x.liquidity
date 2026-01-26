@@ -79,6 +79,7 @@ async fn migrate_single_position(
         accumulated_long: FractionalShares(accumulated_long),
         accumulated_short: FractionalShares(accumulated_short),
         threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
+        last_price_usdc: None,
     };
 
     match execution {

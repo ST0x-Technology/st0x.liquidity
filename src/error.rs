@@ -92,8 +92,16 @@ pub(crate) enum AlloyError {
 pub(crate) enum EventQueueError {
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
-    #[error("Event queue error: {0}")]
-    Processing(String),
+    #[error("Log missing required field: {0}")]
+    MissingLogField(&'static str),
+    #[error("Queued event missing ID")]
+    MissingEventId,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
+    #[error("Event serialization failed: {0}")]
+    Serialization(#[from] serde_json::Error),
+    #[error("Invalid tx_hash format: {0}")]
+    InvalidTxHash(#[from] alloy::hex::FromHexError),
 }
 
 /// Event processing errors for live event handling.
@@ -105,8 +113,10 @@ pub(crate) enum EventProcessingError {
     EnqueueClearV3(#[source] EventQueueError),
     #[error("Failed to enqueue TakeOrderV3 event: {0}")]
     EnqueueTakeOrderV3(#[source] EventQueueError),
-    #[error("Failed to process trade through accumulator: {0}")]
-    AccumulatorProcessing(String),
+    #[error("Database transaction error: {0}")]
+    Transaction(#[from] sqlx::Error),
+    #[error("Execution with ID {0} not found")]
+    ExecutionNotFound(i64),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
@@ -172,6 +182,12 @@ pub(crate) enum OnChainError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
+    #[error("Dual write error: {0}")]
+    DualWrite(#[from] crate::dual_write::DualWriteError),
+    #[error("Position error: {0}")]
+    Position(#[from] crate::position::PositionError),
+    #[error("Shares conversion error: {0}")]
+    SharesConversion(#[from] crate::shares::SharesConversionError),
 }
 
 impl From<sqlx::Error> for OnChainError {

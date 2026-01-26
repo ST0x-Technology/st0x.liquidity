@@ -4,6 +4,7 @@ use st0x_execution::{Direction, OrderState, PersistenceError, Shares, SupportedE
 use tracing::{debug, info, warn};
 
 use super::OnchainTrade;
+use crate::dual_write::{DualWriteContext, load_position};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_execution_lease};
 use crate::offchain::execution::OffchainExecution;
@@ -36,12 +37,13 @@ pub(crate) struct TradeProcessingResult {
 /// Returns `TradeProcessingResult` containing the new execution (if created) and any
 /// cleaned up stale executions. The transaction must be committed by the caller.
 #[tracing::instrument(
-    skip(sql_tx, trade),
+    skip(sql_tx, dual_write_context, trade),
     fields(symbol = %trade.symbol, amount = %trade.amount, direction = ?trade.direction),
     level = tracing::Level::INFO
 )]
 pub(crate) async fn process_onchain_trade(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    dual_write_context: &DualWriteContext,
     trade: OnchainTrade,
     executor_type: SupportedExecutor,
 ) -> Result<TradeProcessingResult, OnChainError> {
@@ -110,9 +112,14 @@ pub(crate) async fn process_onchain_trade(
     let cleaned_up_executions = clean_up_stale_executions(sql_tx, base_symbol).await?;
 
     let execution = if try_acquire_execution_lease(sql_tx, base_symbol).await? {
-        let result =
-            try_create_execution_if_ready(sql_tx, base_symbol, &mut calculator, executor_type)
-                .await?;
+        let result = try_create_execution_if_ready(
+            sql_tx,
+            dual_write_context,
+            base_symbol,
+            &mut calculator,
+            executor_type,
+        )
+        .await?;
 
         match &result {
             Some(execution) => {
@@ -224,12 +231,37 @@ pub(crate) async fn save_within_transaction(
 
 async fn try_create_execution_if_ready(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    dual_write_context: &DualWriteContext,
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
-    let Some(execution_type) = calculator.determine_execution_type() else {
+    let Some(position) = load_position(dual_write_context, base_symbol).await? else {
+        debug!(
+            symbol = %base_symbol,
+            "Position aggregate not found, cannot check threshold"
+        );
         return Ok(None);
+    };
+
+    let Some((direction, shares)) = position.is_ready_for_execution()? else {
+        debug!(
+            symbol = %base_symbol,
+            net = %position.net.0,
+            "Position threshold not met"
+        );
+        return Ok(None);
+    };
+
+    let shares_u64 = shares.try_into_u64()?;
+
+    if shares_u64 == 0 {
+        return Ok(None);
+    }
+
+    let execution_type = match direction {
+        Direction::Sell => AccumulationBucket::LongExposure,
+        Direction::Buy => AccumulationBucket::ShortExposure,
     };
 
     execute_position(
@@ -237,6 +269,8 @@ async fn try_create_execution_if_ready(
         base_symbol,
         calculator,
         execution_type,
+        shares_u64,
+        direction,
         executor_type,
     )
     .await
@@ -247,27 +281,13 @@ async fn execute_position(
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     execution_type: AccumulationBucket,
+    shares: u64,
+    direction: Direction,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
-    let shares = calculator.calculate_executable_shares()?;
-
-    if shares == 0 {
-        return Ok(None);
-    }
-
-    let instruction = match execution_type {
-        AccumulationBucket::LongExposure => Direction::Sell, // Long exposure -> Schwab SELL to offset
-        AccumulationBucket::ShortExposure => Direction::Buy, // Short exposure -> Schwab BUY to offset
-    };
-
-    let execution = create_execution_within_transaction(
-        sql_tx,
-        base_symbol,
-        shares,
-        instruction,
-        executor_type,
-    )
-    .await?;
+    let execution =
+        create_execution_within_transaction(sql_tx, base_symbol, shares, direction, executor_type)
+            .await?;
 
     let execution_id = execution.id.ok_or(PersistenceError::MissingExecutionId)?;
 
@@ -280,12 +300,12 @@ async fn execute_position(
     info!(
         symbol = %base_symbol,
         shares = shares,
-        direction = ?instruction,
+        direction = ?direction,
         execution_type = ?execution_type,
         execution_id = ?execution.id,
         remaining_long = calculator.accumulated_long,
         remaining_short = calculator.accumulated_short,
-        "Created Schwab execution with trade linkages"
+        "Created offchain execution with trade linkages"
     );
 
     Ok(Some(execution))
@@ -574,116 +594,48 @@ async fn mark_execution_as_timed_out(
 /// It prevents positions from sitting idle indefinitely when they've accumulated
 /// enough shares to execute but the triggering trade didn't push them over the threshold.
 #[tracing::instrument(
-    skip(pool),
+    skip(pool, dual_write_context),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
 pub(crate) async fn check_all_accumulated_positions(
     pool: &SqlitePool,
+    dual_write_context: &DualWriteContext,
     executor_type: SupportedExecutor,
 ) -> Result<Vec<OffchainExecution>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
 
-    let ready_symbols = sqlx::query!(
+    let candidate_symbols = sqlx::query!(
         r#"
-        SELECT
-            symbol,
-            accumulated_long,
-            accumulated_short,
-            (accumulated_long - accumulated_short) as "net_position!: f64"
+        SELECT symbol
         FROM trade_accumulators
         WHERE pending_execution_id IS NULL
-          AND ABS(accumulated_long - accumulated_short) >= 1.0
         ORDER BY last_updated ASC
         "#
     )
     .fetch_all(pool)
     .await?;
 
-    if ready_symbols.is_empty() {
-        info!("No accumulated positions found ready for execution");
+    if candidate_symbols.is_empty() {
+        info!("No accumulated positions found to check");
         return Ok(vec![]);
     }
 
     info!(
-        "Found {} symbols with positions ready for execution",
-        ready_symbols.len()
+        "Found {} symbols to check for execution readiness",
+        candidate_symbols.len()
     );
 
     let mut executions = Vec::new();
 
-    for row in ready_symbols {
+    for row in candidate_symbols {
         let symbol = Symbol::new(&row.symbol)?;
-        info!(
-            symbol = %symbol,
-            accumulated_long = row.accumulated_long,
-            accumulated_short = row.accumulated_short,
-            net_position = row.net_position,
-            "Checking symbol for execution"
-        );
 
-        let mut sql_tx = pool.begin().await?;
-
-        // Clean up any stale executions for this symbol
-        clean_up_stale_executions(&mut sql_tx, &symbol).await?;
-
-        // Try to acquire execution lease for this symbol
-        if try_acquire_execution_lease(&mut sql_tx, &symbol).await? {
-            // Re-fetch calculator to get current state
-            let mut calculator = get_or_create_within_transaction(&mut sql_tx, &symbol).await?;
-
-            // Check if still ready after potentially concurrent processing
-            if let Some(execution_type) = calculator.determine_execution_type() {
-                // The linkage system will handle allocating the oldest available trades
-                let result = execute_position(
-                    &mut sql_tx,
-                    &symbol,
-                    &mut calculator,
-                    execution_type,
-                    executor_type,
-                )
-                .await?;
-
-                if let Some(execution) = &result {
-                    let execution_id = execution.id.ok_or(PersistenceError::MissingExecutionId)?;
-                    set_pending_execution_id(&mut sql_tx, &symbol, execution_id).await?;
-
-                    info!(
-                        symbol = %symbol,
-                        execution_id = ?execution.id,
-                        shares = ?execution.shares,
-                        direction = ?execution.direction,
-                        "Created execution for accumulated position"
-                    );
-
-                    executions.push(execution.clone());
-                } else {
-                    clear_execution_lease(&mut sql_tx, &symbol).await?;
-                    info!(
-                        symbol = %symbol,
-                        "No execution created for symbol (insufficient shares after re-check)"
-                    );
-                }
-
-                // Save updated calculator state
-                let pending_execution_id = result.as_ref().and_then(|e| e.id);
-                save_within_transaction(&mut sql_tx, &symbol, &calculator, pending_execution_id)
-                    .await?;
-            } else {
-                clear_execution_lease(&mut sql_tx, &symbol).await?;
-                info!(
-                    symbol = %symbol,
-                    "No execution needed for symbol (insufficient shares after cleanup)"
-                );
-            }
-        } else {
-            info!(
-                symbol = %symbol,
-                "Another worker holds execution lease, skipping"
-            );
+        if let Some(execution) =
+            check_symbol_for_execution(pool, dual_write_context, &symbol, executor_type).await?
+        {
+            executions.push(execution);
         }
-
-        sql_tx.commit().await?;
     }
 
     if executions.is_empty() {
@@ -696,6 +648,116 @@ pub(crate) async fn check_all_accumulated_positions(
     }
 
     Ok(executions)
+}
+
+async fn check_symbol_for_execution(
+    pool: &SqlitePool,
+    dual_write_context: &DualWriteContext,
+    symbol: &Symbol,
+    executor_type: SupportedExecutor,
+) -> Result<Option<OffchainExecution>, OnChainError> {
+    let Some((direction, shares_u64)) =
+        get_ready_execution_params(dual_write_context, symbol).await?
+    else {
+        return Ok(None);
+    };
+
+    info!(
+        symbol = %symbol,
+        shares = shares_u64,
+        direction = ?direction,
+        "Position ready for execution"
+    );
+
+    let mut sql_tx = pool.begin().await?;
+    clean_up_stale_executions(&mut sql_tx, symbol).await?;
+
+    let result = if try_acquire_execution_lease(&mut sql_tx, symbol).await? {
+        process_symbol_execution(&mut sql_tx, symbol, direction, shares_u64, executor_type).await?
+    } else {
+        info!(symbol = %symbol, "Another worker holds execution lease, skipping");
+        None
+    };
+
+    sql_tx.commit().await?;
+    Ok(result)
+}
+
+async fn get_ready_execution_params(
+    dual_write_context: &DualWriteContext,
+    symbol: &Symbol,
+) -> Result<Option<(Direction, u64)>, OnChainError> {
+    let Some(position) = load_position(dual_write_context, symbol).await? else {
+        debug!(symbol = %symbol, "Position aggregate not found, skipping");
+        return Ok(None);
+    };
+
+    let Some((direction, shares)) = position.is_ready_for_execution()? else {
+        debug!(
+            symbol = %symbol,
+            net = %position.net.0,
+            "Position threshold not met, skipping"
+        );
+        return Ok(None);
+    };
+
+    let shares_u64 = match shares.try_into_u64() {
+        Ok(s) if s > 0 => s,
+        Ok(_) => return Ok(None),
+        Err(e) => {
+            warn!(symbol = %symbol, error = %e, "Failed to convert shares to u64, skipping");
+            return Ok(None);
+        }
+    };
+
+    Ok(Some((direction, shares_u64)))
+}
+
+async fn process_symbol_execution(
+    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    symbol: &Symbol,
+    direction: Direction,
+    shares_u64: u64,
+    executor_type: SupportedExecutor,
+) -> Result<Option<OffchainExecution>, OnChainError> {
+    let mut calculator = get_or_create_within_transaction(sql_tx, symbol).await?;
+
+    let execution_type = match direction {
+        Direction::Sell => AccumulationBucket::LongExposure,
+        Direction::Buy => AccumulationBucket::ShortExposure,
+    };
+
+    let result = execute_position(
+        sql_tx,
+        symbol,
+        &mut calculator,
+        execution_type,
+        shares_u64,
+        direction,
+        executor_type,
+    )
+    .await?;
+
+    if let Some(execution) = &result {
+        let execution_id = execution.id.ok_or(PersistenceError::MissingExecutionId)?;
+        set_pending_execution_id(sql_tx, symbol, execution_id).await?;
+
+        info!(
+            symbol = %symbol,
+            execution_id = ?execution.id,
+            shares = ?execution.shares,
+            direction = ?execution.direction,
+            "Created execution for accumulated position"
+        );
+    } else {
+        clear_execution_lease(sql_tx, symbol).await?;
+        info!(symbol = %symbol, "No execution created for symbol");
+    }
+
+    let pending_execution_id = result.as_ref().and_then(|e| e.id);
+    save_within_transaction(sql_tx, symbol, &calculator, pending_execution_id).await?;
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -712,6 +774,7 @@ mod tests {
     use crate::onchain::io::Usdc;
     use crate::position::{Position, PositionCommand};
     use crate::symbol;
+    use crate::symbol::lock::get_symbol_lock;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
@@ -809,11 +872,37 @@ mod tests {
         pool: &SqlitePool,
         trade: OnchainTrade,
     ) -> Result<Option<OffchainExecution>, OnChainError> {
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let base_symbol = trade.symbol.base();
+
+        // Mirror production: acquire symbol lock before updating Position aggregate
+        let symbol_lock = get_symbol_lock(base_symbol).await;
+        let _guard = symbol_lock.lock().await;
+
+        // Initialize Position aggregate and acknowledge fill BEFORE processing
+        // so threshold check sees current state
+        let _ = crate::dual_write::initialize_position(
+            &dual_write_context,
+            base_symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+
+        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
+            .await
+            .unwrap();
+
         let mut sql_tx = pool.begin().await?;
         let TradeProcessingResult {
             execution,
             cleaned_up_executions: _,
-        } = process_onchain_trade(&mut sql_tx, trade, SupportedExecutor::Schwab).await?;
+        } = process_onchain_trade(
+            &mut sql_tx,
+            &dual_write_context,
+            trade,
+            SupportedExecutor::Schwab,
+        )
+        .await?;
         sql_tx.commit().await?;
         Ok(execution)
     }
@@ -832,7 +921,7 @@ mod tests {
             amount: 0.5,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(45000),
             effective_gas_price: Some(1_200_000_000),
@@ -865,7 +954,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(300.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(52000),
             effective_gas_price: Some(1_800_000_000),
@@ -900,7 +989,7 @@ mod tests {
             amount: 0.3,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(43000),
             effective_gas_price: Some(1_100_000_000),
@@ -923,7 +1012,7 @@ mod tests {
             amount: 0.4,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(44000),
             effective_gas_price: Some(1_250_000_000),
@@ -946,7 +1035,7 @@ mod tests {
             amount: 0.4,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(46000),
             effective_gas_price: Some(1_300_000_000),
@@ -982,7 +1071,7 @@ mod tests {
             amount: 1.0,
             direction: Direction::Buy,
             price: Usdc::new(100.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(48000),
             effective_gas_price: Some(1_400_000_000),
@@ -1011,7 +1100,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(47000),
             effective_gas_price: Some(1_350_000_000),
@@ -1042,7 +1131,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Buy,
             price: Usdc::new(300.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(49000),
             effective_gas_price: Some(1_450_000_000),
@@ -1090,7 +1179,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(51000),
             effective_gas_price: Some(1_600_000_000),
@@ -1144,7 +1233,7 @@ mod tests {
             amount: 0.8,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(42000),
             effective_gas_price: Some(1_050_000_000),
@@ -1164,7 +1253,7 @@ mod tests {
             amount: 0.3,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(43500),
             effective_gas_price: Some(1_150_000_000),
@@ -1227,7 +1316,7 @@ mod tests {
             amount,
             direction: Direction::Sell,
             price: Usdc::new(15000.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: None,
             effective_gas_price: None,
@@ -1307,7 +1396,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(46500),
             effective_gas_price: Some(1_320_000_000),
@@ -1346,7 +1435,7 @@ mod tests {
                 amount: 0.3,
                 direction: Direction::Buy,
                 price: Usdc::new(300.0).unwrap(),
-                block_timestamp: None,
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: Some(41000),
                 effective_gas_price: Some(1_000_000_000),
@@ -1365,7 +1454,7 @@ mod tests {
                 amount: 0.4,
                 direction: Direction::Buy,
                 price: Usdc::new(305.0).unwrap(),
-                block_timestamp: None,
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: Some(42500),
                 effective_gas_price: Some(1_080_000_000),
@@ -1384,7 +1473,7 @@ mod tests {
                 amount: 0.5,
                 direction: Direction::Buy,
                 price: Usdc::new(310.0).unwrap(),
-                block_timestamp: None,
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: Some(44000),
                 effective_gas_price: Some(1_180_000_000),
@@ -1454,7 +1543,7 @@ mod tests {
                 amount: 0.4, // Below threshold
                 direction: Direction::Sell,
                 price: Usdc::new(150.0).unwrap(),
-                block_timestamp: None,
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: Some(40000),
                 effective_gas_price: Some(950_000_000),
@@ -1473,7 +1562,7 @@ mod tests {
                 amount: 0.8, // Combined: 0.4 + 0.8 = 1.2, triggers execution of 1 share
                 direction: Direction::Sell,
                 price: Usdc::new(155.0).unwrap(),
-                block_timestamp: None,
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: Some(41500),
                 effective_gas_price: Some(1_020_000_000),
@@ -1527,7 +1616,7 @@ mod tests {
             amount: 1.2,
             direction: Direction::Buy,
             price: Usdc::new(800.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(47500),
             effective_gas_price: Some(1_380_000_000),
@@ -1571,7 +1660,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Buy,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(48500),
             effective_gas_price: Some(1_420_000_000),
@@ -1591,7 +1680,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(155.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(49500),
             effective_gas_price: Some(1_480_000_000),
@@ -1679,7 +1768,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(50000),
             effective_gas_price: Some(1_500_000_000),
@@ -1775,7 +1864,7 @@ mod tests {
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(140.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(51000),
             effective_gas_price: Some(1_550_000_000),
@@ -1976,6 +2065,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_all_accumulated_positions_finds_ready_symbols() {
         let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
 
         // Create some accumulated positions using the normal flow
         let aapl_trade = OnchainTrade {
@@ -1988,7 +2078,7 @@ mod tests {
             amount: 0.8,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(43200),
             effective_gas_price: Some(1_120_000_000),
@@ -2007,9 +2097,10 @@ mod tests {
         assert!(aapl_pending.is_none());
 
         // Run the function - should not create any executions since 0.8 < 1.0
-        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
         assert_eq!(executions.len(), 0);
 
         // Verify AAPL state unchanged
@@ -2021,11 +2112,13 @@ mod tests {
     #[tokio::test]
     async fn test_check_all_accumulated_positions_no_ready_positions() {
         let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
 
         // Run the function on empty database
-        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         // Should create no executions
         assert_eq!(executions.len(), 0);
@@ -2064,10 +2157,13 @@ mod tests {
 
         sql_tx.commit().await.unwrap();
 
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
         // Run the function
-        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         // Should create no executions since AAPL has pending execution
         assert_eq!(executions.len(), 0);
@@ -2093,7 +2189,7 @@ mod tests {
             amount: 0.6,
             direction: Direction::Sell,
             price: Usdc::new(120.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(39000),
             effective_gas_price: Some(900_000_000),
@@ -2113,7 +2209,7 @@ mod tests {
             amount: 0.3,
             direction: Direction::Sell,
             price: Usdc::new(100.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(40500),
             effective_gas_price: Some(980_000_000),
@@ -2133,7 +2229,7 @@ mod tests {
             amount: 0.2,
             direction: Direction::Sell,
             price: Usdc::new(110.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(41000),
             effective_gas_price: Some(1_000_000_000),
@@ -2224,9 +2320,14 @@ mod tests {
         let TradeProcessingResult {
             execution: _,
             cleaned_up_executions,
-        } = process_onchain_trade(&mut sql_tx, trade, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+        } = process_onchain_trade(
+            &mut sql_tx,
+            &dual_write_context,
+            trade,
+            SupportedExecutor::Schwab,
+        )
+        .await
+        .unwrap();
         sql_tx.commit().await.unwrap();
 
         assert_eq!(cleaned_up_executions.len(), 1);
@@ -2321,9 +2422,22 @@ mod tests {
             (actual_net - (-0.5)).abs() < f64::EPSILON,
             "actual net (long - short) should be -0.5"
         );
-        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        // Initialize Position for SPLG so the threshold check works
+        crate::dual_write::initialize_position(
+            &dual_write_context,
+            &Symbol::new("SPLG").unwrap(),
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .ok();
+
+        let executions =
+            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         assert_eq!(
             executions.len(),
@@ -2348,7 +2462,7 @@ mod tests {
             amount: 0.8,
             direction: Direction::Sell,
             price: Usdc::new(500.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(40000),
             effective_gas_price: Some(1_000_000_000),
@@ -2371,7 +2485,7 @@ mod tests {
             amount: 0.7,
             direction: Direction::Sell,
             price: Usdc::new(510.0).unwrap(),
-            block_timestamp: None,
+            block_timestamp: Some(Utc::now()),
             created_at: None,
             gas_used: Some(40000),
             effective_gas_price: Some(1_000_000_000),
@@ -2395,11 +2509,14 @@ mod tests {
         );
         assert!(pending_id.is_some());
 
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
         // Now run check_all_accumulated_positions - should NOT create additional
         // executions since there's already a pending one (and net is now 0.5 < 1.0)
-        let executions = check_all_accumulated_positions(&pool, SupportedExecutor::Schwab)
-            .await
-            .unwrap();
+        let executions =
+            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         assert_eq!(
             executions.len(),
@@ -2560,5 +2677,264 @@ mod tests {
         let cleaned = result.unwrap();
         assert_eq!(cleaned.execution_id, execution_id);
         assert_eq!(cleaned.symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn test_get_ready_execution_params_returns_none_when_position_not_found() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let symbol = Symbol::new("NONEXISTENT").unwrap();
+
+        let result = get_ready_execution_params(&dual_write_context, &symbol)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_ready_execution_params_returns_none_when_below_threshold() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        crate::dual_write::initialize_position(
+            &dual_write_context,
+            &symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: alloy::primitives::B256::repeat_byte(0xaa),
+            log_index: 1,
+            symbol: tokenized_symbol!("AAPL0x"),
+            amount: 0.5,
+            direction: Direction::Buy,
+            price: Usdc::new(150.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: None,
+            effective_gas_price: None,
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
+            .await
+            .unwrap();
+
+        let result = get_ready_execution_params(&dual_write_context, &symbol)
+            .await
+            .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_ready_execution_params_returns_params_when_threshold_met() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        crate::dual_write::initialize_position(
+            &dual_write_context,
+            &symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: alloy::primitives::B256::repeat_byte(0xbb),
+            log_index: 1,
+            symbol: tokenized_symbol!("AAPL0x"),
+            amount: 1.5,
+            direction: Direction::Buy,
+            price: Usdc::new(150.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: None,
+            effective_gas_price: None,
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
+            .await
+            .unwrap();
+
+        let result = get_ready_execution_params(&dual_write_context, &symbol)
+            .await
+            .unwrap();
+
+        assert!(result.is_some());
+        let (direction, shares) = result.unwrap();
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(shares, 1);
+    }
+
+    #[tokio::test]
+    async fn test_check_symbol_for_execution_returns_none_when_no_position() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let symbol = Symbol::new("NONEXISTENT").unwrap();
+
+        let result = check_symbol_for_execution(
+            &pool,
+            &dual_write_context,
+            &symbol,
+            SupportedExecutor::Schwab,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_symbol_for_execution_returns_none_when_below_threshold() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        crate::dual_write::initialize_position(
+            &dual_write_context,
+            &symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: alloy::primitives::B256::repeat_byte(0xcc),
+            log_index: 1,
+            symbol: tokenized_symbol!("AAPL0x"),
+            amount: 0.3,
+            direction: Direction::Sell,
+            price: Usdc::new(150.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: None,
+            effective_gas_price: None,
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
+            .await
+            .unwrap();
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let calculator = PositionCalculator::new();
+        save_within_transaction(&mut sql_tx, &symbol, &calculator, None)
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        let result = check_symbol_for_execution(
+            &pool,
+            &dual_write_context,
+            &symbol,
+            SupportedExecutor::Schwab,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_check_symbol_for_execution_skips_when_lease_already_held() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let symbol = Symbol::new("INTC").unwrap();
+
+        crate::dual_write::initialize_position(
+            &dual_write_context,
+            &symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: alloy::primitives::B256::repeat_byte(0xee),
+            log_index: 1,
+            symbol: tokenized_symbol!("INTC0x"),
+            amount: 1.5,
+            direction: Direction::Buy,
+            price: Usdc::new(50.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: None,
+            effective_gas_price: None,
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
+            .await
+            .unwrap();
+
+        let existing_execution = OffchainExecution {
+            id: None,
+            symbol: symbol.clone(),
+            shares: Shares::new(1).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::Schwab,
+            state: OrderState::Pending,
+        };
+
+        let mut sql_tx = pool.begin().await.unwrap();
+        let execution_id = existing_execution
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap();
+
+        let calculator = PositionCalculator::new();
+        save_within_transaction(&mut sql_tx, &symbol, &calculator, Some(execution_id))
+            .await
+            .unwrap();
+        sql_tx.commit().await.unwrap();
+
+        crate::dual_write::place_offchain_order(
+            &dual_write_context,
+            &OffchainExecution {
+                id: Some(execution_id),
+                symbol: symbol.clone(),
+                shares: Shares::new(1).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::Schwab,
+                state: OrderState::Pending,
+            },
+            &symbol,
+        )
+        .await
+        .unwrap();
+
+        let result = check_symbol_for_execution(
+            &pool,
+            &dual_write_context,
+            &symbol,
+            SupportedExecutor::Schwab,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.is_none());
     }
 }
