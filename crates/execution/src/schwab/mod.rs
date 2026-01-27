@@ -1,6 +1,8 @@
 use reqwest::header::InvalidHeaderValue;
 use thiserror::Error;
 
+use crate::InvalidSharesError;
+
 mod auth;
 mod encryption;
 mod executor;
@@ -103,10 +105,9 @@ pub enum SchwabError {
     #[error("Encryption error: {0}")]
     Encryption(#[from] encryption::EncryptionError),
 
-    /// Schwab API does not support fractional share orders.
-    /// Orders must be placed with whole share quantities.
-    #[error("Schwab API does not support fractional shares: {0}")]
-    FractionalSharesNotSupported(#[from] crate::InvalidSharesError),
+    /// Invalid share quantity for Schwab API (requires whole shares).
+    #[error("Invalid shares for Schwab API: {0}")]
+    InvalidShares(#[from] InvalidSharesError),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {

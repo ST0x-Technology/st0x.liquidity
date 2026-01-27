@@ -124,6 +124,8 @@ pub enum InvalidSharesError {
     NonPositive(Decimal),
     #[error("Cannot convert fractional shares {0} to whole shares")]
     Fractional(Decimal),
+    #[error("Shares value {0} exceeds u64 range")]
+    Overflow(Decimal),
     #[error(transparent)]
     TryFromInt(#[from] std::num::TryFromIntError),
     #[error(transparent)]
@@ -313,6 +315,10 @@ impl FractionalShares {
             return Err(SharesConversionError::Underflow(self.0));
         }
 
+        if scaled != truncated {
+            return Err(SharesConversionError::PrecisionLoss(self.0));
+        }
+
         Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
     }
 }
@@ -325,6 +331,8 @@ pub enum SharesConversionError {
     Underflow(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
+    #[error("shares value {0} has more than 18 decimal places")]
+    PrecisionLoss(Decimal),
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
@@ -399,8 +407,8 @@ impl Display for FractionalShares {
 impl Positive<FractionalShares> {
     pub const ONE: Self = Self(FractionalShares::ONE);
 
-    /// Converts to whole shares count, returning error if value has a fractional part.
-    /// Use this when the target API does not support fractional shares.
+    /// Converts to whole shares count, returning error if value has a fractional part
+    /// or exceeds u64 range. Use this when the target API does not support fractional shares.
     pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
         let inner = self.inner();
         if !inner.is_whole() {
@@ -410,7 +418,7 @@ impl Positive<FractionalShares> {
         inner
             .0
             .to_u64()
-            .ok_or(InvalidSharesError::Fractional(inner.0))
+            .ok_or(InvalidSharesError::Overflow(inner.0))
     }
 }
 

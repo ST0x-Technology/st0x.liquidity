@@ -160,8 +160,7 @@ where
         match completed_request.status {
             TokenizationRequestStatus::Completed => {
                 let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
-                let shares_minted =
-                    decimal_to_u256_18_decimals(completed_request.quantity.inner())?;
+                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity)?;
 
                 self.cqrs
                     .execute(
@@ -196,10 +195,16 @@ where
     }
 }
 
-fn decimal_to_u256_18_decimals(value: Decimal) -> Result<U256, MintError> {
-    let scaled = value * Decimal::from(10u64.pow(18));
-    let as_str = scaled.trunc().to_string();
-    Ok(U256::from_str_radix(&as_str, 10)?)
+fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintError> {
+    let decimal = value.inner();
+    let scaled = decimal * Decimal::from(10u64.pow(18));
+    let truncated = scaled.trunc();
+
+    if scaled != truncated {
+        return Err(MintError::PrecisionLoss(value));
+    }
+
+    Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
 }
 
 #[async_trait]
@@ -281,7 +286,7 @@ mod tests {
 
     #[test]
     fn decimal_to_u256_converts_fractional() {
-        let value = dec!(100.5);
+        let value = FractionalShares::new(dec!(100.5));
         let result = decimal_to_u256_18_decimals(value).unwrap();
 
         let expected = U256::from(100_500_000_000_000_000_000_u128);
@@ -290,7 +295,7 @@ mod tests {
 
     #[test]
     fn decimal_to_u256_converts_whole_number() {
-        let value = dec!(42);
+        let value = FractionalShares::new(dec!(42));
         let result = decimal_to_u256_18_decimals(value).unwrap();
 
         let expected = U256::from(42_000_000_000_000_000_000_u128);
@@ -299,7 +304,7 @@ mod tests {
 
     #[test]
     fn decimal_to_u256_converts_zero() {
-        let value = dec!(0);
+        let value = FractionalShares::new(dec!(0));
         let result = decimal_to_u256_18_decimals(value).unwrap();
 
         assert_eq!(result, U256::ZERO);

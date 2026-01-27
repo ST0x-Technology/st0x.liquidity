@@ -1,11 +1,9 @@
 use st0x_execution::{FractionalShares, OrderState, PersistenceError};
 use tracing::info;
 
-use crate::offchain::execution::OffchainExecution;
-use crate::offchain_order::{BrokerOrderId, PriceCents};
-use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
-
 use super::{DualWriteContext, DualWriteError};
+use crate::offchain::execution::OffchainExecution;
+use crate::offchain_order::{BrokerOrderId, OffchainOrder, OffchainOrderCommand, PriceCents};
 
 pub(crate) async fn place_order(
     context: &DualWriteContext,

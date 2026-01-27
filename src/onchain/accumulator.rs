@@ -281,11 +281,9 @@ async fn execute_position(
     direction: Direction,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
-    let shares_f64 = shares
-        .inner()
-        .inner()
-        .to_f64()
-        .ok_or_else(|| OnChainError::Validation(TradeValidationError::NegativeShares(0.0)))?;
+    let shares_f64 = shares.inner().inner().to_f64().ok_or_else(|| {
+        OnChainError::Validation(TradeValidationError::ShareConversionFailed(shares))
+    })?;
 
     let execution =
         create_execution_within_transaction(sql_tx, base_symbol, shares, direction, executor_type)

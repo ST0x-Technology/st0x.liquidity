@@ -2,7 +2,10 @@ use chrono::{DateTime, TimeZone, Utc};
 use num_traits::ToPrimitive;
 
 use super::OrderStatus;
-use crate::{Direction, ExecutionError, FractionalShares, Positive, SupportedExecutor, Symbol};
+use crate::{
+    Direction, ExecutionError, FractionalShares, PersistenceError, Positive, SupportedExecutor,
+    Symbol,
+};
 
 /// Database fields extracted from OrderState for storage
 #[derive(Debug)]
@@ -113,7 +116,7 @@ impl OrderState {
         shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
-    ) -> Result<i64, crate::PersistenceError> {
+    ) -> Result<i64, PersistenceError> {
         let status_str = self.status().as_str();
         let db_fields = self.to_db_fields()?;
 
@@ -122,7 +125,7 @@ impl OrderState {
             .inner()
             .inner()
             .to_f64()
-            .ok_or(crate::PersistenceError::InvalidShareQuantity(0.0))?;
+            .ok_or(PersistenceError::ShareQuantityConversionFailed(shares))?;
         let direction_str = direction.as_str();
         let executor_str = executor.to_string();
 

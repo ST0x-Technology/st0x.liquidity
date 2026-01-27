@@ -36,6 +36,9 @@ pub(crate) enum MintError {
 
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
+
+    #[error("Quantity {0} has more than 18 decimal places")]
+    PrecisionLoss(FractionalShares),
 }
 
 /// Trait for executing mint operations.
