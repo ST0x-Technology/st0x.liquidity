@@ -102,6 +102,11 @@ pub enum SchwabError {
     /// Token encryption or decryption failed, wraps [`encryption::EncryptionError`].
     #[error("Encryption error: {0}")]
     Encryption(#[from] encryption::EncryptionError),
+
+    /// Schwab API does not support fractional share orders.
+    /// Orders must be placed with whole share quantities.
+    #[error("Schwab API does not support fractional shares: {0}")]
+    FractionalSharesNotSupported(#[from] crate::InvalidSharesError),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {

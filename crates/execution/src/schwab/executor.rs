@@ -7,8 +7,8 @@ use crate::schwab::SchwabAuthEnv;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    Direction, ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus,
-    OrderUpdate, Shares, Symbol, TryIntoExecutor,
+    Direction, ExecutionError, Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState,
+    OrderStatus, OrderUpdate, Symbol, TryIntoExecutor,
 };
 
 /// Configuration for SchwabExecutor containing auth environment and database pool
@@ -92,9 +92,12 @@ impl Executor for SchwabExecutor {
         &self,
         order: MarketOrder,
     ) -> Result<OrderPlacement<Self::OrderId>, Self::Error> {
+        // Schwab API does not support fractional shares - validate before placing order
+        let whole_shares = order.shares.to_whole_shares()?;
+
         info!(
             "Placing market order: {} {} shares of {}",
-            order.direction, order.shares, order.symbol
+            order.direction, whole_shares, order.symbol
         );
 
         // Convert Direction to Schwab Instruction
@@ -103,12 +106,9 @@ impl Executor for SchwabExecutor {
             crate::Direction::Sell => crate::schwab::order::Instruction::Sell,
         };
 
-        // Create Schwab order
-        let schwab_order = crate::schwab::order::Order::new(
-            order.symbol.to_string(),
-            instruction,
-            order.shares.value().into(),
-        );
+        // Create Schwab order with validated whole shares
+        let schwab_order =
+            crate::schwab::order::Order::new(order.symbol.to_string(), instruction, whole_shares);
 
         // Place the order using Schwab API
         let response = schwab_order.place(&self.auth, &self.pool).await?;
@@ -207,11 +207,10 @@ impl Executor for SchwabExecutor {
 
                         let symbol = Symbol::new(row.symbol)?;
 
-                        let shares_u64: u64 = row
-                            .shares
-                            .try_into()
-                            .map_err(|_| ExecutionError::NegativeShares { value: row.shares })?;
-                        let shares = Shares::new(shares_u64)?;
+                        if row.shares <= 0.0 {
+                            return Err(ExecutionError::NegativeShares { value: row.shares });
+                        }
+                        let shares = FractionalShares::from_f64(row.shares)?;
 
                         let direction: Direction = row.direction.parse()?;
 

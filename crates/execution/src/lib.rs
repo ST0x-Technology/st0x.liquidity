@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use clap::ValueEnum;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display};
 use tokio::task::JoinHandle;
@@ -112,12 +114,18 @@ impl std::str::FromStr for Symbol {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]
     Zero,
+    #[error("Shares must be positive")]
+    NonPositive,
+    #[error("Cannot convert fractional shares {0} to whole shares")]
+    Fractional(Decimal),
     #[error(transparent)]
     TryFromInt(#[from] std::num::TryFromIntError),
+    #[error(transparent)]
+    DecimalConversion(#[from] rust_decimal::Error),
 }
 
 /// Share quantity newtype wrapper with validation
@@ -151,6 +159,65 @@ impl<'de> Deserialize<'de> for Shares {
 }
 
 impl Display for Shares {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Fractional share quantity newtype wrapper with validation.
+///
+/// Represents share quantities that can include fractional amounts (e.g., 1.212 shares).
+/// Values must be positive (greater than zero).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FractionalShares(Decimal);
+
+impl FractionalShares {
+    pub fn new(value: Decimal) -> Result<Self, InvalidSharesError> {
+        if value <= Decimal::ZERO {
+            return Err(InvalidSharesError::NonPositive);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn value(&self) -> Decimal {
+        self.0
+    }
+
+    /// Returns true if this represents a whole number of shares (no fractional part).
+    pub fn is_whole(&self) -> bool {
+        self.0.fract().is_zero()
+    }
+
+    /// Converts to whole shares count, returning error if value has a fractional part.
+    /// Use this when the target API does not support fractional shares.
+    pub fn to_whole_shares(&self) -> Result<u64, InvalidSharesError> {
+        if !self.is_whole() {
+            return Err(InvalidSharesError::Fractional(self.0));
+        }
+
+        self.0
+            .to_u64()
+            .ok_or(InvalidSharesError::Fractional(self.0))
+    }
+
+    /// Creates FractionalShares from an f64 value (typically from database REAL column).
+    pub fn from_f64(value: f64) -> Result<Self, InvalidSharesError> {
+        let decimal = Decimal::try_from(value)?;
+        Self::new(decimal)
+    }
+}
+
+impl<'de> Deserialize<'de> for FractionalShares {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <Decimal as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Display for FractionalShares {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -262,7 +329,7 @@ pub enum ExecutionError {
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
     #[error("Negative shares value: {value}")]
-    NegativeShares { value: i64 },
+    NegativeShares { value: f64 },
     #[error("Price {price} cannot be converted to cents")]
     PriceConversion { price: f64 },
     #[error("Numeric conversion error: {0}")]
@@ -282,7 +349,48 @@ pub trait TryIntoExecutor {
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
+    use proptest::prelude::*;
+
     use super::*;
+
+    #[test]
+    fn fractional_shares_to_whole_shares_succeeds_for_whole_numbers() {
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
+        assert_eq!(shares.to_whole_shares().unwrap(), 5);
+
+        let shares = FractionalShares::new(Decimal::from_str("100.0").unwrap()).unwrap();
+        assert_eq!(shares.to_whole_shares().unwrap(), 100);
+    }
+
+    #[test]
+    fn fractional_shares_to_whole_shares_errors_for_fractional_values() {
+        let shares = FractionalShares::new(Decimal::from_str("1.212").unwrap()).unwrap();
+        let err = shares.to_whole_shares().unwrap_err();
+        assert!(
+            matches!(err, InvalidSharesError::Fractional(v) if v == Decimal::from_str("1.212").unwrap()),
+            "Expected Fractional error with value 1.212, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn fractional_shares_is_whole_returns_true_for_whole_numbers() {
+        let shares = FractionalShares::new(Decimal::from(1)).unwrap();
+        assert!(shares.is_whole());
+
+        let shares = FractionalShares::new(Decimal::from_str("42.0").unwrap()).unwrap();
+        assert!(shares.is_whole());
+    }
+
+    #[test]
+    fn fractional_shares_is_whole_returns_false_for_fractional_values() {
+        let shares = FractionalShares::new(Decimal::from_str("1.5").unwrap()).unwrap();
+        assert!(!shares.is_whole());
+
+        let shares = FractionalShares::new(Decimal::from_str("0.001").unwrap()).unwrap();
+        assert!(!shares.is_whole());
+    }
 
     #[test]
     fn test_symbol_new_valid() {
@@ -333,5 +441,82 @@ mod tests {
     fn test_shares_new_one() {
         let shares = Shares::new(1).unwrap();
         assert_eq!(shares.to_string(), "1");
+    }
+
+    proptest! {
+        #[test]
+        fn fractional_shares_construction_preserves_value(
+            mantissa in 1i64..=i64::MAX,
+            scale in 0u32..=10,
+        ) {
+            let decimal = Decimal::new(mantissa, scale);
+            let shares = FractionalShares::new(decimal).unwrap();
+            prop_assert_eq!(shares.value(), decimal);
+        }
+
+        #[test]
+        fn fractional_shares_rejects_zero_and_negative(
+            mantissa in i64::MIN..=0i64,
+            scale in 0u32..=10,
+        ) {
+            let decimal = Decimal::new(mantissa, scale);
+            let result = FractionalShares::new(decimal);
+            prop_assert!(matches!(result, Err(InvalidSharesError::NonPositive)));
+        }
+
+        #[test]
+        fn fractional_shares_is_whole_matches_fract_is_zero(
+            mantissa in 1i64..=i64::MAX,
+            scale in 0u32..=10,
+        ) {
+            let decimal = Decimal::new(mantissa, scale);
+            let shares = FractionalShares::new(decimal).unwrap();
+            prop_assert_eq!(shares.is_whole(), decimal.fract().is_zero());
+        }
+
+        #[test]
+        fn fractional_shares_to_whole_roundtrips_integers(value in 1u64..=u64::MAX) {
+            let decimal = Decimal::from(value);
+            let shares = FractionalShares::new(decimal).unwrap();
+            prop_assert_eq!(shares.to_whole_shares().unwrap(), value);
+        }
+
+        #[test]
+        fn fractional_shares_to_whole_rejects_fractional(
+            whole in 0i64..=1_000_000,
+            frac in 1u32..=999_999_999,
+        ) {
+            let decimal = Decimal::new(whole * 1_000_000_000 + i64::from(frac), 9);
+            if decimal > Decimal::ZERO {
+                let shares = FractionalShares::new(decimal).unwrap();
+                prop_assert!(matches!(
+                    shares.to_whole_shares(),
+                    Err(InvalidSharesError::Fractional(_))
+                ));
+            }
+        }
+
+        #[test]
+        fn fractional_shares_from_f64_roundtrip_within_precision(
+            mantissa in 1i64..=999_999_999_999i64,
+            scale in 0u32..=6,
+        ) {
+            let decimal = Decimal::new(mantissa, scale);
+            let shares = FractionalShares::new(decimal).unwrap();
+
+            if let Some(f64_value) = shares.value().to_f64()
+                && f64_value.is_finite()
+                && f64_value > 0.0
+            {
+                let roundtrip = FractionalShares::from_f64(f64_value).unwrap();
+                let diff = (shares.value() - roundtrip.value()).abs();
+                prop_assert!(
+                    diff < Decimal::new(1, 10),
+                    "Roundtrip diff too large: {} for original {}",
+                    diff,
+                    decimal
+                );
+            }
+        }
     }
 }

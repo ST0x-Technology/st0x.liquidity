@@ -8,7 +8,7 @@ pub enum PersistenceError {
     #[error("Invalid trade status in database: {0}")]
     InvalidTradeStatus(String),
     #[error("Invalid share quantity in database: {0}")]
-    InvalidShareQuantity(i64),
+    InvalidShareQuantity(f64),
     #[error("Invalid price cents in database: {0}")]
     InvalidPriceCents(i64),
     #[error("Execution missing ID after database save")]

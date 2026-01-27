@@ -237,8 +237,8 @@ mod tests {
                 .json_body(json!([
                     {
                         "date": today_str,
-                        "open": "0000",
-                        "close": "2359"
+                        "open": "00:00",
+                        "close": "23:59"
                     }
                 ]));
         });

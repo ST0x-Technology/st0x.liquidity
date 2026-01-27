@@ -10,7 +10,7 @@ pub use status::OrderStatus;
 pub struct OrderPlacement<OrderId> {
     pub order_id: OrderId,
     pub symbol: crate::Symbol,
-    pub shares: crate::Shares,
+    pub shares: crate::FractionalShares,
     pub direction: crate::Direction,
     pub placed_at: chrono::DateTime<chrono::Utc>,
 }
@@ -19,7 +19,7 @@ pub struct OrderPlacement<OrderId> {
 pub struct OrderUpdate<OrderId> {
     pub order_id: OrderId,
     pub symbol: crate::Symbol,
-    pub shares: crate::Shares,
+    pub shares: crate::FractionalShares,
     pub direction: crate::Direction,
     pub status: OrderStatus,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -29,6 +29,6 @@ pub struct OrderUpdate<OrderId> {
 #[derive(Debug, Clone)]
 pub struct MarketOrder {
     pub symbol: crate::Symbol,
-    pub shares: crate::Shares,
+    pub shares: crate::FractionalShares,
     pub direction: crate::Direction,
 }

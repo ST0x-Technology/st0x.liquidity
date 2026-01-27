@@ -38,6 +38,7 @@ num-decimal.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
+proptest.workspace = true
 serde_json.workspace = true
 serial_test.workspace = true
 

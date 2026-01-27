@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
-use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Shares, Symbol};
+use crate::{
+    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Symbol,
+};
 
 /// Order side
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,8 +55,8 @@ pub enum ConversionDirection {
 pub(super) struct OrderRequest {
     #[serde(serialize_with = "serialize_symbol")]
     pub symbol: Symbol,
-    #[serde(rename = "qty", serialize_with = "serialize_shares")]
-    pub quantity: Shares,
+    #[serde(rename = "qty", serialize_with = "serialize_fractional_shares")]
+    pub quantity: FractionalShares,
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
@@ -71,7 +73,10 @@ where
 
 // serde's serialize_with requires the field to be passed by reference
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn serialize_shares<S>(shares: &Shares, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_fractional_shares<S>(
+    shares: &FractionalShares,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -83,8 +88,11 @@ where
 pub(super) struct OrderResponse {
     pub id: Uuid,
     pub symbol: Symbol,
-    #[serde(rename = "qty", deserialize_with = "deserialize_shares_from_string")]
-    pub quantity: Shares,
+    #[serde(
+        rename = "qty",
+        deserialize_with = "deserialize_fractional_shares_from_string"
+    )]
+    pub quantity: FractionalShares,
     #[serde(
         rename = "filled_qty",
         default,
@@ -164,13 +172,15 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-fn deserialize_shares_from_string<'de, D>(deserializer: D) -> Result<Shares, D::Error>
+fn deserialize_fractional_shares_from_string<'de, D>(
+    deserializer: D,
+) -> Result<FractionalShares, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    let value: u64 = s.parse().map_err(serde::de::Error::custom)?;
-    Shares::new(value).map_err(serde::de::Error::custom)
+    let value: Decimal = s.parse().map_err(serde::de::Error::custom)?;
+    FractionalShares::new(value).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_optional_price<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
@@ -254,7 +264,7 @@ pub(super) async fn get_order_status(
         debug!(
             order_id,
             symbol = %response.symbol,
-            ordered_qty = response.quantity.value(),
+            ordered_qty = %response.quantity.value(),
             filled_qty = ?response.filled_quantity,
             "Order is partially filled"
         );
@@ -293,7 +303,7 @@ pub(super) async fn poll_pending_orders(
                 debug!(
                     order_id = %response.id,
                     symbol = %response.symbol,
-                    ordered_qty = response.quantity.value(),
+                    ordered_qty = %response.quantity.value(),
                     filled_qty = ?response.filled_quantity,
                     "Order is partially filled"
                 );
@@ -477,7 +487,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&config).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(100).unwrap(),
+            shares: FractionalShares::new(Decimal::from(100)).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -487,7 +497,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.value(), 100);
+        assert_eq!(placement.shares.value(), Decimal::from(100));
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -522,7 +532,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&config).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: Shares::new(50).unwrap(),
+            shares: FractionalShares::new(Decimal::from(50)).unwrap(),
             direction: Direction::Sell,
         };
 
@@ -532,7 +542,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.value(), 50);
+        assert_eq!(placement.shares.value(), Decimal::from(50));
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -565,7 +575,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.value(), 100);
+        assert_eq!(order_update.shares.value(), Decimal::from(100));
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
@@ -600,7 +610,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.value(), 50);
+        assert_eq!(order_update.shares.value(), Decimal::from(50));
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));
