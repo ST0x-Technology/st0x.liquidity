@@ -36,6 +36,12 @@ pub(crate) enum MintError {
 
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
+
+    #[error("Quantity {0} has more than 18 decimal places")]
+    PrecisionLoss(FractionalShares),
+
+    #[error("Decimal overflow when scaling {0} to 18 decimals")]
+    DecimalOverflow(FractionalShares),
 }
 
 /// Trait for executing mint operations.
@@ -72,7 +78,7 @@ mod tests {
         mock.execute_mint(
             &IssuerRequestId::new("test-id"),
             Symbol::new("AAPL").unwrap(),
-            FractionalShares(dec!(100)),
+            FractionalShares::new(dec!(100)),
             address!("0x1234567890123456789012345678901234567890"),
         )
         .await
@@ -85,7 +91,7 @@ mod tests {
     async fn mock_mint_captures_last_call_parameters() {
         let mock = Arc::new(MockMint::new());
         let symbol = Symbol::new("TSLA").unwrap();
-        let quantity = FractionalShares(dec!(50.5));
+        let quantity = FractionalShares::new(dec!(50.5));
         let wallet = address!("0xabcdef0123456789abcdef0123456789abcdef01");
 
         mock.execute_mint(
@@ -111,7 +117,7 @@ mod tests {
             .execute_mint(
                 &IssuerRequestId::new("test"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(10)),
+                FractionalShares::new(dec!(10)),
                 Address::ZERO,
             )
             .await;

@@ -2,14 +2,15 @@ use sqlx::SqlitePool;
 
 use crate::error::OnChainError;
 use st0x_execution::{
-    Direction, OrderState, OrderStatus, PersistenceError, Shares, SupportedExecutor, Symbol,
+    Direction, FractionalShares, OrderState, OrderStatus, PersistenceError, Positive,
+    SupportedExecutor, Symbol,
 };
 
 #[derive(sqlx::FromRow)]
 struct ExecutionRow {
     id: i64,
     symbol: String,
-    shares: i64,
+    shares: f64,
     direction: String,
     broker: String,
     order_id: Option<String>,
@@ -41,14 +42,13 @@ fn row_to_execution(
             OnChainError::Persistence(PersistenceError::InvalidTradeStatus(e.to_string()))
         })?;
 
-    let shares_u64 = shares
-        .try_into()
-        .map_err(|_| OnChainError::Persistence(PersistenceError::InvalidShareQuantity(shares)))?;
+    let fractional_shares = FractionalShares::from_f64(shares)?;
+    let positive_shares = Positive::new(fractional_shares)?;
 
     Ok(OffchainExecution {
         id: Some(id),
         symbol: Symbol::new(symbol)?,
-        shares: Shares::new(shares_u64)?,
+        shares: positive_shares,
         direction: parsed_direction,
         executor: parsed_executor,
         state: parsed_state,
@@ -59,7 +59,7 @@ fn row_to_execution(
 pub(crate) struct OffchainExecution {
     pub(crate) id: Option<i64>,
     pub(crate) symbol: Symbol,
-    pub(crate) shares: Shares,
+    pub(crate) shares: Positive<FractionalShares>,
     pub(crate) direction: Direction,
     pub(crate) executor: SupportedExecutor,
     pub(crate) state: OrderState,
@@ -254,6 +254,8 @@ impl OffchainExecution {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+
     use super::*;
     use crate::test_utils::{OffchainExecutionBuilder, setup_test_db};
     use chrono::Utc;
@@ -288,7 +290,7 @@ mod tests {
         let execution1 = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(50).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -297,7 +299,7 @@ mod tests {
         let execution2 = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(25).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(25))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
@@ -310,7 +312,7 @@ mod tests {
         let execution3 = OffchainExecution {
             id: None,
             symbol: Symbol::new("MSFT").unwrap(),
-            shares: Shares::new(10).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -347,7 +349,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(pending_aapl.len(), 1);
-        assert_eq!(pending_aapl[0].shares, Shares::new(50).unwrap());
+        assert_eq!(
+            pending_aapl[0].shares,
+            Positive::new(FractionalShares::new(Decimal::from(50))).unwrap()
+        );
         assert_eq!(pending_aapl[0].direction, Direction::Buy);
 
         let completed_aapl = find_executions_by_symbol_status_and_broker(
@@ -360,7 +365,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(completed_aapl.len(), 1);
-        assert_eq!(completed_aapl[0].shares, Shares::new(25).unwrap());
+        assert_eq!(
+            completed_aapl[0].shares,
+            Positive::new(FractionalShares::new(Decimal::from(25))).unwrap()
+        );
         assert_eq!(completed_aapl[0].direction, Direction::Sell);
         assert!(matches!(
             &completed_aapl[0].state,
@@ -402,7 +410,7 @@ mod tests {
         OffchainExecution {
             id: None,
             symbol: Symbol::new(symbol).unwrap(),
-            shares: Shares::new(shares).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(shares))).unwrap(),
             direction,
             executor,
             state: OrderState::Pending,

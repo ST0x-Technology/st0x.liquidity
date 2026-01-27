@@ -1,12 +1,17 @@
 use apca::Client;
 use apca::api::v2::{order, orders};
 use chrono::Utc;
+use num_decimal::Num;
 use num_traits::ToPrimitive;
+use rust_decimal::Decimal;
 use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
-use crate::{Direction, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Shares, Symbol};
+use crate::{
+    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
+    Symbol,
+};
 
 pub(super) async fn place_market_order(
     client: &Client,
@@ -30,10 +35,15 @@ pub(super) async fn place_market_order(
         ..Default::default()
     };
 
+    // Convert Decimal to Num for apca crate using exact rational representation
+    // Decimal stores value as mantissa * 10^(-scale), so we represent it as mantissa/10^scale
+    let decimal = market_order.shares.inner().inner();
+    let quantity = Num::new(decimal.mantissa(), 10i128.pow(decimal.scale()));
+
     let order_request = order_init.init(
         market_order.symbol.to_string(),
         alpaca_side,
-        order::Amount::quantity(market_order.shares.value()),
+        order::Amount::quantity(quantity),
     );
 
     let order_response = client.issue::<order::Create>(&order_request).await?;
@@ -191,11 +201,13 @@ fn extract_price_cents_from_order(
 }
 
 /// Extracts shares from Alpaca Amount enum
-fn extract_shares_from_amount(amount: &order::Amount) -> Result<Shares, AlpacaTradingApiError> {
+fn extract_shares_from_amount(
+    amount: &order::Amount,
+) -> Result<Positive<FractionalShares>, AlpacaTradingApiError> {
     match amount {
         order::Amount::Quantity { quantity } => {
-            let qty_u64 = quantity.to_string().parse::<u64>()?;
-            Ok(Shares::new(qty_u64)?)
+            let qty_decimal: Decimal = quantity.to_string().parse()?;
+            Ok(Positive::new(FractionalShares::new(qty_decimal))?)
         }
         order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
     }
@@ -203,10 +215,13 @@ fn extract_shares_from_amount(amount: &order::Amount) -> Result<Shares, AlpacaTr
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use apca::api::v2::order::Amount;
     use httpmock::prelude::*;
+    use proptest::prelude::*;
+    use rust_decimal::Decimal;
     use serde_json::json;
+
+    use super::*;
 
     fn create_test_client(mock_server: &MockServer) -> Client {
         let api_info =
@@ -269,7 +284,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL".to_string()).unwrap(),
-            shares: Shares::new(100).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -279,7 +294,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.value(), 100);
+        assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -338,7 +353,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA".to_string()).unwrap(),
-            shares: Shares::new(50).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
             direction: Direction::Sell,
         };
 
@@ -348,7 +363,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.value(), 50);
+        assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -369,7 +384,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("INVALID".to_string()).unwrap(),
-            shares: Shares::new(10).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -397,7 +412,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL".to_string()).unwrap(),
-            shares: Shares::new(100).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -424,7 +439,7 @@ mod tests {
         let client = create_test_client(&server);
         let market_order = MarketOrder {
             symbol: Symbol::new("SPY".to_string()).unwrap(),
-            shares: Shares::new(25).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(25))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -481,7 +496,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.value(), 100);
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
@@ -533,7 +548,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.value(), 50);
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));
@@ -585,7 +600,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "MSFT");
-        assert_eq!(order_update.shares.value(), 25);
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(25));
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Failed);
         assert_eq!(order_update.price_cents, None);
@@ -637,7 +652,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "GOOGL");
-        assert_eq!(order_update.shares.value(), 200);
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(200));
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
@@ -651,7 +666,7 @@ mod tests {
 
         let result = extract_shares_from_amount(&quantity_amount);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().value(), 100);
+        assert_eq!(result.unwrap().inner().inner(), Decimal::from(100));
     }
 
     #[tokio::test]
@@ -735,7 +750,7 @@ mod tests {
         let aapl_order = &order_updates[0];
         assert_eq!(aapl_order.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(aapl_order.symbol.to_string(), "AAPL");
-        assert_eq!(aapl_order.shares.value(), 100);
+        assert_eq!(aapl_order.shares.inner().inner(), Decimal::from(100));
         assert_eq!(aapl_order.direction, Direction::Buy);
         assert_eq!(aapl_order.status, OrderStatus::Submitted);
         assert_eq!(aapl_order.price_cents, None);
@@ -744,7 +759,7 @@ mod tests {
         let tsla_order = &order_updates[1];
         assert_eq!(tsla_order.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(tsla_order.symbol.to_string(), "TSLA");
-        assert_eq!(tsla_order.shares.value(), 50);
+        assert_eq!(tsla_order.shares.inner().inner(), Decimal::from(50));
         assert_eq!(tsla_order.direction, Direction::Sell);
         assert_eq!(tsla_order.status, OrderStatus::Submitted); // partially_filled maps to Submitted
         assert_eq!(tsla_order.price_cents, None);
@@ -828,7 +843,7 @@ mod tests {
             "c7ca82d4-3c95-4f89-9b42-abc123def456"
         );
         assert_eq!(filled_order.symbol.to_string(), "MSFT");
-        assert_eq!(filled_order.shares.value(), 75);
+        assert_eq!(filled_order.shares.inner().inner(), Decimal::from(75));
         assert_eq!(filled_order.direction, Direction::Buy);
         assert_eq!(filled_order.status, OrderStatus::Filled);
         assert_eq!(filled_order.price_cents, Some(33542)); // $335.42 in cents
@@ -881,5 +896,41 @@ mod tests {
         mock.assert();
         let error = result.unwrap_err();
         assert!(matches!(error, AlpacaTradingApiError::OrderList(_)));
+    }
+
+    proptest! {
+        #[test]
+        fn decimal_to_num_conversion_is_exact(
+            mantissa in 1i64..=999_999_999_999i64,
+            scale in 0u32..=10,
+        ) {
+            let decimal = Decimal::new(mantissa, scale);
+            let shares = FractionalShares::new(decimal);
+
+            let quantity = Num::new(
+                shares.inner().mantissa(),
+                10i128.pow(shares.inner().scale()),
+            );
+
+            let quantity_from_string: Num = decimal.to_string().parse().unwrap();
+
+            prop_assert_eq!(
+                quantity, quantity_from_string,
+                "Mantissa/scale conversion should match string parsing for {}",
+                decimal
+            );
+        }
+
+        #[test]
+        fn num_to_decimal_via_string_preserves_value(
+            mantissa in 1i64..=999_999_999i64,
+            scale in 0u32..=6,
+        ) {
+            let original = Decimal::new(mantissa, scale);
+            let num = Num::new(original.mantissa(), 10i128.pow(original.scale()));
+
+            let roundtrip: Decimal = num.to_string().parse().unwrap();
+            prop_assert_eq!(original, roundtrip);
+        }
     }
 }

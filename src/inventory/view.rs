@@ -610,7 +610,7 @@ mod tests {
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
 
     fn shares(n: i64) -> FractionalShares {
-        FractionalShares(Decimal::from(n))
+        FractionalShares::new(Decimal::from(n))
     }
 
     fn venue(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
@@ -819,8 +819,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(110));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     #[test]
@@ -832,8 +832,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(90));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(90));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     #[test]
@@ -845,8 +845,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(110));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(110));
     }
 
     #[test]
@@ -858,8 +858,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(90));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(90));
     }
 
     #[test]
@@ -875,10 +875,13 @@ mod tests {
         let updated = view.apply_position_event(&aapl, &event).unwrap();
 
         let aapl_inv = updated.equities.get(&aapl).unwrap();
-        assert_eq!(aapl_inv.onchain.total().unwrap().0, Decimal::from(110));
+        assert_eq!(
+            aapl_inv.onchain.total().unwrap().inner(),
+            Decimal::from(110)
+        );
 
         let msft_inv = updated.equities.get(&msft).unwrap();
-        assert_eq!(msft_inv.onchain.total().unwrap().0, Decimal::from(50));
+        assert_eq!(msft_inv.onchain.total().unwrap().inner(), Decimal::from(50));
     }
 
     #[test]
@@ -917,8 +920,8 @@ mod tests {
         assert_eq!(updated.last_updated, event_time);
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     fn make_mint_requested(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
@@ -978,8 +981,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     #[test]
@@ -993,8 +996,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1010,8 +1013,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(130));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(70));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(130));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(70));
         assert!(!inv.has_inflight());
     }
 
@@ -1040,8 +1043,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(!inv.has_inflight());
     }
 
@@ -1056,8 +1059,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(!inv.has_inflight());
     }
 
@@ -1079,16 +1082,16 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
 
         // MintAccepted: Move 30 from offchain available to inflight
         let view = view
             .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
 
         // TokensReceived: Remove from offchain inflight, add to onchain available
@@ -1101,8 +1104,8 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(130));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(70));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(130));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(70));
         assert!(!inv.has_inflight());
 
         // MintCompleted: Update last_rebalancing
@@ -1144,8 +1147,8 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(!inv.has_inflight());
     }
 
@@ -1258,8 +1261,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1275,8 +1278,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1292,8 +1295,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(70));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(70));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(130));
         assert!(!inv.has_inflight());
         assert!(inv.last_rebalancing.is_some());
     }
@@ -1309,8 +1312,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1325,8 +1328,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1348,7 +1351,7 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
 
         // Detected: No balance change
@@ -1356,7 +1359,7 @@ mod tests {
             .apply_redemption_event(&symbol, &make_redemption_detected(), quantity, Utc::now())
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
 
         // Completed: Remove from onchain inflight, add to offchain available
@@ -1364,8 +1367,8 @@ mod tests {
             .apply_redemption_event(&symbol, &make_redemption_completed(), quantity, Utc::now())
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(70));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(70));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(130));
         assert!(!inv.has_inflight());
         assert!(inv.last_rebalancing.is_some());
     }
@@ -1491,10 +1494,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1000));
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(1000)
+        );
         assert!(updated.usdc.offchain.has_inflight());
         assert!(!updated.usdc.onchain.has_inflight());
     }
@@ -1513,9 +1519,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1000));
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(1000)
+        );
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
         assert!(updated.usdc.onchain.has_inflight());
@@ -1536,8 +1545,14 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1100));
-        assert_eq!(updated.usdc.offchain.total().unwrap().0, Decimal::from(900));
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(1100)
+        );
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().inner(),
+            Decimal::from(900)
+        );
         assert!(!updated.usdc.offchain.has_inflight());
     }
 
@@ -1556,10 +1571,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1100)
         );
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(900));
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(900)
+        );
         assert!(!updated.usdc.onchain.has_inflight());
     }
 
@@ -1586,7 +1604,7 @@ mod tests {
             .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
             .unwrap();
         assert_eq!(
-            after_initiated.usdc.offchain.total().unwrap().0,
+            after_initiated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
         assert!(after_initiated.usdc.has_inflight());
@@ -1600,11 +1618,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            after_bridged.usdc.onchain.total().unwrap().0,
+            after_bridged.usdc.onchain.total().unwrap().inner(),
             Decimal::from(1200)
         );
         assert_eq!(
-            after_bridged.usdc.offchain.total().unwrap().0,
+            after_bridged.usdc.offchain.total().unwrap().inner(),
             Decimal::from(800)
         );
         assert!(!after_bridged.usdc.has_inflight());
@@ -1630,7 +1648,7 @@ mod tests {
             .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
             .unwrap();
         assert_eq!(
-            after_initiated.usdc.onchain.total().unwrap().0,
+            after_initiated.usdc.onchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
         assert!(after_initiated.usdc.has_inflight());
@@ -1644,11 +1662,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            after_bridged.usdc.offchain.total().unwrap().0,
+            after_bridged.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1200)
         );
         assert_eq!(
-            after_bridged.usdc.onchain.total().unwrap().0,
+            after_bridged.usdc.onchain.total().unwrap().inner(),
             Decimal::from(800)
         );
         assert!(!after_bridged.usdc.has_inflight());
@@ -1911,7 +1929,7 @@ mod tests {
 
         // Onchain should receive the ACTUAL amount (99.99), not the requested (100)
         assert_eq!(
-            updated.usdc.onchain.total().unwrap().0,
+            updated.usdc.onchain.total().unwrap().inner(),
             dec!(1099.99),
             "onchain should have 1000 + 99.99 (actual received), not 1000 + 100 (requested)"
         );
@@ -1921,7 +1939,7 @@ mod tests {
         // After bridge: 100 inflight consumed, but only 99.99 arrived at destination
         // So offchain total is now 900 (the 0.01 fee was lost in transit)
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.offchain.total().unwrap().inner(),
             dec!(900),
             "offchain should have 900 (inflight consumed)"
         );

@@ -6,12 +6,12 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, SupportedExecutor, Symbol};
+use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 use tracing::warn;
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
-use crate::shares::{ArithmeticError, FractionalShares, HasZero};
+use crate::shares::ArithmeticError;
 use crate::threshold::{ExecutionThreshold, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -238,11 +238,14 @@ impl Position {
         match threshold {
             ExecutionThreshold::Shares(threshold_shares) => {
                 let net_abs = self.net.abs();
+                let threshold_value = threshold_shares.inner().inner();
                 Ok(
-                    (net_abs.0 >= threshold_shares.0).then_some(TriggerReason::SharesThreshold {
-                        net_position_shares: net_abs.0,
-                        threshold_shares: threshold_shares.0,
-                    }),
+                    (net_abs.inner() >= threshold_value).then_some(
+                        TriggerReason::SharesThreshold {
+                            net_position_shares: net_abs.inner(),
+                            threshold_shares: threshold_value,
+                        },
+                    ),
                 )
             }
             ExecutionThreshold::DollarValue(threshold_dollars) => {
@@ -256,11 +259,11 @@ impl Position {
                 };
 
                 let net_abs = self.net.abs();
-                let dollar_value = (Usdc(price) * net_abs.0)?;
+                let dollar_value = (Usdc(price) * net_abs.inner())?;
 
                 if dollar_value.0 >= threshold_dollars.0 {
                     Ok(Some(TriggerReason::DollarThreshold {
-                        net_position_shares: self.net.0,
+                        net_position_shares: self.net.inner(),
                         dollar_value: dollar_value.0,
                         price_usdc: price,
                         threshold_dollars: threshold_dollars.0,
@@ -326,13 +329,15 @@ impl Position {
     ///
     /// Returns `Ok(Some((direction, shares)))` if threshold is met:
     /// - `direction`: The direction to execute (Sell for long exposure, Buy for short exposure)
-    /// - `shares`: The number of whole shares ready for execution
+    /// - `shares`: Full fractional amount if executor supports fractional shares, otherwise
+    ///   floored to whole shares
     ///
     /// Returns `Ok(None)` if threshold is not met or no price available for dollar-value threshold.
     ///
     /// Returns `Err` if calculation fails (e.g., arithmetic overflow).
     pub(crate) fn is_ready_for_execution(
         &self,
+        executor: SupportedExecutor,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
         if self.pending_execution_id.is_some() {
             return Ok(None);
@@ -342,13 +347,19 @@ impl Position {
 
         match trigger {
             Some(TriggerReason::SharesThreshold { .. } | TriggerReason::DollarThreshold { .. }) => {
-                let executable_shares = FractionalShares(self.net.abs().0.floor());
+                let raw_shares = self.net.abs();
 
-                if executable_shares.0 == Decimal::ZERO {
+                let executable_shares = if executor.supports_fractional_shares() {
+                    raw_shares
+                } else {
+                    FractionalShares::new(raw_shares.inner().trunc())
+                };
+
+                if executable_shares.is_zero() {
                     return Ok(None);
                 }
 
-                let direction = if self.net.0 > Decimal::ZERO {
+                let direction = if self.net.inner() > Decimal::ZERO {
                     Direction::Sell
                 } else {
                     Direction::Buy
@@ -708,16 +719,17 @@ pub(crate) enum TriggerReason {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
+    use st0x_execution::Positive;
     use std::collections::HashMap;
     use std::str::FromStr;
 
+    use super::*;
     use crate::threshold::Usdc;
 
     fn one_share_threshold() -> ExecutionThreshold {
-        ExecutionThreshold::shares(FractionalShares::ONE).unwrap()
+        ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
     }
 
     fn make_envelope(
@@ -756,7 +768,7 @@ mod tests {
             tx_hash: TxHash::random(),
             log_index: 1,
         };
-        let amount = FractionalShares(dec!(0.5));
+        let amount = FractionalShares::new(dec!(0.5));
         let price_usdc = dec!(150.0);
         let block_timestamp = Utc::now();
 
@@ -804,7 +816,7 @@ mod tests {
                     },
                     PositionEvent::OnChainOrderFilled {
                         trade_id: trade_id1,
-                        amount: FractionalShares(dec!(0.6)),
+                        amount: FractionalShares::new(dec!(0.6)),
                         direction: Direction::Buy,
                         price_usdc: dec!(150.0),
                         block_timestamp: Utc::now(),
@@ -812,7 +824,7 @@ mod tests {
                     },
                     PositionEvent::OnChainOrderFilled {
                         trade_id: trade_id2,
-                        amount: FractionalShares(dec!(0.5)),
+                        amount: FractionalShares::new(dec!(0.5)),
                         direction: Direction::Buy,
                         price_usdc: dec!(151.0),
                         block_timestamp: Utc::now(),
@@ -848,7 +860,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id,
-                    amount: FractionalShares(dec!(0.5)),
+                    amount: FractionalShares::new(dec!(0.5)),
                     direction: Direction::Buy,
                     price_usdc: dec!(150.0),
                     block_timestamp: Utc::now(),
@@ -862,7 +874,7 @@ mod tests {
                 executor: SupportedExecutor::Schwab,
             })
             .then_expect_error(PositionError::ThresholdNotMet {
-                net_position: FractionalShares(dec!(0.5)),
+                net_position: FractionalShares::new(dec!(0.5)),
                 threshold,
             });
     }
@@ -885,7 +897,7 @@ mod tests {
                 },
                 PositionEvent::OnChainOrderFilled {
                     trade_id,
-                    amount: FractionalShares(dec!(1.5)),
+                    amount: FractionalShares::new(dec!(1.5)),
                     direction: Direction::Buy,
                     price_usdc: dec!(150.0),
                     block_timestamp: Utc::now(),
@@ -905,7 +917,7 @@ mod tests {
             ])
             .when(PositionCommand::PlaceOffChainOrder {
                 execution_id: ExecutionId(2),
-                shares: FractionalShares(dec!(0.5)),
+                shares: FractionalShares::new(dec!(0.5)),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
             })
@@ -933,7 +945,7 @@ mod tests {
                     },
                     PositionEvent::OnChainOrderFilled {
                         trade_id,
-                        amount: FractionalShares(dec!(1.5)),
+                        amount: FractionalShares::new(dec!(1.5)),
                         direction: Direction::Buy,
                         price_usdc: dec!(150.0),
                         block_timestamp: Utc::now(),
@@ -983,7 +995,7 @@ mod tests {
                     },
                     PositionEvent::OnChainOrderFilled {
                         trade_id,
-                        amount: FractionalShares(dec!(1.5)),
+                        amount: FractionalShares::new(dec!(1.5)),
                         direction: Direction::Buy,
                         price_usdc: dec!(150.0),
                         block_timestamp: Utc::now(),
@@ -1028,7 +1040,7 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares(dec!(2.0)),
+                amount: FractionalShares::new(dec!(2.0)),
                 direction: Direction::Buy,
                 price_usdc: dec!(150.0),
                 block_timestamp: Utc::now(),
@@ -1036,7 +1048,7 @@ mod tests {
             },
             PositionEvent::OffChainOrderPlaced {
                 execution_id,
-                shares: FractionalShares(dec!(1.5)),
+                shares: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
@@ -1047,7 +1059,7 @@ mod tests {
             },
             PositionEvent::OffChainOrderFilled {
                 execution_id,
-                shares_filled: FractionalShares(dec!(1.5)),
+                shares_filled: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Sell,
                 broker_order_id,
                 price_cents,
@@ -1065,7 +1077,7 @@ mod tests {
         };
 
         // OnChain buy of 2.0 + OffChain sell of 1.5 = net position of 0.5
-        assert_eq!(position.net, FractionalShares(dec!(0.5)));
+        assert_eq!(position.net, FractionalShares::new(dec!(0.5)));
         assert!(
             position.pending_execution_id.is_none(),
             "pending_execution_id should be cleared after OffChainOrderFilled"
@@ -1090,7 +1102,7 @@ mod tests {
                     tx_hash: TxHash::random(),
                     log_index: 1,
                 },
-                amount: FractionalShares(dec!(2.0)),
+                amount: FractionalShares::new(dec!(2.0)),
                 direction: Direction::Sell,
                 price_usdc: dec!(150.0),
                 block_timestamp: Utc::now(),
@@ -1098,7 +1110,7 @@ mod tests {
             },
             PositionEvent::OffChainOrderPlaced {
                 execution_id,
-                shares: FractionalShares(dec!(1.5)),
+                shares: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Buy,
                 executor: SupportedExecutor::Schwab,
                 trigger_reason: TriggerReason::SharesThreshold {
@@ -1109,7 +1121,7 @@ mod tests {
             },
             PositionEvent::OffChainOrderFilled {
                 execution_id,
-                shares_filled: FractionalShares(dec!(1.5)),
+                shares_filled: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Buy,
                 broker_order_id,
                 price_cents,
@@ -1127,7 +1139,7 @@ mod tests {
         };
 
         // OnChain sell of 2.0 + OffChain buy of 1.5 = net position of -0.5
-        assert_eq!(position.net, FractionalShares(dec!(-0.5)));
+        assert_eq!(position.net, FractionalShares::new(dec!(-0.5)));
         assert!(
             position.pending_execution_id.is_none(),
             "pending_execution_id should be cleared after OffChainOrderFilled"
@@ -1137,7 +1149,8 @@ mod tests {
     #[test]
     fn update_threshold_creates_audit_trail() {
         let old_threshold = one_share_threshold();
-        let new_threshold = ExecutionThreshold::shares(FractionalShares(dec!(5.0))).unwrap();
+        let new_threshold =
+            ExecutionThreshold::shares(Positive::new(FractionalShares::new(dec!(5.0))).unwrap());
 
         let result =
             TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
@@ -1161,7 +1174,9 @@ mod tests {
 
         let event = PositionEvent::Initialized {
             symbol: symbol.clone(),
-            threshold: ExecutionThreshold::shares(FractionalShares(dec!(100))).unwrap(),
+            threshold: ExecutionThreshold::shares(
+                Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            ),
             initialized_at,
         };
 
@@ -1208,7 +1223,7 @@ mod tests {
                 log_index: 0,
             },
             direction: Direction::Buy,
-            amount: FractionalShares(dec!(10.5)),
+            amount: FractionalShares::new(dec!(10.5)),
             price_usdc: dec!(150.25),
             block_timestamp: seen_at,
             seen_at,
@@ -1220,8 +1235,8 @@ mod tests {
             panic!("Expected Active state");
         };
 
-        assert_eq!(position.net, FractionalShares(dec!(10.5)));
-        assert_eq!(position.accumulated_long, FractionalShares(dec!(10.5)));
+        assert_eq!(position.net, FractionalShares::new(dec!(10.5)));
+        assert_eq!(position.accumulated_long, FractionalShares::new(dec!(10.5)));
         assert_eq!(position.accumulated_short, FractionalShares::ZERO);
         assert_eq!(position.last_updated, Some(seen_at));
     }
@@ -1234,8 +1249,8 @@ mod tests {
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
-            net: FractionalShares(dec!(20.0)),
-            accumulated_long: FractionalShares(dec!(20.0)),
+            net: FractionalShares::new(dec!(20.0)),
+            accumulated_long: FractionalShares::new(dec!(20.0)),
             accumulated_short: FractionalShares::ZERO,
             pending_execution_id: None,
             threshold: ExecutionThreshold::whole_share(),
@@ -1252,7 +1267,7 @@ mod tests {
                 log_index: 1,
             },
             direction: Direction::Sell,
-            amount: FractionalShares(dec!(5.5)),
+            amount: FractionalShares::new(dec!(5.5)),
             price_usdc: dec!(149.75),
             block_timestamp: seen_at,
             seen_at,
@@ -1264,9 +1279,9 @@ mod tests {
             panic!("Expected Active state");
         };
 
-        assert_eq!(position.net, FractionalShares(dec!(14.5)));
-        assert_eq!(position.accumulated_long, FractionalShares(dec!(20.0)));
-        assert_eq!(position.accumulated_short, FractionalShares(dec!(5.5)));
+        assert_eq!(position.net, FractionalShares::new(dec!(14.5)));
+        assert_eq!(position.accumulated_long, FractionalShares::new(dec!(20.0)));
+        assert_eq!(position.accumulated_short, FractionalShares::new(dec!(5.5)));
         assert_eq!(position.last_updated, Some(seen_at));
     }
 
@@ -1279,8 +1294,8 @@ mod tests {
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
-            net: FractionalShares(dec!(100.0)),
-            accumulated_long: FractionalShares(dec!(100.0)),
+            net: FractionalShares::new(dec!(100.0)),
+            accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
             pending_execution_id: None,
             threshold: ExecutionThreshold::whole_share(),
@@ -1290,7 +1305,7 @@ mod tests {
 
         let event = PositionEvent::OffChainOrderPlaced {
             execution_id,
-            shares: FractionalShares(dec!(100)),
+            shares: FractionalShares::new(dec!(100)),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             trigger_reason: TriggerReason::SharesThreshold {
@@ -1319,8 +1334,8 @@ mod tests {
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
-            net: FractionalShares(dec!(100.0)),
-            accumulated_long: FractionalShares(dec!(100.0)),
+            net: FractionalShares::new(dec!(100.0)),
+            accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
             pending_execution_id: Some(execution_id),
             threshold: ExecutionThreshold::whole_share(),
@@ -1330,7 +1345,7 @@ mod tests {
 
         let event = PositionEvent::OffChainOrderFilled {
             execution_id,
-            shares_filled: FractionalShares(dec!(100)),
+            shares_filled: FractionalShares::new(dec!(100)),
             direction: Direction::Sell,
             broker_order_id: BrokerOrderId("ORD123".to_string()),
             price_cents: PriceCents(15025),
@@ -1357,8 +1372,8 @@ mod tests {
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
-            net: FractionalShares(dec!(50.0)),
-            accumulated_long: FractionalShares(dec!(50.0)),
+            net: FractionalShares::new(dec!(50.0)),
+            accumulated_long: FractionalShares::new(dec!(50.0)),
             accumulated_short: FractionalShares::ZERO,
             pending_execution_id: Some(execution_id),
             threshold: ExecutionThreshold::whole_share(),
@@ -1368,7 +1383,7 @@ mod tests {
 
         let event = PositionEvent::OffChainOrderFilled {
             execution_id,
-            shares_filled: FractionalShares(dec!(25)),
+            shares_filled: FractionalShares::new(dec!(25)),
             direction: Direction::Buy,
             broker_order_id: BrokerOrderId("ORD456".to_string()),
             price_cents: PriceCents(14500),
@@ -1381,7 +1396,7 @@ mod tests {
             panic!("Expected Active state");
         };
 
-        assert_eq!(position.net, FractionalShares(dec!(75.0)));
+        assert_eq!(position.net, FractionalShares::new(dec!(75.0)));
         assert_eq!(position.pending_execution_id, None);
         assert_eq!(position.last_updated, Some(broker_timestamp));
     }
@@ -1395,8 +1410,8 @@ mod tests {
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
-            net: FractionalShares(dec!(100.0)),
-            accumulated_long: FractionalShares(dec!(100.0)),
+            net: FractionalShares::new(dec!(100.0)),
+            accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
             pending_execution_id: Some(execution_id),
             threshold: ExecutionThreshold::whole_share(),
@@ -1416,7 +1431,7 @@ mod tests {
             panic!("Expected Active state");
         };
 
-        assert_eq!(position.net, FractionalShares(dec!(100.0)));
+        assert_eq!(position.net, FractionalShares::new(dec!(100.0)));
         assert_eq!(position.pending_execution_id, None);
         assert_eq!(position.last_updated, Some(failed_at));
     }
@@ -1429,17 +1444,21 @@ mod tests {
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
-            net: FractionalShares(dec!(100.0)),
-            accumulated_long: FractionalShares(dec!(100.0)),
+            net: FractionalShares::new(dec!(100.0)),
+            accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
             pending_execution_id: None,
-            threshold: ExecutionThreshold::shares(FractionalShares(dec!(100))).unwrap(),
+            threshold: ExecutionThreshold::shares(
+                Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            ),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
         });
 
         let event = PositionEvent::ThresholdUpdated {
-            old_threshold: ExecutionThreshold::shares(FractionalShares(dec!(100))).unwrap(),
+            old_threshold: ExecutionThreshold::shares(
+                Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            ),
             new_threshold: ExecutionThreshold::dollar_value(Usdc(dec!(10000))).unwrap(),
             updated_at,
         };
@@ -1460,10 +1479,12 @@ mod tests {
 
         let event = PositionEvent::Migrated {
             symbol: symbol.clone(),
-            net_position: FractionalShares(dec!(150.5)),
-            accumulated_long: FractionalShares(dec!(200.0)),
-            accumulated_short: FractionalShares(dec!(49.5)),
-            threshold: ExecutionThreshold::shares(FractionalShares(dec!(100))).unwrap(),
+            net_position: FractionalShares::new(dec!(150.5)),
+            accumulated_long: FractionalShares::new(dec!(200.0)),
+            accumulated_short: FractionalShares::new(dec!(49.5)),
+            threshold: ExecutionThreshold::shares(
+                Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            ),
             last_price_usdc: None,
             migrated_at,
         };
@@ -1478,9 +1499,15 @@ mod tests {
         };
 
         assert_eq!(position.symbol, symbol);
-        assert_eq!(position.net, FractionalShares(dec!(150.5)));
-        assert_eq!(position.accumulated_long, FractionalShares(dec!(200.0)));
-        assert_eq!(position.accumulated_short, FractionalShares(dec!(49.5)));
+        assert_eq!(position.net, FractionalShares::new(dec!(150.5)));
+        assert_eq!(
+            position.accumulated_long,
+            FractionalShares::new(dec!(200.0))
+        );
+        assert_eq!(
+            position.accumulated_short,
+            FractionalShares::new(dec!(49.5))
+        );
         assert_eq!(position.pending_execution_id, None);
         assert_eq!(position.last_updated, Some(migrated_at));
     }
@@ -1498,7 +1525,7 @@ mod tests {
                 log_index: 0,
             },
             direction: Direction::Buy,
-            amount: FractionalShares(dec!(10)),
+            amount: FractionalShares::new(dec!(10)),
             price_usdc: dec!(150.00),
             block_timestamp: Utc::now(),
             seen_at: Utc::now(),
@@ -1606,7 +1633,9 @@ mod tests {
         let timestamp = Utc::now();
         let event = PositionEvent::ThresholdUpdated {
             old_threshold: ExecutionThreshold::whole_share(),
-            new_threshold: ExecutionThreshold::shares(FractionalShares(dec!(5.0))).unwrap(),
+            new_threshold: ExecutionThreshold::shares(
+                Positive::new(FractionalShares::new(dec!(5.0))).unwrap(),
+            ),
             updated_at: timestamp,
         };
 
@@ -1617,9 +1646,9 @@ mod tests {
     async fn test_migrate_command_creates_migrated_event() {
         let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let net_position = FractionalShares(dec!(5.5));
-        let accumulated_long = FractionalShares(dec!(10.0));
-        let accumulated_short = FractionalShares(dec!(4.5));
+        let net_position = FractionalShares::new(dec!(5.5));
+        let accumulated_long = FractionalShares::new(dec!(10.0));
+        let accumulated_short = FractionalShares::new(dec!(4.5));
         let threshold = ExecutionThreshold::whole_share();
 
         let command = PositionCommand::Migrate {
@@ -1689,13 +1718,13 @@ mod tests {
     async fn test_migrate_preserves_negative_position() {
         let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
         let symbol = Symbol::new("GOOGL").unwrap();
-        let net_position = FractionalShares(dec!(-10.5));
+        let net_position = FractionalShares::new(dec!(-10.5));
 
         let command = PositionCommand::Migrate {
             symbol,
             net_position,
-            accumulated_long: FractionalShares(dec!(5.0)),
-            accumulated_short: FractionalShares(dec!(15.5)),
+            accumulated_long: FractionalShares::new(dec!(5.0)),
+            accumulated_short: FractionalShares::new(dec!(15.5)),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
         };
@@ -1708,8 +1737,8 @@ mod tests {
                 net_position: event_net,
                 ..
             } => {
-                assert_eq!(event_net.0, dec!(-10.5));
-                assert!(event_net.0 < Decimal::ZERO);
+                assert_eq!(event_net.inner(), dec!(-10.5));
+                assert!(event_net.inner() < Decimal::ZERO);
             }
             _ => panic!("Expected Migrated event"),
         }
@@ -1729,8 +1758,8 @@ mod tests {
 
         let command = PositionCommand::Migrate {
             symbol,
-            net_position: FractionalShares(dec!(1.5)),
-            accumulated_long: FractionalShares(dec!(1.5)),
+            net_position: FractionalShares::new(dec!(1.5)),
+            accumulated_long: FractionalShares::new(dec!(1.5)),
             accumulated_short: FractionalShares::ZERO,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
@@ -1742,5 +1771,113 @@ mod tests {
             result,
             Err(PositionError::State(LifecycleError::AlreadyInitialized))
         ));
+    }
+
+    #[test]
+    fn is_ready_for_execution_floors_shares_for_non_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(1.212)),
+            accumulated_long: FractionalShares::new(dec!(1.212)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::Schwab)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(
+            shares.inner(),
+            dec!(1),
+            "Schwab executor should floor to whole shares: expected 1, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn is_ready_for_execution_floors_shares_for_negative_position_with_non_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(-2.567)),
+            accumulated_long: FractionalShares::ZERO,
+            accumulated_short: FractionalShares::new(dec!(2.567)),
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::Schwab)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Buy);
+        assert_eq!(
+            shares.inner(),
+            dec!(2),
+            "Schwab executor should floor to whole shares: expected 2, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn is_ready_for_execution_returns_fractional_shares_for_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(1.212)),
+            accumulated_long: FractionalShares::new(dec!(1.212)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(
+            shares.inner(),
+            dec!(1.212),
+            "Alpaca executor should return full fractional shares: expected 1.212, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn is_ready_for_execution_returns_fractional_for_negative_position_with_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(-2.567)),
+            accumulated_long: FractionalShares::ZERO,
+            accumulated_short: FractionalShares::new(dec!(2.567)),
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Buy);
+        assert_eq!(
+            shares.inner(),
+            dec!(2.567),
+            "Alpaca executor should return full fractional shares: expected 2.567, got {}",
+            shares.inner()
+        );
     }
 }

@@ -63,7 +63,7 @@ async fn migrate_single_onchain_trade(
         .try_into()
         .map_err(|_| MigrationError::NegativeValue {
             field: "log_index".to_string(),
-            value: row.log_index,
+            value: row.log_index.to_string(),
         })?;
 
     let aggregate_id = OnChainTrade::aggregate_id(tx_hash, log_index);

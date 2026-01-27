@@ -1,13 +1,13 @@
-use rust_decimal::{Decimal, prelude::One};
+use rust_decimal::Decimal;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_execution::Symbol;
+use st0x_execution::{FractionalShares, Positive, Symbol};
 use tracing::{info, warn};
 
 use super::{ExecutionMode, MigrationError};
 use crate::lifecycle::Lifecycle;
 use crate::position::{Position, PositionCommand};
-use crate::shares::{ArithmeticError, FractionalShares};
+use crate::shares::ArithmeticError;
 use crate::threshold::ExecutionThreshold;
 
 #[derive(sqlx::FromRow)]
@@ -75,10 +75,10 @@ async fn migrate_single_position(
 
     let command = PositionCommand::Migrate {
         symbol,
-        net_position: FractionalShares(net_position),
-        accumulated_long: FractionalShares(accumulated_long),
-        accumulated_short: FractionalShares(accumulated_short),
-        threshold: ExecutionThreshold::Shares(FractionalShares(Decimal::one())),
+        net_position: FractionalShares::new(net_position),
+        accumulated_long: FractionalShares::new(accumulated_long),
+        accumulated_short: FractionalShares::new(accumulated_short),
+        threshold: ExecutionThreshold::shares(Positive::<FractionalShares>::ONE),
         last_price_usdc: None,
     };
 

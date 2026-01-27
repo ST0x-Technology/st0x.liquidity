@@ -46,7 +46,7 @@ pub struct RebalancingEnv {
     #[clap(long, env, default_value = "0.5")]
     equity_target_ratio: Decimal,
     /// Deviation from equity target that triggers rebalancing (0.0-1.0)
-    #[clap(long, env, default_value = "0.2")]
+    #[clap(long, env, default_value = "0.15")]
     equity_deviation: Decimal,
     /// Target ratio of onchain to total for USDC (0.0-1.0)
     #[clap(long, env, default_value = "0.5")]
@@ -393,7 +393,7 @@ impl RebalancingTrigger {
                 symbol, quantity, ..
             } = &envelope.payload
             {
-                let shares = FractionalShares(*quantity);
+                let shares = FractionalShares::new(*quantity);
                 return Some((symbol.clone(), shares));
             }
         }
@@ -444,7 +444,7 @@ impl RebalancingTrigger {
                 symbol, quantity, ..
             } = &envelope.payload
             {
-                let shares = FractionalShares(*quantity);
+                let shares = FractionalShares::new(*quantity);
                 return Some((symbol.clone(), shares));
             }
         }
@@ -678,7 +678,7 @@ mod tests {
     }
 
     fn shares(n: i64) -> FractionalShares {
-        FractionalShares(Decimal::from(n))
+        FractionalShares::new(Decimal::from(n))
     }
 
     fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
@@ -999,7 +999,7 @@ mod tests {
 
         let (extracted_symbol, extracted_quantity) = result.unwrap();
         assert_eq!(extracted_symbol, symbol);
-        assert_eq!(extracted_quantity.0, dec!(42.5));
+        assert_eq!(extracted_quantity.inner(), dec!(42.5));
     }
 
     #[test]
@@ -1169,7 +1169,7 @@ mod tests {
 
         let (extracted_symbol, extracted_quantity) = result.unwrap();
         assert_eq!(extracted_symbol, symbol);
-        assert_eq!(extracted_quantity.0, dec!(42.5));
+        assert_eq!(extracted_quantity.inner(), dec!(42.5));
     }
 
     #[test]
@@ -1658,7 +1658,7 @@ mod tests {
             let config = RebalancingConfig::from_env().unwrap();
 
             assert_eq!(config.equity_threshold.target, dec!(0.5));
-            assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+            assert_eq!(config.equity_threshold.deviation, dec!(0.15));
             assert_eq!(config.usdc_threshold.target, dec!(0.5));
             assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
             assert_eq!(

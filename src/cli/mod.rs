@@ -166,15 +166,26 @@ pub enum Commands {
     /// Useful for debugging transfer status and verifying deposits.
     AlpacaTransfers,
 
-    /// Deposit USDC into a Raindex vault
+    /// Deposit tokens into a Raindex vault
     ///
-    /// This command deposits USDC from your wallet into a Raindex OrderBook vault.
+    /// This command deposits ERC20 tokens from your wallet into a Raindex OrderBook vault.
     /// It handles ERC20 approval and the vault deposit in sequence.
-    /// Network is automatically determined from Alpaca trading mode.
     VaultDeposit {
-        /// Amount of USDC to deposit
+        /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount")]
-        amount: Usdc,
+        amount: rust_decimal::Decimal,
+
+        /// Token contract address
+        #[arg(short = 't', long = "token")]
+        token: Address,
+
+        /// Vault ID
+        #[arg(short = 'v', long = "vault-id")]
+        vault_id: B256,
+
+        /// Token decimals (e.g., 6 for USDC, 18 for most ERC20s)
+        #[arg(short = 'd', long = "decimals")]
+        decimals: u8,
     },
 
     /// Withdraw USDC from a Raindex vault
@@ -379,7 +390,10 @@ enum ProviderCommand {
         amount: Usdc,
     },
     VaultDeposit {
-        amount: Usdc,
+        amount: rust_decimal::Decimal,
+        token: Address,
+        vault_id: B256,
+        decimals: u8,
     },
     VaultWithdraw {
         amount: Usdc,
@@ -454,7 +468,17 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
         Commands::TransferUsdc { direction, amount } => {
             Err(ProviderCommand::TransferUsdc { direction, amount })
         }
-        Commands::VaultDeposit { amount } => Err(ProviderCommand::VaultDeposit { amount }),
+        Commands::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => Err(ProviderCommand::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        }),
         Commands::VaultWithdraw { amount } => Err(ProviderCommand::VaultWithdraw { amount }),
         Commands::CctpBridge { amount, all, from } => {
             Err(ProviderCommand::CctpBridge { amount, all, from })
@@ -562,8 +586,16 @@ async fn run_provider_command<W: Write>(
             rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
                 .await
         }
-        ProviderCommand::VaultDeposit { amount } => {
-            vault::vault_deposit_command(stdout, amount, config, provider).await
+        ProviderCommand::VaultDeposit {
+            amount,
+            token,
+            vault_id,
+            decimals,
+        } => {
+            vault::vault_deposit_command(
+                stdout, amount, token, vault_id, decimals, config, provider,
+            )
+            .await
         }
         ProviderCommand::VaultWithdraw { amount } => {
             vault::vault_withdraw_command(stdout, amount, config, provider).await
@@ -608,9 +640,10 @@ mod tests {
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
     use httpmock::MockServer;
+    use rust_decimal::Decimal;
     use serde_json::json;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens};
-    use st0x_execution::{Direction, OrderStatus, Shares};
+    use st0x_execution::{Direction, FractionalShares, OrderStatus, Positive};
     use std::str::FromStr;
 
     use super::*;
@@ -1750,7 +1783,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, Shares::new(9).unwrap());
+        assert_eq!(
+            executions[0].shares,
+            Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
+        );
         assert_eq!(executions[0].direction, Direction::Buy);
 
         let execution_id = executions[0].id.unwrap();

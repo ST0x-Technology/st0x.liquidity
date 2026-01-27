@@ -1,15 +1,7 @@
-use num_traits::ToPrimitive;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccumulationBucket {
     LongExposure,
     ShortExposure,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ConversionError {
-    #[error("Failed to convert u64 {value} to f64: precision loss would occur")]
-    U64ToF64PrecisionLoss { value: u64 },
 }
 
 /// Legacy position calculator for tracking accumulated positions.
@@ -61,25 +53,15 @@ impl PositionCalculator {
         }
     }
 
-    pub(crate) fn reduce_accumulation(
-        &mut self,
-        execution_type: AccumulationBucket,
-        shares: u64,
-    ) -> Result<(), ConversionError> {
-        let shares_f64 = shares
-            .to_f64()
-            .ok_or(ConversionError::U64ToF64PrecisionLoss { value: shares })?;
-
+    pub(crate) fn reduce_accumulation(&mut self, execution_type: AccumulationBucket, shares: f64) {
         match execution_type {
             AccumulationBucket::LongExposure => {
-                self.accumulated_long -= shares_f64;
+                self.accumulated_long -= shares;
             }
             AccumulationBucket::ShortExposure => {
-                self.accumulated_short -= shares_f64;
+                self.accumulated_short -= shares;
             }
         }
-
-        Ok(())
     }
 }
 
@@ -137,13 +119,11 @@ mod tests {
     #[test]
     fn test_reduce_accumulation() {
         let mut calc = PositionCalculator::with_positions(2.5, 3.0);
-        calc.reduce_accumulation(AccumulationBucket::LongExposure, 2)
-            .unwrap();
+        calc.reduce_accumulation(AccumulationBucket::LongExposure, 2.0);
         assert!((calc.accumulated_long - 0.5).abs() < f64::EPSILON);
         assert!((calc.net_position() - (-2.5)).abs() < f64::EPSILON);
 
-        calc.reduce_accumulation(AccumulationBucket::ShortExposure, 1)
-            .unwrap();
+        calc.reduce_accumulation(AccumulationBucket::ShortExposure, 1.0);
         assert!((calc.accumulated_short - 2.0).abs() < f64::EPSILON);
         assert!((calc.net_position() - (-1.5)).abs() < f64::EPSILON);
     }

@@ -9,13 +9,12 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
-    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
-    InvalidSharesError, PersistenceError,
+    EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
+    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::env::ConfigError;
-use crate::onchain::position_calculator::ConversionError;
 
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
@@ -69,6 +68,8 @@ pub(crate) enum TradeValidationError {
     },
     #[error("Negative shares amount: {0}")]
     NegativeShares(f64),
+    #[error("Share quantity {0} cannot be converted to f64")]
+    ShareConversionFailed(Positive<FractionalShares>),
     #[error("Negative USDC amount: {0}")]
     NegativeUsdc(f64),
     #[error(
@@ -170,8 +171,6 @@ pub(crate) enum OnChainError {
     OrderStatusParse(#[from] ParseOrderStatusError),
     #[error("Invalid executor: {0}")]
     InvalidExecutor(#[from] InvalidExecutorError),
-    #[error("Numeric conversion error: {0}")]
-    Conversion(#[from] ConversionError),
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
     #[error("Integer conversion error: {0}")]

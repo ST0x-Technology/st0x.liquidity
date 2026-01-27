@@ -155,9 +155,10 @@ impl TryIntoExecutor for MockExecutorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rust_decimal::Decimal;
 
-    use crate::{Direction, Shares, Symbol};
+    use super::*;
+    use crate::{Direction, FractionalShares, Positive, Symbol};
 
     #[tokio::test]
     async fn test_try_from_config_success() {
@@ -205,9 +206,10 @@ mod tests {
     #[tokio::test]
     async fn test_place_market_order_success() {
         let executor = MockExecutor::new();
+        let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(10).unwrap(),
+            shares,
             direction: Direction::Buy,
         };
 
@@ -216,7 +218,10 @@ mod tests {
 
         assert!(placement.order_id.starts_with("TEST_"));
         assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(placement.shares, Shares::new(10).unwrap());
+        assert_eq!(
+            placement.shares,
+            Positive::new(FractionalShares::new(Decimal::from(10))).unwrap()
+        );
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -225,7 +230,7 @@ mod tests {
         let executor = MockExecutor::with_failure("Simulated API error");
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(10).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Buy,
         };
 
