@@ -151,10 +151,11 @@ pub struct OnchainTrade {
     pub(crate) pyth_confidence: Option<Decimal>,
     pub(crate) pyth_exponent: Option<i32>,
     pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
-    /// For wrapped tokens, this is the underlying-equivalent amount for hedge calculations.
-    /// When set, the accumulator uses this instead of `amount` for position tracking.
-    /// This allows correct hedging when onchain amounts are in wrapped units.
-    pub(crate) underlying_amount: Option<f64>,
+    /// The underlying-equivalent amount for hedge calculations.
+    /// For wrapped tokens, this differs from `amount` (in wrapped units).
+    /// For unwrapped tokens, this equals `amount`.
+    /// The accumulator uses this for position tracking to ensure correct hedging.
+    pub(crate) underlying_amount: f64,
 }
 
 impl OnchainTrade {
@@ -392,7 +393,7 @@ impl OnchainTrade {
             pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
             pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
             pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
-            underlying_amount: Some(trade_details.equity_amount().value()),
+            underlying_amount: trade_details.equity_amount().value(),
         };
 
         Ok(Some(trade))
@@ -605,7 +606,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: Some(10.0),
+            underlying_amount: 10.0,
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -784,7 +785,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: Some(10.0),
+            underlying_amount: 10.0,
         };
 
         // Insert first trade
@@ -826,7 +827,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: Some(10.0),
+            underlying_amount: 10.0,
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -966,7 +967,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: Some(10.0),
+                underlying_amount: 10.0,
             };
 
             let mut sql_tx = pool.begin().await.unwrap();

@@ -789,7 +789,7 @@ pub(crate) mod tests {
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
-    const TEST_ACCOUNT_ID: AlpacaAccountId =
+    pub(crate) const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     pub(crate) fn tokenization_mint_path() -> String {
