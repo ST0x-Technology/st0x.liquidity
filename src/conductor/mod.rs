@@ -1394,7 +1394,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(5.0),
         };
         let mut sql_tx = pool.begin().await.unwrap();
         existing_trade

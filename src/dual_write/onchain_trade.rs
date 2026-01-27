@@ -74,7 +74,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(10.5),
         };
 
         let result = witness_trade(&context, &trade, 12345).await;
@@ -133,7 +133,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(10.5),
         };
 
         witness_trade(&context, &trade1, 12345).await.unwrap();
@@ -178,7 +178,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(10.5),
         };
 
         let result = witness_trade(&context, &trade, 12345).await;
