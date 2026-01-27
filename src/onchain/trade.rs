@@ -158,14 +158,6 @@ pub struct OnchainTrade {
 }
 
 impl OnchainTrade {
-    /// Returns the amount to use for hedge calculations.
-    ///
-    /// For wrapped tokens, returns the underlying-equivalent amount.
-    /// For unwrapped tokens, returns the raw onchain amount.
-    pub(crate) fn hedge_amount(&self) -> f64 {
-        self.underlying_amount.unwrap_or(self.amount)
-    }
-
     pub async fn save_within_transaction(
         &self,
         sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
@@ -247,7 +239,8 @@ impl OnchainTrade {
                 pyth_price,
                 pyth_confidence,
                 pyth_exponent,
-                pyth_publish_time
+                pyth_publish_time,
+                underlying_amount
             FROM onchain_trades
             WHERE tx_hash = ?1 AND log_index = ?2
             ",
@@ -287,7 +280,7 @@ impl OnchainTrade {
             pyth_publish_time: row
                 .pyth_publish_time
                 .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            underlying_amount: None, // Not stored in DB, computed at processing time
+            underlying_amount: row.underlying_amount,
         })
     }
 
@@ -395,11 +388,11 @@ impl OnchainTrade {
             created_at: None,
             gas_used,
             effective_gas_price,
-            pyth_price: pyth_pricing.as_ref().map(|pricing| pricing.price),
-            pyth_confidence: pyth_pricing.as_ref().map(|pricing| pricing.confidence),
-            pyth_exponent: pyth_pricing.as_ref().map(|pricing| pricing.exponent),
-            pyth_publish_time: pyth_pricing.as_ref().map(|pricing| pricing.publish_time),
-            underlying_amount: None,
+            pyth_price: pyth_pricing.as_ref().map(|p| p.price),
+            pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
+            pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
+            pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
+            underlying_amount: Some(trade_details.equity_amount().value()),
         };
 
         Ok(Some(trade))
@@ -612,7 +605,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(10.0),
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -791,7 +784,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(10.0),
         };
 
         // Insert first trade
@@ -833,7 +826,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: None,
+            underlying_amount: Some(10.0),
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -973,7 +966,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: None,
+                underlying_amount: Some(10.0),
             };
 
             let mut sql_tx = pool.begin().await.unwrap();
