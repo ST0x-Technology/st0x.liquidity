@@ -1772,4 +1772,112 @@ mod tests {
             Err(PositionError::State(LifecycleError::AlreadyInitialized))
         ));
     }
+
+    #[test]
+    fn is_ready_for_execution_floors_shares_for_non_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(1.212)),
+            accumulated_long: FractionalShares::new(dec!(1.212)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::Schwab)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(
+            shares.inner(),
+            dec!(1),
+            "Schwab executor should floor to whole shares: expected 1, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn is_ready_for_execution_floors_shares_for_negative_position_with_non_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(-2.567)),
+            accumulated_long: FractionalShares::ZERO,
+            accumulated_short: FractionalShares::new(dec!(2.567)),
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::whole_share(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::Schwab)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Buy);
+        assert_eq!(
+            shares.inner(),
+            dec!(2),
+            "Schwab executor should floor to whole shares: expected 2, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn is_ready_for_execution_returns_fractional_shares_for_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(1.212)),
+            accumulated_long: FractionalShares::new(dec!(1.212)),
+            accumulated_short: FractionalShares::ZERO,
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Sell);
+        assert_eq!(
+            shares.inner(),
+            dec!(1.212),
+            "Alpaca executor should return full fractional shares: expected 1.212, got {}",
+            shares.inner()
+        );
+    }
+
+    #[test]
+    fn is_ready_for_execution_returns_fractional_for_negative_position_with_fractional_executor() {
+        let position = Position {
+            symbol: Symbol::new("AAPL").unwrap(),
+            net: FractionalShares::new(dec!(-2.567)),
+            accumulated_long: FractionalShares::ZERO,
+            accumulated_short: FractionalShares::new(dec!(2.567)),
+            pending_execution_id: None,
+            threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
+            last_price_usdc: Some(dec!(150.0)),
+            last_updated: Some(Utc::now()),
+        };
+
+        let result = position
+            .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
+            .unwrap();
+
+        let (direction, shares) = result.expect("should be ready for execution");
+        assert_eq!(direction, Direction::Buy);
+        assert_eq!(
+            shares.inner(),
+            dec!(2.567),
+            "Alpaca executor should return full fractional shares: expected 2.567, got {}",
+            shares.inner()
+        );
+    }
 }

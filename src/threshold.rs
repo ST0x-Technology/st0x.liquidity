@@ -36,6 +36,19 @@ impl HasZero for Usdc {
 const USDC_DECIMAL_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
 impl Usdc {
+    #[cfg(test)]
+    pub(crate) fn inner(self) -> Decimal {
+        self.0
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+
+    pub(crate) fn is_negative(self) -> bool {
+        self.0.is_sign_negative()
+    }
+
     /// Converts to U256 with 6 decimal places (USDC standard).
     ///
     /// Returns an error for negative values or overflow during scaling.
@@ -156,7 +169,28 @@ pub(crate) enum InvalidThresholdError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rust_decimal::Decimal;
+
+    fn arb_decimal() -> impl Strategy<Value = Decimal> {
+        (any::<i64>(), 0u32..=10).prop_map(|(mantissa, scale)| Decimal::new(mantissa, scale))
+    }
+
+    proptest! {
+        #[test]
+        fn usdc_is_zero_matches_decimal_is_zero(decimal in arb_decimal()) {
+            let usdc = Usdc(decimal);
+
+            prop_assert_eq!(usdc.is_zero(), decimal.is_zero());
+        }
+
+        #[test]
+        fn usdc_is_negative_matches_decimal_is_sign_negative(decimal in arb_decimal()) {
+            let usdc = Usdc(decimal);
+
+            prop_assert_eq!(usdc.is_negative(), decimal.is_sign_negative());
+        }
+    }
 
     #[test]
     fn whole_share_matches_smart_constructor() {

@@ -252,14 +252,15 @@ impl Env {
 
         // Execution threshold is determined by broker capabilities:
         // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
-        // - Alpaca requires $1 minimum for fractional trading, so use $1 dollar value threshold
+        // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
+        //   for slippage, fees, and price discrepancies that could push fills below $1.
         // - DryRun uses shares threshold for testing
         let execution_threshold = match &broker {
             BrokerConfig::Schwab(_) | BrokerConfig::DryRun => {
                 ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
             }
             BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
-                ExecutionThreshold::dollar_value(Usdc(Decimal::ONE))?
+                ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))?
             }
         };
 
@@ -1069,7 +1070,7 @@ pub(crate) mod tests {
                 let env = Env::try_parse_from(args).unwrap();
                 let config = env.into_config().unwrap();
 
-                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
+                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
                 assert_eq!(config.execution_threshold, expected);
             },
         );
@@ -1104,7 +1105,7 @@ pub(crate) mod tests {
                 let env = Env::try_parse_from(args).unwrap();
                 let config = env.into_config().unwrap();
 
-                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
+                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
                 assert_eq!(config.execution_threshold, expected);
             },
         );
