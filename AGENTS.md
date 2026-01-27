@@ -4,7 +4,12 @@ This file provides guidance to AI agents working with code in this repository.
 
 **CRITICAL: File Size Limit** - AGENTS.md must not exceed 40,000 characters.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
-the limit, condense explanations without removing any rules.
+the limit:
+
+- **NEVER remove guidelines** - only condense verbose explanations
+- **Condense code examples first** - examples are illustrative, rules are not
+- **Remove redundancy** - if a guideline duplicates another, keep one reference
+- **Shorten explanations** - preserve the rule, reduce the elaboration
 
 ## Ownership Principles
 
@@ -743,9 +748,7 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
 ```rust
 // ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
 // ❌ Obvious from context: // Store test tokens
-// ❌ Just restating code: // Mock account hash endpoint
 // ❌ Test section markers: // 1. Test token refresh integration
-// ❌ Obvious operations: // Execute the order, // Create a trade, // Verify mocks
 ```
 
 #### Comment Maintenance
@@ -925,22 +928,11 @@ let Some(symbol) = trade_data.extract_symbol() else {
 };
 ```
 
-##### Extract functions for complex logic:
-
-Break deeply nested event processing into helper functions with clear names.
-
 ##### Use pattern matching with guards:
 
 ```rust
 // ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
 // ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
-```
-
-##### Prefer iterator chains over nested loops:
-
-```rust
-// ❌ Imperative: let mut results = Vec::new(); for t in &trades { if t.is_valid() { results.push(...) } }
-// ✅ Functional: trades.iter().filter(|t| t.is_valid()).map(process_trade).collect::<Result<Vec<_>, _>>()
 ```
 
 #### Struct field access
