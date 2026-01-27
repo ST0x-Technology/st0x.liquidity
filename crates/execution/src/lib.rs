@@ -443,6 +443,16 @@ pub enum SupportedExecutor {
     DryRun,
 }
 
+impl SupportedExecutor {
+    /// Returns whether this executor supports fractional share orders.
+    pub const fn supports_fractional_shares(self) -> bool {
+        match self {
+            Self::Schwab => false,
+            Self::AlpacaTradingApi | Self::AlpacaBrokerApi | Self::DryRun => true,
+        }
+    }
+}
+
 impl std::fmt::Display for SupportedExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -845,5 +855,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn schwab_does_not_support_fractional_shares() {
+        assert!(!SupportedExecutor::Schwab.supports_fractional_shares());
+    }
+
+    #[test]
+    fn alpaca_trading_api_supports_fractional_shares() {
+        assert!(SupportedExecutor::AlpacaTradingApi.supports_fractional_shares());
+    }
+
+    #[test]
+    fn alpaca_broker_api_supports_fractional_shares() {
+        assert!(SupportedExecutor::AlpacaBrokerApi.supports_fractional_shares());
+    }
+
+    #[test]
+    fn dry_run_supports_fractional_shares() {
+        assert!(SupportedExecutor::DryRun.supports_fractional_shares());
     }
 }
