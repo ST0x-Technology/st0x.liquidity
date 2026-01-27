@@ -392,6 +392,6 @@ The core arbitrage bot functionality is now live and operational:
 
 ---
 
-**See
-[SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/blob/master/SPEC.md)
-for detailed specification.**
+## [SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/blob/master/SPEC.md)
+
+See the specification for detailed system behavior documentation.
