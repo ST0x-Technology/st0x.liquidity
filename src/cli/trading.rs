@@ -6,10 +6,11 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
+use rust_decimal::Decimal;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
-    Direction, Executor, MarketOrder, MockExecutorConfig, OrderPlacement, OrderState, Shares,
-    Symbol, TryIntoExecutor,
+    Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig, OrderPlacement,
+    OrderState, Symbol, TryIntoExecutor,
 };
 
 use crate::dual_write::DualWriteContext;
@@ -116,7 +117,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Shares::new(quantity)?,
+        shares: FractionalShares::new(Decimal::from(quantity))?,
         direction,
     };
 

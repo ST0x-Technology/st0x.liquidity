@@ -15,7 +15,6 @@ use st0x_execution::{
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::env::ConfigError;
-use crate::onchain::position_calculator::ConversionError;
 
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
@@ -170,8 +169,6 @@ pub(crate) enum OnChainError {
     OrderStatusParse(#[from] ParseOrderStatusError),
     #[error("Invalid executor: {0}")]
     InvalidExecutor(#[from] InvalidExecutorError),
-    #[error("Numeric conversion error: {0}")]
-    Conversion(#[from] ConversionError),
     #[error("Float conversion error: {0}")]
     FloatConversion(#[from] FloatError),
     #[error("Integer conversion error: {0}")]

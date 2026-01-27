@@ -2,7 +2,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use num_traits::ToPrimitive;
 
 use super::OrderStatus;
-use crate::{Direction, ExecutionError, FractionalShares, SupportedExecutor, Symbol};
+use crate::{Direction, ExecutionError, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 /// Database fields extracted from OrderState for storage
 #[derive(Debug)]
@@ -110,7 +110,7 @@ impl OrderState {
         &self,
         sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         symbol: &Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
     ) -> Result<i64, crate::PersistenceError> {
@@ -119,6 +119,7 @@ impl OrderState {
 
         let symbol_str = symbol.to_string();
         let shares_f64 = shares
+            .value()
             .value()
             .to_f64()
             .ok_or(crate::PersistenceError::InvalidShareQuantity(0.0))?;

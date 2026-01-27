@@ -9,7 +9,8 @@ use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
 use crate::{
-    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Symbol,
+    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
+    Symbol,
 };
 
 pub(super) async fn place_market_order(
@@ -36,7 +37,7 @@ pub(super) async fn place_market_order(
 
     // Convert Decimal to Num for apca crate using exact rational representation
     // Decimal stores value as mantissa * 10^(-scale), so we represent it as mantissa/10^scale
-    let decimal = market_order.shares.value();
+    let decimal = market_order.shares.value().value();
     let quantity = Num::new(decimal.mantissa(), 10i128.pow(decimal.scale()));
 
     let order_request = order_init.init(
@@ -202,11 +203,11 @@ fn extract_price_cents_from_order(
 /// Extracts shares from Alpaca Amount enum
 fn extract_shares_from_amount(
     amount: &order::Amount,
-) -> Result<FractionalShares, AlpacaTradingApiError> {
+) -> Result<Positive<FractionalShares>, AlpacaTradingApiError> {
     match amount {
         order::Amount::Quantity { quantity } => {
             let qty_decimal: Decimal = quantity.to_string().parse()?;
-            Ok(FractionalShares::new(qty_decimal)?)
+            Ok(Positive::new(FractionalShares::new(qty_decimal))?)
         }
         order::Amount::Notional { .. } => Err(AlpacaTradingApiError::NotionalOrdersNotSupported),
     }

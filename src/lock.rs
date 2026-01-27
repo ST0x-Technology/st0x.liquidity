@@ -140,13 +140,15 @@ pub(crate) async fn clear_pending_execution_id(
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
+    use st0x_execution::OrderState;
+    use st0x_execution::{Direction, FractionalShares, SupportedExecutor};
+
     use super::*;
     use crate::offchain::execution::OffchainExecution;
     use crate::onchain::accumulator::save_within_transaction;
     use crate::onchain::position_calculator::PositionCalculator;
     use crate::test_utils::setup_test_db;
-    use st0x_execution::OrderState;
-    use st0x_execution::{Direction, Shares, SupportedExecutor};
 
     #[tokio::test]
     async fn test_try_acquire_execution_lease_success() {
@@ -239,7 +241,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(100).unwrap(),
+            shares: FractionalShares::new(Decimal::from(100)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -368,7 +370,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(100).unwrap(),
+            shares: FractionalShares::new(Decimal::from(100)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,

@@ -7,7 +7,6 @@ mod rebalancing;
 mod trading;
 mod vault;
 
-use alloy::hex;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -16,23 +15,6 @@ use st0x_execution::{Direction, Symbol};
 use std::io::Write;
 use thiserror::Error;
 use tracing::info;
-
-/// Parse a hex string into B256, left-padding with zeros if shorter than 32 bytes.
-fn parse_vault_id(s: &str) -> Result<B256, String> {
-    let s = s.strip_prefix("0x").unwrap_or(s);
-
-    if s.len() > 64 {
-        return Err(format!(
-            "vault ID too long: {s} ({} hex chars, max 64)",
-            s.len()
-        ));
-    }
-
-    let padded = format!("{:0>64}", s);
-    let bytes = hex::decode(&padded).map_err(|e| format!("invalid hex: {e}"))?;
-
-    Ok(B256::from_slice(&bytes))
-}
 
 use crate::env::{Config, Env};
 use crate::shares::FractionalShares;
@@ -658,9 +640,10 @@ mod tests {
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
     use httpmock::MockServer;
+    use rust_decimal::Decimal;
     use serde_json::json;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens};
-    use st0x_execution::{Direction, OrderStatus, Shares};
+    use st0x_execution::{Direction, FractionalShares, OrderStatus};
     use std::str::FromStr;
 
     use super::*;
@@ -1800,7 +1783,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, Shares::new(9).unwrap());
+        assert_eq!(
+            executions[0].shares,
+            FractionalShares::new(Decimal::from(9)).unwrap()
+        );
         assert_eq!(executions[0].direction, Direction::Buy);
 
         let execution_id = executions[0].id.unwrap();

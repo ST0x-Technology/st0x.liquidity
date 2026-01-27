@@ -83,7 +83,7 @@ pub(crate) async fn place_offchain_order(
             .id
             .ok_or_else(|| DualWriteError::MissingExecutionId)?,
     );
-    let shares = FractionalShares(Decimal::from(execution.shares.value()));
+    let shares = FractionalShares(execution.shares.value());
     let direction = execution.direction;
     let executor = execution.executor;
 
@@ -114,7 +114,7 @@ pub(crate) async fn complete_offchain_order(
             .id
             .ok_or_else(|| DualWriteError::MissingExecutionId)?,
     );
-    let shares_filled = FractionalShares(Decimal::from(execution.shares.value()));
+    let shares_filled = FractionalShares(execution.shares.value());
     let direction = execution.direction;
 
     let (broker_order_id, price_cents, broker_timestamp) = match &execution.state {
@@ -207,11 +207,12 @@ pub(crate) async fn load_position(
 mod tests {
     use alloy::primitives::fixed_bytes;
     use chrono::Utc;
-    use st0x_execution::{Direction, SupportedExecutor};
+    use rust_decimal::Decimal;
+    use st0x_execution::{Direction, FractionalShares as ExecutionShares, SupportedExecutor};
 
     use super::*;
     use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
-    use crate::shares::HasZero;
+    use crate::shares::{FractionalShares, HasZero};
     use crate::test_utils::setup_test_db;
 
     #[tokio::test]
@@ -315,7 +316,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: ExecutionShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -369,7 +370,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: ExecutionShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
@@ -433,7 +434,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: ExecutionShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -490,7 +491,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: ExecutionShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -514,7 +515,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: ExecutionShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,

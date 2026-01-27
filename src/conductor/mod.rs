@@ -1282,9 +1282,10 @@ mod tests {
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
+    use rust_decimal::Decimal;
     use st0x_execution::{
-        Direction, MockExecutorConfig, OrderState, OrderStatus, Shares, SupportedExecutor, Symbol,
-        TryIntoExecutor,
+        Direction, FractionalShares, MockExecutorConfig, OrderState, OrderStatus,
+        SupportedExecutor, Symbol, TryIntoExecutor,
     };
 
     fn abort_all_conductor_tasks(conductor: Conductor) {
@@ -2005,7 +2006,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOGL").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
 
         crate::dual_write::initialize_position(
             &dual_write_context,
@@ -2081,7 +2082,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AMZN").unwrap();
-        let shares = Shares::new(10).unwrap();
+        let shares = FractionalShares::new(Decimal::from(10)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let pending_state = OrderState::Pending;
@@ -2152,7 +2153,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("BMNR").unwrap();
-        let shares = Shares::new(1).unwrap();
+        let shares = FractionalShares::new(Decimal::from(1)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let pending_state = OrderState::Pending;
@@ -2247,7 +2248,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let pending_state = OrderState::Pending;
@@ -2309,7 +2310,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("NVDA").unwrap();
-        let shares = Shares::new(3).unwrap();
+        let shares = FractionalShares::new(Decimal::from(3)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let pending_state = OrderState::Pending;
@@ -2393,7 +2394,7 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOGL").unwrap();
-        let shares = Shares::new(2).unwrap();
+        let shares = FractionalShares::new(Decimal::from(2)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let pending_state = OrderState::Pending;

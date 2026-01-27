@@ -118,14 +118,64 @@ impl std::str::FromStr for Symbol {
 pub enum InvalidSharesError {
     #[error("Shares cannot be zero")]
     Zero,
-    #[error("Shares must be positive")]
-    NonPositive,
+    #[error("Value must be positive, got {0}")]
+    NonPositive(Decimal),
     #[error("Cannot convert fractional shares {0} to whole shares")]
     Fractional(Decimal),
     #[error(transparent)]
     TryFromInt(#[from] std::num::TryFromIntError),
     #[error(transparent)]
     DecimalConversion(#[from] rust_decimal::Error),
+}
+
+/// Wrapper that guarantees the inner value is positive (greater than zero).
+///
+/// Use this when an API requires strictly positive values, such as order quantities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
+pub struct Positive<T>(T);
+
+impl<T> Positive<T>
+where
+    T: PartialOrd + HasZero + Copy,
+{
+    pub fn new(value: T) -> Result<Self, InvalidSharesError>
+    where
+        T: Into<Decimal>,
+    {
+        if value <= T::ZERO {
+            return Err(InvalidSharesError::NonPositive(value.into()));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn value(self) -> T {
+        self.0
+    }
+}
+
+impl<'de, T> Deserialize<'de> for Positive<T>
+where
+    T: Deserialize<'de> + PartialOrd + HasZero + Copy + Into<Decimal>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = T::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl<T: Display> Display for Positive<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Trait for types that have a zero value.
+pub trait HasZero {
+    const ZERO: Self;
 }
 
 /// Share quantity newtype wrapper with validation
@@ -164,46 +214,71 @@ impl Display for Shares {
     }
 }
 
-/// Fractional share quantity newtype wrapper with validation.
+/// Fractional share quantity newtype wrapper.
 ///
 /// Represents share quantities that can include fractional amounts (e.g., 1.212 shares).
-/// Values must be positive (greater than zero).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+/// Can be negative (for position tracking). Use `Positive<FractionalShares>` when
+/// strictly positive values are required (e.g., order quantities).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(transparent)]
 pub struct FractionalShares(Decimal);
 
+impl HasZero for FractionalShares {
+    const ZERO: Self = Self(Decimal::ZERO);
+}
+
+impl From<FractionalShares> for Decimal {
+    fn from(value: FractionalShares) -> Self {
+        value.0
+    }
+}
+
 impl FractionalShares {
-    pub fn new(value: Decimal) -> Result<Self, InvalidSharesError> {
-        if value <= Decimal::ZERO {
-            return Err(InvalidSharesError::NonPositive);
-        }
-        Ok(Self(value))
+    pub const fn new(value: Decimal) -> Self {
+        Self(value)
     }
 
-    pub fn value(&self) -> Decimal {
+    pub fn value(self) -> Decimal {
         self.0
+    }
+
+    pub fn abs(self) -> Self {
+        Self(self.0.abs())
+    }
+
+    pub fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+
+    pub fn is_negative(self) -> bool {
+        self.0.is_sign_negative()
     }
 
     /// Returns true if this represents a whole number of shares (no fractional part).
-    pub fn is_whole(&self) -> bool {
+    pub fn is_whole(self) -> bool {
         self.0.fract().is_zero()
-    }
-
-    /// Converts to whole shares count, returning error if value has a fractional part.
-    /// Use this when the target API does not support fractional shares.
-    pub fn to_whole_shares(&self) -> Result<u64, InvalidSharesError> {
-        if !self.is_whole() {
-            return Err(InvalidSharesError::Fractional(self.0));
-        }
-
-        self.0
-            .to_u64()
-            .ok_or(InvalidSharesError::Fractional(self.0))
     }
 
     /// Creates FractionalShares from an f64 value (typically from database REAL column).
     pub fn from_f64(value: f64) -> Result<Self, InvalidSharesError> {
         let decimal = Decimal::try_from(value)?;
-        Self::new(decimal)
+        Ok(Self(decimal))
+    }
+}
+
+impl Positive<FractionalShares> {
+    /// Converts to whole shares count, returning error if value has a fractional part.
+    /// Use this when the target API does not support fractional shares.
+    pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
+        let inner = self.value();
+        if !inner.is_whole() {
+            return Err(InvalidSharesError::Fractional(inner.0));
+        }
+
+        inner
+            .0
+            .to_u64()
+            .ok_or(InvalidSharesError::Fractional(inner.0))
     }
 }
 
@@ -213,7 +288,7 @@ impl<'de> Deserialize<'de> for FractionalShares {
         D: serde::Deserializer<'de>,
     {
         let value = <Decimal as serde::Deserialize>::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        Ok(Self::new(value))
     }
 }
 

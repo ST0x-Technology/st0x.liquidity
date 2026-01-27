@@ -8,7 +8,7 @@ use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
     Direction, ExecutionError, Executor, FractionalShares, MarketOrder, OrderPlacement, OrderState,
-    OrderStatus, OrderUpdate, Symbol, TryIntoExecutor,
+    OrderStatus, OrderUpdate, Positive, Symbol, TryIntoExecutor,
 };
 
 /// Configuration for SchwabExecutor containing auth environment and database pool
@@ -206,12 +206,7 @@ impl Executor for SchwabExecutor {
                         };
 
                         let symbol = Symbol::new(row.symbol)?;
-
-                        if row.shares <= 0.0 {
-                            return Err(ExecutionError::NegativeShares { value: row.shares });
-                        }
-                        let shares = FractionalShares::from_f64(row.shares)?;
-
+                        let shares = Positive::new(FractionalShares::from_f64(row.shares)?)?;
                         let direction: Direction = row.direction.parse()?;
 
                         updates.push(OrderUpdate {

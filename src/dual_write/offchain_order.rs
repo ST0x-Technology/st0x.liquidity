@@ -1,4 +1,3 @@
-use rust_decimal::Decimal;
 use st0x_execution::{OrderState, PersistenceError};
 use tracing::info;
 
@@ -21,7 +20,7 @@ pub(crate) async fn place_order(
 
     let command = OffchainOrderCommand::Place {
         symbol: execution.symbol.clone(),
-        shares: FractionalShares(Decimal::from(execution.shares.value())),
+        shares: FractionalShares(execution.shares.value()),
         direction: execution.direction,
         executor: execution.executor,
     };
@@ -128,7 +127,8 @@ pub(crate) async fn mark_failed(
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_execution::{Direction, Shares, SupportedExecutor, Symbol};
+    use rust_decimal::Decimal;
+    use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 
     use super::*;
     use crate::test_utils::setup_test_db;
@@ -142,7 +142,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: Shares::new(10).unwrap(),
+            shares: FractionalShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -179,7 +179,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol,
-            shares: Shares::new(10).unwrap(),
+            shares: FractionalShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -200,7 +200,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Shares::new(10).unwrap();
+        let shares = FractionalShares::new(Decimal::from(10)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let execution_id = OrderState::Pending
@@ -259,7 +259,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Shares::new(10).unwrap();
+        let shares = FractionalShares::new(Decimal::from(10)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let execution_id = OrderState::Pending
@@ -318,7 +318,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(4),
             symbol,
-            shares: Shares::new(10).unwrap(),
+            shares: FractionalShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -342,7 +342,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(5),
             symbol,
-            shares: Shares::new(10).unwrap(),
+            shares: FractionalShares::new(Decimal::from(10)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -369,7 +369,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Shares::new(10).unwrap();
+        let shares = FractionalShares::new(Decimal::from(10)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let execution_id = OrderState::Pending
@@ -424,7 +424,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
         let broker_order_id = BrokerOrderId::new("SCHWAB-12345");
 
         let mut tx = pool.begin().await.unwrap();
@@ -483,7 +483,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("NVDA").unwrap();
-        let shares = Shares::new(3).unwrap();
+        let shares = FractionalShares::new(Decimal::from(3)).unwrap();
         let broker_order_id = BrokerOrderId::new("ORDER-ABC-789");
 
         let mut tx = pool.begin().await.unwrap();
@@ -545,7 +545,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOG").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let execution_id = OrderState::Pending
@@ -597,7 +597,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("META").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
         let nonexistent_execution_id = 99999i64;
 
         let execution = OffchainExecution {
@@ -645,7 +645,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AMZN").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         let execution_id = OrderState::Pending
@@ -720,7 +720,7 @@ mod tests {
         let context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOGL").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
         let nonexistent_execution_id = 88888i64;
 
         let execution = OffchainExecution {

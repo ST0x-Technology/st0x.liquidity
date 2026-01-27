@@ -8,7 +8,8 @@ use uuid::Uuid;
 use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
 use crate::{
-    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Symbol,
+    Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
+    Symbol,
 };
 
 /// Order side
@@ -55,8 +56,8 @@ pub enum ConversionDirection {
 pub(super) struct OrderRequest {
     #[serde(serialize_with = "serialize_symbol")]
     pub symbol: Symbol,
-    #[serde(rename = "qty", serialize_with = "serialize_fractional_shares")]
-    pub quantity: FractionalShares,
+    #[serde(rename = "qty", serialize_with = "serialize_positive_shares")]
+    pub quantity: Positive<FractionalShares>,
     pub side: OrderSide,
     #[serde(rename = "type")]
     pub order_type: &'static str,
@@ -73,14 +74,14 @@ where
 
 // serde's serialize_with requires the field to be passed by reference
 #[allow(clippy::trivially_copy_pass_by_ref)]
-fn serialize_fractional_shares<S>(
-    shares: &FractionalShares,
+fn serialize_positive_shares<S>(
+    shares: &Positive<FractionalShares>,
     serializer: S,
 ) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&shares.value().to_string())
+    serializer.serialize_str(&shares.value().value().to_string())
 }
 
 /// Order response from the Alpaca Broker API
@@ -90,9 +91,9 @@ pub(super) struct OrderResponse {
     pub symbol: Symbol,
     #[serde(
         rename = "qty",
-        deserialize_with = "deserialize_fractional_shares_from_string"
+        deserialize_with = "deserialize_positive_shares_from_string"
     )]
-    pub quantity: FractionalShares,
+    pub quantity: Positive<FractionalShares>,
     #[serde(
         rename = "filled_qty",
         default,
@@ -172,15 +173,15 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-fn deserialize_fractional_shares_from_string<'de, D>(
+fn deserialize_positive_shares_from_string<'de, D>(
     deserializer: D,
-) -> Result<FractionalShares, D::Error>
+) -> Result<Positive<FractionalShares>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
     let value: Decimal = s.parse().map_err(serde::de::Error::custom)?;
-    FractionalShares::new(value).map_err(serde::de::Error::custom)
+    Positive::new(FractionalShares::new(value)).map_err(serde::de::Error::custom)
 }
 
 fn deserialize_optional_price<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
