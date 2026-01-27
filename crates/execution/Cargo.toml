@@ -34,6 +34,7 @@ aes-gcm = "0.10.3"
 cqrs-es.workspace = true
 sqlite-es.workspace = true
 rust_decimal.workspace = true
+num-decimal.workspace = true
 
 [dev-dependencies]
 httpmock.workspace = true
