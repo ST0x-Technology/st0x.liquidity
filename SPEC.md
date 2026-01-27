@@ -366,21 +366,10 @@ connection is lost during activation.
 
 **CI/CD Credential Management:**
 
-Clear separation between build-time and runtime secrets:
-
-| Secret Type | Storage                | When Used                          | Example                                          |
-| ----------- | ---------------------- | ---------------------------------- | ------------------------------------------------ |
-| Runtime     | ragenix (.age files)   | Decrypted on droplet at activation | Schwab API keys, Alpaca keys, DB encryption key  |
-| Build-time  | GitHub Secrets or OIDC | Used by CI during build/deploy     | DO API token, Spaces credentials, deploy SSH key |
-
-Build-time secrets required by GitHub Actions:
-
-| Secret Name          | Purpose                         |
-| -------------------- | ------------------------------- |
-| `DIGITALOCEAN_TOKEN` | Terraform, image upload         |
-| `SPACES_ACCESS_KEY`  | Upload NixOS image to DO Spaces |
-| `SPACES_SECRET_KEY`  | Upload NixOS image to DO Spaces |
-| `DEPLOY_SSH_KEY`     | deploy-rs SSH access to droplet |
+| Secret Type | Storage               | When Used           | Example                |
+| ----------- | --------------------- | ------------------- | ---------------------- |
+| Runtime     | ragenix (.age in git) | Decrypted at deploy | Schwab/Alpaca API keys |
+| Build-time  | GitHub Secrets        | CI build/deploy     | DO token, SSH key      |
 
 Use GitHub Actions environment protection (require approval for production,
 restrict to master branch).
@@ -437,7 +426,7 @@ Ansible lets you describe "what state servers should be in" declaratively:
   copy:
     src: ./target/release/server
     dest: /opt/st0x/current/server
-    mode: '0755'
+    mode: "0755"
 
 - name: Ensure server service is running
   systemd:
@@ -500,19 +489,18 @@ ln -sfn /opt/st0x/releases/20240101-abc123 /opt/st0x/current
 sudo systemctl restart server reporter
 ```
 
-Can be automated via `ansible-playbook rollback.yml --extra-vars "release=20240101-abc123"`.
+Can be automated via
+`ansible-playbook rollback.yml --extra-vars "release=20240101-abc123"`.
 
 This is convention-based (not built-in like nix profiles), but widely understood
 and battle-tested.
 
 **CI/CD Credential Management:**
 
-| Secret Type | Storage              | When Used                  | Example                  |
-| ----------- | -------------------- | -------------------------- | ------------------------ |
-| Runtime     | Ansible Vault (git)  | Decrypted at deploy        | Schwab/Alpaca API keys   |
-| Build-time  | GitHub Secrets       | CI build                   | (none needed)            |
-| Deploy SSH  | GitHub Secrets       | Ansible SSH to servers     | SSH private key          |
-| Vault pass  | GitHub Secrets       | Decrypt Ansible Vault      | Vault password           |
+| Secret Type | Storage             | When Used           | Example                 |
+| ----------- | ------------------- | ------------------- | ----------------------- |
+| Runtime     | Ansible Vault (git) | Decrypted at deploy | Schwab/Alpaca API keys  |
+| Build-time  | GitHub Secrets      | CI build/deploy     | SSH key, Vault password |
 
 **Trade-offs:**
 
@@ -575,6 +563,13 @@ kamal rollback [version]  # specific version
 
 Also has automatic health check gate - new container must pass health check
 before old one is stopped.
+
+**CI/CD Credential Management:**
+
+| Secret Type | Storage             | When Used           | Example                |
+| ----------- | ------------------- | ------------------- | ---------------------- |
+| Runtime     | SOPS (.yaml in git) | Decrypted at deploy | Schwab/Alpaca API keys |
+| Build-time  | GitHub Secrets      | CI build/deploy     | SSH key, SOPS key      |
 
 **Trade-offs:**
 
@@ -694,232 +689,50 @@ Cons:
 
 #### **Comparison Matrix**
 
-| Requirement             | Approach A (Nix)       | Approach B (Ansible)   | Approach C (Kamal)     |
-| ----------------------- | ---------------------- | ---------------------- | ---------------------- |
-| Solves fragility        | Yes (declarative)      | Mostly (YAML > bash)   | Yes (declarative)      |
-| Eliminate DO UI         | Terraform              | Terraform              | Terraform              |
-| Eliminate GH Secrets UI | Ragenix                | Ansible Vault          | SOPS                   |
-| Secrets in git          | Yes                    | Yes                    | Yes                    |
-| Per-service control     | systemctl              | systemctl via roles    | `kamal deploy -d`      |
-| Rollback (on-demand)    | `nix profile rollback` | Symlink + restart      | `kamal rollback`       |
-| Rollback (auto)         | deploy-rs magic        | None                   | Health check gate      |
-| Add staging later       | Add node to flake      | Add to inventory       | Add to deploy.yml      |
-| Custom VM images        | nixos-generators       | Stock images           | Stock images           |
-| Reproducibility         | Byte-identical         | Best effort            | Best effort            |
-| Dev/prod version parity | Same flake.lock        | Manual coordination    | Manual coordination    |
-| Leverage existing Nix   | Extends flake          | Parallel tooling       | Parallel tooling       |
+| Requirement             | Approach A (Nix)       | Approach B (Ansible) | Approach C (Kamal)  |
+| ----------------------- | ---------------------- | -------------------- | ------------------- |
+| Solves fragility        | Yes (declarative)      | Mostly (YAML > bash) | Yes (declarative)   |
+| Eliminate DO UI         | Terraform              | Terraform            | Terraform           |
+| Eliminate GH Secrets UI | Ragenix                | Ansible Vault        | SOPS                |
+| Secrets in git          | Yes                    | Yes                  | Yes                 |
+| Per-service control     | systemctl              | systemctl via roles  | `kamal deploy -d`   |
+| Rollback (on-demand)    | `nix profile rollback` | Symlink + restart    | `kamal rollback`    |
+| Rollback (auto)         | deploy-rs magic        | None                 | Health check gate   |
+| Add staging later       | Add node to flake      | Add to inventory     | Add to deploy.yml   |
+| Custom VM images        | nixos-generators       | Stock images         | Stock images        |
+| Reproducibility         | Byte-identical         | Best effort          | Best effort         |
+| Dev/prod version parity | Same flake.lock        | Manual coordination  | Manual coordination |
+| Leverage existing Nix   | Extends flake          | Parallel tooling     | Parallel tooling    |
 
-**Note on Approach D (Shuttle.rs):** Not included in matrix as it's a
+#### **Cost Comparison**
+
+Approaches A, B, and C use the same infrastructure (DigitalOcean droplet) with
+different open-source tooling. Approach D is a PaaS with bundled infrastructure.
+
+| Component          | A (Nix)    | B (Ansible) | C (Kamal)         | D (Shuttle)         |
+| ------------------ | ---------- | ----------- | ----------------- | ------------------- |
+| Tooling            | Free       | Free        | Free              | Free tier available |
+| Infrastructure     | DO droplet | DO droplet  | DO droplet        | Included            |
+| Container registry | N/A        | N/A         | Free (Docker Hub) | Included            |
+
+**Infrastructure costs (DigitalOcean, Jan 2026):**
+
+- Basic droplet: $4/month (1 vCPU, 512MB RAM, 10GB SSD)
+- Premium droplet: $7-8/month (1 vCPU, 1GB RAM, 25-35GB NVMe)
+- Outbound transfer beyond allowance: $0.01/GiB
+- Backups: +20-30% of droplet cost
+
+For 6 services on a single droplet, expect $7-14/month infrastructure cost
+depending on resource needs.
+
+**Shuttle.rs:** Free tier for experimentation. Pro tier pricing currently in
+flux (overhauled late 2024, new tiers announced for 2025). Check
+[shuttle.dev/pricing](https://www.shuttle.dev/pricing) for current rates.
+
+**Note on Approach D (Shuttle.rs):** Not included in comparison matrix as it's a
 fundamentally different model (PaaS vs self-managed). Shuttle eliminates
 infrastructure management entirely but introduces vendor lock-in and less
 control. Evaluate separately based on compliance requirements and risk appetite.
-
-#### **Specification Requirements**
-
-**Infrastructure Management:**
-
-- Custom NixOS images built from flake (reproducible, auditable)
-- Infrastructure defined in code (Terraform HCL or Nix)
-- Remote state with locking (if using Terraform)
-- No manual DigitalOcean UI configuration
-- Architecture supports adding staging environment later
-
-**Deployment:**
-
-- System-level deployment via deploy-rs
-- Per-service control via systemctl
-- Rollback via nix profile generations (`nix profile rollback`)
-- Magic rollback as safety net for deploy connectivity loss
-- Atomic updates (never half-broken state)
-- Thin GitHub Actions wrappers (`deploy .#production`)
-
-**Secrets Management:**
-
-- Encrypted secrets in version control (ragenix)
-- No secrets in GitHub Secrets UI
-- Decryption at deployment time using SSH keys
-- Audit trail via git history
-- No plaintext in CI/CD logs
-
-**Build Pipeline:**
-
-- Custom NixOS images built in CI
-- Validation on all commits (tests, lints)
-- Production deploy from master only
-- Image uploads to DO Spaces
-
-**Health Checking:**
-
-- Meaningful health endpoints per service
-- Database, RPC, brokerage API connectivity checks
-- Deployment gates on health
-
-**Observability:**
-
-- OpenTelemetry metrics
-- Deployment event logging
-- Alerting conditions defined
-
-#### **Implementation Phases**
-
-Phases are ordered by dependency: infrastructure first, then images, deployment
-tooling, and secrets migration.
-
-**Phase 1: Terraform Infrastructure**
-
-Establish infrastructure-as-code foundation before building images.
-
-Tasks:
-
-- Write Terraform for DO resources: Spaces bucket (for images), droplet, VPC,
-  firewall rules
-- Configure S3-compatible backend in DO Spaces for state storage
-- Set up state locking (Terraform Cloud or DynamoDB-compatible)
-- Configure GitHub Secrets for `DIGITALOCEAN_TOKEN`, `SPACES_ACCESS_KEY`,
-  `SPACES_SECRET_KEY`
-- Document infrastructure provisioning
-
-Validation gates:
-
-- `terraform plan` shows expected resources
-- `terraform apply` creates Spaces bucket successfully
-- State file stored remotely and locked
-
-Rollback plan:
-
-- `terraform destroy` removes created resources
-- Manual cleanup via DO console if Terraform state corrupted
-- Existing bash deployment continues to work (no changes to current system)
-
-Secrets during this phase:
-
-| Secret             | Location       | Notes                               |
-| ------------------ | -------------- | ----------------------------------- |
-| DO API token       | GitHub Secrets | New, for Terraform                  |
-| Spaces credentials | GitHub Secrets | New, for image upload               |
-| Existing secrets   | GitHub Secrets | Unchanged, current deployment works |
-
-**Phase 2: Custom NixOS Image**
-
-Build and test reproducible VM images.
-
-Tasks:
-
-- Add nixos-generators to flake.nix
-- Define base NixOS configuration for DO (`nixos/base.nix`)
-- Bake monitoring agents (node_exporter, Grafana Agent)
-- Configure SSH key injection (hybrid approach)
-- Build image: `nix build .#digitalOceanImage`
-- Upload to DO Spaces via CI
-- Create test droplet from custom image
-- Verify SSH access and basic operation
-
-Validation gates:
-
-- Image builds successfully in CI
-- Droplet boots from custom image
-- SSH access works (DO-injected keys)
-- node_exporter metrics accessible on localhost:9100
-- Grafana Agent running (even without credentials yet)
-
-Rollback plan:
-
-- Delete test droplet
-- Remove image from Spaces
-- Revert flake.nix changes
-- Current production droplet unaffected (still on Ubuntu/existing image)
-
-Dry-run mode:
-
-- Use `--dry-run` with `nix build` to verify build without full execution
-- Create droplet in separate test project/region
-
-**Phase 3: Deploy-rs Setup**
-
-Migrate from bash scripts to declarative deployment.
-
-Tasks:
-
-- Add deploy-rs to flake.nix
-- Define NixOS configuration with all services (server, reporter, grafana,
-  dashboard)
-- Configure health check endpoints
-- Add rollback wrapper to flake (`nix run .#rollback`)
-- Test deployment: `deploy .#production`
-- Test magic rollback: disconnect SSH during activation, verify auto-revert
-- Test intentional rollback: deploy, then `nix run .#rollback` to previous gen
-
-Validation gates:
-
-- `deploy .#production` succeeds on droplet
-- Health checks pass for all services
-- Magic rollback triggers on SSH disconnect during activation
-- `nix run .#rollback` lists generations and can switch to previous
-
-Rollback plan:
-
-- Keep bash deployment scripts intact during migration
-- If deploy-rs fails: `./deploy.sh` continues to work
-- Full rollback: revert flake.nix, use bash scripts exclusively
-
-**Phase 4: Ragenix Secrets**
-
-Migrate secrets from GitHub Secrets to git-stored encrypted files.
-
-Tasks:
-
-- Add ragenix to flake.nix (drop-in replacement for agenix with better CLI)
-- Bootstrap: obtain droplet SSH public key, add to secrets.nix
-- Encrypt existing secrets as .age files:
-  - `schwab-credentials.age`
-  - `alpaca-credentials.age`
-  - `db-encryption-key.age`
-- Update NixOS modules to read from /run/agenix/
-- Test decryption on deployment
-- Remove runtime secrets from GitHub Secrets (keep build-time secrets)
-
-Validation gates:
-
-- `ragenix -d schwab-credentials.age` decrypts successfully (admin key)
-- Deployment decrypts secrets on droplet
-- Services start with ragenix-provided secrets
-- Health checks pass
-
-Rollback plan:
-
-- Keep GitHub Secrets populated during transition (dual-source)
-- If ragenix decryption fails: services fall back to environment variables
-- Emergency restore:
-  1. Re-add secrets to GitHub Secrets
-  2. Revert NixOS module to read from environment
-  3. Deploy via deploy-rs (or bash fallback)
-
-Dry-run mode:
-
-- Test ragenix encryption/decryption locally before deployment
-- Verify decryption works on droplet before removing GitHub Secrets
-
-Secrets transition table:
-
-| Secret             | Phase 4 Start  | Phase 4 End    | Notes             |
-| ------------------ | -------------- | -------------- | ----------------- |
-| Schwab credentials | GitHub Secrets | ragenix (.age) | Runtime secret    |
-| Alpaca credentials | GitHub Secrets | ragenix (.age) | Runtime secret    |
-| DB encryption key  | GitHub Secrets | ragenix (.age) | Runtime secret    |
-| DO API token       | GitHub Secrets | GitHub Secrets | Build-time, stays |
-| Spaces credentials | GitHub Secrets | GitHub Secrets | Build-time, stays |
-| Deploy SSH key     | GitHub Secrets | GitHub Secrets | Build-time, stays |
-
-**Future: Staging Environment**
-
-The architecture supports adding a staging environment later by:
-
-- Adding `nixosConfigurations.staging` (copy of production with different
-  secrets)
-- Adding `deploy.nodes.staging` with staging hostname
-- Creating staging-specific `.age` files
-
-This is not part of the initial rollout.
 
 ## **Crate Architecture**
 
