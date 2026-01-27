@@ -823,7 +823,7 @@ pub(crate) mod tests {
                 let rebalancing = config.rebalancing.expect("rebalancing should be Some");
 
                 assert_eq!(rebalancing.equity_threshold.target, Decimal::new(5, 1));
-                assert_eq!(rebalancing.equity_threshold.deviation, Decimal::new(2, 1));
+                assert_eq!(rebalancing.equity_threshold.deviation, Decimal::new(15, 2));
                 assert_eq!(rebalancing.usdc_threshold.target, Decimal::new(5, 1));
                 assert_eq!(rebalancing.usdc_threshold.deviation, Decimal::new(3, 1));
             },

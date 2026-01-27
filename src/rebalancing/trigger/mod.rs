@@ -46,7 +46,7 @@ pub struct RebalancingEnv {
     #[clap(long, env, default_value = "0.5")]
     equity_target_ratio: Decimal,
     /// Deviation from equity target that triggers rebalancing (0.0-1.0)
-    #[clap(long, env, default_value = "0.2")]
+    #[clap(long, env, default_value = "0.15")]
     equity_deviation: Decimal,
     /// Target ratio of onchain to total for USDC (0.0-1.0)
     #[clap(long, env, default_value = "0.5")]
@@ -1658,7 +1658,7 @@ mod tests {
             let config = RebalancingConfig::from_env().unwrap();
 
             assert_eq!(config.equity_threshold.target, dec!(0.5));
-            assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+            assert_eq!(config.equity_threshold.deviation, dec!(0.15));
             assert_eq!(config.usdc_threshold.target, dec!(0.5));
             assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
             assert_eq!(
