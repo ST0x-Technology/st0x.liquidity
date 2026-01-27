@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
 
-use crate::shares::{ArithmeticError, FractionalShares, HasZero};
+use st0x_execution::{FractionalShares, Positive};
+
+use crate::shares::{ArithmeticError, HasZero};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -116,21 +118,13 @@ impl std::ops::Sub for Usdc {
 /// Threshold configuration that determines when to trigger offchain execution.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ExecutionThreshold {
-    Shares(FractionalShares),
+    Shares(Positive<FractionalShares>),
     DollarValue(Usdc),
 }
 
 impl ExecutionThreshold {
-    pub(crate) fn shares(value: FractionalShares) -> Result<Self, InvalidThresholdError> {
-        if value.is_negative() {
-            return Err(InvalidThresholdError::NegativeShares(value));
-        }
-
-        if value.is_zero() {
-            return Err(InvalidThresholdError::ZeroShares);
-        }
-
-        Ok(Self::Shares(value))
+    pub(crate) fn shares(value: Positive<FractionalShares>) -> Self {
+        Self::Shares(value)
     }
 
     pub(crate) fn dollar_value(value: Usdc) -> Result<Self, InvalidThresholdError> {
@@ -147,18 +141,14 @@ impl ExecutionThreshold {
 
     #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(FractionalShares::ONE)
+        Self::Shares(Positive::new(FractionalShares::new(rust_decimal::Decimal::ONE)).unwrap())
     }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum InvalidThresholdError {
-    #[error("Shares threshold cannot be negative: {0:?}")]
-    NegativeShares(FractionalShares),
     #[error("Dollar threshold cannot be negative: {0:?}")]
     NegativeDollarValue(Usdc),
-    #[error("Shares threshold cannot be zero")]
-    ZeroShares,
     #[error("Dollar threshold cannot be zero")]
     ZeroDollarValue,
 }
@@ -171,30 +161,14 @@ mod tests {
     #[test]
     fn whole_share_matches_smart_constructor() {
         let from_whole_share = ExecutionThreshold::whole_share();
-        let from_constructor = ExecutionThreshold::Shares(FractionalShares::ONE);
+        let from_constructor = ExecutionThreshold::Shares(Positive::<FractionalShares>::ONE);
         assert_eq!(from_whole_share, from_constructor);
     }
 
     #[test]
-    fn shares_threshold_rejects_zero() {
-        let result = ExecutionThreshold::shares(FractionalShares::ZERO);
-        assert_eq!(result.unwrap_err(), InvalidThresholdError::ZeroShares);
-    }
-
-    #[test]
-    fn shares_threshold_rejects_negative() {
-        let negative = FractionalShares(Decimal::NEGATIVE_ONE);
-        let result = ExecutionThreshold::shares(negative);
-        assert_eq!(
-            result.unwrap_err(),
-            InvalidThresholdError::NegativeShares(negative)
-        );
-    }
-
-    #[test]
     fn shares_threshold_accepts_positive() {
-        let result = ExecutionThreshold::shares(FractionalShares::ONE);
-        assert!(result.is_ok());
+        let threshold = ExecutionThreshold::shares(Positive::<FractionalShares>::ONE);
+        assert!(matches!(threshold, ExecutionThreshold::Shares(_)));
     }
 
     #[test]
