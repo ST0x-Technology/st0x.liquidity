@@ -244,7 +244,7 @@ async fn try_create_execution_if_ready(
         return Ok(None);
     };
 
-    let Some((direction, shares)) = position.is_ready_for_execution()? else {
+    let Some((direction, shares)) = position.is_ready_for_execution(executor_type)? else {
         debug!(
             symbol = %base_symbol,
             net = %position.net,
@@ -660,7 +660,8 @@ async fn check_symbol_for_execution(
     symbol: &Symbol,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
-    let Some((direction, shares)) = get_ready_execution_params(dual_write_context, symbol).await?
+    let Some((direction, shares)) =
+        get_ready_execution_params(dual_write_context, symbol, executor_type).await?
     else {
         return Ok(None);
     };
@@ -689,13 +690,14 @@ async fn check_symbol_for_execution(
 async fn get_ready_execution_params(
     dual_write_context: &DualWriteContext,
     symbol: &Symbol,
+    executor: SupportedExecutor,
 ) -> Result<Option<(Direction, Positive<FractionalShares>)>, OnChainError> {
     let Some(position) = load_position(dual_write_context, symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };
 
-    let Some((direction, shares)) = position.is_ready_for_execution()? else {
+    let Some((direction, shares)) = position.is_ready_for_execution(executor)? else {
         debug!(
             symbol = %symbol,
             net = %position.net,
@@ -1530,14 +1532,16 @@ mod tests {
             .unwrap();
         assert_eq!(links.len(), 3);
 
-        // Verify total contribution equals execution shares
+        // With Shares threshold, execution is floored to 1.0 share
+        // Verify total contribution equals floored execution shares
         let total_contribution: f64 = links
             .iter()
             .map(TradeExecutionLink::contributed_shares)
             .sum();
         assert!((total_contribution - 1.0).abs() < f64::EPSILON);
 
-        // Verify individual contributions match chronological allocation
+        // Verify chronological allocation: 0.3 + 0.4 + 0.3 = 1.0
+        // Trade 1: 0.3 (fully used), Trade 2: 0.4 (fully used), Trade 3: 0.3 (partially used)
         let mut contributions: Vec<_> = links
             .iter()
             .map(TradeExecutionLink::contributed_shares)
@@ -1615,7 +1619,8 @@ mod tests {
             .unwrap();
         assert_eq!(links.len(), 2);
 
-        // Verify total contributions
+        // With Shares threshold, execution is floored to 1.0 share
+        // Contributions: 0.4 (fully used) + 0.6 (partial from 0.8) = 1.0
         let total: f64 = links
             .iter()
             .map(TradeExecutionLink::contributed_shares)
@@ -1624,7 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_linkage_prevents_over_allocation() {
+    async fn test_linkage_with_fractional_shares() {
         let pool = setup_test_db().await;
 
         // Create a trade
@@ -1652,19 +1657,22 @@ mod tests {
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
         let execution_id = execution.id.unwrap();
 
-        // Verify only 1 share executed, not 1.2
-        assert_eq!(execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
 
-        // Verify linkage shows correct contribution (1.0, not 1.2)
+        // Verify linkage shows floored contribution (1.0)
         let links = TradeExecutionLink::find_by_execution_id(&pool, execution_id)
             .await
             .unwrap();
         assert_eq!(links.len(), 1);
         assert!((links[0].contributed_shares() - 1.0).abs() < f64::EPSILON);
 
-        // Verify the remaining 0.2 is still available for future executions
+        // Verify residual 0.2 shares remain (1.2 - 1.0 = 0.2)
         let (calculator, _) = find_by_symbol(&pool, "TSLA").await.unwrap().unwrap();
-        assert!((calculator.accumulated_long - 0.2).abs() < f64::EPSILON); // BUY creates long exposure
+        assert!((calculator.accumulated_long - 0.2).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1806,7 +1814,11 @@ mod tests {
         assert!(result.is_some());
         let new_execution = result.unwrap();
         assert_eq!(new_execution.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(new_execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            new_execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
 
         // Verify the stale execution was marked as failed
         let stale_executions = find_executions_by_symbol_status_and_broker(
@@ -1902,7 +1914,11 @@ mod tests {
         assert!(result.is_some());
         let new_execution = result.unwrap();
         assert_eq!(new_execution.symbol, Symbol::new("NVDA").unwrap());
-        assert_eq!(new_execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            new_execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
 
         // Verify the stale PENDING execution was marked as failed
         let failed_executions = find_executions_by_symbol_status_and_broker(
@@ -2035,7 +2051,7 @@ mod tests {
         let recent_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("NVDA").unwrap(),
-            shares: Shares::new(2).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(2))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Submitted {
@@ -2287,23 +2303,27 @@ mod tests {
 
         let execution = result3.unwrap();
         assert_eq!(execution.symbol, Symbol::new("GME").unwrap()); // Base symbol used for execution
-        assert_eq!(execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap()); // 1 whole share executed
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
         assert_eq!(execution.direction, Direction::Buy); // Buy to offset short exposure
 
-        // Verify all three trades contributed to the execution
+        // Verify all three trades contributed to the execution (may be partial contributions)
         let links = TradeExecutionLink::find_by_execution_id(&pool, execution.id.unwrap())
             .await
             .unwrap();
         assert_eq!(links.len(), 3);
 
-        // Verify total contribution equals 1 share
+        // Verify total contribution equals 1.0 shares (floored)
         let total_contributed: f64 = links
             .iter()
             .map(TradeExecutionLink::contributed_shares)
             .sum();
         assert!((total_contributed - 1.0).abs() < f64::EPSILON);
 
-        // Verify remaining accumulation
+        // Verify remaining accumulation (0.1 shares residual)
         let (final_calc, final_pending) = find_by_symbol(&pool, "GME").await.unwrap().unwrap();
         assert!((final_calc.accumulated_short - 0.1).abs() < f64::EPSILON); // 0.6 + 0.3 + 0.2 - 1.0 = 0.1 remaining
         assert!((final_calc.accumulated_long - 0.0).abs() < f64::EPSILON);
@@ -2521,12 +2541,12 @@ mod tests {
         let result = process_trade_with_tx(&pool, trade2).await.unwrap();
         assert!(result.is_some());
 
-        // Verify the execution was created. accumulated_short is 0.5 because
-        // 1.0 share was consumed by the execution (1.5 - 1.0 = 0.5).
+        // With Shares threshold, execution is floored to 1.0 share.
+        // Remaining accumulated_short = 1.5 - 1.0 = 0.5 shares.
         let (calc, pending_id) = find_by_symbol(&pool, "NVDA").await.unwrap().unwrap();
         assert!(
             (calc.accumulated_short - 0.5).abs() < f64::EPSILON,
-            "accumulated_short={}, expected 0.5 (1.5 - 1.0 executed)",
+            "accumulated_short={}, expected 0.5 (1.5 - 1.0 floored execution)",
             calc.accumulated_short
         );
         assert!(pending_id.is_some());
@@ -2621,7 +2641,7 @@ mod tests {
         let execution2 = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(2).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(2))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -2707,9 +2727,10 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
         let symbol = Symbol::new("NONEXISTENT").unwrap();
 
-        let result = get_ready_execution_params(&dual_write_context, &symbol)
-            .await
-            .unwrap();
+        let result =
+            get_ready_execution_params(&dual_write_context, &symbol, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         assert!(result.is_none());
     }
@@ -2750,9 +2771,10 @@ mod tests {
             .await
             .unwrap();
 
-        let result = get_ready_execution_params(&dual_write_context, &symbol)
-            .await
-            .unwrap();
+        let result =
+            get_ready_execution_params(&dual_write_context, &symbol, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         assert!(result.is_none());
     }
@@ -2793,14 +2815,19 @@ mod tests {
             .await
             .unwrap();
 
-        let result = get_ready_execution_params(&dual_write_context, &symbol)
-            .await
-            .unwrap();
+        let result =
+            get_ready_execution_params(&dual_write_context, &symbol, SupportedExecutor::Schwab)
+                .await
+                .unwrap();
 
         assert!(result.is_some());
         let (direction, shares) = result.unwrap();
         assert_eq!(direction, Direction::Sell);
-        assert_eq!(shares, 1);
+        // Schwab doesn't support fractional shares, so execution is floored
+        assert_eq!(
+            shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
     }
 
     #[tokio::test]

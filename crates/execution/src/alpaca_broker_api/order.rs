@@ -488,7 +488,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&config).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(Decimal::from(100)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -498,7 +498,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.inner(), Decimal::from(100));
+        assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -533,7 +533,7 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&config).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: FractionalShares::new(Decimal::from(50)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
             direction: Direction::Sell,
         };
 
@@ -543,7 +543,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.inner(), Decimal::from(50));
+        assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -576,7 +576,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.inner(), Decimal::from(100));
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
@@ -611,7 +611,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.inner(), Decimal::from(50));
+        assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));
