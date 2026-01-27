@@ -197,7 +197,10 @@ where
 
 fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintError> {
     let decimal = value.inner();
-    let scaled = decimal * Decimal::from(10u64.pow(18));
+    let scale_factor = Decimal::from(10u64.pow(18));
+    let scaled = decimal
+        .checked_mul(scale_factor)
+        .ok_or(MintError::DecimalOverflow(value))?;
     let truncated = scaled.trunc();
 
     if scaled != truncated {

@@ -39,6 +39,9 @@ pub(crate) enum MintError {
 
     #[error("Quantity {0} has more than 18 decimal places")]
     PrecisionLoss(FractionalShares),
+
+    #[error("Decimal overflow when scaling {0} to 18 decimals")]
+    DecimalOverflow(FractionalShares),
 }
 
 /// Trait for executing mint operations.
