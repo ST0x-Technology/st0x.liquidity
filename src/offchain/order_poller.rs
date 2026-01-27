@@ -352,7 +352,8 @@ fn log_filled_order(execution_id: i64, price_cents: u64, execution: &OffchainExe
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use st0x_execution::{Direction, MockExecutor, Shares, SupportedExecutor, Symbol};
+    use rust_decimal::Decimal;
+    use st0x_execution::{Direction, FractionalShares, MockExecutor, SupportedExecutor, Symbol};
 
     use super::*;
     use crate::offchain_order::BrokerOrderId;
@@ -417,7 +418,7 @@ mod tests {
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Shares::new(10).unwrap();
+        let shares = FractionalShares::new(Decimal::from(10)).unwrap();
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "AAPL0x", 10.0).await;
 
@@ -499,7 +500,7 @@ mod tests {
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("TSLA").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "TSLA0x", 5.0).await;
 
@@ -672,7 +673,7 @@ mod tests {
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("BMNR").unwrap();
-        let shares = Shares::new(1).unwrap();
+        let shares = FractionalShares::new(Decimal::from(1)).unwrap();
         let order_id = "1005070742758";
 
         setup_position_with_onchain_fill(&dual_write_context, &symbol, "BMNR0x", 1.0).await;
@@ -741,7 +742,7 @@ mod tests {
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let shares = Shares::new(10).unwrap();
+        let shares = FractionalShares::new(Decimal::from(10)).unwrap();
 
         // Create execution in SUBMITTED state
         let mut tx = pool.begin().await.unwrap();
@@ -813,7 +814,7 @@ mod tests {
         let config = OrderPollerConfig::default();
 
         let symbol = Symbol::new("MSFT").unwrap();
-        let shares = Shares::new(5).unwrap();
+        let shares = FractionalShares::new(Decimal::from(5)).unwrap();
 
         // Create execution in SUBMITTED state but no symbol lock
         let mut tx = pool.begin().await.unwrap();
