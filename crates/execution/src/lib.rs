@@ -265,6 +265,7 @@ impl FractionalShares {
         self.0
     }
 
+    #[must_use]
     pub fn abs(self) -> Self {
         Self(self.0.abs())
     }
@@ -396,6 +397,8 @@ impl Display for FractionalShares {
 }
 
 impl Positive<FractionalShares> {
+    pub const ONE: Self = Self(FractionalShares::ONE);
+
     /// Converts to whole shares count, returning error if value has a fractional part.
     /// Use this when the target API does not support fractional shares.
     pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {

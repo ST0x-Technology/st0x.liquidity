@@ -1,5 +1,4 @@
 use num_traits::ToPrimitive;
-use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use st0x_execution::{
     Direction, FractionalShares, OrderState, PersistenceError, Positive, SupportedExecutor, Symbol,
@@ -248,13 +247,13 @@ async fn try_create_execution_if_ready(
     let Some((direction, shares)) = position.is_ready_for_execution()? else {
         debug!(
             symbol = %base_symbol,
-            net = %position.net.0,
+            net = %position.net,
             "Position threshold not met"
         );
         return Ok(None);
     };
 
-    let execution_shares = Positive::new(FractionalShares::new(Decimal::from(shares)))?;
+    let execution_shares = Positive::new(shares)?;
 
     let execution_type = match direction {
         Direction::Sell => AccumulationBucket::LongExposure,
@@ -366,11 +365,7 @@ async fn create_trade_execution_linkages(
     .fetch_all(&mut **sql_tx)
     .await?;
 
-    let mut remaining_execution_shares = execution_shares.to_f64().ok_or(
-        OnChainError::Conversion(ConversionError::U64ToF64PrecisionLoss {
-            value: execution_shares,
-        }),
-    )?;
+    let mut remaining_execution_shares = execution_shares;
 
     // Allocate trades to this execution in chronological order
     for row in trade_rows {
@@ -703,13 +698,13 @@ async fn get_ready_execution_params(
     let Some((direction, shares)) = position.is_ready_for_execution()? else {
         debug!(
             symbol = %symbol,
-            net = %position.net.0,
+            net = %position.net,
             "Position threshold not met, skipping"
         );
         return Ok(None);
     };
 
-    let execution_shares = Positive::new(FractionalShares::new(Decimal::from(shares)))?;
+    let execution_shares = Positive::new(shares)?;
 
     Ok(Some((direction, execution_shares)))
 }
@@ -764,11 +759,11 @@ async fn process_symbol_execution(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{FixedBytes, fixed_bytes};
-    use std::str::FromStr;
-
     use backon::{ExponentialBuilder, Retryable};
     use chrono::Utc;
-    use st0x_execution::{FractionalShares, OrderStatus, Symbol};
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use st0x_execution::{FractionalShares, OrderStatus, Positive, Symbol};
 
     use super::*;
     use crate::dual_write::DualWriteContext;
@@ -970,12 +965,17 @@ mod tests {
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
 
         assert_eq!(execution.symbol, Symbol::new("MSFT").unwrap());
-        assert_eq!(execution.shares, Shares::new(1).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
 
         let (calculator, _) = find_by_symbol(&pool, "MSFT").await.unwrap().unwrap();
-        assert!((calculator.accumulated_short - 0.5).abs() < f64::EPSILON); // SELL creates short exposure
-        assert!((calculator.net_position() - (-0.5)).abs() < f64::EPSILON); // Short position = negative net
+        // Residual 0.5 shares remain after floored execution (1.5 - 1.0 = 0.5)
+        assert!((calculator.accumulated_short - 0.5).abs() < f64::EPSILON);
+        assert!((calculator.net_position() - (-0.5)).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1052,10 +1052,15 @@ mod tests {
         let execution = result3.unwrap();
 
         assert_eq!(execution.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(execution.shares, Shares::new(1).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
 
         let (calculator, _) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
+        // Residual 0.1 shares remain after floored execution (1.1 - 1.0 = 0.1)
         assert!((calculator.accumulated_short - 0.1).abs() < f64::EPSILON); // Remaining short exposure
         assert!((calculator.net_position() - (-0.1)).abs() < f64::EPSILON); // Net short position
     }
@@ -1117,7 +1122,11 @@ mod tests {
 
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
         assert_eq!(execution.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(execution.shares, Shares::new(1).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1148,7 +1157,11 @@ mod tests {
 
         assert_eq!(execution.direction, Direction::Sell); // Schwab SELL to offset onchain BUY (long exposure)
         assert_eq!(execution.symbol, Symbol::new("MSFT").unwrap());
-        assert_eq!(execution.shares, Shares::new(1).unwrap());
+        // With Shares threshold, execution is floored to whole shares
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1159,7 +1172,7 @@ mod tests {
         let blocking_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(Decimal::from(50)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -1220,7 +1233,7 @@ mod tests {
         assert_eq!(executions.len(), 1);
         assert_eq!(
             executions[0].shares,
-            FractionalShares::new(Decimal::from(50)).unwrap()
+            Positive::new(FractionalShares::new(Decimal::from(50))).unwrap()
         );
     }
 
@@ -1278,7 +1291,10 @@ mod tests {
         let execution = result2.unwrap();
 
         // Verify execution created for exactly 1 share
-        assert_eq!(execution.shares, Shares::new(1).unwrap());
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(Decimal::from(1))).unwrap()
+        );
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL
 
         // Verify accumulator shows correct remaining fractional amount
@@ -1637,7 +1653,7 @@ mod tests {
         let execution_id = execution.id.unwrap();
 
         // Verify only 1 share executed, not 1.2
-        assert_eq!(execution.shares, Shares::new(1).unwrap());
+        assert_eq!(execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap());
 
         // Verify linkage shows correct contribution (1.0, not 1.2)
         let links = TradeExecutionLink::find_by_execution_id(&pool, execution_id)
@@ -1727,7 +1743,7 @@ mod tests {
         let stale_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Submitted {
@@ -1790,7 +1806,7 @@ mod tests {
         assert!(result.is_some());
         let new_execution = result.unwrap();
         assert_eq!(new_execution.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(new_execution.shares, Shares::new(1).unwrap());
+        assert_eq!(new_execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap());
 
         // Verify the stale execution was marked as failed
         let stale_executions = find_executions_by_symbol_status_and_broker(
@@ -1825,7 +1841,7 @@ mod tests {
         let stale_pending_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("NVDA").unwrap(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -1886,7 +1902,7 @@ mod tests {
         assert!(result.is_some());
         let new_execution = result.unwrap();
         assert_eq!(new_execution.symbol, Symbol::new("NVDA").unwrap());
-        assert_eq!(new_execution.shares, Shares::new(1).unwrap());
+        assert_eq!(new_execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap());
 
         // Verify the stale PENDING execution was marked as failed
         let failed_executions = find_executions_by_symbol_status_and_broker(
@@ -1921,7 +1937,7 @@ mod tests {
         let recent_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("MSFT").unwrap(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Submitted {
@@ -1932,7 +1948,7 @@ mod tests {
         let stale_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("TSLA").unwrap(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Submitted {
@@ -2138,7 +2154,7 @@ mod tests {
         let pending_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -2271,7 +2287,7 @@ mod tests {
 
         let execution = result3.unwrap();
         assert_eq!(execution.symbol, Symbol::new("GME").unwrap()); // Base symbol used for execution
-        assert_eq!(execution.shares, Shares::new(1).unwrap()); // 1 whole share executed
+        assert_eq!(execution.shares, Positive::new(FractionalShares::new(Decimal::from(1))).unwrap()); // 1 whole share executed
         assert_eq!(execution.direction, Direction::Buy); // Buy to offset short exposure
 
         // Verify all three trades contributed to the execution
@@ -2540,7 +2556,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -2595,7 +2611,7 @@ mod tests {
         let execution1 = OffchainExecution {
             id: None,
             symbol: symbol_other,
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -2651,7 +2667,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -2899,7 +2915,7 @@ mod tests {
         let existing_execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -2922,7 +2938,7 @@ mod tests {
             &OffchainExecution {
                 id: Some(execution_id),
                 symbol: symbol.clone(),
-                shares: Shares::new(1).unwrap(),
+                shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
                 state: OrderState::Pending,

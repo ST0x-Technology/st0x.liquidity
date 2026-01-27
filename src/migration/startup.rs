@@ -230,17 +230,17 @@ async fn verify_single_position(
 
     let legacy_net = legacy_long - legacy_short;
 
-    check_field_match(symbol_str, "net_position", position.net.0, legacy_net);
+    check_field_match(symbol_str, "net_position", position.net.inner(), legacy_net);
     check_field_match(
         symbol_str,
         "accumulated_long",
-        position.accumulated_long.0,
+        position.accumulated_long.inner(),
         legacy_long,
     );
     check_field_match(
         symbol_str,
         "accumulated_short",
-        position.accumulated_short.0,
+        position.accumulated_short.inner(),
         legacy_short,
     );
 }

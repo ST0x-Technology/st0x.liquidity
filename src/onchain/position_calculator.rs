@@ -53,14 +53,14 @@ impl PositionCalculator {
         }
     }
 
-    pub(crate) fn reduce_accumulation(
-        &mut self,
-        execution_type: AccumulationBucket,
-        shares: u64,
-    ) -> Result<(), ConversionError> {
-        let shares_f64 = shares
-            .to_f64()
-            .ok_or(ConversionError::U64ToF64PrecisionLoss { value: shares })?;
+    pub(crate) fn reduce_accumulation(&mut self, execution_type: AccumulationBucket, shares: f64) {
+        // Tolerance for floating-point precision drift when accumulated values should
+        // equal zero after reductions. Set to 1e-9 (not f64::EPSILON) to account for
+        // accumulated rounding errors across multiple arithmetic operations.
+        //
+        // This is a workaround. All floating-point calculations will be removed as
+        // part of issue #247
+        const ACCUMULATED_SHARES_TOLERANCE: f64 = 1e-9;
 
         match execution_type {
             AccumulationBucket::LongExposure => {
@@ -129,13 +129,11 @@ mod tests {
     #[test]
     fn test_reduce_accumulation() {
         let mut calc = PositionCalculator::with_positions(2.5, 3.0);
-        calc.reduce_accumulation(AccumulationBucket::LongExposure, 2)
-            .unwrap();
+        calc.reduce_accumulation(AccumulationBucket::LongExposure, 2.0);
         assert!((calc.accumulated_long - 0.5).abs() < f64::EPSILON);
         assert!((calc.net_position() - (-2.5)).abs() < f64::EPSILON);
 
-        calc.reduce_accumulation(AccumulationBucket::ShortExposure, 1)
-            .unwrap();
+        calc.reduce_accumulation(AccumulationBucket::ShortExposure, 1.0);
         assert!((calc.accumulated_short - 2.0).abs() < f64::EPSILON);
         assert!((calc.net_position() - (-1.5)).abs() < f64::EPSILON);
     }

@@ -70,7 +70,7 @@ where
                 &issuer_request_id.0,
                 TokenizedEquityMintCommand::RequestMint {
                     symbol: symbol.clone(),
-                    quantity: quantity.0,
+                    quantity: quantity.inner(),
                     wallet,
                 },
             )
@@ -160,7 +160,8 @@ where
         match completed_request.status {
             TokenizationRequestStatus::Completed => {
                 let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
-                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity.0)?;
+                let shares_minted =
+                    decimal_to_u256_18_decimals(completed_request.quantity.inner())?;
 
                 self.cqrs
                     .execute(
@@ -329,7 +330,7 @@ mod tests {
         });
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(dec!(100.0));
+        let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
@@ -379,7 +380,7 @@ mod tests {
         });
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(dec!(100.0));
+        let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
@@ -408,7 +409,7 @@ mod tests {
         });
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(dec!(100.0));
+        let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
@@ -450,7 +451,7 @@ mod tests {
             .execute_mint(
                 &IssuerRequestId::new("trait-001"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(50.0)),
+                FractionalShares::new(dec!(50.0)),
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
             )
             .await;

@@ -127,7 +127,7 @@ fn build_offchain_order_command(
 
     Ok(OffchainOrderCommand::Migrate {
         symbol,
-        shares: FractionalShares(shares),
+        shares: FractionalShares::new(shares),
         direction,
         executor: SupportedExecutor::Schwab,
         status: migrated_status,

@@ -6,13 +6,13 @@ use sqlx::SqlitePool;
 use std::process::ExitCode;
 use tracing::{Level, error, info};
 
+use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
+
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
-use crate::shares::FractionalShares;
 use crate::telemetry::HyperDxConfig;
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
-use st0x_execution::SupportedExecutor;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
 use st0x_execution::schwab::SchwabAuthEnv;
@@ -119,6 +119,8 @@ pub(crate) enum ConfigError {
     PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
     #[error("Invalid execution threshold: {0}")]
     InvalidThreshold(#[from] InvalidThresholdError),
+    #[error("Invalid shares value: {0}")]
+    InvalidShares(#[from] st0x_execution::InvalidSharesError),
 }
 
 impl ConfigError {
@@ -129,6 +131,7 @@ impl ConfigError {
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
             Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
             Self::InvalidThreshold(_) => "invalid execution threshold",
+            Self::InvalidShares(_) => "invalid shares value",
         }
     }
 }
@@ -253,7 +256,7 @@ impl Env {
         // - DryRun uses shares threshold for testing
         let execution_threshold = match &broker {
             BrokerConfig::Schwab(_) | BrokerConfig::DryRun => {
-                ExecutionThreshold::shares(FractionalShares::ONE)?
+                ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
             }
             BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
                 ExecutionThreshold::dollar_value(Usdc(Decimal::ONE))?
@@ -1005,7 +1008,7 @@ pub(crate) mod tests {
 
                 assert_eq!(
                     config.execution_threshold,
-                    ExecutionThreshold::shares(FractionalShares::ONE).unwrap()
+                    ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
                 );
             },
         );
@@ -1033,7 +1036,7 @@ pub(crate) mod tests {
             let env = Env::try_parse_from(args).unwrap();
             let config = env.into_config().unwrap();
 
-            let expected = ExecutionThreshold::shares(FractionalShares::ONE).unwrap();
+            let expected = ExecutionThreshold::shares(Positive::<FractionalShares>::ONE);
             assert_eq!(config.execution_threshold, expected);
         });
     }
@@ -1125,7 +1128,7 @@ pub(crate) mod tests {
 
     #[test]
     fn config_error_kind_invalid_threshold() {
-        let err = ConfigError::InvalidThreshold(InvalidThresholdError::ZeroShares);
+        let err = ConfigError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
         assert_eq!(err.kind(), "invalid execution threshold");
     }
 

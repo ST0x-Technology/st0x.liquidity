@@ -730,7 +730,7 @@ pub(crate) mod tests {
     fn create_mint_request() -> MintRequest {
         MintRequest {
             underlying_symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares(dec!(100.5)),
+            quantity: FractionalShares::new(dec!(100.5)),
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
@@ -783,7 +783,7 @@ pub(crate) mod tests {
             result.token_symbol.as_ref().map(ToString::to_string),
             Some("tAAPL".to_string())
         );
-        assert_eq!(result.quantity, FractionalShares(dec!(100.5)));
+        assert_eq!(result.quantity, FractionalShares::new(dec!(100.5)));
         assert_eq!(result.issuer, Issuer::new("st0x"));
         assert_eq!(result.network, Network::new("base"));
         assert_eq!(
@@ -1356,7 +1356,7 @@ pub(crate) mod tests {
         });
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(dec!(100.0));
+        let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let mint_result = service

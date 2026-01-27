@@ -290,7 +290,7 @@ mod tests {
         let execution1 = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(Decimal::from(50)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -299,7 +299,7 @@ mod tests {
         let execution2 = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: FractionalShares::new(Decimal::from(25)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(25))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
@@ -312,7 +312,7 @@ mod tests {
         let execution3 = OffchainExecution {
             id: None,
             symbol: Symbol::new("MSFT").unwrap(),
-            shares: FractionalShares::new(Decimal::from(10)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -351,7 +351,7 @@ mod tests {
         assert_eq!(pending_aapl.len(), 1);
         assert_eq!(
             pending_aapl[0].shares,
-            FractionalShares::new(Decimal::from(50)).unwrap()
+            Positive::new(FractionalShares::new(Decimal::from(50))).unwrap()
         );
         assert_eq!(pending_aapl[0].direction, Direction::Buy);
 
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(completed_aapl.len(), 1);
         assert_eq!(
             completed_aapl[0].shares,
-            FractionalShares::new(Decimal::from(25)).unwrap()
+            Positive::new(FractionalShares::new(Decimal::from(25))).unwrap()
         );
         assert_eq!(completed_aapl[0].direction, Direction::Sell);
         assert!(matches!(
@@ -410,7 +410,7 @@ mod tests {
         OffchainExecution {
             id: None,
             symbol: Symbol::new(symbol).unwrap(),
-            shares: FractionalShares::new(Decimal::from(shares)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(shares))).unwrap(),
             direction,
             executor,
             state: OrderState::Pending,

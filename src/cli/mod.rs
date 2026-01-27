@@ -643,7 +643,7 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::json;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens};
-    use st0x_execution::{Direction, FractionalShares, OrderStatus};
+    use st0x_execution::{Direction, FractionalShares, OrderStatus, Positive};
     use std::str::FromStr;
 
     use super::*;
@@ -1785,7 +1785,7 @@ mod tests {
         assert_eq!(executions.len(), 1);
         assert_eq!(
             executions[0].shares,
-            FractionalShares::new(Decimal::from(9)).unwrap()
+            Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
         );
         assert_eq!(executions[0].direction, Direction::Buy);
 

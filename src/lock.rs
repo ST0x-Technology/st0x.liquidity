@@ -142,7 +142,7 @@ pub(crate) async fn clear_pending_execution_id(
 mod tests {
     use rust_decimal::Decimal;
     use st0x_execution::OrderState;
-    use st0x_execution::{Direction, FractionalShares, SupportedExecutor};
+    use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
 
     use super::*;
     use crate::offchain::execution::OffchainExecution;
@@ -241,7 +241,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: FractionalShares::new(Decimal::from(100)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -370,7 +370,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: FractionalShares::new(Decimal::from(100)).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,

@@ -72,7 +72,7 @@ mod tests {
         mock.execute_mint(
             &IssuerRequestId::new("test-id"),
             Symbol::new("AAPL").unwrap(),
-            FractionalShares(dec!(100)),
+            FractionalShares::new(dec!(100)),
             address!("0x1234567890123456789012345678901234567890"),
         )
         .await
@@ -85,7 +85,7 @@ mod tests {
     async fn mock_mint_captures_last_call_parameters() {
         let mock = Arc::new(MockMint::new());
         let symbol = Symbol::new("TSLA").unwrap();
-        let quantity = FractionalShares(dec!(50.5));
+        let quantity = FractionalShares::new(dec!(50.5));
         let wallet = address!("0xabcdef0123456789abcdef0123456789abcdef01");
 
         mock.execute_mint(
@@ -111,7 +111,7 @@ mod tests {
             .execute_mint(
                 &IssuerRequestId::new("test"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(10)),
+                FractionalShares::new(dec!(10)),
                 Address::ZERO,
             )
             .await;
