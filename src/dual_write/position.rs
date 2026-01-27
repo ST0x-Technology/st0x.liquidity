@@ -2,14 +2,14 @@ use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventStore};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteEventRepository;
-use st0x_execution::{OrderState, Symbol};
+use st0x_execution::{FractionalShares, OrderState, Symbol};
 
 use crate::lifecycle::Lifecycle;
 use crate::offchain::execution::OffchainExecution;
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::onchain::OnchainTrade;
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::shares::{ArithmeticError, FractionalShares};
+use crate::shares::ArithmeticError;
 use crate::threshold::ExecutionThreshold;
 
 use super::{DualWriteContext, DualWriteError};
@@ -44,7 +44,7 @@ pub(crate) async fn acknowledge_onchain_fill(
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
     };
-    let amount = FractionalShares(Decimal::try_from(trade.amount)?);
+    let amount = FractionalShares::new(Decimal::try_from(trade.amount)?);
     let price_usdc = Decimal::try_from(trade.price.value())?;
 
     let block_timestamp =
@@ -83,7 +83,7 @@ pub(crate) async fn place_offchain_order(
             .id
             .ok_or_else(|| DualWriteError::MissingExecutionId)?,
     );
-    let shares = FractionalShares(execution.shares.value());
+    let shares = FractionalShares::new(execution.shares.inner().inner());
     let direction = execution.direction;
     let executor = execution.executor;
 
