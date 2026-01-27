@@ -291,6 +291,9 @@ to infrastructure, deployment, and secrets management.
 
 **Key Tools:**
 
+- **Terraform**: Provisions DigitalOcean infrastructure (droplets, Spaces
+  buckets, VPCs, firewall rules). Standard HCL, version pinned via flake.lock.
+
 - **nixos-generators**: Builds custom NixOS VM images for cloud providers
   (DigitalOcean, AWS, etc.). We build a base image with OS essentials, then
   upload it to DigitalOcean Spaces for droplet provisioning.
@@ -314,14 +317,18 @@ to infrastructure, deployment, and secrets management.
 The approach separates stable infrastructure (base image) from frequently
 changing application code (service deployments):
 
-*Base NixOS image* (rebuilt occasionally when adding services or changing infra):
+_Base NixOS image_ (rebuilt occasionally when adding services or changing
+infra):
+
 - OS essentials: SSH, firewall, users
-- Systemd unit definitions for application services (pointing to deployment paths)
+- Systemd unit definitions for application services (pointing to deployment
+  paths)
 - Grafana as a NixOS native service
 - Monitoring agents
 - ragenix integration for secret decryption
 
-*Per-service deploy-rs profiles* (deployed independently):
+_Per-service deploy-rs profiles_ (deployed independently):
+
 - `server` - hedging bot (Schwab instance and Alpaca instance)
 - `reporter` - position reporter (Schwab instance and Alpaca instance)
 - `dashboard` - custom operations dashboard
@@ -329,17 +336,34 @@ changing application code (service deployments):
 Each profile deploys its binary to a known path and restarts the corresponding
 systemd unit. This allows updating one service without touching others.
 
-*Configuration management*:
+_Configuration management_:
+
 - Single TOML config file per service containing all config (secrets and
   non-secrets)
 - Files encrypted with ragenix, decrypted at activation to `/run/agenix/`
 - Services use `clap-config-file` crate to load config via `--config-file` flag
 - Secrets marked `config_only` so they cannot be passed via CLI args
 
-*Infrastructure*:
+_Infrastructure_:
+
 - Terraform (standard HCL) for DigitalOcean resources
 - Nix wraps Terraform for reproducible execution (pinned version via flake.lock)
 - Remote state in DO Spaces with locking
+
+**Rollback:**
+
+deploy-rs deploys each service to a nix profile (e.g.,
+`/nix/var/nix/profiles/per-service/server`). Each deployment creates a new
+profile generation:
+
+- `nix profile history` shows deployment history with timestamps
+- `nix profile rollback` reverts to previous generation
+- Retention configured declaratively via NixOS `nix.gc.*` options
+- Same tooling used for dev environments - no new mental model
+
+deploy-rs "magic rollback" is a separate safety net: auto-reverts if SSH
+connection is lost during activation.
+
 **CI/CD Credential Management:**
 
 Clear separation between build-time and runtime secrets:
@@ -348,26 +372,554 @@ Clear separation between build-time and runtime secrets:
 | ----------- | ---------------------- | ---------------------------------- | ------------------------------------------------ |
 | Runtime     | ragenix (.age files)   | Decrypted on droplet at activation | Schwab API keys, Alpaca keys, DB encryption key  |
 | Build-time  | GitHub Secrets or OIDC | Used by CI during build/deploy     | DO API token, Spaces credentials, deploy SSH key |
-**1. Custom NixOS Images (nixos-generators):**
 
-Build reproducible DigitalOcean VM images directly from flake:
+Build-time secrets required by GitHub Actions:
 
-```nix
-# flake.nix
-{
-  inputs.nixos-generators.url = "github:nix-community/nixos-generators";
+| Secret Name          | Purpose                         |
+| -------------------- | ------------------------------- |
+| `DIGITALOCEAN_TOKEN` | Terraform, image upload         |
+| `SPACES_ACCESS_KEY`  | Upload NixOS image to DO Spaces |
+| `SPACES_SECRET_KEY`  | Upload NixOS image to DO Spaces |
+| `DEPLOY_SSH_KEY`     | deploy-rs SSH access to droplet |
 
-  outputs = { self, nixpkgs, nixos-generators, ... }: {
-    # Build with: nix build .#digitalOceanImage
-    packages.x86_64-linux.digitalOceanImage =
-      nixos-generators.nixosGenerate {
-        system = "x86_64-linux";
-        format = "do";  # DigitalOcean format
-        modules = [ ./nixos/base.nix ];
-      };
-  };
+Use GitHub Actions environment protection (require approval for production,
+restrict to master branch).
+
+**SSH Key Management:**
+
+Hybrid approach: DigitalOcean injects team SSH keys at droplet creation for
+emergency access; automation keys (CI/CD, deploy-rs) managed via ragenix
+(`authorized_keys.age`) for audit trail. Emergency access preserved even if
+ragenix deployment fails.
+
+**Trade-offs:**
+
+Pros:
+
+- Leverages team's existing Nix knowledge
+- Single language (Nix) for images, deployments, secrets, dev environments
+- Dev/prod version parity: same flake.lock pins dependencies everywhere
+- Reproducible, byte-identical builds
+- Atomic updates - system never in half-broken state
+- Robust rollback via nix profile generations (built-in, not custom scripts)
+- Secrets in git with audit trail
+- More lightweight than containers; Nix derivations can be converted to Docker
+  images if needed (`dockerTools.buildImage`), but not vice versa
+
+Cons:
+
+- Requires NixOS on target (can't deploy to arbitrary Ubuntu hosts)
+- deploy-rs is less mature than some alternatives
+
+#### **Approach B: Ansible + Terraform + Ansible Vault (Non-Nix Path)**
+
+This approach uses Ansible for deployment automation without extending Nix to
+infrastructure.
+
+**Key Tools:**
+
+- **Terraform**: Provisions DigitalOcean droplets (Ubuntu) declaratively.
+- **Ansible**: Deployment automation via SSH. You describe desired server state
+  in YAML files, Ansible makes it so. No agent/daemon on target servers - just
+  SSH access.
+- **Ansible Vault** (file encryption, not a server): Ansible's built-in feature
+  for encrypting YAML files stored in git. Decrypted at deploy time using a
+  password. Similar concept to ragenix/SOPS - no external service, just
+  encrypted files in version control.
+
+**What Ansible Actually Does:**
+
+Ansible lets you describe "what state servers should be in" declaratively:
+
+```yaml
+# Example: deploy server binary and ensure it's running
+- name: Copy server binary
+  copy:
+    src: ./target/release/server
+    dest: /opt/st0x/current/server
+    mode: '0755'
+
+- name: Ensure server service is running
+  systemd:
+    name: server
+    state: restarted
+    enabled: yes
+```
+
+Run `ansible-playbook deploy.yml` and Ansible SSHs into servers, executes tasks
+in order, reports what changed.
+
+**Ansible Concepts:**
+
+- **Inventory**: File listing your servers. Example:
+  `production ansible_host=192.168.1.1`. Later add `staging ansible_host=...`.
+- **Task**: Single action (copy file, restart service, create directory).
+- **Role**: Bundle of related tasks. A `server` role contains all tasks to
+  deploy the server binary. Roles are reusable across environments.
+- **Playbook**: YAML file that says "run these roles on these servers". Example:
+  "on production, run the server and reporter roles".
+
+**Architecture:**
+
+Terraform provisions Ubuntu droplet. Ansible handles everything else:
+
+1. CI builds Rust binaries (`cargo build --release`)
+2. `ansible-playbook deploy.yml` runs
+3. Ansible SSHs to server, copies binaries, writes systemd units from templates
+4. Ansible restarts services
+5. Previous binaries retained in versioned directories for rollback
+
+_Per-service deployment_: Ansible tags target specific roles:
+`ansible-playbook deploy.yml --tags server`. Each role is independent.
+
+_Secrets_: Ansible Vault encrypts secrets in git. At deploy time, Ansible
+decrypts and writes to environment files that systemd reads. Audit trail via git
+history, no external service.
+
+**Rollback:**
+
+Capistrano-style versioned deployments:
+
+```
+/opt/st0x/
+├── releases/
+│   ├── 20240101-abc123/
+│   │   ├── server
+│   │   └── reporter
+│   └── 20240102-def456/
+│       ├── server
+│       └── reporter
+└── current -> releases/20240102-def456/
+```
+
+Systemd units point to `/opt/st0x/current/server`. Rollback:
+
+```bash
+# Point to previous release
+ln -sfn /opt/st0x/releases/20240101-abc123 /opt/st0x/current
+sudo systemctl restart server reporter
+```
+
+Can be automated via `ansible-playbook rollback.yml --extra-vars "release=20240101-abc123"`.
+
+This is convention-based (not built-in like nix profiles), but widely understood
+and battle-tested.
+
+**CI/CD Credential Management:**
+
+| Secret Type | Storage              | When Used                  | Example                  |
+| ----------- | -------------------- | -------------------------- | ------------------------ |
+| Runtime     | Ansible Vault (git)  | Decrypted at deploy        | Schwab/Alpaca API keys   |
+| Build-time  | GitHub Secrets       | CI build                   | (none needed)            |
+| Deploy SSH  | GitHub Secrets       | Ansible SSH to servers     | SSH private key          |
+| Vault pass  | GitHub Secrets       | Decrypt Ansible Vault      | Vault password           |
+
+**Trade-offs:**
+
+Pros:
+
+- Deploys Rust binaries directly (no Docker layer)
+- Works with any Linux distribution (Ubuntu, Debian, etc.)
+- Declarative YAML - readable even without deep Ansible knowledge
+- Secrets in git (Ansible Vault) - audit trail, no external UI
+- Roles transfer between environments (production, staging)
+- Well-documented with large community
+
+Cons:
+
+- Rollback is convention-based (symlinks), not built-in like nix profiles
+- Playbooks can become complex for sophisticated deployments
+- No atomic updates - can end up in partial deployment state
+- Requires Python runtime for Ansible CLI
+- Introduces separate tooling instead of extending existing Nix
+- Team already knows Nix; this doesn't leverage that knowledge
+
+#### **Approach C: Kamal + Terraform + SOPS (Container-Based)**
+
+This approach uses Docker containers with Kamal for deployment orchestration and
+SOPS for git-stored encrypted secrets.
+
+**Key Tools:**
+
+- **Terraform**: Provisions DigitalOcean infrastructure (droplets, networking).
+- **Kamal**: Basecamp's deployment tool. Runs from CI over SSH, manages Docker
+  container lifecycle on remote servers. No daemon on server - just Docker.
+- **SOPS**: Mozilla's secrets tool. Encrypts values (not keys) in YAML/JSON
+  files stored in git. Similar to ragenix but not Nix-specific.
+
+**Architecture:**
+
+Terraform provisions Ubuntu droplet with Docker. Kamal handles deployments from
+CI:
+
+1. CI builds Docker image, pushes to registry
+2. `kamal deploy` SSHs to server, pulls image
+3. Starts new container, runs health check
+4. Stops old container (kept on disk for rollback)
+
+_Per-service deployment_: `kamal deploy -d server` deploys only the server
+service. Each service defined separately in `deploy.yml`.
+
+_Secrets_: SOPS encrypts secrets in git. CI decrypts at deploy time, Kamal
+injects as environment variables. Partial encryption means you can see secret
+names in PRs without decrypting values.
+
+**Rollback:**
+
+Kamal keeps previous containers on disk:
+
+```bash
+kamal rollback            # previous version
+kamal rollback [version]  # specific version
+```
+
+Also has automatic health check gate - new container must pass health check
+before old one is stopped.
+
+**Trade-offs:**
+
+Pros:
+
+- All pain points solved including secrets in git
+- No daemon on server - just Docker
+- Production-proven (Hey.com, Basecamp)
+- SOPS partial encryption - review secret structure in PRs
+
+Cons:
+
+- Ruby runtime for Kamal CLI
+- Container-only (no raw Rust binaries)
+- Another tool (SOPS) though simpler than HashiCorp Vault
+- Designed for web apps (Traefik/zero-downtime features unused)
+
+#### **Approach D: Shuttle.rs (Rust-Native PaaS)**
+
+This approach uses Shuttle.rs, a Platform-as-a-Service designed specifically for
+Rust backends. Eliminates infrastructure management entirely by delegating to
+the platform.
+
+**Key Tools:**
+
+- **Shuttle.rs**: Rust-native PaaS that handles infrastructure, deployment, and
+  hosting. Annotate Rust code with macros, push to Shuttle, and they handle
+  everything else.
+
+**Architecture:**
+
+Shuttle is a fundamentally different model - you don't manage infrastructure at
+all. The deployment flow:
+
+1. Add Shuttle dependencies and macros to your Rust code
+2. `cargo shuttle deploy` builds and pushes to Shuttle's infrastructure
+3. Shuttle provisions compute, databases, secrets storage automatically
+4. Application runs on Shuttle's managed infrastructure
+
+_Per-service deployment_: Each Shuttle project is a separate deployment unit.
+Multiple services would be multiple Shuttle projects, deployed independently.
+
+_Secrets_: Shuttle has built-in secrets management via `shuttle secrets set`.
+Secrets are injected at runtime through Shuttle's runtime macros.
+
+**How It Would Work for This Project:**
+
+The hedging bot would need refactoring to use Shuttle's runtime:
+
+```rust
+#[shuttle_runtime::main]
+async fn main(
+    #[shuttle_runtime::Secrets] secrets: SecretStore,
+) -> shuttle_axum::ShuttleAxum {
+    let schwab_key = secrets.get("SCHWAB_API_KEY").unwrap();
+    // ... rest of application
 }
 ```
+
+Each service (server, reporter, dashboard) becomes a separate Shuttle project.
+
+**Rollback:**
+
+Shuttle maintains deployment history. Rollback via:
+`cargo shuttle deployment rollback <deployment-id>`
+
+Platform-managed, so reliability depends on Shuttle's infrastructure.
+
+**Caveats:**
+
+- **Nix integration is broken**: The `cargo-shuttle` package in nixpkgs is
+  outdated and non-functional. Shuttle no longer maintains cargo-shuttle as a
+  separate tool. You must use the official installer or write a custom
+  derivation wrapping it.
+- **Vendor lock-in**: Application code depends on Shuttle-specific macros and
+  runtime. Migrating away requires removing these annotations and re-adding
+  infrastructure management.
+- **Less control**: Cannot customize underlying infrastructure, networking,
+  security policies beyond what Shuttle exposes.
+- **Maturity**: Younger platform, less battle-tested for financial applications.
+  Unclear SLAs and compliance certifications.
+- **Multi-service coordination**: Each service is a separate Shuttle project.
+  Coordinating deployments across services requires external orchestration.
+
+**Financial Application Concerns:**
+
+- **Compliance**: Does Shuttle's infrastructure meet requirements for financial
+  applications? SOC2? Where is data stored?
+- **Audit trail**: Platform-managed means less visibility into infrastructure
+  changes
+- **Availability SLAs**: What guarantees does Shuttle provide for uptime?
+- **Data residency**: Where do Shuttle's servers run? Is data leaving expected
+  jurisdictions?
+
+These questions need answers before this approach is viable for a financial
+application.
+
+**Trade-offs:**
+
+Pros:
+
+- Eliminates infrastructure management entirely
+- Rust-native - feels like a natural extension of cargo
+- Familiar DX if you use Vercel for frontends
+- Built-in secrets, databases, deployment history
+- Solves the fragility problem by removing self-managed infrastructure entirely
+
+Cons:
+
+- Vendor lock-in (code changes required to adopt or leave)
+- Broken Nix integration (can't manage Shuttle CLI via flake)
+- Less control over infrastructure
+- Unclear fit for financial compliance requirements
+- Team's Nix knowledge provides no advantage here
+- Younger platform with less battle-testing
+- Pricing at scale unclear (currently free tier + $20/month pro)
+
+#### **Comparison Matrix**
+
+| Requirement             | Approach A (Nix)       | Approach B (Ansible)   | Approach C (Kamal)     |
+| ----------------------- | ---------------------- | ---------------------- | ---------------------- |
+| Solves fragility        | Yes (declarative)      | Mostly (YAML > bash)   | Yes (declarative)      |
+| Eliminate DO UI         | Terraform              | Terraform              | Terraform              |
+| Eliminate GH Secrets UI | Ragenix                | Ansible Vault          | SOPS                   |
+| Secrets in git          | Yes                    | Yes                    | Yes                    |
+| Per-service control     | systemctl              | systemctl via roles    | `kamal deploy -d`      |
+| Rollback (on-demand)    | `nix profile rollback` | Symlink + restart      | `kamal rollback`       |
+| Rollback (auto)         | deploy-rs magic        | None                   | Health check gate      |
+| Add staging later       | Add node to flake      | Add to inventory       | Add to deploy.yml      |
+| Custom VM images        | nixos-generators       | Stock images           | Stock images           |
+| Reproducibility         | Byte-identical         | Best effort            | Best effort            |
+| Dev/prod version parity | Same flake.lock        | Manual coordination    | Manual coordination    |
+| Leverage existing Nix   | Extends flake          | Parallel tooling       | Parallel tooling       |
+
+**Note on Approach D (Shuttle.rs):** Not included in matrix as it's a
+fundamentally different model (PaaS vs self-managed). Shuttle eliminates
+infrastructure management entirely but introduces vendor lock-in and less
+control. Evaluate separately based on compliance requirements and risk appetite.
+
+#### **Specification Requirements**
+
+**Infrastructure Management:**
+
+- Custom NixOS images built from flake (reproducible, auditable)
+- Infrastructure defined in code (Terraform HCL or Nix)
+- Remote state with locking (if using Terraform)
+- No manual DigitalOcean UI configuration
+- Architecture supports adding staging environment later
+
+**Deployment:**
+
+- System-level deployment via deploy-rs
+- Per-service control via systemctl
+- Rollback via nix profile generations (`nix profile rollback`)
+- Magic rollback as safety net for deploy connectivity loss
+- Atomic updates (never half-broken state)
+- Thin GitHub Actions wrappers (`deploy .#production`)
+
+**Secrets Management:**
+
+- Encrypted secrets in version control (ragenix)
+- No secrets in GitHub Secrets UI
+- Decryption at deployment time using SSH keys
+- Audit trail via git history
+- No plaintext in CI/CD logs
+
+**Build Pipeline:**
+
+- Custom NixOS images built in CI
+- Validation on all commits (tests, lints)
+- Production deploy from master only
+- Image uploads to DO Spaces
+
+**Health Checking:**
+
+- Meaningful health endpoints per service
+- Database, RPC, brokerage API connectivity checks
+- Deployment gates on health
+
+**Observability:**
+
+- OpenTelemetry metrics
+- Deployment event logging
+- Alerting conditions defined
+
+#### **Implementation Phases**
+
+Phases are ordered by dependency: infrastructure first, then images, deployment
+tooling, and secrets migration.
+
+**Phase 1: Terraform Infrastructure**
+
+Establish infrastructure-as-code foundation before building images.
+
+Tasks:
+
+- Write Terraform for DO resources: Spaces bucket (for images), droplet, VPC,
+  firewall rules
+- Configure S3-compatible backend in DO Spaces for state storage
+- Set up state locking (Terraform Cloud or DynamoDB-compatible)
+- Configure GitHub Secrets for `DIGITALOCEAN_TOKEN`, `SPACES_ACCESS_KEY`,
+  `SPACES_SECRET_KEY`
+- Document infrastructure provisioning
+
+Validation gates:
+
+- `terraform plan` shows expected resources
+- `terraform apply` creates Spaces bucket successfully
+- State file stored remotely and locked
+
+Rollback plan:
+
+- `terraform destroy` removes created resources
+- Manual cleanup via DO console if Terraform state corrupted
+- Existing bash deployment continues to work (no changes to current system)
+
+Secrets during this phase:
+
+| Secret             | Location       | Notes                               |
+| ------------------ | -------------- | ----------------------------------- |
+| DO API token       | GitHub Secrets | New, for Terraform                  |
+| Spaces credentials | GitHub Secrets | New, for image upload               |
+| Existing secrets   | GitHub Secrets | Unchanged, current deployment works |
+
+**Phase 2: Custom NixOS Image**
+
+Build and test reproducible VM images.
+
+Tasks:
+
+- Add nixos-generators to flake.nix
+- Define base NixOS configuration for DO (`nixos/base.nix`)
+- Bake monitoring agents (node_exporter, Grafana Agent)
+- Configure SSH key injection (hybrid approach)
+- Build image: `nix build .#digitalOceanImage`
+- Upload to DO Spaces via CI
+- Create test droplet from custom image
+- Verify SSH access and basic operation
+
+Validation gates:
+
+- Image builds successfully in CI
+- Droplet boots from custom image
+- SSH access works (DO-injected keys)
+- node_exporter metrics accessible on localhost:9100
+- Grafana Agent running (even without credentials yet)
+
+Rollback plan:
+
+- Delete test droplet
+- Remove image from Spaces
+- Revert flake.nix changes
+- Current production droplet unaffected (still on Ubuntu/existing image)
+
+Dry-run mode:
+
+- Use `--dry-run` with `nix build` to verify build without full execution
+- Create droplet in separate test project/region
+
+**Phase 3: Deploy-rs Setup**
+
+Migrate from bash scripts to declarative deployment.
+
+Tasks:
+
+- Add deploy-rs to flake.nix
+- Define NixOS configuration with all services (server, reporter, grafana,
+  dashboard)
+- Configure health check endpoints
+- Add rollback wrapper to flake (`nix run .#rollback`)
+- Test deployment: `deploy .#production`
+- Test magic rollback: disconnect SSH during activation, verify auto-revert
+- Test intentional rollback: deploy, then `nix run .#rollback` to previous gen
+
+Validation gates:
+
+- `deploy .#production` succeeds on droplet
+- Health checks pass for all services
+- Magic rollback triggers on SSH disconnect during activation
+- `nix run .#rollback` lists generations and can switch to previous
+
+Rollback plan:
+
+- Keep bash deployment scripts intact during migration
+- If deploy-rs fails: `./deploy.sh` continues to work
+- Full rollback: revert flake.nix, use bash scripts exclusively
+
+**Phase 4: Ragenix Secrets**
+
+Migrate secrets from GitHub Secrets to git-stored encrypted files.
+
+Tasks:
+
+- Add ragenix to flake.nix (drop-in replacement for agenix with better CLI)
+- Bootstrap: obtain droplet SSH public key, add to secrets.nix
+- Encrypt existing secrets as .age files:
+  - `schwab-credentials.age`
+  - `alpaca-credentials.age`
+  - `db-encryption-key.age`
+- Update NixOS modules to read from /run/agenix/
+- Test decryption on deployment
+- Remove runtime secrets from GitHub Secrets (keep build-time secrets)
+
+Validation gates:
+
+- `ragenix -d schwab-credentials.age` decrypts successfully (admin key)
+- Deployment decrypts secrets on droplet
+- Services start with ragenix-provided secrets
+- Health checks pass
+
+Rollback plan:
+
+- Keep GitHub Secrets populated during transition (dual-source)
+- If ragenix decryption fails: services fall back to environment variables
+- Emergency restore:
+  1. Re-add secrets to GitHub Secrets
+  2. Revert NixOS module to read from environment
+  3. Deploy via deploy-rs (or bash fallback)
+
+Dry-run mode:
+
+- Test ragenix encryption/decryption locally before deployment
+- Verify decryption works on droplet before removing GitHub Secrets
+
+Secrets transition table:
+
+| Secret             | Phase 4 Start  | Phase 4 End    | Notes             |
+| ------------------ | -------------- | -------------- | ----------------- |
+| Schwab credentials | GitHub Secrets | ragenix (.age) | Runtime secret    |
+| Alpaca credentials | GitHub Secrets | ragenix (.age) | Runtime secret    |
+| DB encryption key  | GitHub Secrets | ragenix (.age) | Runtime secret    |
+| DO API token       | GitHub Secrets | GitHub Secrets | Build-time, stays |
+| Spaces credentials | GitHub Secrets | GitHub Secrets | Build-time, stays |
+| Deploy SSH key     | GitHub Secrets | GitHub Secrets | Build-time, stays |
+
+**Future: Staging Environment**
+
+The architecture supports adding a staging environment later by:
+
+- Adding `nixosConfigurations.staging` (copy of production with different
+  secrets)
+- Adding `deploy.nodes.staging` with staging hostname
+- Creating staging-specific `.age` files
+
+This is not part of the initial rollout.
 
 ## **Crate Architecture**
 
