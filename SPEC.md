@@ -324,14 +324,17 @@ infra):
 - Systemd unit definitions for application services (pointing to deployment
   paths)
 - Grafana as a NixOS native service
-- Monitoring agents
 - ragenix integration for secret decryption
 
-_Per-service deploy-rs profiles_ (deployed independently):
+_Per-service deploy-rs profiles_ (deployed independently, 1-to-1 with systemd
+units):
 
-- `server` - hedging bot (Schwab instance and Alpaca instance)
-- `reporter` - position reporter (Schwab instance and Alpaca instance)
-- `dashboard` - custom operations dashboard
+- `server-schwab` - hedging bot for Schwab executor
+- `server-alpaca` - hedging bot for Alpaca executor
+- `reporter-schwab` - position reporter for Schwab
+- `reporter-alpaca` - position reporter for Alpaca
+- `dashboard` - operations dashboard (single instance, switches executors in UI)
+- `grafana` - metrics (NixOS native service, not a deploy-rs profile)
 
 Each profile deploys its binary to a known path and restarts the corresponding
 systemd unit. This allows updating one service without touching others.
@@ -353,8 +356,8 @@ _Infrastructure_:
 **Rollback:**
 
 deploy-rs deploys each service to a nix profile (e.g.,
-`/nix/var/nix/profiles/per-service/server`). Each deployment creates a new
-profile generation:
+`/nix/var/nix/profiles/per-service/server-schwab`). Each deployment creates a
+new profile generation:
 
 - `nix profile history` shows deployment history with timestamps
 - `nix profile rollback` reverts to previous generation
@@ -421,16 +424,16 @@ infrastructure.
 Ansible lets you describe "what state servers should be in" declaratively:
 
 ```yaml
-# Example: deploy server binary and ensure it's running
-- name: Copy server binary
+# Example: deploy server-schwab binary and ensure it's running
+- name: Copy server-schwab binary
   copy:
     src: ./target/release/server
-    dest: /opt/st0x/current/server
+    dest: /opt/st0x/current/server-schwab
     mode: "0755"
 
-- name: Ensure server service is running
+- name: Ensure server-schwab service is running
   systemd:
-    name: server
+    name: server-schwab
     state: restarted
     enabled: yes
 ```
@@ -443,10 +446,10 @@ in order, reports what changed.
 - **Inventory**: File listing your servers. Example:
   `production ansible_host=192.168.1.1`. Later add `staging ansible_host=...`.
 - **Task**: Single action (copy file, restart service, create directory).
-- **Role**: Bundle of related tasks. A `server` role contains all tasks to
-  deploy the server binary. Roles are reusable across environments.
+- **Role**: Bundle of related tasks. A `server-schwab` role contains all tasks
+  to deploy that service's binary. Roles are reusable across environments.
 - **Playbook**: YAML file that says "run these roles on these servers". Example:
-  "on production, run the server and reporter roles".
+  "on production, run the server-schwab and reporter-schwab roles".
 
 **Architecture:**
 
@@ -459,7 +462,7 @@ Terraform provisions Ubuntu droplet. Ansible handles everything else:
 5. Previous binaries retained in versioned directories for rollback
 
 _Per-service deployment_: Ansible tags target specific roles:
-`ansible-playbook deploy.yml --tags server`. Each role is independent.
+`ansible-playbook deploy.yml --tags server-schwab`. Each role is independent.
 
 _Secrets_: Ansible Vault encrypts secrets in git. At deploy time, Ansible
 decrypts and writes to environment files that systemd reads. Audit trail via git
@@ -473,20 +476,22 @@ Capistrano-style versioned deployments:
 /opt/st0x/
 ├── releases/
 │   ├── 20240101-abc123/
-│   │   ├── server
-│   │   └── reporter
+│   │   ├── server-schwab
+│   │   ├── server-alpaca
+│   │   ├── reporter-schwab
+│   │   ├── reporter-alpaca
+│   │   └── dashboard
 │   └── 20240102-def456/
-│       ├── server
-│       └── reporter
+│       └── ...
 └── current -> releases/20240102-def456/
 ```
 
-Systemd units point to `/opt/st0x/current/server`. Rollback:
+Systemd units point to `/opt/st0x/current/<service>`. Rollback:
 
 ```bash
 # Point to previous release
 ln -sfn /opt/st0x/releases/20240101-abc123 /opt/st0x/current
-sudo systemctl restart server reporter
+sudo systemctl restart server-schwab server-alpaca reporter-schwab reporter-alpaca dashboard
 ```
 
 Can be automated via
@@ -545,7 +550,7 @@ CI:
 3. Starts new container, runs health check
 4. Stops old container (kept on disk for rollback)
 
-_Per-service deployment_: `kamal deploy -d server` deploys only the server
+_Per-service deployment_: `kamal deploy -d server-schwab` deploys only that
 service. Each service defined separately in `deploy.yml`.
 
 _Secrets_: SOPS encrypts secrets in git. CI decrypts at deploy time, Kamal
@@ -629,7 +634,8 @@ async fn main(
 }
 ```
 
-Each service (server, reporter, dashboard) becomes a separate Shuttle project.
+Each service (server-schwab, server-alpaca, reporter-schwab, reporter-alpaca,
+dashboard) becomes a separate Shuttle project.
 
 **Rollback:**
 
@@ -704,6 +710,11 @@ Cons:
 | Dev/prod version parity | Same flake.lock        | Manual coordination  | Manual coordination |
 | Leverage existing Nix   | Extends flake          | Parallel tooling     | Parallel tooling    |
 
+**Note on Approach D (Shuttle.rs):** Not included in comparison matrix as it's a
+fundamentally different model (PaaS vs self-managed). Shuttle eliminates
+infrastructure management entirely but introduces vendor lock-in and less
+control. Evaluate separately based on compliance requirements and risk appetite.
+
 #### **Cost Comparison**
 
 Approaches A, B, and C use the same infrastructure (DigitalOcean droplet) with
@@ -728,11 +739,6 @@ depending on resource needs.
 **Shuttle.rs:** Free tier for experimentation. Pro tier pricing currently in
 flux (overhauled late 2024, new tiers announced for 2025). Check
 [shuttle.dev/pricing](https://www.shuttle.dev/pricing) for current rates.
-
-**Note on Approach D (Shuttle.rs):** Not included in comparison matrix as it's a
-fundamentally different model (PaaS vs self-managed). Shuttle eliminates
-infrastructure management entirely but introduces vendor lock-in and less
-control. Evaluate separately based on compliance requirements and risk appetite.
 
 ## **Crate Architecture**
 
