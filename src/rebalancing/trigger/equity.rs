@@ -89,7 +89,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
     symbol_cache: &SymbolCache,
-    vault_ratio: Option<&VaultRatio>,
+    vault_ratio: &VaultRatio,
 ) -> Result<TriggeredOperation, EquityTriggerSkip> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -208,13 +208,14 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result = check_imbalance_and_build_operation(
             &Symbol::new("AAPL").unwrap(),
             &threshold,
             &inventory,
             &symbol_cache,
-            None,
+            &ratio,
         )
         .await;
 
@@ -239,13 +240,14 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result = check_imbalance_and_build_operation(
             &symbol,
             &threshold,
             &inventory,
             &symbol_cache,
-            None,
+            &ratio,
         )
         .await;
 
@@ -276,13 +278,14 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result = check_imbalance_and_build_operation(
             &symbol,
             &threshold,
             &inventory,
             &symbol_cache,
-            None,
+            &ratio,
         )
         .await;
 
@@ -307,13 +310,14 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result = check_imbalance_and_build_operation(
             &symbol,
             &threshold,
             &inventory,
             &symbol_cache,
-            None,
+            &ratio,
         )
         .await;
 

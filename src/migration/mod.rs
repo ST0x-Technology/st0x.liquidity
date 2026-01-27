@@ -347,16 +347,18 @@ mod tests {
                 symbol,
                 amount,
                 direction,
-                price_usdc
+                price_usdc,
+                underlying_amount
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ",
             tx_hash_str,
             log_index,
             symbol,
             amount,
             direction,
-            price_usdc
+            price_usdc,
+            amount
         )
         .execute(pool)
         .await

@@ -546,8 +546,9 @@ mod tests {
                 amount,
                 direction,
                 price_usdc,
-                created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                created_at,
+                underlying_amount
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             tx_hash,
             log_index,
             symbol,
@@ -555,6 +556,7 @@ mod tests {
             direction,
             price_usdc,
             naive_timestamp,
+            amount,
         )
         .execute(pool)
         .await

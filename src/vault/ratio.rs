@@ -68,22 +68,6 @@ impl VaultRatio {
         Ok(numerator / RATIO_ONE)
     }
 
-    /// Converts unwrapped token amount to wrapped-equivalent amount.
-    ///
-    /// Formula: wrapped = unwrapped * 10^18 / assets_per_share
-    pub(crate) fn unwrapped_to_wrapped(&self, unwrapped: U256) -> Result<U256, VaultRatioError> {
-        let numerator = unwrapped
-            .checked_mul(RATIO_ONE)
-            .ok_or(VaultRatioError::Overflow)?;
-
-        Ok(numerator / self.assets_per_share)
-    }
-
-    /// Returns the assets per share value (18 decimals).
-    pub(crate) fn assets_per_share(&self) -> U256 {
-        self.assets_per_share
-    }
-
     /// Converts wrapped FractionalShares to unwrapped-equivalent FractionalShares.
     ///
     /// Handles the conversion chain: FractionalShares -> U256 -> apply ratio -> FractionalShares.
@@ -114,9 +98,6 @@ mod tests {
 
         let unwrapped = ratio.wrapped_to_unwrapped(amount).unwrap();
         assert_eq!(unwrapped, amount);
-
-        let wrapped = ratio.unwrapped_to_wrapped(amount).unwrap();
-        assert_eq!(wrapped, amount);
     }
 
     #[test]
@@ -129,11 +110,6 @@ mod tests {
         let wrapped = U256::from(100u64);
         let unwrapped = ratio.wrapped_to_unwrapped(wrapped).unwrap();
         assert_eq!(unwrapped, U256::from(105u64));
-
-        // 105 unwrapped should give 100 wrapped
-        let unwrapped = U256::from(105u64);
-        let wrapped = ratio.unwrapped_to_wrapped(unwrapped).unwrap();
-        assert_eq!(wrapped, U256::from(100u64));
     }
 
     #[test]
@@ -146,11 +122,6 @@ mod tests {
         let wrapped = U256::from(50u64);
         let unwrapped = ratio.wrapped_to_unwrapped(wrapped).unwrap();
         assert_eq!(unwrapped, U256::from(100u64));
-
-        // 100 unwrapped should give 50 wrapped
-        let unwrapped = U256::from(100u64);
-        let wrapped = ratio.unwrapped_to_wrapped(unwrapped).unwrap();
-        assert_eq!(wrapped, U256::from(50u64));
     }
 
     #[test]
@@ -159,9 +130,6 @@ mod tests {
 
         let unwrapped = ratio.wrapped_to_unwrapped(U256::ZERO).unwrap();
         assert_eq!(unwrapped, U256::ZERO);
-
-        let wrapped = ratio.unwrapped_to_wrapped(U256::ZERO).unwrap();
-        assert_eq!(wrapped, U256::ZERO);
     }
 
     #[test]
@@ -171,29 +139,6 @@ mod tests {
             result.unwrap_err(),
             VaultRatioError::DivisionByZero
         ));
-    }
-
-    #[test]
-    fn round_trip_preserves_approximate_value() {
-        let assets_per_share = U256::from(1_050_000_000_000_000_000u64);
-        let ratio = VaultRatio::new(assets_per_share).unwrap();
-
-        // Start with a large amount to minimize rounding error impact
-        let original = U256::from(1_000_000u64);
-        let unwrapped = ratio.wrapped_to_unwrapped(original).unwrap();
-        let back_to_wrapped = ratio.unwrapped_to_wrapped(unwrapped).unwrap();
-
-        // Due to integer division, we might lose a tiny amount
-        // but it should be very close
-        let diff = if original > back_to_wrapped {
-            original - back_to_wrapped
-        } else {
-            back_to_wrapped - original
-        };
-
-        // Difference should be less than 0.01% of original
-        let max_diff = original / U256::from(10_000u64);
-        assert!(diff <= max_diff);
     }
 
     #[test]

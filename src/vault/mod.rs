@@ -39,12 +39,6 @@ pub(crate) enum VaultError {
     #[error("Ratio error: {0}")]
     Ratio(#[from] VaultRatioError),
 
-    #[error("Wrapped token not configured: {0}")]
-    TokenNotConfigured(Address),
-
-    #[error("Slippage exceeded: expected {expected}, got {actual}")]
-    SlippageExceeded { expected: U256, actual: U256 },
-
     #[error("Missing Deposit event in transaction receipt")]
     MissingDepositEvent,
 
@@ -89,7 +83,8 @@ where
 
     /// Fetches the current conversion ratio for a wrapped token.
     ///
-    /// Uses a 2-second cache to deduplicate burst calls during rapid event processing.
+    /// Uses a 2-second cache to deduplicate burst calls during rapid event processing,
+    /// since each block is approx 2 seconds
     /// The ratio represents assets per share (underlying per wrapped).
     pub(crate) async fn get_ratio(&self, wrapped_token: Address) -> Result<VaultRatio, VaultError> {
         // Check cache first
@@ -134,11 +129,13 @@ where
         let receipt = pending.get_receipt().await?;
         let tx_hash = receipt.transaction_hash;
 
-        // Parse the Deposit event to get actual shares received
+        // Parse the Deposit event to get actual shares received.
+        // Filter by address first to avoid picking up events from other vaults.
         let actual_shares = receipt
             .inner
             .logs()
             .iter()
+            .filter(|log| log.address() == wrapped_token)
             .find_map(|log| {
                 IERC4626::Deposit::decode_log(log.as_ref())
                     .ok()
@@ -179,11 +176,13 @@ where
         let receipt = pending.get_receipt().await?;
         let tx_hash = receipt.transaction_hash;
 
-        // Parse the Withdraw event to get actual assets received
+        // Parse the Withdraw event to get actual assets received.
+        // Filter by address first to avoid picking up events from other vaults.
         let actual_assets = receipt
             .inner
             .logs()
             .iter()
+            .filter(|log| log.address() == wrapped_token)
             .find_map(|log| {
                 IERC4626::Withdraw::decode_log(log.as_ref())
                     .ok()
@@ -238,16 +237,6 @@ where
         Ok(())
     }
 
-    /// Checks if an address is a configured wrapped token.
-    pub(crate) fn is_wrapped(&self, address: &Address) -> bool {
-        self.registry.is_wrapped(address)
-    }
-
-    /// Checks if an address is a configured unwrapped token.
-    pub(crate) fn is_unwrapped(&self, address: &Address) -> bool {
-        self.registry.is_unwrapped(address)
-    }
-
     /// Gets the wrapped token config for a symbol.
     pub(crate) fn get_config_by_symbol(
         &self,
@@ -259,24 +248,6 @@ where
     /// Gets the wrapped token config for a wrapped token address.
     pub(crate) fn get_config_by_wrapped(&self, wrapped: &Address) -> Option<&WrappedTokenConfig> {
         self.registry.get_by_wrapped(wrapped)
-    }
-
-    /// Gets the wrapped token config for an unwrapped token address.
-    pub(crate) fn get_config_by_unwrapped(
-        &self,
-        unwrapped: &Address,
-    ) -> Option<&WrappedTokenConfig> {
-        self.registry.get_by_unwrapped(unwrapped)
-    }
-
-    /// Returns a reference to the registry.
-    pub(crate) fn registry(&self) -> &WrappedTokenRegistry {
-        &self.registry
-    }
-
-    /// Cleans up expired cache entries.
-    pub(crate) fn cleanup_cache(&self) {
-        self.cache.cleanup_expired();
     }
 }
 
@@ -294,19 +265,6 @@ mod tests {
         };
 
         WrappedTokenRegistry::new(vec![config])
-    }
-
-    #[test]
-    fn is_wrapped_delegates_to_registry() {
-        // This test verifies the delegation without needing a provider
-        let registry = create_test_registry();
-        let wrapped = address!("1111111111111111111111111111111111111111");
-        let unwrapped = address!("2222222222222222222222222222222222222222");
-        let unknown = address!("3333333333333333333333333333333333333333");
-
-        assert!(registry.is_wrapped(&wrapped));
-        assert!(!registry.is_wrapped(&unwrapped));
-        assert!(!registry.is_wrapped(&unknown));
     }
 
     #[test]

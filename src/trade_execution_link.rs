@@ -132,7 +132,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: Some(1.5),
+            underlying_amount: 1.5,
         };
 
         let execution = OffchainExecution {
@@ -205,7 +205,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: Some(amount),
+                underlying_amount: amount,
             };
             let trade_id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
             trade_ids.push(trade_id);
@@ -264,7 +264,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: Some(1.0),
+            underlying_amount: 1.0,
         };
 
         let execution = OffchainExecution {

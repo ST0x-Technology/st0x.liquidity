@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
 use crate::shares::FractionalShares;
+use crate::vault::VaultError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -27,6 +28,9 @@ pub(crate) enum RedemptionError {
 
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
+
+    #[error("Vault unwrapping error: {0}")]
+    Vault(#[from] VaultError),
 }
 
 /// Trait for executing redemption operations.

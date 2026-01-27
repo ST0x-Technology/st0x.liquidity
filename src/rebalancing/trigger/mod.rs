@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use alloy::primitives::{Address, B256};
+use alloy::providers::Provider;
 use async_trait::async_trait;
 use chrono::Utc;
 use clap::Parser;
@@ -29,6 +30,7 @@ use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
+use crate::vault::VaultService;
 use crate::vault::{WrappedTokenConfig, WrappedTokenRegistry};
 
 pub(crate) use equity::EquityTriggerSkip;
@@ -187,21 +189,29 @@ pub(crate) enum TriggeredOperation {
 }
 
 /// Trigger that monitors inventory and sends rebalancing operations.
-pub(crate) struct RebalancingTrigger {
+pub(crate) struct RebalancingTrigger<P>
+where
+    P: Provider + Clone,
+{
     config: RebalancingTriggerConfig,
     symbol_cache: SymbolCache,
     inventory: Arc<RwLock<InventoryView>>,
     equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
+    vault_service: Arc<VaultService<P>>,
 }
 
-impl RebalancingTrigger {
+impl<P> RebalancingTrigger<P>
+where
+    P: Provider + Clone,
+{
     pub(crate) fn new(
         config: RebalancingTriggerConfig,
         symbol_cache: SymbolCache,
         inventory: Arc<RwLock<InventoryView>>,
         sender: mpsc::Sender<TriggeredOperation>,
+        vault_service: Arc<VaultService<P>>,
     ) -> Self {
         Self {
             config,
@@ -210,12 +220,16 @@ impl RebalancingTrigger {
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
+            vault_service,
         }
     }
 }
 
 #[async_trait]
-impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for RebalancingTrigger {
+impl<P> Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for RebalancingTrigger<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
     async fn dispatch(
         &self,
         aggregate_id: &str,
@@ -234,7 +248,10 @@ impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for Rebalanci
 }
 
 #[async_trait]
-impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
+impl<P> Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
     async fn dispatch(
         &self,
         aggregate_id: &str,
@@ -261,7 +278,10 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
+impl<P> Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
     async fn dispatch(
         &self,
         aggregate_id: &str,
@@ -288,7 +308,10 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
+impl<P> Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
     async fn dispatch(
         &self,
         aggregate_id: &str,
@@ -314,7 +337,10 @@ impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
     }
 }
 
-impl RebalancingTrigger {
+impl<P> RebalancingTrigger<P>
+where
+    P: Provider + Clone + Send + Sync + 'static,
+{
     /// Checks inventory for equity imbalance and triggers operation if needed.
     async fn check_and_trigger_equity(&self, symbol: &Symbol) {
         let Some(guard) = equity::InProgressGuard::try_claim(
@@ -339,12 +365,14 @@ impl RebalancingTrigger {
     }
 
     async fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
+        let vault_ratio = self.get_vault_ratio_for_symbol(symbol).await;
+
         match equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity_threshold,
             &self.inventory,
             &self.symbol_cache,
-            None, // TODO: Pass actual VaultRatio in Phase 6 when VaultService is wired up
+            &vault_ratio,
         )
         .await
         {
@@ -353,6 +381,31 @@ impl RebalancingTrigger {
             Err(EquityTriggerSkip::TokenNotInCache) => {
                 error!(symbol = %symbol, "Skipped equity trigger: token not in cache");
                 None
+            }
+        }
+    }
+
+    /// Fetches the VaultRatio for a symbol.
+    ///
+    /// Returns the actual ratio for wrapped tokens, or `VaultRatio::one_to_one()`
+    /// for non-wrapped tokens (which leaves values unchanged when applied).
+    async fn get_vault_ratio_for_symbol(&self, symbol: &Symbol) -> crate::vault::VaultRatio {
+        let Some(config) = self.vault_service.get_config_by_symbol(symbol) else {
+            return crate::vault::VaultRatio::one_to_one();
+        };
+
+        let wrapped_token = config.wrapped_token;
+
+        match self.vault_service.get_ratio(wrapped_token).await {
+            Ok(ratio) => ratio,
+            Err(e) => {
+                warn!(
+                    symbol = %symbol,
+                    wrapped_token = %wrapped_token,
+                    error = %e,
+                    "Failed to fetch VaultRatio, using 1:1 ratio"
+                );
+                crate::vault::VaultRatio::one_to_one()
             }
         }
     }
@@ -600,8 +653,10 @@ impl RebalancingTrigger {
 
 #[cfg(test)]
 mod tests {
+    use alloy::network::Ethereum;
     use alloy::primitives::fixed_bytes;
     use alloy::primitives::{TxHash, address};
+    use alloy::providers::{ProviderBuilder, RootProvider};
     use chrono::Utc;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{CqrsFramework, Query};
@@ -624,9 +679,35 @@ mod tests {
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
+    use crate::vault::WrappedTokenRegistry;
     use alloy::primitives::{Address, U256};
+    use alloy::providers::Identity;
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
+    };
 
-    fn make_trigger() -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+    /// Test provider type. Uses HTTP transport but won't be called since tests
+    /// use empty WrappedTokenRegistry (no wrapped tokens configured).
+    type TestProvider = FillProvider<
+        JoinFill<
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+        >,
+        RootProvider<Ethereum>,
+        Ethereum,
+    >;
+
+    fn make_test_vault_service() -> Arc<VaultService<TestProvider>> {
+        // Create a provider with a dummy URL - it won't be called since the registry is empty
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        Arc::new(VaultService::new(provider, WrappedTokenRegistry::empty()))
+    }
+
+    fn make_trigger() -> (
+        RebalancingTrigger<TestProvider>,
+        mpsc::Receiver<TriggeredOperation>,
+    ) {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let symbol_cache = SymbolCache::default();
@@ -642,7 +723,13 @@ mod tests {
         };
 
         (
-            RebalancingTrigger::new(config, symbol_cache, inventory, sender),
+            RebalancingTrigger::new(
+                config,
+                symbol_cache,
+                inventory,
+                sender,
+                make_test_vault_service(),
+            ),
             receiver,
         )
     }
@@ -742,7 +829,10 @@ mod tests {
 
     fn make_trigger_with_inventory(
         inventory: InventoryView,
-    ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+    ) -> (
+        RebalancingTrigger<TestProvider>,
+        mpsc::Receiver<TriggeredOperation>,
+    ) {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(inventory));
         let symbol_cache = SymbolCache::default();
@@ -758,7 +848,13 @@ mod tests {
         };
 
         (
-            RebalancingTrigger::new(config, symbol_cache, inventory, sender),
+            RebalancingTrigger::new(
+                config,
+                symbol_cache,
+                inventory,
+                sender,
+                make_test_vault_service(),
+            ),
             receiver,
         )
     }
@@ -981,7 +1077,9 @@ mod tests {
         ];
 
         // Check that terminal event is detected.
-        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_mint_event(
+            &events
+        ));
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
@@ -1006,7 +1104,9 @@ mod tests {
             make_mint_envelope(make_mint_rejected()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_mint_event(
+            &events
+        ));
 
         trigger.clear_equity_in_progress(&symbol);
         assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
@@ -1021,7 +1121,9 @@ mod tests {
             make_mint_envelope(make_mint_acceptance_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_mint_event(
+            &events
+        ));
     }
 
     #[test]
@@ -1029,7 +1131,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let events = vec![make_mint_envelope(make_mint_requested(&symbol, dec!(42.5)))];
 
-        let result = RebalancingTrigger::extract_mint_info(&events);
+        let result = RebalancingTrigger::<TestProvider>::extract_mint_info(&events);
 
         let (extracted_symbol, extracted_quantity) = result.unwrap();
         assert_eq!(extracted_symbol, symbol);
@@ -1040,7 +1142,7 @@ mod tests {
     fn extract_mint_info_returns_none_without_mint_requested() {
         let events = vec![make_mint_envelope(make_mint_completed())];
 
-        let result = RebalancingTrigger::extract_mint_info(&events);
+        let result = RebalancingTrigger::<TestProvider>::extract_mint_info(&events);
 
         assert!(result.is_none());
     }
@@ -1054,7 +1156,7 @@ mod tests {
             make_mint_envelope(make_tokens_received()),
         ];
 
-        assert!(!RebalancingTrigger::has_terminal_mint_event(&events));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_mint_event(&events));
     }
 
     fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
@@ -1159,7 +1261,7 @@ mod tests {
         ];
 
         // Check that terminal event is detected.
-        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_redemption_event(&events));
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_equity_in_progress(&symbol);
@@ -1175,7 +1277,7 @@ mod tests {
             make_redemption_envelope(make_detection_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_redemption_event(&events));
     }
 
     #[test]
@@ -1188,7 +1290,7 @@ mod tests {
             make_redemption_envelope(make_redemption_rejected()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_redemption_event(&events));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_redemption_event(&events));
     }
 
     #[test]
@@ -1199,7 +1301,7 @@ mod tests {
             dec!(42.5),
         ))];
 
-        let result = RebalancingTrigger::extract_redemption_info(&events);
+        let result = RebalancingTrigger::<TestProvider>::extract_redemption_info(&events);
 
         let (extracted_symbol, extracted_quantity) = result.unwrap();
         assert_eq!(extracted_symbol, symbol);
@@ -1210,7 +1312,7 @@ mod tests {
     fn extract_redemption_info_returns_none_without_tokens_sent() {
         let events = vec![make_redemption_envelope(make_redemption_completed())];
 
-        let result = RebalancingTrigger::extract_redemption_info(&events);
+        let result = RebalancingTrigger::<TestProvider>::extract_redemption_info(&events);
 
         assert!(result.is_none());
     }
@@ -1223,7 +1325,7 @@ mod tests {
             make_redemption_envelope(make_redemption_detected()),
         ];
 
-        assert!(!RebalancingTrigger::has_terminal_redemption_event(&events));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_redemption_event(&events));
     }
 
     fn usdc(n: i64) -> Usdc {
@@ -1353,9 +1455,7 @@ mod tests {
         ];
 
         // Check that terminal event is detected (AlpacaToBase deposit is terminal).
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
 
         // Simulate what dispatch does - clear in-progress on terminal.
         trigger.clear_usdc_in_progress();
@@ -1372,9 +1472,7 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_withdrawal_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1387,9 +1485,7 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_bridging_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1402,9 +1498,7 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_deposit_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1414,7 +1508,7 @@ mod tests {
             usdc(5000),
         ))];
 
-        let result = RebalancingTrigger::extract_usdc_rebalance_info(&events);
+        let result = RebalancingTrigger::<TestProvider>::extract_usdc_rebalance_info(&events);
 
         let (extracted_direction, extracted_amount) = result.unwrap();
         assert_eq!(extracted_direction, RebalanceDirection::BaseToAlpaca);
@@ -1427,7 +1521,7 @@ mod tests {
             RebalanceDirection::AlpacaToBase,
         ))];
 
-        let result = RebalancingTrigger::extract_usdc_rebalance_info(&events);
+        let result = RebalancingTrigger::<TestProvider>::extract_usdc_rebalance_info(&events);
 
         assert!(result.is_none());
     }
@@ -1444,9 +1538,7 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_bridged()),
         ];
 
-        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1459,9 +1551,7 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_conversion_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1481,9 +1571,7 @@ mod tests {
             make_usdc_rebalance_envelope(make_usdc_conversion_failed()),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1506,9 +1594,7 @@ mod tests {
             )),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1529,9 +1615,7 @@ mod tests {
         ];
 
         // ConversionConfirmed hasn't happened yet, so not terminal
-        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1548,9 +1632,7 @@ mod tests {
             )),
         ];
 
-        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1574,9 +1656,7 @@ mod tests {
             )),
         ];
 
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1594,9 +1674,7 @@ mod tests {
         ];
 
         // For AlpacaToBase, ConversionConfirmed is NOT terminal (flow continues to withdrawal)
-        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     #[test]
@@ -1608,9 +1686,7 @@ mod tests {
         )];
 
         // Direction not extracted (no Initiated), defaults to checking DepositConfirmed
-        assert!(!RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &events
-        ));
+        assert!(!RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events));
     }
 
     // CRITICAL: Tests for incremental dispatch behavior (cqrs-es 0.4 only sends newly committed events)
@@ -1630,7 +1706,7 @@ mod tests {
         )];
 
         assert!(
-            RebalancingTrigger::has_terminal_usdc_rebalance_event(&events),
+            RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&events),
             "ConversionConfirmed alone should be detected as terminal for BaseToAlpaca"
         );
     }
@@ -1639,24 +1715,28 @@ mod tests {
     fn incremental_dispatch_failure_events_alone_are_terminal() {
         // Failure events should always be terminal regardless of what else is in the slice
         let withdrawal_failed = vec![make_usdc_rebalance_envelope(make_usdc_withdrawal_failed())];
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &withdrawal_failed
-        ));
+        assert!(
+            RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(
+                &withdrawal_failed
+            )
+        );
 
         let bridging_failed = vec![make_usdc_rebalance_envelope(make_usdc_bridging_failed())];
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &bridging_failed
-        ));
+        assert!(
+            RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&bridging_failed)
+        );
 
         let deposit_failed = vec![make_usdc_rebalance_envelope(make_usdc_deposit_failed())];
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &deposit_failed
-        ));
+        assert!(
+            RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(&deposit_failed)
+        );
 
         let conversion_failed = vec![make_usdc_rebalance_envelope(make_usdc_conversion_failed())];
-        assert!(RebalancingTrigger::has_terminal_usdc_rebalance_event(
-            &conversion_failed
-        ));
+        assert!(
+            RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(
+                &conversion_failed
+            )
+        );
     }
 
     fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 7] {
@@ -1907,7 +1987,8 @@ mod tests {
                 }
             }
 
-            let is_terminal = RebalancingTrigger::has_terminal_usdc_rebalance_event(events);
+            let is_terminal =
+                RebalancingTrigger::<TestProvider>::has_terminal_usdc_rebalance_event(events);
             self.terminal_detection_results
                 .lock()
                 .await
@@ -2231,6 +2312,7 @@ mod tests {
             symbol_cache,
             inventory,
             sender,
+            make_test_vault_service(),
         ));
 
         // Set in_progress flag

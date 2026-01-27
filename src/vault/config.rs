@@ -29,7 +29,6 @@ pub(crate) struct WrappedTokenConfig {
 /// Provides efficient lookups by:
 /// - Equity symbol (for mint/redemption flows)
 /// - Wrapped token address (for trade processing)
-/// - Unwrapped token address (for identifying Alpaca tokens)
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WrappedTokenRegistry {
     /// Configs indexed by equity symbol.
@@ -37,9 +36,6 @@ pub(crate) struct WrappedTokenRegistry {
 
     /// Configs indexed by wrapped token address.
     wrapped: HashMap<Address, WrappedTokenConfig>,
-
-    /// Configs indexed by unwrapped token address.
-    unwrapped: HashMap<Address, WrappedTokenConfig>,
 }
 
 impl WrappedTokenRegistry {
@@ -47,19 +43,13 @@ impl WrappedTokenRegistry {
     pub(crate) fn new(configs: Vec<WrappedTokenConfig>) -> Self {
         let mut symbols = HashMap::with_capacity(configs.len());
         let mut wrapped = HashMap::with_capacity(configs.len());
-        let mut unwrapped = HashMap::with_capacity(configs.len());
 
         for config in configs {
             symbols.insert(config.equity_symbol.clone(), config.clone());
-            wrapped.insert(config.wrapped_token, config.clone());
-            unwrapped.insert(config.unwrapped_token, config);
+            wrapped.insert(config.wrapped_token, config);
         }
 
-        Self {
-            symbols,
-            wrapped,
-            unwrapped,
-        }
+        Self { symbols, wrapped }
     }
 
     /// Creates an empty registry (no wrapped tokens configured).
@@ -75,36 +65,6 @@ impl WrappedTokenRegistry {
     /// Looks up config by wrapped token address.
     pub(crate) fn get_by_wrapped(&self, wrapped: &Address) -> Option<&WrappedTokenConfig> {
         self.wrapped.get(wrapped)
-    }
-
-    /// Looks up config by unwrapped token address.
-    pub(crate) fn get_by_unwrapped(&self, unwrapped: &Address) -> Option<&WrappedTokenConfig> {
-        self.unwrapped.get(unwrapped)
-    }
-
-    /// Checks if an address is a wrapped token.
-    pub(crate) fn is_wrapped(&self, address: &Address) -> bool {
-        self.wrapped.contains_key(address)
-    }
-
-    /// Checks if an address is an unwrapped token.
-    pub(crate) fn is_unwrapped(&self, address: &Address) -> bool {
-        self.unwrapped.contains_key(address)
-    }
-
-    /// Returns all configured wrapped token addresses.
-    pub(crate) fn wrapped_tokens(&self) -> impl Iterator<Item = &Address> {
-        self.wrapped.keys()
-    }
-
-    /// Returns the number of configured token pairs.
-    pub(crate) fn len(&self) -> usize {
-        self.symbols.len()
-    }
-
-    /// Returns true if no token pairs are configured.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.symbols.is_empty()
     }
 }
 
@@ -150,38 +110,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_lookups_by_unwrapped() {
-        let config = create_test_config();
-        let registry = WrappedTokenRegistry::new(vec![config.clone()]);
-
-        let found = registry.get_by_unwrapped(&config.unwrapped_token);
-        assert!(found.is_some());
-        assert_eq!(found.unwrap(), &config);
-    }
-
-    #[test]
-    fn is_wrapped_checks_address() {
-        let config = create_test_config();
-        let registry = WrappedTokenRegistry::new(vec![config.clone()]);
-
-        assert!(registry.is_wrapped(&config.wrapped_token));
-        assert!(!registry.is_wrapped(&config.unwrapped_token));
-    }
-
-    #[test]
-    fn is_unwrapped_checks_address() {
-        let config = create_test_config();
-        let registry = WrappedTokenRegistry::new(vec![config.clone()]);
-
-        assert!(registry.is_unwrapped(&config.unwrapped_token));
-        assert!(!registry.is_unwrapped(&config.wrapped_token));
-    }
-
-    #[test]
     fn empty_registry_returns_none() {
         let registry = WrappedTokenRegistry::empty();
 
-        assert!(registry.is_empty());
         assert!(
             registry
                 .get_by_symbol(&Symbol::new("AAPL").unwrap())
@@ -204,7 +135,6 @@ mod tests {
 
         let registry = WrappedTokenRegistry::new(vec![aapl.clone(), tsla.clone()]);
 
-        assert_eq!(registry.len(), 2);
         assert_eq!(
             registry.get_by_symbol(&Symbol::new("AAPL").unwrap()),
             Some(&aapl)

@@ -16,6 +16,7 @@ use thiserror::Error;
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::vault::VaultError;
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
@@ -42,6 +43,9 @@ pub(crate) enum MintError {
 
     #[error("Decimal overflow when scaling {0} to 18 decimals")]
     DecimalOverflow(FractionalShares),
+
+    #[error("Vault wrapping error: {0}")]
+    Vault(#[from] VaultError),
 }
 
 /// Trait for executing mint operations.
