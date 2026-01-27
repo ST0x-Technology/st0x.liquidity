@@ -393,7 +393,7 @@ impl RebalancingTrigger {
                 symbol, quantity, ..
             } = &envelope.payload
             {
-                let shares = FractionalShares(*quantity);
+                let shares = FractionalShares::new(*quantity);
                 return Some((symbol.clone(), shares));
             }
         }
@@ -444,7 +444,7 @@ impl RebalancingTrigger {
                 symbol, quantity, ..
             } = &envelope.payload
             {
-                let shares = FractionalShares(*quantity);
+                let shares = FractionalShares::new(*quantity);
                 return Some((symbol.clone(), shares));
             }
         }
@@ -678,7 +678,7 @@ mod tests {
     }
 
     fn shares(n: i64) -> FractionalShares {
-        FractionalShares(Decimal::from(n))
+        FractionalShares::new(Decimal::from(n))
     }
 
     fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
@@ -999,7 +999,7 @@ mod tests {
 
         let (extracted_symbol, extracted_quantity) = result.unwrap();
         assert_eq!(extracted_symbol, symbol);
-        assert_eq!(extracted_quantity.0, dec!(42.5));
+        assert_eq!(extracted_quantity.inner(), dec!(42.5));
     }
 
     #[test]
@@ -1169,7 +1169,7 @@ mod tests {
 
         let (extracted_symbol, extracted_quantity) = result.unwrap();
         assert_eq!(extracted_symbol, symbol);
-        assert_eq!(extracted_quantity.0, dec!(42.5));
+        assert_eq!(extracted_quantity.inner(), dec!(42.5));
     }
 
     #[test]

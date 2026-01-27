@@ -125,7 +125,7 @@ mod tests {
     use crate::shares::FractionalShares;
 
     fn shares(n: i64) -> FractionalShares {
-        FractionalShares(Decimal::from(n))
+        FractionalShares::new(Decimal::from(n))
     }
 
     fn make_onchain_fill(amount: FractionalShares, direction: Direction) -> PositionEvent {
