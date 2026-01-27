@@ -11,10 +11,35 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
+use thiserror::Error;
 
+use crate::onchain::vault::VaultError;
+use crate::tokenization::TokenizerError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::vault::VaultError;
 
-pub(crate) type MintError = AggregateError<TokenizedEquityMintError>;
+#[derive(Debug, Error)]
+pub(crate) enum MintError {
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
+    #[error("Vault deposit error: {0}")]
+    Vault(#[from] VaultError),
+    #[error("Vault not found for symbol {0}")]
+    VaultNotFound(Symbol),
+    #[error("Mint request was rejected by Alpaca")]
+    Rejected,
+    #[error("Missing tx_hash in completed Alpaca response")]
+    MissingTxHash,
+    #[error("U256 parse error: {0}")]
+    U256Parse(#[from] alloy::primitives::ruint::ParseError),
+    #[error("Decimal overflow when scaling {0} to 18 decimals")]
+    DecimalOverflow(FractionalShares),
+
+    #[error("Vault wrapping error: {0}")]
+    Vault(#[from] VaultError),
+}
 
 /// Trait for executing mint operations.
 #[async_trait]
@@ -94,11 +119,6 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(AggregateError::UserError(
-                TokenizedEquityMintError::AlreadyFailed
-            ))
-        ));
+        assert!(matches!(result, Err(MintError::Rejected)));
     }
 }

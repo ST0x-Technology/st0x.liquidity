@@ -14,21 +14,26 @@ use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
 use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
+use crate::tokenization::TokenizerError;
+use crate::vault::VaultError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<EquityRedemptionError>),
     #[error("Aggregate not found after command execution")]
     AggregateNotFound,
     #[error("Unexpected aggregate state after command")]
     UnexpectedState,
-    #[error("Transfer to redemption wallet failed")]
-    TransferFailed,
-    #[error("Detection polling failed")]
-    DetectionFailed,
+    #[error("Send to tokenizer failed: {reason}")]
+    SendFailed { reason: String },
     #[error("Redemption was rejected by tokenizer")]
     Rejected,
+
+    #[error("Vault unwrapping error: {0}")]
+    Vault(#[from] VaultError),
 }
 
 /// Trait for executing redemption operations.

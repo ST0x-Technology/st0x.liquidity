@@ -253,6 +253,7 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result = check_imbalance_and_build_operation(
             &Symbol::new("AAPL").unwrap(),
@@ -274,6 +275,7 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result =
             check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO, None)
@@ -291,6 +293,7 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result =
             check_imbalance_and_build_operation(&symbol, &threshold, &inventory, token_address, None)

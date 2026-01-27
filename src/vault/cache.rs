@@ -90,18 +90,6 @@ impl RatioCache {
 
         entries.remove(wrapped_token);
     }
-
-    /// Removes all expired entries from the cache.
-    ///
-    /// Called periodically to prevent unbounded memory growth.
-    pub(crate) fn cleanup_expired(&self) {
-        let mut entries = match self.entries.write() {
-            Ok(guard) => guard,
-            Err(poison) => poison.into_inner(),
-        };
-
-        entries.retain(|_, entry| !entry.is_expired());
-    }
 }
 
 #[cfg(test)]
@@ -143,32 +131,6 @@ mod tests {
 
         cache.invalidate(&token);
         assert!(cache.get(&token).is_none());
-    }
-
-    #[test]
-    fn cleanup_removes_expired_entries() {
-        let cache = RatioCache::new();
-        let token1 = address!("1111111111111111111111111111111111111111");
-        let token2 = address!("2222222222222222222222222222222222222222");
-
-        cache.set(token1, VaultRatio::one_to_one());
-        cache.set(token2, VaultRatio::one_to_one());
-
-        // Force token1's entry to be expired by manipulating the entry directly
-        {
-            let mut entries = cache.entries.write().unwrap();
-            if let Some(entry) = entries.get_mut(&token1) {
-                entry.expires_at = Instant::now()
-                    .checked_sub(Duration::from_secs(1))
-                    .expect("test always runs after process start");
-            }
-        }
-
-        cache.cleanup_expired();
-
-        // token1 should be gone, token2 should remain
-        assert!(cache.get(&token1).is_none());
-        assert!(cache.get(&token2).is_some());
     }
 
     #[test]
