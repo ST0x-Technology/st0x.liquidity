@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
     Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig, OrderPlacement,
-    OrderState, Symbol, TryIntoExecutor,
+    OrderState, Positive, Symbol, TryIntoExecutor,
 };
 
 use crate::dual_write::DualWriteContext;
@@ -117,7 +117,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: FractionalShares::new(Decimal::from(quantity))?,
+        shares: Positive::new(FractionalShares::new(Decimal::from(quantity)))?,
         direction,
     };
 

@@ -81,7 +81,7 @@ fn serialize_positive_shares<S>(
 where
     S: serde::Serializer,
 {
-    serializer.serialize_str(&shares.value().value().to_string())
+    serializer.serialize_str(&shares.inner().inner().to_string())
 }
 
 /// Order response from the Alpaca Broker API
@@ -265,7 +265,7 @@ pub(super) async fn get_order_status(
         debug!(
             order_id,
             symbol = %response.symbol,
-            ordered_qty = %response.quantity.value(),
+            ordered_qty = %response.quantity.inner(),
             filled_qty = ?response.filled_quantity,
             "Order is partially filled"
         );
@@ -304,7 +304,7 @@ pub(super) async fn poll_pending_orders(
                 debug!(
                     order_id = %response.id,
                     symbol = %response.symbol,
-                    ordered_qty = %response.quantity.value(),
+                    ordered_qty = %response.quantity.inner(),
                     filled_qty = ?response.filled_quantity,
                     "Order is partially filled"
                 );
@@ -498,7 +498,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
-        assert_eq!(placement.shares.value(), Decimal::from(100));
+        assert_eq!(placement.shares.inner(), Decimal::from(100));
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -543,7 +543,7 @@ mod tests {
         let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
-        assert_eq!(placement.shares.value(), Decimal::from(50));
+        assert_eq!(placement.shares.inner(), Decimal::from(50));
         assert_eq!(placement.direction, Direction::Sell);
     }
 
@@ -576,7 +576,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
-        assert_eq!(order_update.shares.value(), Decimal::from(100));
+        assert_eq!(order_update.shares.inner(), Decimal::from(100));
         assert_eq!(order_update.direction, Direction::Buy);
         assert_eq!(order_update.status, OrderStatus::Submitted);
         assert_eq!(order_update.price_cents, None);
@@ -611,7 +611,7 @@ mod tests {
         let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
-        assert_eq!(order_update.shares.value(), Decimal::from(50));
+        assert_eq!(order_update.shares.inner(), Decimal::from(50));
         assert_eq!(order_update.direction, Direction::Sell);
         assert_eq!(order_update.status, OrderStatus::Filled);
         assert_eq!(order_update.price_cents, Some(24567));

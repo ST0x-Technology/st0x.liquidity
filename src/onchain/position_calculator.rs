@@ -1,15 +1,7 @@
-use num_traits::ToPrimitive;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccumulationBucket {
     LongExposure,
     ShortExposure,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ConversionError {
-    #[error("Failed to convert u64 {value} to f64: precision loss would occur")]
-    U64ToF64PrecisionLoss { value: u64 },
 }
 
 /// Legacy position calculator for tracking accumulated positions.

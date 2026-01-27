@@ -2,8 +2,7 @@ use num_traits::ToPrimitive;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use st0x_execution::{
-    Direction, FractionalShares as ExecutionShares, OrderState, PersistenceError,
-    SupportedExecutor, Symbol,
+    Direction, FractionalShares, OrderState, PersistenceError, Positive, SupportedExecutor, Symbol,
 };
 use tracing::{debug, info, warn};
 
@@ -255,11 +254,7 @@ async fn try_create_execution_if_ready(
         return Ok(None);
     };
 
-    let shares_u64 = shares.try_into_u64()?;
-
-    if shares_u64 == 0 {
-        return Ok(None);
-    }
+    let execution_shares = Positive::new(FractionalShares::new(Decimal::from(shares)))?;
 
     let execution_type = match direction {
         Direction::Sell => AccumulationBucket::LongExposure,
@@ -271,7 +266,7 @@ async fn try_create_execution_if_ready(
         base_symbol,
         calculator,
         execution_type,
-        shares_u64,
+        execution_shares,
         direction,
         executor_type,
     )
@@ -283,10 +278,16 @@ async fn execute_position(
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     execution_type: AccumulationBucket,
-    shares: u64,
+    shares: Positive<FractionalShares>,
     direction: Direction,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
+    let shares_f64 = shares
+        .inner()
+        .inner()
+        .to_f64()
+        .ok_or_else(|| OnChainError::Validation(TradeValidationError::NegativeShares(0.0)))?;
+
     let execution =
         create_execution_within_transaction(sql_tx, base_symbol, shares, direction, executor_type)
             .await?;
@@ -294,14 +295,20 @@ async fn execute_position(
     let execution_id = execution.id.ok_or(PersistenceError::MissingExecutionId)?;
 
     // Find all trades that contributed to this execution and create linkages
-    create_trade_execution_linkages(sql_tx, base_symbol, execution_id, execution_type, shares)
-        .await?;
+    create_trade_execution_linkages(
+        sql_tx,
+        base_symbol,
+        execution_id,
+        execution_type,
+        shares_f64,
+    )
+    .await?;
 
-    calculator.reduce_accumulation(execution_type, shares)?;
+    calculator.reduce_accumulation(execution_type, shares_f64);
 
     info!(
         symbol = %base_symbol,
-        shares = shares,
+        shares = %shares,
         direction = ?direction,
         execution_type = ?execution_type,
         execution_id = ?execution.id,
@@ -320,7 +327,7 @@ async fn create_trade_execution_linkages(
     base_symbol: &Symbol,
     execution_id: i64,
     execution_type: AccumulationBucket,
-    execution_shares: u64,
+    execution_shares: f64,
 ) -> Result<(), OnChainError> {
     // Find all trades for this symbol that created this accumulated exposure
     // AccumulationBucket::ShortExposure comes from onchain SELL trades (sold stock, now short)
@@ -411,14 +418,14 @@ async fn create_trade_execution_linkages(
 async fn create_execution_within_transaction(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     symbol: &Symbol,
-    shares: u64,
+    shares: Positive<FractionalShares>,
     direction: Direction,
     executor: SupportedExecutor,
 ) -> Result<OffchainExecution, OnChainError> {
     let execution = OffchainExecution {
         id: None,
         symbol: symbol.clone(),
-        shares: Shares::new(shares)?,
+        shares,
         direction,
         executor,
         state: OrderState::Pending,
@@ -658,15 +665,14 @@ async fn check_symbol_for_execution(
     symbol: &Symbol,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
-    let Some((direction, shares_u64)) =
-        get_ready_execution_params(dual_write_context, symbol).await?
+    let Some((direction, shares)) = get_ready_execution_params(dual_write_context, symbol).await?
     else {
         return Ok(None);
     };
 
     info!(
         symbol = %symbol,
-        shares = shares_u64,
+        shares = %shares,
         direction = ?direction,
         "Position ready for execution"
     );
@@ -675,7 +681,7 @@ async fn check_symbol_for_execution(
     clean_up_stale_executions(&mut sql_tx, symbol).await?;
 
     let result = if try_acquire_execution_lease(&mut sql_tx, symbol).await? {
-        process_symbol_execution(&mut sql_tx, symbol, direction, shares_u64, executor_type).await?
+        process_symbol_execution(&mut sql_tx, symbol, direction, shares, executor_type).await?
     } else {
         info!(symbol = %symbol, "Another worker holds execution lease, skipping");
         None
@@ -688,7 +694,7 @@ async fn check_symbol_for_execution(
 async fn get_ready_execution_params(
     dual_write_context: &DualWriteContext,
     symbol: &Symbol,
-) -> Result<Option<(Direction, u64)>, OnChainError> {
+) -> Result<Option<(Direction, Positive<FractionalShares>)>, OnChainError> {
     let Some(position) = load_position(dual_write_context, symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
@@ -703,23 +709,16 @@ async fn get_ready_execution_params(
         return Ok(None);
     };
 
-    let shares_u64 = match shares.try_into_u64() {
-        Ok(s) if s > 0 => s,
-        Ok(_) => return Ok(None),
-        Err(e) => {
-            warn!(symbol = %symbol, error = %e, "Failed to convert shares to u64, skipping");
-            return Ok(None);
-        }
-    };
+    let execution_shares = Positive::new(FractionalShares::new(Decimal::from(shares)))?;
 
-    Ok(Some((direction, shares_u64)))
+    Ok(Some((direction, execution_shares)))
 }
 
 async fn process_symbol_execution(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     symbol: &Symbol,
     direction: Direction,
-    shares_u64: u64,
+    shares: Positive<FractionalShares>,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let mut calculator = get_or_create_within_transaction(sql_tx, symbol).await?;
@@ -734,7 +733,7 @@ async fn process_symbol_execution(
         symbol,
         &mut calculator,
         execution_type,
-        shares_u64,
+        shares,
         direction,
         executor_type,
     )
@@ -765,9 +764,11 @@ async fn process_symbol_execution(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{FixedBytes, fixed_bytes};
+    use std::str::FromStr;
+
     use backon::{ExponentialBuilder, Retryable};
     use chrono::Utc;
-    use st0x_execution::{OrderStatus, Symbol};
+    use st0x_execution::{FractionalShares, OrderStatus, Symbol};
 
     use super::*;
     use crate::dual_write::DualWriteContext;
@@ -810,7 +811,7 @@ mod tests {
         let stale_execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -842,7 +843,7 @@ mod tests {
         let pending_execution = OffchainExecution {
             id: Some(execution_id),
             symbol: symbol.clone(),
-            shares: Shares::new(1).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -1158,7 +1159,7 @@ mod tests {
         let blocking_execution = OffchainExecution {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(50).unwrap(),
+            shares: FractionalShares::new(Decimal::from(50)).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -1217,7 +1218,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(executions[0].shares, Shares::new(50).unwrap());
+        assert_eq!(
+            executions[0].shares,
+            FractionalShares::new(Decimal::from(50)).unwrap()
+        );
     }
 
     #[tokio::test]

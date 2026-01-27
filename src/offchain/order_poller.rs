@@ -353,7 +353,9 @@ fn log_filled_order(execution_id: i64, price_cents: u64, execution: &OffchainExe
 mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
-    use st0x_execution::{Direction, FractionalShares, MockExecutor, SupportedExecutor, Symbol};
+    use st0x_execution::{
+        Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
+    };
 
     use super::*;
     use crate::offchain_order::BrokerOrderId;

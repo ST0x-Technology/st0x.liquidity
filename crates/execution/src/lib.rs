@@ -149,7 +149,7 @@ where
         Ok(Self(value))
     }
 
-    pub fn value(self) -> T {
+    pub fn inner(self) -> T {
         self.0
     }
 }
@@ -238,7 +238,7 @@ impl FractionalShares {
         Self(value)
     }
 
-    pub fn value(self) -> Decimal {
+    pub fn inner(self) -> Decimal {
         self.0
     }
 
@@ -270,7 +270,7 @@ impl Positive<FractionalShares> {
     /// Converts to whole shares count, returning error if value has a fractional part.
     /// Use this when the target API does not support fractional shares.
     pub fn to_whole_shares(self) -> Result<u64, InvalidSharesError> {
-        let inner = self.value();
+        let inner = self.inner();
         if !inner.is_whole() {
             return Err(InvalidSharesError::Fractional(inner.0));
         }
@@ -526,7 +526,7 @@ mod tests {
         ) {
             let decimal = Decimal::new(mantissa, scale);
             let shares = FractionalShares::new(decimal).unwrap();
-            prop_assert_eq!(shares.value(), decimal);
+            prop_assert_eq!(shares.inner(), decimal);
         }
 
         #[test]
@@ -579,12 +579,12 @@ mod tests {
             let decimal = Decimal::new(mantissa, scale);
             let shares = FractionalShares::new(decimal).unwrap();
 
-            if let Some(f64_value) = shares.value().to_f64()
+            if let Some(f64_value) = shares.inner().to_f64()
                 && f64_value.is_finite()
                 && f64_value > 0.0
             {
                 let roundtrip = FractionalShares::from_f64(f64_value).unwrap();
-                let diff = (shares.value() - roundtrip.value()).abs();
+                let diff = (shares.inner() - roundtrip.inner()).abs();
                 prop_assert!(
                     diff < Decimal::new(1, 10),
                     "Roundtrip diff too large: {} for original {}",

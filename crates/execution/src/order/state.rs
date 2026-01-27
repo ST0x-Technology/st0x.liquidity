@@ -119,8 +119,8 @@ impl OrderState {
 
         let symbol_str = symbol.to_string();
         let shares_f64 = shares
-            .value()
-            .value()
+            .inner()
+            .inner()
             .to_f64()
             .ok_or(crate::PersistenceError::InvalidShareQuantity(0.0))?;
         let direction_str = direction.as_str();

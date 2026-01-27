@@ -2,8 +2,8 @@ use sqlx::SqlitePool;
 
 use crate::error::OnChainError;
 use st0x_execution::{
-    Direction, FractionalShares, OrderState, OrderStatus, PersistenceError, SupportedExecutor,
-    Symbol,
+    Direction, FractionalShares, OrderState, OrderStatus, PersistenceError, Positive,
+    SupportedExecutor, Symbol,
 };
 
 #[derive(sqlx::FromRow)]
@@ -42,17 +42,13 @@ fn row_to_execution(
             OnChainError::Persistence(PersistenceError::InvalidTradeStatus(e.to_string()))
         })?;
 
-    if shares <= 0.0 {
-        return Err(OnChainError::Persistence(
-            PersistenceError::InvalidShareQuantity(shares),
-        ));
-    }
     let fractional_shares = FractionalShares::from_f64(shares)?;
+    let positive_shares = Positive::new(fractional_shares)?;
 
     Ok(OffchainExecution {
         id: Some(id),
         symbol: Symbol::new(symbol)?,
-        shares: fractional_shares,
+        shares: positive_shares,
         direction: parsed_direction,
         executor: parsed_executor,
         state: parsed_state,
@@ -63,7 +59,7 @@ fn row_to_execution(
 pub(crate) struct OffchainExecution {
     pub(crate) id: Option<i64>,
     pub(crate) symbol: Symbol,
-    pub(crate) shares: FractionalShares,
+    pub(crate) shares: Positive<FractionalShares>,
     pub(crate) direction: Direction,
     pub(crate) executor: SupportedExecutor,
     pub(crate) state: OrderState,
