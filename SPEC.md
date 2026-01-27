@@ -280,14 +280,14 @@ before merging to avoid confusing human and AI contributors.
 - **Rollback uncertainty:** Rollback scripts exist but haven't been
   battle-tested enough to trust them in an emergency
 
-#### **Approaches**
+---
 
 The following approaches address these pain points with different trade-offs.
 
-#### **Approach A: Nix-Maxxing (NixOS + deploy-rs + ragenix)**
+#### Nix-Maxxing
 
-This approach extends the team's existing Nix usage for development environments
-to infrastructure, deployment, and secrets management.
+This approach extends Nix usage from only development environments and builds to
+infrastructure, deployment, and secrets management.
 
 **Key Tools:**
 
@@ -301,7 +301,7 @@ to infrastructure, deployment, and secrets management.
   activation types: `activate.nixos` for full system configs, `activate.custom`
   for standalone packages with an auto-rollback on failed deployments.
 
-- **ragenix**: Age-encrypted secrets for NixOS, using existing SSH keys. CLI
+- (r)**agenix**: Age-encrypted secrets for NixOS, using existing SSH keys. CLI
   encrypts secrets locally into `.age` files you commit to git. NixOS module
   decrypts at activation using the host's SSH key, mounting secrets to
   `/run/agenix/` (tmpfs - cleartext never hits disk or Nix store). No GPG, no
@@ -331,15 +331,16 @@ units):
 - `reporter-schwab` - position reporter for Schwab
 - `reporter-alpaca` - position reporter for Alpaca
 - `dashboard` - operations dashboard (single instance, switches executors in UI)
-- `grafana` - metrics (NixOS native service, not a deploy-rs profile)
 
 Each profile deploys its binary to a known path and restarts the corresponding
 systemd unit. This allows updating one service without touching others.
 
+Grafana runs as a NixOS native service (part of base image configuration, not a
+deploy-rs profile).
+
 _Configuration management_:
 
-- Single TOML config file per service containing all config (secrets and
-  non-secrets)
+- Single TOML config file per service containing complete configuration
 - Files encrypted with ragenix, decrypted at activation to `/run/agenix/`
 - Services use `clap-config-file` crate to load config via `--config-file` flag
 - Secrets marked `config_only` so they cannot be passed via CLI args
@@ -384,22 +385,23 @@ ragenix deployment fails.
 
 Pros:
 
-- Leverages team's existing Nix knowledge
 - Single language (Nix) for images, deployments, secrets, dev environments
-- Dev/prod version parity: same flake.lock pins dependencies everywhere
-- Reproducible, byte-identical builds
+- Consistent dependency versions in all environments managed by a single source
+  of truth
 - Atomic updates - system never in half-broken state
 - Robust rollback via nix profile generations (built-in, not custom scripts)
 - Secrets in git with audit trail
-- More lightweight than containers; Nix derivations can be converted to Docker
-  images if needed (`dockerTools.buildImage`), but not vice versa
+- Nix provides many benefits of containerization while being more lightweight
+- Nix derivations can be converted to Docker images using
+  `dockerTools.buildImage`, but not vice versa
 
 Cons:
 
-- Requires NixOS on target (can't deploy to arbitrary Ubuntu hosts)
+- (r)agenix requires NixOS on target
 - deploy-rs is less mature than some alternatives
+- There is a learning curve if you're not already familiar with Nix
 
-#### **Approach B: Ansible + Terraform + Ansible Vault (Non-Nix Path)**
+#### Ansible
 
 This approach uses Ansible for deployment automation without extending Nix to
 infrastructure.
@@ -451,7 +453,7 @@ in order, reports what changed.
 
 Terraform provisions Ubuntu droplet. Ansible handles everything else:
 
-1. CI builds Rust binaries (`cargo build --release`)
+1. CI builds Rust binaries
 2. `ansible-playbook deploy.yml` runs
 3. Ansible SSHs to server, copies binaries, writes systemd units from templates
 4. Ansible restarts services
@@ -523,7 +525,7 @@ Cons:
 - Introduces separate tooling instead of extending existing Nix
 - Team already knows Nix; this doesn't leverage that knowledge
 
-#### **Approach C: Kamal + Terraform + SOPS (Container-Based)**
+#### Kamal
 
 This approach uses Docker containers with Kamal for deployment orchestration and
 SOPS for git-stored encrypted secrets.
@@ -588,110 +590,9 @@ Cons:
 - Another tool (SOPS) though simpler than HashiCorp Vault
 - Designed for web apps (Traefik/zero-downtime features unused)
 
-#### **Approach D: Shuttle.rs (Rust-Native PaaS)**
-
-This approach uses Shuttle.rs, a Platform-as-a-Service designed specifically for
-Rust backends. Eliminates infrastructure management entirely by delegating to
-the platform.
-
-**Key Tools:**
-
-- **Shuttle.rs**: Rust-native PaaS that handles infrastructure, deployment, and
-  hosting. Annotate Rust code with macros, push to Shuttle, and they handle
-  everything else.
-
-**Architecture:**
-
-Shuttle is a fundamentally different model - you don't manage infrastructure at
-all. The deployment flow:
-
-1. Add Shuttle dependencies and macros to your Rust code
-2. `cargo shuttle deploy` builds and pushes to Shuttle's infrastructure
-3. Shuttle provisions compute, databases, secrets storage automatically
-4. Application runs on Shuttle's managed infrastructure
-
-_Per-service deployment_: Each Shuttle project is a separate deployment unit.
-Multiple services would be multiple Shuttle projects, deployed independently.
-
-_Secrets_: Shuttle has built-in secrets management via `shuttle secrets set`.
-Secrets are injected at runtime through Shuttle's runtime macros.
-
-**How It Would Work for This Project:**
-
-The hedging bot would need refactoring to use Shuttle's runtime:
-
-```rust
-#[shuttle_runtime::main]
-async fn main(
-    #[shuttle_runtime::Secrets] secrets: SecretStore,
-) -> shuttle_axum::ShuttleAxum {
-    let schwab_key = secrets.get("SCHWAB_API_KEY").unwrap();
-    // ... rest of application
-}
-```
-
-Each service (server-schwab, server-alpaca, reporter-schwab, reporter-alpaca,
-dashboard) becomes a separate Shuttle project.
-
-**Rollback:**
-
-Shuttle maintains deployment history. Rollback via:
-`cargo shuttle deployment rollback <deployment-id>`
-
-Platform-managed, so reliability depends on Shuttle's infrastructure.
-
-**Caveats:**
-
-- **Nix integration is broken**: The `cargo-shuttle` package in nixpkgs is
-  outdated and non-functional. Shuttle no longer maintains cargo-shuttle as a
-  separate tool. You must use the official installer or write a custom
-  derivation wrapping it.
-- **Vendor lock-in**: Application code depends on Shuttle-specific macros and
-  runtime. Migrating away requires removing these annotations and re-adding
-  infrastructure management.
-- **Less control**: Cannot customize underlying infrastructure, networking,
-  security policies beyond what Shuttle exposes.
-- **Maturity**: Younger platform, less battle-tested for financial applications.
-  Unclear SLAs and compliance certifications.
-- **Multi-service coordination**: Each service is a separate Shuttle project.
-  Coordinating deployments across services requires external orchestration.
-
-**Financial Application Concerns:**
-
-- **Compliance**: Does Shuttle's infrastructure meet requirements for financial
-  applications? SOC2? Where is data stored?
-- **Audit trail**: Platform-managed means less visibility into infrastructure
-  changes
-- **Availability SLAs**: What guarantees does Shuttle provide for uptime?
-- **Data residency**: Where do Shuttle's servers run? Is data leaving expected
-  jurisdictions?
-
-These questions need answers before this approach is viable for a financial
-application.
-
-**Trade-offs:**
-
-Pros:
-
-- Eliminates infrastructure management entirely
-- Rust-native - feels like a natural extension of cargo
-- Familiar DX if you use Vercel for frontends
-- Built-in secrets, databases, deployment history
-- Solves the fragility problem by removing self-managed infrastructure entirely
-
-Cons:
-
-- Vendor lock-in (code changes required to adopt or leave)
-- Broken Nix integration (can't manage Shuttle CLI via flake)
-- Less control over infrastructure
-- Unclear fit for financial compliance requirements
-- Team's Nix knowledge provides no advantage here
-- Younger platform with less battle-testing
-- Pricing at scale unclear (currently free tier + $20/month pro)
-
 #### **Comparison Matrix**
 
-| Requirement             | Approach A (Nix)       | Approach B (Ansible) | Approach C (Kamal)  |
+| Requirement             | Nix-Maxxing            | Ansible              | Kamal               |
 | ----------------------- | ---------------------- | -------------------- | ------------------- |
 | Solves fragility        | Yes (declarative)      | Mostly (YAML > bash) | Yes (declarative)   |
 | Eliminate DO UI         | Terraform              | Terraform            | Terraform           |
@@ -705,36 +606,6 @@ Cons:
 | Reproducibility         | Byte-identical         | Best effort          | Best effort         |
 | Dev/prod version parity | Same flake.lock        | Manual coordination  | Manual coordination |
 | Leverage existing Nix   | Extends flake          | Parallel tooling     | Parallel tooling    |
-
-**Note on Approach D (Shuttle.rs):** Not included in comparison matrix as it's a
-fundamentally different model (PaaS vs self-managed). Shuttle eliminates
-infrastructure management entirely but introduces vendor lock-in and less
-control. Evaluate separately based on compliance requirements and risk appetite.
-
-#### **Cost Comparison**
-
-Approaches A, B, and C use the same infrastructure (DigitalOcean droplet) with
-different open-source tooling. Approach D is a PaaS with bundled infrastructure.
-
-| Component          | A (Nix)    | B (Ansible) | C (Kamal)         | D (Shuttle)         |
-| ------------------ | ---------- | ----------- | ----------------- | ------------------- |
-| Tooling            | Free       | Free        | Free              | Free tier available |
-| Infrastructure     | DO droplet | DO droplet  | DO droplet        | Included            |
-| Container registry | N/A        | N/A         | Free (Docker Hub) | Included            |
-
-**Infrastructure costs (DigitalOcean, Jan 2026):**
-
-- Basic droplet: $4/month (1 vCPU, 512MB RAM, 10GB SSD)
-- Premium droplet: $7-8/month (1 vCPU, 1GB RAM, 25-35GB NVMe)
-- Outbound transfer beyond allowance: $0.01/GiB
-- Backups: +20-30% of droplet cost
-
-For 6 services on a single droplet, expect $7-14/month infrastructure cost
-depending on resource needs.
-
-**Shuttle.rs:** Free tier for experimentation. Pro tier pricing currently in
-flux (overhauled late 2024, new tiers announced for 2025). Check
-[shuttle.dev/pricing](https://www.shuttle.dev/pricing) for current rates.
 
 ## **Crate Architecture**
 
