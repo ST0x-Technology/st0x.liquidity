@@ -250,7 +250,7 @@ before merging to avoid confusing human and AI contributors.
 - Balanced complexity: more robust than bash scripts, less complex than
   Kubernetes
 - Support potential future microservices architecture
-- Thin GitHub Actions workflows (invoke tools, no inline bash)
+- Thin GitHub Actions workflows with minimal bash
 
 #### **Current Setup and Pain Points**
 
@@ -291,12 +291,11 @@ to infrastructure, deployment, and secrets management.
 
 **Key Tools:**
 
-- **Terraform**: Provisions DigitalOcean infrastructure (droplets, Spaces
-  buckets, VPCs, firewall rules). Standard HCL, version pinned via flake.lock.
+- **Terraform**: Provisions single DigitalOcean droplet (matching current
+  architecture). Standard HCL, version pinned via flake.lock.
 
-- **nixos-generators**: Builds custom NixOS VM images for cloud providers
-  (DigitalOcean, AWS, etc.). We build a base image with OS essentials, then
-  upload it to DigitalOcean Spaces for droplet provisioning.
+- **nixos-generators**: Builds custom NixOS VM images for DigitalOcean. Base
+  image with OS essentials, uploaded as custom image for droplet creation.
 
 - **deploy-rs**: Deploys to NixOS (or non-NixOS) hosts via SSH. Supports two
   activation types: `activate.nixos` for full system configs, `activate.custom`
@@ -349,9 +348,8 @@ _Configuration management_:
 
 _Infrastructure_:
 
-- Terraform (standard HCL) for DigitalOcean resources
+- Terraform (standard HCL) provisions single droplet
 - Nix wraps Terraform for reproducible execution (pinned version via flake.lock)
-- Remote state in DO Spaces with locking
 
 **Rollback:**
 
@@ -410,7 +408,7 @@ infrastructure.
 
 **Key Tools:**
 
-- **Terraform**: Provisions DigitalOcean droplets (Ubuntu) declaratively.
+- **Terraform**: Provisions single DigitalOcean droplet (Ubuntu).
 - **Ansible**: Deployment automation via SSH. You describe desired server state
   in YAML files, Ansible makes it so. No agent/daemon on target servers - just
   SSH access.
@@ -534,7 +532,7 @@ SOPS for git-stored encrypted secrets.
 
 **Key Tools:**
 
-- **Terraform**: Provisions DigitalOcean infrastructure (droplets, networking).
+- **Terraform**: Provisions single DigitalOcean droplet (Ubuntu with Docker).
 - **Kamal**: Basecamp's deployment tool. Runs from CI over SSH, manages Docker
   container lifecycle on remote servers. No daemon on server - just Docker.
 - **SOPS**: Mozilla's secrets tool. Encrypts values (not keys) in YAML/JSON
