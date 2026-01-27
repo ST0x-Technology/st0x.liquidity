@@ -299,9 +299,7 @@ to infrastructure, deployment, and secrets management.
 
 - **deploy-rs**: Deploys to NixOS (or non-NixOS) hosts via SSH. Supports two
   activation types: `activate.nixos` for full system configs, `activate.custom`
-  for standalone packages. Key feature: "magic rollback" auto-reverts if SSH
-  connection is lost during activation (safety net, not a general rollback
-  mechanism).
+  for standalone packages with an auto-rollback on failed deployments.
 
 - **ragenix**: Age-encrypted secrets for NixOS, using existing SSH keys. CLI
   encrypts secrets locally into `.age` files you commit to git. NixOS module
