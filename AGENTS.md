@@ -29,8 +29,8 @@ The project uses a strict document hierarchy:
 
 1. **SPEC.md** - Source of truth for system behavior. Features documented here
    before implementation.
-2. **GitHub Issues / Roadmap (#2)** - Downstream from spec. Describe problems,
-   not solutions.
+2. **ROADMAP.md / GitHub Issues** - Downstream from spec. Describe problems, not
+   solutions.
 3. **Planning** - Downstream from issues. Implementation plans before coding.
 4. **Tests** - Downstream from plan. Written before implementation (TDD).
 5. **Implementation** - Makes the tests pass.
@@ -194,18 +194,46 @@ resolution and feature selection.
   If you want to test functionality, write proper tests. There is never a reason
   to run the application speculatively.
 
-### Updating GitHub Issues
+### Updating ROADMAP.md
 
-When updating GitHub issue bodies (especially the roadmap issue #2):
+After completing work or creating new issues, update ROADMAP.md:
 
-1. Save the current body to a local `.md` file:
-   `gh issue view <number> --repo ST0x-Technology/st0x.liquidity --json body -q '.body' > roadmap-issue-2.md`
-2. Edit the file using the `Edit` tool (so changes are visible for review)
-3. Apply the update:
-   `gh issue edit <number> --repo ST0x-Technology/st0x.liquidity --body-file roadmap-issue-2.md`
-4. Delete the temp file
+**Section ordering (newest first):**
 
-This pattern ensures changes are reviewable before being applied.
+The roadmap is ordered with highest priority / most recent work at the top:
+
+1. **Current Development Focus** - Active work and immediate priorities
+2. **Backlog sections** - Planned future work by category
+3. **Completed sections** - Finished work, ordered newest to oldest
+
+This ordering ensures readers see current priorities immediately without
+scrolling past historical work. When adding new "Completed" sections, add them
+above older completed sections.
+
+**After completing a plan:**
+
+1. Mark completed issues as `[x]` with PR link
+2. Use this format:
+   ```markdown
+   - [x] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
+     - PR: [#M PR title](https://github.com/ST0x-Technology/st0x.liquidity/pull/M)
+   ```
+3. Move completed items from "Current Development Focus" to the appropriate
+   "Completed" section (or create a new one if it represents a milestone)
+
+**When creating new issues:**
+
+1. Add the issue to the appropriate roadmap section
+2. Use this format:
+   ```markdown
+   - [ ] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
+   ```
+
+**Verification:**
+
+- Use `gh issue list --state all` and `gh pr list --state all` to cross-check
+- Ensure no issues are marked `[x]` in ROADMAP.md but still open on GitHub
+- Ensure all recent closed issues/PRs are reflected in the roadmap
 
 ## Architecture Overview
 
