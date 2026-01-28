@@ -248,6 +248,31 @@ where
     pub(crate) fn get_config_by_wrapped(&self, wrapped: &Address) -> Option<&WrappedTokenConfig> {
         self.registry.get_by_wrapped(wrapped)
     }
+
+    /// Fetches the VaultRatio for a symbol.
+    ///
+    /// Returns the actual ratio for wrapped tokens, or `VaultRatio::one_to_one()`
+    /// for non-wrapped tokens (which leaves values unchanged when applied).
+    pub(crate) async fn get_ratio_for_symbol(&self, symbol: &st0x_execution::Symbol) -> VaultRatio {
+        let Some(config) = self.get_config_by_symbol(symbol) else {
+            return VaultRatio::one_to_one();
+        };
+
+        let wrapped_token = config.wrapped_token;
+
+        match self.get_ratio(wrapped_token).await {
+            Ok(ratio) => ratio,
+            Err(e) => {
+                tracing::warn!(
+                    symbol = %symbol,
+                    wrapped_token = %wrapped_token,
+                    error = %e,
+                    "Failed to fetch VaultRatio, using 1:1 ratio"
+                );
+                VaultRatio::one_to_one()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
