@@ -54,7 +54,7 @@ pub(super) async fn fetch_inventory(
                                 "Market value conversion to cents failed"
                             );
                             AlpacaBrokerApiError::MarketValueConversion {
-                                symbol: position.symbol.clone(),
+                                symbol: symbol.clone(),
                                 market_value: position.market_value,
                             }
                         })?;
@@ -300,7 +300,7 @@ mod tests {
 
         assert!(matches!(
             result.unwrap_err(),
-            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol == "AAPL"
+            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
         ));
     }
 

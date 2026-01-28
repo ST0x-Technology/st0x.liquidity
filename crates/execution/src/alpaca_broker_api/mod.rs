@@ -3,6 +3,8 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::Symbol;
+
 mod auth;
 mod client;
 mod executor;
@@ -82,7 +84,7 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Market value conversion failed for symbol {symbol}: {market_value:?}")]
     MarketValueConversion {
-        symbol: String,
+        symbol: Symbol,
         market_value: Option<Decimal>,
     },
 }

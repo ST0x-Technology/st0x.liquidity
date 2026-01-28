@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
@@ -833,6 +833,13 @@ async fn discover_vaults_for_trade(
                 symbol: base_symbol.clone(),
             }
         } else {
+            warn!(
+                vault_id = %vault.vault_id,
+                token = %vault.token,
+                usdc = %USDC_BASE,
+                expected_equity_token = %expected_equity_token,
+                "Vault token does not match USDC or expected equity token, skipping"
+            );
             continue;
         };
 
