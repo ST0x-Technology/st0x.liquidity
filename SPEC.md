@@ -2064,6 +2064,14 @@ know about cross-venue inventory.
   destination available
 - `UsdcRebalanceEvent::RebalancingFailed` - Reconciles inflight back to source
   available
+- `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
+  vaults
+- `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
+  vault
+- `InventorySnapshotEvent::OffchainEquity` - Offchain equity positions fetched
+  from broker
+- `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
+  broker
 
 **Separation of concerns**:
 
@@ -2072,6 +2080,31 @@ know about cross-venue inventory.
   movements
 - UsdcRebalance: Tracks rebalancing-induced USDC movements
 - InventoryView: Combines all events to calculate total inventory
+- InventorySnapshot: Records fetched balances from onchain vaults and offchain
+  broker
+
+**Inventory Reconciliation**:
+
+The system's internal accounting is built from events it knows about (trades,
+mints, redemptions, USDC rebalances). But inventory can be affected by actions
+outside the system - manual deposits, withdrawals, or trades on either venue.
+Until those external changes are observed and fed back as events, the internal
+accounting drifts from reality.
+
+The reconciliation system closes this gap by periodically fetching actual
+balances and emitting them as events the system can react to:
+
+- **VaultRegistry** (CQRS aggregate): Auto-discovers Raindex vaults from
+  ClearV3/TakeOrderV3 trade events. Tracks equity vaults (per token address) and
+  a single USDC vault per orderbook/owner pair.
+- **InventorySnapshot** (CQRS aggregate): Records point-in-time snapshots of
+  actual balances fetched from onchain vaults and the offchain broker.
+- **InventoryPollingService**: Periodically polls actual balances from both
+  venues, emitting InventorySnapshot events. InventoryView reacts to these events
+  to update tracked inventory.
+- **Polling runs on a 60-second interval** during market hours as a background
+  conductor task. Onchain polling uses the `vaultBalance2` contract call; offchain
+  polling uses the `Executor::get_inventory()` trait method.
 
 ### **View Design**
 
