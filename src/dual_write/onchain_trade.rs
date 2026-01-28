@@ -74,7 +74,6 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            vault_ratio: None,
         };
 
         let result = witness_trade(&context, &trade, 12345).await;
@@ -133,7 +132,6 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            vault_ratio: None,
         };
 
         witness_trade(&context, &trade1, 12345).await.unwrap();
@@ -178,7 +176,6 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            vault_ratio: None,
         };
 
         let result = witness_trade(&context, &trade, 12345).await;

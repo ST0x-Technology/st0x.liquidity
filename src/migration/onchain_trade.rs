@@ -252,8 +252,7 @@ mod tests {
                 amount REAL NOT NULL,
                 direction TEXT NOT NULL,
                 price_usdc REAL NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                vault_ratio REAL
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
         .execute(&pool)
@@ -307,8 +306,7 @@ mod tests {
                 amount REAL NOT NULL,
                 direction TEXT NOT NULL,
                 price_usdc REAL NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                vault_ratio REAL
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
         .execute(&pool)
@@ -391,8 +389,7 @@ mod tests {
                 amount REAL NOT NULL,
                 direction TEXT NOT NULL,
                 price_usdc REAL NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                vault_ratio REAL
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )",
         )
         .execute(&pool)
