@@ -7,15 +7,16 @@ mod executor;
 mod market_hours;
 mod order;
 mod order_status;
+pub mod persistence;
 mod tokens;
 
 // Re-export only what's needed for executor construction
-pub use auth::{
-    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthEnv, SchwabAuthError,
-    SchwabAuthEvent,
+pub use auth::SchwabAuthEnv;
+pub use encryption::{
+    EncryptedToken, EncryptionError, EncryptionKey, decrypt_token, encrypt_token,
 };
-pub use encryption::{EncryptedToken, EncryptionError, EncryptionKey, decrypt_token};
 pub use executor::{SchwabConfig, SchwabExecutor};
+pub use persistence::SchwabPersistence;
 
 // Re-export for auth CLI command (Schwab-specific, not part of generic broker API)
 pub use tokens::SchwabTokens;
@@ -31,10 +32,6 @@ pub enum SchwabError {
     /// HTTP request execution failed, wraps [`reqwest::Error`].
     #[error("Request failed: {0}")]
     Reqwest(#[from] reqwest::Error),
-
-    /// Database query or migration failed, wraps [`sqlx::Error`].
-    #[error("Database error: {0}")]
-    Sqlx(#[from] sqlx::Error),
 
     /// File system operation failed, wraps [`std::io::Error`].
     #[error("IO error: {0}")]
@@ -102,6 +99,10 @@ pub enum SchwabError {
     /// Token encryption or decryption failed, wraps [`encryption::EncryptionError`].
     #[error("Encryption error: {0}")]
     Encryption(#[from] encryption::EncryptionError),
+
+    /// Persistence layer operation failed.
+    #[error("Persistence error: {0}")]
+    Persistence(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {

@@ -21,6 +21,27 @@ pub use mock::{MockExecutor, MockExecutorConfig};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::SchwabExecutor;
 
+/// Trait for persisting order state to legacy tables.
+/// Used by DualWritePersistence in dual-write mode.
+/// In pure ES/CQRS mode, this trait is not used - persistence calls are skipped entirely.
+#[async_trait]
+pub trait OrderStatePersistence: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Store a new order state, returns the execution ID (database row ID).
+    async fn store(
+        &self,
+        state: &OrderState,
+        symbol: &Symbol,
+        shares: Shares,
+        direction: Direction,
+        executor: SupportedExecutor,
+    ) -> Result<i64, Self::Error>;
+
+    /// Update an existing order state by execution ID.
+    async fn store_update(&self, state: &OrderState, execution_id: i64) -> Result<(), Self::Error>;
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -47,10 +68,6 @@ pub trait Executor: Send + Sync + 'static {
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
-
-    /// Poll all pending orders for status updates
-    /// More efficient than individual get_order_status calls for multiple orders
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
     /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic
@@ -239,8 +256,6 @@ impl std::str::FromStr for Direction {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
-    #[error("Database error: {0}")]
-    Database(#[from] sqlx::Error),
     #[error("Schwab error: {0}")]
     Schwab(#[from] schwab::SchwabError),
     #[error("{status:?} order requires order_id")]

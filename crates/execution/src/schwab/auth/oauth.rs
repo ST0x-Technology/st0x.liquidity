@@ -5,11 +5,12 @@ use chrono::Utc;
 use clap::Parser;
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use std::io::Read;
 use tracing::{debug, info};
 
-use super::super::{SchwabError, tokens::SchwabTokens};
+use super::super::SchwabError;
+use super::super::persistence::SchwabPersistence;
+use super::super::tokens::SchwabTokens;
 
 #[derive(Parser, Debug, Clone)]
 pub struct SchwabAuthEnv {
@@ -45,8 +46,11 @@ pub(crate) struct AccountNumbers {
 }
 
 impl SchwabAuthEnv {
-    pub async fn get_account_hash(&self, pool: &SqlitePool) -> Result<String, SchwabError> {
-        let access_token = SchwabTokens::get_valid_access_token(pool, self).await?;
+    pub async fn get_account_hash<P: SchwabPersistence>(
+        &self,
+        persistence: &P,
+    ) -> Result<String, SchwabError> {
+        let access_token = SchwabTokens::get_valid_access_token(persistence, self).await?;
 
         let headers = [
             (
@@ -245,10 +249,20 @@ async fn extract_error_body(response: reqwest::Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
+    use crate::schwab::persistence::MockSchwabPersistence;
+    use crate::test_utils::TEST_ENCRYPTION_KEY;
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
+
+    fn create_test_tokens() -> crate::schwab::tokens::SchwabTokens {
+        crate::schwab::tokens::SchwabTokens {
+            access_token: "test_access_token".to_string(),
+            access_token_fetched_at: Utc::now(),
+            refresh_token: "test_refresh_token".to_string(),
+            refresh_token_fetched_at: Utc::now(),
+        }
+    }
 
     fn create_test_env() -> SchwabAuthEnv {
         SchwabAuthEnv {
@@ -586,8 +600,7 @@ mod tests {
     async fn test_get_account_hash_success() {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock_response = json!([
             {
@@ -610,7 +623,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = env.get_account_hash(&persistence).await;
 
         mock.assert();
         assert_eq!(result.unwrap(), "ABC123DEF456");
@@ -621,8 +634,7 @@ mod tests {
         let server = MockServer::start();
         let mut env = create_test_env_with_mock_server(&server);
         env.schwab_account_index = 1;
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock_response = json!([
             {
@@ -645,7 +657,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = env.get_account_hash(&persistence).await;
 
         mock.assert();
         assert_eq!(result.unwrap(), "XYZ789GHI012");
@@ -656,8 +668,7 @@ mod tests {
         let server = MockServer::start();
         let mut env = create_test_env_with_mock_server(&server);
         env.schwab_account_index = 2;
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock_response = json!([
             {
@@ -673,7 +684,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = env.get_account_hash(&persistence).await;
 
         mock.assert();
         assert!(matches!(
@@ -686,8 +697,7 @@ mod tests {
     async fn test_get_account_hash_no_accounts() {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/trader/v1/accounts/accountNumbers");
@@ -696,7 +706,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = env.get_account_hash(&persistence).await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::NoAccountsFound));
@@ -722,15 +732,5 @@ mod tests {
             }
             other => panic!("Expected RequestFailed error, got: {other:?}"),
         }
-    }
-
-    async fn setup_test_tokens(pool: &SqlitePool) {
-        let tokens = crate::schwab::tokens::SchwabTokens {
-            access_token: "test_access_token".to_string(),
-            access_token_fetched_at: Utc::now(),
-            refresh_token: "test_refresh_token".to_string(),
-            refresh_token_fetched_at: Utc::now(),
-        };
-        tokens.store(pool, &TEST_ENCRYPTION_KEY).await.unwrap();
     }
 }

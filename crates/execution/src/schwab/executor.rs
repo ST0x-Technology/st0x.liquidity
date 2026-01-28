@@ -1,51 +1,53 @@
 use async_trait::async_trait;
-use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::schwab::SchwabAuthEnv;
-use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
-use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
+use super::SchwabAuthEnv;
+use super::market_hours::{MarketStatus, fetch_market_hours};
+use super::persistence::SchwabPersistence;
+use super::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
-    Direction, ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus,
-    OrderUpdate, Shares, Symbol, TryIntoExecutor,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, TryIntoExecutor,
 };
 
-/// Configuration for SchwabExecutor containing auth environment and database pool
+/// Configuration for SchwabExecutor containing auth environment and persistence layer.
 #[derive(Debug, Clone)]
-pub struct SchwabConfig {
+pub struct SchwabConfig<P: SchwabPersistence> {
     pub auth: SchwabAuthEnv,
-    pub pool: SqlitePool,
+    pub persistence: P,
 }
 
-/// Schwab executor implementation
+/// Schwab executor implementation generic over persistence layer.
 #[derive(Debug, Clone)]
-pub struct SchwabExecutor {
-    auth: SchwabAuthEnv,
-    pool: SqlitePool,
+pub struct SchwabExecutor<P: SchwabPersistence> {
+    pub(crate) auth: SchwabAuthEnv,
+    pub(crate) persistence: P,
 }
 
 #[async_trait]
-impl Executor for SchwabExecutor {
+impl<P: SchwabPersistence> Executor for SchwabExecutor<P>
+where
+    P::Error: 'static,
+{
     type Error = ExecutionError;
     type OrderId = String;
-    type Config = SchwabConfig;
+    type Config = SchwabConfig<P>;
 
     async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
         // Validate and refresh tokens during initialization
-        SchwabTokens::refresh_if_needed(&config.pool, &config.auth).await?;
+        SchwabTokens::refresh_if_needed(&config.persistence, &config.auth).await?;
 
         info!("Schwab executor initialized with valid tokens");
 
         Ok(Self {
             auth: config.auth,
-            pool: config.pool,
+            persistence: config.persistence,
         })
     }
 
     async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
         loop {
-            let market_hours = fetch_market_hours(&self.auth, &self.pool, None).await?;
+            let market_hours = fetch_market_hours(&self.auth, &self.persistence, None).await?;
 
             match market_hours.current_status() {
                 MarketStatus::Open => {
@@ -111,7 +113,7 @@ impl Executor for SchwabExecutor {
         );
 
         // Place the order using Schwab API
-        let response = schwab_order.place(&self.auth, &self.pool).await?;
+        let response = schwab_order.place(&self.auth, &self.persistence).await?;
 
         Ok(OrderPlacement {
             order_id: response.order_id,
@@ -127,7 +129,8 @@ impl Executor for SchwabExecutor {
         info!("Getting order status for: {}", order_id);
 
         let order_response =
-            crate::schwab::order::Order::get_order_status(order_id, &self.auth, &self.pool).await?;
+            crate::schwab::order::Order::get_order_status(order_id, &self.auth, &self.persistence)
+                .await?;
 
         if order_response.is_filled() {
             let price_cents = order_response.price_in_cents()?.ok_or_else(|| {
@@ -176,67 +179,6 @@ impl Executor for SchwabExecutor {
         }
     }
 
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
-        info!("Polling pending orders");
-
-        // Query database directly for submitted orders
-        let rows = sqlx::query!(
-            "SELECT * FROM offchain_trades WHERE status = 'SUBMITTED' ORDER BY id ASC"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut updates = Vec::new();
-
-        for row in rows {
-            let Some(order_id_value) = row.order_id else {
-                return Err(ExecutionError::MissingOrderId {
-                    status: OrderStatus::Submitted,
-                });
-            };
-
-            // Get current status from Schwab API
-            match self.get_order_status(&order_id_value).await {
-                Ok(current_state) => {
-                    // Only include orders that have changed status
-                    if !matches!(current_state, OrderState::Submitted { .. }) {
-                        let price_cents = match &current_state {
-                            OrderState::Filled { price_cents, .. } => Some(*price_cents),
-                            _ => None,
-                        };
-
-                        let symbol = Symbol::new(row.symbol)?;
-
-                        let shares_u64: u64 = row
-                            .shares
-                            .try_into()
-                            .map_err(|_| ExecutionError::NegativeShares { value: row.shares })?;
-                        let shares = Shares::new(shares_u64)?;
-
-                        let direction: Direction = row.direction.parse()?;
-
-                        updates.push(OrderUpdate {
-                            order_id: order_id_value.clone(),
-                            symbol,
-                            shares,
-                            direction,
-                            status: current_state.status(),
-                            updated_at: chrono::Utc::now(),
-                            price_cents,
-                        });
-                    }
-                }
-                Err(e) => {
-                    // Log error but continue with other orders
-                    info!("Failed to get status for order {}: {}", order_id_value, e);
-                }
-            }
-        }
-
-        info!("Found {} order updates", updates.len());
-        Ok(updates)
-    }
-
     fn to_supported_executor(&self) -> crate::SupportedExecutor {
         crate::SupportedExecutor::Schwab
     }
@@ -247,11 +189,11 @@ impl Executor for SchwabExecutor {
     }
 
     async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
-        let pool_clone = self.pool.clone();
+        let persistence_clone = self.persistence.clone();
         let auth_clone = self.auth.clone();
 
         let handle = tokio::spawn(async move {
-            let refresh_handle = spawn_automatic_token_refresh(pool_clone, auth_clone);
+            let refresh_handle = spawn_automatic_token_refresh(persistence_clone, auth_clone);
 
             if let Err(e) = refresh_handle.await
                 && !e.is_cancelled()
@@ -265,8 +207,11 @@ impl Executor for SchwabExecutor {
 }
 
 #[async_trait]
-impl TryIntoExecutor for SchwabConfig {
-    type Executor = SchwabExecutor;
+impl<P: SchwabPersistence> TryIntoExecutor for SchwabConfig<P>
+where
+    P::Error: 'static,
+{
+    type Executor = SchwabExecutor<P>;
 
     async fn try_into_executor(
         self,
@@ -278,13 +223,12 @@ impl TryIntoExecutor for SchwabConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schwab::tokens::SchwabTokens;
-    use crate::schwab::{SchwabAuthEnv, SchwabError};
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
+    use crate::schwab::SchwabError;
+    use crate::schwab::persistence::MockSchwabPersistence;
+    use crate::test_utils::TEST_ENCRYPTION_KEY;
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
-    use sqlx::SqlitePool;
 
     fn create_test_auth_env() -> SchwabAuthEnv {
         SchwabAuthEnv {
@@ -310,9 +254,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_config_with_no_tokens() {
-        let pool = setup_test_db().await;
+        let persistence = MockSchwabPersistence::new();
         let auth = create_test_auth_env();
-        let config = SchwabConfig { auth, pool };
+        let config = SchwabConfig { auth, persistence };
 
         let result = SchwabExecutor::try_from_config(config).await;
 
@@ -322,23 +266,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_config_with_valid_tokens() {
-        let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
 
-        // Store valid tokens
+        // Create persistence with valid tokens
         let valid_tokens = SchwabTokens {
             access_token: "valid_access_token".to_string(),
             access_token_fetched_at: Utc::now() - Duration::minutes(10), // Fresh token
             refresh_token: "valid_refresh_token".to_string(),
             refresh_token_fetched_at: Utc::now() - Duration::days(1),
         };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let persistence = MockSchwabPersistence::with_tokens(valid_tokens);
 
-        let config = SchwabConfig { auth, pool };
+        let config = SchwabConfig { auth, persistence };
         let result = SchwabExecutor::try_from_config(config).await;
 
         assert!(result.is_ok());
@@ -348,21 +288,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_config_with_expired_access_token_valid_refresh() {
-        let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
 
-        // Store tokens with expired access token but valid refresh token
+        // Create persistence with expired access token but valid refresh token
         let tokens_needing_refresh = SchwabTokens {
             access_token: "expired_access_token".to_string(),
             access_token_fetched_at: Utc::now() - Duration::minutes(35), // Expired
             refresh_token: "valid_refresh_token".to_string(),
             refresh_token_fetched_at: Utc::now() - Duration::days(1), // Valid
         };
-        tokens_needing_refresh
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let persistence = MockSchwabPersistence::with_tokens(tokens_needing_refresh);
 
         // Mock the token refresh endpoint
         let refresh_mock = server.mock(|when, then| {
@@ -383,7 +319,7 @@ mod tests {
 
         let config = SchwabConfig {
             auth,
-            pool: pool.clone(),
+            persistence: persistence.clone(),
         };
         let result = SchwabExecutor::try_from_config(config).await;
 
@@ -391,32 +327,26 @@ mod tests {
         refresh_mock.assert();
 
         // Verify tokens were updated
-        let updated_tokens = SchwabTokens::load(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let updated_tokens = persistence.get_tokens().await.unwrap();
         assert_eq!(updated_tokens.access_token, "refreshed_access_token");
         assert_eq!(updated_tokens.refresh_token, "new_refresh_token");
     }
 
     #[tokio::test]
     async fn test_try_from_config_with_expired_refresh_token() {
-        let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
 
-        // Store tokens with both access and refresh tokens expired
+        // Create persistence with both access and refresh tokens expired
         let expired_tokens = SchwabTokens {
             access_token: "expired_access_token".to_string(),
             access_token_fetched_at: Utc::now() - Duration::minutes(35),
             refresh_token: "expired_refresh_token".to_string(),
             refresh_token_fetched_at: Utc::now() - Duration::days(8), // Expired
         };
-        expired_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let persistence = MockSchwabPersistence::with_tokens(expired_tokens);
 
-        let config = SchwabConfig { auth, pool };
+        let config = SchwabConfig { auth, persistence };
         let result = SchwabExecutor::try_from_config(config).await;
 
         assert!(result.is_err());
@@ -428,21 +358,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_until_market_open_with_market_open() {
-        let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
 
-        // Store valid tokens
+        // Create persistence with valid tokens
         let valid_tokens = SchwabTokens {
             access_token: "valid_access_token".to_string(),
             access_token_fetched_at: Utc::now() - Duration::minutes(10),
             refresh_token: "valid_refresh_token".to_string(),
             refresh_token_fetched_at: Utc::now() - Duration::days(1),
         };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let persistence = MockSchwabPersistence::with_tokens(valid_tokens);
 
         // Get current time in Eastern timezone to ensure date alignment
         use chrono_tz::America::New_York as Eastern;
@@ -488,7 +414,7 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabExecutor { auth, pool };
+        let broker = SchwabExecutor { auth, persistence };
         let result = broker.wait_until_market_open().await;
 
         assert!(result.is_ok());
@@ -501,21 +427,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_until_market_open_with_market_closed() {
-        let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
 
-        // Store valid tokens
+        // Create persistence with valid tokens
         let valid_tokens = SchwabTokens {
             access_token: "valid_access_token".to_string(),
             access_token_fetched_at: Utc::now() - Duration::minutes(10),
             refresh_token: "valid_refresh_token".to_string(),
             refresh_token_fetched_at: Utc::now() - Duration::days(1),
         };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let persistence = MockSchwabPersistence::with_tokens(valid_tokens);
 
         // Mock market hours API to return closed market
         let market_hours_mock = server.mock(|when, then| {
@@ -543,7 +465,7 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabExecutor { auth, pool };
+        let broker = SchwabExecutor { auth, persistence };
         // This test should not complete because the method loops when market is closed
         // We'll just verify it starts correctly by not panicking immediately
         tokio::time::timeout(
@@ -558,21 +480,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_until_market_open_with_api_error() {
-        let pool = setup_test_db().await;
         let server = MockServer::start();
         let auth = create_test_auth_env_with_server(&server);
 
-        // Store valid tokens
+        // Create persistence with valid tokens
         let valid_tokens = SchwabTokens {
             access_token: "valid_access_token".to_string(),
             access_token_fetched_at: Utc::now() - Duration::minutes(10),
             refresh_token: "valid_refresh_token".to_string(),
             refresh_token_fetched_at: Utc::now() - Duration::days(1),
         };
-        valid_tokens
-            .store(&pool, &TEST_ENCRYPTION_KEY)
-            .await
-            .unwrap();
+        let persistence = MockSchwabPersistence::with_tokens(valid_tokens);
 
         // Mock market hours API to return error
         let market_hours_mock = server.mock(|when, then| {
@@ -586,7 +504,7 @@ mod tests {
                 }));
         });
 
-        let broker = SchwabExecutor { auth, pool };
+        let broker = SchwabExecutor { auth, persistence };
         let result = broker.wait_until_market_open().await;
 
         assert!(result.is_err());
@@ -596,9 +514,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_order_id() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let persistence = MockSchwabPersistence::new();
         let auth = create_test_auth_env();
-        let broker = SchwabExecutor { auth, pool };
+        let broker = SchwabExecutor { auth, persistence };
 
         let test_id = "12345";
         let parsed = broker.parse_order_id(test_id).unwrap();
@@ -607,9 +525,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_to_supported_executor() {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let persistence = MockSchwabPersistence::new();
         let auth = create_test_auth_env();
-        let executor = SchwabExecutor { auth, pool };
+        let executor = SchwabExecutor { auth, persistence };
 
         assert_eq!(
             executor.to_supported_executor(),

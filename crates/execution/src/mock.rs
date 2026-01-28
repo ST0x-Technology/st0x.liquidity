@@ -7,8 +7,8 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate,
-    SupportedExecutor, TryIntoExecutor,
+    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, SupportedExecutor,
+    TryIntoExecutor,
 };
 
 /// Configuration for MockExecutor
@@ -113,19 +113,6 @@ impl Executor for MockExecutor {
             order_id: order_id.clone(),
             price_cents: 10000, // $100.00 mock price
         })
-    }
-
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
-        if self.should_fail {
-            return Err(ExecutionError::MockFailure {
-                message: self.failure_message.clone(),
-            });
-        }
-
-        warn!("[TEST] Polling pending orders - no pending orders in test mode");
-
-        // Return empty list since test orders are immediately "filled"
-        Ok(Vec::new())
     }
 
     fn to_supported_executor(&self) -> SupportedExecutor {
@@ -233,25 +220,6 @@ mod tests {
         assert!(matches!(
             result.unwrap_err(),
             ExecutionError::MockFailure { message } if message == "Simulated API error"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_poll_pending_orders_success() {
-        let executor = MockExecutor::new();
-        let result = executor.poll_pending_orders().await;
-
-        assert!(result.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_poll_pending_orders_failure() {
-        let executor = MockExecutor::with_failure("Connection timeout");
-        let result = executor.poll_pending_orders().await;
-
-        assert!(matches!(
-            result.unwrap_err(),
-            ExecutionError::MockFailure { message } if message == "Connection timeout"
         ));
     }
 

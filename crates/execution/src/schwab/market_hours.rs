@@ -3,10 +3,11 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use chrono_tz::{Tz, US::Eastern};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use tracing::debug;
 
-use super::{SchwabAuthEnv, SchwabError, SchwabTokens};
+use super::persistence::SchwabPersistence;
+use super::tokens::SchwabTokens;
+use super::{SchwabAuthEnv, SchwabError};
 
 /// Market session types for trading hours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +128,12 @@ struct TimeRange {
 ///
 /// Uses the `/marketdata/v1/markets/{marketId}` endpoint with "equity" as the market ID.
 /// Returns market hours in Eastern timezone per the API specification.
-pub async fn fetch_market_hours(
+pub async fn fetch_market_hours<P: SchwabPersistence>(
     env: &SchwabAuthEnv,
-    pool: &SqlitePool,
+    persistence: &P,
     date: Option<&str>,
 ) -> Result<MarketHours, SchwabError> {
-    let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
+    let access_token = SchwabTokens::get_valid_access_token(persistence, env).await?;
 
     let headers = [
         (
@@ -289,7 +290,9 @@ fn parse_datetime(datetime_str: &str, date: NaiveDate) -> Result<DateTime<Utc>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
+    use crate::schwab::persistence::MockSchwabPersistence;
+    use crate::test_utils::TEST_ENCRYPTION_KEY;
+    use chrono::Utc;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -304,12 +307,20 @@ mod tests {
         }
     }
 
+    fn create_test_tokens() -> SchwabTokens {
+        SchwabTokens {
+            access_token: "test_access_token".to_string(),
+            access_token_fetched_at: Utc::now(),
+            refresh_token: "test_refresh_token".to_string(),
+            refresh_token_fetched_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn test_fetch_market_hours_open_market() {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock_response = json!({
             "equity": {
@@ -349,7 +360,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&env, &pool, None).await;
+        let result = fetch_market_hours(&env, &persistence, None).await;
 
         mock.assert();
         let market_hours = result.unwrap();
@@ -367,8 +378,7 @@ mod tests {
     async fn test_fetch_market_hours_closed_market() {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock_response = json!({
             "equity": {
@@ -395,7 +405,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&env, &pool, Some("2025-01-04")).await;
+        let result = fetch_market_hours(&env, &persistence, Some("2025-01-04")).await;
 
         mock.assert();
         let market_hours = result.unwrap();
@@ -414,8 +424,7 @@ mod tests {
     async fn test_fetch_market_hours_api_error() {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/marketdata/v1/markets/equity");
@@ -424,7 +433,7 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = fetch_market_hours(&env, &pool, None).await;
+        let result = fetch_market_hours(&env, &persistence, None).await;
 
         mock.assert();
         assert!(matches!(
@@ -438,8 +447,7 @@ mod tests {
     async fn test_fetch_market_hours_invalid_response() {
         let server = MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/marketdata/v1/markets/equity");
@@ -448,7 +456,7 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = fetch_market_hours(&env, &pool, None).await;
+        let result = fetch_market_hours(&env, &persistence, None).await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));

@@ -1,10 +1,12 @@
 use backon::{ExponentialBuilder, Retryable};
 use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{SchwabAuthEnv, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
+use super::order_status::OrderStatusResponse;
+use super::persistence::SchwabPersistence;
+use super::tokens::SchwabTokens;
+use super::{SchwabAuthEnv, SchwabError};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -47,13 +49,13 @@ impl Order {
         }
     }
 
-    pub async fn place(
+    pub async fn place<P: SchwabPersistence>(
         &self,
         env: &SchwabAuthEnv,
-        pool: &SqlitePool,
+        persistence: &P,
     ) -> Result<OrderPlacementResponse, SchwabError> {
-        let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
-        let account_hash = env.get_account_hash(pool).await?;
+        let access_token = SchwabTokens::get_valid_access_token(persistence, env).await?;
+        let account_hash = env.get_account_hash(persistence).await?;
 
         let headers = [
             (
@@ -104,13 +106,13 @@ impl Order {
 
     /// Get the status of a specific order from Schwab API.
     /// Returns the order status response containing fill information and execution details.
-    pub async fn get_order_status(
+    pub async fn get_order_status<P: SchwabPersistence>(
         order_id: &str,
         env: &SchwabAuthEnv,
-        pool: &SqlitePool,
+        persistence: &P,
     ) -> Result<OrderStatusResponse, SchwabError> {
-        let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
-        let account_hash = env.get_account_hash(pool).await?;
+        let access_token = SchwabTokens::get_valid_access_token(persistence, env).await?;
+        let account_hash = env.get_account_hash(persistence).await?;
 
         let headers = [
             (
@@ -312,8 +314,19 @@ pub(crate) struct Instrument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
+    use crate::schwab::persistence::MockSchwabPersistence;
+    use crate::test_utils::TEST_ENCRYPTION_KEY;
+    use chrono::Utc;
     use serde_json::json;
+
+    fn create_test_tokens() -> SchwabTokens {
+        SchwabTokens {
+            access_token: "test_access_token".to_string(),
+            access_token_fetched_at: Utc::now(),
+            refresh_token: "test_refresh_token".to_string(),
+            refresh_token_fetched_at: Utc::now(),
+        }
+    }
 
     #[test]
     fn test_new_buy() {
@@ -445,8 +458,7 @@ mod tests {
     async fn test_place_order_success() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -470,7 +482,7 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -482,8 +494,7 @@ mod tests {
     async fn test_place_order_failure() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -504,7 +515,7 @@ mod tests {
         });
 
         let order = Order::new("INVALID".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -529,8 +540,7 @@ mod tests {
     async fn test_order_placement_success_with_location_header() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -551,7 +561,7 @@ mod tests {
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -563,8 +573,7 @@ mod tests {
     async fn test_order_placement_missing_location_header() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -584,7 +593,7 @@ mod tests {
         });
 
         let order = Order::new("SPY".to_string(), Instruction::Buy, 25);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -600,8 +609,7 @@ mod tests {
     async fn test_order_placement_invalid_location_header() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -621,7 +629,7 @@ mod tests {
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -641,8 +649,7 @@ mod tests {
 
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -664,7 +671,7 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
 
@@ -687,8 +694,7 @@ mod tests {
     async fn test_order_placement_server_error_500() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -709,7 +715,7 @@ mod tests {
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -725,8 +731,7 @@ mod tests {
     async fn test_order_placement_authentication_failure() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -746,7 +751,7 @@ mod tests {
         });
 
         let order = Order::new("SPY".to_string(), Instruction::Buy, 25);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -762,8 +767,7 @@ mod tests {
     async fn test_order_placement_malformed_json_response() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -772,7 +776,7 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         let error = result.unwrap_err();
@@ -784,8 +788,7 @@ mod tests {
     async fn test_order_placement_empty_location_header_value() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -806,7 +809,7 @@ mod tests {
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Sell, 50);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&env, &persistence).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -822,8 +825,7 @@ mod tests {
     async fn test_get_order_status_success_filled() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -862,7 +864,7 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -879,8 +881,7 @@ mod tests {
     async fn test_get_order_status_success_working() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -911,7 +912,7 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538456", &env, &pool).await;
+        let result = Order::get_order_status("1004055538456", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -927,8 +928,7 @@ mod tests {
     async fn test_get_order_status_partially_filled() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -975,7 +975,7 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538789", &env, &pool).await;
+        let result = Order::get_order_status("1004055538789", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -996,8 +996,7 @@ mod tests {
     async fn test_get_order_status_order_not_found() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1018,7 +1017,7 @@ mod tests {
                 .json_body(json!({"error": "Order not found"}));
         });
 
-        let result = Order::get_order_status("NONEXISTENT", &env, &pool).await;
+        let result = Order::get_order_status("NONEXISTENT", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1036,8 +1035,7 @@ mod tests {
     async fn test_get_order_status_authentication_failure() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1058,7 +1056,7 @@ mod tests {
                 .json_body(json!({"error": "Unauthorized"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1074,8 +1072,7 @@ mod tests {
     async fn test_get_order_status_server_error() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1096,7 +1093,7 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1112,8 +1109,7 @@ mod tests {
     async fn test_get_order_status_invalid_json_response() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1134,7 +1130,7 @@ mod tests {
                 .body("invalid json response");
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &persistence).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1146,8 +1142,7 @@ mod tests {
     async fn test_get_order_status_retry_on_transient_failure() {
         let server = httpmock::MockServer::start();
         let env = create_test_env_with_mock_server(&server);
-        let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        let persistence = MockSchwabPersistence::with_tokens(create_test_tokens());
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1169,7 +1164,7 @@ mod tests {
                 .json_body(json!({"error": "Bad Gateway"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &env, &persistence).await;
 
         account_mock.assert();
         // Should have made at least one request (retry logic is handled by backon)

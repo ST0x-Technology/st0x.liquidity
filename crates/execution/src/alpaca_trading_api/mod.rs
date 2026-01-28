@@ -20,8 +20,6 @@ pub enum AlpacaTradingApiError {
     OrderCreate(#[from] apca::RequestError<apca::api::v2::order::CreateError>),
     #[error("Order query failed: {0}")]
     OrderGet(#[from] apca::RequestError<apca::api::v2::order::GetError>),
-    #[error("Order listing failed: {0}")]
-    OrderList(#[from] apca::RequestError<apca::api::v2::orders::ListError>),
     #[error("Market hours error: {0}")]
     MarketHours(#[from] MarketHoursError),
     #[error("Invalid order ID: {0}")]
