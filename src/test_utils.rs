@@ -131,7 +131,7 @@ impl OnchainTradeBuilder {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 1.0,
+                vault_ratio: None,
             },
         }
     }
