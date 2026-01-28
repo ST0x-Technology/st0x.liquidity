@@ -9,13 +9,11 @@
 //! The aggregate progresses through the following states:
 //!
 //! ```text
-//! (start) --UnwrapTokens--> TokensUnwrapped --+
-//!    |                                        |
-//!    +------------SendTokens------------------+--> TokensSent --Detect--> Pending --Complete--> Completed
-//!                                                      |                    |
-//!                                                      |                    |
-//!                                                      v                    v
-//!                                                   Failed <-----Fail----- Failed
+//! (start) --UnwrapTokens--> TokensUnwrapped -->SendTokens----> TokensSent --Detect--> Pending --Complete--> Completed
+//!                                                                  |                    |
+//!                                                                  |                    |
+//!                                                                  v                    v
+//!                                                              Failed <-----Fail----- Failed
 //! ```
 //!
 //! - For wrapped tokens: `UnwrapTokens` → `TokensUnwrapped` → `SendTokens` → `TokensSent` → ...
