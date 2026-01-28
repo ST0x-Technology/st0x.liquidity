@@ -1074,6 +1074,10 @@ where
             execution.symbol, execution.shares, execution.direction, execution_id
         );
 
+        // Emit Placed event BEFORE spawning execution task.
+        // This ensures the OffchainOrder aggregate is initialized before ConfirmSubmission is attempted.
+        execute_new_execution_dual_write(dual_write_context, &execution, &execution.symbol).await;
+
         let pool_clone = pool.clone();
         let executor_clone = executor.clone();
         let dual_write_clone = dual_write_context.clone();
@@ -2802,6 +2806,134 @@ mod tests {
         assert!(
             logs_contain("ClearV3"),
             "Expected log to mention event type"
+        );
+    }
+
+    /// Helper to set up accumulated position state for testing check_and_execute_accumulated_positions.
+    /// Returns the symbol string for use in assertions.
+    async fn setup_accumulated_position_state(
+        pool: &SqlitePool,
+        dual_write_context: &DualWriteContext,
+        symbol: &Symbol,
+    ) -> String {
+        crate::dual_write::initialize_position(
+            dual_write_context,
+            symbol,
+            ExecutionThreshold::whole_share(),
+        )
+        .await
+        .unwrap();
+
+        let mut trade = OnchainTradeBuilder::new()
+            .with_symbol("RKLB0x")
+            .with_amount(1.2)
+            .with_price(15.0)
+            .build();
+        trade.direction = Direction::Sell;
+        trade.block_timestamp = Some(chrono::Utc::now());
+
+        crate::dual_write::acknowledge_onchain_fill(dual_write_context, &trade)
+            .await
+            .unwrap();
+
+        let tx_hash_str = trade.tx_hash.to_string();
+        let log_index_i64 = i64::try_from(trade.log_index).unwrap();
+        let now = chrono::Utc::now();
+
+        sqlx::query!(
+            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, \
+             price_usdc, block_timestamp, created_at) VALUES (?, ?, 'RKLB0x', 1.2, 'SELL', 15.0, ?, ?)",
+            tx_hash_str,
+            log_index_i64,
+            now,
+            now
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let symbol_str = symbol.to_string();
+        sqlx::query!(
+            "INSERT INTO trade_accumulators (symbol, accumulated_long, accumulated_short, \
+             pending_execution_id, last_updated) VALUES (?, 0.0, 1.2, NULL, ?)",
+            symbol_str,
+            now
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        symbol_str
+    }
+
+    /// Regression test for #250: check_and_execute_accumulated_positions must emit Placed event
+    /// before spawning execution tasks, otherwise ConfirmSubmission fails on uninitialized aggregate.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_accumulated_position_execution_emits_placed_event_before_submission() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        let symbol_str =
+            setup_accumulated_position_state(&pool, &dual_write_context, &symbol).await;
+
+        check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context)
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let execution_id = sqlx::query!(
+            "SELECT id FROM offchain_trades WHERE symbol = ?",
+            symbol_str
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .id
+        .expect("execution_id should exist");
+
+        let aggregate_id = execution_id.to_string();
+        let events: Vec<String> = sqlx::query_scalar!(
+            "SELECT event_type FROM events WHERE aggregate_type = 'OffchainOrder' \
+             AND aggregate_id = ? ORDER BY sequence",
+            aggregate_id
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            events.len(),
+            2,
+            "Expected 2 events (Placed, Submitted), got {events:?}"
+        );
+        assert_eq!(
+            events[0], "OffchainOrderEvent::Placed",
+            "First event should be Placed"
+        );
+        assert_eq!(
+            events[1], "OffchainOrderEvent::Submitted",
+            "Second event should be Submitted"
+        );
+
+        assert!(
+            !logs_contain("operation on uninitialized state"),
+            "Bug: ConfirmSubmission attempted before Placed event"
+        );
+
+        let status: String = sqlx::query_scalar!(
+            "SELECT status FROM offchain_trades WHERE id = ?",
+            execution_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            status, "SUBMITTED",
+            "Legacy table should show SUBMITTED status"
         );
     }
 }
