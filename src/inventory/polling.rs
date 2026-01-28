@@ -448,6 +448,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         // Should succeed without error
@@ -797,6 +798,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         let result = service.poll_and_record().await;
@@ -827,6 +829,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         let result = service.poll_and_record().await;

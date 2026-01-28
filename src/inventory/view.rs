@@ -2225,6 +2225,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_onchain_equity_skips_when_offchain_has_inflight() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(0)),
+                    offchain: VenueBalance::new(shares(40), shares(10)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(95));
+
+        let event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.onchain.available(),
+            shares(90),
+            "should be unchanged because offchain has inflight"
+        );
+        assert_eq!(equity.onchain.inflight(), shares(0));
+        assert_eq!(equity.offchain.inflight(), shares(10));
+    }
+
+    #[test]
     fn snapshot_onchain_equity_reconciles_when_inflight_zero() {
         let now = Utc::now();
         let aapl = Symbol::new("AAPL").unwrap();
@@ -2294,6 +2332,36 @@ mod tests {
             Usdc(dec!(500)),
             "should be unchanged"
         );
+    }
+
+    #[test]
+    fn snapshot_onchain_cash_skips_when_offchain_has_inflight() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(400)), Usdc(dec!(100))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(dec!(950)),
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.onchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged because offchain has inflight"
+        );
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
     }
 
     #[test]
@@ -2369,6 +2437,44 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_offchain_equity_skips_when_onchain_has_inflight() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(10)),
+                    offchain: VenueBalance::new(shares(50), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(55));
+
+        let event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.offchain.available(),
+            shares(50),
+            "should be unchanged because onchain has inflight"
+        );
+        assert_eq!(equity.offchain.inflight(), shares(0));
+        assert_eq!(equity.onchain.inflight(), shares(10));
+    }
+
+    #[test]
     fn snapshot_offchain_equity_reconciles_when_inflight_zero() {
         let now = Utc::now();
         let aapl = Symbol::new("AAPL").unwrap();
@@ -2438,6 +2544,36 @@ mod tests {
             Usdc(dec!(500)),
             "should be unchanged"
         );
+    }
+
+    #[test]
+    fn snapshot_offchain_cash_skips_when_onchain_has_inflight() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(400)), Usdc(dec!(100))),
+                offchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 95000,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged because onchain has inflight"
+        );
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(100)));
     }
 
     #[test]
