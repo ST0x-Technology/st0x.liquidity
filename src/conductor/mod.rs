@@ -1074,6 +1074,10 @@ where
             execution.symbol, execution.shares, execution.direction, execution_id
         );
 
+        // Emit Placed event BEFORE spawning execution task.
+        // This ensures the OffchainOrder aggregate is initialized before ConfirmSubmission is attempted.
+        execute_new_execution_dual_write(dual_write_context, &execution, &execution.symbol).await;
+
         let pool_clone = pool.clone();
         let executor_clone = executor.clone();
         let dual_write_clone = dual_write_context.clone();
