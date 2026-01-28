@@ -164,6 +164,24 @@ where
             inflight: self.inflight,
         })
     }
+
+    /// Reconcile available balance based on actual fetched total.
+    ///
+    /// Sets `available = max(0, actual_total - inflight)` to match the fetched total
+    /// while preserving inflight operations. If actual_total < inflight, available
+    /// becomes zero (we can't have negative available).
+    pub(super) fn reconcile_from_actual(self, actual_total: T) -> Result<Self, InventoryError<T>> {
+        let new_available = (actual_total - self.inflight)?;
+
+        Ok(Self {
+            available: if new_available.is_negative() {
+                T::ZERO
+            } else {
+                new_available
+            },
+            inflight: self.inflight,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +340,66 @@ mod tests {
 
         assert_eq!(result.available().0, Decimal::from(70));
         assert_eq!(result.inflight().0, Decimal::from(30));
+    }
+
+    #[test]
+    fn reconcile_from_actual_adjusts_available_to_match_total() {
+        // tracked: available=90, inflight=10, total=100
+        // actual: 95
+        // new_available should be 95-10=85
+        let b = equity_balance(90, 10);
+        let actual = FractionalShares::new(Decimal::from(95));
+
+        let result = b.reconcile_from_actual(actual).unwrap();
+
+        assert_eq!(result.available().inner(), Decimal::from(85));
+        assert_eq!(result.inflight().inner(), Decimal::from(10));
+    }
+
+    #[test]
+    fn reconcile_from_actual_sets_available_to_zero_when_actual_less_than_inflight() {
+        // tracked: available=90, inflight=10
+        // actual: 5 (less than inflight)
+        // new_available should be 0 (can't be negative)
+        let b = equity_balance(90, 10);
+        let actual = FractionalShares::new(Decimal::from(5));
+
+        let result = b.reconcile_from_actual(actual).unwrap();
+
+        assert_eq!(result.available().inner(), Decimal::ZERO);
+        assert_eq!(result.inflight().inner(), Decimal::from(10));
+    }
+
+    #[test]
+    fn reconcile_from_actual_preserves_inflight() {
+        let b = equity_balance(100, 50);
+        let actual = FractionalShares::new(Decimal::from(200));
+
+        let result = b.reconcile_from_actual(actual).unwrap();
+
+        assert_eq!(result.available().inner(), Decimal::from(150));
+        assert_eq!(result.inflight().inner(), Decimal::from(50));
+    }
+
+    #[test]
+    fn reconcile_from_actual_works_with_zero_inflight() {
+        let b = equity_balance(100, 0);
+        let actual = FractionalShares::new(Decimal::from(75));
+
+        let result = b.reconcile_from_actual(actual).unwrap();
+
+        assert_eq!(result.available().inner(), Decimal::from(75));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn reconcile_from_actual_works_with_usdc() {
+        let b = usdc_balance(1000, 100);
+        let actual = Usdc(Decimal::from(950));
+
+        let result = b.reconcile_from_actual(actual).unwrap();
+
+        assert_eq!(result.available().0, Decimal::from(850));
+        assert_eq!(result.inflight().0, Decimal::from(100));
     }
 }

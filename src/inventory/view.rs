@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
+use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::EquityRedemptionEvent;
 use crate::position::PositionEvent;
@@ -242,6 +243,20 @@ where
             last_rebalancing: Some(timestamp),
             ..self
         }
+    }
+
+    fn reconcile_onchain(self, actual: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            onchain: self.onchain.reconcile_from_actual(actual)?,
+            ..self
+        })
+    }
+
+    fn reconcile_offchain(self, actual: T) -> Result<Self, InventoryError<T>> {
+        Ok(Self {
+            offchain: self.offchain.reconcile_from_actual(actual)?,
+            ..self
+        })
     }
 }
 
