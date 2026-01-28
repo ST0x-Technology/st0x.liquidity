@@ -114,9 +114,7 @@ impl VaultRegistry {
         }
     }
 
-    pub(crate) fn from_event(
-        event: &VaultRegistryEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn from_event(event: &VaultRegistryEvent) -> Result<Self, LifecycleError<Never>> {
         match event {
             VaultRegistryEvent::Initialized {
                 orderbook,
@@ -136,7 +134,6 @@ impl VaultRegistry {
             }),
         }
     }
-
 }
 
 #[async_trait]
@@ -196,9 +193,9 @@ impl Aggregate for Lifecycle<VaultRegistry, Never> {
                         discovered_at: Utc::now(),
                     }])
                 } else {
-                    let symbol = symbol.clone().ok_or(VaultRegistryError::MissingSymbol {
-                        token: *token,
-                    })?;
+                    let symbol = symbol
+                        .clone()
+                        .ok_or(VaultRegistryError::MissingSymbol { token: *token })?;
 
                     Ok(vec![VaultRegistryEvent::EquityVaultDiscovered {
                         owner: *owner,
@@ -274,8 +271,12 @@ impl DomainEvent for VaultRegistryEvent {
     fn event_type(&self) -> String {
         match self {
             Self::Initialized { .. } => "VaultRegistryEvent::Initialized".to_string(),
-            Self::EquityVaultDiscovered { .. } => "VaultRegistryEvent::EquityVaultDiscovered".to_string(),
-            Self::UsdcVaultDiscovered { .. } => "VaultRegistryEvent::UsdcVaultDiscovered".to_string(),
+            Self::EquityVaultDiscovered { .. } => {
+                "VaultRegistryEvent::EquityVaultDiscovered".to_string()
+            }
+            Self::UsdcVaultDiscovered { .. } => {
+                "VaultRegistryEvent::UsdcVaultDiscovered".to_string()
+            }
         }
     }
 
@@ -294,8 +295,10 @@ mod tests {
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
     const TEST_OWNER: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
     const TEST_TOKEN: Address = address!("0x9876543210987654321098765432109876543210");
-    const TEST_VAULT_ID: B256 = b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
-    const TEST_TX_HASH: TxHash = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const TEST_VAULT_ID: B256 =
+        b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+    const TEST_TX_HASH: TxHash =
+        b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
 
     type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
@@ -423,8 +426,10 @@ mod tests {
             symbol: test_symbol(),
         });
 
-        let new_vault_id = b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
-        let new_tx_hash = b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000099");
+        let new_tx_hash =
+            b256!("0x2222222222222222222222222222222222222222222222222222222222222222");
 
         let command = VaultRegistryCommand::DiscoverVault {
             owner: TEST_OWNER,
@@ -532,7 +537,8 @@ mod tests {
         view.update(&init_envelope);
 
         let token_2 = address!("0x2222222222222222222222222222222222222222");
-        let vault_id_2 = b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let vault_id_2 =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
 
         let discover_1 = make_envelope(
             &aggregate_id,

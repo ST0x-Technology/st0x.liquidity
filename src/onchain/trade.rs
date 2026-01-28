@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -20,6 +20,95 @@ use st0x_execution::Direction;
 pub enum TradeEvent {
     ClearV3(Box<ClearV3>),
     TakeOrderV3(Box<TakeOrderV3>),
+}
+
+/// Information about a vault extracted from an order's IO specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VaultInfo {
+    pub(crate) token: Address,
+    pub(crate) vault_id: B256,
+}
+
+/// Extracts vault information from an OrderV4 for both input and output at the
+/// specified indices.
+///
+/// Returns `(input_vault, output_vault)` if both indices are valid, or None if either is out of bounds.
+pub(crate) fn extract_vault_info(
+    order: &OrderV4,
+    input_index: usize,
+    output_index: usize,
+) -> Option<(VaultInfo, VaultInfo)> {
+    let input = order.validInputs.get(input_index)?;
+    let output = order.validOutputs.get(output_index)?;
+
+    Some((
+        VaultInfo {
+            token: input.token,
+            vault_id: input.vaultId,
+        },
+        VaultInfo {
+            token: output.token,
+            vault_id: output.vaultId,
+        },
+    ))
+}
+
+/// Vault info paired with the order owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedVaultInfo {
+    pub(crate) owner: Address,
+    pub(crate) vault: VaultInfo,
+}
+
+/// Extracts all vault information from a ClearV3 event.
+///
+/// Returns vaults from both alice and bob orders. Each order contributes two vaults
+/// (input and output) as determined by the clear config indices.
+pub(crate) fn extract_vaults_from_clear(event: &ClearV3) -> Vec<OwnedVaultInfo> {
+    let participants = [
+        (
+            &event.alice,
+            event.clearConfig.aliceInputIOIndex,
+            event.clearConfig.aliceOutputIOIndex,
+        ),
+        (
+            &event.bob,
+            event.clearConfig.bobInputIOIndex,
+            event.clearConfig.bobOutputIOIndex,
+        ),
+    ];
+
+    participants
+        .into_iter()
+        .flat_map(|(order, input_idx, output_idx)| {
+            extract_owned_vaults(order, input_idx, output_idx)
+        })
+        .collect()
+}
+
+pub(crate) fn extract_owned_vaults(
+    order: &OrderV4,
+    input_idx: U256,
+    output_idx: U256,
+) -> Vec<OwnedVaultInfo> {
+    let (Ok(in_idx), Ok(out_idx)) = (input_idx.try_into(), output_idx.try_into()) else {
+        return vec![];
+    };
+
+    extract_vault_info(order, in_idx, out_idx)
+        .map(|(input, output)| {
+            vec![
+                OwnedVaultInfo {
+                    owner: order.owner,
+                    vault: input,
+                },
+                OwnedVaultInfo {
+                    owner: order.owner,
+                    vault: output,
+                },
+            ]
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -399,11 +488,12 @@ fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, fixed_bytes, uint};
+    use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
 
     use super::*;
+    use crate::bindings::IOrderBookV5;
     use crate::onchain::EvmEnv;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
@@ -775,10 +865,9 @@ mod tests {
 
             let trade = OnchainTrade {
                 id: None,
-                tx_hash: alloy::primitives::B256::from(tx_hash_bytes),
+                tx_hash: B256::from(tx_hash_bytes),
                 log_index: u64::from(i),
-                symbol: crate::onchain::io::TokenizedEquitySymbol::parse(&format!("TEST{i}0x"))
-                    .unwrap(),
+                symbol: TokenizedEquitySymbol::parse(&format!("TEST{i}0x")).unwrap(),
                 amount: 10.0,
                 direction: Direction::Buy,
                 price: Usdc::new(150.0).unwrap(),
@@ -799,5 +888,179 @@ mod tests {
 
         let count = OnchainTrade::db_count(&pool).await.unwrap();
         assert_eq!(count, 5);
+    }
+
+    fn make_io(token: Address, vault_id: B256) -> IOrderBookV5::IOV2 {
+        IOrderBookV5::IOV2 {
+            token,
+            vaultId: vault_id,
+        }
+    }
+
+    fn make_order(
+        owner: Address,
+        inputs: Vec<IOrderBookV5::IOV2>,
+        outputs: Vec<IOrderBookV5::IOV2>,
+    ) -> IOrderBookV5::OrderV4 {
+        IOrderBookV5::OrderV4 {
+            owner,
+            evaluable: IOrderBookV5::EvaluableV4::default(),
+            validInputs: inputs,
+            validOutputs: outputs,
+            nonce: B256::ZERO,
+        }
+    }
+
+    #[test]
+    fn extract_vault_info_returns_none_for_out_of_bounds_input() {
+        let order = make_order(
+            address!("0x1111111111111111111111111111111111111111"),
+            vec![make_io(
+                address!("0x2222222222222222222222222222222222222222"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![make_io(
+                address!("0x3333333333333333333333333333333333333333"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            )],
+        );
+
+        assert!(extract_vault_info(&order, 1, 0).is_none());
+    }
+
+    #[test]
+    fn extract_vault_info_returns_none_for_out_of_bounds_output() {
+        let order = make_order(
+            address!("0x1111111111111111111111111111111111111111"),
+            vec![make_io(
+                address!("0x2222222222222222222222222222222222222222"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![make_io(
+                address!("0x3333333333333333333333333333333333333333"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            )],
+        );
+
+        assert!(extract_vault_info(&order, 0, 1).is_none());
+    }
+
+    #[test]
+    fn extract_vault_info_extracts_valid_indices() {
+        let input_token = address!("0x2222222222222222222222222222222222222222");
+        let output_token = address!("0x3333333333333333333333333333333333333333");
+        let input_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let output_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        let order = make_order(
+            address!("0x1111111111111111111111111111111111111111"),
+            vec![make_io(input_token, input_vault)],
+            vec![make_io(output_token, output_vault)],
+        );
+
+        let (input, output) = extract_vault_info(&order, 0, 0).unwrap();
+
+        assert_eq!(input.token, input_token);
+        assert_eq!(input.vault_id, input_vault);
+        assert_eq!(output.token, output_token);
+        assert_eq!(output.vault_id, output_vault);
+    }
+
+    #[test]
+    fn extract_vaults_from_clear_extracts_both_orders() {
+        let alice_owner = address!("0xaaaa000000000000000000000000000000000001");
+        let bob_owner = address!("0xbbbb000000000000000000000000000000000002");
+
+        let alice = make_order(
+            alice_owner,
+            vec![make_io(
+                address!("0x1111111111111111111111111111111111111111"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![make_io(
+                address!("0x2222222222222222222222222222222222222222"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            )],
+        );
+
+        let bob = make_order(
+            bob_owner,
+            vec![make_io(
+                address!("0x3333333333333333333333333333333333333333"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
+            )],
+            vec![make_io(
+                address!("0x4444444444444444444444444444444444444444"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000004"),
+            )],
+        );
+
+        let event = IOrderBookV5::ClearV3 {
+            sender: address!("0x0000000000000000000000000000000000000000"),
+            alice,
+            bob,
+            clearConfig: IOrderBookV5::ClearConfigV2 {
+                aliceInputIOIndex: uint!(0_U256),
+                aliceOutputIOIndex: uint!(0_U256),
+                bobInputIOIndex: uint!(0_U256),
+                bobOutputIOIndex: uint!(0_U256),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let vaults = extract_vaults_from_clear(&event);
+
+        assert_eq!(vaults.len(), 4);
+        assert_eq!(vaults[0].owner, alice_owner);
+        assert_eq!(vaults[1].owner, alice_owner);
+        assert_eq!(vaults[2].owner, bob_owner);
+        assert_eq!(vaults[3].owner, bob_owner);
+    }
+
+    #[test]
+    fn extract_owned_vaults_extracts_order_vaults() {
+        let owner = address!("0xaaaa000000000000000000000000000000000001");
+        let input_token = address!("0x1111111111111111111111111111111111111111");
+        let output_token = address!("0x2222222222222222222222222222222222222222");
+        let input_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let output_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        let order = make_order(
+            owner,
+            vec![make_io(input_token, input_vault)],
+            vec![make_io(output_token, output_vault)],
+        );
+
+        let vaults = extract_owned_vaults(&order, uint!(0_U256), uint!(0_U256));
+
+        assert_eq!(vaults.len(), 2);
+        assert_eq!(vaults[0].owner, owner);
+        assert_eq!(vaults[0].vault.token, input_token);
+        assert_eq!(vaults[0].vault.vault_id, input_vault);
+        assert_eq!(vaults[1].owner, owner);
+        assert_eq!(vaults[1].vault.token, output_token);
+        assert_eq!(vaults[1].vault.vault_id, output_vault);
+    }
+
+    #[test]
+    fn extract_owned_vaults_returns_empty_for_invalid_indices() {
+        let owner = address!("0xaaaa000000000000000000000000000000000001");
+
+        let order = make_order(
+            owner,
+            vec![make_io(
+                address!("0x1111111111111111111111111111111111111111"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![],
+        );
+
+        let vaults = extract_owned_vaults(&order, uint!(0_U256), uint!(0_U256));
+        assert!(vaults.is_empty());
     }
 }
