@@ -618,17 +618,17 @@ impl InventoryView {
     /// For each symbol/venue combination, sets `available = max(0, actual - inflight)` to
     /// match the fetched total while preserving inflight operations.
     ///
-    /// - `OnchainEquityFetched`: Reconcile onchain equity balances for all fetched symbols.
-    /// - `OnchainCashFetched`: Reconcile onchain USDC balance.
-    /// - `OffchainEquityFetched`: Reconcile offchain equity positions for all fetched symbols.
-    /// - `OffchainCashFetched`: Reconcile offchain cash balance (converted from cents to Usdc).
+    /// - `OnchainEquity`: Reconcile onchain equity balances for all fetched symbols.
+    /// - `OnchainCash`: Reconcile onchain USDC balance.
+    /// - `OffchainEquity`: Reconcile offchain equity positions for all fetched symbols.
+    /// - `OffchainCash`: Reconcile offchain cash balance (converted from cents to Usdc).
     pub(crate) fn apply_snapshot_event(
         self,
         event: &InventorySnapshotEvent,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         match event {
-            InventorySnapshotEvent::OnchainEquityFetched { balances, .. } => {
+            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
                 balances.iter().try_fold(self, |view, (symbol, actual)| {
                     view.update_equity(
                         symbol,
@@ -638,11 +638,11 @@ impl InventoryView {
                 })
             }
 
-            InventorySnapshotEvent::OnchainCashFetched { usdc_balance, .. } => {
+            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => {
                 self.update_usdc(|inventory| inventory.reconcile_onchain(*usdc_balance), now)
             }
 
-            InventorySnapshotEvent::OffchainEquityFetched { positions, .. } => {
+            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
                 positions.iter().try_fold(self, |view, (symbol, actual)| {
                     view.update_equity(
                         symbol,
@@ -652,7 +652,7 @@ impl InventoryView {
                 })
             }
 
-            InventorySnapshotEvent::OffchainCashFetched {
+            InventorySnapshotEvent::OffchainCash {
                 cash_balance_cents, ..
             } => {
                 let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
@@ -2178,7 +2178,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(aapl.clone(), shares(95));
 
-        let event = InventorySnapshotEvent::OnchainEquityFetched {
+        let event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: now,
         };
@@ -2214,7 +2214,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(aapl.clone(), shares(5)); // less than inflight
 
-        let event = InventorySnapshotEvent::OnchainEquityFetched {
+        let event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: now,
         };
@@ -2241,7 +2241,7 @@ mod tests {
             last_updated: now,
         };
 
-        let event = InventorySnapshotEvent::OnchainCashFetched {
+        let event = InventorySnapshotEvent::OnchainCash {
             usdc_balance: Usdc(dec!(950)),
             fetched_at: now,
         };
@@ -2276,7 +2276,7 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert(aapl.clone(), shares(55));
 
-        let event = InventorySnapshotEvent::OffchainEquityFetched {
+        let event = InventorySnapshotEvent::OffchainEquity {
             positions,
             fetched_at: now,
         };
@@ -2306,7 +2306,7 @@ mod tests {
         };
 
         // 95000 cents = $950.00
-        let event = InventorySnapshotEvent::OffchainCashFetched {
+        let event = InventorySnapshotEvent::OffchainCash {
             cash_balance_cents: 95000,
             fetched_at: now,
         };
@@ -2353,7 +2353,7 @@ mod tests {
         balances.insert(aapl.clone(), shares(80));
         balances.insert(msft.clone(), shares(180));
 
-        let event = InventorySnapshotEvent::OnchainEquityFetched {
+        let event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: now,
         };

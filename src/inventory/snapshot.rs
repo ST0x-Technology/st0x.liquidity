@@ -47,37 +47,32 @@ impl InventorySnapshot {
         }
     }
 
-    pub(crate) fn from_event(
-        event: &InventorySnapshotEvent,
-    ) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn from_event(event: &InventorySnapshotEvent) -> Self {
         let mut snapshot = Self::empty(event.timestamp());
         snapshot.apply_event(event);
-        Ok(snapshot)
+        snapshot
     }
 
-    pub(crate) fn apply_transition(
-        event: &InventorySnapshotEvent,
-        snapshot: &Self,
-    ) -> Result<Self, LifecycleError<Never>> {
+    pub(crate) fn apply_transition(event: &InventorySnapshotEvent, snapshot: &Self) -> Self {
         let mut new_snapshot = snapshot.clone();
         new_snapshot.apply_event(event);
-        Ok(new_snapshot)
+        new_snapshot
     }
 
     fn apply_event(&mut self, event: &InventorySnapshotEvent) {
         self.last_updated = event.timestamp();
 
         match event {
-            InventorySnapshotEvent::OnchainEquityFetched { balances, .. } => {
+            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
                 self.onchain_equity = balances.clone();
             }
-            InventorySnapshotEvent::OnchainCashFetched { usdc_balance, .. } => {
+            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => {
                 self.onchain_cash = Some(*usdc_balance);
             }
-            InventorySnapshotEvent::OffchainEquityFetched { positions, .. } => {
+            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
                 self.offchain_equity = positions.clone();
             }
-            InventorySnapshotEvent::OffchainCashFetched {
+            InventorySnapshotEvent::OffchainCash {
                 cash_balance_cents, ..
             } => {
                 self.offchain_cash_cents = Some(*cash_balance_cents);
@@ -100,8 +95,10 @@ impl Aggregate for Lifecycle<InventorySnapshot, Never> {
     fn apply(&mut self, event: Self::Event) {
         *self = self
             .clone()
-            .transition(&event, InventorySnapshot::apply_transition)
-            .or_initialize(&event, InventorySnapshot::from_event);
+            .transition(&event, |event, state| {
+                Ok(InventorySnapshot::apply_transition(event, state))
+            })
+            .or_initialize(&event, |event| Ok(InventorySnapshot::from_event(event)));
     }
 
     async fn handle(
@@ -112,26 +109,26 @@ impl Aggregate for Lifecycle<InventorySnapshot, Never> {
         let now = Utc::now();
 
         let event = match command {
-            InventorySnapshotCommand::RecordOnchainEquity { balances } => {
-                InventorySnapshotEvent::OnchainEquityFetched {
+            InventorySnapshotCommand::OnchainEquity { balances } => {
+                InventorySnapshotEvent::OnchainEquity {
                     balances,
                     fetched_at: now,
                 }
             }
-            InventorySnapshotCommand::RecordOnchainCash { usdc_balance } => {
-                InventorySnapshotEvent::OnchainCashFetched {
+            InventorySnapshotCommand::OnchainCash { usdc_balance } => {
+                InventorySnapshotEvent::OnchainCash {
                     usdc_balance,
                     fetched_at: now,
                 }
             }
-            InventorySnapshotCommand::RecordOffchainEquity { positions } => {
-                InventorySnapshotEvent::OffchainEquityFetched {
+            InventorySnapshotCommand::OffchainEquity { positions } => {
+                InventorySnapshotEvent::OffchainEquity {
                     positions,
                     fetched_at: now,
                 }
             }
-            InventorySnapshotCommand::RecordOffchainCash { cash_balance_cents } => {
-                InventorySnapshotEvent::OffchainCashFetched {
+            InventorySnapshotCommand::OffchainCash { cash_balance_cents } => {
+                InventorySnapshotEvent::OffchainCash {
                     cash_balance_cents,
                     fetched_at: now,
                 }
@@ -150,35 +147,35 @@ pub(crate) enum InventorySnapshotError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum InventorySnapshotCommand {
-    RecordOnchainEquity {
+    OnchainEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
     },
-    RecordOnchainCash {
+    OnchainCash {
         usdc_balance: Usdc,
     },
-    RecordOffchainEquity {
+    OffchainEquity {
         positions: BTreeMap<Symbol, FractionalShares>,
     },
-    RecordOffchainCash {
+    OffchainCash {
         cash_balance_cents: i64,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum InventorySnapshotEvent {
-    OnchainEquityFetched {
+    OnchainEquity {
         balances: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
-    OnchainCashFetched {
+    OnchainCash {
         usdc_balance: Usdc,
         fetched_at: DateTime<Utc>,
     },
-    OffchainEquityFetched {
+    OffchainEquity {
         positions: BTreeMap<Symbol, FractionalShares>,
         fetched_at: DateTime<Utc>,
     },
-    OffchainCashFetched {
+    OffchainCash {
         cash_balance_cents: i64,
         fetched_at: DateTime<Utc>,
     },
@@ -187,10 +184,10 @@ pub(crate) enum InventorySnapshotEvent {
 impl InventorySnapshotEvent {
     fn timestamp(&self) -> DateTime<Utc> {
         match self {
-            Self::OnchainEquityFetched { fetched_at, .. }
-            | Self::OnchainCashFetched { fetched_at, .. }
-            | Self::OffchainEquityFetched { fetched_at, .. }
-            | Self::OffchainCashFetched { fetched_at, .. } => *fetched_at,
+            Self::OnchainEquity { fetched_at, .. }
+            | Self::OnchainCash { fetched_at, .. }
+            | Self::OffchainEquity { fetched_at, .. }
+            | Self::OffchainCash { fetched_at, .. } => *fetched_at,
         }
     }
 }
@@ -198,18 +195,10 @@ impl InventorySnapshotEvent {
 impl DomainEvent for InventorySnapshotEvent {
     fn event_type(&self) -> String {
         match self {
-            Self::OnchainEquityFetched { .. } => {
-                "InventorySnapshotEvent::OnchainEquityFetched".to_string()
-            }
-            Self::OnchainCashFetched { .. } => {
-                "InventorySnapshotEvent::OnchainCashFetched".to_string()
-            }
-            Self::OffchainEquityFetched { .. } => {
-                "InventorySnapshotEvent::OffchainEquityFetched".to_string()
-            }
-            Self::OffchainCashFetched { .. } => {
-                "InventorySnapshotEvent::OffchainCashFetched".to_string()
-            }
+            Self::OnchainEquity { .. } => "InventorySnapshotEvent::OnchainEquity".to_string(),
+            Self::OnchainCash { .. } => "InventorySnapshotEvent::OnchainCash".to_string(),
+            Self::OffchainEquity { .. } => "InventorySnapshotEvent::OffchainEquity".to_string(),
+            Self::OffchainCash { .. } => "InventorySnapshotEvent::OffchainCash".to_string(),
         }
     }
 
@@ -245,7 +234,7 @@ mod tests {
 
         let events = aggregate
             .handle(
-                InventorySnapshotCommand::RecordOnchainEquity {
+                InventorySnapshotCommand::OnchainEquity {
                     balances: balances.clone(),
                 },
                 &(),
@@ -255,13 +244,13 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OnchainEquityFetched {
+            InventorySnapshotEvent::OnchainEquity {
                 balances: event_balances,
                 ..
             } => {
                 assert_eq!(event_balances, &balances);
             }
-            _ => panic!("Expected OnchainEquityFetched event"),
+            _ => panic!("Expected OnchainEquity event"),
         }
     }
 
@@ -270,7 +259,7 @@ mod tests {
         let mut aggregate = InventorySnapshotAggregate::default();
 
         // First event initializes
-        aggregate.apply(InventorySnapshotEvent::OnchainCashFetched {
+        aggregate.apply(InventorySnapshotEvent::OnchainCash {
             usdc_balance: Usdc::from_str("1000").unwrap(),
             fetched_at: Utc::now(),
         });
@@ -281,7 +270,7 @@ mod tests {
 
         let events = aggregate
             .handle(
-                InventorySnapshotCommand::RecordOnchainEquity {
+                InventorySnapshotCommand::OnchainEquity {
                     balances: balances.clone(),
                 },
                 &(),
@@ -291,13 +280,13 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OnchainEquityFetched {
+            InventorySnapshotEvent::OnchainEquity {
                 balances: event_balances,
                 ..
             } => {
                 assert_eq!(event_balances, &balances);
             }
-            _ => panic!("Expected OnchainEquityFetched event"),
+            _ => panic!("Expected OnchainEquity event"),
         }
     }
 
@@ -308,22 +297,19 @@ mod tests {
         let usdc_balance = Usdc::from_str("10000.50").unwrap();
 
         let events = aggregate
-            .handle(
-                InventorySnapshotCommand::RecordOnchainCash { usdc_balance },
-                &(),
-            )
+            .handle(InventorySnapshotCommand::OnchainCash { usdc_balance }, &())
             .await
             .unwrap();
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OnchainCashFetched {
+            InventorySnapshotEvent::OnchainCash {
                 usdc_balance: event_balance,
                 ..
             } => {
                 assert_eq!(*event_balance, usdc_balance);
             }
-            _ => panic!("Expected OnchainCashFetched event"),
+            _ => panic!("Expected OnchainCash event"),
         }
     }
 
@@ -336,7 +322,7 @@ mod tests {
 
         let events = aggregate
             .handle(
-                InventorySnapshotCommand::RecordOffchainEquity {
+                InventorySnapshotCommand::OffchainEquity {
                     positions: positions.clone(),
                 },
                 &(),
@@ -346,13 +332,13 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OffchainEquityFetched {
+            InventorySnapshotEvent::OffchainEquity {
                 positions: event_positions,
                 ..
             } => {
                 assert_eq!(event_positions, &positions);
             }
-            _ => panic!("Expected OffchainEquityFetched event"),
+            _ => panic!("Expected OffchainEquity event"),
         }
     }
 
@@ -360,11 +346,11 @@ mod tests {
     async fn record_offchain_cash_emits_event() {
         let aggregate = InventorySnapshotAggregate::default();
 
-        let cash_balance_cents = 500_000_00; // $500,000.00
+        let cash_balance_cents = 50_000_000; // $500,000.00
 
         let events = aggregate
             .handle(
-                InventorySnapshotCommand::RecordOffchainCash { cash_balance_cents },
+                InventorySnapshotCommand::OffchainCash { cash_balance_cents },
                 &(),
             )
             .await
@@ -372,13 +358,13 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         match &events[0] {
-            InventorySnapshotEvent::OffchainCashFetched {
+            InventorySnapshotEvent::OffchainCash {
                 cash_balance_cents: event_cents,
                 ..
             } => {
                 assert_eq!(*event_cents, cash_balance_cents);
             }
-            _ => panic!("Expected OffchainCashFetched event"),
+            _ => panic!("Expected OffchainCash event"),
         }
     }
 
@@ -390,7 +376,7 @@ mod tests {
         let mut balances = BTreeMap::new();
         balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquityFetched {
+        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
             balances: balances.clone(),
             fetched_at: Utc::now(),
         });
@@ -403,7 +389,7 @@ mod tests {
 
         // Second event updates
         let usdc = Usdc::from_str("5000").unwrap();
-        aggregate.apply(InventorySnapshotEvent::OnchainCashFetched {
+        aggregate.apply(InventorySnapshotEvent::OnchainCash {
             usdc_balance: usdc,
             fetched_at: Utc::now(),
         });
@@ -422,7 +408,7 @@ mod tests {
         let mut first_balances = BTreeMap::new();
         first_balances.insert(test_symbol("AAPL"), test_shares(100));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquityFetched {
+        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
             balances: first_balances,
             fetched_at: Utc::now(),
         });
@@ -430,7 +416,7 @@ mod tests {
         let mut second_balances = BTreeMap::new();
         second_balances.insert(test_symbol("MSFT"), test_shares(50));
 
-        aggregate.apply(InventorySnapshotEvent::OnchainEquityFetched {
+        aggregate.apply(InventorySnapshotEvent::OnchainEquity {
             balances: second_balances.clone(),
             fetched_at: Utc::now(),
         });

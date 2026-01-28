@@ -44,6 +44,7 @@ impl MockExecutor {
     }
 
     /// Configures the executor to return the specified inventory when `get_inventory()` is called.
+    #[must_use]
     pub fn with_inventory(mut self, inventory: Inventory) -> Self {
         self.inventory_result = InventoryResult::Fetched(inventory);
         self
