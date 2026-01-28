@@ -1,13 +1,13 @@
-# **Arbitrage Bot Specification for Tokenized Equities (V1 MVP)**
+# SPEC.md
 
-## **Background**
+## Background
 
 Early-stage onchain tokenized equity markets typically suffer from poor price
 discovery and limited liquidity. Without sufficient market makers, onchain
 prices can diverge substantially from traditional equity market prices, creating
 a poor user experience and limiting adoption.
 
-## **Solution Overview**
+## Solution Overview
 
 This specification outlines a minimum viable product (MVP) arbitrage bot that
 helps establish price discovery by exploiting discrepancies between onchain
@@ -23,9 +23,9 @@ The focus is on getting a functional system live quickly. There are known risks
 that will be addressed in future iterations as total value locked (TVL) grows
 and the system proves market fit.
 
-## **Operational Process and Architecture**
+## Operational Process and Architecture
 
-### **System Components**
+### System Components
 
 **Onchain Infrastructure:**
 
@@ -45,7 +45,7 @@ and the system proves market fit.
 
 - st0x bridge for offchain ↔ onchain asset movement
 
-### **Operational Flow**
+### Operational Flow
 
 **Normal Operation Cycle:**
 
@@ -109,12 +109,12 @@ Example (Offchain Batching):
 - Execute manual transfers as needed to maintain adequate trading capital
 - No automated rebalancing infrastructure for Schwab
 
-## **Bot Implementation Specification**
+## Bot Implementation Specification
 
 The arbitrage bot will be built in Rust to leverage its performance, safety, and
 excellent async ecosystem for handling concurrent trading flows.
 
-### **Event Monitoring**
+### Event Monitoring
 
 **Raindex Event Monitor:**
 
@@ -139,7 +139,7 @@ excellent async ecosystem for handling concurrent trading flows.
   Accumulation -> Broker Execution (when threshold reached) -> Record Result
 - Failed flows retry independently without affecting other trades
 
-### **Trade Execution**
+### Trade Execution
 
 **Broker API Integration:**
 
@@ -174,7 +174,7 @@ The bot supports multiple brokers through a unified trait interface:
 - Complete audit trail maintained linking individual trades to batch executions
 - Proper error handling and structured error logging
 
-### **Trade Tracking and Reporting**
+### Trade Tracking and Reporting
 
 **SQLite Trade Database:**
 
@@ -216,7 +216,7 @@ defined in `migrations/20250703115746_trades.sql`.
 - Separate reporting process reads from SQLite database for analysis without
   impacting trading performance
 
-### **Health Monitoring and Logging**
+### Health Monitoring and Logging
 
 - System uptime and connectivity status using structured logging
 - API rate limiting and error tracking with metrics collection
@@ -225,23 +225,179 @@ defined in `migrations/20250703115746_trades.sql`.
 - Configuration management with environment variables and config files
 - Proper error propagation and custom error types
 
-### **Risk Management**
+### Risk Management
 
 - Manual override capabilities for emergency situations with proper
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 
-### **CI/CD and Deployment**
+### Infrastructure and Deployment
 
-**Containerization:**
+This section specifies infrastructure, deployment, and secrets management.
 
-- Docker containerization for consistent deployment with multi-stage builds
-- Simple CI/CD pipeline for automated builds and deployments
-- Health check endpoints for container orchestration
-- Environment-based configuration injection
-- Resource limits and restart policies for production deployment
+Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
+`5ede2d47465d3621b351c73c9c1af33d20a7c879`.
 
-## **Crate Architecture**
+#### Design Goals
+
+- Declarative infrastructure management (eliminate DigitalOcean UI dependency)
+- Declarative secret management (eliminate GitHub Secrets UI dependency)
+- Structured configuration management (replace scattered env vars with validated
+  config files)
+- Easy addition of staging environments
+- Independent service deployment and rollback
+- Reliable rollback mechanism (replace brittle rollback scripts)
+- Balanced complexity: more robust than bash scripts, less complex than
+  Kubernetes
+- Support potential future microservices architecture
+- Thin GitHub Actions workflows with minimal bash
+
+#### Current Setup and Pain Points
+
+**Current infrastructure:**
+
+- Single DigitalOcean droplet running Ubuntu
+- Services deployed via Docker Compose
+- Deployment and rollback via bash scripts
+- Secrets stored in GitHub Secrets, injected as environment variables
+- Configuration scattered across multiple env var definitions
+
+**Pain points:**
+
+- **Fragile foundation:** The bash deployment scripts "kinda work" but feel
+  brittle - not a robust foundation to build serious production-grade systems
+  on. Adding a new env var with no default is stressful. Increasing deployment
+  complexity means touching scripts that only run in CI and haven't been
+  meaningfully tested.
+- **Manual infrastructure:** Droplet provisioning requires DigitalOcean UI
+- **Secret management friction:** Adding/updating secrets requires GitHub UI
+- **Configuration sprawl:** Env vars scattered across multiple places, different
+  vars required based on values of other vars that can be set in countless
+  different places without any ultimate source of truth
+- **Deployment coupling:** Updating one service requires redeploying everything
+- **No staging:** Adding a staging environment would require significant manual
+  work
+- **Rollback uncertainty:** Rollback scripts exist but haven't been
+  battle-tested enough to trust them in an emergency
+
+#### Approach
+
+Extend Nix from development environments and builds to infrastructure,
+deployment, and secrets management.
+
+**Key Tools:**
+
+- **Terraform**: Provisions single DigitalOcean droplet (matching current
+  architecture). Standard HCL, version pinned via flake.lock.
+
+- **nixos-generators**: Builds custom NixOS VM images for DigitalOcean. Base
+  image with OS essentials, uploaded as custom image for droplet creation.
+
+- **deploy-rs**: Deploys to NixOS (or non-NixOS) hosts via SSH. Supports two
+  activation types: `activate.nixos` for full system configs, `activate.custom`
+  for standalone packages with an auto-rollback on failed deployments.
+
+- (r)**agenix**: Age-encrypted secrets for NixOS, using existing SSH keys. CLI
+  encrypts secrets locally into `.age` files you commit to git. NixOS module
+  decrypts at activation using the host's SSH key, mounting secrets to
+  `/run/agenix/` (tmpfs - cleartext never hits disk or Nix store). No GPG, no
+  separate secret distribution - secrets deploy with `nixos-rebuild` like any
+  other config. Ragenix is a Rust drop-in for agenix but is less documented, so
+  it's best to follow agenix documentation but use ragenix instead.
+
+**Architecture:**
+
+The approach separates stable infrastructure (base image) from frequently
+changing application code (service deployments):
+
+_Base NixOS image_ (rebuilt occasionally when adding services or changing
+infra):
+
+- OS essentials: SSH, firewall, users
+- Systemd unit definitions for application services (pointing to deployment
+  paths)
+- Grafana as a NixOS native service
+- ragenix integration for secret decryption
+
+_Per-service deploy-rs profiles_ (deployed independently, 1-to-1 with systemd
+units):
+
+- `server-schwab` - hedging bot for Schwab executor
+- `server-alpaca` - hedging bot for Alpaca executor
+- `reporter-schwab` - position reporter for Schwab
+- `reporter-alpaca` - position reporter for Alpaca
+- `dashboard` - operations dashboard (single instance, switches executors in UI)
+
+Each profile deploys its binary to a known path and restarts the corresponding
+systemd unit. This allows updating one service without touching others.
+
+Grafana runs as a NixOS native service (part of base image configuration, not a
+deploy-rs profile).
+
+_Configuration management_:
+
+- Single TOML config file per service containing complete configuration
+- Files encrypted with ragenix, decrypted at activation to `/run/agenix/`
+- Services use `clap-config-file` crate to load config via `--config-file` flag
+- Secrets marked `config_only` so they cannot be passed via CLI args
+
+_Infrastructure_:
+
+- Terraform (standard HCL) provisions single droplet
+- Nix wraps Terraform for reproducible execution (pinned version via flake.lock)
+
+**Rollback:**
+
+deploy-rs deploys each service to a nix profile (e.g.,
+`/nix/var/nix/profiles/per-service/server-schwab`). Each deployment creates a
+new profile generation:
+
+- `nix profile history` shows deployment history with timestamps
+- `nix profile rollback` reverts to previous generation
+- Retention configured declaratively via NixOS `nix.gc.*` options
+- Same tooling used for dev environments - no new mental model
+
+deploy-rs "magic rollback" is a separate safety net: auto-reverts if SSH
+connection is lost during activation.
+
+**CI/CD Credential Management:**
+
+| Secret Type | Storage               | When Used           | Example                |
+| ----------- | --------------------- | ------------------- | ---------------------- |
+| Runtime     | ragenix (.age in git) | Decrypted at deploy | Schwab/Alpaca API keys |
+| Build-time  | GitHub Secrets        | CI build/deploy     | DO token, SSH key      |
+
+Use GitHub Actions environment protection (require approval for production,
+restrict to master branch).
+
+**SSH Key Management:**
+
+Hybrid approach: DigitalOcean injects team SSH keys at droplet creation for
+emergency access; automation keys (CI/CD, deploy-rs) managed via ragenix
+(`authorized_keys.age`) for audit trail. Emergency access preserved even if
+ragenix deployment fails.
+
+**Trade-offs:**
+
+Pros:
+
+- Single language (Nix) for images, deployments, secrets, dev environments
+- Consistent dependency versions in all environments managed by a single source
+  of truth
+- Atomic updates - system never in half-broken state
+- Robust rollback via nix profile generations (built-in, not custom scripts)
+- Secrets in git with audit trail
+- Nix provides many benefits of containerization while being more lightweight
+- Nix derivations can be converted to Docker images using
+  `dockerTools.buildImage`, but not vice versa
+
+Cons:
+
+- (r)agenix requires NixOS on target
+- deploy-rs is less mature than some alternatives
+- There is a learning curve if you're not already familiar with Nix
+
+## Crate Architecture
 
 The codebase is organized into multiple Rust crates to achieve:
 
@@ -254,7 +410,7 @@ The codebase is organized into multiple Rust crates to achieve:
 4. **Reduced coupling** - Each crate defines a clear public API; internals stay
    hidden
 
-### **Core Capabilities**
+### Core Capabilities
 
 The system provides two top-level capabilities:
 
@@ -263,7 +419,7 @@ The system provides two top-level capabilities:
 2. **Maintaining balance invariants** - Keeping inventory balanced across venues
    through transfers (tokenization, bridging, vault operations)
 
-### **Architecture Layers**
+### Architecture Layers
 
 ```text
 ┌───────────────────────────────────────────────────────────────────────┐
@@ -326,7 +482,7 @@ The system provides two top-level capabilities:
                 · · · · · · · · · · · · · · · · · · · · ·
 ```
 
-### **Crate Descriptions**
+### Crate Descriptions
 
 **Integration Layer** (external API wrappers):
 
@@ -359,7 +515,7 @@ enables testing with mocks and future implementation swaps.
 | `st0x-dashboard` | Admin dashboard backend, websocket events, manual operations   |
 | `st0x-cli`       | Temporary utility for manual auth and debug (to be deprecated) |
 
-### **Feature Flag Strategy**
+### Feature Flag Strategy
 
 Feature flags control which implementations are compiled:
 
@@ -381,7 +537,7 @@ This enables:
 - Easy addition of new implementations behind new feature flags
 - Fork-friendly architecture for different asset classes
 
-### **Implementation Phases**
+### Implementation Phases
 
 The crate extraction is sequenced around the CQRS/ES migration:
 
@@ -422,12 +578,12 @@ Extract hedging logic and create application binary (must happen atomically):
 - CLI remains temporary utility
 - Depends on OnChainTrade, OffchainOrder, Position migration completing first
 
-## **System Risks**
+## System Risks
 
 The following risks are known for v1 but will not be addressed in the initial
 implementation. Solutions will be developed in later iterations.
 
-### **Offchain Risks**
+### Offchain Risks
 
 - **Fractional Share Exposure**: Charles Schwab does not support fractional
   share trading, requiring offchain batching until net positions reach whole
@@ -446,7 +602,7 @@ implementation. Solutions will be developed in later iterations.
   traditional markets are closed, allowing onchain trades while broker markets
   are unavailable. Creates guaranteed daily exposure windows.
 
-### **Onchain Risks**
+### Onchain Risks
 
 - **Stale Pyth Oracle Data**: If the oracle becomes stale, the order won't trade
   onchain, resulting in missed arbitrage opportunities. However, this is
@@ -457,9 +613,9 @@ implementation. Solutions will be developed in later iterations.
 
 ---
 
-## **DDD/CQRS/ES Migration Proposal**
+## DDD/CQRS/ES Migration Proposal
 
-### **Background**
+### Background
 
 The current implementation provides some auditability through `onchain_trades`,
 `schwab_executions`, and `trade_execution_links`. However, these tables are
@@ -506,7 +662,7 @@ We will migrate st0x.liquidity-a to DDD/CQRS/ES patterns for:
 - **Reasoning**: Clear separation between facts (events) and derived data
   (views)
 
-### **Migration Strategy Overview**
+### Migration Strategy Overview
 
 This migration will transform the current database from a CRUD-style schema to
 an event-sourced architecture through **three independently deployable phases**.
@@ -526,7 +682,7 @@ name changes (e.g., `onchain_trades` -> `onchain_trade_view`). Additionally, we
 can create specialized views that pre-compute complex metrics, simplifying
 queries and improving performance.
 
-#### **Phase 1: Dual-Write Foundation (Shadow Mode)**
+#### Phase 1: Dual-Write Foundation (Shadow Mode)
 
 **Goal**: Run CQRS/ES alongside existing system to validate correctness before
 cutting over.
@@ -578,7 +734,7 @@ cutting over.
 - No event processing errors
 - Performance acceptable
 
-#### **Phase 2: Rebalancing Feature (New Feature on CQRS/ES)**
+#### Phase 2: Rebalancing Feature (New Feature on CQRS/ES)
 
 **Goal**: Implement inventory rebalancing using CQRS/ES architecture from day
 one.
@@ -622,7 +778,7 @@ one.
 - Complete audit trail visible in events
 - No issues with CQRS/ES patterns
 
-#### **Phase 3: Complete Migration (Cut Over to Views)**
+#### Phase 3: Complete Migration (Cut Over to Views)
 
 **Goal**: Make views the source of truth and remove old tables.
 
@@ -657,7 +813,7 @@ one.
 - Production running successfully on views
 - Old tables dropped
 
-#### **Phased Migration Benefits**
+#### Phased Migration Benefits
 
 - **Risk mitigation**: Each phase is independently deployable and reversible
 - **Incremental validation**: Catch issues early before they compound
@@ -665,9 +821,9 @@ one.
 - **Prove value early**: Rebalancing feature demonstrates CQRS/ES benefits
 - **Learn and adapt**: Each phase informs the next
 
-### **Core Architecture**
+### Core Architecture
 
-#### **Event Sourcing Pattern**
+#### Event Sourcing Pattern
 
 All state changes are captured as immutable domain events. The event store is
 the single source of truth. All other data (views, snapshots) is derived and can
@@ -684,7 +840,7 @@ flowchart LR
     E --> F[Update Views]
 ```
 
-#### **Database Schema**
+#### Database Schema
 
 ##### **Event Store Tables** (Single Source of Truth)
 
@@ -921,9 +1077,9 @@ This means blockchain fills are recorded in both OnChainTradeEvent::Filled
 (audit trail) and PositionEvent::OnChainOrderFilled (position tracking), but
 they serve different purposes in different bounded contexts.
 
-### **Aggregate Design**
+### Aggregate Design
 
-#### **Lifecycle Wrapper Pattern**
+#### Lifecycle Wrapper Pattern
 
 All event-sourced aggregates use the `Lifecycle<T, E>` wrapper which handles
 infrastructure concerns while keeping business logic clean:
@@ -967,7 +1123,7 @@ fn apply(&mut self, event: Self::Event) {
 - Use domain-specific error types (e.g., `ArithmeticError`) when transitions can
   fail
 
-#### **OnChainTrade Aggregate**
+#### OnChainTrade Aggregate
 
 **Purpose**: Represents a single filled order from the blockchain. Decouples
 trade recording from position management, allowing metadata enrichment without
@@ -1054,7 +1210,7 @@ enum OnChainTradeEvent {
 - Can only enrich once
 - Cannot enrich before fill is witnessed
 
-#### **Position Aggregate**
+#### Position Aggregate
 
 **Purpose**: Manages accumulated position for a single symbol, tracking
 fractional shares and coordinating offchain hedging when thresholds are reached.
@@ -1209,7 +1365,7 @@ enum TriggerReason {
 - Threshold can be updated at any time, emits ThresholdUpdated event for audit
   trail
 
-#### **OffchainOrder Aggregate**
+#### OffchainOrder Aggregate
 
 **Purpose**: Manages the lifecycle of a single broker order, tracking
 submission, filling, and settlement.
@@ -1348,7 +1504,7 @@ enum MigratedOrderStatus {
 }
 ```
 
-#### **SchwabAuth Aggregate**
+#### SchwabAuth Aggregate
 
 **Purpose**: Manages OAuth tokens for Charles Schwab broker. Alpaca uses simple
 API key/secret (configured via environment variables) and doesn't require
@@ -1401,7 +1557,7 @@ enum SchwabAuthEvent {
 }
 ```
 
-### **Rebalancing Aggregates**
+### Rebalancing Aggregates
 
 **Note**: Automated rebalancing is **Alpaca-only**. These aggregates are not
 used for Schwab-based operations, which rely on manual rebalancing processes.
@@ -1410,7 +1566,7 @@ Rebalancing manages inventory positions across venues (onchain vs offchain) by
 coordinating cross-venue asset movements. Three aggregates handle the different
 rebalancing flows for Alpaca operations.
 
-#### **TokenizedEquityMint Aggregate**
+#### TokenizedEquityMint Aggregate
 
 **Purpose**: Manages the process of converting offchain shares at Alpaca into
 onchain tokens.
@@ -1535,7 +1691,7 @@ enum TokenizedEquityMintEvent {
 - Tokens received requires transaction confirmation
 - Can mark failed from any non-terminal state
 
-#### **EquityRedemption Aggregate**
+#### EquityRedemption Aggregate
 
 **Purpose**: Manages the process of converting onchain tokens into offchain
 shares at Alpaca.
@@ -1635,7 +1791,7 @@ enum EquityRedemptionEvent {
 - Can mark failed from any non-terminal state (captures both API rejections and
   internal failures)
 
-#### **UsdcRebalance Aggregate**
+#### UsdcRebalance Aggregate
 
 **Purpose**: Manages bidirectional USDC movements between Alpaca and Rain
 orderbook vaults via Circle CCTP bridge.
@@ -1973,7 +2129,7 @@ Base to Alpaca:
 - **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
   rather than bridge time
 
-#### **Rebalancing Triggers**
+#### Rebalancing Triggers
 
 **Inventory Tracking**:
 
@@ -2036,7 +2192,7 @@ aggregates.
    - Trigger: Redeem AAPL (tokens -> shares) AND Mint MSFT (shares -> tokens)
    - Each symbol rebalances independently
 
-#### **Coordination with Position Aggregate**
+#### Coordination with Position Aggregate
 
 **Position Aggregate** tracks net exposure from arbitrage trading but does NOT
 know about cross-venue inventory.
@@ -2073,9 +2229,9 @@ know about cross-venue inventory.
 - UsdcRebalance: Tracks rebalancing-induced USDC movements
 - InventoryView: Combines all events to calculate total inventory
 
-### **View Design**
+### View Design
 
-#### **Position View**
+#### Position View
 
 **Purpose**: Current position state for all symbols, optimized for querying by
 symbol and position status.
@@ -2098,7 +2254,7 @@ enum PositionView {
 
 **Projection Logic**: Updates on `PositionEvent::*`
 
-#### **OffchainTradeView**
+#### OffchainTradeView
 
 **Purpose**: All broker executions with filtering by status and symbol.
 
@@ -2132,7 +2288,7 @@ enum ExecutionStatus {
 **Projection Logic**: Updates on `OffchainOrderEvent::*`, building view of
 filled orders (which become trades)
 
-#### **OnChainTradeView**
+#### OnChainTradeView
 
 **Purpose**: Immutable record of all blockchain trades.
 
@@ -2160,7 +2316,7 @@ enum OnChainTradeView {
 **Projection Logic**: Builds from `OnChainTradeEvent::Filled` and
 `OnChainTradeEvent::Enriched`
 
-#### **MetricsPnLView**
+#### MetricsPnLView
 
 **Purpose**: Profit/loss calculations per symbol over time.
 
@@ -2193,7 +2349,7 @@ enum Venue {
 **Projection Logic**: Calculates from both `OnChainTradeEvent::Filled` and
 `PositionEvent::OffChainOrderFilled` events
 
-#### **TokenizedEquityMintView**
+#### TokenizedEquityMintView
 
 **Purpose**: Tracks all equity mint operations (Alpaca shares to onchain
 tokens).
@@ -2229,7 +2385,7 @@ enum MintStatus {
 
 **Projection Logic**: Updates on `TokenizedEquityMintEvent::*` events
 
-#### **EquityRedemptionView**
+#### EquityRedemptionView
 
 **Purpose**: Tracks all equity redemption operations (onchain tokens to Alpaca
 shares).
@@ -2262,7 +2418,7 @@ enum RedeemStatus {
 
 **Projection Logic**: Updates on `EquityRedemptionEvent::*` events
 
-#### **UsdcRebalanceView**
+#### UsdcRebalanceView
 
 **Purpose**: Tracks all USDC rebalancing operations across Alpaca and Base via
 Circle CCTP bridge.
@@ -2299,7 +2455,7 @@ enum RebalancingStatus {
 
 **Projection Logic**: Updates on `UsdcRebalanceEvent::*` events
 
-#### **InventoryView**
+#### InventoryView
 
 **Purpose**: Aggregates inventory across all venues and detects imbalances that
 trigger rebalancing operations. This is the central view that monitors total
@@ -2377,7 +2533,7 @@ BaseToAlpaca when too much onchain.
 
 Trigger events are emitted to RebalancingManager for execution.
 
-#### **Failure Handling and Reconciliation**
+#### Failure Handling and Reconciliation
 
 **Automatic Reconciliation**: When rebalancing operations fail, the projection
 logic automatically reconciles inflight balances back to source venue's
@@ -2428,9 +2584,9 @@ enum Resolution {
 This would provide complete audit trail for all manual interventions and allow
 proper tracking of asset movements that required manual resolution.
 
-### **Event Processing Flow**
+### Event Processing Flow
 
-#### **OnChain Event Processing**
+#### OnChain Event Processing
 
 **Current Flow** (Event-driven with Conductor):
 
@@ -2530,7 +2686,7 @@ sequenceDiagram
     App->>Views: Update OnChainTradeView
 ```
 
-#### **Manager Pattern**
+#### Manager Pattern
 
 Managers coordinate between aggregates by subscribing to events and sending
 commands. They can be stateless (simple event->command reactions) or stateful
@@ -2547,7 +2703,7 @@ PositionCommand::AcknowledgeOnChainFill
 - Tracks in-flight orders
 - Sends commands to OffchainOrder and Position aggregates
 
-#### **Future Consideration: Reorg Handling**
+#### Future Consideration: Reorg Handling
 
 **Note**: Reorg handling is not implemented currently, but the event-sourced
 architecture will make it significantly easier to add in the future.
@@ -2582,18 +2738,18 @@ original trade's position impact. Views would update automatically. The
 This demonstrates how the event-sourced architecture provides a cleaner
 foundation for future enhancements.
 
-### **Data Migration Strategy**
+### Data Migration Strategy
 
 **Note**: This data import occurs in **Phase 1** as part of initial deployment,
 before dual-write begins. This ensures the event store contains all existing
 data, allowing proper validation that views match old tables from day one.
 
-#### **Importing Existing Data**
+#### Importing Existing Data
 
 Use genesis events as snapshots from the legacy system. Migrated events
 initialize aggregates without synthesizing full event histories:
 
-##### **Migrated Event Types**
+##### Migrated Event Types
 
 Migrated events use proper domain types (FractionalShares, TxHash, etc.)
 matching the new system:
@@ -2668,7 +2824,7 @@ enum MigratedOrderStatus {
 }
 ```
 
-##### **Existing Data Import**
+##### Existing Data Import
 
 One-time binary: `src/bin/migrate_to_events.rs`
 
@@ -2688,7 +2844,7 @@ automatically on every deployment.
 5. Rebuild all views from events
 6. Verify counts and sample records match between old tables and new views
 
-##### **Migrating OnChain Trades**
+##### Migrating OnChain Trades
 
 Query `onchain_trades` ordered by `created_at, tx_hash, log_index`. For each
 trade:
@@ -2697,7 +2853,7 @@ trade:
 - Sequence: 1
 - Event: OnChainTradeEvent::Migrated with all fields from legacy table
 
-##### **Migrating Positions**
+##### Migrating Positions
 
 Query `trade_accumulators`. For each position:
 
@@ -2707,7 +2863,7 @@ Query `trade_accumulators`. For each position:
 - Threshold: `ExecutionThreshold::Shares(Decimal::ONE)` (production currently
   only supports whole share thresholds for Schwab compatibility)
 
-##### **Migrating OffChain Orders**
+##### Migrating OffChain Orders
 
 Query `schwab_executions` ordered by `id`. For each execution:
 
@@ -2716,7 +2872,7 @@ Query `schwab_executions` ordered by `id`. For each execution:
 - Event: OffchainOrderEvent::Migrated with status mapped from legacy system
 - Broker: SupportedBroker::Schwab (legacy system only used Schwab)
 
-##### **Migrating Schwab Auth**
+##### Migrating Schwab Auth
 
 Query `schwab_auth` table (singleton):
 
@@ -2724,7 +2880,7 @@ Query `schwab_auth` table (singleton):
 - Sequence: 1
 - Event: SchwabAuthEvent::TokensStored
 
-##### **Verification Strategy**
+##### Verification Strategy
 
 After migration:
 
@@ -2733,9 +2889,9 @@ After migration:
 3. Verify random sample of records match
 4. For positions: verify net_position, accumulated_long, accumulated_short match
 
-### **Testing Strategy**
+### Testing Strategy
 
-#### **Aggregate Testing**
+#### Aggregate Testing
 
 Use Given-When-Then pattern from `cqrs-es::test::TestFramework`:
 
@@ -2749,7 +2905,7 @@ fn test_position_accumulates_fills() {
 }
 ```
 
-#### **View Testing**
+#### View Testing
 
 ```rust
 #[test]
@@ -2764,7 +2920,7 @@ fn test_view_updates_from_events() {
 }
 ```
 
-#### **Integration Testing**
+#### Integration Testing
 
 ```rust
 #[tokio::test]
@@ -2775,7 +2931,7 @@ async fn test_full_flow_blockchain_to_broker() {
 }
 ```
 
-### **Code Organization**
+### Code Organization
 
 Aggregates use flat file structure by default. Submodules are only introduced
 when natural business logic boundaries emerge (e.g., `schwab/auth/` uses CQRS
@@ -2819,7 +2975,7 @@ crates/
       mock.rs                     - Mock implementation for testing
 ```
 
-### **Dependencies**
+### Dependencies
 
 Add to `Cargo.toml`:
 
@@ -2831,16 +2987,16 @@ cqrs-es = "0.4"
 
 ---
 
-## **Admin Dashboard**
+## Admin Dashboard
 
-### **Overview**
+### Overview
 
 A web-based admin dashboard for monitoring and controlling the liquidity bot
 from a single interface. The dashboard consolidates system health, trading
 activity, P&L metrics, and operational controls without duplicating
 functionality already available in Grafana.
 
-### **Technology Stack**
+### Technology Stack
 
 - **Framework**: SvelteKit with Svelte 5 (runes, snippets)
 - **UI Components**: shadcn-svelte
@@ -2850,9 +3006,9 @@ functionality already available in Grafana.
 - **Build Tool**: Vite
 - **Language**: TypeScript
 
-### **TypeScript Patterns**
+### TypeScript Patterns
 
-#### **Tagged Unions for Domain Modeling**
+#### Tagged Unions for Domain Modeling
 
 Following the same ADT philosophy used in the Rust backend, the dashboard uses
 discriminated unions (tagged unions) for type-safe domain modeling:
@@ -2881,7 +3037,7 @@ type Result<T, E> =
   | { ok: false; error: E };
 ```
 
-#### **Custom FP Helpers Module**
+#### Custom FP Helpers Module
 
 A small `lib/fp.ts` module provides utility functions for working with Result
 types and tagged unions:
@@ -2893,7 +3049,7 @@ types and tagged unions:
 
 No external dependencies - keeps bundle small and avoids library lock-in.
 
-#### **Alternatives Considered**
+#### Alternatives Considered
 
 - **Effect**: Full-featured FP library with structured concurrency, dependency
   injection, and comprehensive error handling. Rejected as overkill for a
@@ -2909,12 +3065,12 @@ No external dependencies - keeps bundle small and avoids library lock-in.
   caching, retry logic, and background refetch. TanStack Query handles this
   better.
 
-#### **State Management**
+#### State Management
 
 - **Server state**: TanStack Query v6 as reactive cache, populated via WebSocket
 - **Local UI state**: Svelte 5 `$state` and `$derived` runes
 
-#### **WebSocket-First Data Flow**
+#### WebSocket-First Data Flow
 
 All read data flows through a single WebSocket connection:
 
@@ -3097,9 +3253,9 @@ TanStack Query provides:
 - Devtools for inspecting state
 - Automatic component re-renders on cache updates
 
-### **Core Features**
+### Core Features
 
-#### **Grafana Dashboard Embedding**
+#### Grafana Dashboard Embedding
 
 Embed existing Grafana dashboards directly in the admin UI:
 
@@ -3112,7 +3268,7 @@ Embed existing Grafana dashboards directly in the admin UI:
 No need to rebuild Grafana's visualization capabilities - leverage existing
 dashboards.
 
-#### **HyperDX Health Status**
+#### HyperDX Health Status
 
 Display service health from HyperDX:
 
@@ -3128,7 +3284,7 @@ const response = await fetch("https://api.hyperdx.io/api/v1/alerts", {
 });
 ```
 
-#### **Schwab OAuth Integration**
+#### Schwab OAuth Integration
 
 Streamline the weekly OAuth re-authentication flow:
 
@@ -3147,7 +3303,7 @@ Streamline the weekly OAuth re-authentication flow:
 5. Dashboard extracts code and calls existing `POST /auth/refresh` endpoint
 6. Dashboard displays success/error and updates status
 
-#### **Circuit Breaker**
+#### Circuit Breaker
 
 Emergency control to halt all trading activity:
 
@@ -3170,7 +3326,7 @@ POST /api/circuit-breaker/trigger  { reason: string }
 POST /api/circuit-breaker/reset
 ```
 
-### **Dashboard Layout**
+### Dashboard Layout
 
 Single-page dashboard with live-updating panels, each expandable to full-screen.
 Supports two bot instances (Schwab and Alpaca) via broker selector in header.
@@ -3225,9 +3381,9 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    excluded to avoid exposing full database records. Starts empty on page load,
    populates as new events arrive via WebSocket.
 
-### **Architecture**
+### Architecture
 
-#### **Separate Frontend Package**
+#### Separate Frontend Package
 
 Dashboard lives in `dashboard/` directory at repository root:
 
@@ -3252,7 +3408,7 @@ dashboard/
 └── vite.config.ts
 ```
 
-#### **Backend API Extensions**
+#### Backend API Extensions
 
 Extend existing Rocket server (`src/api.rs`):
 
@@ -3274,7 +3430,7 @@ GET  /api/auth/url                 (generates Schwab OAuth URL)
 POST /auth/refresh                 (existing endpoint)
 ```
 
-#### **Authentication**
+#### Authentication
 
 Public read access with authenticated actions:
 
@@ -3285,7 +3441,7 @@ Public read access with authenticated actions:
   environment variable
 - Future: Proper user authentication system with role-based access
 
-#### **Deployment**
+#### Deployment
 
 Dashboard can be deployed as:
 
@@ -3306,13 +3462,13 @@ FROM nginx:alpine
 COPY --from=builder /app/build /usr/share/nginx/html
 ```
 
-### **Non-Goals (MVP)**
+### Non-Goals (MVP)
 
 - User authentication system (API key is sufficient for actions)
 - Position entry from dashboard (read-only + circuit breaker only)
 - Multi-tenant support
 
-### **Nice to Have**
+### Nice to Have
 
 - Mobile-responsive design (not mobile-first, but usable on mobile - modern
   stack makes this low effort)

@@ -96,6 +96,29 @@ check output, provide input), you must ensure they see the request:
 The user checks your output when they see you've stopped. If you give them a
 command mid-response and keep working, they will miss it.
 
+### Before handing over
+
+After implementation is complete and verification passes (tests, lints, fmt),
+perform a self-review:
+
+1. **Review the diff** - examine all changes and ask: can I justify each chunk?
+2. **Revert unjustified changes** - if you can't articulate why a change is
+   necessary, revert it
+3. **Check for scope creep** - did you change things unrelated to the task?
+
+**Justified changes:** explicitly requested by user, required to make the
+requested change work, fixes a bug/warning encountered during the task, improves
+readability of code being modified, enforces stricter domain boundaries.
+
+**Unjustified changes:** renaming unrelated things, reformatting outside the
+change area, LLM-initiated "while I'm here" improvements, changing terminology
+without request, adding comments to unchanged code.
+
+This step exists because LLMs are not naturally aware of diff size while
+generating, but can effectively review diffs after the fact. When context is
+ambiguous (after compaction), if you cannot point to an explicit user request in
+visible conversation, treat the change as unjustified and revert it.
+
 ## Project Overview
 
 This is a Rust-based market making system for tokenized equities that provides
@@ -605,6 +628,8 @@ returning values within expected bounds.
   2. `cargo test -q` - only run after check passes
   3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
   4. `cargo fmt` - always run last to ensure clean formatting
+  5. **Diff review** - after all checks pass, review staged changes and revert
+     any chunks without clear justification (see "Before handing over" section)
 
 #### CRITICAL: Lint Policy
 
