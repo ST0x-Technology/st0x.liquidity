@@ -666,11 +666,14 @@ impl InventoryView {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use alloy::primitives::{Address, TxHash, U256};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::ExecutionThreshold;
@@ -2152,5 +2155,218 @@ mod tests {
 
         // Onchain unchanged
         assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn snapshot_onchain_equity_fetched_reconciles_available_balance() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(10)),
+                    offchain: VenueBalance::new(shares(50), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(95));
+
+        let event = InventorySnapshotEvent::OnchainEquityFetched {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        // actual=95, inflight=10, so available should be 85
+        assert_eq!(equity.onchain.available(), shares(85));
+        assert_eq!(equity.onchain.inflight(), shares(10));
+        // offchain unchanged
+        assert_eq!(equity.offchain.available(), shares(50));
+    }
+
+    #[test]
+    fn snapshot_onchain_equity_clamps_available_to_zero_when_actual_less_than_inflight() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(10)),
+                    offchain: VenueBalance::new(shares(50), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(5)); // less than inflight
+
+        let event = InventorySnapshotEvent::OnchainEquityFetched {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        // actual=5, inflight=10, so available should be clamped to 0
+        assert_eq!(equity.onchain.available(), shares(0));
+        assert_eq!(equity.onchain.inflight(), shares(10));
+    }
+
+    #[test]
+    fn snapshot_onchain_cash_fetched_reconciles_usdc_balance() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(100))),
+                offchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OnchainCashFetched {
+            usdc_balance: Usdc(dec!(950)),
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        // actual=950, inflight=100, so available should be 850
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(850)));
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(100)));
+        // offchain unchanged
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn snapshot_offchain_equity_fetched_reconciles_available_balance() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(100), shares(0)),
+                    offchain: VenueBalance::new(shares(40), shares(10)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(55));
+
+        let event = InventorySnapshotEvent::OffchainEquityFetched {
+            positions,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        // actual=55, inflight=10, so available should be 45
+        assert_eq!(equity.offchain.available(), shares(45));
+        assert_eq!(equity.offchain.inflight(), shares(10));
+        // onchain unchanged
+        assert_eq!(equity.onchain.available(), shares(100));
+    }
+
+    #[test]
+    fn snapshot_offchain_cash_fetched_reconciles_usdc_balance_from_cents() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(100))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // 95000 cents = $950.00
+        let event = InventorySnapshotEvent::OffchainCashFetched {
+            cash_balance_cents: 95000,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        // actual=$950, inflight=$100, so available should be $850
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(850)));
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
+        // onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn snapshot_multiple_symbols_reconciled_in_single_event() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([
+                (
+                    aapl.clone(),
+                    Inventory {
+                        onchain: VenueBalance::new(shares(100), shares(0)),
+                        offchain: VenueBalance::new(shares(50), shares(0)),
+                        last_rebalancing: None,
+                    },
+                ),
+                (
+                    msft.clone(),
+                    Inventory {
+                        onchain: VenueBalance::new(shares(200), shares(0)),
+                        offchain: VenueBalance::new(shares(75), shares(0)),
+                        last_rebalancing: None,
+                    },
+                ),
+            ]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(80));
+        balances.insert(msft.clone(), shares(180));
+
+        let event = InventorySnapshotEvent::OnchainEquityFetched {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.equities.get(&aapl).unwrap().onchain.available(),
+            shares(80)
+        );
+        assert_eq!(
+            updated.equities.get(&msft).unwrap().onchain.available(),
+            shares(180)
+        );
     }
 }
