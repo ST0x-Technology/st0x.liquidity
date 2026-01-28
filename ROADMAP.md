@@ -116,6 +116,7 @@ Extract hedging logic and create application binary:
 - [ ] [#73 Stop storing onchain events unrelated to the arbitrageur](https://github.com/ST0x-Technology/st0x.liquidity/issues/73) -
       Filter unnecessary event storage
 - [ ] [#240 Conversion slippage not tracked, causing inventory drift](https://github.com/ST0x-Technology/st0x.liquidity/issues/240)
+- [ ] [#254 Track transfers with unique IDs for accurate inventory reconciliation](https://github.com/ST0x-Technology/st0x.liquidity/issues/254)
 
 **Edge Cases:**
 
