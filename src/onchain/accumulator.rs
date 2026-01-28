@@ -1,3 +1,4 @@
+use alloy::providers::Provider;
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
 use st0x_execution::{
@@ -12,6 +13,7 @@ use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_e
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
 use crate::trade_execution_link::TradeExecutionLink;
+use crate::vault::{VaultRatio, VaultService};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CleanedUpExecution {
@@ -46,6 +48,7 @@ pub(crate) async fn process_onchain_trade(
     dual_write_context: &DualWriteContext,
     trade: OnchainTrade,
     executor_type: SupportedExecutor,
+    vault_ratio: &VaultRatio,
 ) -> Result<TradeProcessingResult, OnChainError> {
     // Check if trade already exists to handle duplicates gracefully
     let tx_hash_str = trade.tx_hash.to_string();
@@ -96,6 +99,9 @@ pub(crate) async fn process_onchain_trade(
         Direction::Sell => AccumulationBucket::ShortExposure, // Sold stock -> short exposure
         Direction::Buy => AccumulationBucket::LongExposure,   // Bought stock -> long exposure
     };
+
+    // Track wrapped amounts in accumulator.
+    // Underlying-equivalent is calculated at query time using current vault ratio.
     calculator.add_trade(trade.amount, exposure_bucket);
 
     info!(
@@ -118,6 +124,7 @@ pub(crate) async fn process_onchain_trade(
             base_symbol,
             &mut calculator,
             executor_type,
+            vault_ratio,
         )
         .await?;
 
@@ -235,6 +242,7 @@ async fn try_create_execution_if_ready(
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     executor_type: SupportedExecutor,
+    vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let Some(position) = load_position(dual_write_context, base_symbol).await? else {
         debug!(
@@ -268,6 +276,7 @@ async fn try_create_execution_if_ready(
         execution_shares,
         direction,
         executor_type,
+        vault_ratio,
     )
     .await
 }
@@ -280,14 +289,25 @@ async fn execute_position(
     shares: Positive<FractionalShares>,
     direction: Direction,
     executor_type: SupportedExecutor,
+    vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
+    // The accumulator tracks wrapped token amounts. Convert to unwrapped
+    // (real equity) amounts before sending to the broker.
+    let unwrapped_shares = vault_ratio.wrapped_to_unwrapped_fractional(shares.inner())?;
+    let unwrapped_positive = Positive::new(unwrapped_shares)?;
+
     let shares_f64 = shares.inner().inner().to_f64().ok_or_else(|| {
         OnChainError::Validation(TradeValidationError::ShareConversionFailed(shares))
     })?;
 
-    let execution =
-        create_execution_within_transaction(sql_tx, base_symbol, shares, direction, executor_type)
-            .await?;
+    let execution = create_execution_within_transaction(
+        sql_tx,
+        base_symbol,
+        unwrapped_positive,
+        direction,
+        executor_type,
+    )
+    .await?;
 
     let execution_id = execution.id.ok_or(PersistenceError::MissingExecutionId)?;
 
@@ -342,17 +362,18 @@ async fn create_trade_execution_linkages(
     let zerox_suffix = format!("{base_str}0x");
     let s1_suffix = format!("{base_str}s1");
 
+    // Use wrapped amount for trade linkages - the actual onchain trade amount
     let trade_rows = sqlx::query!(
         r#"
         SELECT
             ot.id as trade_id,
-            ot.amount as trade_amount,
+            ot.amount as "trade_amount!: f64",
             COALESCE(SUM(tel.contributed_shares), 0.0) as "already_allocated: f64"
         FROM onchain_trades ot
         LEFT JOIN trade_execution_links tel ON ot.id = tel.trade_id
         WHERE (ot.symbol = ?1 OR ot.symbol = ?2 OR ot.symbol = ?3) AND ot.direction = ?4
         GROUP BY ot.id, ot.amount, ot.created_at
-        HAVING (ot.amount - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001  -- Has remaining allocation
+        HAVING (ot.amount - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001
         ORDER BY ot.created_at ASC
         "#,
         t_prefix,
@@ -596,14 +617,15 @@ async fn mark_execution_as_timed_out(
 /// It prevents positions from sitting idle indefinitely when they've accumulated
 /// enough shares to execute but the triggering trade didn't push them over the threshold.
 #[tracing::instrument(
-    skip(pool, dual_write_context),
+    skip(pool, dual_write_context, vault_service),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
-pub(crate) async fn check_all_accumulated_positions(
+pub(crate) async fn check_all_accumulated_positions<P: Provider + Clone>(
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
     executor_type: SupportedExecutor,
+    vault_service: &VaultService<P>,
 ) -> Result<Vec<OffchainExecution>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
 
@@ -633,8 +655,16 @@ pub(crate) async fn check_all_accumulated_positions(
     for row in candidate_symbols {
         let symbol = Symbol::new(&row.symbol)?;
 
-        if let Some(execution) =
-            check_symbol_for_execution(pool, dual_write_context, &symbol, executor_type).await?
+        let vault_ratio = vault_service.get_ratio_for_symbol(&symbol).await;
+
+        if let Some(execution) = check_symbol_for_execution(
+            pool,
+            dual_write_context,
+            &symbol,
+            executor_type,
+            &vault_ratio,
+        )
+        .await?
         {
             executions.push(execution);
         }
@@ -657,6 +687,7 @@ async fn check_symbol_for_execution(
     dual_write_context: &DualWriteContext,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
+    vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let Some((direction, shares)) =
         get_ready_execution_params(dual_write_context, symbol, executor_type).await?
@@ -675,7 +706,15 @@ async fn check_symbol_for_execution(
     clean_up_stale_executions(&mut sql_tx, symbol).await?;
 
     let result = if try_acquire_execution_lease(&mut sql_tx, symbol).await? {
-        process_symbol_execution(&mut sql_tx, symbol, direction, shares, executor_type).await?
+        process_symbol_execution(
+            &mut sql_tx,
+            symbol,
+            direction,
+            shares,
+            executor_type,
+            vault_ratio,
+        )
+        .await?
     } else {
         info!(symbol = %symbol, "Another worker holds execution lease, skipping");
         None
@@ -715,6 +754,7 @@ async fn process_symbol_execution(
     direction: Direction,
     shares: Positive<FractionalShares>,
     executor_type: SupportedExecutor,
+    vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let mut calculator = get_or_create_within_transaction(sql_tx, symbol).await?;
 
@@ -731,6 +771,7 @@ async fn process_symbol_execution(
         shares,
         direction,
         executor_type,
+        vault_ratio,
     )
     .await?;
 
@@ -758,7 +799,8 @@ async fn process_symbol_execution(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{FixedBytes, fixed_bytes};
+    use alloy::primitives::{FixedBytes, U256, fixed_bytes};
+    use alloy::providers::ProviderBuilder;
     use backon::{ExponentialBuilder, Retryable};
     use chrono::Utc;
     use rust_decimal::Decimal;
@@ -777,14 +819,22 @@ mod tests {
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
     use crate::trade_execution_link::TradeExecutionLink;
+    use crate::vault::WrappedTokenRegistry;
+
+    fn create_test_vault_service() -> VaultService<impl alloy::providers::Provider + Clone> {
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        VaultService::new(provider, WrappedTokenRegistry::empty())
+    }
 
     fn create_test_onchain_trade(symbol: &str, tx_hash_byte: u8) -> OnchainTrade {
+        let amount = 1.5;
         OnchainTrade {
             id: None,
             tx_hash: FixedBytes([tx_hash_byte; 32]),
             log_index: 1,
             symbol: symbol.parse().unwrap(),
-            amount: 1.5,
+            amount,
             direction: Direction::Buy,
             price: Usdc::new(250.0).unwrap(),
             block_timestamp: Some(Utc::now()),
@@ -869,16 +919,14 @@ mod tests {
     async fn process_trade_with_tx(
         pool: &SqlitePool,
         trade: OnchainTrade,
+        vault_ratio: &VaultRatio,
     ) -> Result<Option<OffchainExecution>, OnChainError> {
         let dual_write_context = DualWriteContext::new(pool.clone());
         let base_symbol = trade.symbol.base();
 
-        // Mirror production: acquire symbol lock before updating Position aggregate
         let symbol_lock = get_symbol_lock(base_symbol).await;
         let _guard = symbol_lock.lock().await;
 
-        // Initialize Position aggregate and acknowledge fill BEFORE processing
-        // so threshold check sees current state
         let _ = crate::dual_write::initialize_position(
             &dual_write_context,
             base_symbol,
@@ -899,10 +947,98 @@ mod tests {
             &dual_write_context,
             trade,
             SupportedExecutor::Schwab,
+            vault_ratio,
         )
         .await?;
         sql_tx.commit().await?;
         Ok(execution)
+    }
+
+    #[tokio::test]
+    async fn test_vault_ratio_converts_wrapped_to_unwrapped_shares() {
+        let pool = setup_test_db().await;
+
+        // 1.05 ratio: 1 wrapped = 1.05 unwrapped
+        let assets_per_share = U256::from(1_050_000_000_000_000_000u64);
+        let vault_ratio = VaultRatio::new(assets_per_share).unwrap();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: fixed_bytes!(
+                "0xaa00000000000000000000000000000000000000000000000000000000000000"
+            ),
+            log_index: 1,
+            symbol: tokenized_symbol!("MSFT0x"),
+            amount: 1.5,
+            direction: Direction::Sell,
+            price: Usdc::new(300.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: Some(52000),
+            effective_gas_price: Some(1_800_000_000),
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        let execution = process_trade_with_tx(&pool, trade, &vault_ratio)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 1.5 wrapped shares * 1.05 ratio = 1.575 unwrapped shares, floored to 1 whole share
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap(),
+            "Execution should be 1 whole share (floored from 1.575 unwrapped)"
+        );
+
+        // Accumulator should still track wrapped amounts
+        let (calculator, _) = find_by_symbol(&pool, "MSFT").await.unwrap().unwrap();
+        // 1 whole share execution reduces the wrapped accumulation by 1.0
+        assert!(
+            (calculator.accumulated_short - 0.5).abs() < f64::EPSILON,
+            "Accumulator should track wrapped amounts, remaining 0.5 wrapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_one_to_one_vault_ratio_preserves_existing_behavior() {
+        let pool = setup_test_db().await;
+
+        let vault_ratio = VaultRatio::one_to_one();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: fixed_bytes!(
+                "0xbb00000000000000000000000000000000000000000000000000000000000000"
+            ),
+            log_index: 1,
+            symbol: tokenized_symbol!("MSFT0x"),
+            amount: 1.5,
+            direction: Direction::Sell,
+            price: Usdc::new(300.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: Some(52000),
+            effective_gas_price: Some(1_800_000_000),
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        let execution = process_trade_with_tx(&pool, trade, &vault_ratio)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // 1:1 ratio means 1.5 wrapped = 1.5 unwrapped, floored to 1 whole share
+        assert_eq!(
+            execution.shares,
+            Positive::new(FractionalShares::new(dec!(1))).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -929,7 +1065,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await.unwrap();
+        let result = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result.is_none());
 
         let (calculator, _) = find_by_symbol(&pool, "AAPL").await.unwrap().unwrap();
@@ -962,7 +1100,10 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(execution.symbol, Symbol::new("MSFT").unwrap());
         // With Shares threshold, execution is floored to whole shares
@@ -1002,7 +1143,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result1 = process_trade_with_tx(&pool, trade1).await.unwrap();
+        let result1 = process_trade_with_tx(&pool, trade1, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result1.is_none());
 
         let trade2 = OnchainTrade {
@@ -1025,7 +1168,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result2 = process_trade_with_tx(&pool, trade2).await.unwrap();
+        let result2 = process_trade_with_tx(&pool, trade2, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result2.is_none());
 
         let trade3 = OnchainTrade {
@@ -1048,7 +1193,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result3 = process_trade_with_tx(&pool, trade3).await.unwrap();
+        let result3 = process_trade_with_tx(&pool, trade3, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         let execution = result3.unwrap();
 
         assert_eq!(execution.symbol, Symbol::new("AAPL").unwrap());
@@ -1089,7 +1236,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await;
+        let result = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one()).await;
         // Should succeed because INVALID0x has valid format, even if INVALID isn't a real ticker
         assert!(result.is_ok());
     }
@@ -1118,7 +1265,10 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(execution.direction, Direction::Buy); // Schwab BUY to offset onchain SELL (short exposure)
         assert_eq!(execution.symbol, Symbol::new("AAPL").unwrap());
@@ -1153,7 +1303,10 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap()
+            .unwrap();
 
         assert_eq!(execution.direction, Direction::Sell); // Schwab SELL to offset onchain BUY (long exposure)
         assert_eq!(execution.symbol, Symbol::new("MSFT").unwrap());
@@ -1206,7 +1359,7 @@ mod tests {
         };
 
         // Attempt to add trade - should fail when trying to save execution due to unique constraint
-        let result = process_trade_with_tx(&pool, trade).await;
+        let result = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one()).await;
 
         // Verify the operation failed due to execution save failure (unique constraint violation)
         assert!(result.is_err());
@@ -1283,11 +1436,15 @@ mod tests {
         };
 
         // Add first trade (should not trigger execution)
-        let result1 = process_trade_with_tx(&pool, trade1).await.unwrap();
+        let result1 = process_trade_with_tx(&pool, trade1, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result1.is_none());
 
         // Add second trade (should trigger execution)
-        let result2 = process_trade_with_tx(&pool, trade2).await.unwrap();
+        let result2 = process_trade_with_tx(&pool, trade2, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         let execution = result2.unwrap();
 
         // Verify execution created for exactly 1 share
@@ -1323,7 +1480,7 @@ mod tests {
             .with_min_delay(std::time::Duration::from_millis(10))
             .with_max_times(3);
 
-        (|| async { process_trade_with_tx(pool, trade.clone()).await })
+        (|| async { process_trade_with_tx(pool, trade.clone(), &VaultRatio::one_to_one()).await })
             .retry(backoff)
             .when(|e| e.to_string().contains("deadlocked"))
             .await
@@ -1428,7 +1585,10 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap()
+            .unwrap();
         let execution_id = execution.id.unwrap();
 
         // Verify trade-execution link was created
@@ -1507,18 +1667,18 @@ mod tests {
         ];
 
         // Add first two trades - should not trigger execution
-        let result1 = process_trade_with_tx(&pool, trades[0].clone())
+        let result1 = process_trade_with_tx(&pool, trades[0].clone(), &VaultRatio::one_to_one())
             .await
             .unwrap();
         assert!(result1.is_none());
 
-        let result2 = process_trade_with_tx(&pool, trades[1].clone())
+        let result2 = process_trade_with_tx(&pool, trades[1].clone(), &VaultRatio::one_to_one())
             .await
             .unwrap();
         assert!(result2.is_none());
 
         // Third trade should trigger execution
-        let result3 = process_trade_with_tx(&pool, trades[2].clone())
+        let result3 = process_trade_with_tx(&pool, trades[2].clone(), &VaultRatio::one_to_one())
             .await
             .unwrap();
         let execution = result3.unwrap();
@@ -1598,13 +1758,13 @@ mod tests {
         ];
 
         // Add first trade - no execution
-        let result1 = process_trade_with_tx(&pool, trades[0].clone())
+        let result1 = process_trade_with_tx(&pool, trades[0].clone(), &VaultRatio::one_to_one())
             .await
             .unwrap();
         assert!(result1.is_none());
 
         // Add second trade - triggers execution
-        let result2 = process_trade_with_tx(&pool, trades[1].clone())
+        let result2 = process_trade_with_tx(&pool, trades[1].clone(), &VaultRatio::one_to_one())
             .await
             .unwrap();
         let execution = result2.unwrap();
@@ -1652,7 +1812,10 @@ mod tests {
         };
 
         // Add trade and trigger execution
-        let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
+        let execution = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap()
+            .unwrap();
         let execution_id = execution.id.unwrap();
 
         // With Shares threshold, execution is floored to whole shares
@@ -1719,8 +1882,12 @@ mod tests {
         };
 
         // Execute both trades
-        let buy_result = process_trade_with_tx(&pool, buy_trade).await.unwrap();
-        let sell_result = process_trade_with_tx(&pool, sell_trade).await.unwrap();
+        let buy_result = process_trade_with_tx(&pool, buy_trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
+        let sell_result = process_trade_with_tx(&pool, sell_trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
 
         let buy_execution = buy_result.unwrap();
         let sell_execution = sell_result.unwrap();
@@ -1806,7 +1973,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await.unwrap();
+        let result = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
 
         // Should succeed and create new execution (because stale one was cleaned up)
         assert!(result.is_some());
@@ -1906,7 +2075,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await.unwrap();
+        let result = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
 
         // Should succeed and create new execution (because stale PENDING one was cleaned up)
         assert!(result.is_some());
@@ -2124,7 +2295,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, aapl_trade).await.unwrap();
+        let result = process_trade_with_tx(&pool, aapl_trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result.is_none()); // Should not execute yet (below 1.0)
 
         // Verify AAPL has accumulated position but no pending execution
@@ -2133,10 +2306,14 @@ mod tests {
         assert!(aapl_pending.is_none());
 
         // Run the function - should not create any executions since 0.8 < 1.0
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
         assert_eq!(executions.len(), 0);
 
         // Verify AAPL state unchanged
@@ -2151,10 +2328,14 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         // Run the function on empty database
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         // Should create no executions
         assert_eq!(executions.len(), 0);
@@ -2196,10 +2377,14 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         // Run the function
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         // Should create no executions since AAPL has pending execution
         assert_eq!(executions.len(), 0);
@@ -2276,7 +2461,9 @@ mod tests {
         };
 
         // Process first trade (GME0x) - should not trigger execution
-        let result1 = process_trade_with_tx(&pool, trade_0x).await.unwrap();
+        let result1 = process_trade_with_tx(&pool, trade_0x, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result1.is_none());
 
         // Verify accumulation for GME base symbol
@@ -2286,7 +2473,9 @@ mod tests {
         assert_eq!(pending, None);
 
         // Process second trade (GMEs1) - should not trigger execution yet
-        let result2 = process_trade_with_tx(&pool, trade_s1).await.unwrap();
+        let result2 = process_trade_with_tx(&pool, trade_s1, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result2.is_none());
 
         // Verify accumulation increased
@@ -2296,7 +2485,9 @@ mod tests {
         assert_eq!(pending2, None);
 
         // Process third trade (tGME) - should trigger execution since total is 1.1 shares
-        let result3 = process_trade_with_tx(&pool, trade_t).await.unwrap();
+        let result3 = process_trade_with_tx(&pool, trade_t, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result3.is_some());
 
         let execution = result3.unwrap();
@@ -2356,6 +2547,8 @@ mod tests {
         let mut trade = create_test_onchain_trade("TSLA0x", 0x99);
         trade.block_timestamp = None;
 
+        let vault_ratio = VaultRatio::one_to_one();
+
         let mut sql_tx = pool.begin().await.unwrap();
         let TradeProcessingResult {
             execution: _,
@@ -2365,6 +2558,7 @@ mod tests {
             &dual_write_context,
             trade,
             SupportedExecutor::Schwab,
+            &vault_ratio,
         )
         .await
         .unwrap();
@@ -2474,10 +2668,14 @@ mod tests {
         .await
         .ok();
 
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             executions.len(),
@@ -2512,7 +2710,9 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade1).await.unwrap();
+        let result = process_trade_with_tx(&pool, trade1, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result.is_none()); // 0.8 < 1.0, no execution yet
 
         let trade2 = OnchainTrade {
@@ -2536,7 +2736,9 @@ mod tests {
         };
 
         // This trade should trigger an execution (0.8 + 0.7 = 1.5 >= 1.0)
-        let result = process_trade_with_tx(&pool, trade2).await.unwrap();
+        let result = process_trade_with_tx(&pool, trade2, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
         assert!(result.is_some());
 
         // With Shares threshold, execution is floored to 1.0 share.
@@ -2553,10 +2755,14 @@ mod tests {
 
         // Now run check_all_accumulated_positions - should NOT create additional
         // executions since there's already a pending one (and net is now 0.5 < 1.0)
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             executions.len(),
@@ -2834,11 +3040,14 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
         let symbol = Symbol::new("NONEXISTENT").unwrap();
 
+        let vault_ratio = VaultRatio::one_to_one();
+
         let result = check_symbol_for_execution(
             &pool,
             &dual_write_context,
             &symbol,
             SupportedExecutor::Schwab,
+            &vault_ratio,
         )
         .await
         .unwrap();
@@ -2889,11 +3098,14 @@ mod tests {
             .unwrap();
         sql_tx.commit().await.unwrap();
 
+        let vault_ratio = VaultRatio::one_to_one();
+
         let result = check_symbol_for_execution(
             &pool,
             &dual_write_context,
             &symbol,
             SupportedExecutor::Schwab,
+            &vault_ratio,
         )
         .await
         .unwrap();
@@ -2973,11 +3185,14 @@ mod tests {
         .await
         .unwrap();
 
+        let vault_ratio = VaultRatio::one_to_one();
+
         let result = check_symbol_for_execution(
             &pool,
             &dual_write_context,
             &symbol,
             SupportedExecutor::Schwab,
+            &vault_ratio,
         )
         .await
         .unwrap();

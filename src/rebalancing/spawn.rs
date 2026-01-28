@@ -38,10 +38,11 @@ use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::http_client_with_retry;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::vault::{VaultId, VaultService as RainVaultService};
 use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
+use crate::vault::VaultService as Erc4626VaultService;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -134,7 +135,10 @@ where
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
-    vault: Arc<VaultService<BP>>,
+    /// Rain OrderBook vault service for USDC deposit/withdraw operations.
+    rain_vault: Arc<RainVaultService<BP>>,
+    /// ERC-4626 vault service for wrapped token operations (ratio, wrap, unwrap).
+    erc4626_vault: Arc<Erc4626VaultService<BP>>,
 }
 
 impl<BP> Services<BP>
@@ -202,14 +206,19 @@ where
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
-        let vault = Arc::new(VaultService::new(base_provider, orderbook));
+        let rain_vault = Arc::new(RainVaultService::new(base_provider.clone(), orderbook));
+        let erc4626_vault = Arc::new(Erc4626VaultService::new(
+            base_provider,
+            config.wrapped_token_registry.clone(),
+        ));
 
         Ok(Self {
             tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            rain_vault,
+            erc4626_vault,
         })
     }
 
@@ -237,6 +246,7 @@ where
             symbol_cache,
             inventory,
             operation_sender,
+            Arc::clone(&self.erc4626_vault),
         ));
 
         let mint_store =
@@ -262,16 +272,23 @@ where
             (),
         ));
 
-        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
+        let mint_manager = Arc::new(MintManager::new(
+            self.tokenization.clone(),
+            mint_cqrs,
+            Arc::clone(&self.erc4626_vault),
+        ));
 
-        let redemption_manager =
-            Arc::new(RedemptionManager::new(self.tokenization, redemption_cqrs));
+        let redemption_manager = Arc::new(RedemptionManager::new(
+            self.tokenization,
+            redemption_cqrs,
+            Arc::clone(&self.erc4626_vault),
+        ));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
             self.broker,
             self.wallet,
             self.cctp,
-            self.vault,
+            self.rain_vault,
             usdc_cqrs,
             market_maker_wallet,
             VaultId(config.usdc_vault_id),
@@ -289,10 +306,13 @@ where
 
 macro_rules! build_queries {
     ($name:ident, $aggregate:ty) => {
-        fn $name(
-            trigger: Arc<RebalancingTrigger>,
+        fn $name<P>(
+            trigger: Arc<RebalancingTrigger<P>>,
             event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-        ) -> Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> {
+        ) -> Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>>
+        where
+            P: Provider + Clone + Send + Sync + 'static,
+        {
             let mut queries: Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> =
                 vec![Box::new(trigger)];
 
@@ -325,6 +345,7 @@ mod tests {
 
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
+    use crate::vault::WrappedTokenRegistry;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -347,6 +368,7 @@ mod tests {
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
             alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
+            wrapped_token_registry: WrappedTokenRegistry::empty(),
         }
     }
 
@@ -501,16 +523,22 @@ mod tests {
         .with_required_confirmations(1);
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
-        let vault = Arc::new(
-            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
+        let rain_vault = Arc::new(
+            RainVaultService::new(base_provider.clone(), TEST_ORDERBOOK)
+                .with_required_confirmations(1),
         );
+        let erc4626_vault = Arc::new(Erc4626VaultService::new(
+            base_provider,
+            config.wrapped_token_registry.clone(),
+        ));
 
         let services = Services {
             tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            rain_vault,
+            erc4626_vault,
         };
 
         (services, config)

@@ -390,7 +390,7 @@ fn spawn_queue_processor<P, E>(
     provider: P,
 ) -> JoinHandle<()>
 where
-    P: Provider + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
@@ -401,6 +401,14 @@ where
     let dual_write_context =
         DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
+    let wrapped_token_registry = config
+        .rebalancing
+        .as_ref()
+        .map(|r| r.wrapped_token_registry.clone())
+        .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
+
+    let vault_service = crate::vault::VaultService::new(provider.clone(), wrapped_token_registry);
+
     tokio::spawn(async move {
         run_queue_processor(
             &executor,
@@ -409,18 +417,21 @@ where
             &cache_clone,
             provider,
             &dual_write_context,
+            &vault_service,
         )
         .await;
     })
 }
 
-fn spawn_periodic_accumulated_position_check<E>(
+fn spawn_periodic_accumulated_position_check<E, P>(
     executor: E,
     pool: SqlitePool,
     dual_write_context: DualWriteContext,
+    vault_service: crate::vault::VaultService<P>,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     EventProcessingError: From<E::Error>,
 {
     info!("Starting periodic accumulated position checker");
@@ -434,8 +445,13 @@ where
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) =
-                check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
+            if let Err(e) = check_and_execute_accumulated_positions(
+                &executor,
+                &pool,
+                &dual_write_context,
+                &vault_service,
+            )
+            .await
             {
                 error!("Periodic accumulated position check failed: {e}");
             }
@@ -564,6 +580,7 @@ async fn run_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     dual_write_context: &DualWriteContext,
+    vault_service: &crate::vault::VaultService<P>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -586,6 +603,7 @@ async fn run_queue_processor<P, E>(
             &provider,
             &feed_id_cache,
             dual_write_context,
+            vault_service,
         )
         .await;
 
@@ -639,6 +657,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     provider: &P,
     feed_id_cache: &FeedIdCache,
     dual_write_context: &DualWriteContext,
+    vault_service: &crate::vault::VaultService<P>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -654,6 +673,10 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return handle_filtered_event(pool, &queued_event, event_id).await;
     };
 
+    let vault_ratio = vault_service
+        .get_ratio_for_symbol(trade.symbol.base())
+        .await;
+
     process_valid_trade(
         executor_type,
         pool,
@@ -661,6 +684,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
         event_id,
         trade,
         dual_write_context,
+        &vault_ratio,
     )
     .await
 }
@@ -752,6 +776,7 @@ async fn process_valid_trade(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
+    vault_ratio: &crate::vault::VaultRatio,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -780,6 +805,7 @@ async fn process_valid_trade(
         event_id,
         trade,
         dual_write_context,
+        vault_ratio,
     )
     .await
 }
@@ -945,6 +971,7 @@ async fn process_trade_within_transaction(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
+    vault_ratio: &crate::vault::VaultRatio,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_initialize_position(dual_write_context, &trade).await;
@@ -968,6 +995,7 @@ async fn process_trade_within_transaction(
         dual_write_context,
         trade.clone(),
         executor_type,
+        vault_ratio,
     )
     .await
     .inspect_err(|e| {
@@ -1040,18 +1068,21 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<E>(
+async fn check_and_execute_accumulated_positions<E, P>(
     executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
+    vault_service: &crate::vault::VaultService<P>,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
+    P: Provider + Clone,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
     let executions =
-        check_all_accumulated_positions(pool, dual_write_context, executor_type).await?;
+        check_all_accumulated_positions(pool, dual_write_context, executor_type, vault_service)
+            .await?;
 
     if executions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1459,6 +1490,7 @@ mod tests {
             .await
             {
                 let dual_write_context = DualWriteContext::new(pool.clone());
+                let vault_ratio = crate::vault::VaultRatio::one_to_one();
 
                 let mut sql_tx = pool.begin().await.unwrap();
                 let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
@@ -1466,6 +1498,7 @@ mod tests {
                     &dual_write_context,
                     trade,
                     SupportedExecutor::DryRun,
+                    &vault_ratio,
                 )
                 .await
                 .unwrap();
@@ -1921,6 +1954,11 @@ mod tests {
 
         let dual_write_context = DualWriteContext::new(pool.clone());
 
+        let vault_service = crate::vault::VaultService::new(
+            provider.clone(),
+            crate::vault::WrappedTokenRegistry::empty(),
+        );
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
@@ -1929,6 +1967,7 @@ mod tests {
             &provider,
             &feed_id_cache,
             &dual_write_context,
+            &vault_service,
         )
         .await;
 
@@ -2743,6 +2782,11 @@ mod tests {
             .await
             .unwrap();
 
+        let vault_service = crate::vault::VaultService::new(
+            provider.clone(),
+            crate::vault::WrappedTokenRegistry::empty(),
+        );
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
@@ -2751,6 +2795,7 @@ mod tests {
             &provider,
             &feed_id_cache,
             &dual_write_context,
+            &vault_service,
         )
         .await;
 
@@ -2791,6 +2836,11 @@ mod tests {
             .await
             .unwrap();
 
+        let vault_service = crate::vault::VaultService::new(
+            provider.clone(),
+            crate::vault::WrappedTokenRegistry::empty(),
+        );
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
@@ -2799,6 +2849,7 @@ mod tests {
             &provider,
             &feed_id_cache,
             &dual_write_context,
+            &vault_service,
         )
         .await;
 
@@ -2879,9 +2930,19 @@ mod tests {
         let symbol_str =
             setup_accumulated_position_state(&pool, &dual_write_context, &symbol).await;
 
-        check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context)
-            .await
-            .unwrap();
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        let vault_service =
+            crate::vault::VaultService::new(provider, crate::vault::WrappedTokenRegistry::empty());
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            &pool,
+            &dual_write_context,
+            &vault_service,
+        )
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 

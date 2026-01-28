@@ -124,7 +124,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
 
 impl<P, E> ConductorBuilder<P, E, WithDexStreams>
 where
-    P: Provider + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
@@ -154,10 +154,22 @@ where
         );
         let event_processor =
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
+        let wrapped_token_registry = self
+            .common
+            .config
+            .rebalancing
+            .as_ref()
+            .map(|r| r.wrapped_token_registry.clone())
+            .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
+
+        let position_checker_vault_service =
+            crate::vault::VaultService::new(self.common.provider.clone(), wrapped_token_registry);
+
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
             self.common.pool.clone(),
             self.common.dual_write_context.clone(),
+            position_checker_vault_service,
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,

@@ -25,7 +25,7 @@ use crate::cctp::{
 };
 use crate::env::{BrokerConfig, Config};
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::vault::{VaultId, VaultService as RainVaultService};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
@@ -34,6 +34,7 @@ use crate::shares::FractionalShares;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::vault::VaultService as Erc4626VaultService;
 
 use super::TransferDirection;
 
@@ -84,7 +85,11 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let mint_store =
                 PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
             let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
-            let mint_manager = MintManager::new(tokenization_service, mint_cqrs);
+            let erc4626_vault = Arc::new(Erc4626VaultService::new(
+                base_provider.clone(),
+                rebalancing_config.wrapped_token_registry.clone(),
+            ));
+            let mint_manager = MintManager::new(tokenization_service, mint_cqrs, erc4626_vault);
 
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
@@ -113,7 +118,12 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let redemption_store =
                 PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
             let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_cqrs);
+            let erc4626_vault = Arc::new(Erc4626VaultService::new(
+                base_provider.clone(),
+                rebalancing_config.wrapped_token_registry.clone(),
+            ));
+            let redemption_manager =
+                RedemptionManager::new(tokenization_service, redemption_cqrs, erc4626_vault);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
@@ -212,7 +222,7 @@ where
     );
 
     let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
-    let vault_service = Arc::new(VaultService::new(
+    let vault_service = Arc::new(RainVaultService::new(
         base_provider_with_wallet,
         config.evm.orderbook,
     ));

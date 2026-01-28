@@ -15,6 +15,10 @@
 //!                                v                                       v
 //!                             Failed                             TokensReceived
 //!                                                                       |
+//!                                                            WrapTokens | Finalize
+//!                                                                       v
+//!                                                                TokensWrapped
+//!                                                                       |
 //!                                                                       | Finalize
 //!                                                                       v
 //!                                                                   Completed
@@ -22,6 +26,7 @@
 //!
 //! - `MintRequested` can be rejected via `RejectMint`
 //! - `MintAccepted` can fail via `FailAcceptance`
+//! - `TokensReceived` can either be wrapped (WrapTokens) or finalized directly
 //! - `Completed` and `Failed` are terminal states
 //!
 //! # Alpaca API Integration
@@ -95,7 +100,10 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to receive tokens before mint was accepted
     #[error("Cannot receive tokens: mint not accepted")]
     NotAccepted,
-    /// Attempted to finalize before tokens were received
+    /// Attempted to wrap tokens before they were received
+    #[error("Cannot wrap tokens: tokens not received")]
+    TokensNotReceivedForWrap,
+    /// Attempted to finalize before tokens were received (or wrapped if applicable)
     #[error("Cannot finalize: tokens not received")]
     TokensNotReceived,
     /// Attempted to modify a completed mint operation
@@ -136,6 +144,12 @@ pub(crate) enum TokenizedEquityMintCommand {
         shares_minted: U256,
     },
 
+    /// Wrap unwrapped tokens into ERC-4626 vault shares.
+    WrapTokens {
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+    },
+
     Finalize,
 }
 
@@ -173,6 +187,13 @@ pub(crate) enum TokenizedEquityMintEvent {
         received_at: DateTime<Utc>,
     },
 
+    /// Unwrapped tokens have been wrapped into ERC-4626 vault shares.
+    TokensWrapped {
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        wrapped_at: DateTime<Utc>,
+    },
+
     MintCompleted {
         completed_at: DateTime<Utc>,
     },
@@ -188,6 +209,7 @@ impl DomainEvent for TokenizedEquityMintEvent {
                 "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
+            Self::TokensWrapped { .. } => "TokenizedEquityMintEvent::TokensWrapped".to_string(),
             Self::MintCompleted { .. } => "TokenizedEquityMintEvent::MintCompleted".to_string(),
         }
     }
@@ -235,6 +257,24 @@ pub(crate) enum TokenizedEquityMint {
         requested_at: DateTime<Utc>,
         accepted_at: DateTime<Utc>,
         received_at: DateTime<Utc>,
+    },
+
+    /// Tokens have been wrapped into ERC-4626 vault shares
+    TokensWrapped {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        tx_hash: TxHash,
+        receipt_id: ReceiptId,
+        shares_minted: U256,
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        requested_at: DateTime<Utc>,
+        accepted_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        wrapped_at: DateTime<Utc>,
     },
 
     /// Mint operation successfully completed (terminal state)
@@ -305,6 +345,11 @@ impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
                 receipt_id,
                 shares_minted,
             } => self.handle_receive_tokens(*tx_hash, receipt_id, *shares_minted),
+
+            TokenizedEquityMintCommand::WrapTokens {
+                wrap_tx_hash,
+                wrapped_shares,
+            } => self.handle_wrap_tokens(*wrap_tx_hash, *wrapped_shares),
 
             TokenizedEquityMintCommand::Finalize => self.handle_finalize(),
         }
@@ -409,7 +454,35 @@ impl Lifecycle<TokenizedEquityMint, Never> {
                 }])
             }
             Ok(
-                TokenizedEquityMint::Completed { .. } | TokenizedEquityMint::TokensReceived { .. },
+                TokenizedEquityMint::Completed { .. }
+                | TokenizedEquityMint::TokensReceived { .. }
+                | TokenizedEquityMint::TokensWrapped { .. },
+            ) => Err(TokenizedEquityMintError::AlreadyCompleted),
+            Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_wrap_tokens(
+        &self,
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                TokenizedEquityMint::MintRequested { .. }
+                | TokenizedEquityMint::MintAccepted { .. },
+            ) => Err(TokenizedEquityMintError::TokensNotReceivedForWrap),
+            Ok(TokenizedEquityMint::TokensReceived { .. }) => {
+                Ok(vec![TokenizedEquityMintEvent::TokensWrapped {
+                    wrap_tx_hash,
+                    wrapped_shares,
+                    wrapped_at: Utc::now(),
+                }])
+            }
+            Ok(
+                TokenizedEquityMint::Completed { .. } | TokenizedEquityMint::TokensWrapped { .. },
             ) => Err(TokenizedEquityMintError::AlreadyCompleted),
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Err(e) => Err(e.into()),
@@ -423,11 +496,12 @@ impl Lifecycle<TokenizedEquityMint, Never> {
                 TokenizedEquityMint::MintRequested { .. }
                 | TokenizedEquityMint::MintAccepted { .. },
             ) => Err(TokenizedEquityMintError::TokensNotReceived),
-            Ok(TokenizedEquityMint::TokensReceived { .. }) => {
-                Ok(vec![TokenizedEquityMintEvent::MintCompleted {
-                    completed_at: Utc::now(),
-                }])
-            }
+            Ok(
+                TokenizedEquityMint::TokensReceived { .. }
+                | TokenizedEquityMint::TokensWrapped { .. },
+            ) => Ok(vec![TokenizedEquityMintEvent::MintCompleted {
+                completed_at: Utc::now(),
+            }]),
             Ok(TokenizedEquityMint::Completed { .. }) => {
                 Err(TokenizedEquityMintError::AlreadyCompleted)
             }
@@ -479,6 +553,11 @@ impl TokenizedEquityMint {
                 *received_at,
                 event,
             ),
+            TokenizedEquityMintEvent::TokensWrapped {
+                wrap_tx_hash,
+                wrapped_shares,
+                wrapped_at,
+            } => current.apply_tokens_wrapped(*wrap_tx_hash, *wrapped_shares, *wrapped_at, event),
             TokenizedEquityMintEvent::MintCompleted { completed_at } => {
                 current.apply_completed(*completed_at, event)
             }
@@ -579,9 +658,11 @@ impl TokenizedEquityMint {
         })
     }
 
-    fn apply_completed(
+    fn apply_tokens_wrapped(
         &self,
-        completed_at: DateTime<Utc>,
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        wrapped_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::TokensReceived {
@@ -594,8 +675,64 @@ impl TokenizedEquityMint {
             receipt_id,
             shares_minted,
             requested_at,
-            ..
+            accepted_at,
+            received_at,
         } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::TokensWrapped {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            wallet: *wallet,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            tx_hash: *tx_hash,
+            receipt_id: receipt_id.clone(),
+            shares_minted: *shares_minted,
+            wrap_tx_hash,
+            wrapped_shares,
+            requested_at: *requested_at,
+            accepted_at: *accepted_at,
+            received_at: *received_at,
+            wrapped_at,
+        })
+    }
+
+    fn apply_completed(
+        &self,
+        completed_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        // Extract common fields from either TokensReceived or TokensWrapped state
+        let (Self::TokensReceived {
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+            tokenization_request_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            requested_at,
+            ..
+        }
+        | Self::TokensWrapped {
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+            tokenization_request_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            requested_at,
+            ..
+        }) = self
         else {
             return Err(LifecycleError::Mismatch {
                 state: format!("{self:?}"),
@@ -1328,5 +1465,280 @@ mod tests {
         };
         assert!(state.contains("MintRequested"));
         assert_eq!(evt, "TokenizedEquityMintEvent::MintRequested");
+    }
+
+    #[tokio::test]
+    async fn test_wrap_tokens_after_tokens_received() {
+        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let wallet = Address::random();
+        let tx_hash = TxHash::random();
+        let wrap_tx_hash = TxHash::random();
+
+        let requested_event = TokenizedEquityMintEvent::MintRequested {
+            symbol,
+            quantity: dec!(100.5),
+            wallet,
+            requested_at: Utc::now(),
+        };
+        aggregate.apply(requested_event);
+
+        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            accepted_at: Utc::now(),
+        };
+        aggregate.apply(accepted_event);
+
+        let received_event = TokenizedEquityMintEvent::TokensReceived {
+            tx_hash,
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            received_at: Utc::now(),
+        };
+        aggregate.apply(received_event);
+
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            TokenizedEquityMintEvent::TokensWrapped { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_wrap_tokens_before_tokens_received() {
+        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let wallet = Address::random();
+
+        let requested_event = TokenizedEquityMintEvent::MintRequested {
+            symbol,
+            quantity: dec!(100.5),
+            wallet,
+            requested_at: Utc::now(),
+        };
+        aggregate.apply(requested_event);
+
+        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            accepted_at: Utc::now(),
+        };
+        aggregate.apply(accepted_event);
+
+        let result = aggregate
+            .handle(
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash: TxHash::random(),
+                    wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(TokenizedEquityMintError::TokensNotReceivedForWrap)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_finalize_after_tokens_wrapped() {
+        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let wallet = Address::random();
+        let tx_hash = TxHash::random();
+        let wrap_tx_hash = TxHash::random();
+
+        let requested_event = TokenizedEquityMintEvent::MintRequested {
+            symbol,
+            quantity: dec!(100.5),
+            wallet,
+            requested_at: Utc::now(),
+        };
+        aggregate.apply(requested_event);
+
+        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            accepted_at: Utc::now(),
+        };
+        aggregate.apply(accepted_event);
+
+        let received_event = TokenizedEquityMintEvent::TokensReceived {
+            tx_hash,
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            received_at: Utc::now(),
+        };
+        aggregate.apply(received_event);
+
+        let wrapped_event = TokenizedEquityMintEvent::TokensWrapped {
+            wrap_tx_hash,
+            wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+            wrapped_at: Utc::now(),
+        };
+        aggregate.apply(wrapped_event);
+
+        let events = aggregate
+            .handle(TokenizedEquityMintCommand::Finalize, &())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            TokenizedEquityMintEvent::MintCompleted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_complete_mint_flow_with_wrapping() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let wallet = Address::random();
+        let tx_hash = TxHash::random();
+        let wrap_tx_hash = TxHash::random();
+
+        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::RequestMint {
+                    symbol: symbol.clone(),
+                    quantity: dec!(100.5),
+                    wallet,
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::AcknowledgeAcceptance {
+                    issuer_request_id: IssuerRequestId("ISS123".to_string()),
+                    tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::ReceiveTokens {
+                    tx_hash,
+                    receipt_id: ReceiptId(U256::from(789)),
+                    shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(TokenizedEquityMintCommand::Finalize, &())
+            .await
+            .unwrap();
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        assert!(matches!(
+            aggregate,
+            Lifecycle::Live(TokenizedEquityMint::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn test_apply_tokens_wrapped_rejects_wrong_state() {
+        let accepted = TokenizedEquityMint::MintAccepted {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
+            wallet: Address::random(),
+            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            requested_at: Utc::now(),
+            accepted_at: Utc::now(),
+        };
+
+        let event = TokenizedEquityMintEvent::TokensWrapped {
+            wrap_tx_hash: TxHash::random(),
+            wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+            wrapped_at: Utc::now(),
+        };
+
+        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
+
+        let LifecycleError::Mismatch { state, event: evt } = err else {
+            panic!("Expected Mismatch error, got {err:?}");
+        };
+        assert!(state.contains("MintAccepted"));
+        assert_eq!(evt, "TokenizedEquityMintEvent::TokensWrapped");
+    }
+
+    #[test]
+    fn test_apply_completed_from_tokens_wrapped() {
+        let wrapped = TokenizedEquityMint::TokensWrapped {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
+            wallet: Address::random(),
+            issuer_request_id: IssuerRequestId("ISS123".to_string()),
+            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
+            tx_hash: TxHash::random(),
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            wrap_tx_hash: TxHash::random(),
+            wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+            requested_at: Utc::now(),
+            accepted_at: Utc::now(),
+            received_at: Utc::now(),
+            wrapped_at: Utc::now(),
+        };
+
+        let event = TokenizedEquityMintEvent::MintCompleted {
+            completed_at: Utc::now(),
+        };
+
+        let result = TokenizedEquityMint::apply_transition(&event, &wrapped);
+        assert!(result.is_ok());
+        assert!(matches!(
+            result.unwrap(),
+            TokenizedEquityMint::Completed { .. }
+        ));
     }
 }

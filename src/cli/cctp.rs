@@ -283,6 +283,7 @@ mod tests {
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
     use crate::threshold::ExecutionThreshold;
+    use crate::vault::WrappedTokenRegistry;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -320,6 +321,7 @@ mod tests {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
             },
+            wrapped_token_registry: WrappedTokenRegistry::empty(),
         });
         config
     }

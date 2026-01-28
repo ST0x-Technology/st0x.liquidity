@@ -1,7 +1,7 @@
 //! MintManager orchestrates the TokenizedEquityMint workflow.
 //!
 //! Coordinates between `AlpacaTokenizationService` and the `TokenizedEquityMint` aggregate
-//! to execute the full mint lifecycle: request -> poll -> receive tokens -> finalize.
+//! to execute the full mint lifecycle: request -> poll -> receive tokens -> wrap -> finalize.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -21,6 +21,7 @@ use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
+use crate::vault::VaultService;
 
 pub(crate) struct MintManager<P, ES>
 where
@@ -29,6 +30,7 @@ where
 {
     service: Arc<AlpacaTokenizationService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+    vault_service: Arc<VaultService<P>>,
 }
 
 impl<P, ES> MintManager<P, ES>
@@ -39,8 +41,13 @@ where
     pub(crate) fn new(
         service: Arc<AlpacaTokenizationService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+        vault_service: Arc<VaultService<P>>,
     ) -> Self {
-        Self { service, cqrs }
+        Self {
+            service,
+            cqrs,
+            vault_service,
+        }
     }
 
     /// Executes the full mint workflow.
@@ -52,7 +59,8 @@ where
     /// 3. Send `AcknowledgeAcceptance` with request IDs
     /// 4. Poll Alpaca until terminal status
     /// 5. Send `ReceiveTokens` when Alpaca reports completion
-    /// 6. Send `Finalize` to complete
+    /// 6. If symbol uses wrapped tokens: wrap via ERC-4626 vault, send `WrapTokens`
+    /// 7. Send `Finalize` to complete
     ///
     /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
     #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
@@ -161,6 +169,7 @@ where
             TokenizationRequestStatus::Completed => {
                 let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
                 let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity)?;
+                let symbol = &completed_request.underlying_symbol;
 
                 self.cqrs
                     .execute(
@@ -172,6 +181,48 @@ where
                         },
                     )
                     .await?;
+
+                // Wrap tokens if this symbol uses wrapped tokens
+                if let Some(config) = self.vault_service.get_config_by_symbol(symbol) {
+                    let unwrapped_token = config.unwrapped_token;
+                    let wrapped_token = config.wrapped_token;
+                    let wallet = completed_request.wallet.ok_or(MintError::MissingTxHash)?;
+
+                    info!(
+                        %symbol,
+                        %unwrapped_token,
+                        %wrapped_token,
+                        amount = %shares_minted,
+                        "Wrapping tokens into ERC-4626 vault"
+                    );
+
+                    // Ensure the vault has approval to spend the unwrapped tokens
+                    self.vault_service
+                        .ensure_approval(unwrapped_token, wrapped_token)
+                        .await?;
+
+                    // Wrap the tokens
+                    let (wrap_tx_hash, wrapped_shares) = self
+                        .vault_service
+                        .wrap(wrapped_token, shares_minted, wallet)
+                        .await?;
+
+                    info!(
+                        %wrap_tx_hash,
+                        %wrapped_shares,
+                        "Tokens wrapped successfully"
+                    );
+
+                    self.cqrs
+                        .execute(
+                            &issuer_request_id.0,
+                            TokenizedEquityMintCommand::WrapTokens {
+                                wrap_tx_hash,
+                                wrapped_shares,
+                            },
+                        )
+                        .await?;
+                }
 
                 self.cqrs
                     .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Finalize)
@@ -238,11 +289,16 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
+    use alloy::network::EthereumWallet;
+    use alloy::signers::local::PrivateKeySigner;
+
     use super::*;
+    use crate::alpaca_tokenization::AlpacaTokenizationService;
     use crate::alpaca_tokenization::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
+        TEST_ACCOUNT_ID, TEST_REDEMPTION_WALLET, setup_anvil, tokenization_mint_path,
         tokenization_requests_path,
     };
+    use crate::vault::WrappedTokenRegistry;
 
     type TestCqrs = CqrsFramework<
         Lifecycle<TokenizedEquityMint, Never>,
@@ -252,6 +308,42 @@ mod tests {
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();
         Arc::new(CqrsFramework::new(store, vec![], ()))
+    }
+
+    /// Creates a test setup with matching provider types for service and vault_service.
+    fn create_test_setup<P: Provider + Clone>(
+        server: &httpmock::MockServer,
+        provider: P,
+    ) -> (Arc<AlpacaTokenizationService<P>>, Arc<VaultService<P>>) {
+        let service = Arc::new(AlpacaTokenizationService::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+
+        let vault_service = Arc::new(VaultService::new(provider, WrappedTokenRegistry::empty()));
+
+        (service, vault_service)
+    }
+
+    async fn create_test_provider() -> impl Provider + Clone {
+        let (anvil, endpoint, key) = setup_anvil();
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = alloy::providers::ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        // Keep anvil alive by leaking it (it's dropped when the test ends anyway)
+        std::mem::forget(anvil);
+
+        provider
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -316,12 +408,10 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_happy_path() {
         let server = MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+        let provider = create_test_provider().await;
+        let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(service, cqrs, vault_service);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
@@ -354,12 +444,10 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_rejected_by_alpaca() {
         let server = MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+        let provider = create_test_provider().await;
+        let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(service, cqrs, vault_service);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
@@ -404,12 +492,10 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_api_error() {
         let server = MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+        let provider = create_test_provider().await;
+        let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(service, cqrs, vault_service);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
@@ -432,12 +518,10 @@ mod tests {
     #[tokio::test]
     async fn trait_impl_delegates_to_execute_mint_impl() {
         let server = MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+        let provider = create_test_provider().await;
+        let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(service, cqrs, vault_service);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());

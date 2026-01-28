@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 use crate::symbol::cache::SymbolCache;
+use crate::vault::VaultRatio;
 
 /// Why an equity trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,9 @@ impl Drop for InProgressGuard {
 
 /// Checks inventory for equity imbalance and returns the appropriate rebalancing operation.
 ///
+/// When `vault_ratio` is provided, the onchain (wrapped) amounts are converted to
+/// unwrapped-equivalent for accurate imbalance detection.
+///
 /// Returns `Mint` if there's too much offchain equity that needs to be tokenized,
 /// or `Redemption` if there's too much onchain equity that needs to be redeemed.
 pub(super) async fn check_imbalance_and_build_operation(
@@ -85,10 +89,11 @@ pub(super) async fn check_imbalance_and_build_operation(
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
     symbol_cache: &SymbolCache,
+    vault_ratio: &VaultRatio,
 ) -> Result<TriggeredOperation, EquityTriggerSkip> {
     let imbalance = {
         let inventory = inventory.read().await;
-        inventory.check_equity_imbalance(symbol, threshold)
+        inventory.check_equity_imbalance(symbol, threshold, vault_ratio)
     };
 
     let imbalance = imbalance.ok_or(EquityTriggerSkip::NoImbalance)?;
@@ -203,12 +208,14 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
         let result = check_imbalance_and_build_operation(
             &Symbol::new("AAPL").unwrap(),
             &threshold,
             &inventory,
             &symbol_cache,
+            &ratio,
         )
         .await;
 
@@ -233,10 +240,16 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, &symbol_cache)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            &symbol_cache,
+            &ratio,
+        )
+        .await;
 
         assert!(matches!(result, Ok(TriggeredOperation::Mint { .. })));
     }
@@ -265,10 +278,16 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, &symbol_cache)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            &symbol_cache,
+            &ratio,
+        )
+        .await;
 
         assert!(matches!(result, Ok(TriggeredOperation::Redemption { .. })));
     }
@@ -291,10 +310,16 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
+        let ratio = VaultRatio::one_to_one();
 
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, &symbol_cache)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            &symbol_cache,
+            &ratio,
+        )
+        .await;
 
         assert_eq!(result, Err(EquityTriggerSkip::TokenNotInCache));
     }
