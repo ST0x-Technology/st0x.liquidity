@@ -43,21 +43,29 @@ pub(super) async fn fetch_inventory(
 
             let market_value_cents = match position.market_value {
                 Some(value) => {
-                    let cents = value
+                    let conversion_error = || {
+                        error!(
+                            symbol = %position.symbol,
+                            market_value = %value,
+                            position = ?position,
+                            "Market value conversion to cents failed"
+                        );
+                        AlpacaBrokerApiError::MarketValueConversion {
+                            symbol: symbol.clone(),
+                            market_value: position.market_value,
+                        }
+                    };
+
+                    let in_cents = value
                         .checked_mul(Decimal::from(100))
-                        .and_then(|in_cents| in_cents.trunc().to_i64())
-                        .ok_or_else(|| {
-                            error!(
-                                symbol = %position.symbol,
-                                market_value = %value,
-                                position = ?position,
-                                "Market value conversion to cents failed"
-                            );
-                            AlpacaBrokerApiError::MarketValueConversion {
-                                symbol: symbol.clone(),
-                                market_value: position.market_value,
-                            }
-                        })?;
+                        .ok_or_else(conversion_error)?;
+
+                    if !in_cents.fract().is_zero() {
+                        return Err(conversion_error());
+                    }
+
+                    let cents = in_cents.to_i64().ok_or_else(conversion_error)?;
+
                     Some(cents)
                 }
                 None => None,
@@ -267,6 +275,9 @@ mod tests {
         let server = MockServer::start();
         let config = create_test_config(&server.base_url());
 
+        // i64::MAX is 9_223_372_036_854_775_807, so a value whose cents
+        // representation exceeds that will fail to_i64().
+        // 92233720368547759.00 * 100 = 9223372036854775900 > i64::MAX
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
                 .path("/v1/trading/accounts/test_account_123/positions");
@@ -276,8 +287,49 @@ mod tests {
                     {
                         "symbol": "AAPL",
                         "qty": "10.0",
-                        // Value too large to fit in i64 when converted to cents
-                        "market_value": "99999999999999999999999999999999.99"
+                        "market_value": "92233720368547759.00"
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let result = fetch_inventory(&client).await;
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_returns_error_on_fractional_cents_in_market_value() {
+        let server = MockServer::start();
+        let config = create_test_config(&server.base_url());
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": "10.0",
+                        // 1575.005 * 100 = 157500.5 -> fractional cent
+                        "market_value": "1575.005"
                     }
                 ]));
         });
