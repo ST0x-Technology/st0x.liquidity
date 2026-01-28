@@ -89,7 +89,7 @@ pub struct EmptySymbolError;
 ///
 /// Ensures symbols are non-empty and provides type safety to prevent
 /// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct Symbol(String);
 
 impl Symbol {

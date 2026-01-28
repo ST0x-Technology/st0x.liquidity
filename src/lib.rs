@@ -21,6 +21,7 @@ mod equity_redemption;
 mod error;
 mod error_decoding;
 mod inventory;
+mod inventory_snapshot;
 mod lifecycle;
 mod lock;
 pub mod migration;
