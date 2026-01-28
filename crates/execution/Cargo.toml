@@ -11,7 +11,6 @@ mock = []
 [dependencies]
 alloy.workspace = true
 async-trait.workspace = true
-sqlx.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 reqwest.workspace = true
@@ -31,8 +30,6 @@ num-traits.workspace = true
 apca = "0.30.0"
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
 aes-gcm = "0.10.3"
-cqrs-es.workspace = true
-sqlite-es.workspace = true
 rust_decimal.workspace = true
 
 [dev-dependencies]

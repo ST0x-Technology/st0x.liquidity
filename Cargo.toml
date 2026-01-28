@@ -73,6 +73,10 @@ tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
 rust_decimal = { version = "1.38.0", features = ["serde"] }
 
+[features]
+default = []
+dual-write = []
+
 [package]
 name = "st0x-hedge"
 version = "0.1.0"
