@@ -39,11 +39,11 @@ pub struct OnchainTrade {
     pub(crate) pyth_confidence: Option<f64>,
     pub(crate) pyth_exponent: Option<i32>,
     pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
-    /// The underlying-equivalent amount for hedge calculations.
-    /// For wrapped tokens, this differs from `amount` (in wrapped units).
-    /// For unwrapped tokens, this equals `amount`.
-    /// The accumulator uses this for position tracking to ensure correct hedging.
-    pub(crate) underlying_amount: f64,
+    /// Historical vault ratio at trade time (for audit purposes only).
+    /// This is the assets_per_share value from the ERC-4626 vault when the trade occurred.
+    /// For unwrapped tokens, this is None.
+    /// Not used for calculations - always compute underlying from current ratio instead.
+    pub(crate) vault_ratio: Option<f64>,
 }
 
 impl OnchainTrade {
@@ -77,7 +77,7 @@ impl OnchainTrade {
                 pyth_confidence,
                 pyth_exponent,
                 pyth_publish_time,
-                underlying_amount
+                vault_ratio
             )
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
             "#,
@@ -94,7 +94,7 @@ impl OnchainTrade {
             self.pyth_confidence,
             self.pyth_exponent,
             self.pyth_publish_time,
-            self.underlying_amount
+            self.vault_ratio
         )
         .execute(&mut **sql_tx)
         .await?;
@@ -129,7 +129,7 @@ impl OnchainTrade {
                 pyth_confidence,
                 pyth_exponent,
                 pyth_publish_time,
-                underlying_amount
+                vault_ratio
             FROM onchain_trades
             WHERE tx_hash = ?1 AND log_index = ?2
             ",
@@ -169,7 +169,7 @@ impl OnchainTrade {
             pyth_publish_time: row
                 .pyth_publish_time
                 .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            underlying_amount: row.underlying_amount,
+            vault_ratio: row.vault_ratio,
         })
     }
 
@@ -280,8 +280,8 @@ impl OnchainTrade {
             pyth_confidence: pyth_pricing.as_ref().map(|p| p.confidence),
             pyth_exponent: pyth_pricing.as_ref().map(|p| p.exponent),
             pyth_publish_time: pyth_pricing.as_ref().map(|p| p.publish_time),
-            // Default to amount for unwrapped tokens; VaultService overrides for wrapped tokens
-            underlying_amount: trade_details.equity_amount().value(),
+            // Vault ratio is set externally for wrapped tokens; None for unwrapped tokens
+            vault_ratio: None,
         };
 
         Ok(Some(trade))
@@ -441,7 +441,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 10.0,
+            vault_ratio: None,
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -620,7 +620,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 10.0,
+            vault_ratio: None,
         };
 
         // Insert first trade
@@ -662,7 +662,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 10.0,
+            vault_ratio: None,
         };
 
         let mut sql_tx = pool.begin().await.unwrap();
@@ -804,7 +804,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 10.0,
+                vault_ratio: None,
             };
 
             let mut sql_tx = pool.begin().await.unwrap();
