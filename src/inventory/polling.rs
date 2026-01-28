@@ -801,11 +801,11 @@ mod tests {
             vec![],
         );
 
-        let result = service.poll_and_record().await;
+        let error = service.poll_and_record().await.unwrap_err();
 
         assert!(
-            matches!(result, Err(InventoryPollingError::Vault(_))),
-            "Expected Vault error when RPC fails, got {result:?}"
+            matches!(error, InventoryPollingError::Vault(_)),
+            "Expected Vault error when RPC fails, got {error:?}"
         );
     }
 
@@ -832,11 +832,11 @@ mod tests {
             vec![],
         );
 
-        let result = service.poll_and_record().await;
+        let error = service.poll_and_record().await.unwrap_err();
 
         assert!(
-            matches!(result, Err(InventoryPollingError::Vault(_))),
-            "Expected Vault error when RPC fails, got {result:?}"
+            matches!(error, InventoryPollingError::Vault(_)),
+            "Expected Vault error when RPC fails, got {error:?}"
         );
     }
 

@@ -1478,6 +1478,10 @@ mod tests {
             handle.abort();
         }
 
+        if let Some(handle) = conductor.inventory_poller {
+            handle.abort();
+        }
+
         conductor.order_poller.abort();
         conductor.dex_event_receiver.abort();
         conductor.event_processor.abort();

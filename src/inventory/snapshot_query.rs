@@ -63,6 +63,7 @@ mod tests {
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
+    use crate::inventory::view::{Imbalance, ImbalanceThreshold};
     use crate::shares::FractionalShares;
     use crate::threshold::Usdc;
     use st0x_execution::Symbol;
@@ -73,6 +74,13 @@ mod tests {
 
     fn test_shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
+    }
+
+    fn balanced_threshold() -> ImbalanceThreshold {
+        ImbalanceThreshold {
+            target: Decimal::new(5, 1),    // 0.5
+            deviation: Decimal::new(1, 1), // 0.1
+        }
     }
 
     fn create_event_envelope(
@@ -88,11 +96,14 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_applies_onchain_equity_event_to_inventory() {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let aapl = test_symbol();
+        let inventory = Arc::new(RwLock::new(
+            InventoryView::default().with_equity(aapl.clone()),
+        ));
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
 
         let mut balances = BTreeMap::new();
-        balances.insert(test_symbol(), test_shares(100));
+        balances.insert(aapl.clone(), test_shares(100));
 
         let event = InventorySnapshotEvent::OnchainEquity {
             balances,
@@ -103,11 +114,19 @@ mod tests {
             .dispatch("test-id", &[create_event_envelope(event)])
             .await;
 
-        // After dispatch, inventory should have been updated
-        let inv = inventory.read().await;
-        // The inventory should now track the symbol (we can't easily check internal state,
-        // but we can verify no panic occurred and the dispatch completed)
-        drop(inv);
+        // 100 shares onchain, 0 offchain -> ratio = 1.0, target = 0.5 -> TooMuchOnchain
+        let imbalance = inventory
+            .read()
+            .await
+            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .expect("should detect imbalance after onchain equity snapshot");
+
+        assert_eq!(
+            imbalance,
+            Imbalance::TooMuchOnchain {
+                excess: test_shares(50)
+            }
+        );
     }
 
     #[tokio::test]
@@ -115,10 +134,8 @@ mod tests {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
 
-        let usdc_balance = Usdc(Decimal::from(1000));
-
         let event = InventorySnapshotEvent::OnchainCash {
-            usdc_balance,
+            usdc_balance: Usdc(Decimal::from(1000)),
             fetched_at: Utc::now(),
         };
 
@@ -126,16 +143,31 @@ mod tests {
             .dispatch("test-id", &[create_event_envelope(event)])
             .await;
 
-        // Dispatch completed successfully
+        // 1000 USDC onchain, 0 offchain -> ratio = 1.0, target = 0.5 -> TooMuchOnchain
+        let imbalance = inventory
+            .read()
+            .await
+            .check_usdc_imbalance(&balanced_threshold())
+            .expect("should detect imbalance after onchain cash snapshot");
+
+        assert_eq!(
+            imbalance,
+            Imbalance::TooMuchOnchain {
+                excess: Usdc(Decimal::from(500))
+            }
+        );
     }
 
     #[tokio::test]
     async fn dispatch_applies_offchain_equity_event_to_inventory() {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let aapl = test_symbol();
+        let inventory = Arc::new(RwLock::new(
+            InventoryView::default().with_equity(aapl.clone()),
+        ));
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
 
         let mut positions = BTreeMap::new();
-        positions.insert(test_symbol(), test_shares(50));
+        positions.insert(aapl.clone(), test_shares(50));
 
         let event = InventorySnapshotEvent::OffchainEquity {
             positions,
@@ -146,7 +178,19 @@ mod tests {
             .dispatch("test-id", &[create_event_envelope(event)])
             .await;
 
-        // Dispatch completed successfully
+        // 0 onchain, 50 offchain -> ratio = 0.0, target = 0.5 -> TooMuchOffchain
+        let imbalance = inventory
+            .read()
+            .await
+            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .expect("should detect imbalance after offchain equity snapshot");
+
+        assert_eq!(
+            imbalance,
+            Imbalance::TooMuchOffchain {
+                excess: test_shares(25)
+            }
+        );
     }
 
     #[tokio::test]
@@ -163,16 +207,31 @@ mod tests {
             .dispatch("test-id", &[create_event_envelope(event)])
             .await;
 
-        // Dispatch completed successfully
+        // 0 onchain, 500000 USDC offchain -> ratio = 0.0, target = 0.5 -> TooMuchOffchain
+        let imbalance = inventory
+            .read()
+            .await
+            .check_usdc_imbalance(&balanced_threshold())
+            .expect("should detect imbalance after offchain cash snapshot");
+
+        assert_eq!(
+            imbalance,
+            Imbalance::TooMuchOffchain {
+                excess: Usdc(Decimal::from(250_000))
+            }
+        );
     }
 
     #[tokio::test]
     async fn dispatch_handles_multiple_events_sequentially() {
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let aapl = test_symbol();
+        let inventory = Arc::new(RwLock::new(
+            InventoryView::default().with_equity(aapl.clone()),
+        ));
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
 
         let mut balances = BTreeMap::new();
-        balances.insert(test_symbol(), test_shares(100));
+        balances.insert(aapl.clone(), test_shares(100));
 
         let events = vec![
             create_event_envelope(InventorySnapshotEvent::OnchainEquity {
@@ -187,6 +246,31 @@ mod tests {
 
         query.dispatch("test-id", &events).await;
 
-        // Both events should have been applied
+        let view = inventory.read().await;
+
+        // Both events applied: equity 100 onchain/0 offchain, USDC 5000 onchain/0 offchain
+        let equity_imbalance = view
+            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .expect("should detect equity imbalance after multiple events");
+
+        let usdc_imbalance = view
+            .check_usdc_imbalance(&balanced_threshold())
+            .expect("should detect USDC imbalance after multiple events");
+
+        drop(view);
+
+        assert_eq!(
+            equity_imbalance,
+            Imbalance::TooMuchOnchain {
+                excess: test_shares(50)
+            }
+        );
+
+        assert_eq!(
+            usdc_imbalance,
+            Imbalance::TooMuchOnchain {
+                excess: Usdc(Decimal::from(2500))
+            }
+        );
     }
 }

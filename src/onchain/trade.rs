@@ -101,20 +101,26 @@ pub(crate) fn extract_owned_vaults(
         return vec![];
     };
 
-    extract_vault_info(order, in_idx, out_idx)
-        .map(|(input, output)| {
-            vec![
-                OwnedVaultInfo {
-                    owner: order.owner,
-                    vault: input,
-                },
-                OwnedVaultInfo {
-                    owner: order.owner,
-                    vault: output,
-                },
-            ]
-        })
-        .unwrap_or_default()
+    let Some((input, output)) = extract_vault_info(order, in_idx, out_idx) else {
+        warn!(
+            owner = %order.owner,
+            input_index = %in_idx,
+            output_index = %out_idx,
+            "extract_vault_info: IO indices out of bounds"
+        );
+        return vec![];
+    };
+
+    vec![
+        OwnedVaultInfo {
+            owner: order.owner,
+            vault: input,
+        },
+        OwnedVaultInfo {
+            owner: order.owner,
+            vault: output,
+        },
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq)]

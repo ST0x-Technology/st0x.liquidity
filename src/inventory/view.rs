@@ -218,6 +218,13 @@ where
         amount_sent: T,
         amount_received: T,
     ) -> Result<Self, InventoryError<T>> {
+        if amount_received > amount_sent {
+            return Err(InventoryError::NegativeFee {
+                amount_sent,
+                amount_received,
+            });
+        }
+
         Ok(Self {
             offchain: self.offchain.confirm_inflight(amount_sent)?,
             onchain: self.onchain.add_available(amount_received)?,
@@ -233,6 +240,13 @@ where
         amount_sent: T,
         amount_received: T,
     ) -> Result<Self, InventoryError<T>> {
+        if amount_received > amount_sent {
+            return Err(InventoryError::NegativeFee {
+                amount_sent,
+                amount_received,
+            });
+        }
+
         Ok(Self {
             onchain: self.onchain.confirm_inflight(amount_sent)?,
             offchain: self.offchain.add_available(amount_received)?,
@@ -279,7 +293,7 @@ where
 }
 
 /// Cross-aggregate projection tracking inventory across venues.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
@@ -635,13 +649,15 @@ impl InventoryView {
 
     /// Applies an inventory snapshot event to reconcile tracked inventory with fetched actuals.
     ///
-    /// For each symbol/venue combination, sets `available = max(0, actual - inflight)` to
-    /// match the fetched total while preserving inflight operations.
+    /// **Skips reconciliation when ANY venue has inflight operations** (not just the venue being
+    /// updated). This is because we cannot distinguish between "transfer completed but not
+    /// confirmed" vs "unrelated inventory change". When no venue has inflight, sets the
+    /// venue's available balance to the snapshot value directly.
     ///
-    /// - `OnchainEquity`: Reconcile onchain equity balances for all fetched symbols.
-    /// - `OnchainCash`: Reconcile onchain USDC balance.
-    /// - `OffchainEquity`: Reconcile offchain equity positions for all fetched symbols.
-    /// - `OffchainCash`: Reconcile offchain cash balance (converted from cents to Usdc).
+    /// - `OnchainEquity`: Sets onchain available to snapshot value (if no inflight anywhere).
+    /// - `OnchainCash`: Sets onchain USDC available to snapshot value (if no inflight anywhere).
+    /// - `OffchainEquity`: Sets offchain available to snapshot value (if no inflight anywhere).
+    /// - `OffchainCash`: Converts cents to Usdc and sets offchain available (if no inflight anywhere).
     pub(crate) fn apply_snapshot_event(
         self,
         event: &InventorySnapshotEvent,
