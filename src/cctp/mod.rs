@@ -2011,7 +2011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_returns_actual_amount_and_fee_from_mint_and_withdraw_event() {
+    async fn mint_returns_amount_received_and_fee_from_mint_and_withdraw_event() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
@@ -2059,7 +2059,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_returns_actual_amount_and_fee_for_base_to_ethereum_direction() {
+    async fn mint_returns_amount_received_and_fee_for_base_to_ethereum_direction() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 

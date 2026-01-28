@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_onchain_equity_returns_error_when_inflight_nonzero() {
+    fn snapshot_onchain_equity_skips_when_inflight_nonzero() {
         let now = Utc::now();
         let aapl = Symbol::new("AAPL").unwrap();
 
@@ -2208,10 +2208,20 @@ mod tests {
             fetched_at: now,
         };
 
-        assert!(matches!(
-            view.apply_snapshot_event(&event, now).unwrap_err(),
-            InventoryViewError::Equity(InventoryError::InflightPreventsReconciliation { .. })
-        ));
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.onchain.available(),
+            shares(90),
+            "should be unchanged"
+        );
+        assert_eq!(equity.onchain.inflight(), shares(10), "should be unchanged");
+        assert_eq!(
+            equity.offchain.available(),
+            shares(50),
+            "should be unchanged"
+        );
     }
 
     #[test]
@@ -2249,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_onchain_cash_returns_error_when_inflight_nonzero() {
+    fn snapshot_onchain_cash_skips_when_inflight_nonzero() {
         let now = Utc::now();
 
         let view = InventoryView {
@@ -2267,10 +2277,23 @@ mod tests {
             fetched_at: now,
         };
 
-        assert!(matches!(
-            view.apply_snapshot_event(&event, now).unwrap_err(),
-            InventoryViewError::Usdc(InventoryError::InflightPreventsReconciliation { .. })
-        ));
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.onchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.onchain.inflight(),
+            Usdc(dec!(100)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(500)),
+            "should be unchanged"
+        );
     }
 
     #[test]
@@ -2300,7 +2323,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_offchain_equity_returns_error_when_inflight_nonzero() {
+    fn snapshot_offchain_equity_skips_when_inflight_nonzero() {
         let now = Utc::now();
         let aapl = Symbol::new("AAPL").unwrap();
 
@@ -2325,10 +2348,24 @@ mod tests {
             fetched_at: now,
         };
 
-        assert!(matches!(
-            view.apply_snapshot_event(&event, now).unwrap_err(),
-            InventoryViewError::Equity(InventoryError::InflightPreventsReconciliation { .. })
-        ));
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.offchain.available(),
+            shares(40),
+            "should be unchanged"
+        );
+        assert_eq!(
+            equity.offchain.inflight(),
+            shares(10),
+            "should be unchanged"
+        );
+        assert_eq!(
+            equity.onchain.available(),
+            shares(100),
+            "should be unchanged"
+        );
     }
 
     #[test]
@@ -2366,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_offchain_cash_returns_error_when_inflight_nonzero() {
+    fn snapshot_offchain_cash_skips_when_inflight_nonzero() {
         let now = Utc::now();
 
         let view = InventoryView {
@@ -2384,10 +2421,23 @@ mod tests {
             fetched_at: now,
         };
 
-        assert!(matches!(
-            view.apply_snapshot_event(&event, now).unwrap_err(),
-            InventoryViewError::Usdc(InventoryError::InflightPreventsReconciliation { .. })
-        ));
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.offchain.inflight(),
+            Usdc(dec!(100)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.onchain.available(),
+            Usdc(dec!(500)),
+            "should be unchanged"
+        );
     }
 
     #[test]
