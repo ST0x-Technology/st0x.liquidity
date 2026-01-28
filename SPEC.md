@@ -2231,7 +2231,7 @@ enum Venue {
 **Purpose**: Tracks all equity mint operations (Alpaca shares to onchain
 tokens).
 
-**View State**:
+##### View State
 
 ```rust
 enum TokenizedEquityMintView {
@@ -2262,12 +2262,12 @@ enum MintStatus {
 
 **Projection Logic**: Updates on `TokenizedEquityMintEvent::*` events
 
-#### **EquityRedemptionView**
+#### EquityRedemptionView
 
 **Purpose**: Tracks all equity redemption operations (onchain tokens to Alpaca
 shares).
 
-**View State**:
+##### View State
 
 ```rust
 enum EquityRedemptionView {
@@ -2295,12 +2295,12 @@ enum RedeemStatus {
 
 **Projection Logic**: Updates on `EquityRedemptionEvent::*` events
 
-#### **UsdcRebalanceView**
+#### UsdcRebalanceView
 
 **Purpose**: Tracks all USDC rebalancing operations across Alpaca and Base via
 Circle CCTP bridge.
 
-**View State**:
+##### View State
 
 ```rust
 enum UsdcRebalanceView {
@@ -2332,13 +2332,13 @@ enum RebalancingStatus {
 
 **Projection Logic**: Updates on `UsdcRebalanceEvent::*` events
 
-#### **InventoryView**
+#### InventoryView
 
 **Purpose**: Aggregates inventory across all venues and detects imbalances that
 trigger rebalancing operations. This is the central view that monitors total
 system inventory.
 
-**View State**:
+##### View State
 
 ```rust
 struct InventoryView {
@@ -2410,14 +2410,14 @@ BaseToAlpaca when too much onchain.
 
 Trigger events are emitted to RebalancingManager for execution.
 
-#### **Failure Handling and Reconciliation**
+#### Failure Handling and Reconciliation
 
 **Automatic Reconciliation**: When rebalancing operations fail, the projection
 logic automatically reconciles inflight balances back to source venue's
 available balance. This ensures InventoryView remains accurate even when
 operations fail.
 
-**Manual Reconciliation Required**:
+##### Manual Reconciliation Required
 
 Some failure scenarios may leave assets in states requiring manual intervention:
 
@@ -2461,9 +2461,9 @@ enum Resolution {
 This would provide complete audit trail for all manual interventions and allow
 proper tracking of asset movements that required manual resolution.
 
-### **Event Processing Flow**
+### Event Processing Flow
 
-#### **OnChain Event Processing**
+#### OnChain Event Processing
 
 **Current Flow** (Event-driven with Conductor):
 
@@ -2563,7 +2563,7 @@ sequenceDiagram
     App->>Views: Update OnChainTradeView
 ```
 
-#### **Manager Pattern**
+#### Manager Pattern
 
 Managers coordinate between aggregates by subscribing to events and sending
 commands. They can be stateless (simple event->command reactions) or stateful
@@ -2580,7 +2580,7 @@ PositionCommand::AcknowledgeOnChainFill
 - Tracks in-flight orders
 - Sends commands to OffchainOrder and Position aggregates
 
-#### **Future Consideration: Reorg Handling**
+#### Future Consideration: Reorg Handling
 
 **Note**: Reorg handling is not implemented currently, but the event-sourced
 architecture will make it significantly easier to add in the future.
@@ -2589,14 +2589,14 @@ Blockchain reorganizations occur before block finalization. When we eventually
 implement reorg handling, the event-sourced architecture will make it
 significantly easier than the current CRUD approach.
 
-**CRUD Approach (Current):**
+##### CRUD Approach (Current)
 
 Would require orchestrating multiple coordinated steps: identify affected
 trades, delete/mark invalid records in `onchain_trades`, update
 `trade_accumulators`, check triggered executions, potentially reverse offchain
 executions. This would be error-prone and lose audit trail.
 
-**Event-Sourced Approach (Future):**
+##### Event-Sourced Approach (Future)
 
 Simply append a reorg event that reverses the position change. The event would
 be: PositionCommand::RecordReorg with tx_hash, log_index, symbol, amount,
@@ -2604,7 +2604,7 @@ direction, reorg_depth. The resulting PositionEvent::Reorged would reverse the
 original trade's position impact. Views would update automatically. The
 `onchain_trade_view` could mark trades as `reorged: true` without deleting them.
 
-**Benefits (when implemented):**
+##### Benefits (when implemented)
 
 - Append-only: no cascading updates across tables
 - Complete audit trail: preserves both original trade and reorg event
@@ -2615,18 +2615,18 @@ original trade's position impact. Views would update automatically. The
 This demonstrates how the event-sourced architecture provides a cleaner
 foundation for future enhancements.
 
-### **Data Migration Strategy**
+### Data Migration Strategy
 
 **Note**: This data import occurs in **Phase 1** as part of initial deployment,
 before dual-write begins. This ensures the event store contains all existing
 data, allowing proper validation that views match old tables from day one.
 
-#### **Importing Existing Data**
+#### Importing Existing Data
 
 Use genesis events as snapshots from the legacy system. Migrated events
 initialize aggregates without synthesizing full event histories:
 
-##### **Migrated Event Types**
+##### Migrated Event Types
 
 Migrated events use proper domain types (FractionalShares, TxHash, etc.)
 matching the new system:
@@ -2701,7 +2701,7 @@ enum MigratedOrderStatus {
 }
 ```
 
-##### **Existing Data Import**
+##### Existing Data Import
 
 One-time binary: `src/bin/migrate_to_events.rs`
 
@@ -2709,7 +2709,7 @@ This binary converts existing CRUD data from old tables into the event store. It
 is separate from schema migrations (`sqlx migrate run`), which create tables
 automatically on every deployment.
 
-**Steps:**
+###### Steps
 
 1. Read from `onchain_trades` table, emit OnChainTradeEvent::Migrated for each
    trade
@@ -2721,7 +2721,7 @@ automatically on every deployment.
 5. Rebuild all views from events
 6. Verify counts and sample records match between old tables and new views
 
-##### **Migrating OnChain Trades**
+##### Migrating OnChain Trades
 
 Query `onchain_trades` ordered by `created_at, tx_hash, log_index`. For each
 trade:
@@ -2730,7 +2730,7 @@ trade:
 - Sequence: 1
 - Event: OnChainTradeEvent::Migrated with all fields from legacy table
 
-##### **Migrating Positions**
+##### Migrating Positions
 
 Query `trade_accumulators`. For each position:
 
@@ -2740,7 +2740,7 @@ Query `trade_accumulators`. For each position:
 - Threshold: `ExecutionThreshold::Shares(Decimal::ONE)` (production currently
   only supports whole share thresholds for Schwab compatibility)
 
-##### **Migrating OffChain Orders**
+##### Migrating OffChain Orders
 
 Query `schwab_executions` ordered by `id`. For each execution:
 
@@ -2749,7 +2749,7 @@ Query `schwab_executions` ordered by `id`. For each execution:
 - Event: OffchainOrderEvent::Migrated with status mapped from legacy system
 - Broker: SupportedBroker::Schwab (legacy system only used Schwab)
 
-##### **Migrating Schwab Auth**
+##### Migrating Schwab Auth
 
 Query `schwab_auth` table (singleton):
 
@@ -2757,7 +2757,7 @@ Query `schwab_auth` table (singleton):
 - Sequence: 1
 - Event: SchwabAuthEvent::TokensStored
 
-##### **Verification Strategy**
+##### Verification Strategy
 
 After migration:
 
@@ -2766,9 +2766,9 @@ After migration:
 3. Verify random sample of records match
 4. For positions: verify net_position, accumulated_long, accumulated_short match
 
-### **Testing Strategy**
+### Testing Strategy
 
-#### **Aggregate Testing**
+#### Aggregate Testing
 
 Use Given-When-Then pattern from `cqrs-es::test::TestFramework`:
 
@@ -2782,7 +2782,7 @@ fn test_position_accumulates_fills() {
 }
 ```
 
-#### **View Testing**
+#### View Testing
 
 ```rust
 #[test]
@@ -2797,7 +2797,7 @@ fn test_view_updates_from_events() {
 }
 ```
 
-#### **Integration Testing**
+#### Integration Testing
 
 ```rust
 #[tokio::test]
@@ -2808,7 +2808,7 @@ async fn test_full_flow_blockchain_to_broker() {
 }
 ```
 
-### **Code Organization**
+### Code Organization
 
 Aggregates use flat file structure by default. Submodules are only introduced
 when natural business logic boundaries emerge (e.g., `schwab/auth/` uses CQRS
@@ -2852,7 +2852,7 @@ crates/
       mock.rs                     - Mock implementation for testing
 ```
 
-### **Dependencies**
+### Dependencies
 
 Add to `Cargo.toml`:
 
@@ -2864,16 +2864,16 @@ cqrs-es = "0.4"
 
 ---
 
-## **Admin Dashboard**
+## Admin Dashboard
 
-### **Overview**
+### Overview
 
 A web-based admin dashboard for monitoring and controlling the liquidity bot
 from a single interface. The dashboard consolidates system health, trading
 activity, P&L metrics, and operational controls without duplicating
 functionality already available in Grafana.
 
-### **Technology Stack**
+### Technology Stack
 
 - **Framework**: SvelteKit with Svelte 5 (runes, snippets)
 - **UI Components**: shadcn-svelte
@@ -2883,9 +2883,9 @@ functionality already available in Grafana.
 - **Build Tool**: Vite
 - **Language**: TypeScript
 
-### **TypeScript Patterns**
+### TypeScript Patterns
 
-#### **Tagged Unions for Domain Modeling**
+#### Tagged Unions for Domain Modeling
 
 Following the same ADT philosophy used in the Rust backend, the dashboard uses
 discriminated unions (tagged unions) for type-safe domain modeling:
@@ -2914,7 +2914,7 @@ type Result<T, E> =
   | { ok: false; error: E };
 ```
 
-#### **Custom FP Helpers Module**
+#### Custom FP Helpers Module
 
 A small `lib/fp.ts` module provides utility functions for working with Result
 types and tagged unions:
@@ -2926,7 +2926,7 @@ types and tagged unions:
 
 No external dependencies - keeps bundle small and avoids library lock-in.
 
-#### **Alternatives Considered**
+#### Alternatives Considered
 
 - **Effect**: Full-featured FP library with structured concurrency, dependency
   injection, and comprehensive error handling. Rejected as overkill for a
@@ -2942,12 +2942,12 @@ No external dependencies - keeps bundle small and avoids library lock-in.
   caching, retry logic, and background refetch. TanStack Query handles this
   better.
 
-#### **State Management**
+#### State Management
 
 - **Server state**: TanStack Query v6 as reactive cache, populated via WebSocket
 - **Local UI state**: Svelte 5 `$state` and `$derived` runes
 
-#### **WebSocket-First Data Flow**
+#### WebSocket-First Data Flow
 
 All read data flows through a single WebSocket connection:
 
@@ -2956,14 +2956,14 @@ All read data flows through a single WebSocket connection:
    auth status, circuit breaker state)
 3. Server streams incremental updates as events occur
 
-**Benefits**:
+##### Benefits
 
 - Single connection to manage
 - No race condition between HTTP fetch and WebSocket updates
 - Server controls exactly what state the client starts with
 - HTTP endpoints only needed for mutations (circuit breaker, auth)
 
-**Message Types**:
+##### Message Types
 
 ```typescript
 type ServerMessage =
@@ -3055,7 +3055,7 @@ type RebalanceStatus =
   | { status: "failed"; startedAt: Date; failedAt: Date; reason: string };
 ```
 
-**TanStack Query Integration**:
+##### TanStack Query Integration
 
 WebSocket messages populate the TanStack Query cache:
 
@@ -3090,7 +3090,7 @@ socket.onmessage = (event) => {
 };
 ```
 
-**Svelte WebSocket Wrapper**:
+##### Svelte WebSocket Wrapper
 
 Minimal wrapper using Svelte 5 runes for connection state:
 
@@ -3130,9 +3130,9 @@ TanStack Query provides:
 - Devtools for inspecting state
 - Automatic component re-renders on cache updates
 
-### **Core Features**
+### Core Features
 
-#### **Grafana Dashboard Embedding**
+#### Grafana Dashboard Embedding
 
 Embed existing Grafana dashboards directly in the admin UI:
 
@@ -3145,7 +3145,7 @@ Embed existing Grafana dashboards directly in the admin UI:
 No need to rebuild Grafana's visualization capabilities - leverage existing
 dashboards.
 
-#### **HyperDX Health Status**
+#### HyperDX Health Status
 
 Display service health from HyperDX:
 
@@ -3161,7 +3161,7 @@ const response = await fetch("https://api.hyperdx.io/api/v1/alerts", {
 });
 ```
 
-#### **Schwab OAuth Integration**
+#### Schwab OAuth Integration
 
 Streamline the weekly OAuth re-authentication flow:
 
@@ -3171,7 +3171,7 @@ Streamline the weekly OAuth re-authentication flow:
 - OAuth callback handler in dashboard
 - Eliminates need for manual CLI coordination
 
-**Flow:**
+##### Flow
 
 1. User clicks "Re-authenticate" in dashboard
 2. Dashboard opens Schwab OAuth URL in new tab
@@ -3180,7 +3180,7 @@ Streamline the weekly OAuth re-authentication flow:
 5. Dashboard extracts code and calls existing `POST /auth/refresh` endpoint
 6. Dashboard displays success/error and updates status
 
-#### **Circuit Breaker**
+#### Circuit Breaker
 
 Emergency control to halt all trading activity:
 
@@ -3191,7 +3191,7 @@ Emergency control to halt all trading activity:
 - Existing positions preserved (no forced liquidation)
 - Manual reset required to resume trading
 
-**Implementation:**
+##### Implementation
 
 - New database table or flag to track circuit breaker state
 - Bot checks flag before placing any broker orders
@@ -3203,24 +3203,24 @@ POST /api/circuit-breaker/trigger  { reason: string }
 POST /api/circuit-breaker/reset
 ```
 
-### **Dashboard Layout**
+### Dashboard Layout
 
 Single-page dashboard with live-updating panels, each expandable to full-screen.
 Supports two bot instances (Schwab and Alpaca) via broker selector in header.
 
-**Broker-specific features:**
+#### Broker-specific features
 
 - **Schwab**: OAuth flow management (weekly re-authentication)
 - **Alpaca**: Automated rebalancing panel (minting, redemption, USDC bridging)
 
-**Header Bar:**
+#### Header Bar
 
 - Broker selector (Schwab / Alpaca) - switches entire dashboard context
 - Auth status indicator with expiry countdown (Schwab only)
 - Circuit breaker status toggle
 - WebSocket connection status
 
-**Panels**:
+#### Panels
 
 1. **Performance Metrics**: Live-updating key metrics with timeframe selector
    (1h, 1d, 1w, 1m, all-time):
@@ -3258,9 +3258,9 @@ Supports two bot instances (Schwab and Alpaca) via broker selector in header.
    excluded to avoid exposing full database records. Starts empty on page load,
    populates as new events arrive via WebSocket.
 
-### **Architecture**
+### Architecture
 
-#### **Separate Frontend Package**
+#### Separate Frontend Package
 
 Dashboard lives in `dashboard/` directory at repository root:
 
@@ -3285,11 +3285,11 @@ dashboard/
 └── vite.config.ts
 ```
 
-#### **Backend API Extensions**
+#### Backend API Extensions
 
 Extend existing Rocket server (`src/api.rs`):
 
-**WebSocket (all read data):**
+##### WebSocket (all read data)
 
 ```text
 WS /api/ws
@@ -3298,7 +3298,7 @@ WS /api/ws
 Sends initial state on connect, then streams updates. See WebSocket-First Data
 Flow section above.
 
-**Mutations (HTTP, require auth):**
+##### Mutations (HTTP, require auth)
 
 ```text
 POST /api/circuit-breaker/trigger  { reason: string }
@@ -3307,7 +3307,7 @@ GET  /api/auth/url                 (generates Schwab OAuth URL)
 POST /auth/refresh                 (existing endpoint)
 ```
 
-#### **Authentication**
+#### Authentication
 
 Public read access with authenticated actions:
 
@@ -3318,7 +3318,7 @@ Public read access with authenticated actions:
   environment variable
 - Future: Proper user authentication system with role-based access
 
-#### **Deployment**
+#### Deployment
 
 Dashboard can be deployed as:
 
@@ -3339,13 +3339,13 @@ FROM nginx:alpine
 COPY --from=builder /app/build /usr/share/nginx/html
 ```
 
-### **Non-Goals (MVP)**
+### Non-Goals (MVP)
 
 - User authentication system (API key is sufficient for actions)
 - Position entry from dashboard (read-only + circuit breaker only)
 - Multi-tenant support
 
-### **Nice to Have**
+### Nice to Have
 
 - Mobile-responsive design (not mobile-first, but usable on mobile - modern
   stack makes this low effort)
