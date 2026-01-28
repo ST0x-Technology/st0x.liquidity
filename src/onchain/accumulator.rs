@@ -97,9 +97,9 @@ pub(crate) async fn process_onchain_trade(
         Direction::Buy => AccumulationBucket::LongExposure,   // Bought stock -> long exposure
     };
 
-    // underlying_amount equals amount for unwrapped tokens,
-    // or the underlying-equivalent for wrapped tokens (set by VaultService).
-    calculator.add_trade(trade.underlying_amount, exposure_bucket);
+    // Track wrapped amounts in accumulator.
+    // Underlying-equivalent is calculated at query time using current vault ratio.
+    calculator.add_trade(trade.amount, exposure_bucket);
 
     info!(
         symbol = %base_symbol,
@@ -107,8 +107,7 @@ pub(crate) async fn process_onchain_trade(
         accumulated_long = calculator.accumulated_long,
         accumulated_short = calculator.accumulated_short,
         exposure_bucket = ?exposure_bucket,
-        onchain_amount = trade.amount,
-        hedge_amount = trade.underlying_amount,
+        trade_amount = trade.amount,
         "Updated calculator"
     );
 
@@ -346,18 +345,18 @@ async fn create_trade_execution_linkages(
     let zerox_suffix = format!("{base_str}0x");
     let s1_suffix = format!("{base_str}s1");
 
-    // underlying_amount is always set (equals amount for unwrapped, underlying-equivalent for wrapped)
+    // Use wrapped amount for trade linkages - the actual onchain trade amount
     let trade_rows = sqlx::query!(
         r#"
         SELECT
             ot.id as trade_id,
-            ot.underlying_amount as "hedge_amount!: f64",
+            ot.amount as "trade_amount!: f64",
             COALESCE(SUM(tel.contributed_shares), 0.0) as "already_allocated: f64"
         FROM onchain_trades ot
         LEFT JOIN trade_execution_links tel ON ot.id = tel.trade_id
         WHERE (ot.symbol = ?1 OR ot.symbol = ?2 OR ot.symbol = ?3) AND ot.direction = ?4
-        GROUP BY ot.id, ot.underlying_amount, ot.created_at
-        HAVING (ot.underlying_amount - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001
+        GROUP BY ot.id, ot.amount, ot.created_at
+        HAVING (ot.amount - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001
         ORDER BY ot.created_at ASC
         "#,
         t_prefix,
@@ -377,7 +376,7 @@ async fn create_trade_execution_linkages(
         }
 
         let already_allocated = row.already_allocated.unwrap_or(0.0);
-        let available_amount = row.hedge_amount - already_allocated;
+        let available_amount = row.trade_amount - already_allocated;
         if available_amount <= 0.001 {
             continue; // Trade fully allocated to previous executions
         }
@@ -801,7 +800,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: amount,
+            vault_ratio: None,
         }
     }
 
@@ -934,7 +933,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.5,
+            vault_ratio: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
@@ -968,7 +967,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1009,7 +1008,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.3,
+            vault_ratio: None,
         };
 
         let result1 = process_trade_with_tx(&pool, trade1).await.unwrap();
@@ -1033,7 +1032,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.4,
+            vault_ratio: None,
         };
 
         let result2 = process_trade_with_tx(&pool, trade2).await.unwrap();
@@ -1057,7 +1056,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.4,
+            vault_ratio: None,
         };
 
         let result3 = process_trade_with_tx(&pool, trade3).await.unwrap();
@@ -1099,7 +1098,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.0,
+            vault_ratio: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await;
@@ -1129,7 +1128,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1165,7 +1164,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1218,7 +1217,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         // Attempt to add trade - should fail when trying to save execution due to unique constraint
@@ -1276,7 +1275,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.8,
+            vault_ratio: None,
         };
 
         let trade2 = OnchainTrade {
@@ -1297,7 +1296,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.3,
+            vault_ratio: None,
         };
 
         // Add first trade (should not trigger execution)
@@ -1364,7 +1363,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: amount,
+            vault_ratio: None,
         }
     }
 
@@ -1445,7 +1444,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let execution = process_trade_with_tx(&pool, trade).await.unwrap().unwrap();
@@ -1485,7 +1484,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 0.3,
+                vault_ratio: None,
             },
             OnchainTrade {
                 id: None,
@@ -1505,7 +1504,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 0.4,
+                vault_ratio: None,
             },
             OnchainTrade {
                 id: None,
@@ -1525,7 +1524,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 0.5,
+                vault_ratio: None,
             },
         ];
 
@@ -1598,7 +1597,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 0.4,
+                vault_ratio: None,
             },
             OnchainTrade {
                 id: None,
@@ -1618,7 +1617,7 @@ mod tests {
                 pyth_confidence: None,
                 pyth_exponent: None,
                 pyth_publish_time: None,
-                underlying_amount: 0.8,
+                vault_ratio: None,
             },
         ];
 
@@ -1674,7 +1673,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.2,
+            vault_ratio: None,
         };
 
         // Add trade and trigger execution
@@ -1722,7 +1721,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let sell_trade = OnchainTrade {
@@ -1743,7 +1742,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         // Execute both trades
@@ -1832,7 +1831,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
@@ -1933,7 +1932,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         let result = process_trade_with_tx(&pool, trade).await.unwrap();
@@ -2152,7 +2151,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.8,
+            vault_ratio: None,
         };
 
         let result = process_trade_with_tx(&pool, aapl_trade).await.unwrap();
@@ -2264,7 +2263,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.6,
+            vault_ratio: None,
         };
 
         let trade_s1 = OnchainTrade {
@@ -2285,7 +2284,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.3,
+            vault_ratio: None,
         };
 
         let trade_t = OnchainTrade {
@@ -2306,7 +2305,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.2,
+            vault_ratio: None,
         };
 
         // Process first trade (GME0x) - should not trigger execution
@@ -2544,7 +2543,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.8,
+            vault_ratio: None,
         };
 
         let result = process_trade_with_tx(&pool, trade1).await.unwrap();
@@ -2568,7 +2567,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.7,
+            vault_ratio: None,
         };
 
         // This trade should trigger an execution (0.8 + 0.7 = 1.5 >= 1.0)
@@ -2799,7 +2798,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.5,
+            vault_ratio: None,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
@@ -2844,7 +2843,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
@@ -2914,7 +2913,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 0.3,
+            vault_ratio: None,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
@@ -2970,7 +2969,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
-            underlying_amount: 1.5,
+            vault_ratio: None,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)

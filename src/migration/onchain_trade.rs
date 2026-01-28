@@ -129,18 +129,16 @@ mod tests {
                 symbol,
                 amount,
                 direction,
-                price_usdc,
-                underlying_amount
+                price_usdc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             ",
             tx_hash_str,
             log_index,
             symbol,
             amount,
             direction,
-            price_usdc,
-            amount
+            price_usdc
         )
         .execute(pool)
         .await
@@ -255,7 +253,7 @@ mod tests {
                 direction TEXT NOT NULL,
                 price_usdc REAL NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                underlying_amount REAL NOT NULL
+                vault_ratio REAL
             )",
         )
         .execute(&pool)
@@ -272,10 +270,9 @@ mod tests {
                 symbol,
                 amount,
                 direction,
-                price_usdc,
-                underlying_amount
+                price_usdc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(tx_hash)
@@ -284,7 +281,6 @@ mod tests {
         .bind(10.0)
         .bind("BUY")
         .bind(150.50)
-        .bind(10.0)
         .execute(&pool)
         .await
         .unwrap();
@@ -312,7 +308,7 @@ mod tests {
                 direction TEXT NOT NULL,
                 price_usdc REAL NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                underlying_amount REAL NOT NULL
+                vault_ratio REAL
             )",
         )
         .execute(&pool)
@@ -329,10 +325,9 @@ mod tests {
                 symbol,
                 amount,
                 direction,
-                price_usdc,
-                underlying_amount
+                price_usdc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(tx_hash)
@@ -341,7 +336,6 @@ mod tests {
         .bind(10.0)
         .bind("BUY")
         .bind(f64::INFINITY)
-        .bind(10.0)
         .execute(&pool)
         .await
         .unwrap();
@@ -398,7 +392,7 @@ mod tests {
                 direction TEXT NOT NULL,
                 price_usdc REAL NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                underlying_amount REAL NOT NULL
+                vault_ratio REAL
             )",
         )
         .execute(&pool)
@@ -415,10 +409,9 @@ mod tests {
                 symbol,
                 amount,
                 direction,
-                price_usdc,
-                underlying_amount
+                price_usdc
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?)
             ",
         )
         .bind(tx_hash)
@@ -427,7 +420,6 @@ mod tests {
         .bind(10.0)
         .bind("INVALID")
         .bind(150.50)
-        .bind(10.0)
         .execute(&pool)
         .await
         .unwrap();

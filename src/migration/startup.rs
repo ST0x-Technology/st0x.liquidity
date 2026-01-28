@@ -455,8 +455,8 @@ mod tests {
         let tx_hash_str = tx_hash.to_string();
 
         sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc, underlying_amount)
-             VALUES (?, 0, 'AAPL', 10.0, 'BUY', 150.50, 10.0)",
+            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
+             VALUES (?, 0, 'AAPL', 10.0, 'BUY', 150.50)",
             tx_hash_str
         )
         .execute(&pool)
@@ -481,8 +481,8 @@ mod tests {
         let tx_hash_str = tx_hash.to_string();
 
         sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc, underlying_amount)
-             VALUES (?, 0, 'AAPL', 10.0, 'BUY', 150.50, 10.0)",
+            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
+             VALUES (?, 0, 'AAPL', 10.0, 'BUY', 150.50)",
             tx_hash_str
         )
         .execute(&pool)
@@ -569,8 +569,8 @@ mod tests {
         let tx_hash_str = tx_hash.to_string();
 
         sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc, underlying_amount)
-             VALUES (?, 0, 'AAPL', 10.0, 'BUY', 150.50, 10.0)",
+            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
+             VALUES (?, 0, 'AAPL', 10.0, 'BUY', 150.50)",
             tx_hash_str
         )
         .execute(&pool)
