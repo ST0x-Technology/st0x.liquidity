@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
@@ -5,7 +7,7 @@ use futures_util::Stream;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use st0x_execution::Executor;
 
@@ -14,11 +16,12 @@ use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
+use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
 
 use super::{
-    Conductor, spawn_event_processor, spawn_onchain_event_receiver, spawn_order_poller,
-    spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
+    spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
@@ -142,6 +145,27 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
+        let inventory_poller = match self.common.config.order_owner() {
+            Ok(order_owner) => {
+                let vault_service = Arc::new(VaultService::new(
+                    self.common.provider.clone(),
+                    self.common.config.evm.orderbook,
+                ));
+                Some(spawn_inventory_poller(
+                    self.common.pool.clone(),
+                    vault_service,
+                    self.common.executor.clone(),
+                    self.common.config.evm.orderbook,
+                    order_owner,
+                ))
+            }
+            Err(error) => {
+                warn!(%error, "Inventory poller disabled: could not resolve order owner");
+                None
+            }
+        };
+        log_optional_task_status("inventory poller", inventory_poller.is_some());
+
         let order_poller = spawn_order_poller(
             &self.common.config,
             &self.common.pool,
@@ -175,6 +199,7 @@ where
             position_checker,
             queue_processor,
             rebalancer,
+            inventory_poller,
         }
     }
 }

@@ -1,11 +1,14 @@
 mod builder;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::{Stream, StreamExt};
 use sqlx::SqlitePool;
-use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -19,6 +22,7 @@ use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
 use crate::error::{EventProcessingError, EventQueueError};
+use crate::inventory::InventoryPollingService;
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::BrokerOrderId;
@@ -28,6 +32,7 @@ use crate::onchain::accumulator::{
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
+use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::spawn_rebalancer;
@@ -43,6 +48,7 @@ pub(crate) struct Conductor {
     pub(crate) position_checker: JoinHandle<()>,
     pub(crate) queue_processor: JoinHandle<()>,
     pub(crate) rebalancer: Option<JoinHandle<()>>,
+    pub(crate) inventory_poller: Option<JoinHandle<()>>,
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -170,6 +176,9 @@ fn handle_conductor_completion(
     if let Some(ref handle) = conductor.rebalancer {
         handle.abort();
     }
+    if let Some(ref handle) = conductor.inventory_poller {
+        handle.abort();
+    }
     result?;
     info!("Conductor completed successfully, continuing to next market session");
     Ok(())
@@ -272,10 +281,13 @@ impl Conductor {
         let maintenance_task =
             wait_for_optional_task(&mut self.executor_maintenance, "Executor maintenance");
         let rebalancer_task = wait_for_optional_task(&mut self.rebalancer, "Rebalancer");
+        let inventory_poller_task =
+            wait_for_optional_task(&mut self.inventory_poller, "Inventory poller");
 
-        let ((), (), poller, dex, processor, position, queue) = tokio::join!(
+        let ((), (), (), poller, dex, processor, position, queue) = tokio::join!(
             maintenance_task,
             rebalancer_task,
+            inventory_poller_task,
             &mut self.order_poller,
             &mut self.dex_event_receiver,
             &mut self.event_processor,
@@ -301,6 +313,9 @@ impl Conductor {
         self.queue_processor.abort();
 
         if let Some(ref handle) = self.rebalancer {
+            handle.abort();
+        }
+        if let Some(ref handle) = self.inventory_poller {
             handle.abort();
         }
 
@@ -438,6 +453,38 @@ where
                 check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
             {
                 error!("Periodic accumulated position check failed: {e}");
+            }
+        }
+    })
+}
+
+fn spawn_inventory_poller<P, E>(
+    pool: SqlitePool,
+    vault_service: Arc<VaultService<P>>,
+    executor: E,
+    orderbook: Address,
+    order_owner: Address,
+) -> JoinHandle<()>
+where
+    P: Provider + Clone + Send + 'static,
+    E: Executor + Clone + Send + 'static,
+{
+    info!("Starting inventory poller");
+
+    let service =
+        InventoryPollingService::new(vault_service, executor, pool, orderbook, order_owner);
+
+    tokio::spawn(async move {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let mut interval = tokio::time::interval(POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            debug!("Running inventory poll");
+            if let Err(error) = service.poll_and_record().await {
+                error!(%error, "Inventory polling failed");
             }
         }
     })

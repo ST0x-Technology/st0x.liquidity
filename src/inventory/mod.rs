@@ -5,6 +5,7 @@ mod snapshot;
 mod venue_balance;
 mod view;
 
+pub(crate) use polling::InventoryPollingService;
 pub(crate) use snapshot::{
     InventorySnapshotCommand, InventorySnapshotError, InventorySnapshotEvent,
 };
