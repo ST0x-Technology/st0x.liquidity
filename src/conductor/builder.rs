@@ -5,6 +5,7 @@ use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
 use sqlx::SqlitePool;
+use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -15,6 +16,7 @@ use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::error::EventProcessingError;
+use crate::inventory::InventoryView;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
@@ -35,6 +37,7 @@ struct CommonFields<P, E> {
     provider: P,
     executor: E,
     dual_write_context: DualWriteContext,
+    inventory: Arc<RwLock<InventoryView>>,
 }
 
 pub(crate) struct Initial;
@@ -67,6 +70,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
         provider: P,
         executor: E,
         dual_write_context: DualWriteContext,
+        inventory: Arc<RwLock<InventoryView>>,
     ) -> Self {
         Self {
             common: CommonFields {
@@ -76,6 +80,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 provider,
                 executor,
                 dual_write_context,
+                inventory,
             },
             state: Initial,
         }
@@ -157,6 +162,7 @@ where
                     self.common.executor.clone(),
                     self.common.config.evm.orderbook,
                     order_owner,
+                    self.common.inventory.clone(),
                 ))
             }
             Err(error) => {

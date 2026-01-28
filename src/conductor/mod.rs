@@ -7,8 +7,11 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::sol_types;
+use cqrs_es::Query;
 use futures_util::{Stream, StreamExt};
+use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
+use tokio::sync::RwLock;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
@@ -18,11 +21,15 @@ use tracing::{debug, error, info, trace};
 use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
+use crate::cctp::USDC_BASE;
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
 use crate::error::{EventProcessingError, EventQueueError};
-use crate::inventory::InventoryPollingService;
+use crate::inventory::{
+    InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
+};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::BrokerOrderId;
@@ -31,14 +38,26 @@ use crate::onchain::accumulator::{
 };
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::trade::TradeEvent;
+use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
-use crate::rebalancing::spawn_rebalancer;
+use crate::rebalancing::{RebalancerContext, spawn_rebalancer};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
+use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 pub(crate) use builder::ConductorBuilder;
+
+type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
+type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
+
+/// Context for vault discovery operations during trade processing.
+struct VaultDiscoveryContext<'a> {
+    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    orderbook: Address,
+    order_owner: Address,
+    cache: &'a SymbolCache,
+}
 
 pub(crate) struct Conductor {
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
@@ -239,6 +258,8 @@ impl Conductor {
         let dual_write_context =
             DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
         // Spawn rebalancer with the provider if configured
         let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
             (Some(rebalancing_config), BrokerConfig::AlpacaTradingApi(alpaca_auth), None) => {
@@ -251,7 +272,10 @@ impl Conductor {
                         provider.clone(),
                         cache.clone(),
                         config.evm.orderbook,
-                        Some(event_sender),
+                        RebalancerContext {
+                            event_broadcast: Some(event_sender),
+                            inventory: inventory.clone(),
+                        },
                     )
                     .await?,
                 )
@@ -266,6 +290,7 @@ impl Conductor {
             provider,
             executor,
             dual_write_context,
+            inventory,
         )
         .with_executor_maintenance(executor_maintenance)
         .with_dex_event_streams(clear_stream, take_stream);
@@ -464,6 +489,7 @@ fn spawn_inventory_poller<P, E>(
     executor: E,
     orderbook: Address,
     order_owner: Address,
+    inventory: Arc<RwLock<InventoryView>>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -471,8 +497,17 @@ where
 {
     info!("Starting inventory poller");
 
-    let service =
-        InventoryPollingService::new(vault_service, executor, pool, orderbook, order_owner);
+    let snapshot_query = InventorySnapshotQuery::new(inventory);
+    let queries = vec![Box::new(snapshot_query) as Box<dyn Query<InventorySnapshotAggregate>>];
+
+    let service = InventoryPollingService::new(
+        vault_service,
+        executor,
+        pool,
+        orderbook,
+        order_owner,
+        queries,
+    );
 
     tokio::spawn(async move {
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -619,20 +654,27 @@ async fn run_queue_processor<P, E>(
     info!("Starting queue processor service");
 
     let feed_id_cache = FeedIdCache::default();
+    let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+        sqlite_cqrs(pool.clone(), vec![], ());
 
     log_unprocessed_event_count(pool).await;
 
     let executor_type = executor.to_supported_executor();
+
+    let queue_context = QueueProcessingContext {
+        cache,
+        feed_id_cache: &feed_id_cache,
+        vault_registry_cqrs: &vault_registry_cqrs,
+    };
 
     loop {
         let result = process_next_queued_event(
             executor_type,
             config,
             pool,
-            cache,
             &provider,
-            &feed_id_cache,
             dual_write_context,
+            &queue_context,
         )
         .await;
 
@@ -677,15 +719,21 @@ async fn handle_queue_processing_result<E>(
     }
 }
 
+/// Context for queue event processing containing caches and CQRS components.
+struct QueueProcessingContext<'a> {
+    cache: &'a SymbolCache,
+    feed_id_cache: &'a FeedIdCache,
+    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+}
+
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn process_next_queued_event<P: Provider + Clone>(
     executor_type: SupportedExecutor,
     config: &Config,
     pool: &SqlitePool,
-    cache: &SymbolCache,
     provider: &P,
-    feed_id_cache: &FeedIdCache,
     dual_write_context: &DualWriteContext,
+    queue_context: &QueueProcessingContext<'_>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -694,11 +742,24 @@ async fn process_next_queued_event<P: Provider + Clone>(
 
     let event_id = extract_event_id(&queued_event)?;
 
-    let onchain_trade =
-        convert_event_to_trade(config, cache, provider, &queued_event, feed_id_cache).await?;
+    let onchain_trade = convert_event_to_trade(
+        config,
+        queue_context.cache,
+        provider,
+        &queued_event,
+        queue_context.feed_id_cache,
+    )
+    .await?;
 
     let Some(trade) = onchain_trade else {
         return handle_filtered_event(pool, &queued_event, event_id).await;
+    };
+
+    let vault_discovery_context = VaultDiscoveryContext {
+        vault_registry_cqrs: queue_context.vault_registry_cqrs,
+        orderbook: config.evm.orderbook,
+        order_owner: config.order_owner()?,
+        cache: queue_context.cache,
     };
 
     process_valid_trade(
@@ -708,6 +769,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
         event_id,
         trade,
         dual_write_context,
+        &vault_discovery_context,
     )
     .await
 }
@@ -716,6 +778,71 @@ fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingEr
     queued_event
         .id
         .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
+}
+
+/// Discovers vaults from a trade and emits VaultRegistryCommands.
+///
+/// This function is called AFTER trade conversion succeeds, using the trade's
+/// already-resolved symbol. It extracts vault information from the queued event
+/// and registers vaults owned by the specified order_owner.
+///
+/// Vaults are classified as:
+/// - USDC vault: token == USDC_BASE
+/// - Equity vault: token matches the trade's symbol (via cache lookup)
+async fn discover_vaults_for_trade(
+    queued_event: &QueuedEvent,
+    trade: &OnchainTrade,
+    context: &VaultDiscoveryContext<'_>,
+) -> Result<(), EventProcessingError> {
+    let tx_hash = queued_event.tx_hash;
+    let base_symbol = trade.symbol.base();
+
+    let expected_equity_token = context
+        .cache
+        .get_address(&base_symbol.to_string())
+        .ok_or_else(|| EventProcessingError::TokenNotInCache(base_symbol.clone()))?;
+
+    let owned_vaults = match &queued_event.event {
+        TradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
+        TradeEvent::TakeOrderV3(take_event) => extract_owned_vaults(
+            &take_event.config.order,
+            take_event.config.inputIOIndex,
+            take_event.config.outputIOIndex,
+        ),
+    };
+
+    let our_vaults = owned_vaults
+        .into_iter()
+        .filter(|vault| vault.owner == context.order_owner);
+
+    let aggregate_id = VaultRegistry::aggregate_id(context.orderbook, context.order_owner);
+
+    for owned_vault in our_vaults {
+        let vault = owned_vault.vault;
+
+        let command = if vault.token == USDC_BASE {
+            VaultRegistryCommand::DiscoverUsdcVault {
+                vault_id: vault.vault_id,
+                discovered_in: tx_hash,
+            }
+        } else if vault.token == expected_equity_token {
+            VaultRegistryCommand::DiscoverEquityVault {
+                token: vault.token,
+                vault_id: vault.vault_id,
+                discovered_in: tx_hash,
+                symbol: base_symbol.clone(),
+            }
+        } else {
+            continue;
+        };
+
+        context
+            .vault_registry_cqrs
+            .execute(&aggregate_id, command)
+            .await?;
+    }
+
+    Ok(())
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
@@ -788,7 +915,7 @@ async fn handle_filtered_event(
 }
 
 #[tracing::instrument(
-    skip(pool, queued_event, trade, dual_write_context),
+    skip(pool, queued_event, trade, dual_write_context, vault_discovery_context),
     fields(event_id, symbol = %trade.symbol),
     level = tracing::Level::INFO
 )]
@@ -799,6 +926,7 @@ async fn process_valid_trade(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
+    vault_discovery_context: &VaultDiscoveryContext<'_>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -811,6 +939,8 @@ async fn process_valid_trade(
         trade.symbol,
         trade.amount
     );
+
+    discover_vaults_for_trade(queued_event, &trade, vault_discovery_context).await?;
 
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
@@ -1316,14 +1446,14 @@ async fn buffer_live_events<S1, S2>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, IntoLogData, U256, address, fixed_bytes};
+    use alloy::primitives::{B256, IntoLogData, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
     use futures_util::stream;
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3};
+    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::env::tests::create_test_config;
     use crate::offchain::execution::{
         OffchainExecution, find_executions_by_symbol_status_and_broker,
@@ -1967,15 +2097,22 @@ mod tests {
         assert_eq!(count, 1);
 
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let queue_context = QueueProcessingContext {
+            cache: &cache,
+            feed_id_cache: &feed_id_cache,
+            vault_registry_cqrs: &vault_registry_cqrs,
+        };
 
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
             &pool,
-            &cache,
             &provider,
-            &feed_id_cache,
             &dual_write_context,
+            &queue_context,
         )
         .await;
 
@@ -2523,12 +2660,20 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         assert!(!conductor.order_poller.is_finished());
         assert!(!conductor.event_processor.is_finished());
@@ -2553,12 +2698,20 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         let order_handle = conductor.order_poller;
         let event_handle = conductor.event_processor;
@@ -2598,12 +2751,20 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         let elapsed = start_time.elapsed();
 
@@ -2628,12 +2789,20 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         assert!(conductor.rebalancer.is_none());
         abort_all_conductor_tasks(conductor);
@@ -2652,20 +2821,27 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
         let rebalancer_handle = tokio::spawn(async {
-            // Simulate rebalancer task that runs until cancelled
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
         });
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .with_rebalancer(rebalancer_handle)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(rebalancer_handle)
+        .spawn();
 
         assert!(conductor.rebalancer.is_some());
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
@@ -2686,6 +2862,7 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
         let rebalancer_handle = tokio::spawn(async {
             loop {
@@ -2693,12 +2870,19 @@ mod tests {
             }
         });
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .with_rebalancer(rebalancer_handle)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(rebalancer_handle)
+        .spawn();
 
         let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_ref.is_finished());
@@ -2721,6 +2905,7 @@ mod tests {
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
         let rebalancer_handle = tokio::spawn(async {
             loop {
@@ -2728,12 +2913,19 @@ mod tests {
             }
         });
 
-        let conductor =
-            ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
-                .with_executor_maintenance(None)
-                .with_dex_event_streams(clear_stream, take_stream)
-                .with_rebalancer(rebalancer_handle)
-                .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            dual_write_context,
+            inventory,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(rebalancer_handle)
+        .spawn();
 
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 
@@ -2770,6 +2962,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
 
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -2790,14 +2984,19 @@ mod tests {
             .await
             .unwrap();
 
+        let queue_context = QueueProcessingContext {
+            cache: &cache,
+            feed_id_cache: &feed_id_cache,
+            vault_registry_cqrs: &vault_registry_cqrs,
+        };
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
             &pool,
-            &cache,
             &provider,
-            &feed_id_cache,
             &dual_write_context,
+            &queue_context,
         )
         .await;
 
@@ -2818,6 +3017,8 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let dual_write_context = DualWriteContext::new(pool.clone());
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
 
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -2838,14 +3039,19 @@ mod tests {
             .await
             .unwrap();
 
+        let queue_context = QueueProcessingContext {
+            cache: &cache,
+            feed_id_cache: &feed_id_cache,
+            vault_registry_cqrs: &vault_registry_cqrs,
+        };
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
             &pool,
-            &cache,
             &provider,
-            &feed_id_cache,
             &dual_write_context,
+            &queue_context,
         )
         .await;
 
@@ -2981,6 +3187,355 @@ mod tests {
         assert_eq!(
             status, "SUBMITTED",
             "Legacy table should show SUBMITTED status"
+        );
+    }
+
+    use crate::bindings::IOrderBookV5::TakeOrderConfigV4;
+    use crate::cctp::USDC_BASE;
+    use crate::queue::QueuedEvent;
+
+    const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
+    const ORDER_OWNER: Address = address!("0xdddddddddddddddddddddddddddddddddddddddd");
+    const OTHER_OWNER: Address = address!("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+    const TEST_EQUITY_TOKEN: Address = address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    const TEST_VAULT_ID: B256 =
+        fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const TEST_TX_HASH: B256 =
+        fixed_bytes!("0x2222222222222222222222222222222222222222222222222222222222222222");
+
+    fn create_order_with_usdc_and_equity_vaults(owner: Address) -> OrderV4 {
+        OrderV4 {
+            owner,
+            evaluable: EvaluableV4 {
+                interpreter: address!("0x2222222222222222222222222222222222222222"),
+                store: address!("0x3333333333333333333333333333333333333333"),
+                bytecode: bytes!("0x00"),
+            },
+            nonce: fixed_bytes!(
+                "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+            ),
+            validInputs: vec![
+                IOV2 {
+                    token: USDC_BASE,
+                    vaultId: TEST_VAULT_ID,
+                },
+                IOV2 {
+                    token: TEST_EQUITY_TOKEN,
+                    vaultId: TEST_VAULT_ID,
+                },
+            ],
+            validOutputs: vec![
+                IOV2 {
+                    token: USDC_BASE,
+                    vaultId: TEST_VAULT_ID,
+                },
+                IOV2 {
+                    token: TEST_EQUITY_TOKEN,
+                    vaultId: TEST_VAULT_ID,
+                },
+            ],
+        }
+    }
+
+    fn create_queued_clear_event(alice: OrderV4, bob: OrderV4) -> QueuedEvent {
+        let clear_event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice,
+            bob,
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        QueuedEvent {
+            id: Some(1),
+            tx_hash: TEST_TX_HASH,
+            log_index: 0,
+            block_number: 12345,
+            event: TradeEvent::ClearV3(Box::new(clear_event)),
+            processed: false,
+            created_at: None,
+            processed_at: None,
+            block_timestamp: None,
+        }
+    }
+
+    fn create_queued_take_event(order: OrderV4) -> QueuedEvent {
+        let take_event = TakeOrderV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            config: TakeOrderConfigV4 {
+                order,
+                inputIOIndex: U256::from(0),
+                outputIOIndex: U256::from(1),
+                signedContext: vec![],
+            },
+            input: B256::ZERO,
+            output: B256::ZERO,
+        };
+
+        QueuedEvent {
+            id: Some(1),
+            tx_hash: TEST_TX_HASH,
+            log_index: 0,
+            block_number: 12345,
+            event: TradeEvent::TakeOrderV3(Box::new(take_event)),
+            processed: false,
+            created_at: None,
+            processed_at: None,
+            block_timestamp: None,
+        }
+    }
+
+    fn setup_symbol_cache_with_equity(cache: &SymbolCache, token: Address, symbol: &str) {
+        cache
+            .map
+            .write()
+            .expect("Test cache lock poisoned")
+            .insert(token, symbol.to_string());
+    }
+
+    async fn get_vault_registry_events(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar!("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
+            .fetch_all(pool)
+            .await
+            .unwrap()
+    }
+
+    fn create_test_trade(symbol: &str) -> OnchainTrade {
+        let tokenized_symbol = format!("{symbol}0x");
+        OnchainTradeBuilder::default()
+            .with_symbol(&tokenized_symbol)
+            .build()
+    }
+
+    fn create_vault_discovery_context<'a>(
+        vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+        cache: &'a SymbolCache,
+    ) -> VaultDiscoveryContext<'a> {
+        VaultDiscoveryContext {
+            vault_registry_cqrs,
+            orderbook: TEST_ORDERBOOK,
+            order_owner: ORDER_OWNER,
+            cache,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let queued_event = create_queued_clear_event(alice, bob);
+        let trade = create_test_trade("AAPL");
+
+        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("Should succeed when cache is populated");
+
+        let events = get_vault_registry_events(&pool).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "VaultRegistryEvent::UsdcVaultDiscovered"),
+            "Expected UsdcVaultDiscovered event, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_discovers_equity_vault() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let queued_event = create_queued_clear_event(alice, bob);
+        let trade = create_test_trade("AAPL");
+
+        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("Should succeed when cache is populated");
+
+        let events = get_vault_registry_events(&pool).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "VaultRegistryEvent::EquityVaultDiscovered"),
+            "Expected EquityVaultDiscovered event, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_from_take_event() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
+        let queued_event = create_queued_take_event(order);
+        let trade = create_test_trade("MSFT");
+
+        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "MSFT");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("Should succeed when cache is populated");
+
+        let events = get_vault_registry_events(&pool).await;
+
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "VaultRegistryEvent::UsdcVaultDiscovered"),
+            "Expected UsdcVaultDiscovered event from take order"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e == "VaultRegistryEvent::EquityVaultDiscovered"),
+            "Expected EquityVaultDiscovered event from take order"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let queued_event = create_queued_clear_event(alice, bob);
+        let trade = create_test_trade("AAPL");
+
+        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("Should succeed even when no vaults match");
+
+        let events = get_vault_registry_events(&pool).await;
+
+        assert!(
+            events.is_empty(),
+            "Expected no events when vaults don't belong to order_owner, got: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_fails_when_token_not_in_cache() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let queued_event = create_queued_clear_event(alice, bob);
+        let trade = create_test_trade("AAPL");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let result = discover_vaults_for_trade(&queued_event, &trade, &context).await;
+
+        assert!(
+            matches!(result, Err(EventProcessingError::TokenNotInCache(_))),
+            "Expected TokenNotInCache error, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let queued_event = create_queued_clear_event(alice, bob);
+        let trade = create_test_trade("AAPL");
+
+        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("Should succeed");
+
+        let expected_aggregate_id =
+            crate::vault_registry::VaultRegistry::aggregate_id(TEST_ORDERBOOK, ORDER_OWNER);
+
+        let aggregate_ids: Vec<String> = sqlx::query_scalar!(
+            "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(aggregate_ids.len(), 1, "Expected exactly one aggregate ID");
+        assert_eq!(
+            aggregate_ids[0], expected_aggregate_id,
+            "Aggregate ID should be {expected_aggregate_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
+        let pool = setup_test_db().await;
+        let cache = SymbolCache::default();
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+
+        let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
+        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
+        let queued_event = create_queued_clear_event(alice, bob);
+        let trade = create_test_trade("GOOG");
+
+        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "GOOG");
+
+        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        discover_vaults_for_trade(&queued_event, &trade, &context)
+            .await
+            .expect("Should succeed");
+
+        let events: Vec<(String, String)> = sqlx::query_as(
+            "SELECT event_type, payload FROM events WHERE aggregate_type = 'VaultRegistry'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let equity_event = events
+            .iter()
+            .find(|(event_type, _)| event_type == "VaultRegistryEvent::EquityVaultDiscovered")
+            .expect("Should have EquityVaultDiscovered event");
+
+        assert!(
+            equity_event.1.contains("GOOG"),
+            "Equity vault should use the trade's symbol (GOOG), got payload: {}",
+            equity_event.1
         );
     }
 }

@@ -8,7 +8,7 @@ use cqrs_es::{EventEnvelope, Query};
 use tokio::sync::RwLock;
 use tracing::warn;
 
-use super::snapshot::{InventorySnapshot, InventorySnapshotEvent};
+use super::snapshot::InventorySnapshot;
 use super::view::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
 
@@ -43,8 +43,10 @@ impl Query<Lifecycle<InventorySnapshot, Never>> for InventorySnapshotQuery {
             match inventory.clone().apply_snapshot_event(event, now) {
                 Ok(updated) => {
                     *inventory = updated;
+                    drop(inventory);
                 }
                 Err(error) => {
+                    drop(inventory);
                     warn!(%error, "Failed to apply inventory snapshot event");
                 }
             }
@@ -54,12 +56,13 @@ impl Query<Lifecycle<InventorySnapshot, Never>> for InventorySnapshotQuery {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use chrono::Utc;
     use rust_decimal::Decimal;
 
     use super::*;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::shares::FractionalShares;
     use crate::threshold::Usdc;
     use st0x_execution::Symbol;
@@ -79,7 +82,7 @@ mod tests {
             aggregate_id: "test".to_string(),
             sequence: 1,
             payload: event,
-            metadata: Default::default(),
+            metadata: HashMap::default(),
         }
     }
 
@@ -152,7 +155,7 @@ mod tests {
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory));
 
         let event = InventorySnapshotEvent::OffchainCash {
-            cash_balance_cents: 500_000_00, // $500,000.00
+            cash_balance_cents: 50_000_000, // $500,000.00
             fetched_at: Utc::now(),
         };
 

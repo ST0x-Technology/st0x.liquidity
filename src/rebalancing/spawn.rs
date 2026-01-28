@@ -43,6 +43,14 @@ use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 
+/// Runtime context passed to the rebalancer.
+///
+/// Groups optional runtime dependencies that are shared across the system.
+pub(crate) struct RebalancerContext {
+    pub(crate) event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+    pub(crate) inventory: Arc<RwLock<InventoryView>>,
+}
+
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnRebalancerError {
@@ -84,7 +92,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
     base_provider: BP,
     symbol_cache: SymbolCache,
     orderbook: Address,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+    context: RebalancerContext,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -107,8 +115,9 @@ where
         pool,
         config,
         symbol_cache,
-        event_broadcast,
+        context.event_broadcast,
         market_maker_wallet,
+        context.inventory,
     );
 
     let handle = tokio::spawn(async move {
@@ -220,12 +229,11 @@ where
         symbol_cache: SymbolCache,
         event_broadcast: Option<broadcast::Sender<ServerMessage>>,
         market_maker_wallet: Address,
+        inventory: Arc<RwLock<InventoryView>>,
     ) -> ConfiguredRebalancer<BP> {
         const OPERATION_CHANNEL_CAPACITY: usize = 100;
 
         let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
-
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
         let trigger_config = RebalancingTriggerConfig {
             equity_threshold: config.equity_threshold,
@@ -525,12 +533,14 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let _rebalancer = services.into_rebalancer(
             pool,
             &config,
             SymbolCache::default(),
             None,
             market_maker_wallet,
+            inventory,
         );
     }
 
