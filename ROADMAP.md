@@ -2,10 +2,11 @@
 
 ## Current Development Focus
 
-**Alpaca Trading Improvements:**
+### Live testing of auto-rebalancing on the Alpaca instance
 
 - [ ] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
 - [ ] [#105 Run the Alpaca instance without whole share accumulation](https://github.com/ST0x-Technology/st0x.liquidity/issues/105)
+- [ ] [#251 Manual operations on trading venues not detected by inventory tracking](https://github.com/ST0x-Technology/st0x.liquidity/issues/251)
 
 **CQRS/ES Phase 3 - Complete Migration:**
 
