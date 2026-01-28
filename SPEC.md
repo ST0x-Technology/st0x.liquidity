@@ -231,12 +231,12 @@ defined in `migrations/20250703115746_trades.sql`.
   authentication
 - Graceful shutdown handling to complete in-flight trades before stopping
 
-### CI/CD and Deployment
+### Infrastructure and Deployment
 
-This section specifies infrastructure, deployment, and secrets management
-requirements as well as potential ways to fulfil them. During the review
-process, one such approach should be chosen and the rest removed from the spec
-before merging to avoid confusing human and AI contributors.
+This section specifies infrastructure, deployment, and secrets management.
+
+Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
+`5ede2d47465d3621b351c73c9c1af33d20a7c879`.
 
 #### Design Goals
 
@@ -280,14 +280,10 @@ before merging to avoid confusing human and AI contributors.
 - **Rollback uncertainty:** Rollback scripts exist but haven't been
   battle-tested enough to trust them in an emergency
 
----
+#### Approach
 
-The following approaches address these pain points with different trade-offs.
-
-#### Nix-Maxxing
-
-This approach extends Nix usage from only development environments and builds to
-infrastructure, deployment, and secrets management.
+Extend Nix from development environments and builds to infrastructure,
+deployment, and secrets management.
 
 **Key Tools:**
 
@@ -400,212 +396,6 @@ Cons:
 - (r)agenix requires NixOS on target
 - deploy-rs is less mature than some alternatives
 - There is a learning curve if you're not already familiar with Nix
-
-#### Ansible
-
-This approach uses Ansible for deployment automation without extending Nix to
-infrastructure.
-
-**Key Tools:**
-
-- **Terraform**: Provisions single DigitalOcean droplet (Ubuntu).
-- **Ansible**: Deployment automation via SSH. You describe desired server state
-  in YAML files, Ansible makes it so. No agent/daemon on target servers - just
-  SSH access.
-- **Ansible Vault** (file encryption, not a server): Ansible's built-in feature
-  for encrypting YAML files stored in git. Decrypted at deploy time using a
-  password. Similar concept to ragenix/SOPS - no external service, just
-  encrypted files in version control.
-
-**What Ansible Actually Does:**
-
-Ansible lets you describe "what state servers should be in" declaratively:
-
-```yaml
-# Example: deploy server-schwab binary and ensure it's running
-- name: Copy server-schwab binary
-  copy:
-    src: ./target/release/server
-    dest: /opt/st0x/current/server-schwab
-    mode: "0755"
-
-- name: Ensure server-schwab service is running
-  systemd:
-    name: server-schwab
-    state: restarted
-    enabled: yes
-```
-
-Run `ansible-playbook deploy.yml` and Ansible SSHs into servers, executes tasks
-in order, reports what changed.
-
-**Ansible Concepts:**
-
-- **Inventory**: File listing your servers. Example:
-  `production ansible_host=192.168.1.1`. Later add `staging ansible_host=...`.
-- **Task**: Single action (copy file, restart service, create directory).
-- **Role**: Bundle of related tasks. A `server-schwab` role contains all tasks
-  to deploy that service's binary. Roles are reusable across environments.
-- **Playbook**: YAML file that says "run these roles on these servers". Example:
-  "on production, run the server-schwab and reporter-schwab roles".
-
-**Architecture:**
-
-Terraform provisions Ubuntu droplet. Ansible handles everything else:
-
-1. CI builds Rust binaries
-2. `ansible-playbook deploy.yml` runs
-3. Ansible SSHs to server, copies binaries, writes systemd units from templates
-4. Ansible restarts services
-5. Previous binaries retained in versioned directories for rollback
-
-_Per-service deployment_: Ansible tags target specific roles:
-`ansible-playbook deploy.yml --tags server-schwab`. Each role is independent.
-
-_Secrets_: Ansible Vault encrypts secrets in git. At deploy time, Ansible
-decrypts and writes to environment files that systemd reads. Audit trail via git
-history, no external service.
-
-**Rollback:**
-
-Capistrano-style versioned deployments:
-
-```
-/opt/st0x/
-├── releases/
-│   ├── 20240101-abc123/
-│   │   ├── server-schwab
-│   │   ├── server-alpaca
-│   │   ├── reporter-schwab
-│   │   ├── reporter-alpaca
-│   │   └── dashboard
-│   └── 20240102-def456/
-│       └── ...
-└── current -> releases/20240102-def456/
-```
-
-Systemd units point to `/opt/st0x/current/<service>`. Rollback:
-
-```bash
-# Point to previous release
-ln -sfn /opt/st0x/releases/20240101-abc123 /opt/st0x/current
-sudo systemctl restart server-schwab server-alpaca reporter-schwab reporter-alpaca dashboard
-```
-
-Can be automated via
-`ansible-playbook rollback.yml --extra-vars "release=20240101-abc123"`.
-
-This is convention-based (not built-in like nix profiles), but widely understood
-and battle-tested.
-
-**CI/CD Credential Management:**
-
-| Secret Type | Storage             | When Used           | Example                 |
-| ----------- | ------------------- | ------------------- | ----------------------- |
-| Runtime     | Ansible Vault (git) | Decrypted at deploy | Schwab/Alpaca API keys  |
-| Build-time  | GitHub Secrets      | CI build/deploy     | SSH key, Vault password |
-
-**Trade-offs:**
-
-Pros:
-
-- Deploys Rust binaries directly (no Docker layer)
-- Works with any Linux distribution (Ubuntu, Debian, etc.)
-- Declarative YAML - readable even without deep Ansible knowledge
-- Secrets in git (Ansible Vault) - audit trail, no external UI
-- Roles transfer between environments (production, staging)
-- Well-documented with large community
-
-Cons:
-
-- Rollback is convention-based (symlinks), not built-in like nix profiles
-- Playbooks can become complex for sophisticated deployments
-- No atomic updates - can end up in partial deployment state
-- Requires Python runtime for Ansible CLI
-- Introduces separate tooling instead of extending existing Nix
-- Team already knows Nix; this doesn't leverage that knowledge
-
-#### Kamal
-
-This approach uses Docker containers with Kamal for deployment orchestration and
-SOPS for git-stored encrypted secrets.
-
-**Key Tools:**
-
-- **Terraform**: Provisions single DigitalOcean droplet (Ubuntu with Docker).
-- **Kamal**: Basecamp's deployment tool. Runs from CI over SSH, manages Docker
-  container lifecycle on remote servers. No daemon on server - just Docker.
-- **SOPS**: Mozilla's secrets tool. Encrypts values (not keys) in YAML/JSON
-  files stored in git. Similar to ragenix but not Nix-specific.
-
-**Architecture:**
-
-Terraform provisions Ubuntu droplet with Docker. Kamal handles deployments from
-CI:
-
-1. CI builds Docker image, pushes to registry
-2. `kamal deploy` SSHs to server, pulls image
-3. Starts new container, runs health check
-4. Stops old container (kept on disk for rollback)
-
-_Per-service deployment_: `kamal deploy -d server-schwab` deploys only that
-service. Each service defined separately in `deploy.yml`.
-
-_Secrets_: SOPS encrypts secrets in git. CI decrypts at deploy time, Kamal
-injects as environment variables. Partial encryption means you can see secret
-names in PRs without decrypting values.
-
-**Rollback:**
-
-Kamal keeps previous containers on disk:
-
-```bash
-kamal rollback            # previous version
-kamal rollback [version]  # specific version
-```
-
-Also has automatic health check gate - new container must pass health check
-before old one is stopped.
-
-**CI/CD Credential Management:**
-
-| Secret Type | Storage             | When Used           | Example                |
-| ----------- | ------------------- | ------------------- | ---------------------- |
-| Runtime     | SOPS (.yaml in git) | Decrypted at deploy | Schwab/Alpaca API keys |
-| Build-time  | GitHub Secrets      | CI build/deploy     | SSH key, SOPS key      |
-
-**Trade-offs:**
-
-Pros:
-
-- All pain points solved including secrets in git
-- No daemon on server - just Docker
-- Production-proven (Hey.com, Basecamp)
-- SOPS partial encryption - review secret structure in PRs
-
-Cons:
-
-- Ruby runtime for Kamal CLI
-- Container-only (no raw Rust binaries)
-- Another tool (SOPS) though simpler than HashiCorp Vault
-- Designed for web apps (Traefik/zero-downtime features unused)
-
-#### Comparison Matrix
-
-| Requirement             | Nix-Maxxing            | Ansible              | Kamal               |
-| ----------------------- | ---------------------- | -------------------- | ------------------- |
-| Solves fragility        | Yes (declarative)      | Mostly (YAML > bash) | Yes (declarative)   |
-| Eliminate DO UI         | Terraform              | Terraform            | Terraform           |
-| Eliminate GH Secrets UI | Ragenix                | Ansible Vault        | SOPS                |
-| Secrets in git          | Yes                    | Yes                  | Yes                 |
-| Per-service control     | systemctl              | systemctl via roles  | `kamal deploy -d`   |
-| Rollback (on-demand)    | `nix profile rollback` | Symlink + restart    | `kamal rollback`    |
-| Rollback (auto)         | deploy-rs magic        | None                 | Health check gate   |
-| Add staging later       | Add node to flake      | Add to inventory     | Add to deploy.yml   |
-| Custom VM images        | nixos-generators       | Stock images         | Stock images        |
-| Reproducibility         | Byte-identical         | Best effort          | Best effort         |
-| Dev/prod version parity | Same flake.lock        | Manual coordination  | Manual coordination |
-| Leverage existing Nix   | Extends flake          | Parallel tooling     | Parallel tooling    |
 
 ## Crate Architecture
 
