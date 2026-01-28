@@ -13,7 +13,6 @@ use st0x_execution::{
     OrderState, Positive, Symbol, TryIntoExecutor,
 };
 
-use crate::cctp::USDC_BASE;
 use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
 use crate::error::OnChainError;
@@ -276,12 +275,8 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let dual_write_context = DualWriteContext::with_threshold(
-        pool.clone(),
-        config.execution_threshold,
-        config.evm.orderbook,
-        USDC_BASE,
-    );
+    let dual_write_context =
+        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
     update_position_aggregate(
         &dual_write_context,

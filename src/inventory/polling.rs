@@ -16,12 +16,15 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{AggregateContext, AggregateError, EventStore};
+use cqrs_es::{AggregateContext, AggregateError, EventStore, Query};
 use futures_util::future::try_join_all;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
+
+/// Type alias for queries that subscribe to InventorySnapshot events.
+pub(crate) type InventorySnapshotQueries = Vec<Box<dyn Query<InventorySnapshotAggregate>>>;
 
 type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
@@ -53,6 +56,7 @@ where
     pool: SqlitePool,
     orderbook: Address,
     order_owner: Address,
+    snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
 
 impl<P, E> InventoryPollingService<P, E>
@@ -66,13 +70,17 @@ where
         pool: SqlitePool,
         orderbook: Address,
         order_owner: Address,
+        queries: InventorySnapshotQueries,
     ) -> Self {
+        let snapshot_cqrs = sqlite_cqrs::<InventorySnapshotAggregate>(pool.clone(), queries, ());
+
         Self {
             vault_service,
             executor,
             pool,
             orderbook,
             order_owner,
+            snapshot_cqrs,
         }
     }
 
@@ -82,15 +90,15 @@ where
     /// 2. Queries onchain USDC balance from USDC vault
     /// 3. Queries offchain positions and cash from executor
     /// 4. Emits InventorySnapshot events via corresponding commands
+    ///
+    /// Registered queries are dispatched when commands are executed.
     pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<E::Error>> {
         let snapshot_aggregate_id =
             InventorySnapshot::aggregate_id(self.orderbook, self.order_owner);
-        let snapshot_cqrs =
-            sqlite_cqrs::<InventorySnapshotAggregate>(self.pool.clone(), vec![], ());
 
-        self.poll_onchain(&snapshot_aggregate_id, &snapshot_cqrs)
+        self.poll_onchain(&snapshot_aggregate_id, &self.snapshot_cqrs)
             .await?;
-        self.poll_offchain(&snapshot_aggregate_id, &snapshot_cqrs)
+        self.poll_offchain(&snapshot_aggregate_id, &self.snapshot_cqrs)
             .await?;
 
         Ok(())
@@ -318,6 +326,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -364,6 +373,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -406,6 +416,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -485,6 +496,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -531,6 +543,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -571,6 +584,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -650,6 +664,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -693,6 +708,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();
@@ -737,6 +753,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
+            vec![],
         );
 
         service.poll_and_record().await.unwrap();

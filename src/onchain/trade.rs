@@ -92,6 +92,12 @@ pub(crate) fn extract_owned_vaults(
     output_idx: U256,
 ) -> Vec<OwnedVaultInfo> {
     let (Ok(in_idx), Ok(out_idx)) = (input_idx.try_into(), output_idx.try_into()) else {
+        warn!(
+            owner = %order.owner,
+            %input_idx,
+            %output_idx,
+            "extract_owned_vaults: failed to convert input_idx or output_idx from U256 to usize"
+        );
         return vec![];
     };
 

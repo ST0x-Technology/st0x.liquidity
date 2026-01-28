@@ -3,6 +3,7 @@
 use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::shares::{ArithmeticError, HasZero};
 
@@ -26,8 +27,6 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
-    #[error("actual amount {actual:?} exceeds inflight amount {inflight:?}")]
-    ActualExceedsInflight { actual: T, inflight: T },
     #[error(transparent)]
     Arithmetic(#[from] ArithmeticError<T>),
 }
@@ -77,7 +76,8 @@ where
     T: Add<Output = Result<T, ArithmeticError<T>>>
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy
-        + HasZero,
+        + HasZero
+        + std::fmt::Debug,
 {
     pub(super) fn has_inflight(self) -> bool {
         !self.inflight.is_zero()
@@ -165,25 +165,25 @@ where
         })
     }
 
-    /// Reconcile available balance based on actual fetched total.
+    /// Apply a fetched venue snapshot to reconcile tracked balance.
     ///
-    /// Sets `available = actual_total - inflight` to match the fetched total
-    /// while preserving inflight operations. Returns an error if actual_total < inflight,
-    /// since that indicates an integrity violation that callers must handle.
-    pub(super) fn reconcile_from_actual(self, actual_total: T) -> Result<Self, InventoryError<T>> {
-        let new_available = (actual_total - self.inflight)?;
-
-        if new_available.is_negative() {
-            return Err(InventoryError::ActualExceedsInflight {
-                actual: actual_total,
-                inflight: self.inflight,
-            });
+    /// When inflight is zero, sets `available = snapshot_balance` to match reality.
+    /// When inflight is non-zero, returns self unchanged - we cannot safely reconcile
+    /// while transfers are in progress because the snapshot alone cannot distinguish
+    /// between "transfer completed" vs "unrelated inventory change".
+    pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Self {
+        if !self.inflight.is_zero() {
+            debug!(
+                inflight = ?self.inflight,
+                "Skipping snapshot reconciliation due to non-zero inflight"
+            );
+            return self;
         }
 
-        Ok(Self {
-            available: new_available,
+        Self {
+            available: snapshot_balance,
             inflight: self.inflight,
-        })
+        }
     }
 }
 
@@ -346,62 +346,36 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_from_actual_adjusts_available_to_match_total() {
-        // tracked: available=90, inflight=10, total=100
-        // actual: 95
-        // new_available should be 95-10=85
-        let b = equity_balance(90, 10);
-        let actual = FractionalShares::new(Decimal::from(95));
+    fn apply_snapshot_skips_when_inflight_nonzero() {
+        let balance = equity_balance(90, 10);
+        let snapshot_balance = FractionalShares::new(Decimal::from(95));
 
-        let result = b.reconcile_from_actual(actual).unwrap();
+        let result = balance.apply_snapshot(snapshot_balance);
 
-        assert_eq!(result.available().inner(), Decimal::from(85));
+        // Balance unchanged when inflight is non-zero
+        assert_eq!(result.available().inner(), Decimal::from(90));
         assert_eq!(result.inflight().inner(), Decimal::from(10));
     }
 
     #[test]
-    fn reconcile_from_actual_returns_error_when_actual_less_than_inflight() {
-        // tracked: available=90, inflight=10
-        // actual: 5 (less than inflight) -> integrity violation
-        let balance = equity_balance(90, 10);
-        let actual = FractionalShares::new(Decimal::from(5));
+    fn apply_snapshot_sets_available_when_inflight_zero() {
+        let balance = equity_balance(100, 0);
+        let snapshot_balance = FractionalShares::new(Decimal::from(75));
 
-        assert!(matches!(
-            balance.reconcile_from_actual(actual).unwrap_err(),
-            InventoryError::ActualExceedsInflight { .. }
-        ));
-    }
-
-    #[test]
-    fn reconcile_from_actual_preserves_inflight() {
-        let b = equity_balance(100, 50);
-        let actual = FractionalShares::new(Decimal::from(200));
-
-        let result = b.reconcile_from_actual(actual).unwrap();
-
-        assert_eq!(result.available().inner(), Decimal::from(150));
-        assert_eq!(result.inflight().inner(), Decimal::from(50));
-    }
-
-    #[test]
-    fn reconcile_from_actual_works_with_zero_inflight() {
-        let b = equity_balance(100, 0);
-        let actual = FractionalShares::new(Decimal::from(75));
-
-        let result = b.reconcile_from_actual(actual).unwrap();
+        let result = balance.apply_snapshot(snapshot_balance);
 
         assert_eq!(result.available().inner(), Decimal::from(75));
         assert_eq!(result.inflight().inner(), Decimal::ZERO);
     }
 
     #[test]
-    fn reconcile_from_actual_works_with_usdc() {
-        let b = usdc_balance(1000, 100);
-        let actual = Usdc(Decimal::from(950));
+    fn apply_snapshot_works_with_usdc_when_inflight_zero() {
+        let balance = usdc_balance(1000, 0);
+        let snapshot_balance = Usdc(Decimal::from(950));
 
-        let result = b.reconcile_from_actual(actual).unwrap();
+        let result = balance.apply_snapshot(snapshot_balance);
 
-        assert_eq!(result.available().0, Decimal::from(850));
-        assert_eq!(result.inflight().0, Decimal::from(100));
+        assert_eq!(result.available().0, Decimal::from(950));
+        assert_eq!(result.inflight().0, Decimal::ZERO);
     }
 }
