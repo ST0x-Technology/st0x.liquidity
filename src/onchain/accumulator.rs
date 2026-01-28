@@ -1,3 +1,4 @@
+use alloy::providers::Provider;
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
 use st0x_execution::{
@@ -12,7 +13,7 @@ use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_e
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
 use crate::trade_execution_link::TradeExecutionLink;
-use crate::vault::VaultRatio;
+use crate::vault::{VaultRatio, VaultService};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CleanedUpExecution {
@@ -616,14 +617,15 @@ async fn mark_execution_as_timed_out(
 /// It prevents positions from sitting idle indefinitely when they've accumulated
 /// enough shares to execute but the triggering trade didn't push them over the threshold.
 #[tracing::instrument(
-    skip(pool, dual_write_context),
+    skip(pool, dual_write_context, vault_service),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
-pub(crate) async fn check_all_accumulated_positions(
+pub(crate) async fn check_all_accumulated_positions<P: Provider + Clone>(
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
     executor_type: SupportedExecutor,
+    vault_service: &VaultService<P>,
 ) -> Result<Vec<OffchainExecution>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
 
@@ -653,9 +655,7 @@ pub(crate) async fn check_all_accumulated_positions(
     for row in candidate_symbols {
         let symbol = Symbol::new(&row.symbol)?;
 
-        // TODO: Fetch per-symbol vault ratio instead of using 1:1.
-        // The periodic checker doesn't yet have access to VaultService.
-        let vault_ratio = VaultRatio::one_to_one();
+        let vault_ratio = vault_service.get_ratio_for_symbol(&symbol).await;
 
         if let Some(execution) = check_symbol_for_execution(
             pool,
@@ -800,6 +800,7 @@ async fn process_symbol_execution(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{FixedBytes, U256, fixed_bytes};
+    use alloy::providers::ProviderBuilder;
     use backon::{ExponentialBuilder, Retryable};
     use chrono::Utc;
     use rust_decimal::Decimal;
@@ -818,6 +819,13 @@ mod tests {
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
     use crate::trade_execution_link::TradeExecutionLink;
+    use crate::vault::WrappedTokenRegistry;
+
+    fn create_test_vault_service() -> VaultService<impl alloy::providers::Provider + Clone> {
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        VaultService::new(provider, WrappedTokenRegistry::empty())
+    }
 
     fn create_test_onchain_trade(symbol: &str, tx_hash_byte: u8) -> OnchainTrade {
         let amount = 1.5;
@@ -2298,10 +2306,14 @@ mod tests {
         assert!(aapl_pending.is_none());
 
         // Run the function - should not create any executions since 0.8 < 1.0
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
         assert_eq!(executions.len(), 0);
 
         // Verify AAPL state unchanged
@@ -2316,10 +2328,14 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         // Run the function on empty database
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         // Should create no executions
         assert_eq!(executions.len(), 0);
@@ -2361,10 +2377,14 @@ mod tests {
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         // Run the function
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         // Should create no executions since AAPL has pending execution
         assert_eq!(executions.len(), 0);
@@ -2648,10 +2668,14 @@ mod tests {
         .await
         .ok();
 
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             executions.len(),
@@ -2731,10 +2755,14 @@ mod tests {
 
         // Now run check_all_accumulated_positions - should NOT create additional
         // executions since there's already a pending one (and net is now 0.5 < 1.0)
-        let executions =
-            check_all_accumulated_positions(&pool, &dual_write_context, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &create_test_vault_service(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             executions.len(),

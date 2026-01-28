@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 
 use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
@@ -423,13 +423,15 @@ where
     })
 }
 
-fn spawn_periodic_accumulated_position_check<E>(
+fn spawn_periodic_accumulated_position_check<E, P>(
     executor: E,
     pool: SqlitePool,
     dual_write_context: DualWriteContext,
+    vault_service: crate::vault::VaultService<P>,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     EventProcessingError: From<E::Error>,
 {
     info!("Starting periodic accumulated position checker");
@@ -443,8 +445,13 @@ where
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) =
-                check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
+            if let Err(e) = check_and_execute_accumulated_positions(
+                &executor,
+                &pool,
+                &dual_write_context,
+                &vault_service,
+            )
+            .await
             {
                 error!("Periodic accumulated position check failed: {e}");
             }
@@ -641,34 +648,6 @@ async fn handle_queue_processing_result<E>(
     }
 }
 
-/// Fetches the VaultRatio for a symbol.
-///
-/// Returns the actual ratio for wrapped tokens, or `VaultRatio::one_to_one()`
-/// for non-wrapped tokens (which leaves values unchanged when applied).
-async fn get_vault_ratio_for_symbol<P: Provider + Clone>(
-    vault_service: &crate::vault::VaultService<P>,
-    symbol: &Symbol,
-) -> crate::vault::VaultRatio {
-    let Some(config) = vault_service.get_config_by_symbol(symbol) else {
-        return crate::vault::VaultRatio::one_to_one();
-    };
-
-    let wrapped_token = config.wrapped_token;
-
-    match vault_service.get_ratio(wrapped_token).await {
-        Ok(ratio) => ratio,
-        Err(e) => {
-            warn!(
-                symbol = %symbol,
-                wrapped_token = %wrapped_token,
-                error = %e,
-                "Failed to fetch VaultRatio, using 1:1 ratio"
-            );
-            crate::vault::VaultRatio::one_to_one()
-        }
-    }
-}
-
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn process_next_queued_event<P: Provider + Clone>(
     executor_type: SupportedExecutor,
@@ -694,7 +673,9 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return handle_filtered_event(pool, &queued_event, event_id).await;
     };
 
-    let vault_ratio = get_vault_ratio_for_symbol(vault_service, trade.symbol.base()).await;
+    let vault_ratio = vault_service
+        .get_ratio_for_symbol(trade.symbol.base())
+        .await;
 
     process_valid_trade(
         executor_type,
@@ -1087,18 +1068,21 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<E>(
+async fn check_and_execute_accumulated_positions<E, P>(
     executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
+    vault_service: &crate::vault::VaultService<P>,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
+    P: Provider + Clone,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
     let executions =
-        check_all_accumulated_positions(pool, dual_write_context, executor_type).await?;
+        check_all_accumulated_positions(pool, dual_write_context, executor_type, vault_service)
+            .await?;
 
     if executions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -2946,9 +2930,19 @@ mod tests {
         let symbol_str =
             setup_accumulated_position_state(&pool, &dual_write_context, &symbol).await;
 
-        check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context)
-            .await
-            .unwrap();
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        let vault_service =
+            crate::vault::VaultService::new(provider, crate::vault::WrappedTokenRegistry::empty());
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            &pool,
+            &dual_write_context,
+            &vault_service,
+        )
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 

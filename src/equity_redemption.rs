@@ -48,6 +48,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
+use tracing::warn;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::tokenized_equity_mint::TokenizationRequestId;
@@ -89,6 +90,17 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to modify a failed redemption operation
     #[error("Already failed")]
     AlreadyFailed,
+    /// Command's symbol/quantity don't match the TokensUnwrapped state
+    #[error(
+        "Mismatched unwrap: expected symbol={expected_symbol} quantity={expected_quantity}, \
+         got symbol={got_symbol} quantity={got_quantity}"
+    )]
+    MismatchedUnwrap {
+        expected_symbol: Symbol,
+        expected_quantity: Decimal,
+        got_symbol: Symbol,
+        got_quantity: Decimal,
+    },
     /// Lifecycle state error
     #[error(transparent)]
     State(#[from] LifecycleError<Never>),
@@ -352,12 +364,23 @@ impl Lifecycle<EquityRedemption, Never> {
                 tx_hash,
                 sent_at: Utc::now(),
             }]),
-            // Send after unwrapping - the symbol/quantity come from the command but
-            // we're transitioning from TokensUnwrapped state
-            Ok(EquityRedemption::TokensUnwrapped { .. }) => {
+            Ok(EquityRedemption::TokensUnwrapped {
+                symbol: unwrapped_symbol,
+                quantity: unwrapped_quantity,
+                ..
+            }) => {
+                if symbol != unwrapped_symbol || quantity != *unwrapped_quantity {
+                    return Err(EquityRedemptionError::MismatchedUnwrap {
+                        expected_symbol: unwrapped_symbol.clone(),
+                        expected_quantity: *unwrapped_quantity,
+                        got_symbol: symbol.clone(),
+                        got_quantity: quantity,
+                    });
+                }
+
                 Ok(vec![EquityRedemptionEvent::TokensSent {
-                    symbol: symbol.clone(),
-                    quantity,
+                    symbol: unwrapped_symbol.clone(),
+                    quantity: *unwrapped_quantity,
                     redemption_wallet,
                     tx_hash,
                     sent_at: Utc::now(),
@@ -543,6 +566,11 @@ impl EquityRedemption {
             ..
         } = self
         else {
+            warn!(
+                state = ?self,
+                event_type = %event.event_type(),
+                "apply_tokens_sent called on non-TokensUnwrapped state"
+            );
             return Err(LifecycleError::Mismatch {
                 state: format!("{self:?}"),
                 event: event.event_type(),

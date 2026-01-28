@@ -176,7 +176,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     .await
     {
         Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, config, pool, stdout).await?;
+            process_found_trade(onchain_trade, config, pool, stdout, provider).await?;
         }
         Ok(None) => {
             writeln!(
@@ -265,11 +265,12 @@ pub(super) async fn execute_broker_order<W: Write>(
     }
 }
 
-pub(super) async fn process_found_trade<W: Write>(
+pub(super) async fn process_found_trade<W: Write, P: Provider + Clone>(
     onchain_trade: OnchainTrade,
     config: &Config,
     pool: &SqlitePool,
     stdout: &mut W,
+    provider: &P,
 ) -> anyhow::Result<()> {
     display_trade_details(&onchain_trade, stdout)?;
 
@@ -285,7 +286,16 @@ pub(super) async fn process_found_trade<W: Write>(
     )
     .await;
 
-    let vault_ratio = crate::vault::VaultRatio::one_to_one();
+    let wrapped_token_registry = config
+        .rebalancing
+        .as_ref()
+        .map(|r| r.wrapped_token_registry.clone())
+        .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
+
+    let vault_service = crate::vault::VaultService::new(provider.clone(), wrapped_token_registry);
+    let vault_ratio = vault_service
+        .get_ratio_for_symbol(onchain_trade.symbol.base())
+        .await;
 
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
