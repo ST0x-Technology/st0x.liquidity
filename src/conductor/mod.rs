@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
@@ -390,7 +390,7 @@ fn spawn_queue_processor<P, E>(
     provider: P,
 ) -> JoinHandle<()>
 where
-    P: Provider + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
@@ -401,6 +401,14 @@ where
     let dual_write_context =
         DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
+    let wrapped_token_registry = config
+        .rebalancing
+        .as_ref()
+        .map(|r| r.wrapped_token_registry.clone())
+        .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
+
+    let vault_service = crate::vault::VaultService::new(provider.clone(), wrapped_token_registry);
+
     tokio::spawn(async move {
         run_queue_processor(
             &executor,
@@ -409,6 +417,7 @@ where
             &cache_clone,
             provider,
             &dual_write_context,
+            &vault_service,
         )
         .await;
     })
@@ -564,6 +573,7 @@ async fn run_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     dual_write_context: &DualWriteContext,
+    vault_service: &crate::vault::VaultService<P>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -586,6 +596,7 @@ async fn run_queue_processor<P, E>(
             &provider,
             &feed_id_cache,
             dual_write_context,
+            vault_service,
         )
         .await;
 
@@ -630,6 +641,34 @@ async fn handle_queue_processing_result<E>(
     }
 }
 
+/// Fetches the VaultRatio for a symbol.
+///
+/// Returns the actual ratio for wrapped tokens, or `VaultRatio::one_to_one()`
+/// for non-wrapped tokens (which leaves values unchanged when applied).
+async fn get_vault_ratio_for_symbol<P: Provider + Clone>(
+    vault_service: &crate::vault::VaultService<P>,
+    symbol: &Symbol,
+) -> crate::vault::VaultRatio {
+    let Some(config) = vault_service.get_config_by_symbol(symbol) else {
+        return crate::vault::VaultRatio::one_to_one();
+    };
+
+    let wrapped_token = config.wrapped_token;
+
+    match vault_service.get_ratio(wrapped_token).await {
+        Ok(ratio) => ratio,
+        Err(e) => {
+            warn!(
+                symbol = %symbol,
+                wrapped_token = %wrapped_token,
+                error = %e,
+                "Failed to fetch VaultRatio, using 1:1 ratio"
+            );
+            crate::vault::VaultRatio::one_to_one()
+        }
+    }
+}
+
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn process_next_queued_event<P: Provider + Clone>(
     executor_type: SupportedExecutor,
@@ -639,6 +678,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     provider: &P,
     feed_id_cache: &FeedIdCache,
     dual_write_context: &DualWriteContext,
+    vault_service: &crate::vault::VaultService<P>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -654,6 +694,8 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return handle_filtered_event(pool, &queued_event, event_id).await;
     };
 
+    let vault_ratio = get_vault_ratio_for_symbol(vault_service, trade.symbol.base()).await;
+
     process_valid_trade(
         executor_type,
         pool,
@@ -661,6 +703,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
         event_id,
         trade,
         dual_write_context,
+        &vault_ratio,
     )
     .await
 }
@@ -752,6 +795,7 @@ async fn process_valid_trade(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
+    vault_ratio: &crate::vault::VaultRatio,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -780,6 +824,7 @@ async fn process_valid_trade(
         event_id,
         trade,
         dual_write_context,
+        vault_ratio,
     )
     .await
 }
@@ -945,6 +990,7 @@ async fn process_trade_within_transaction(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
+    vault_ratio: &crate::vault::VaultRatio,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_initialize_position(dual_write_context, &trade).await;
@@ -968,6 +1014,7 @@ async fn process_trade_within_transaction(
         dual_write_context,
         trade.clone(),
         executor_type,
+        vault_ratio,
     )
     .await
     .inspect_err(|e| {
@@ -1459,6 +1506,7 @@ mod tests {
             .await
             {
                 let dual_write_context = DualWriteContext::new(pool.clone());
+                let vault_ratio = crate::vault::VaultRatio::one_to_one();
 
                 let mut sql_tx = pool.begin().await.unwrap();
                 let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
@@ -1466,6 +1514,7 @@ mod tests {
                     &dual_write_context,
                     trade,
                     SupportedExecutor::DryRun,
+                    &vault_ratio,
                 )
                 .await
                 .unwrap();
@@ -1921,6 +1970,11 @@ mod tests {
 
         let dual_write_context = DualWriteContext::new(pool.clone());
 
+        let vault_service = crate::vault::VaultService::new(
+            provider.clone(),
+            crate::vault::WrappedTokenRegistry::empty(),
+        );
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
@@ -1929,6 +1983,7 @@ mod tests {
             &provider,
             &feed_id_cache,
             &dual_write_context,
+            &vault_service,
         )
         .await;
 
@@ -2743,6 +2798,11 @@ mod tests {
             .await
             .unwrap();
 
+        let vault_service = crate::vault::VaultService::new(
+            provider.clone(),
+            crate::vault::WrappedTokenRegistry::empty(),
+        );
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
@@ -2751,6 +2811,7 @@ mod tests {
             &provider,
             &feed_id_cache,
             &dual_write_context,
+            &vault_service,
         )
         .await;
 
@@ -2791,6 +2852,11 @@ mod tests {
             .await
             .unwrap();
 
+        let vault_service = crate::vault::VaultService::new(
+            provider.clone(),
+            crate::vault::WrappedTokenRegistry::empty(),
+        );
+
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
             &config,
@@ -2799,6 +2865,7 @@ mod tests {
             &provider,
             &feed_id_cache,
             &dual_write_context,
+            &vault_service,
         )
         .await;
 

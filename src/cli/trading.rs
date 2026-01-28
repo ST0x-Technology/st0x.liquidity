@@ -285,12 +285,15 @@ pub(super) async fn process_found_trade<W: Write>(
     )
     .await;
 
+    let vault_ratio = crate::vault::VaultRatio::one_to_one();
+
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
         &dual_write_context,
         onchain_trade,
         config.broker.to_supported_executor(),
+        &vault_ratio,
     )
     .await?;
     sql_tx.commit().await?;

@@ -187,6 +187,9 @@ pub(crate) enum OnChainError {
     Position(#[from] crate::position::PositionError),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] crate::shares::SharesConversionError),
+
+    #[error("Vault ratio error: {0}")]
+    VaultRatio(#[from] crate::vault::VaultRatioError),
 }
 
 impl From<sqlx::Error> for OnChainError {
