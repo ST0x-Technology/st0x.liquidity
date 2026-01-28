@@ -89,7 +89,6 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::shares::HasZero;
 
     #[test]
     fn one_to_one_ratio_converts_identity() {
@@ -155,11 +154,11 @@ mod tests {
     #[test]
     fn fractional_one_to_one_converts_identity() {
         let ratio = VaultRatio::one_to_one();
-        let wrapped = FractionalShares(dec!(100));
+        let wrapped = FractionalShares::new(dec!(100));
 
         let unwrapped = ratio.wrapped_to_unwrapped_fractional(wrapped).unwrap();
 
-        assert_eq!(unwrapped.0, dec!(100));
+        assert_eq!(unwrapped.inner(), dec!(100));
     }
 
     #[test]
@@ -169,10 +168,10 @@ mod tests {
         let ratio = VaultRatio::new(assets_per_share).unwrap();
 
         // 100 wrapped should give 105 unwrapped
-        let wrapped = FractionalShares(dec!(100));
+        let wrapped = FractionalShares::new(dec!(100));
         let unwrapped = ratio.wrapped_to_unwrapped_fractional(wrapped).unwrap();
 
-        assert_eq!(unwrapped.0, dec!(105));
+        assert_eq!(unwrapped.inner(), dec!(105));
     }
 
     #[test]
@@ -182,10 +181,10 @@ mod tests {
         let ratio = VaultRatio::new(assets_per_share).unwrap();
 
         // 50 wrapped should give 100 unwrapped
-        let wrapped = FractionalShares(dec!(50));
+        let wrapped = FractionalShares::new(dec!(50));
         let unwrapped = ratio.wrapped_to_unwrapped_fractional(wrapped).unwrap();
 
-        assert_eq!(unwrapped.0, dec!(100));
+        assert_eq!(unwrapped.inner(), dec!(100));
     }
 
     #[test]
@@ -202,10 +201,10 @@ mod tests {
     #[test]
     fn fractional_conversion_handles_small_values() {
         let ratio = VaultRatio::one_to_one();
-        let wrapped = FractionalShares(Decimal::new(1, 6)); // 0.000001
+        let wrapped = FractionalShares::new(Decimal::new(1, 6)); // 0.000001
 
         let unwrapped = ratio.wrapped_to_unwrapped_fractional(wrapped).unwrap();
 
-        assert_eq!(unwrapped.0, Decimal::new(1, 6));
+        assert_eq!(unwrapped.inner(), Decimal::new(1, 6));
     }
 }
