@@ -25,6 +25,8 @@ pub(crate) enum InventoryViewError {
     Equity(#[from] InventoryError<FractionalShares>),
     #[error(transparent)]
     Usdc(#[from] InventoryError<Usdc>),
+    #[error("failed to convert cash balance cents {0} to USDC")]
+    CashBalanceConversion(i64),
 }
 
 /// Imbalance requiring rebalancing action.
@@ -608,6 +610,56 @@ impl InventoryView {
                 last_updated: now,
                 ..self
             }),
+        }
+    }
+
+    /// Applies an inventory snapshot event to reconcile tracked inventory with fetched actuals.
+    ///
+    /// For each symbol/venue combination, sets `available = max(0, actual - inflight)` to
+    /// match the fetched total while preserving inflight operations.
+    ///
+    /// - `OnchainEquityFetched`: Reconcile onchain equity balances for all fetched symbols.
+    /// - `OnchainCashFetched`: Reconcile onchain USDC balance.
+    /// - `OffchainEquityFetched`: Reconcile offchain equity positions for all fetched symbols.
+    /// - `OffchainCashFetched`: Reconcile offchain cash balance (converted from cents to Usdc).
+    pub(crate) fn apply_snapshot_event(
+        self,
+        event: &InventorySnapshotEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        match event {
+            InventorySnapshotEvent::OnchainEquityFetched { balances, .. } => {
+                balances.iter().try_fold(self, |view, (symbol, actual)| {
+                    view.update_equity(
+                        symbol,
+                        |inventory| inventory.reconcile_onchain(*actual),
+                        now,
+                    )
+                })
+            }
+
+            InventorySnapshotEvent::OnchainCashFetched { usdc_balance, .. } => {
+                self.update_usdc(|inventory| inventory.reconcile_onchain(*usdc_balance), now)
+            }
+
+            InventorySnapshotEvent::OffchainEquityFetched { positions, .. } => {
+                positions.iter().try_fold(self, |view, (symbol, actual)| {
+                    view.update_equity(
+                        symbol,
+                        |inventory| inventory.reconcile_offchain(*actual),
+                        now,
+                    )
+                })
+            }
+
+            InventorySnapshotEvent::OffchainCashFetched {
+                cash_balance_cents, ..
+            } => {
+                let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
+                    InventoryViewError::CashBalanceConversion(*cash_balance_cents),
+                )?;
+                self.update_usdc(|inventory| inventory.reconcile_offchain(usdc), now)
+            }
         }
     }
 }
