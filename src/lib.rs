@@ -169,11 +169,11 @@ async fn run(
                     && matches!(
                         execution_error,
                         ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
-                    )
-                {
-                    warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
-                    tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
-                    continue;
+                    ) {
+                        warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
+                        tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
+                        continue;
+                    }
                 }
 
                 error!("Bot session failed: {error}");
