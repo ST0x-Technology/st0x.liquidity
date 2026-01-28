@@ -140,6 +140,10 @@ impl Executor for MockExecutor {
     async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
         None
     }
+
+    async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
+        Ok(crate::InventoryResult::Unimplemented)
+    }
 }
 
 #[async_trait]

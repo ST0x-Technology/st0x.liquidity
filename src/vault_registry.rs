@@ -51,7 +51,7 @@ pub(crate) struct VaultRegistry {
 impl VaultRegistry {
     /// Creates the aggregate ID from orderbook and owner addresses.
     pub(crate) fn aggregate_id(orderbook: Address, owner: Address) -> String {
-        format!("{}:{}", orderbook, owner)
+        format!("{orderbook}:{owner}")
     }
 
     pub(crate) fn apply_transition(

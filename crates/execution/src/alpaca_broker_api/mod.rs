@@ -1,4 +1,5 @@
 use chrono::{NaiveDate, NaiveTime};
+use rust_decimal::Decimal;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -7,6 +8,7 @@ mod client;
 mod executor;
 mod market_hours;
 mod order;
+mod positions;
 
 pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
@@ -68,4 +70,7 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
+
+    #[error("Cash balance {0} cannot be converted to cents")]
+    CashBalanceConversion(Decimal),
 }

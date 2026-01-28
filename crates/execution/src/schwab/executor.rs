@@ -256,6 +256,10 @@ impl Executor for SchwabExecutor {
 
         Some(handle)
     }
+
+    async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
+        Ok(crate::InventoryResult::Unimplemented)
+    }
 }
 
 #[async_trait]
