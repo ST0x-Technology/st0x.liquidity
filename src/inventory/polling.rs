@@ -4,20 +4,33 @@
 //! inventory balances, then emits InventorySnapshotCommands to record the fetched
 //! values. The InventoryView reacts to these events to reconcile tracked inventory.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
+use cqrs_es::AggregateError;
+use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
-use st0x_execution::Executor;
+use st0x_execution::{Executor, InventoryResult};
 
+use crate::inventory::snapshot::{
+    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
+};
+use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultError, VaultService};
+
+type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum InventoryPollingError {
+pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     Vault(#[from] VaultError),
+    #[error(transparent)]
+    Executor(ExecutorError),
+    #[error(transparent)]
+    Aggregate(#[from] AggregateError<InventorySnapshotError>),
 }
 
 /// Service that polls actual inventory from onchain vaults and offchain brokers.
@@ -59,9 +72,41 @@ where
     /// 2. Queries onchain USDC balance from USDC vault
     /// 3. Queries offchain positions and cash from executor
     /// 4. Emits InventorySnapshot events via corresponding commands
-    pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError> {
-        // TODO: Implement after tests are written
-        todo!()
+    pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<E::Error>> {
+        let aggregate_id = InventorySnapshot::aggregate_id(self.orderbook, self.order_owner);
+        let cqrs = sqlite_cqrs::<InventorySnapshotAggregate>(self.pool.clone(), vec![], ());
+
+        let inventory_result = self
+            .executor
+            .get_inventory()
+            .await
+            .map_err(InventoryPollingError::Executor)?;
+
+        let InventoryResult::Fetched(inventory) = inventory_result else {
+            return Ok(());
+        };
+
+        let positions: BTreeMap<_, _> = inventory
+            .positions
+            .into_iter()
+            .map(|position| (position.symbol, position.quantity))
+            .collect();
+
+        cqrs.execute(
+            &aggregate_id,
+            InventorySnapshotCommand::RecordOffchainEquity { positions },
+        )
+        .await?;
+
+        cqrs.execute(
+            &aggregate_id,
+            InventorySnapshotCommand::RecordOffchainCash {
+                cash_balance_cents: inventory.cash_balance_cents,
+            },
+        )
+        .await?;
+
+        Ok(())
     }
 }
 
