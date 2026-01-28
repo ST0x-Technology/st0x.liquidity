@@ -1,12 +1,16 @@
 use chrono::{NaiveDate, NaiveTime};
+use rust_decimal::Decimal;
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::Symbol;
 
 mod auth;
 mod client;
 mod executor;
 mod market_hours;
 mod order;
+mod positions;
 
 pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
@@ -68,4 +72,19 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
+
+    #[error("Cash balance {0} cannot be converted to cents")]
+    CashBalanceConversion(Decimal),
+
+    #[error("Cash balance {0} has fractional cents after conversion")]
+    FractionalCents(Decimal),
+
+    #[error("Invalid symbol in position: {0}")]
+    InvalidSymbol(#[from] crate::EmptySymbolError),
+
+    #[error("Market value conversion failed for symbol {symbol}: {market_value:?}")]
+    MarketValueConversion {
+        symbol: Symbol,
+        market_value: Option<Decimal>,
+    },
 }

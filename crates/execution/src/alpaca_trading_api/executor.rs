@@ -98,6 +98,10 @@ impl Executor for AlpacaTradingApi {
         // Alpaca uses API keys, no token refresh needed
         None
     }
+
+    async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
+        Ok(crate::InventoryResult::Unimplemented)
+    }
 }
 
 #[async_trait]

@@ -3,6 +3,7 @@
 
 use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
+use cqrs_es::AggregateError;
 use rain_math_float::FloatError;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
@@ -10,11 +11,12 @@ use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
     EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
-    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive,
+    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive, Symbol,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::env::ConfigError;
+use crate::vault_registry::VaultRegistryError;
 
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +134,10 @@ pub(crate) enum EventProcessingError {
     EmptySymbol(#[from] EmptySymbolError),
     #[error("Config error: {0}")]
     Config(#[from] ConfigError),
+    #[error("Token address not found in cache for symbol: {0}")]
+    TokenNotInCache(Symbol),
+    #[error("Vault registry command failed: {0}")]
+    VaultRegistry(#[from] AggregateError<VaultRegistryError>),
 }
 
 /// Order polling errors for order status monitoring.

@@ -69,6 +69,16 @@ pub trait Executor: Send + Sync + 'static {
     /// Tasks should run indefinitely and be aborted by the caller when shutdown is needed
     /// Errors are logged inside the task and do not propagate to the caller
     async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>>;
+
+    /// Fetches current inventory (positions and cash balance) from the broker.
+    ///
+    /// Returns `InventoryResult::Unimplemented` if not implemented for the executor.
+    /// Returns `InventoryResult::Fetched(Inventory)` on success.
+    //
+    // NOTE: InventoryResult::Unimplemented is a workaround. This method is needed
+    // for auto-rebalancing but not all executors support auto-rebalancing, so
+    // implementing the method for non-auto-rebalancing executors is lower priority
+    async fn get_inventory(&self) -> Result<InventoryResult, Self::Error>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -79,7 +89,7 @@ pub struct EmptySymbolError;
 ///
 /// Ensures symbols are non-empty and provides type safety to prevent
 /// mixing symbols with other string types.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub struct Symbol(String);
 
 impl Symbol {
@@ -521,6 +531,37 @@ impl std::str::FromStr for Direction {
             _ => Err(InvalidDirectionError(s.to_string())),
         }
     }
+}
+
+/// An equity position with symbol, quantity, and optional market value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquityPosition {
+    pub symbol: Symbol,
+    pub quantity: FractionalShares,
+    pub market_value_cents: Option<i64>,
+}
+
+/// Account state from the broker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inventory {
+    pub positions: Vec<EquityPosition>,
+    pub cash_balance_cents: i64,
+}
+
+/// Result of fetching inventory from an executor.
+///
+/// Custom enum to force explicit handling. Unlike `Option` which is easy to `.unwrap()`,
+/// this type requires callers to explicitly match on the `Unimplemented` variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InventoryResult {
+    /// Fetching inventory is unimplemented for this executor.
+    ///
+    /// This is a workaround. We need to fetch inventory for auto-rebalancing
+    /// but not all executors support auto-rebalancing, so implementing the
+    /// method for non-auto-rebalancing executors is lower priority
+    Unimplemented,
+    /// Successfully fetched inventory.
+    Fetched(Inventory),
 }
 
 #[derive(Debug, thiserror::Error)]

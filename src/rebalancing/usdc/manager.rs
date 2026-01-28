@@ -500,7 +500,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
-                    actual_amount: u256_to_usdc(mint_receipt.amount)?,
+                    amount_received: u256_to_usdc(mint_receipt.amount)?,
                     fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
                 },
             )
@@ -600,8 +600,8 @@ where
             .await?;
 
         // Convert deposited USDC to USD buying power using actual received amount
-        let actual_amount = u256_to_usdc(mint_receipt.amount)?;
-        self.execute_usdc_to_usd_conversion(id, actual_amount)
+        let amount_received = u256_to_usdc(mint_receipt.amount)?;
+        self.execute_usdc_to_usd_conversion(id, amount_received)
             .await?;
 
         info!("Base to Alpaca rebalance completed successfully");
@@ -761,7 +761,7 @@ where
                 &id.0,
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
-                    actual_amount: u256_to_usdc(mint_receipt.amount)?,
+                    amount_received: u256_to_usdc(mint_receipt.amount)?,
                     fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
                 },
             )
@@ -997,7 +997,7 @@ mod tests {
             &id.0,
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
-                actual_amount: Usdc(dec!(99.99)),
+                amount_received: Usdc(dec!(99.99)),
                 fee_collected: Usdc(dec!(0.01)),
             },
         )
@@ -1745,7 +1745,7 @@ mod tests {
             &id.0,
             UsdcRebalanceCommand::ConfirmBridging {
                 mint_tx,
-                actual_amount: Usdc(dec!(99.99)),
+                amount_received: Usdc(dec!(99.99)),
                 fee_collected: Usdc(dec!(0.01)),
             },
         )

@@ -39,6 +39,7 @@ mod threshold;
 mod tokenized_equity_mint;
 mod trade_execution_link;
 mod usdc_rebalance;
+mod vault_registry;
 
 pub use dashboard::export_bindings;
 pub use telemetry::{TelemetryError, TelemetryGuard};
