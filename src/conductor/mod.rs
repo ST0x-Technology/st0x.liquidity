@@ -18,8 +18,9 @@ use tracing::{debug, error, info, trace};
 use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
+use crate::cctp::USDC_BASE;
 use crate::dashboard::ServerMessage;
-use crate::dual_write::DualWriteContext;
+use crate::dual_write::{DualWriteContext, discover_vaults_from_trade};
 use crate::env::{BrokerConfig, Config};
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::InventoryPollingService;

@@ -152,6 +152,12 @@ impl Executor for MockExecutor {
     }
 
     async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+        if self.should_fail {
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
+            });
+        }
+
         Ok(self.inventory_result.clone())
     }
 }
@@ -335,6 +341,16 @@ mod tests {
                 panic!("Expected Fetched, got Unimplemented")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn get_inventory_returns_error_when_should_fail() {
+        let executor = MockExecutor::with_failure("Inventory fetch failed");
+
+        assert!(matches!(
+            executor.get_inventory().await.unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "Inventory fetch failed"
+        ));
     }
 
     #[tokio::test]

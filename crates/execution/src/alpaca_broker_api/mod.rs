@@ -73,4 +73,16 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Cash balance {0} cannot be converted to cents")]
     CashBalanceConversion(Decimal),
+
+    #[error("Cash balance {0} has fractional cents after conversion")]
+    FractionalCents(Decimal),
+
+    #[error("Invalid symbol in position: {0}")]
+    InvalidSymbol(#[from] crate::EmptySymbolError),
+
+    #[error("Market value conversion failed for symbol {symbol}: {market_value:?}")]
+    MarketValueConversion {
+        symbol: String,
+        market_value: Option<Decimal>,
+    },
 }

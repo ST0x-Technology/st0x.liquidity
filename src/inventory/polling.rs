@@ -21,6 +21,7 @@ use futures_util::future::try_join_all;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
+use tracing::debug;
 
 type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
@@ -103,6 +104,7 @@ where
         let vault_registry = self.load_vault_registry().await?;
 
         let Some(registry) = vault_registry else {
+            debug!("Vault registry not initialized, skipping onchain polling");
             return Ok(());
         };
 
@@ -140,6 +142,7 @@ where
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         if registry.equity_vaults.is_empty() {
+            debug!("No equity vaults discovered, skipping onchain equity polling");
             return Ok(());
         }
 
@@ -185,6 +188,7 @@ where
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let Some(usdc_vault) = &registry.usdc_vault else {
+            debug!("No USDC vault discovered, skipping onchain cash polling");
             return Ok(());
         };
 
@@ -215,6 +219,7 @@ where
             .map_err(InventoryPollingError::Executor)?;
 
         let InventoryResult::Fetched(inventory) = inventory_result else {
+            debug!("Executor returned non-fetched inventory result, skipping offchain polling");
             return Ok(());
         };
 

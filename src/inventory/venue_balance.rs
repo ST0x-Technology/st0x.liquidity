@@ -167,18 +167,21 @@ where
 
     /// Reconcile available balance based on actual fetched total.
     ///
-    /// Sets `available = max(0, actual_total - inflight)` to match the fetched total
-    /// while preserving inflight operations. If actual_total < inflight, available
-    /// becomes zero (we can't have negative available).
+    /// Sets `available = actual_total - inflight` to match the fetched total
+    /// while preserving inflight operations. Returns an error if actual_total < inflight,
+    /// since that indicates an integrity violation that callers must handle.
     pub(super) fn reconcile_from_actual(self, actual_total: T) -> Result<Self, InventoryError<T>> {
         let new_available = (actual_total - self.inflight)?;
 
+        if new_available.is_negative() {
+            return Err(InventoryError::ActualExceedsInflight {
+                actual: actual_total,
+                inflight: self.inflight,
+            });
+        }
+
         Ok(Self {
-            available: if new_available.is_negative() {
-                T::ZERO
-            } else {
-                new_available
-            },
+            available: new_available,
             inflight: self.inflight,
         })
     }
@@ -357,17 +360,16 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_from_actual_sets_available_to_zero_when_actual_less_than_inflight() {
+    fn reconcile_from_actual_returns_error_when_actual_less_than_inflight() {
         // tracked: available=90, inflight=10
-        // actual: 5 (less than inflight)
-        // new_available should be 0 (can't be negative)
-        let b = equity_balance(90, 10);
+        // actual: 5 (less than inflight) -> integrity violation
+        let balance = equity_balance(90, 10);
         let actual = FractionalShares::new(Decimal::from(5));
 
-        let result = b.reconcile_from_actual(actual).unwrap();
-
-        assert_eq!(result.available().inner(), Decimal::ZERO);
-        assert_eq!(result.inflight().inner(), Decimal::from(10));
+        assert!(matches!(
+            balance.reconcile_from_actual(actual).unwrap_err(),
+            InventoryError::ActualExceedsInflight { .. }
+        ));
     }
 
     #[test]
