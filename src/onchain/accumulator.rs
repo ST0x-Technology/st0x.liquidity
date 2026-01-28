@@ -2799,6 +2799,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: 0.5,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
@@ -2843,6 +2844,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: 1.5,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
@@ -2912,6 +2914,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: 0.3,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)
@@ -2967,6 +2970,7 @@ mod tests {
             pyth_confidence: None,
             pyth_exponent: None,
             pyth_publish_time: None,
+            underlying_amount: 1.5,
         };
 
         crate::dual_write::acknowledge_onchain_fill(&dual_write_context, &trade)

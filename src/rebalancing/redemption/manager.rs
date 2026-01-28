@@ -128,7 +128,7 @@ where
                 &aggregate_id.0,
                 EquityRedemptionCommand::UnwrapTokens {
                     symbol: symbol.clone(),
-                    quantity: quantity.0,
+                    quantity: quantity.inner(),
                     wrapped_amount: amount,
                     unwrap_tx_hash,
                     unwrapped_amount,
