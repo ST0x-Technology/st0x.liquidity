@@ -1,9 +1,12 @@
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::OrderStatus;
-use crate::{Direction, ExecutionError, Shares, SupportedExecutor, Symbol};
+use crate::ExecutionError;
+#[cfg(feature = "dual-write")]
+use crate::{Direction, Shares, SupportedExecutor, Symbol};
 
 /// Database fields extracted from OrderState for storage
+#[cfg(feature = "dual-write")]
 #[derive(Debug)]
 pub(crate) struct OrderStateDbFields {
     pub(crate) order_id: Option<String>,
