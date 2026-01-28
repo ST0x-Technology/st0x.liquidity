@@ -8,12 +8,11 @@ mod cache;
 mod config;
 mod ratio;
 
-use std::collections::HashSet;
-use std::sync::RwLock;
-
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolEvent;
+use std::collections::HashSet;
+use std::sync::RwLock;
 
 use crate::bindings::{IERC20, IERC4626};
 

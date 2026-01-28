@@ -324,6 +324,26 @@ impl FractionalShares {
 
         Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
     }
+
+    /// Creates FractionalShares from a U256 value with 18 decimal places.
+    ///
+    /// Divides by 10^18 to convert from raw token units to decimal shares.
+    pub fn from_u256_18_decimals(value: U256) -> Result<Self, SharesConversionError> {
+        use std::str::FromStr;
+
+        if value.is_zero() {
+            return Ok(Self::ZERO);
+        }
+
+        let raw_str = value.to_string();
+        let raw_decimal =
+            Decimal::from_str(&raw_str).map_err(|_| SharesConversionError::Overflow)?;
+
+        raw_decimal
+            .checked_div(TOKENIZED_EQUITY_SCALE)
+            .map(Self)
+            .ok_or(SharesConversionError::Overflow)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
