@@ -1,17 +1,17 @@
-{ pkgs, rustPlatform, sol-build-inputs, sqlx-cli, repoUrl, self }:
+{ pkgs, rustPlatform, sqlx-cli }:
 
 let
-  src = builtins.fetchGit {
-    url = repoUrl;
-    inherit (self) rev;
-    submodules = true;
-    shallow = true;
+  # Requires --impure. Submodules must be checked out and prepSolArtifacts
+  # must have been run before building.
+  libDir = builtins.path {
+    path = builtins.getEnv "PWD" + "/lib";
+    name = "lib";
   };
 in rustPlatform.buildRustPackage {
   pname = "st0x-liquidity";
   version = "0.1.0";
 
-  inherit src;
+  src = ../.;
 
   cargoLock = {
     lockFile = ../Cargo.lock;
@@ -24,29 +24,24 @@ in rustPlatform.buildRustPackage {
     };
   };
 
-  nativeBuildInputs = sol-build-inputs ++ [ sqlx-cli pkgs.pkg-config ];
+  nativeBuildInputs = [ sqlx-cli pkgs.pkg-config ];
 
   buildInputs = [ pkgs.openssl pkgs.sqlite ]
     ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
     [ pkgs.apple-sdk_15 ];
 
   preBuild = ''
-    set -euxo pipefail
-
-    # lib/ comes from the Nix store (read-only). Copy to writable location
-    # and replace with the writable copy so forge can write build artifacts.
-    cp -r lib "$TMPDIR/lib"
+    set -eo pipefail
     rm -rf lib
-    mv "$TMPDIR/lib" lib
-
-    (cd lib/rain.orderbook/ && forge build)
-    (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
-    (cd lib/forge-std/ && forge build)
-    (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
+    ln -s ${libDir} lib
 
     export DATABASE_URL="sqlite:$TMPDIR/build.db"
     sqlx db create
     sqlx migrate run --source migrations
+
+    # sqlite-es uses sqlx::migrate!("../../migrations") relative to its
+    # vendored source. Place our migrations where it expects them.
+    ln -sf "$(pwd)/migrations" "$NIX_BUILD_TOP/migrations"
   '';
 
   cargoBuildFlags = [ "--bin" "server" ];
