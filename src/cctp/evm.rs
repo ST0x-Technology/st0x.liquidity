@@ -1,16 +1,17 @@
 //! Single-chain CCTP operations.
 
-use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolEvent;
-use tracing::info;
+use tracing::{info, trace};
 
 use super::{
     BridgeDirection, BurnReceipt, CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2,
-    TokenMessengerV2,
+    MintReceipt, TokenMessengerV2,
 };
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 
 /// EVM chain connection with contract instances for CCTP operations.
 pub(crate) struct Evm<P>
@@ -25,6 +26,9 @@ where
     token_messenger: TokenMessengerV2::TokenMessengerV2Instance<P>,
     /// MessageTransmitterV2 contract instance for CCTP mints
     message_transmitter: MessageTransmitterV2::MessageTransmitterV2Instance<P>,
+    /// Number of confirmations to wait for approval transactions.
+    /// Higher values help with load-balanced RPC providers like dRPC.
+    required_confirmations: u64,
 }
 
 impl<P> Evm<P>
@@ -35,6 +39,9 @@ where
     ///
     /// The `owner` address should be the account that will sign transactions
     /// (typically obtained from a signer via `.address()`).
+    ///
+    /// Uses 3 confirmations by default for approval transactions to handle
+    /// load-balanced RPC providers. Use `with_required_confirmations` to override.
     pub(crate) fn new(
         provider: P,
         owner: Address,
@@ -47,20 +54,35 @@ where
             usdc: IERC20::new(usdc, provider.clone()),
             token_messenger: TokenMessengerV2::new(token_messenger, provider.clone()),
             message_transmitter: MessageTransmitterV2::new(message_transmitter, provider),
+            required_confirmations: REQUIRED_CONFIRMATIONS,
         }
+    }
+
+    /// Sets the number of confirmations to wait for approval transactions.
+    #[cfg(test)]
+    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
+        self.required_confirmations = confirmations;
+        self
     }
 
     pub(super) async fn ensure_usdc_approval(&self, amount: U256) -> Result<(), CctpError> {
         let spender = *self.token_messenger.address();
-
         let allowance = self.usdc.allowance(self.owner, spender).call().await?;
+
+        trace!(%allowance, %amount, "Checking USDC allowance");
 
         if allowance < amount {
             let pending = match self.usdc.approve(spender, amount).send().await {
                 Ok(pending) => pending,
                 Err(e) => return Err(handle_contract_error(e).await),
             };
-            pending.get_receipt().await?;
+
+            // Wait for multiple confirmations to ensure state propagates across
+            // load-balanced RPC nodes before the subsequent burn transaction
+            pending
+                .with_required_confirmations(self.required_confirmations)
+                .get_receipt()
+                .await?;
         }
 
         Ok(())
@@ -117,11 +139,15 @@ where
     }
 
     /// Claims USDC on this chain by submitting the attestation.
+    ///
+    /// Parses the `MintAndWithdraw` event from the transaction receipt to extract
+    /// the actual minted amount and fee collected. This is the source of truth
+    /// for what the recipient actually received.
     pub(super) async fn claim(
         &self,
         message: Bytes,
         attestation: Bytes,
-    ) -> Result<TxHash, CctpError> {
+    ) -> Result<MintReceipt, CctpError> {
         let pending = match self
             .message_transmitter
             .receiveMessage(message, attestation)
@@ -134,7 +160,24 @@ where
 
         let receipt = pending.get_receipt().await?;
 
-        Ok(receipt.transaction_hash)
+        let mint_event = receipt
+            .inner
+            .logs()
+            .iter()
+            .find_map(|log| TokenMessengerV2::MintAndWithdraw::decode_log(log.as_ref()).ok())
+            .ok_or(CctpError::MintAndWithdrawEventNotFound)?;
+
+        info!(
+            amount = %mint_event.amount,
+            fee_collected = %mint_event.feeCollected,
+            "Parsed MintAndWithdraw event"
+        );
+
+        Ok(MintReceipt {
+            tx: receipt.transaction_hash,
+            amount: mint_event.amount,
+            fee_collected: mint_event.feeCollected,
+        })
     }
 
     #[cfg(test)]

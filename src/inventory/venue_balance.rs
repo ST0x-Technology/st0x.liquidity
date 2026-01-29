@@ -3,6 +3,7 @@
 use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::shares::{ArithmeticError, HasZero};
 
@@ -26,6 +27,10 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
+    #[error(
+        "amount received {amount_received:?} exceeds amount sent {amount_sent:?} (fees cannot be negative)"
+    )]
+    NegativeFee { amount_sent: T, amount_received: T },
     #[error(transparent)]
     Arithmetic(#[from] ArithmeticError<T>),
 }
@@ -75,7 +80,8 @@ where
     T: Add<Output = Result<T, ArithmeticError<T>>>
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy
-        + HasZero,
+        + HasZero
+        + std::fmt::Debug,
 {
     pub(super) fn has_inflight(self) -> bool {
         !self.inflight.is_zero()
@@ -162,6 +168,27 @@ where
             inflight: self.inflight,
         })
     }
+
+    /// Apply a fetched venue snapshot to reconcile tracked balance.
+    ///
+    /// When inflight is zero, sets `available = snapshot_balance` to match reality.
+    /// When inflight is non-zero, returns self unchanged - we cannot safely reconcile
+    /// while transfers are in progress because the snapshot alone cannot distinguish
+    /// between "transfer completed" vs "unrelated inventory change".
+    pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Self {
+        if !self.inflight.is_zero() {
+            debug!(
+                inflight = ?self.inflight,
+                "Skipping snapshot reconciliation due to non-zero inflight"
+            );
+            return self;
+        }
+
+        Self {
+            available: snapshot_balance,
+            inflight: self.inflight,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -174,8 +201,8 @@ mod tests {
 
     fn equity_balance(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
         VenueBalance::new(
-            FractionalShares(Decimal::from(available)),
-            FractionalShares(Decimal::from(inflight)),
+            FractionalShares::new(Decimal::from(available)),
+            FractionalShares::new(Decimal::from(inflight)),
         )
     }
 
@@ -189,7 +216,7 @@ mod tests {
     #[test]
     fn total_sums_available_and_inflight() {
         let b = equity_balance(100, 50);
-        assert_eq!(b.total().unwrap().0, Decimal::from(150));
+        assert_eq!(b.total().unwrap().inner(), Decimal::from(150));
     }
 
     #[test]
@@ -207,18 +234,18 @@ mod tests {
     #[test]
     fn move_to_inflight_transfers_from_available() {
         let b = equity_balance(100, 0);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.move_to_inflight(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(70));
-        assert_eq!(result.inflight().0, Decimal::from(30));
+        assert_eq!(result.available().inner(), Decimal::from(70));
+        assert_eq!(result.inflight().inner(), Decimal::from(30));
     }
 
     #[test]
     fn move_to_inflight_fails_when_insufficient() {
         let b = equity_balance(10, 0);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.move_to_inflight(amount);
 
@@ -231,18 +258,18 @@ mod tests {
     #[test]
     fn confirm_inflight_removes_from_inflight() {
         let b = equity_balance(100, 50);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.confirm_inflight(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(100));
-        assert_eq!(result.inflight().0, Decimal::from(20));
+        assert_eq!(result.available().inner(), Decimal::from(100));
+        assert_eq!(result.inflight().inner(), Decimal::from(20));
     }
 
     #[test]
     fn confirm_inflight_fails_when_insufficient() {
         let b = equity_balance(100, 10);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.confirm_inflight(amount);
 
@@ -255,18 +282,18 @@ mod tests {
     #[test]
     fn cancel_inflight_returns_to_available() {
         let b = equity_balance(100, 50);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.cancel_inflight(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(130));
-        assert_eq!(result.inflight().0, Decimal::from(20));
+        assert_eq!(result.available().inner(), Decimal::from(130));
+        assert_eq!(result.inflight().inner(), Decimal::from(20));
     }
 
     #[test]
     fn cancel_inflight_fails_when_insufficient() {
         let b = equity_balance(100, 10);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.cancel_inflight(amount);
 
@@ -279,29 +306,29 @@ mod tests {
     #[test]
     fn add_available_increases_available() {
         let b = equity_balance(100, 50);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.add_available(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(130));
-        assert_eq!(result.inflight().0, Decimal::from(50));
+        assert_eq!(result.available().inner(), Decimal::from(130));
+        assert_eq!(result.inflight().inner(), Decimal::from(50));
     }
 
     #[test]
     fn remove_available_decreases_available() {
         let b = equity_balance(100, 50);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.remove_available(amount).unwrap();
 
-        assert_eq!(result.available().0, Decimal::from(70));
-        assert_eq!(result.inflight().0, Decimal::from(50));
+        assert_eq!(result.available().inner(), Decimal::from(70));
+        assert_eq!(result.inflight().inner(), Decimal::from(50));
     }
 
     #[test]
     fn remove_available_fails_when_insufficient() {
         let b = equity_balance(10, 50);
-        let amount = FractionalShares(Decimal::from(30));
+        let amount = FractionalShares::new(Decimal::from(30));
 
         let result = b.remove_available(amount);
 
@@ -320,5 +347,39 @@ mod tests {
 
         assert_eq!(result.available().0, Decimal::from(70));
         assert_eq!(result.inflight().0, Decimal::from(30));
+    }
+
+    #[test]
+    fn apply_snapshot_skips_when_inflight_nonzero() {
+        let balance = equity_balance(90, 10);
+        let snapshot_balance = FractionalShares::new(Decimal::from(95));
+
+        let result = balance.apply_snapshot(snapshot_balance);
+
+        // Balance unchanged when inflight is non-zero
+        assert_eq!(result.available().inner(), Decimal::from(90));
+        assert_eq!(result.inflight().inner(), Decimal::from(10));
+    }
+
+    #[test]
+    fn apply_snapshot_sets_available_when_inflight_zero() {
+        let balance = equity_balance(100, 0);
+        let snapshot_balance = FractionalShares::new(Decimal::from(75));
+
+        let result = balance.apply_snapshot(snapshot_balance);
+
+        assert_eq!(result.available().inner(), Decimal::from(75));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn apply_snapshot_works_with_usdc_when_inflight_zero() {
+        let balance = usdc_balance(1000, 0);
+        let snapshot_balance = Usdc(Decimal::from(950));
+
+        let result = balance.apply_snapshot(snapshot_balance);
+
+        assert_eq!(result.available().0, Decimal::from(950));
+        assert_eq!(result.inflight().0, Decimal::ZERO);
     }
 }

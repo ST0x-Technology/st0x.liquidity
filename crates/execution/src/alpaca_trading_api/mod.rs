@@ -26,8 +26,14 @@ pub enum AlpacaTradingApiError {
     MarketHours(#[from] MarketHoursError),
     #[error("Invalid order ID: {0}")]
     InvalidOrderId(#[from] uuid::Error),
-    #[error("Invalid order: {0}")]
-    InvalidOrder(String),
+    #[error("Empty symbol")]
+    EmptySymbol(#[from] crate::EmptySymbolError),
+    #[error("Invalid shares: {0}")]
+    InvalidShares(#[from] crate::InvalidSharesError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
+    #[error("Num parse error: {0}")]
+    NumParse(#[from] num_decimal::ParseNumError),
     #[error("Parse error: {0}")]
     ParseFloat(#[from] std::num::ParseFloatError),
     #[error("Parse error: {0}")]

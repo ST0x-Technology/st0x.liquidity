@@ -72,6 +72,9 @@ opentelemetry-otlp = "0.30.0"
 tracing-opentelemetry = "0.31.0"
 proptest = "1.7.0"
 rust_decimal = { version = "1.38.0", features = ["serde"] }
+num-decimal = { version = "0.2.5", default-features = false, features = [
+  "num-v04",
+] }
 
 [package]
 name = "st0x-hedge"
@@ -123,15 +126,16 @@ ts-rs = { version = "11.1.0", features = [
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
+rust_decimal_macros = "1.38.0"
 
 [dev-dependencies]
 httpmock.workspace = true
 serial_test.workspace = true
-rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
 st0x-execution = { path = "crates/execution", features = ["mock"] }
+tracing-test = "0.2.5"
 
 [[bin]]
 name = "migrate_to_events"

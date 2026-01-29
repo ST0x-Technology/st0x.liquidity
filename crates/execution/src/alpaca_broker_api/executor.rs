@@ -105,6 +105,11 @@ impl Executor for AlpacaBrokerApi {
         // Alpaca uses API keys, no token refresh needed
         None
     }
+
+    async fn get_inventory(&self) -> Result<crate::InventoryResult, Self::Error> {
+        let inventory = super::positions::fetch_inventory(&self.client).await?;
+        Ok(crate::InventoryResult::Fetched(inventory))
+    }
 }
 
 #[async_trait]
@@ -237,8 +242,8 @@ mod tests {
                 .json_body(json!([
                     {
                         "date": today_str,
-                        "open": "0000",
-                        "close": "2359"
+                        "open": "00:00",
+                        "close": "23:59"
                     }
                 ]));
         });
@@ -321,5 +326,55 @@ mod tests {
         let result = executor.run_executor_maintenance().await;
 
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_inventory_returns_fetched() {
+        let server = MockServer::start();
+        let config = create_test_config(&server.base_url());
+
+        // Mock account endpoint with all fields needed for both verify_account and fetch_inventory
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "status": "ACTIVE",
+                    "cash": "25000.00"
+                }));
+        });
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": "10.0",
+                        "market_value": "1500.00"
+                    }
+                ]));
+        });
+
+        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+
+        let result = executor.get_inventory().await.unwrap();
+
+        account_mock.assert_hits(2); // Once for verify, once for fetch_inventory
+        positions_mock.assert();
+
+        match result {
+            crate::InventoryResult::Fetched(inventory) => {
+                assert_eq!(inventory.positions.len(), 1);
+                assert_eq!(inventory.cash_balance_cents, 2_500_000);
+            }
+            crate::InventoryResult::Unimplemented => {
+                panic!("Expected Fetched, got Unimplemented");
+            }
+        }
     }
 }

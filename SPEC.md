@@ -27,7 +27,7 @@ and the system proves market fit.
 
 ### System Components
 
-**Onchain Infrastructure:**
+#### Onchain Infrastructure
 
 - Raindex orderbook with deployed Orders from specific owner using Pyth oracle
   feeds
@@ -35,19 +35,19 @@ and the system proves market fit.
     at Pyth price ± spread
 - Order vaults holding stablecoins and tokenized equities
 
-**Offchain Infrastructure:**
+#### Offchain Infrastructure
 
 - Brokerage account with API access (Charles Schwab or Alpaca Markets)
 - Arbitrage bot monitoring and execution engine
 - Basic terminal/logging interface for system overview
 
-**Bridge Infrastructure:**
+#### Bridge Infrastructure
 
 - st0x bridge for offchain ↔ onchain asset movement
 
 ### Operational Flow
 
-**Normal Operation Cycle:**
+#### Normal Operation Cycle
 
 1. Orders continuously offer to buy/sell tokenized equities at Pyth price ±
    spread
@@ -63,7 +63,7 @@ and the system proves market fit.
 5. Bot maintains running inventory of positions across both venues
 6. Periodic rebalancing via st0x bridge to normalize inventory levels
 
-**Note on Fractional Share Handling:**
+#### Note on Fractional Share Handling
 
 - **Charles Schwab**: Does not support fractional shares via their API. Batching
   to whole shares is required (as described above).
@@ -81,9 +81,9 @@ Example (Offchain Batching):
 - Continue accumulating fractional amount until next whole share threshold is
   reached
 
-**Rebalancing Process:**
+#### Rebalancing Process
 
-**Alpaca (Automated):**
+##### Alpaca (Automated)
 
 - **Inventory Monitoring**: InventoryView tracks total inventory across venues
   (onchain tokens + offchain shares, onchain USDC + offchain USDC)
@@ -102,7 +102,7 @@ Example (Offchain Batching):
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
   cross-chain USDC transfers
 
-**Schwab (Manual):**
+##### Schwab (Manual)
 
 - Rebalancing for Schwab-based operations remains manual
 - Monitor inventory drift over time
@@ -116,7 +116,7 @@ excellent async ecosystem for handling concurrent trading flows.
 
 ### Event Monitoring
 
-**Raindex Event Monitor:**
+#### Raindex Event Monitor
 
 - WebSocket or polling connection to Ethereum node
 - Filter for events involving any orders from the arbitrageur's owner address
@@ -125,7 +125,7 @@ excellent async ecosystem for handling concurrent trading flows.
 - Generate unique identifiers using transaction hash and log index for trade
   tracking
 
-**Event-Driven Async Architecture:**
+#### Event-Driven Async Architecture
 
 - Each blockchain event spawns an independent async execution flow using Rust's
   async/await
@@ -141,11 +141,11 @@ excellent async ecosystem for handling concurrent trading flows.
 
 ### Trade Execution
 
-**Broker API Integration:**
+#### Broker API Integration
 
 The bot supports multiple brokers through a unified trait interface:
 
-**Charles Schwab:**
+##### Charles Schwab
 
 - OAuth 2.0 authentication flow with token refresh
 - Connection pooling and retry logic for API calls with exponential backoff
@@ -153,7 +153,7 @@ The bot supports multiple brokers through a unified trait interface:
 - Market order execution for immediate fills
 - Order status tracking and confirmation with polling
 
-**Alpaca Markets:**
+##### Alpaca Markets
 
 - API key-based authentication (simpler than OAuth)
 - Market order execution through Alpaca Trading API v2
@@ -162,7 +162,7 @@ The bot supports multiple brokers through a unified trait interface:
 - Position querying for inventory management
 - Account balance monitoring for available capital
 
-**Idempotency Controls:**
+#### Idempotency Controls
 
 - Event queue table to track all events with unique (transaction_hash,
   log_index) keys prevents duplicate processing
@@ -176,7 +176,7 @@ The bot supports multiple brokers through a unified trait interface:
 
 ### Trade Tracking and Reporting
 
-**SQLite Trade Database:**
+#### SQLite Trade Database
 
 The bot uses a multi-table SQLite database to track trades and manage state. Key
 tables include: onchain trade records, broker execution tracking, position
@@ -193,7 +193,7 @@ defined in `migrations/20250703115746_trades.sql`.
 - Maintain complete audit trail linking onchain trades to broker executions
 - Handle concurrent database writes safely with per-symbol locking
 
-**Pyth Price Extraction:**
+#### Pyth Price Extraction
 
 - Extracts exact oracle prices used during trade execution from transaction
   traces
@@ -206,7 +206,7 @@ defined in `migrations/20250703115746_trades.sql`.
 - CLI command for testing: `cargo run --bin cli get-pyth-price <TX_HASH>`
 - Trade processing continues normally even if price extraction fails
 
-**Reporting and Analysis:**
+#### Reporting and Analysis
 
 - Calculate profit/loss for each trade pair using actual executed amounts
 - Generate running totals and performance reports over time
@@ -621,7 +621,7 @@ The current implementation provides some auditability through `onchain_trades`,
 `schwab_executions`, and `trade_execution_links`. However, these tables are
 mutable and don't form a complete event log:
 
-**Current Limitations:**
+#### Current Limitations
 
 - **Mutable state**: Tables can be updated/deleted, losing history of state
   transitions (e.g., `schwab_executions.status` transitions from PENDING ->
@@ -637,7 +637,7 @@ mutable and don't form a complete event log:
   execute, how to batch) are scattered across functions - hard to test in
   isolation
 
-**Event Sourcing Improvements:**
+#### Event Sourcing Improvements
 
 Events ARE immutable facts, but the current system only captures some facts
 (trades executed, final execution state) while losing others (when thresholds
@@ -669,7 +669,7 @@ an event-sourced architecture through **three independently deployable phases**.
 
 **Before**: Multiple mutable state tables with potential contradictions
 
-**After**:
+#### After
 
 - **Event Store**: Immutable append-only log (single source of truth)
 - **Snapshots**: Performance optimization for aggregate reconstruction
@@ -687,7 +687,7 @@ queries and improving performance.
 **Goal**: Run CQRS/ES alongside existing system to validate correctness before
 cutting over.
 
-**Implementation**:
+##### Implementation
 
 - Implement event sourcing infrastructure (sqlite-es integration)
 - Create event store and view tables via migrations
@@ -699,7 +699,7 @@ cutting over.
 - Old tables remain the source of truth for all queries (API, CLI, Grafana)
 - Monitoring/logging to compare old table data vs new view data
 
-**Deployment sequence**:
+##### Deployment sequence
 
 1. Deploy schema migrations (creates event store and view tables)
 2. Run data import binary once (`migrate_to_events`) to convert all existing
@@ -709,7 +709,7 @@ cutting over.
 4. Verify views match old tables and new events appear in both systems
 5. Monitor for errors and performance issues
 
-**Benefits**:
+##### Benefits
 
 - **Low risk**: Old system continues working; new system validates in shadow
   mode
@@ -720,14 +720,14 @@ cutting over.
 - **Easy rollback**: Stop writing events; old system unaffected
 - **Catch discrepancies**: Identify any bugs in event logic before cutover
 
-**Deployment verification**:
+##### Deployment verification
 
 - After import: Verify view counts and sample records match old tables exactly
 - After dual-write starts: Spot check that new events appear in both systems
 - Monitor for any errors in event processing
 - Confirm no performance degradation
 
-**Phase complete when**:
+##### Phase complete when
 
 - Dual-write running in production for sufficient validation period
 - View data consistently matches old table data
@@ -739,7 +739,7 @@ cutting over.
 **Goal**: Implement inventory rebalancing using CQRS/ES architecture from day
 one.
 
-**Why now**:
+##### Why now
 
 - Rebalancing is a business priority
 - Building on new architecture proves CQRS/ES works for new features
@@ -747,7 +747,7 @@ one.
 - Demonstrates value of event sourcing (complete audit trail for all rebalancing
   operations)
 
-**Implementation scope**:
+##### Implementation scope
 
 - Three rebalancing aggregates (TokenizedEquityMint, EquityRedemption,
   UsdcRebalance)
@@ -757,7 +757,7 @@ one.
 - RebalancingManager for triggering rebalancing operations
 - Complete event-sourced audit trail for all rebalancing operations
 
-**Integration points**:
+##### Integration points
 
 - Alpaca for share and USDC management
 - Circle's USDC native bridge via CCTP (cross-chain transfers between Ethereum
@@ -765,14 +765,14 @@ one.
 - Rain OrderBook (deposit2/withdraw2 for vault operations on Base)
 - Position aggregate (provides inventory data to InventoryView)
 
-**Benefits**:
+##### Benefits
 
 - New feature built using the new architecture
 - Proves CQRS/ES architecture in production
 - Complete audit trail for compliance and debugging
 - Easier to reason about rebalancing state transitions
 
-**Phase complete when**:
+##### Phase complete when
 
 - Rebalancing working in production with Alpaca
 - Complete audit trail visible in events
@@ -782,7 +782,7 @@ one.
 
 **Goal**: Make views the source of truth and remove old tables.
 
-**Implementation**:
+##### Implementation
 
 - Update Conductor to read from views instead of old tables
 - Update API/CLI to query views
@@ -791,14 +791,14 @@ one.
 - Stop writing to old tables
 - After validation period, drop old tables
 
-**Cutover approach**:
+##### Cutover approach
 
 - Switch application reads from old tables to views
 - Stop dual-write (only write to event store)
 - Monitor for issues
 - After validation period, drop old tables
 
-**Benefits**:
+##### Benefits
 
 - Old system completely removed
 - Full CQRS/ES benefits realized (time-travel debugging, easy projections,
@@ -806,7 +806,7 @@ one.
 - Cleaner codebase
 - Foundation for future features
 
-**Phase complete when**:
+##### Phase complete when
 
 - All reads happening from views
 - No code querying old tables
@@ -829,7 +829,7 @@ All state changes are captured as immutable domain events. The event store is
 the single source of truth. All other data (views, snapshots) is derived and can
 be rebuilt at any time.
 
-**Key Flow:**
+##### Key Flow
 
 ```mermaid
 flowchart LR
@@ -842,7 +842,7 @@ flowchart LR
 
 #### Database Schema
 
-##### **Event Store Tables** (Single Source of Truth)
+##### Event Store Tables (Single Source of Truth)
 
 ```sql
 -- Events table: stores all domain events
@@ -871,7 +871,7 @@ CREATE TABLE snapshots (
 );
 ```
 
-##### **View Tables** (Derived Read Models)
+##### View Tables (Derived Read Models)
 
 Views are materialized projections built from events, optimized for specific
 query patterns. These views use SQLite generated columns to expose JSON fields
@@ -983,7 +983,7 @@ CREATE TABLE schwab_auth_view (
 );
 ```
 
-**Grafana Dashboard Migration:**
+##### Grafana Dashboard Migration
 
 Most existing Grafana queries can migrate with only table name changes:
 
@@ -1004,7 +1004,7 @@ WHERE symbol = 'AAPL' AND created_at > datetime('now', '-7 days');
 Generated columns are indexed for query performance, ensuring dashboards
 maintain their current performance characteristics.
 
-**Opportunity for Dashboard Simplification:**
+##### Opportunity for Dashboard Simplification
 
 The event-sourced architecture allows us to create specialized views that
 pre-compute complex metrics, replacing complex Grafana queries with simple
@@ -1095,14 +1095,14 @@ enum Lifecycle<T, E> {
 }
 ```
 
-**Why This Pattern Exists**:
+##### Why This Pattern Exists
 
 - `Aggregate::apply` and `View::update` are infallible (no `Result` return)
 - Financial applications cannot panic on arithmetic overflow
 - Events might arrive before genesis (replay ordering, bugs)
 - Transitions might fail (overflow, invalid state combinations)
 
-**Usage in `apply()` method**:
+##### Usage in `apply()` method
 
 ```rust
 fn apply(&mut self, event: Self::Event) {
@@ -1117,7 +1117,7 @@ fn apply(&mut self, event: Self::Event) {
 - `or_initialize()` handles genesis events if entity doesn't exist yet
 - Failures transition to `Failed` instead of panicking
 
-**Error Type Parameter**:
+##### Error Type Parameter
 
 - Use `Never` (uninhabited type) for aggregates with no fallible operations
 - Use domain-specific error types (e.g., `ArithmeticError`) when transitions can
@@ -1133,7 +1133,7 @@ affecting position calculations.
 
 **Type**: `Lifecycle<OnChainTrade, Never>` (transitions never fail)
 
-**State**:
+##### State
 
 ```rust
 struct OnChainTrade {
@@ -1154,7 +1154,7 @@ struct Enrichment {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 enum OnChainTradeCommand {
@@ -1173,7 +1173,7 @@ enum OnChainTradeCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum OnChainTradeEvent {
@@ -1219,7 +1219,7 @@ fractional shares and coordinating offchain hedging when thresholds are reached.
 
 **Type**: `Lifecycle<Position, ArithmeticError>` (arithmetic can overflow)
 
-**State**:
+##### State
 
 ```rust
 struct Position {
@@ -1238,7 +1238,7 @@ enum ExecutionThreshold {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 // Common types
@@ -1283,7 +1283,7 @@ enum PositionCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum PositionEvent {
@@ -1374,7 +1374,7 @@ submission, filling, and settlement.
 
 **Type**: `Lifecycle<OffchainOrder, Never>` (transitions never fail)
 
-**States**:
+##### States
 
 ```rust
 enum OffchainOrder {
@@ -1429,7 +1429,7 @@ enum OffchainOrder {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 enum OffchainOrderCommand {
@@ -1455,7 +1455,7 @@ enum OffchainOrderCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum OffchainOrderEvent {
@@ -1512,7 +1512,7 @@ database storage.
 
 **Aggregate ID**: `"schwab"` (singleton)
 
-**States**:
+##### States
 
 ```rust
 enum SchwabAuth {
@@ -1526,7 +1526,7 @@ enum SchwabAuth {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 enum SchwabAuthCommand {
@@ -1540,7 +1540,7 @@ enum SchwabAuthCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum SchwabAuthEvent {
@@ -1573,7 +1573,7 @@ onchain tokens.
 
 **Aggregate ID**: UUID for each mint request
 
-**States**:
+##### States
 
 ```rust
 enum TokenizedEquityMint {
@@ -1628,7 +1628,7 @@ enum TokenizedEquityMint {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 enum TokenizedEquityMintCommand {
@@ -1653,7 +1653,7 @@ enum TokenizedEquityMintCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum TokenizedEquityMintEvent {
@@ -1684,7 +1684,7 @@ enum TokenizedEquityMintEvent {
 }
 ```
 
-**Business Rules**:
+##### Business Rules
 
 - Can only request mint from NotStarted state
 - Mint acceptance requires valid issuer and tokenization request IDs
@@ -1698,7 +1698,7 @@ shares at Alpaca.
 
 **Aggregate ID**: UUID for each redeem request
 
-**States**:
+##### States
 
 ```rust
 enum EquityRedemption {
@@ -1737,7 +1737,7 @@ enum EquityRedemption {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 enum EquityRedemptionCommand {
@@ -1756,7 +1756,7 @@ enum EquityRedemptionCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum EquityRedemptionEvent {
@@ -1781,7 +1781,7 @@ enum EquityRedemptionEvent {
 }
 ```
 
-**Business Rules**:
+##### Business Rules
 
 - Can only send tokens from NotStarted state
 - Redemption transitions to Pending when detected in Alpaca API (via polling GET
@@ -1808,7 +1808,7 @@ orderbook vaults via Circle CCTP bridge.
 The inner `UsdcRebalance` enum contains only business states - the
 `Uninitialized` state is provided by the wrapper, not the inner type.
 
-**Supporting Types**:
+##### Supporting Types
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1941,7 +1941,7 @@ enum UsdcRebalance {
 }
 ```
 
-**Commands**:
+##### Commands
 
 ```rust
 enum UsdcRebalanceCommand {
@@ -1978,7 +1978,7 @@ enum UsdcRebalanceCommand {
 }
 ```
 
-**Events**:
+##### Events
 
 ```rust
 enum UsdcRebalanceEvent {
@@ -2036,7 +2036,7 @@ enum UsdcRebalanceEvent {
 }
 ```
 
-**Business Rules**:
+##### Business Rules
 
 - Direction determines source and destination (AlpacaToBase: Ethereum mainnet ->
   Base, BaseToAlpaca: Base -> Ethereum mainnet)
@@ -2074,7 +2074,7 @@ enum UsdcRebalanceEvent {
 - Can mark failed from any non-terminal state
 - Each rebalancing has unique UUID allowing multiple parallel operations
 
-**Integration Points**:
+##### Integration Points
 
 - **Alpaca API**: Withdraw/deposit USDC
 - **Circle CCTP (Ethereum mainnet)**: TokenMessenger contract at
@@ -2084,7 +2084,7 @@ enum UsdcRebalanceEvent {
 - **Circle Attestation API**: Poll for attestation using CCTP nonce
 - **Rain OrderBook**: deposit2()/withdraw2() for vault operations
 
-**CCTP Flow (using V2 Fast Transfer)**:
+##### CCTP Flow (using V2 Fast Transfer)
 
 Alpaca to Base:
 
@@ -2121,7 +2121,7 @@ Base to Alpaca:
     USDC)
 12. Poll Alpaca until conversion order is filled
 
-**Fast Transfer Benefits**:
+###### Fast Transfer Benefits
 
 - **Timing**: ~20-30 seconds for CCTP bridge portion vs 13-19 minutes standard
   transfer (50-80x faster)
@@ -2131,7 +2131,7 @@ Base to Alpaca:
 
 #### Rebalancing Triggers
 
-**Inventory Tracking**:
+##### Inventory Tracking
 
 The system tracks two separate inventory categories:
 
@@ -2146,7 +2146,7 @@ The system tracks two separate inventory categories:
    - Offchain: USDC in Alpaca account
    - Single global ratio (not per-symbol)
 
-**Imbalance Detection**:
+##### Imbalance Detection
 
 InventoryView calculates imbalances after each position or rebalancing event by
 checking per-symbol equity ratios and global USDC ratio against configured
@@ -2166,7 +2166,7 @@ emits imbalance detection events.
   - Example: Triggers at <0.2 (bridge to Base) or >0.8 (bridge to Alpaca)
   - Minimum rebalancing amount: e.g., $5000 to avoid frequent small transfers
 
-**Trigger Events**:
+##### Trigger Events
 
 When thresholds crossed AND minimum amounts met, InventoryView emits:
 
@@ -2178,7 +2178,7 @@ When thresholds crossed AND minimum amounts met, InventoryView emits:
 appropriate commands on TokenizedEquityMint, EquityRedemption, or UsdcRebalance
 aggregates.
 
-**Example Scenarios**:
+##### Example Scenarios
 
 1. **Heavy onchain trading in AAPL**: Sold lots of AAPL tokens onchain, now 85%
    of AAPL inventory is offchain shares
@@ -2220,14 +2220,47 @@ know about cross-venue inventory.
   destination available
 - `UsdcRebalanceEvent::RebalancingFailed` - Reconciles inflight back to source
   available
+- `InventorySnapshotEvent::OnchainEquity` - Onchain equity balances fetched from
+  vaults
+- `InventorySnapshotEvent::OnchainCash` - Onchain USDC balance fetched from
+  vault
+- `InventorySnapshotEvent::OffchainEquity` - Offchain equity positions fetched
+  from broker
+- `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
+  broker
 
-**Separation of concerns**:
+##### Separation of concerns
 
 - Position: Tracks trading-induced position changes
 - TokenizedEquityMint/EquityRedemption: Tracks rebalancing-induced equity
   movements
 - UsdcRebalance: Tracks rebalancing-induced USDC movements
 - InventoryView: Combines all events to calculate total inventory
+- InventorySnapshot: Records fetched balances from onchain vaults and offchain
+  broker
+
+##### Inventory Reconciliation
+
+The system's internal accounting is built from events it knows about (trades,
+mints, redemptions, USDC rebalances). But inventory can be affected by actions
+outside the system - manual deposits, withdrawals, or trades on either venue.
+Until those external changes are observed and fed back as events, the internal
+accounting drifts from reality.
+
+The reconciliation system closes this gap by periodically fetching actual
+balances and emitting them as events the system can react to:
+
+- **VaultRegistry** (CQRS aggregate): Auto-discovers Raindex vaults from
+  ClearV3/TakeOrderV3 trade events. Tracks equity vaults (per token address) and
+  a single USDC vault per orderbook/owner pair.
+- **InventorySnapshot** (CQRS aggregate): Records point-in-time snapshots of
+  actual balances fetched from onchain vaults and the offchain broker.
+- **InventoryPollingService**: Periodically polls actual balances from both
+  venues, emitting InventorySnapshot events. InventoryView reacts to these
+  events to update tracked inventory.
+- **Polling runs on a 60-second interval** during market hours as a background
+  conductor task. Onchain polling uses the `vaultBalance2` contract call;
+  offchain polling uses the `Executor::get_inventory()` trait method.
 
 ### View Design
 
@@ -2236,7 +2269,7 @@ know about cross-venue inventory.
 **Purpose**: Current position state for all symbols, optimized for querying by
 symbol and position status.
 
-**View State**:
+##### View State
 
 ```rust
 enum PositionView {
@@ -2258,7 +2291,7 @@ enum PositionView {
 
 **Purpose**: All broker executions with filtering by status and symbol.
 
-**View State**:
+##### View State
 
 ```rust
 enum OffchainTradeView {
@@ -2292,7 +2325,7 @@ filled orders (which become trades)
 
 **Purpose**: Immutable record of all blockchain trades.
 
-**View State**:
+##### View State
 
 ```rust
 enum OnChainTradeView {
@@ -2320,7 +2353,7 @@ enum OnChainTradeView {
 
 **Purpose**: Profit/loss calculations per symbol over time.
 
-**View State**:
+##### View State
 
 ```rust
 enum MetricsPnLView {
@@ -2354,7 +2387,7 @@ enum Venue {
 **Purpose**: Tracks all equity mint operations (Alpaca shares to onchain
 tokens).
 
-**View State**:
+##### View State
 
 ```rust
 enum TokenizedEquityMintView {
@@ -2390,7 +2423,7 @@ enum MintStatus {
 **Purpose**: Tracks all equity redemption operations (onchain tokens to Alpaca
 shares).
 
-**View State**:
+##### View State
 
 ```rust
 enum EquityRedemptionView {
@@ -2423,7 +2456,7 @@ enum RedeemStatus {
 **Purpose**: Tracks all USDC rebalancing operations across Alpaca and Base via
 Circle CCTP bridge.
 
-**View State**:
+##### View State
 
 ```rust
 enum UsdcRebalanceView {
@@ -2461,7 +2494,7 @@ enum RebalancingStatus {
 trigger rebalancing operations. This is the central view that monitors total
 system inventory.
 
-**View State**:
+##### View State
 
 ```rust
 struct InventoryView {
@@ -2540,7 +2573,7 @@ logic automatically reconciles inflight balances back to source venue's
 available balance. This ensures InventoryView remains accurate even when
 operations fail.
 
-**Manual Reconciliation Required**:
+##### Manual Reconciliation Required
 
 Some failure scenarios may leave assets in states requiring manual intervention:
 
@@ -2712,14 +2745,14 @@ Blockchain reorganizations occur before block finalization. When we eventually
 implement reorg handling, the event-sourced architecture will make it
 significantly easier than the current CRUD approach.
 
-**CRUD Approach (Current):**
+##### CRUD Approach (Current)
 
 Would require orchestrating multiple coordinated steps: identify affected
 trades, delete/mark invalid records in `onchain_trades`, update
 `trade_accumulators`, check triggered executions, potentially reverse offchain
 executions. This would be error-prone and lose audit trail.
 
-**Event-Sourced Approach (Future):**
+##### Event-Sourced Approach (Future)
 
 Simply append a reorg event that reverses the position change. The event would
 be: PositionCommand::RecordReorg with tx_hash, log_index, symbol, amount,
@@ -2727,7 +2760,7 @@ direction, reorg_depth. The resulting PositionEvent::Reorged would reverse the
 original trade's position impact. Views would update automatically. The
 `onchain_trade_view` could mark trades as `reorged: true` without deleting them.
 
-**Benefits (when implemented):**
+##### Benefits (when implemented)
 
 - Append-only: no cascading updates across tables
 - Complete audit trail: preserves both original trade and reorg event
@@ -2832,7 +2865,7 @@ This binary converts existing CRUD data from old tables into the event store. It
 is separate from schema migrations (`sqlx migrate run`), which create tables
 automatically on every deployment.
 
-**Steps:**
+###### Steps
 
 1. Read from `onchain_trades` table, emit OnChainTradeEvent::Migrated for each
    trade
@@ -3079,14 +3112,14 @@ All read data flows through a single WebSocket connection:
    auth status, circuit breaker state)
 3. Server streams incremental updates as events occur
 
-**Benefits**:
+##### Benefits
 
 - Single connection to manage
 - No race condition between HTTP fetch and WebSocket updates
 - Server controls exactly what state the client starts with
 - HTTP endpoints only needed for mutations (circuit breaker, auth)
 
-**Message Types**:
+##### Message Types
 
 ```typescript
 type ServerMessage =
@@ -3178,7 +3211,7 @@ type RebalanceStatus =
   | { status: "failed"; startedAt: Date; failedAt: Date; reason: string };
 ```
 
-**TanStack Query Integration**:
+##### TanStack Query Integration
 
 WebSocket messages populate the TanStack Query cache:
 
@@ -3213,7 +3246,7 @@ socket.onmessage = (event) => {
 };
 ```
 
-**Svelte WebSocket Wrapper**:
+##### Svelte WebSocket Wrapper
 
 Minimal wrapper using Svelte 5 runes for connection state:
 
@@ -3294,7 +3327,7 @@ Streamline the weekly OAuth re-authentication flow:
 - OAuth callback handler in dashboard
 - Eliminates need for manual CLI coordination
 
-**Flow:**
+##### Flow
 
 1. User clicks "Re-authenticate" in dashboard
 2. Dashboard opens Schwab OAuth URL in new tab
@@ -3314,7 +3347,7 @@ Emergency control to halt all trading activity:
 - Existing positions preserved (no forced liquidation)
 - Manual reset required to resume trading
 
-**Implementation:**
+##### Implementation
 
 - New database table or flag to track circuit breaker state
 - Bot checks flag before placing any broker orders
@@ -3331,19 +3364,19 @@ POST /api/circuit-breaker/reset
 Single-page dashboard with live-updating panels, each expandable to full-screen.
 Supports two bot instances (Schwab and Alpaca) via broker selector in header.
 
-**Broker-specific features:**
+#### Broker-specific features
 
 - **Schwab**: OAuth flow management (weekly re-authentication)
 - **Alpaca**: Automated rebalancing panel (minting, redemption, USDC bridging)
 
-**Header Bar:**
+#### Header Bar
 
 - Broker selector (Schwab / Alpaca) - switches entire dashboard context
 - Auth status indicator with expiry countdown (Schwab only)
 - Circuit breaker status toggle
 - WebSocket connection status
 
-**Panels**:
+#### Panels
 
 1. **Performance Metrics**: Live-updating key metrics with timeframe selector
    (1h, 1d, 1w, 1m, all-time):
@@ -3412,7 +3445,7 @@ dashboard/
 
 Extend existing Rocket server (`src/api.rs`):
 
-**WebSocket (all read data):**
+##### WebSocket (all read data)
 
 ```text
 WS /api/ws
@@ -3421,7 +3454,7 @@ WS /api/ws
 Sends initial state on connect, then streams updates. See WebSocket-First Data
 Flow section above.
 
-**Mutations (HTTP, require auth):**
+##### Mutations (HTTP, require auth)
 
 ```text
 POST /api/circuit-breaker/trigger  { reason: string }

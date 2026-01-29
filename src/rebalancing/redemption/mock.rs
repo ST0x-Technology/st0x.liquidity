@@ -113,7 +113,7 @@ mod tests {
         mock.execute_redemption(
             &RedemptionAggregateId::new("agg-1"),
             Symbol::new("AAPL").unwrap(),
-            FractionalShares(dec!(10)),
+            FractionalShares::new(dec!(10)),
             Address::ZERO,
             U256::ZERO,
         )
@@ -125,7 +125,7 @@ mod tests {
         mock.execute_redemption(
             &RedemptionAggregateId::new("agg-2"),
             Symbol::new("TSLA").unwrap(),
-            FractionalShares(dec!(20)),
+            FractionalShares::new(dec!(20)),
             Address::ZERO,
             U256::ZERO,
         )
@@ -145,7 +145,7 @@ mod tests {
         mock.execute_redemption(
             &aggregate_id,
             Symbol::new("GOOG").unwrap(),
-            FractionalShares(dec!(123.456)),
+            FractionalShares::new(dec!(123.456)),
             token,
             amount,
         )
@@ -155,7 +155,7 @@ mod tests {
         let call = mock.last_call().unwrap();
         assert_eq!(call.aggregate_id, aggregate_id);
         assert_eq!(call.symbol, Symbol::new("GOOG").unwrap());
-        assert_eq!(call.quantity, FractionalShares(dec!(123.456)));
+        assert_eq!(call.quantity, FractionalShares::new(dec!(123.456)));
         assert_eq!(call.token, token);
         assert_eq!(call.amount, amount);
     }
@@ -168,7 +168,7 @@ mod tests {
             .execute_redemption(
                 &RedemptionAggregateId::new("fail-test"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(1)),
+                FractionalShares::new(dec!(1)),
                 Address::ZERO,
                 U256::ZERO,
             )
@@ -185,7 +185,7 @@ mod tests {
             .execute_redemption(
                 &RedemptionAggregateId::new("x"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(1)),
+                FractionalShares::new(dec!(1)),
                 Address::ZERO,
                 U256::ZERO,
             )
@@ -203,7 +203,7 @@ mod tests {
             .execute_redemption(
                 &aggregate_id,
                 Symbol::new("NVDA").unwrap(),
-                FractionalShares(dec!(50)),
+                FractionalShares::new(dec!(50)),
                 Address::ZERO,
                 U256::from(12345u64),
             )

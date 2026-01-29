@@ -5,10 +5,11 @@ use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 use alloy::primitives::{LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 use st0x_execution::OrderState;
 use st0x_execution::schwab::{SchwabAuthEnv, SchwabTokens};
-use st0x_execution::{Direction, Shares, SupportedExecutor, Symbol};
+use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important – only that the
@@ -182,7 +183,7 @@ impl OffchainExecutionBuilder {
             execution: OffchainExecution {
                 id: None,
                 symbol: Symbol::new("AAPL").unwrap(),
-                shares: Shares::new(100).unwrap(),
+                shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
                 direction: Direction::Buy,
                 executor: SupportedExecutor::Schwab,
                 state: OrderState::Pending,
