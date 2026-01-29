@@ -123,6 +123,7 @@ ts-rs = { version = "11.1.0", features = [
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
+clap-config-file = "0.6.0"
 
 [dev-dependencies]
 httpmock.workspace = true
