@@ -6,6 +6,7 @@ let
       url = repoUrl;
       inherit (self) rev;
       submodules = true;
+      shallow = true;
     };
   in pkgs.runCommand "src-with-submodules" { } ''
     set -euxo pipefail
