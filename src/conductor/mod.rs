@@ -24,7 +24,7 @@ use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
-use crate::env::{BrokerConfig, Config};
+use crate::env::Config;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
@@ -75,7 +75,6 @@ pub(crate) async fn run_market_hours_loop<E>(
     config: Config,
     pool: SqlitePool,
     executor_maintenance: Option<JoinHandle<()>>,
-    rebalancer: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()>
 where
@@ -96,7 +95,6 @@ where
         &pool,
         executor.clone(),
         executor_maintenance,
-        rebalancer,
         event_sender.clone(),
     )
     .await
@@ -151,7 +149,6 @@ where
         config,
         pool,
         new_maintenance,
-        None,
         event_sender,
     ))
     .await
@@ -223,7 +220,6 @@ where
         config,
         pool,
         next_maintenance,
-        None,
         event_sender,
     ))
     .await
@@ -235,7 +231,6 @@ impl Conductor {
         pool: &SqlitePool,
         executor: E,
         executor_maintenance: Option<JoinHandle<()>>,
-        rebalancer: Option<JoinHandle<()>>,
         event_sender: broadcast::Sender<ServerMessage>,
     ) -> anyhow::Result<Self>
     where
@@ -260,15 +255,13 @@ impl Conductor {
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        // Spawn rebalancer with the provider if configured
-        let rebalancer = match (&config.rebalancing, &config.broker, rebalancer) {
-            (Some(rebalancing_config), BrokerConfig::AlpacaTradingApi(alpaca_auth), None) => {
+        let rebalancer = match config.rebalancing_config() {
+            Some(rebalancing_config) => {
                 info!("Initializing rebalancing infrastructure");
                 Some(
                     spawn_rebalancer(
                         pool.clone(),
                         rebalancing_config,
-                        alpaca_auth,
                         provider.clone(),
                         cache.clone(),
                         config.evm.orderbook,
@@ -280,7 +273,7 @@ impl Conductor {
                     .await?,
                 )
             }
-            (_, _, existing) => existing,
+            None => None,
         };
 
         let mut builder = ConductorBuilder::new(
