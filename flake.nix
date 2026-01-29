@@ -3,11 +3,15 @@
 
   inputs = {
     rainix.url =
-      "github:rainprotocol/rainix?rev=49c4a3e151f232953e1c2370ab526f74c25eb6d2";
+      "github:rainprotocol/rainix?rev=6e14de54456eb33821c2f334cf4d250bcc22c121";
     flake-utils.url = "github:numtide/flake-utils";
+    bun2nix = {
+      url = "github:nix-community/bun2nix?tag=2.0.7";
+      inputs.nixpkgs.follows = "rainix/nixpkgs";
+    };
   };
 
-  outputs = { flake-utils, rainix, ... }:
+  outputs = { flake-utils, rainix, bun2nix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = rainix.pkgs.${system};
@@ -24,6 +28,11 @@
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
 
+          st0x-dashboard = pkgs.callPackage ./nix/dashboard.nix {
+            bun2nix = bun2nix.packages.${system}.default;
+            codegen = packages.st0x-liquidity;
+          };
+
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
@@ -33,6 +42,14 @@
               (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
               (cd lib/forge-std/ && forge build)
               (cd lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/ && forge build)
+            '';
+          };
+
+          genBunNix = rainix.mkTask.${system} {
+            name = "gen-bun-nix";
+            additionalBuildInputs = [ bun2nix.packages.${system}.default ];
+            body = ''
+              exec bun2nix -o dashboard/bun.nix --lock-file dashboard/bun.lock
             '';
           };
 
