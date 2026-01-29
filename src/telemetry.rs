@@ -27,10 +27,11 @@
 //!
 //! ```ignore
 //! // Optional telemetry setup through config
-//! let config = env::Env::parse().into_config();
+//! let config = Config::load_file(&path)?;
+//! let log_level: tracing::Level = (&config.log_level).into();
 //!
 //! let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
-//!     match hyperdx.setup_telemetry() {
+//!     match hyperdx.setup_telemetry(log_level) {
 //!         Ok(guard) => Some(guard),
 //!         Err(e) => {
 //!             eprintln!("Failed to setup telemetry: {e}");
@@ -71,20 +72,16 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct HyperDxTomlConfig {
-    pub(crate) api_key: String,
-    pub(crate) service_name: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct HyperDxConfig {
     pub(crate) api_key: String,
     pub(crate) service_name: String,
-    pub(crate) log_level: tracing::Level,
 }
 
 impl HyperDxConfig {
-    pub fn setup_telemetry(&self) -> Result<TelemetryGuard, TelemetryError> {
+    pub fn setup_telemetry(
+        &self,
+        log_level: tracing::Level,
+    ) -> Result<TelemetryGuard, TelemetryError> {
         let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
 
         let http_client = std::thread::spawn(|| {
@@ -131,10 +128,7 @@ impl HyperDxConfig {
             .with_tracer(tracer)
             .with_level(true);
 
-        let default_filter = format!(
-            "st0x_hedge={},st0x_execution={}",
-            self.log_level, self.log_level
-        );
+        let default_filter = format!("st0x_hedge={log_level},st0x_execution={log_level}");
 
         let fmt_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| default_filter.clone().into());

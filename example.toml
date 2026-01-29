@@ -16,6 +16,10 @@ api_key = "test_key"
 api_secret = "test_secret"
 account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
+[hyperdx]
+api_key = "test-hyperdx-key"
+service_name = "st0x-hedge"
+
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 ethereum_rpc_url = "https://mainnet.infura.io"

@@ -9,7 +9,7 @@ use tracing::Level;
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmConfig;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
-use crate::telemetry::{HyperDxConfig, HyperDxTomlConfig};
+use crate::telemetry::HyperDxConfig;
 use st0x_execution::SupportedExecutor;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
@@ -143,18 +143,13 @@ impl<'de> Deserialize<'de> for Config {
             order_polling_interval: Option<u64>,
             order_polling_max_jitter: Option<u64>,
             broker: BrokerConfig,
-            hyperdx: Option<HyperDxTomlConfig>,
+            hyperdx: Option<HyperDxConfig>,
             rebalancing: Option<RebalancingConfig>,
         }
 
         let fields = ConfigFields::deserialize(deserializer)?;
 
         let log_level = fields.log_level.unwrap_or(LogLevel::Debug);
-        let log_level_tracing: Level = (&log_level).into();
-
-        let hyperdx = fields
-            .hyperdx
-            .map(|h| HyperDxConfig::from_toml(h, log_level_tracing));
 
         Ok(Self {
             database_url: fields.database_url,
@@ -164,7 +159,7 @@ impl<'de> Deserialize<'de> for Config {
             order_polling_interval: fields.order_polling_interval.unwrap_or(15),
             order_polling_max_jitter: fields.order_polling_max_jitter.unwrap_or(5),
             broker: fields.broker,
-            hyperdx,
+            hyperdx: fields.hyperdx,
             rebalancing: fields.rebalancing,
         })
     }
@@ -543,12 +538,12 @@ pub mod tests {
             type = "dry-run"
             [hyperdx]
             api_key = "test-api-key"
+            service_name = "test-service"
         "#;
 
         let config = Config::load(toml).unwrap();
         let hyperdx = config.hyperdx.as_ref().expect("hyperdx should be Some");
         assert_eq!(hyperdx.api_key, "test-api-key");
-        assert_eq!(hyperdx.service_name, "st0x-hedge");
-        assert_eq!(hyperdx.log_level, Level::WARN);
+        assert_eq!(hyperdx.service_name, "test-service");
     }
 }
