@@ -1,4 +1,4 @@
-{ pkgs, rustPlatform, sqlx-cli }:
+{ pkgs, rustPlatform, sqlx-cli, sol-build-inputs }:
 
 let
   # Requires --impure. Submodules must be checked out and prepSolArtifacts
@@ -26,6 +26,8 @@ in rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [ sqlx-cli pkgs.pkg-config ];
 
+  nativeCheckInputs = sol-build-inputs;
+
   buildInputs = [ pkgs.openssl pkgs.sqlite ]
     ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
     [ pkgs.apple-sdk_15 ];
@@ -44,10 +46,7 @@ in rustPlatform.buildRustPackage {
     ln -sf "$(pwd)/migrations" "$NIX_BUILD_TOP/migrations"
   '';
 
-  cargoBuildFlags = [ "--bin" "server" ];
-
   doCheck = true;
-  cargoTestFlags = [ "--bin" "server" ];
 
   meta = {
     description = "st0x liquidity market making system";

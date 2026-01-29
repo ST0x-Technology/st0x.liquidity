@@ -18,9 +18,10 @@
       in rec {
         packages = let rainixPkgs = rainix.packages.${system};
         in rainixPkgs // {
-          server = pkgs.callPackage ./nix/rust.nix {
+          st0x-liquidity = pkgs.callPackage ./nix/rust.nix {
             inherit rustPlatform;
             inherit (pkgs) sqlx-cli;
+            sol-build-inputs = rainix.sol-build-inputs.${system};
           };
 
           prepSolArtifacts = rainix.mkTask.${system} {
