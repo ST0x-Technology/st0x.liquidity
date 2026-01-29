@@ -126,11 +126,11 @@ ts-rs = { version = "11.1.0", features = [
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
+rust_decimal_macros = "1.38.0"
 
 [dev-dependencies]
 httpmock.workspace = true
 serial_test.workspace = true
-rust_decimal_macros = "1.38.0"
 proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"

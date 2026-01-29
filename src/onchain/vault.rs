@@ -15,10 +15,13 @@ use alloy::primitives::{Address, B256, TxHash, U256, address};
 use alloy::providers::Provider;
 use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
+use rust_decimal::Decimal;
+use st0x_execution::FractionalShares;
 
 use crate::bindings::IOrderBookV5;
 use crate::error_decoding::handle_contract_error;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
+use crate::threshold::Usdc;
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
@@ -37,6 +40,8 @@ pub(crate) enum VaultError {
     Revert(#[from] AbiDecodedErrorType),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
     #[error("Amount cannot be zero")]
     ZeroAmount,
 }
@@ -209,6 +214,52 @@ where
         self.withdraw(USDC_BASE, vault_id, target_amount, USDC_DECIMALS)
             .await
     }
+
+    /// Gets the current equity balance of a tokenized equity vault.
+    pub(crate) async fn get_equity_balance(
+        &self,
+        owner: Address,
+        token: Address,
+        vault_id: VaultId,
+    ) -> Result<FractionalShares, VaultError> {
+        let decimal = self.get_vault_balance(owner, token, vault_id).await?;
+        Ok(FractionalShares::new(decimal))
+    }
+
+    /// Gets the USDC balance of a vault on Base.
+    pub(crate) async fn get_usdc_balance(
+        &self,
+        owner: Address,
+        vault_id: VaultId,
+    ) -> Result<Usdc, VaultError> {
+        let decimal = self.get_vault_balance(owner, USDC_BASE, vault_id).await?;
+        Ok(Usdc(decimal))
+    }
+
+    async fn get_vault_balance(
+        &self,
+        owner: Address,
+        token: Address,
+        vault_id: VaultId,
+    ) -> Result<Decimal, VaultError> {
+        let balance_float = self
+            .orderbook
+            .vaultBalance2(owner, token, vault_id.0)
+            .call()
+            .await?;
+
+        float_to_decimal(balance_float)
+    }
+}
+
+/// Converts a Float (bytes32) amount to Decimal.
+///
+/// Uses the rain-math-float library's format() method to convert the Float to a string,
+/// then parses it to Decimal for precise financial arithmetic.
+fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
+    let float = Float::from_raw(float);
+    let formatted = float.format()?;
+    Ok(formatted.parse::<Decimal>()?)
 }
 
 #[cfg(test)]
@@ -502,5 +553,117 @@ mod tests {
             USDC_BASE,
             address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
         );
+    }
+
+    #[tokio::test]
+    async fn get_equity_balance_returns_zero_for_empty_vault() {
+        let local_evm = LocalEvm::new().await.unwrap();
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+
+        let balance = service
+            .get_equity_balance(
+                local_evm.signer.address(),
+                local_evm.token_address,
+                TEST_VAULT_ID,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(balance, FractionalShares::ZERO);
+    }
+
+    #[tokio::test]
+    async fn get_equity_balance_returns_deposited_amount() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+
+        service
+            .deposit(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let balance = service
+            .get_equity_balance(
+                local_evm.signer.address(),
+                local_evm.token_address,
+                TEST_VAULT_ID,
+            )
+            .await
+            .unwrap();
+
+        let expected = FractionalShares::new(Decimal::from(1000));
+        assert_eq!(
+            balance, expected,
+            "Expected 1000 shares but got {balance:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_equity_balance_returns_remaining_after_withdrawal() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        let deposit_amount = U256::from(1000) * U256::from(10).pow(U256::from(18));
+        let withdraw_amount = U256::from(300) * U256::from(10).pow(U256::from(18));
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                deposit_amount,
+            )
+            .await
+            .unwrap();
+
+        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address)
+            .with_required_confirmations(1);
+
+        service
+            .deposit(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        service
+            .withdraw(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                withdraw_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await
+            .unwrap();
+
+        let balance = service
+            .get_equity_balance(
+                local_evm.signer.address(),
+                local_evm.token_address,
+                TEST_VAULT_ID,
+            )
+            .await
+            .unwrap();
+
+        let expected = FractionalShares::new(Decimal::from(700));
+        assert_eq!(balance, expected, "Expected 700 shares but got {balance:?}");
     }
 }

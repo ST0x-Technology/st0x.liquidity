@@ -76,7 +76,6 @@ impl DualWriteContext {
     }
 
     /// Creates a new context with a specific execution threshold.
-    /// Used in production to pass through configuration.
     pub(crate) fn with_threshold(
         pool: SqlitePool,
         execution_threshold: ExecutionThreshold,

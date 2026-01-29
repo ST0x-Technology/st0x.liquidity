@@ -273,6 +273,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
     use std::str::FromStr;
     use uuid::uuid;
 
@@ -319,6 +320,12 @@ mod tests {
             usdc_threshold: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
+            },
+            alpaca_broker_auth: AlpacaBrokerApiAuthEnv {
+                alpaca_broker_api_key: "test-key".to_string(),
+                alpaca_broker_api_secret: "test-secret".to_string(),
+                alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+                alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
             },
         });
         config

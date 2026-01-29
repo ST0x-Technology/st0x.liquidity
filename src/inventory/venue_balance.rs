@@ -3,6 +3,7 @@
 use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 use crate::shares::{ArithmeticError, HasZero};
 
@@ -26,8 +27,10 @@ pub(crate) enum InventoryError<T> {
         "insufficient inflight balance: requested {requested:?}, but only {inflight:?} inflight"
     )]
     InsufficientInflight { requested: T, inflight: T },
-    #[error("actual amount {actual:?} exceeds inflight amount {inflight:?}")]
-    ActualExceedsInflight { actual: T, inflight: T },
+    #[error(
+        "amount received {amount_received:?} exceeds amount sent {amount_sent:?} (fees cannot be negative)"
+    )]
+    NegativeFee { amount_sent: T, amount_received: T },
     #[error(transparent)]
     Arithmetic(#[from] ArithmeticError<T>),
 }
@@ -77,7 +80,8 @@ where
     T: Add<Output = Result<T, ArithmeticError<T>>>
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy
-        + HasZero,
+        + HasZero
+        + std::fmt::Debug,
 {
     pub(super) fn has_inflight(self) -> bool {
         !self.inflight.is_zero()
@@ -163,6 +167,27 @@ where
             available: new_available,
             inflight: self.inflight,
         })
+    }
+
+    /// Apply a fetched venue snapshot to reconcile tracked balance.
+    ///
+    /// When inflight is zero, sets `available = snapshot_balance` to match reality.
+    /// When inflight is non-zero, returns self unchanged - we cannot safely reconcile
+    /// while transfers are in progress because the snapshot alone cannot distinguish
+    /// between "transfer completed" vs "unrelated inventory change".
+    pub(super) fn apply_snapshot(self, snapshot_balance: T) -> Self {
+        if !self.inflight.is_zero() {
+            debug!(
+                inflight = ?self.inflight,
+                "Skipping snapshot reconciliation due to non-zero inflight"
+            );
+            return self;
+        }
+
+        Self {
+            available: snapshot_balance,
+            inflight: self.inflight,
+        }
     }
 }
 
@@ -322,5 +347,39 @@ mod tests {
 
         assert_eq!(result.available().0, Decimal::from(70));
         assert_eq!(result.inflight().0, Decimal::from(30));
+    }
+
+    #[test]
+    fn apply_snapshot_skips_when_inflight_nonzero() {
+        let balance = equity_balance(90, 10);
+        let snapshot_balance = FractionalShares::new(Decimal::from(95));
+
+        let result = balance.apply_snapshot(snapshot_balance);
+
+        // Balance unchanged when inflight is non-zero
+        assert_eq!(result.available().inner(), Decimal::from(90));
+        assert_eq!(result.inflight().inner(), Decimal::from(10));
+    }
+
+    #[test]
+    fn apply_snapshot_sets_available_when_inflight_zero() {
+        let balance = equity_balance(100, 0);
+        let snapshot_balance = FractionalShares::new(Decimal::from(75));
+
+        let result = balance.apply_snapshot(snapshot_balance);
+
+        assert_eq!(result.available().inner(), Decimal::from(75));
+        assert_eq!(result.inflight().inner(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn apply_snapshot_works_with_usdc_when_inflight_zero() {
+        let balance = usdc_balance(1000, 0);
+        let snapshot_balance = Usdc(Decimal::from(950));
+
+        let result = balance.apply_snapshot(snapshot_balance);
+
+        assert_eq!(result.available().0, Decimal::from(950));
+        assert_eq!(result.inflight().0, Decimal::ZERO);
     }
 }

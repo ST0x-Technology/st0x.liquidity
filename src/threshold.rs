@@ -2,6 +2,7 @@
 
 use alloy::primitives::U256;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
@@ -39,6 +40,11 @@ impl Usdc {
     #[cfg(test)]
     pub(crate) fn inner(self) -> Decimal {
         self.0
+    }
+
+    /// Creates a Usdc amount from cents (e.g., 12345 cents = $123.45).
+    pub(crate) fn from_cents(cents: i64) -> Option<Self> {
+        Decimal::from(cents).checked_div(dec!(100)).map(Self)
     }
 
     pub(crate) fn is_zero(self) -> bool {
@@ -305,5 +311,29 @@ mod tests {
         assert_eq!(err.operation, "*");
         assert_eq!(err.lhs, max);
         assert_eq!(err.rhs, Usdc(two));
+    }
+
+    #[test]
+    fn from_cents_converts_positive_cents_to_dollars() {
+        let usdc = Usdc::from_cents(12345).unwrap();
+        assert_eq!(usdc.0, Decimal::new(12345, 2)); // 123.45
+    }
+
+    #[test]
+    fn from_cents_converts_negative_cents_to_dollars() {
+        let usdc = Usdc::from_cents(-500).unwrap();
+        assert_eq!(usdc.0, Decimal::new(-5, 0)); // -5.00
+    }
+
+    #[test]
+    fn from_cents_converts_zero() {
+        let usdc = Usdc::from_cents(0).unwrap();
+        assert!(usdc.is_zero());
+    }
+
+    #[test]
+    fn from_cents_handles_large_values() {
+        let usdc = Usdc::from_cents(i64::MAX).unwrap();
+        assert_eq!(usdc.0, Decimal::from(i64::MAX) / Decimal::from(100));
     }
 }
