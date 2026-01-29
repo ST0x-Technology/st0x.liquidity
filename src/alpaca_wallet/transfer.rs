@@ -41,10 +41,6 @@ impl AlpacaAccountId {
     pub(crate) const fn new(uuid: Uuid) -> Self {
         Self(uuid)
     }
-
-    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
 }
 
 impl std::fmt::Display for AlpacaAccountId {

@@ -50,7 +50,7 @@ impl AlpacaBrokerApiClient {
             http_client,
             base_url: config.base_url().to_string(),
             account_id: config.account_id.clone(),
-            mode: config.mode().clone(),
+            mode: config.mode(),
         })
     }
 

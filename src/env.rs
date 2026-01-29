@@ -156,7 +156,7 @@ impl<'de> Deserialize<'de> for Config {
             .hyperdx
             .map(|h| HyperDxConfig::from_toml(h, log_level_tracing));
 
-        Ok(Config {
+        Ok(Self {
             database_url: fields.database_url,
             log_level,
             server_port: fields.server_port.unwrap_or(8080),
@@ -177,7 +177,7 @@ impl Config {
     }
 
     pub fn load(toml_str: &str) -> Result<Self, ConfigError> {
-        let config: Config = toml::from_str(toml_str)?;
+        let config: Self = toml::from_str(toml_str)?;
 
         if config.rebalancing.is_some()
             && !matches!(config.broker, BrokerConfig::AlpacaBrokerApi(_))
@@ -310,9 +310,8 @@ pub mod tests {
         )
     }
 
-    fn schwab_toml_without_order_owner() -> String {
-        format!(
-            r#"
+    fn schwab_toml_without_order_owner() -> &'static str {
+        r#"
             database_url = ":memory:"
             [evm]
             ws_rpc_url = "ws://localhost:8545"
@@ -324,35 +323,17 @@ pub mod tests {
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
             "#
-        )
     }
 
-    fn alpaca_rebalancing_toml(evm_private_key: &str) -> String {
-        format!(
-            r#"
-            database_url = ":memory:"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-            orderbook = "0x1111111111111111111111111111111111111111"
-            deployment_block = 1
-            [broker]
-            type = "alpaca-broker-api"
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            [rebalancing]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            evm_private_key = "{evm_private_key}"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            [rebalancing.equity_threshold]
-            target = "0.5"
-            deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
-            "#
+    fn example_toml() -> &'static str {
+        include_str!("../example.toml")
+    }
+
+    fn example_toml_with_private_key(evm_private_key: &str) -> String {
+        example_toml().replacen(
+            "evm_private_key = \"0x0000000000000000000000000000000000000000000000000000000000000001\"",
+            &format!("evm_private_key = \"{evm_private_key}\""),
+            1,
         )
     }
 
@@ -490,7 +471,7 @@ pub mod tests {
 
     #[test]
     fn schwab_without_order_owner_fails() {
-        let result = Config::load(&schwab_toml_without_order_owner());
+        let result = Config::load(schwab_toml_without_order_owner());
         assert!(
             matches!(result, Err(ConfigError::MissingOrderOwner)),
             "Expected MissingOrderOwner error, got {result:?}"
@@ -509,10 +490,7 @@ pub mod tests {
 
     #[test]
     fn rebalancing_derives_order_owner_from_private_key() {
-        let config = Config::load(&alpaca_rebalancing_toml(
-            "0x0000000000000000000000000000000000000000000000000000000000000001",
-        ))
-        .unwrap();
+        let config = Config::load(example_toml()).unwrap();
 
         let order_owner = config.order_owner().unwrap();
         assert_eq!(
@@ -523,33 +501,12 @@ pub mod tests {
 
     #[test]
     fn rebalancing_ignores_evm_order_owner_field() {
-        let toml = r#"
-            database_url = ":memory:"
-            [evm]
-            ws_rpc_url = "ws://localhost:8545"
-            orderbook = "0x1111111111111111111111111111111111111111"
-            order_owner = "0xcccccccccccccccccccccccccccccccccccccccc"
-            deployment_block = 1
-            [broker]
-            type = "alpaca-broker-api"
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            [rebalancing]
-            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            ethereum_rpc_url = "https://mainnet.infura.io"
-            evm_private_key = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            [rebalancing.equity_threshold]
-            target = "0.5"
-            deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
-        "#;
+        let toml = example_toml().replace(
+            "deployment_block = 1",
+            "order_owner = \"0xcccccccccccccccccccccccccccccccccccccccc\"\ndeployment_block = 1",
+        );
 
-        let config = Config::load(toml).unwrap();
+        let config = Config::load(&toml).unwrap();
         let order_owner = config.order_owner().unwrap();
         assert_eq!(
             order_owner,
@@ -560,7 +517,7 @@ pub mod tests {
 
     #[test]
     fn rebalancing_with_invalid_private_key_fails() {
-        let config = Config::load(&alpaca_rebalancing_toml(
+        let config = Config::load(&example_toml_with_private_key(
             "0x0000000000000000000000000000000000000000000000000000000000000000",
         ))
         .unwrap();

@@ -1019,7 +1019,7 @@ async fn process_trade_within_transaction(
 }
 
 fn reconstruct_log_from_queued_event(
-    evm_env: &EvmConfig,
+    config: &EvmConfig,
     queued_event: &crate::queue::QueuedEvent,
 ) -> Log {
     use alloy::primitives::IntoLogData;
@@ -1035,7 +1035,7 @@ fn reconstruct_log_from_queued_event(
 
     Log {
         inner: alloy::primitives::Log {
-            address: evm_env.orderbook,
+            address: config.orderbook,
             data: log_data,
         },
         block_hash: None,

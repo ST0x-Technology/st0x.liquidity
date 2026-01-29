@@ -30,17 +30,16 @@ pub struct SchwabAuthConfig {
 
 impl SchwabAuthConfig {
     pub fn redirect_uri(&self) -> Result<&Url, url::ParseError> {
-        match &self.redirect_uri {
-            Some(url) => Ok(url),
-            None => DEFAULT_REDIRECT_URI.as_ref().map_err(|e| e.to_owned()),
-        }
+        self.redirect_uri.as_ref().map_or_else(
+            || DEFAULT_REDIRECT_URI.as_ref().map_err(ToOwned::to_owned),
+            Ok,
+        )
     }
 
     pub fn base_url(&self) -> Result<&Url, url::ParseError> {
-        match &self.base_url {
-            Some(url) => Ok(url),
-            None => DEFAULT_BASE_URL.as_ref().map_err(|e| e.to_owned()),
-        }
+        self.base_url
+            .as_ref()
+            .map_or_else(|| DEFAULT_BASE_URL.as_ref().map_err(ToOwned::to_owned), Ok)
     }
 
     pub fn account_index(&self) -> usize {

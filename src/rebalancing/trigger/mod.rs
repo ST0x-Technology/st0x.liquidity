@@ -1553,220 +1553,119 @@ mod tests {
         ));
     }
 
-    fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 7] {
-        [
-            (
-                "REDEMPTION_WALLET",
-                Some("0x1234567890123456789012345678901234567890"),
-            ),
-            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            (
-                "EVM_PRIVATE_KEY",
-                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            ),
-            ("BASE_RPC_URL", Some("https://base.example.com")),
-            (
-                "BASE_ORDERBOOK",
-                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            ),
-            (
-                "USDC_VAULT_ID",
-                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            ),
-            (
-                "ALPACA_ACCOUNT_ID",
-                Some("904837e3-3b76-47ec-b432-046db621571b"),
-            ),
-        ]
+    fn valid_rebalancing_toml() -> &'static str {
+        r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [equity_threshold]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc_threshold]
+            target = "0.5"
+            deviation = "0.3"
+        "#
     }
 
     #[test]
-    fn from_env_with_all_required_fields_succeeds() {
-        temp_env::with_vars(all_rebalancing_env_vars(), || {
-            let config = RebalancingConfig::from_env().unwrap();
+    fn deserialize_with_all_required_fields_succeeds() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_toml()).unwrap();
 
-            assert_eq!(config.equity_threshold.target, dec!(0.5));
-            assert_eq!(config.equity_threshold.deviation, dec!(0.2));
-            assert_eq!(config.usdc_threshold.target, dec!(0.5));
-            assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
-            assert_eq!(
-                config.redemption_wallet,
-                address!("1234567890123456789012345678901234567890")
-            );
-        });
+        assert_eq!(config.equity_threshold.target, dec!(0.5));
+        assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+        assert_eq!(config.usdc_threshold.target, dec!(0.5));
+        assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
+        assert_eq!(
+            config.redemption_wallet,
+            address!("1234567890123456789012345678901234567890")
+        );
     }
 
     #[test]
-    fn from_env_with_custom_thresholds() {
-        let vars = [
-            (
-                "REDEMPTION_WALLET",
-                Some("0x1234567890123456789012345678901234567890"),
-            ),
-            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            (
-                "EVM_PRIVATE_KEY",
-                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            ),
-            ("BASE_RPC_URL", Some("https://base.example.com")),
-            (
-                "BASE_ORDERBOOK",
-                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            ),
-            (
-                "USDC_VAULT_ID",
-                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            ),
-            (
-                "ALPACA_ACCOUNT_ID",
-                Some("904837e3-3b76-47ec-b432-046db621571b"),
-            ),
-            ("EQUITY_TARGET_RATIO", Some("0.6")),
-            ("EQUITY_DEVIATION", Some("0.1")),
-            ("USDC_TARGET_RATIO", Some("0.4")),
-            ("USDC_DEVIATION", Some("0.15")),
-        ];
+    fn deserialize_with_custom_thresholds() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-        temp_env::with_vars(vars, || {
-            let config = RebalancingConfig::from_env().unwrap();
+            [equity_threshold]
+            target = "0.6"
+            deviation = "0.1"
 
-            assert_eq!(config.equity_threshold.target, dec!(0.6));
-            assert_eq!(config.equity_threshold.deviation, dec!(0.1));
-            assert_eq!(config.usdc_threshold.target, dec!(0.4));
-            assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
-        });
+            [usdc_threshold]
+            target = "0.4"
+            deviation = "0.15"
+        "#;
+
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+
+        assert_eq!(config.equity_threshold.target, dec!(0.6));
+        assert_eq!(config.equity_threshold.deviation, dec!(0.1));
+        assert_eq!(config.usdc_threshold.target, dec!(0.4));
+        assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
     }
 
     #[test]
-    fn from_env_missing_redemption_wallet_fails() {
-        let vars = [
-            ("REDEMPTION_WALLET", None),
-            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            (
-                "EVM_PRIVATE_KEY",
-                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            ),
-            ("BASE_RPC_URL", Some("https://base.example.com")),
-            (
-                "BASE_ORDERBOOK",
-                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            ),
-            (
-                "USDC_VAULT_ID",
-                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            ),
-            (
-                "ALPACA_ACCOUNT_ID",
-                Some("904837e3-3b76-47ec-b432-046db621571b"),
-            ),
-        ];
+    fn deserialize_missing_redemption_wallet_fails() {
+        let toml_str = r#"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-        temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
-            assert!(
-                matches!(result, Err(RebalancingConfigError::Clap(_))),
-                "Expected Clap error, got {result:?}"
-            );
-        });
+            [equity_threshold]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc_threshold]
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
-    fn from_env_missing_evm_private_key_fails() {
-        let vars = [
-            (
-                "REDEMPTION_WALLET",
-                Some("0x1234567890123456789012345678901234567890"),
-            ),
-            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            ("EVM_PRIVATE_KEY", None),
-            ("BASE_RPC_URL", Some("https://base.example.com")),
-            (
-                "BASE_ORDERBOOK",
-                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            ),
-            (
-                "USDC_VAULT_ID",
-                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            ),
-            (
-                "ALPACA_ACCOUNT_ID",
-                Some("904837e3-3b76-47ec-b432-046db621571b"),
-            ),
-        ];
+    fn deserialize_missing_evm_private_key_fails() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            ethereum_rpc_url = "https://eth.example.com"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-        temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
-            assert!(
-                matches!(result, Err(RebalancingConfigError::Clap(_))),
-                "Expected Clap error, got {result:?}"
-            );
-        });
+            [equity_threshold]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc_threshold]
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
-    fn from_env_invalid_address_format_fails() {
-        let vars = [
-            ("REDEMPTION_WALLET", Some("not-an-address")),
-            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            (
-                "EVM_PRIVATE_KEY",
-                Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
-            ),
-            ("BASE_RPC_URL", Some("https://base.example.com")),
-            (
-                "BASE_ORDERBOOK",
-                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            ),
-            (
-                "USDC_VAULT_ID",
-                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            ),
-            (
-                "ALPACA_ACCOUNT_ID",
-                Some("904837e3-3b76-47ec-b432-046db621571b"),
-            ),
-        ];
+    fn deserialize_missing_equity_threshold_fails() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-        temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
-            assert!(
-                matches!(result, Err(RebalancingConfigError::Clap(_))),
-                "Expected Clap error, got {result:?}"
-            );
-        });
-    }
+            [usdc_threshold]
+            target = "0.5"
+            deviation = "0.3"
+        "#;
 
-    #[test]
-    fn from_env_invalid_private_key_format_fails() {
-        let vars = [
-            (
-                "REDEMPTION_WALLET",
-                Some("0x1234567890123456789012345678901234567890"),
-            ),
-            ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
-            ("EVM_PRIVATE_KEY", Some("not-a-valid-key")),
-            ("BASE_RPC_URL", Some("https://base.example.com")),
-            (
-                "BASE_ORDERBOOK",
-                Some("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd"),
-            ),
-            (
-                "USDC_VAULT_ID",
-                Some("0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"),
-            ),
-            (
-                "ALPACA_ACCOUNT_ID",
-                Some("904837e3-3b76-47ec-b432-046db621571b"),
-            ),
-        ];
-
-        temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
-            assert!(
-                matches!(result, Err(RebalancingConfigError::Clap(_))),
-                "Expected Clap error, got {result:?}"
-            );
-        });
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;

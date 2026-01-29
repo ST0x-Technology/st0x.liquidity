@@ -6642,7 +6642,6 @@ dependencies = [
  "chrono-tz",
  "clap",
  "cqrs-es",
- "dotenvy",
  "flate2",
  "futures-util",
  "httpmock",

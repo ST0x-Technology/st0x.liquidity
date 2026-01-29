@@ -912,8 +912,8 @@ mod tests {
         let auth = AlpacaBrokerApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+            account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 
         AlpacaBrokerApi::try_from_config(auth)

@@ -27,7 +27,7 @@ impl Default for OrderPollerConfig {
 
 pub(crate) struct OrderStatusPoller<B: Broker> {
     config: OrderPollerConfig,
-    env: SchwabAuthConfig,
+    auth: SchwabAuthConfig,
     pool: SqlitePool,
     interval: Interval,
     broker: B,
@@ -36,7 +36,7 @@ pub(crate) struct OrderStatusPoller<B: Broker> {
 impl<B: Broker> OrderStatusPoller<B> {
     pub(crate) fn new(
         config: OrderPollerConfig,
-        env: SchwabAuthConfig,
+        auth: SchwabAuthConfig,
         pool: SqlitePool,
         broker: B,
     ) -> Self {
@@ -44,7 +44,7 @@ impl<B: Broker> OrderStatusPoller<B> {
 
         Self {
             config,
-            env,
+            auth,
             pool,
             interval,
             broker,
@@ -128,7 +128,7 @@ impl<B: Broker> OrderStatusPoller<B> {
 
         let order_status = self
             .broker
-            .get_order_status(&order_id, &self.env, &self.pool)
+            .get_order_status(&order_id, &self.auth, &self.pool)
             .await?;
 
         if order_status.is_filled() {
@@ -336,17 +336,17 @@ mod tests {
     #[tokio::test]
     async fn test_order_poller_creation() {
         let config = OrderPollerConfig::default();
-        let env = SchwabAuthConfig {
+        let auth = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: "https://api.schwabapi.com".to_string(),
-            account_index: 0,
+            redirect_uri: None,
+            base_url: None,
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let pool = setup_test_db().await;
 
-        let poller = OrderStatusPoller::new(config.clone(), env, pool, Schwab);
+        let poller = OrderStatusPoller::new(config.clone(), auth, pool, Schwab);
         assert_eq!(poller.config.polling_interval, config.polling_interval);
         assert_eq!(poller.config.max_jitter, config.max_jitter);
     }
@@ -354,17 +354,17 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pending_orders_empty_database() {
         let config = OrderPollerConfig::default();
-        let env = SchwabAuthConfig {
+        let auth = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: "https://api.schwabapi.com".to_string(),
-            account_index: 0,
+            redirect_uri: None,
+            base_url: None,
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let pool = setup_test_db().await;
 
-        let poller = OrderStatusPoller::new(config, env, pool, Schwab);
+        let poller = OrderStatusPoller::new(config, auth, pool, Schwab);
 
         let result = poller.poll_pending_orders().await;
         assert!(result.is_ok());
@@ -373,12 +373,12 @@ mod tests {
     #[tokio::test]
     async fn test_poll_execution_status_missing_order_id() {
         let config = OrderPollerConfig::default();
-        let env = SchwabAuthConfig {
+        let auth = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: "https://api.schwabapi.com".to_string(),
-            account_index: 0,
+            redirect_uri: None,
+            base_url: None,
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let pool = setup_test_db().await;
@@ -395,7 +395,7 @@ mod tests {
         let execution_id = execution.save_within_transaction(&mut tx).await.unwrap();
         tx.commit().await.unwrap();
 
-        let poller = OrderStatusPoller::new(config, env, pool.clone(), Schwab);
+        let poller = OrderStatusPoller::new(config, auth, pool.clone(), Schwab);
 
         // Fetch the execution to pass to poll_execution_status
         let execution = find_execution_by_id(&pool, execution_id)
@@ -413,12 +413,12 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Setup test environment with mock server
-        let env = SchwabAuthConfig {
+        let auth = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: server.base_url(),
-            account_index: 0,
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
@@ -429,7 +429,7 @@ mod tests {
             refresh_token: "test_refresh_token".to_string(),
             refresh_token_fetched_at: chrono::Utc::now(),
         };
-        tokens.store(&pool, &env.encryption_key).await.unwrap();
+        tokens.store(&pool, &auth.encryption_key).await.unwrap();
 
         // Mock account hash endpoint
         let account_mock = server.mock(|when, then| {
@@ -506,7 +506,7 @@ mod tests {
 
         // Step 4: Poll for status and let the poller find it's filled
         let config = OrderPollerConfig::default();
-        let poller = OrderStatusPoller::new(config, env.clone(), pool.clone(), Schwab);
+        let poller = OrderStatusPoller::new(config, auth.clone(), pool.clone(), Schwab);
 
         // Step 5: Poll for status and verify order gets updated to FILLED with actual price
         let execution = find_execution_by_id(&pool, execution_id)
@@ -592,12 +592,12 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Setup test environment
-        let env = SchwabAuthConfig {
+        let auth = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: server.base_url(),
-            account_index: 0,
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
@@ -608,7 +608,7 @@ mod tests {
             refresh_token: "test_refresh_token".to_string(),
             refresh_token_fetched_at: chrono::Utc::now(),
         };
-        tokens.store(&pool, &env.encryption_key).await.unwrap();
+        tokens.store(&pool, &auth.encryption_key).await.unwrap();
 
         // Mock account hash endpoint
         let account_mock = server.mock(|when, then| {
@@ -686,7 +686,7 @@ mod tests {
             max_jitter: std::time::Duration::from_millis(10),
         };
 
-        let poller = OrderStatusPoller::new(config, env, pool.clone(), Schwab);
+        let poller = OrderStatusPoller::new(config, auth, pool.clone(), Schwab);
 
         // Measure performance of concurrent polling
         let start_time = Instant::now();
@@ -743,12 +743,12 @@ mod tests {
         let server = MockServer::start();
         let pool = setup_test_db().await;
 
-        let env = SchwabAuthConfig {
+        let auth = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: server.base_url(),
-            account_index: 0,
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
@@ -758,7 +758,7 @@ mod tests {
             refresh_token: "test_refresh_token".to_string(),
             refresh_token_fetched_at: chrono::Utc::now(),
         };
-        tokens.store(&pool, &env.encryption_key).await.unwrap();
+        tokens.store(&pool, &auth.encryption_key).await.unwrap();
 
         let execution = SchwabExecution {
             id: None,
@@ -791,7 +791,7 @@ mod tests {
             .unwrap();
         sql_tx.commit().await.unwrap();
 
-        (server, pool, env, execution_id)
+        (server, pool, auth, execution_id)
     }
 
     fn setup_failed_order_mocks(server: &MockServer) -> (Mock, Mock) {
@@ -861,7 +861,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_failed_order_clears_pending_execution_id() {
-        let (server, pool, env, execution_id) = setup_failed_order_test().await;
+        let (server, pool, auth, execution_id) = setup_failed_order_test().await;
         let (account_mock, order_status_mock) = setup_failed_order_mocks(&server);
 
         // Verify pending_execution_id is set before the test
@@ -875,7 +875,7 @@ mod tests {
         assert_eq!(row.pending_execution_id, Some(execution_id));
 
         let config = OrderPollerConfig::default();
-        let poller = OrderStatusPoller::new(config, env, pool.clone(), Schwab);
+        let poller = OrderStatusPoller::new(config, auth, pool.clone(), Schwab);
 
         let execution = find_execution_by_id(&pool, execution_id)
             .await

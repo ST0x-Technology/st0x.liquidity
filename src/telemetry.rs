@@ -70,6 +70,12 @@ use thiserror::Error;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HyperDxTomlConfig {
+    pub(crate) api_key: String,
+    pub(crate) service_name: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HyperDxConfig {
     pub(crate) api_key: String,

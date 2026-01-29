@@ -534,7 +534,7 @@ mod tests {
         let auth = AlpacaTradingApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            trading_mode: st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Paper,
+            trading_mode: Some(st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Paper),
         };
 
         let broker_api_mode = if auth.is_paper_trading() {
@@ -555,7 +555,7 @@ mod tests {
         let auth = AlpacaTradingApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            trading_mode: st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Live,
+            trading_mode: Some(st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Live),
         };
 
         let broker_api_mode = if auth.is_paper_trading() {

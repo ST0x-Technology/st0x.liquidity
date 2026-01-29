@@ -40,17 +40,16 @@ impl AlpacaBrokerApiAuthConfig {
     }
 
     pub fn base_url(&self) -> &str {
-        match &self.mode {
-            Some(mode) => mode.base_url(),
-            None => AlpacaBrokerApiMode::Sandbox.base_url(),
-        }
+        self.mode.as_ref().map_or_else(
+            || AlpacaBrokerApiMode::Sandbox.base_url(),
+            |mode| mode.base_url(),
+        )
     }
 
     pub fn is_sandbox(&self) -> bool {
-        match &self.mode {
-            Some(mode) => !matches!(mode, AlpacaBrokerApiMode::Production),
-            None => true,
-        }
+        self.mode
+            .as_ref()
+            .is_none_or(|mode| !matches!(mode, AlpacaBrokerApiMode::Production))
     }
 }
 

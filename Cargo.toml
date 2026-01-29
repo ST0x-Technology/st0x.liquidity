@@ -87,7 +87,6 @@ sqlite-es.workspace = true
 st0x-execution = { path = "crates/execution" }
 backon.workspace = true
 clap.workspace = true
-dotenvy = "0.15.7"
 futures-util = "0.3.31"
 lazy_static = "1.5.0"
 rain-math-float.workspace = true
@@ -134,10 +133,6 @@ temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
 st0x-execution = { path = "crates/execution", features = ["mock"] }
 tempfile = "3.24.0"
-
-[[bin]]
-name = "migrate_to_events"
-path = "src/bin/migrate_to_events.rs"
 
 [[bin]]
 name = "validate_config"

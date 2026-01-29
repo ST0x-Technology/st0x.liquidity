@@ -3,10 +3,9 @@ use st0x_hedge::env::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv_override().ok();
-    let (env, command) = cli::CliEnv::parse_and_convert()?;
-    setup_tracing(&env.log_level);
+    let (config, command) = cli::CliEnv::parse_and_convert()?;
+    setup_tracing(&config.log_level);
 
-    cli::run_command(env, command).await?;
+    cli::run_command(config, command).await?;
     Ok(())
 }

@@ -158,19 +158,12 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     provider: &P,
     cache: &SymbolCache,
 ) -> anyhow::Result<()> {
-    let evm_env = &config.evm;
+    let evm = &config.evm;
     let feed_id_cache = FeedIdCache::new();
     let order_owner = config.order_owner()?;
 
-    match OnchainTrade::try_from_tx_hash(
-        tx_hash,
-        provider,
-        cache,
-        evm_env,
-        &feed_id_cache,
-        order_owner,
-    )
-    .await
+    match OnchainTrade::try_from_tx_hash(tx_hash, provider, cache, evm, &feed_id_cache, order_owner)
+        .await
     {
         Ok(Some(onchain_trade)) => {
             process_found_trade(onchain_trade, config, pool, stdout).await?;

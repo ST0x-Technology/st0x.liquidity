@@ -2,9 +2,6 @@ database_url = ":memory:"
 log_level = "debug"
 server_port = 8080
 
-order_polling_interval = 15
-order_polling_max_jitter = 5
-
 [evm]
 # Base WebSocket JSON RPC URL
 ws_rpc_url = "ws://localhost:8545"
