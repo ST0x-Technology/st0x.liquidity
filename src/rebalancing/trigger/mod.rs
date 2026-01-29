@@ -38,6 +38,8 @@ pub enum RebalancingConfigError {
     NotAlpacaBroker,
     #[error(transparent)]
     Clap(#[from] clap::Error),
+    #[error("invalid ALPACA_ACCOUNT_ID in broker auth")]
+    InvalidAccountId(#[from] uuid::Error),
 }
 
 /// Environment configuration for rebalancing (parsed via clap).
@@ -67,9 +69,6 @@ pub struct RebalancingEnv {
     /// Vault ID for USDC deposits to the Raindex vault
     #[clap(long, env)]
     usdc_vault_id: B256,
-    /// Alpaca account ID (UUID) for Broker API wallet operations
-    #[clap(long, env, value_parser = AlpacaAccountId::parse)]
-    alpaca_account_id: AlpacaAccountId,
 }
 
 impl RebalancingConfig {
@@ -82,6 +81,10 @@ impl RebalancingConfig {
         const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
 
         let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+
+        // Validate the account ID is a valid UUID upfront so callers
+        // don't encounter parse failures at runtime.
+        let alpaca_account_id = AlpacaAccountId::parse(&alpaca_broker_auth.alpaca_account_id)?;
 
         Ok(Self {
             equity_threshold: ImbalanceThreshold {
@@ -96,7 +99,7 @@ impl RebalancingConfig {
             ethereum_rpc_url: env.ethereum_rpc_url,
             evm_private_key: env.evm_private_key,
             usdc_vault_id: env.usdc_vault_id,
-            alpaca_account_id: env.alpaca_account_id,
+            alpaca_account_id,
             alpaca_broker_auth,
         })
     }
@@ -112,7 +115,7 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Alpaca AP (Authorized Participant) account ID for Broker API operations.
+    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Alpaca Broker API authentication for rebalancing operations.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthEnv,
