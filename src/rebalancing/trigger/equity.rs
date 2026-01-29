@@ -12,7 +12,7 @@ use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 
 /// Why an equity trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EquityTriggerSkip {
+pub(super) enum EquityTriggerSkip {
     /// No imbalance detected for this symbol.
     NoImbalance,
 }

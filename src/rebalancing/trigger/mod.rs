@@ -33,7 +33,6 @@ use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 
 use crate::vault_registry::VaultRegistryError;
-pub(crate) use equity::EquityTriggerSkip;
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
@@ -349,17 +348,14 @@ impl RebalancingTrigger {
             }
         };
 
-        match equity::check_imbalance_and_build_operation(
+        equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity_threshold,
             &self.inventory,
             token_address,
         )
         .await
-        {
-            Ok(op) => Some(op),
-            Err(EquityTriggerSkip::NoImbalance) => None,
-        }
+        .ok()
     }
 
     async fn load_token_address(
