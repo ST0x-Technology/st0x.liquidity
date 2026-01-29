@@ -4,3 +4,6 @@
 [submodule "lib/rain.orderbook"]
 	path = lib/rain.orderbook
 	url = https://github.com/rainlanguage/rain.orderbook
+[submodule "lib/pyth-crosschain"]
+	path = lib/pyth-crosschain
+	url = https://github.com/pyth-network/pyth-crosschain

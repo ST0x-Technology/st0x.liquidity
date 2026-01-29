@@ -1,1 +1,1 @@
-@pythnetwork/pyth-sdk-solidity/=node_modules/@pythnetwork/pyth-sdk-solidity/
+@pythnetwork/pyth-sdk-solidity/=lib/pyth-crosschain/target_chains/ethereum/sdk/solidity/
