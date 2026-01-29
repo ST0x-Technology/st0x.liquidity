@@ -208,7 +208,6 @@ async fn run_bot_session(
                 config.clone(),
                 pool.clone(),
                 executor,
-                None,
                 event_sender,
             ))
             .await
@@ -225,7 +224,6 @@ async fn run_bot_session(
                 config.clone(),
                 pool.clone(),
                 executor,
-                None,
                 event_sender,
             ))
             .await
@@ -238,7 +236,6 @@ async fn run_bot_session(
                 config.clone(),
                 pool.clone(),
                 executor,
-                None,
                 event_sender,
             ))
             .await
@@ -251,7 +248,6 @@ async fn run_bot_session(
                 config.clone(),
                 pool.clone(),
                 executor,
-                None,
                 event_sender,
             ))
             .await
@@ -263,7 +259,6 @@ async fn run_with_executor<E>(
     config: Config,
     pool: SqlitePool,
     executor: E,
-    rebalancer: Option<JoinHandle<()>>,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()>
 where
@@ -272,15 +267,8 @@ where
 {
     let executor_maintenance = executor.run_executor_maintenance().await;
 
-    conductor::run_market_hours_loop(
-        executor,
-        config,
-        pool,
-        executor_maintenance,
-        rebalancer,
-        event_sender,
-    )
-    .await
+    conductor::run_market_hours_loop(executor, config, pool, executor_maintenance, event_sender)
+        .await
 }
 
 #[cfg(test)]

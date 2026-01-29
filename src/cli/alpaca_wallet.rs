@@ -514,6 +514,12 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
+                alpaca_broker_auth: AlpacaBrokerApiAuthEnv {
+                    alpaca_broker_api_key: "test-key".to_string(),
+                    alpaca_broker_api_secret: "test-secret".to_string(),
+                    alpaca_account_id: alpaca_account_id.to_string(),
+                    alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                },
             }),
             execution_threshold: ExecutionThreshold::whole_share(),
         }

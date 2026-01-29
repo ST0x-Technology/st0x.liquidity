@@ -27,6 +27,7 @@ use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use chrono::Utc;
 use st0x_execution::Symbol;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 
 pub(crate) use equity::EquityTriggerSkip;
 
@@ -73,7 +74,9 @@ pub struct RebalancingEnv {
 
 impl RebalancingConfig {
     /// Parse rebalancing configuration from environment variables.
-    pub(crate) fn from_env() -> Result<Self, RebalancingConfigError> {
+    pub(crate) fn from_env(
+        alpaca_broker_auth: AlpacaBrokerApiAuthEnv,
+    ) -> Result<Self, RebalancingConfigError> {
         // clap's try_parse_from expects argv[0] to be the program name, but we only
         // care about environment variables, so this is just a placeholder.
         const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
@@ -94,6 +97,7 @@ impl RebalancingConfig {
             evm_private_key: env.evm_private_key,
             usdc_vault_id: env.usdc_vault_id,
             alpaca_account_id: env.alpaca_account_id,
+            alpaca_broker_auth,
         })
     }
 }
@@ -110,6 +114,8 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc_vault_id: B256,
     /// Alpaca AP (Authorized Participant) account ID for Broker API operations.
     pub(crate) alpaca_account_id: AlpacaAccountId,
+    /// Alpaca Broker API authentication for rebalancing operations.
+    pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthEnv,
 }
 
 impl std::fmt::Debug for RebalancingConfig {
@@ -122,6 +128,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
+            .field("alpaca_broker_auth", &"[REDACTED]")
             .finish()
     }
 }
@@ -579,6 +586,8 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
     use uuid::Uuid;
+
+    use st0x_execution::alpaca_broker_api::AlpacaBrokerApiMode;
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -1625,6 +1634,15 @@ mod tests {
         ));
     }
 
+    fn test_broker_auth() -> AlpacaBrokerApiAuthEnv {
+        AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test_key".to_string(),
+            alpaca_broker_api_secret: "test_secret".to_string(),
+            alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+        }
+    }
+
     fn all_rebalancing_env_vars() -> [(&'static str, Option<&'static str>); 7] {
         [
             (
@@ -1655,7 +1673,7 @@ mod tests {
     #[test]
     fn from_env_with_all_required_fields_succeeds() {
         temp_env::with_vars(all_rebalancing_env_vars(), || {
-            let config = RebalancingConfig::from_env().unwrap();
+            let config = RebalancingConfig::from_env(test_broker_auth()).unwrap();
 
             assert_eq!(config.equity_threshold.target, dec!(0.5));
             assert_eq!(config.equity_threshold.deviation, dec!(0.15));
@@ -1700,7 +1718,7 @@ mod tests {
         ];
 
         temp_env::with_vars(vars, || {
-            let config = RebalancingConfig::from_env().unwrap();
+            let config = RebalancingConfig::from_env(test_broker_auth()).unwrap();
 
             assert_eq!(config.equity_threshold.target, dec!(0.6));
             assert_eq!(config.equity_threshold.deviation, dec!(0.1));
@@ -1734,7 +1752,7 @@ mod tests {
         ];
 
         temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
+            let result = RebalancingConfig::from_env(test_broker_auth());
             assert!(
                 matches!(result, Err(RebalancingConfigError::Clap(_))),
                 "Expected Clap error, got {result:?}"
@@ -1767,7 +1785,7 @@ mod tests {
         ];
 
         temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
+            let result = RebalancingConfig::from_env(test_broker_auth());
             assert!(
                 matches!(result, Err(RebalancingConfigError::Clap(_))),
                 "Expected Clap error, got {result:?}"
@@ -1800,7 +1818,7 @@ mod tests {
         ];
 
         temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
+            let result = RebalancingConfig::from_env(test_broker_auth());
             assert!(
                 matches!(result, Err(RebalancingConfigError::Clap(_))),
                 "Expected Clap error, got {result:?}"
@@ -1833,7 +1851,7 @@ mod tests {
         ];
 
         temp_env::with_vars(vars, || {
-            let result = RebalancingConfig::from_env();
+            let result = RebalancingConfig::from_env(test_broker_auth());
             assert!(
                 matches!(result, Err(RebalancingConfigError::Clap(_))),
                 "Expected Clap error, got {result:?}"

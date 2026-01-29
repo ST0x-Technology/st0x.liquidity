@@ -238,10 +238,10 @@ impl Env {
         });
 
         let rebalancing = if self.rebalancing_enabled {
-            if !matches!(broker, BrokerConfig::AlpacaBrokerApi(_)) {
+            let BrokerConfig::AlpacaBrokerApi(ref auth) = broker else {
                 return Err(RebalancingConfigError::NotAlpacaBroker.into());
-            }
-            Some(RebalancingConfig::from_env()?)
+            };
+            Some(RebalancingConfig::from_env(auth.clone())?)
         } else {
             None
         };
@@ -282,6 +282,10 @@ impl Env {
 impl Config {
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
         configure_sqlite_pool(&self.database_url).await
+    }
+
+    pub(crate) fn rebalancing_config(&self) -> Option<&RebalancingConfig> {
+        self.rebalancing.as_ref()
     }
 
     pub const fn get_order_poller_config(&self) -> OrderPollerConfig {
@@ -1346,6 +1350,152 @@ pub(crate) mod tests {
                 assert!(
                     matches!(result, Err(ConfigError::PrivateKeyDerivation(_))),
                     "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn rebalancing_config_returns_some_for_alpaca_broker_api() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                assert!(
+                    config.rebalancing_config().is_some(),
+                    "rebalancing_config() should return Some for AlpacaBrokerApi with rebalancing enabled"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn rebalancing_config_returns_none_when_disabled() {
+        temp_env::with_vars([("REBALANCING_ENABLED", None::<&str>)], || {
+            let args = vec![
+                "test",
+                "--db",
+                ":memory:",
+                "--ws-rpc-url",
+                "ws://localhost:8545",
+                "--orderbook",
+                "0x1111111111111111111111111111111111111111",
+                "--order-owner",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--deployment-block",
+                "1",
+                "--executor",
+                "dry-run",
+            ];
+
+            let env = Env::try_parse_from(args).unwrap();
+            let config = env.into_config().unwrap();
+            assert!(
+                config.rebalancing_config().is_none(),
+                "rebalancing_config() should return None when rebalancing is disabled"
+            );
+        });
+    }
+
+    #[test]
+    fn rebalancing_config_contains_broker_auth() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("my_broker_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("my_broker_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let rebalancing = config.rebalancing_config().unwrap();
+
+                assert_eq!(
+                    rebalancing.alpaca_broker_auth.alpaca_broker_api_key,
+                    "my_broker_key"
+                );
+                assert_eq!(
+                    rebalancing.alpaca_broker_auth.alpaca_broker_api_secret,
+                    "my_broker_secret"
                 );
             },
         );
