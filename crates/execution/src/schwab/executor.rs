@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::schwab::SchwabAuthEnv;
+use crate::schwab::SchwabAuthConfig;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
 use crate::{
@@ -14,14 +14,14 @@ use crate::{
 /// Configuration for SchwabExecutor containing auth environment and database pool
 #[derive(Debug, Clone)]
 pub struct SchwabConfig {
-    pub auth: SchwabAuthEnv,
+    pub auth: SchwabAuthConfig,
     pub pool: SqlitePool,
 }
 
 /// Schwab executor implementation
 #[derive(Debug, Clone)]
 pub struct SchwabExecutor {
-    auth: SchwabAuthEnv,
+    auth: SchwabAuthConfig,
     pool: SqlitePool,
 }
 
@@ -279,31 +279,31 @@ impl TryIntoExecutor for SchwabConfig {
 mod tests {
     use super::*;
     use crate::schwab::tokens::SchwabTokens;
-    use crate::schwab::{SchwabAuthEnv, SchwabError};
+    use crate::schwab::{SchwabAuthConfig, SchwabError};
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db};
     use chrono::{Duration, Utc};
     use httpmock::prelude::*;
     use serde_json::json;
     use sqlx::SqlitePool;
 
-    fn create_test_auth_env() -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_key".to_string(),
-            schwab_app_secret: "test_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: "https://test.com".to_string(),
-            schwab_account_index: 0,
+    fn create_test_auth_env() -> SchwabAuthConfig {
+        SchwabAuthConfig {
+            app_key: "test_key".to_string(),
+            app_secret: "test_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse("https://test.com").expect("test url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
     }
 
-    fn create_test_auth_env_with_server(server: &MockServer) -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_key".to_string(),
-            schwab_app_secret: "test_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: server.base_url(),
-            schwab_account_index: 0,
+    fn create_test_auth_env_with_server(server: &MockServer) -> SchwabAuthConfig {
+        SchwabAuthConfig {
+            app_key: "test_key".to_string(),
+            app_secret: "test_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
     }
@@ -343,7 +343,7 @@ mod tests {
 
         assert!(result.is_ok());
         let broker = result.unwrap();
-        assert_eq!(broker.auth.schwab_app_key, "test_key");
+        assert_eq!(broker.auth.app_key, "test_key");
     }
 
     #[tokio::test]

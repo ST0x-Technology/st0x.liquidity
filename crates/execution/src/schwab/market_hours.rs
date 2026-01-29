@@ -6,7 +6,7 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 use tracing::debug;
 
-use super::{SchwabAuthEnv, SchwabError, SchwabTokens};
+use super::{SchwabAuthConfig, SchwabError, SchwabTokens};
 
 /// Market session types for trading hours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

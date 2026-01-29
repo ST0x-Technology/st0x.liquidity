@@ -844,7 +844,8 @@ mod tests {
 
     use st0x_execution::Executor;
     use st0x_execution::alpaca_broker_api::{
-        AlpacaBrokerApiAuthEnv, AlpacaBrokerApiError, AlpacaBrokerApiMode, CryptoOrderFailureReason,
+        AlpacaBrokerApiAuthConfig, AlpacaBrokerApiError, AlpacaBrokerApiMode,
+        CryptoOrderFailureReason,
     };
 
     use super::*;
@@ -908,11 +909,11 @@ mod tests {
     async fn create_test_broker_service(server: &MockServer) -> AlpacaBrokerApi {
         let _account_mock = create_broker_account_mock(server);
 
-        let auth = AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key".to_string(),
-            alpaca_broker_api_secret: "test_secret".to_string(),
+        let auth = AlpacaBrokerApiAuthConfig {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
             alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+            mode: AlpacaBrokerApiMode::Mock(server.base_url()),
         };
 
         AlpacaBrokerApi::try_from_config(auth)

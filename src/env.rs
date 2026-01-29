@@ -9,9 +9,9 @@ use crate::onchain::EvmEnv;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
 use crate::telemetry::HyperDxConfig;
 use st0x_execution::SupportedExecutor;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
-use st0x_execution::schwab::SchwabAuthEnv;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
+use st0x_execution::schwab::SchwabAuthConfig;
 
 // Dummy program name required by clap when parsing from environment variables.
 // clap's try_parse_from expects argv[0] to be the program name, but we only
@@ -20,9 +20,9 @@ const DUMMY_PROGRAM_NAME: &[&str] = &["server"];
 
 #[derive(Debug, Clone)]
 pub enum BrokerConfig {
-    Schwab(SchwabAuthEnv),
-    AlpacaTradingApi(AlpacaTradingApiAuthEnv),
-    AlpacaBrokerApi(AlpacaBrokerApiAuthEnv),
+    Schwab(SchwabAuthConfig),
+    AlpacaTradingApi(AlpacaTradingApiAuthConfig),
+    AlpacaBrokerApi(AlpacaBrokerApiAuthConfig),
     DryRun,
 }
 
@@ -162,15 +162,15 @@ impl Env {
     pub fn into_config(self) -> Result<Config, ConfigError> {
         let broker = match self.executor {
             SupportedExecutor::Schwab => {
-                let schwab_auth = SchwabAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                let schwab_auth = SchwabAuthConfig::try_parse_from(DUMMY_PROGRAM_NAME)?;
                 BrokerConfig::Schwab(schwab_auth)
             }
             SupportedExecutor::AlpacaTradingApi => {
-                let alpaca_auth = AlpacaTradingApiAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                let alpaca_auth = AlpacaTradingApiAuthConfig::try_parse_from(DUMMY_PROGRAM_NAME)?;
                 BrokerConfig::AlpacaTradingApi(alpaca_auth)
             }
             SupportedExecutor::AlpacaBrokerApi => {
-                let alpaca_auth = AlpacaBrokerApiAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+                let alpaca_auth = AlpacaBrokerApiAuthConfig::try_parse_from(DUMMY_PROGRAM_NAME)?;
                 BrokerConfig::AlpacaBrokerApi(alpaca_auth)
             }
             SupportedExecutor::DryRun => BrokerConfig::DryRun,
@@ -253,7 +253,7 @@ pub mod tests {
     use crate::onchain::EvmEnv;
     use alloy::primitives::{Address, FixedBytes, address};
     use rust_decimal::Decimal;
-    use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
+    use st0x_execution::schwab::{SchwabAuthConfig, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -271,12 +271,12 @@ pub mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuthEnv {
-                schwab_app_key: "test_key".to_string(),
-                schwab_app_secret: "test_secret".to_string(),
-                schwab_redirect_uri: "https://127.0.0.1".to_string(),
-                schwab_base_url: "https://test.com".to_string(),
-                schwab_account_index: 0,
+            broker: BrokerConfig::Schwab(SchwabAuthConfig {
+                app_key: "test_key".to_string(),
+                app_secret: "test_secret".to_string(),
+                redirect_uri: "https://127.0.0.1".to_string(),
+                base_url: "https://test.com".to_string(),
+                account_index: 0,
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,

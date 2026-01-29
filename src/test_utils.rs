@@ -7,7 +7,7 @@ use alloy::rpc::types::Log;
 use chrono::Utc;
 use sqlx::SqlitePool;
 use st0x_execution::OrderState;
-use st0x_execution::schwab::{SchwabAuthEnv, SchwabTokens};
+use st0x_execution::schwab::{SchwabAuthConfig, SchwabTokens};
 use st0x_execution::{Direction, Shares, SupportedExecutor, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
@@ -82,7 +82,7 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
 
 /// Centralized test token setup to eliminate duplication across test files.
 /// Creates and stores test tokens in the database for Schwab API authentication.
-pub(crate) async fn setup_test_tokens(pool: &SqlitePool, env: &SchwabAuthEnv) {
+pub(crate) async fn setup_test_tokens(pool: &SqlitePool, env: &SchwabAuthConfig) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
         access_token_fetched_at: Utc::now(),

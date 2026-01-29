@@ -8,7 +8,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountResponse, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+use super::auth::{AccountResponse, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 
 /// Alpaca Broker API HTTP client with Basic authentication
@@ -202,30 +202,30 @@ mod tests {
 
     use super::*;
 
-    fn create_test_sandbox_config() -> AlpacaBrokerApiAuthEnv {
-        AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key_id".to_string(),
-            alpaca_broker_api_secret: "test_secret_key".to_string(),
-            alpaca_account_id: "test_account_123".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+    fn create_test_sandbox_config() -> AlpacaBrokerApiAuthConfig {
+        AlpacaBrokerApiAuthConfig {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            account_id: "test_account_123".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         }
     }
 
-    fn create_test_production_config() -> AlpacaBrokerApiAuthEnv {
-        AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key_id".to_string(),
-            alpaca_broker_api_secret: "test_secret_key".to_string(),
-            alpaca_account_id: "test_account_123".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
+    fn create_test_production_config() -> AlpacaBrokerApiAuthConfig {
+        AlpacaBrokerApiAuthConfig {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            account_id: "test_account_123".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Production),
         }
     }
 
-    fn create_test_mock_config(base_url: &str) -> AlpacaBrokerApiAuthEnv {
-        AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key_id".to_string(),
-            alpaca_broker_api_secret: "test_secret_key".to_string(),
-            alpaca_account_id: "test_account_123".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(base_url.to_string()),
+    fn create_test_mock_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
+        AlpacaBrokerApiAuthConfig {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            account_id: "test_account_123".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
         }
     }
 

@@ -4,7 +4,7 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
-use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens, extract_code_from_url};
+use st0x_execution::schwab::{SchwabAuthConfig, SchwabError, SchwabTokens, extract_code_from_url};
 
 use crate::env::BrokerConfig;
 
@@ -73,7 +73,10 @@ pub(super) async fn ensure_schwab_authentication<W: Write>(
     }
 }
 
-async fn run_oauth_flow(pool: &SqlitePool, schwab_auth: &SchwabAuthEnv) -> Result<(), SchwabError> {
+async fn run_oauth_flow(
+    pool: &SqlitePool,
+    schwab_auth: &SchwabAuthConfig,
+) -> Result<(), SchwabError> {
     println!(
         "Authenticate portfolio brokerage account (not dev account) and paste URL: {}",
         schwab_auth.get_auth_url()
@@ -107,13 +110,13 @@ mod tests {
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuthEnv) {
-        let schwab_auth = SchwabAuthEnv {
-            schwab_app_key: "test_app_key".to_string(),
-            schwab_app_secret: "test_app_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: mock_server.base_url(),
-            schwab_account_index: 0,
+    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuthConfig) {
+        let schwab_auth = SchwabAuthConfig {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: "https://127.0.0.1".to_string(),
+            base_url: mock_server.base_url(),
+            account_index: 0,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 

@@ -7,7 +7,7 @@ use tracing::{debug, error, info};
 
 use super::broker::Broker;
 use super::execution::find_execution_by_id;
-use super::{SchwabAuthEnv, SchwabError, TradeState};
+use super::{SchwabAuthConfig, SchwabError, TradeState};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id};
 
 #[derive(Debug, Clone)]
@@ -27,7 +27,7 @@ impl Default for OrderPollerConfig {
 
 pub(crate) struct OrderStatusPoller<B: Broker> {
     config: OrderPollerConfig,
-    env: SchwabAuthEnv,
+    env: SchwabAuthConfig,
     pool: SqlitePool,
     interval: Interval,
     broker: B,
@@ -36,7 +36,7 @@ pub(crate) struct OrderStatusPoller<B: Broker> {
 impl<B: Broker> OrderStatusPoller<B> {
     pub(crate) fn new(
         config: OrderPollerConfig,
-        env: SchwabAuthEnv,
+        env: SchwabAuthConfig,
         pool: SqlitePool,
         broker: B,
     ) -> Self {
@@ -336,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn test_order_poller_creation() {
         let config = OrderPollerConfig::default();
-        let env = SchwabAuthEnv {
+        let env = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: "https://127.0.0.1".to_string(),
@@ -354,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pending_orders_empty_database() {
         let config = OrderPollerConfig::default();
-        let env = SchwabAuthEnv {
+        let env = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: "https://127.0.0.1".to_string(),
@@ -373,7 +373,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_execution_status_missing_order_id() {
         let config = OrderPollerConfig::default();
-        let env = SchwabAuthEnv {
+        let env = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: "https://127.0.0.1".to_string(),
@@ -413,7 +413,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Setup test environment with mock server
-        let env = SchwabAuthEnv {
+        let env = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: "https://127.0.0.1".to_string(),
@@ -592,7 +592,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Setup test environment
-        let env = SchwabAuthEnv {
+        let env = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: "https://127.0.0.1".to_string(),
@@ -739,11 +739,11 @@ mod tests {
         account_mock.assert_hits(num_orders); // Called once per order status check
     }
 
-    async fn setup_failed_order_test() -> (MockServer, SqlitePool, SchwabAuthEnv, i64) {
+    async fn setup_failed_order_test() -> (MockServer, SqlitePool, SchwabAuthConfig, i64) {
         let server = MockServer::start();
         let pool = setup_test_db().await;
 
-        let env = SchwabAuthEnv {
+        let env = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: "https://127.0.0.1".to_string(),

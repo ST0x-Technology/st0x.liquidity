@@ -1,7 +1,7 @@
 use alloy::primitives::FixedBytes;
 use sqlx::SqlitePool;
 
-use crate::schwab::{SchwabAuthEnv, SchwabTokens};
+use crate::schwab::{SchwabAuthConfig, SchwabTokens};
 
 pub(crate) const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -11,7 +11,7 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
     pool
 }
 
-pub(crate) async fn setup_test_tokens(pool: &SqlitePool, env: &SchwabAuthEnv) {
+pub(crate) async fn setup_test_tokens(pool: &SqlitePool, env: &SchwabAuthConfig) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
         access_token_fetched_at: chrono::Utc::now(),

@@ -212,14 +212,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthEnv {
-        AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key".to_string(),
-            alpaca_broker_api_secret: "test_secret".to_string(),
-            alpaca_account_id: "test_account_123".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(base_url.to_string()),
+    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
+        AlpacaBrokerApiAuthConfig {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: "test_account_123".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
         }
     }
 

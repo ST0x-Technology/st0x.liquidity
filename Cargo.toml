@@ -123,7 +123,7 @@ ts-rs = { version = "11.1.0", features = [
   "serde-compat",
 ] }
 rocket_ws = "0.1.1"
-clap-config-file = "0.6.0"
+toml = "0.9.11"
 
 [dev-dependencies]
 httpmock.workspace = true
@@ -133,6 +133,7 @@ proptest.workspace = true
 temp-env = "0.3.6"
 tokio-tungstenite = "0.28.0"
 st0x-execution = { path = "crates/execution", features = ["mock"] }
+tempfile = "3.24.0"
 
 [[bin]]
 name = "migrate_to_events"

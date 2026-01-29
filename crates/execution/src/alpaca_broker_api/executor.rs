@@ -6,7 +6,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountStatus, AlpacaBrokerApiAuthEnv};
+use super::auth::{AccountStatus, AlpacaBrokerApiAuthConfig};
 use super::client::AlpacaBrokerApiClient;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use crate::{
@@ -24,7 +24,7 @@ pub struct AlpacaBrokerApi {
 impl Executor for AlpacaBrokerApi {
     type Error = AlpacaBrokerApiError;
     type OrderId = String;
-    type Config = AlpacaBrokerApiAuthEnv;
+    type Config = AlpacaBrokerApiAuthConfig;
 
     async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
         let client = AlpacaBrokerApiClient::new(&config)?;
@@ -108,7 +108,7 @@ impl Executor for AlpacaBrokerApi {
 }
 
 #[async_trait]
-impl TryIntoExecutor for AlpacaBrokerApiAuthEnv {
+impl TryIntoExecutor for AlpacaBrokerApiAuthConfig {
     type Executor = AlpacaBrokerApi;
 
     async fn try_into_executor(
@@ -154,12 +154,12 @@ mod tests {
     use super::*;
     use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthEnv {
-        AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key".to_string(),
-            alpaca_broker_api_secret: "test_secret".to_string(),
-            alpaca_account_id: "test_account_123".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(base_url.to_string()),
+    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
+        AlpacaBrokerApiAuthConfig {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: "test_account_123".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
         }
     }
 
@@ -237,8 +237,8 @@ mod tests {
                 .json_body(json!([
                     {
                         "date": today_str,
-                        "open": "0000",
-                        "close": "2359"
+                        "open": "00:00",
+                        "close": "23:59"
                     }
                 ]));
         });

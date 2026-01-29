@@ -1,17 +1,15 @@
 use apca::api::v2::account::{self, GetError};
 use apca::{Client, RequestError};
-use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 
 /// Trading mode for Alpaca Trading API
-#[derive(Debug, Clone, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AlpacaTradingApiMode {
-    /// Paper trading mode (simulated trading with fake money)
     Paper,
-    /// Live trading mode (real money)
     Live,
-    /// Mock mode for testing (test-only)
     #[cfg(test)]
-    #[clap(skip)]
+    #[serde(skip_deserializing)]
     Mock(String),
 }
 
@@ -27,44 +25,36 @@ impl AlpacaTradingApiMode {
     }
 }
 
-/// Alpaca Trading API authentication environment configuration
-#[derive(Parser, Clone)]
-pub struct AlpacaTradingApiAuthEnv {
-    /// Alpaca API key
-    #[clap(long, env)]
-    pub alpaca_api_key: String,
-
-    /// Alpaca API secret
-    #[clap(long, env)]
-    pub alpaca_api_secret: String,
-
-    /// Trading mode: paper or live (defaults to paper for safety)
-    #[clap(long, env, default_value = "paper")]
-    pub alpaca_trading_mode: AlpacaTradingApiMode,
+#[derive(Clone, Deserialize)]
+pub struct AlpacaTradingApiAuthConfig {
+    pub api_key: String,
+    pub api_secret: String,
+    pub trading_mode: Option<AlpacaTradingApiMode>,
 }
 
-impl std::fmt::Debug for AlpacaTradingApiAuthEnv {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AlpacaTradingApiAuthEnv")
-            .field("alpaca_api_key", &"[REDACTED]")
-            .field("alpaca_api_secret", &"[REDACTED]")
-            .field("alpaca_trading_mode", &self.alpaca_trading_mode)
-            .finish()
+impl AlpacaTradingApiAuthConfig {
+    pub fn trading_mode(&self) -> AlpacaTradingApiMode {
+        self.trading_mode
+            .clone()
+            .unwrap_or(AlpacaTradingApiMode::Paper)
     }
-}
 
-impl AlpacaTradingApiAuthEnv {
-    /// Returns the base URL for Alpaca Trading API.
     pub fn base_url(&self) -> String {
-        self.alpaca_trading_mode.base_url()
+        self.trading_mode().base_url()
     }
 
-    /// Returns true if using paper trading mode (sandbox).
-    ///
-    /// Paper trading uses Ethereum Sepolia for crypto operations,
-    /// while live trading uses Ethereum mainnet.
     pub fn is_paper_trading(&self) -> bool {
-        matches!(self.alpaca_trading_mode, AlpacaTradingApiMode::Paper)
+        matches!(self.trading_mode(), AlpacaTradingApiMode::Paper)
+    }
+}
+
+impl std::fmt::Debug for AlpacaTradingApiAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlpacaTradingApiAuthConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("api_secret", &"[REDACTED]")
+            .field("trading_mode", &self.trading_mode())
+            .finish()
     }
 }
 
@@ -84,16 +74,16 @@ impl std::fmt::Debug for AlpacaTradingApiClient {
 }
 
 impl AlpacaTradingApiClient {
-    pub(crate) fn new(env: &AlpacaTradingApiAuthEnv) -> Result<Self, super::AlpacaTradingApiError> {
+    pub(crate) fn new(env: &AlpacaTradingApiAuthConfig) -> Result<Self, super::AlpacaTradingApiError> {
         let base_url = env.base_url();
         let api_info =
-            apca::ApiInfo::from_parts(&base_url, &env.alpaca_api_key, &env.alpaca_api_secret)?;
+            apca::ApiInfo::from_parts(&base_url, &env.api_key, &env.api_secret)?;
 
         let client = Client::new(api_info);
 
         Ok(Self {
             client,
-            trading_mode: env.alpaca_trading_mode.clone(),
+            trading_mode: env.trading_mode(),
         })
     }
 
@@ -115,19 +105,19 @@ impl AlpacaTradingApiClient {
 mod tests {
     use super::*;
 
-    fn create_test_paper_config() -> AlpacaTradingApiAuthEnv {
-        AlpacaTradingApiAuthEnv {
-            alpaca_api_key: "test_key_id".to_string(),
-            alpaca_api_secret: "test_secret_key".to_string(),
-            alpaca_trading_mode: AlpacaTradingApiMode::Paper,
+    fn create_test_paper_config() -> AlpacaTradingApiAuthConfig {
+        AlpacaTradingApiAuthConfig {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Paper),
         }
     }
 
-    fn create_test_live_config() -> AlpacaTradingApiAuthEnv {
-        AlpacaTradingApiAuthEnv {
-            alpaca_api_key: "test_key_id".to_string(),
-            alpaca_api_secret: "test_secret_key".to_string(),
-            alpaca_trading_mode: AlpacaTradingApiMode::Live,
+    fn create_test_live_config() -> AlpacaTradingApiAuthConfig {
+        AlpacaTradingApiAuthConfig {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Live),
         }
     }
 
@@ -163,10 +153,10 @@ mod tests {
 
     #[test]
     fn test_alpaca_trading_api_client_new_empty_credentials() {
-        let empty_config = AlpacaTradingApiAuthEnv {
-            alpaca_api_key: String::new(),
-            alpaca_api_secret: String::new(),
-            alpaca_trading_mode: AlpacaTradingApiMode::Paper,
+        let empty_config = AlpacaTradingApiAuthConfig {
+            api_key: String::new(),
+            api_secret: String::new(),
+            trading_mode: None,
         };
 
         let result = AlpacaTradingApiClient::new(&empty_config);
@@ -189,10 +179,10 @@ mod tests {
 
     #[test]
     fn test_alpaca_trading_api_auth_env_debug_redacts_secrets() {
-        let config = AlpacaTradingApiAuthEnv {
-            alpaca_api_key: "secret_key_id_123".to_string(),
-            alpaca_api_secret: "super_secret_key_456".to_string(),
-            alpaca_trading_mode: AlpacaTradingApiMode::Paper,
+        let config = AlpacaTradingApiAuthConfig {
+            api_key: "secret_key_id_123".to_string(),
+            api_secret: "super_secret_key_456".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Paper),
         };
 
         let debug_output = format!("{config:?}");

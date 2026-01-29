@@ -5,7 +5,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::AlpacaTradingApiError;
-use super::auth::{AlpacaTradingApiAuthEnv, AlpacaTradingApiClient};
+use super::auth::{AlpacaTradingApiAuthConfig, AlpacaTradingApiClient};
 use crate::{
     Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
     TryIntoExecutor,
@@ -21,7 +21,7 @@ pub struct AlpacaTradingApi {
 impl Executor for AlpacaTradingApi {
     type Error = AlpacaTradingApiError;
     type OrderId = String;
-    type Config = AlpacaTradingApiAuthEnv;
+    type Config = AlpacaTradingApiAuthConfig;
 
     async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
         let client = AlpacaTradingApiClient::new(&config)?;
@@ -101,7 +101,7 @@ impl Executor for AlpacaTradingApi {
 }
 
 #[async_trait]
-impl TryIntoExecutor for AlpacaTradingApiAuthEnv {
+impl TryIntoExecutor for AlpacaTradingApiAuthConfig {
     type Executor = AlpacaTradingApi;
 
     async fn try_into_executor(
@@ -119,11 +119,11 @@ mod tests {
     use super::*;
     use crate::alpaca_trading_api::AlpacaTradingApiMode;
 
-    fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiAuthEnv {
-        AlpacaTradingApiAuthEnv {
-            alpaca_api_key: "test_key_id".to_string(),
-            alpaca_api_secret: "test_secret_key".to_string(),
-            alpaca_trading_mode: AlpacaTradingApiMode::Mock(base_url.to_string()),
+    fn create_test_auth_env(base_url: &str) -> AlpacaTradingApiAuthConfig {
+        AlpacaTradingApiAuthConfig {
+            api_key: "test_key_id".to_string(),
+            api_secret: "test_secret_key".to_string(),
+            trading_mode: Some(AlpacaTradingApiMode::Mock(base_url.to_string())),
         }
     }
 

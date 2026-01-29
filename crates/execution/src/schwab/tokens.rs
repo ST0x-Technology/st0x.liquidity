@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use alloy::primitives::FixedBytes;
 
 use super::SchwabError;
-use super::auth::SchwabAuthEnv;
+use super::auth::SchwabAuthConfig;
 use super::encryption::{EncryptedToken, EncryptionError, decrypt_token, encrypt_token};
 
 const ACCESS_TOKEN_DURATION_MINUTES: i64 = 30;

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{SchwabAuthEnv, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
+use super::{SchwabAuthConfig, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -49,7 +49,7 @@ impl Order {
 
     pub async fn place(
         &self,
-        env: &SchwabAuthEnv,
+        env: &SchwabAuthConfig,
         pool: &SqlitePool,
     ) -> Result<OrderPlacementResponse, SchwabError> {
         let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;

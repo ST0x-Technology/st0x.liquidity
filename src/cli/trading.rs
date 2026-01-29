@@ -348,7 +348,7 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_execution::schwab::SchwabAuthEnv;
+    use st0x_execution::schwab::SchwabAuthConfig;
 
     use super::*;
     use crate::env::LogLevel;
@@ -370,12 +370,12 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuthEnv {
-                schwab_app_key: "test_app_key".to_string(),
-                schwab_app_secret: "test_app_secret".to_string(),
-                schwab_redirect_uri: "https://127.0.0.1".to_string(),
-                schwab_base_url: mock_server.base_url(),
-                schwab_account_index: 0,
+            broker: BrokerConfig::Schwab(SchwabAuthConfig {
+                app_key: "test_app_key".to_string(),
+                app_secret: "test_app_secret".to_string(),
+                redirect_uri: "https://127.0.0.1".to_string(),
+                base_url: mock_server.base_url(),
+                account_index: 0,
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,
@@ -383,7 +383,7 @@ mod tests {
         }
     }
 
-    fn get_schwab_auth(config: &Config) -> &SchwabAuthEnv {
+    fn get_schwab_auth(config: &Config) -> &SchwabAuthConfig {
         match &config.broker {
             BrokerConfig::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config"),

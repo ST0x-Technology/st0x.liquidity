@@ -11,7 +11,7 @@ mod tokens;
 
 // Re-export only what's needed for executor construction
 pub use auth::{
-    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthEnv, SchwabAuthError,
+    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthConfig, SchwabAuthError,
     SchwabAuthEvent,
 };
 pub use encryption::{EncryptedToken, EncryptionError, EncryptionKey, decrypt_token};

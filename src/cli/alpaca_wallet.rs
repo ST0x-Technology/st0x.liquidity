@@ -54,8 +54,8 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
@@ -171,8 +171,8 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
@@ -264,8 +264,8 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
@@ -331,8 +331,8 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     let alpaca_wallet = AlpacaWalletService::new(
         broker_api_base_url.to_string(),
         rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
     );
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
@@ -424,7 +424,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use uuid::uuid;
 
     use super::*;
@@ -456,11 +456,11 @@ mod tests {
 
     fn create_alpaca_config_without_rebalancing() -> Config {
         let mut config = create_config_without_alpaca();
-        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test-key".to_string(),
-            alpaca_broker_api_secret: "test-secret".to_string(),
+        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
+            api_key: "test-key".to_string(),
+            api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            mode: AlpacaBrokerApiMode::Sandbox,
         });
         config
     }
@@ -479,11 +479,11 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthEnv {
-                alpaca_broker_api_key: "test-key".to_string(),
-                alpaca_broker_api_secret: "test-secret".to_string(),
+            broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
                 alpaca_account_id: alpaca_account_id.to_string(),
-                alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                mode: AlpacaBrokerApiMode::Sandbox,
             }),
             hyperdx: None,
             rebalancing: Some(RebalancingConfig {
