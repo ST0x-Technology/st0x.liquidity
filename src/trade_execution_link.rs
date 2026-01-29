@@ -97,7 +97,7 @@ impl TradeExecutionLink {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{Address, fixed_bytes};
     use rust_decimal::Decimal;
     use st0x_execution::{
         Direction, FractionalShares, OrderState, Positive, SupportedExecutor, Symbol,
@@ -121,6 +121,7 @@ mod tests {
             ),
             log_index: 1,
             symbol: tokenized_symbol!("AAPL0x"),
+            equity_token: Address::ZERO,
             amount: 1.5,
             direction: Direction::Sell,
             price: Usdc::new(150.0).unwrap(),
@@ -193,6 +194,7 @@ mod tests {
                 ),
                 log_index,
                 symbol: tokenized_symbol!("AAPL0x"),
+                equity_token: Address::ZERO,
                 amount,
                 direction: Direction::Sell,
                 price: Usdc::new(150.0).unwrap(),
@@ -251,6 +253,7 @@ mod tests {
             ),
             log_index: 1,
             symbol: tokenized_symbol!("AAPL0x"),
+            equity_token: Address::ZERO,
             amount: 1.0,
             direction: Direction::Buy,
             price: Usdc::new(150.0).unwrap(),

@@ -3,20 +3,18 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use alloy::primitives::Address;
 use st0x_execution::Symbol;
 use tokio::sync::RwLock;
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
-use crate::symbol::cache::SymbolCache;
 
 /// Why an equity trigger check did not produce an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum EquityTriggerSkip {
+pub(super) enum EquityTriggerSkip {
     /// No imbalance detected for this symbol.
     NoImbalance,
-    /// Token address not found in cache (required for redemption).
-    TokenNotInCache,
 }
 
 /// RAII guard that holds an equity in-progress claim.
@@ -84,7 +82,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     symbol: &Symbol,
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
-    symbol_cache: &SymbolCache,
+    token_address: Address,
 ) -> Result<TriggeredOperation, EquityTriggerSkip> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -98,17 +96,11 @@ pub(super) async fn check_imbalance_and_build_operation(
             symbol: symbol.clone(),
             quantity: excess,
         }),
-        Imbalance::TooMuchOnchain { excess } => {
-            let token = symbol_cache
-                .get_address(&symbol.to_string())
-                .ok_or(EquityTriggerSkip::TokenNotInCache)?;
-
-            Ok(TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: excess,
-                token,
-            })
-        }
+        Imbalance::TooMuchOnchain { excess } => Ok(TriggeredOperation::Redemption {
+            symbol: symbol.clone(),
+            quantity: excess,
+            token: token_address,
+        }),
     }
 }
 
@@ -151,6 +143,24 @@ mod tests {
             price_cents: PriceCents(15000),
             broker_timestamp: chrono::Utc::now(),
         }
+    }
+
+    fn make_imbalanced_view(
+        symbol: &Symbol,
+        onchain: i64,
+        offchain: i64,
+    ) -> Arc<RwLock<InventoryView>> {
+        let view = InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(symbol, &make_onchain_fill(shares(onchain), Direction::Buy))
+            .unwrap()
+            .apply_position_event(
+                symbol,
+                &make_offchain_fill(shares(offchain), Direction::Buy),
+            )
+            .unwrap();
+
+        Arc::new(RwLock::new(view))
     }
 
     #[test]
@@ -198,7 +208,6 @@ mod tests {
     #[tokio::test]
     async fn test_balanced_inventory_returns_no_imbalance() {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let symbol_cache = SymbolCache::default();
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
@@ -208,7 +217,7 @@ mod tests {
             &Symbol::new("AAPL").unwrap(),
             &threshold,
             &inventory,
-            &symbol_cache,
+            Address::ZERO,
         )
         .await;
 
@@ -218,84 +227,36 @@ mod tests {
     #[tokio::test]
     async fn test_too_much_offchain_returns_mint() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let view = InventoryView::default().with_equity(symbol.clone());
-
-        // 20 onchain, 80 offchain -> 20% onchain ratio, below 30% threshold
-        let view = view
-            .apply_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
-            .unwrap()
-            .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
-            .unwrap();
-
-        let inventory = Arc::new(RwLock::new(view));
-        let symbol_cache = SymbolCache::default();
+        let inventory = make_imbalanced_view(&symbol, 20, 80);
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
 
         let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, &symbol_cache)
+            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO)
                 .await;
 
         assert!(matches!(result, Ok(TriggeredOperation::Mint { .. })));
     }
 
     #[tokio::test]
-    async fn test_too_much_onchain_with_cached_token_returns_redemption() {
+    async fn test_too_much_onchain_returns_redemption_with_token() {
         let symbol = Symbol::new("AAPL").unwrap();
         let token_address = address!("0x1234567890123456789012345678901234567890");
-        let view = InventoryView::default().with_equity(symbol.clone());
-
-        // 80 onchain, 20 offchain -> 80% onchain ratio, above 70% threshold
-        let view = view
-            .apply_position_event(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
-            .unwrap()
-            .apply_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
-            .unwrap();
-
-        let inventory = Arc::new(RwLock::new(view));
-        let symbol_cache = SymbolCache::default();
-        symbol_cache
-            .map
-            .write()
-            .unwrap()
-            .insert(token_address, "AAPL".to_string());
+        let inventory = make_imbalanced_view(&symbol, 80, 20);
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
 
         let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, &symbol_cache)
+            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, token_address)
                 .await;
 
-        assert!(matches!(result, Ok(TriggeredOperation::Redemption { .. })));
-    }
-
-    #[tokio::test]
-    async fn test_too_much_onchain_without_cached_token_returns_error() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let view = InventoryView::default().with_equity(symbol.clone());
-
-        // 80 onchain, 20 offchain -> 80% onchain ratio, above 70% threshold
-        let view = view
-            .apply_position_event(&symbol, &make_onchain_fill(shares(80), Direction::Buy))
-            .unwrap()
-            .apply_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
-            .unwrap();
-
-        let inventory = Arc::new(RwLock::new(view));
-        let symbol_cache = SymbolCache::default(); // Empty cache
-        let threshold = ImbalanceThreshold {
-            target: dec!(0.5),
-            deviation: dec!(0.2),
+        let Ok(TriggeredOperation::Redemption { token, .. }) = result else {
+            panic!("Expected Redemption, got {result:?}");
         };
-
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, &symbol_cache)
-                .await;
-
-        assert_eq!(result, Err(EquityTriggerSkip::TokenNotInCache));
+        assert_eq!(token, token_address);
     }
 }

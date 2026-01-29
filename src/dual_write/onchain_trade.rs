@@ -43,7 +43,7 @@ pub(crate) async fn witness_trade(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{Address, fixed_bytes};
     use chrono::Utc;
     use st0x_execution::Direction;
 
@@ -63,6 +63,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -121,6 +122,7 @@ mod tests {
             tx_hash,
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -165,6 +167,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),

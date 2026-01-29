@@ -129,6 +129,7 @@ pub struct OnchainTrade {
     pub(crate) tx_hash: B256,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedEquitySymbol,
+    pub(crate) equity_token: Address,
     pub(crate) amount: f64,
     pub(crate) direction: Direction,
     pub(crate) price: Usdc,
@@ -245,6 +246,7 @@ impl OnchainTrade {
             log_index: u64::try_from(row.log_index)
                 .expect("test db log_index should be non-negative"),
             symbol: row.symbol.parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: row.amount,
             direction,
             price: Usdc::new(row.price_usdc).expect("db price_usdc should be non-negative"),
@@ -329,10 +331,10 @@ impl OnchainTrade {
         }
 
         // Parse the tokenized equity symbol to ensure it's valid
-        let tokenized_symbol_str = if onchain_input_symbol == "USDC" {
-            onchain_output_symbol
+        let (tokenized_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
+            (onchain_output_symbol, output.token)
         } else {
-            onchain_input_symbol
+            (onchain_input_symbol, input.token)
         };
         let tokenized_symbol = TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
 
@@ -358,6 +360,7 @@ impl OnchainTrade {
             tx_hash,
             log_index,
             symbol: tokenized_symbol,
+            equity_token,
             amount: trade_details.equity_amount().value(),
             direction: trade_details.direction(),
             price,
@@ -521,6 +524,7 @@ mod tests {
             ),
             log_index: 42,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.0,
             direction: Direction::Sell,
             price: Usdc::new(150.25).unwrap(),
@@ -699,6 +703,7 @@ mod tests {
             ),
             log_index: 100,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.0,
             direction: Direction::Buy,
             price: Usdc::new(150.0).unwrap(),
@@ -740,6 +745,7 @@ mod tests {
             ),
             log_index: u64::MAX, // Will become -1 when cast to i64
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.0,
             direction: Direction::Buy,
             price: Usdc::new(150.0).unwrap(),
@@ -880,6 +886,7 @@ mod tests {
                 tx_hash: B256::from(tx_hash_bytes),
                 log_index: u64::from(i),
                 symbol: TokenizedEquitySymbol::parse(&format!("TEST{i}0x")).unwrap(),
+                equity_token: Address::ZERO,
                 amount: 10.0,
                 direction: Direction::Buy,
                 price: Usdc::new(150.0).unwrap(),
