@@ -1,32 +1,17 @@
 { pkgs, rustPlatform, sol-build-inputs, sqlx-cli, repoUrl, self }:
 
 let
-  srcWithSubmodules = let
-    fetched = builtins.fetchGit {
-      url = repoUrl;
-      inherit (self) rev;
-      submodules = true;
-      shallow = true;
-    };
-  in pkgs.runCommand "src-with-submodules" { } ''
-    set -euxo pipefail
-    cp -r ${fetched} $out
-    chmod -R u+w $out
-
-    # Overlay local source on top, keeping lib/ (submodules) from the fetch
-    for item in ${self}/*; do
-      name=$(basename "$item")
-      if [ "$name" != "lib" ]; then
-        rm -rf "$out/$name"
-        cp -r "$item" "$out/$name"
-      fi
-    done
-  '';
+  src = builtins.fetchGit {
+    url = repoUrl;
+    inherit (self) rev;
+    submodules = true;
+    shallow = true;
+  };
 in rustPlatform.buildRustPackage {
   pname = "st0x-liquidity";
   version = "0.1.0";
 
-  src = srcWithSubmodules;
+  inherit src;
 
   cargoLock = {
     lockFile = ../Cargo.lock;
@@ -45,12 +30,15 @@ in rustPlatform.buildRustPackage {
     ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
     [ pkgs.apple-sdk_15 ];
 
-  postUnpack = ''
-    chmod -R u+w $sourceRoot/lib
-  '';
-
   preBuild = ''
     set -euxo pipefail
+
+    # lib/ comes from the Nix store (read-only). Copy to writable location
+    # and replace with the writable copy so forge can write build artifacts.
+    cp -r lib "$TMPDIR/lib"
+    rm -rf lib
+    mv "$TMPDIR/lib" lib
+
     (cd lib/rain.orderbook/ && forge build)
     (cd lib/rain.orderbook/lib/rain.orderbook.interface/lib/rain.interpreter.interface/lib/rain.math.float/ && forge build)
     (cd lib/forge-std/ && forge build)
