@@ -36,7 +36,6 @@ use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
-use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 
@@ -86,7 +85,6 @@ pub(crate) async fn spawn_rebalancer<BP>(
     pool: SqlitePool,
     config: &RebalancingConfig,
     base_provider: BP,
-    symbol_cache: SymbolCache,
     orderbook: Address,
     context: RebalancerContext,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
@@ -109,7 +107,7 @@ where
     let rebalancer = services.into_rebalancer(
         pool,
         config,
-        symbol_cache,
+        orderbook,
         context.event_broadcast,
         market_maker_wallet,
         context.inventory,
@@ -208,7 +206,7 @@ where
         self,
         pool: SqlitePool,
         config: &RebalancingConfig,
-        symbol_cache: SymbolCache,
+        orderbook: Address,
         event_broadcast: Option<broadcast::Sender<ServerMessage>>,
         market_maker_wallet: Address,
         inventory: Arc<RwLock<InventoryView>>,
@@ -224,7 +222,9 @@ where
 
         let trigger = Arc::new(RebalancingTrigger::new(
             trigger_config,
-            symbol_cache,
+            pool.clone(),
+            orderbook,
+            market_maker_wallet,
             inventory,
             operation_sender,
         ));
@@ -522,10 +522,11 @@ mod tests {
 
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
         let _rebalancer = services.into_rebalancer(
             pool,
             &config,
-            SymbolCache::default(),
+            orderbook,
             None,
             market_maker_wallet,
             inventory,

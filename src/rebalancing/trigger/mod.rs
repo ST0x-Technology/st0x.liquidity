@@ -7,7 +7,7 @@ use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use clap::Parser;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{Aggregate, EventEnvelope, EventStore, Query};
+use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
@@ -24,15 +24,27 @@ use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
 use crate::shares::{ArithmeticError, FractionalShares};
-use crate::vault_registry::VaultRegistry;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
+use crate::vault_registry::VaultRegistry;
 use chrono::Utc;
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 
+use crate::vault_registry::VaultRegistryError;
 pub(crate) use equity::EquityTriggerSkip;
+
+/// Why loading a token address from the vault registry failed.
+#[derive(Debug, thiserror::Error)]
+enum TokenAddressError {
+    #[error("vault registry aggregate not initialized")]
+    Uninitialized,
+    #[error("vault registry aggregate in failed state")]
+    Failed,
+    #[error(transparent)]
+    Persistence(#[from] cqrs_es::AggregateError<VaultRegistryError>),
+}
 
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
@@ -325,20 +337,48 @@ impl RebalancingTrigger {
     }
 
     async fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
+        let token_address = match self.load_token_address(symbol).await {
+            Ok(Some(addr)) => addr,
+            Ok(None) => {
+                error!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                return None;
+            }
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
+                return None;
+            }
+        };
+
         match equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity_threshold,
             &self.inventory,
-            &self.symbol_cache,
+            token_address,
         )
         .await
         {
             Ok(op) => Some(op),
             Err(EquityTriggerSkip::NoImbalance) => None,
-            Err(EquityTriggerSkip::TokenNotInCache) => {
-                error!(symbol = %symbol, "Skipped equity trigger: token not in cache");
-                None
-            }
+        }
+    }
+
+    async fn load_token_address(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<Address>, TokenAddressError> {
+        let repo = SqliteEventRepository::new(self.pool.clone());
+        let store = PersistedEventStore::<
+            SqliteEventRepository,
+            Lifecycle<VaultRegistry, Never>,
+        >::new_event_store(repo);
+
+        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
+        let aggregate_context = store.load_aggregate(&aggregate_id).await?;
+
+        match aggregate_context.aggregate() {
+            Lifecycle::Live(registry) => Ok(registry.token_by_symbol(symbol)),
+            Lifecycle::Uninitialized => Err(TokenAddressError::Uninitialized),
+            Lifecycle::Failed { .. } => Err(TokenAddressError::Failed),
         }
     }
 
@@ -592,6 +632,7 @@ mod tests {
     use cqrs_es::{CqrsFramework, Query};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use sqlite_es::sqlite_cqrs;
     use st0x_execution::Direction;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -611,13 +652,11 @@ mod tests {
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
+    use crate::vault_registry::VaultRegistryCommand;
     use alloy::primitives::{Address, U256};
 
-    fn make_trigger() -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
-        let (sender, receiver) = mpsc::channel(10);
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let symbol_cache = SymbolCache::default();
-        let config = RebalancingTriggerConfig {
+    fn test_config() -> RebalancingTriggerConfig {
+        RebalancingTriggerConfig {
             equity_threshold: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
@@ -626,17 +665,30 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-        };
+        }
+    }
+
+    async fn make_trigger() -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+        let (sender, receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
 
         (
-            RebalancingTrigger::new(config, symbol_cache, inventory, sender),
+            RebalancingTrigger::new(
+                test_config(),
+                pool,
+                TEST_ORDERBOOK,
+                TEST_ORDER_OWNER,
+                inventory,
+                sender,
+            ),
             receiver,
         )
     }
 
     #[tokio::test]
     async fn test_in_progress_symbol_does_not_send() {
-        let (trigger, mut receiver) = make_trigger();
+        let (trigger, mut receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         {
@@ -650,7 +702,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_usdc_in_progress_does_not_send() {
-        let (trigger, mut receiver) = make_trigger();
+        let (trigger, mut receiver) = make_trigger().await;
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
@@ -658,9 +710,9 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
-    #[test]
-    fn test_clear_equity_in_progress() {
-        let (trigger, _receiver) = make_trigger();
+    #[tokio::test]
+    async fn test_clear_equity_in_progress() {
+        let (trigger, _receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         {
@@ -675,9 +727,9 @@ mod tests {
         assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
     }
 
-    #[test]
-    fn test_clear_usdc_in_progress() {
-        let (trigger, _receiver) = make_trigger();
+    #[tokio::test]
+    async fn test_clear_usdc_in_progress() {
+        let (trigger, _receiver) = make_trigger().await;
 
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
         assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
@@ -689,7 +741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_balanced_inventory_does_not_trigger() {
-        let (trigger, mut receiver) = make_trigger();
+        let (trigger, mut receiver) = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
         trigger.check_and_trigger_equity(&symbol).await;
@@ -727,32 +779,110 @@ mod tests {
         }
     }
 
-    fn make_trigger_with_inventory(
+    const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
+    const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
+    const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
+
+    async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
+        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+
+        cqrs.execute(
+            &aggregate_id,
+            VaultRegistryCommand::DiscoverEquityVault {
+                token: TEST_TOKEN,
+                vault_id: fixed_bytes!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000001"
+                ),
+                discovered_in: TxHash::ZERO,
+                symbol: symbol.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn make_trigger_with_inventory(
         inventory: InventoryView,
     ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(inventory));
-        let symbol_cache = SymbolCache::default();
-        let config = RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-            usdc_threshold: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-        };
+        let pool = crate::test_utils::setup_test_db().await;
 
         (
-            RebalancingTrigger::new(config, symbol_cache, inventory, sender),
+            RebalancingTrigger::new(
+                test_config(),
+                pool,
+                TEST_ORDERBOOK,
+                TEST_ORDER_OWNER,
+                inventory,
+                sender,
+            ),
+            receiver,
+        )
+    }
+
+    async fn make_trigger_with_inventory_and_registry(
+        inventory: InventoryView,
+        symbol: &Symbol,
+    ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+        let (sender, receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(inventory));
+        let pool = crate::test_utils::setup_test_db().await;
+
+        seed_vault_registry(&pool, symbol).await;
+
+        (
+            RebalancingTrigger::new(
+                test_config(),
+                pool,
+                TEST_ORDERBOOK,
+                TEST_ORDER_OWNER,
+                inventory,
+                sender,
+            ),
             receiver,
         )
     }
 
     #[tokio::test]
+    async fn load_token_address_errors_when_registry_uninitialized() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let result = trigger.load_token_address(&symbol).await;
+        assert!(
+            matches!(result, Err(TokenAddressError::Uninitialized)),
+            "Expected Uninitialized error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_token_address_returns_address_for_known_symbol() {
+        let (trigger, _receiver) = make_trigger().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        seed_vault_registry(&trigger.pool, &symbol).await;
+
+        let result = trigger.load_token_address(&symbol).await.unwrap();
+        assert_eq!(result, Some(TEST_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn load_token_address_returns_none_for_unknown_symbol() {
+        let (trigger, _receiver) = make_trigger().await;
+        let known = Symbol::new("AAPL").unwrap();
+        let unknown = Symbol::new("MSFT").unwrap();
+
+        seed_vault_registry(&trigger.pool, &known).await;
+
+        let result = trigger.load_token_address(&unknown).await.unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
     async fn position_event_for_unknown_symbol_logs_error_without_panic() {
-        let (trigger, mut receiver) = make_trigger_with_inventory(InventoryView::default());
+        let (trigger, mut receiver) = make_trigger_with_inventory(InventoryView::default()).await;
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
@@ -771,7 +901,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
 
         // Apply onchain buy - should add to onchain available.
         let event = make_onchain_fill(shares(50), Direction::Buy);
@@ -806,7 +936,7 @@ mod tests {
             .apply_position_event(&symbol, &make_offchain_fill(shares(50), Direction::Buy))
             .unwrap();
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
 
         // Apply a small buy that maintains balance (5 shares onchain).
         // After: 55 onchain, 50 offchain = 52.4% ratio, within 30-70% bounds.
@@ -833,7 +963,8 @@ mod tests {
             .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
         // Apply a small event that triggers the imbalance check.
         let event = make_onchain_fill(shares(1), Direction::Buy);
@@ -920,7 +1051,8 @@ mod tests {
             .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
             .unwrap();
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
         // Initially, trigger should detect imbalance (too much offchain).
         trigger.check_and_trigger_equity(&symbol).await;
@@ -947,12 +1079,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn mint_completion_clears_in_progress_flag() {
+    #[tokio::test]
+    async fn mint_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
         // Mark symbol as in-progress.
         {
@@ -975,12 +1107,12 @@ mod tests {
         assert!(!trigger.equity_in_progress.read().unwrap().contains(&symbol));
     }
 
-    #[test]
-    fn mint_rejection_clears_in_progress_flag() {
+    #[tokio::test]
+    async fn mint_rejection_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
         // Mark symbol as in-progress.
         {
@@ -1106,7 +1238,7 @@ mod tests {
             .apply_position_event(&symbol, &make_offchain_fill(shares(20), Direction::Buy))
             .unwrap();
 
-        let (trigger, mut receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, mut receiver) = make_trigger_with_inventory(inventory).await;
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger
@@ -1125,12 +1257,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn redemption_completion_clears_in_progress_flag() {
+    #[tokio::test]
+    async fn redemption_completion_clears_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
 
-        let (trigger, _receiver) = make_trigger_with_inventory(inventory);
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
         // Mark symbol as in-progress.
         {
@@ -1320,9 +1452,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn usdc_rebalance_completion_clears_in_progress_flag() {
-        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default());
+    #[tokio::test]
+    async fn usdc_rebalance_completion_clears_in_progress_flag() {
+        let (trigger, _receiver) = make_trigger_with_inventory(InventoryView::default()).await;
 
         // Mark USDC as in-progress.
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
@@ -2207,24 +2339,16 @@ mod tests {
     #[tokio::test]
     async fn trigger_clears_in_progress_flag_when_terminal_event_received() {
         let (sender, _receiver) = mpsc::channel(10);
+        let pool = crate::test_utils::setup_test_db().await;
         let inventory = Arc::new(tokio::sync::RwLock::new(
             InventoryView::default().with_usdc(Usdc(dec!(5000)), Usdc(dec!(5000))),
         ));
-        let symbol_cache = crate::symbol::cache::SymbolCache::default();
-        let config = RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-            usdc_threshold: ImbalanceThreshold {
-                target: dec!(0.5),
-                deviation: dec!(0.2),
-            },
-        };
 
         let trigger = Arc::new(RebalancingTrigger::new(
-            config,
-            symbol_cache,
+            test_config(),
+            pool,
+            Address::ZERO,
+            Address::ZERO,
             inventory,
             sender,
         ));

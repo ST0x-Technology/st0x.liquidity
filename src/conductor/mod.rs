@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_execution::{Direction, EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
+use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
@@ -3288,7 +3288,6 @@ mod tests {
             block_timestamp: None,
         }
     }
-
 
     async fn get_vault_registry_events(pool: &SqlitePool) -> Vec<String> {
         sqlx::query_scalar!("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")

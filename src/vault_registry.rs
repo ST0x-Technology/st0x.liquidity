@@ -50,6 +50,13 @@ impl VaultRegistry {
         format!("{orderbook}:{owner}")
     }
 
+    pub(crate) fn token_by_symbol(&self, symbol: &Symbol) -> Option<Address> {
+        self.equity_vaults
+            .values()
+            .find(|v| v.symbol == *symbol)
+            .map(|v| v.token)
+    }
+
     fn empty(timestamp: DateTime<Utc>) -> Self {
         Self {
             equity_vaults: BTreeMap::new(),
@@ -511,5 +518,75 @@ mod tests {
             panic!("Expected Live state");
         };
         assert_eq!(registry.equity_vaults.len(), 2);
+    }
+
+    #[test]
+    fn token_by_symbol_returns_address_for_known_symbol() {
+        let mut aggregate = VaultRegistryAggregate::default();
+        aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            discovered_in: TEST_TX_HASH,
+            discovered_at: Utc::now(),
+            symbol: test_symbol(),
+        });
+
+        let Lifecycle::Live(registry) = &aggregate else {
+            panic!("Expected Live state");
+        };
+
+        assert_eq!(registry.token_by_symbol(&test_symbol()), Some(TEST_TOKEN));
+    }
+
+    #[test]
+    fn token_by_symbol_returns_none_for_unknown_symbol() {
+        let mut aggregate = VaultRegistryAggregate::default();
+        aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            discovered_in: TEST_TX_HASH,
+            discovered_at: Utc::now(),
+            symbol: test_symbol(),
+        });
+
+        let Lifecycle::Live(registry) = &aggregate else {
+            panic!("Expected Live state");
+        };
+
+        assert_eq!(
+            registry.token_by_symbol(&Symbol::new("MSFT").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn token_by_symbol_distinguishes_multiple_equities() {
+        let mut aggregate = VaultRegistryAggregate::default();
+        let token_2 = address!("0x2222222222222222222222222222222222222222");
+        let vault_id_2 =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        let msft = Symbol::new("MSFT").unwrap();
+
+        aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            discovered_in: TEST_TX_HASH,
+            discovered_at: Utc::now(),
+            symbol: test_symbol(),
+        });
+        aggregate.apply(VaultRegistryEvent::EquityVaultDiscovered {
+            token: token_2,
+            vault_id: vault_id_2,
+            discovered_in: TEST_TX_HASH,
+            discovered_at: Utc::now(),
+            symbol: msft.clone(),
+        });
+
+        let Lifecycle::Live(registry) = &aggregate else {
+            panic!("Expected Live state");
+        };
+
+        assert_eq!(registry.token_by_symbol(&test_symbol()), Some(TEST_TOKEN));
+        assert_eq!(registry.token_by_symbol(&msft), Some(token_2));
     }
 }
