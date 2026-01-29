@@ -45,6 +45,10 @@ in rustPlatform.buildRustPackage {
     ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin
     [ pkgs.apple-sdk_15 ];
 
+  postUnpack = ''
+    chmod -R u+w $sourceRoot/lib
+  '';
+
   preBuild = ''
     set -euxo pipefail
     (cd lib/rain.orderbook/ && forge build)
