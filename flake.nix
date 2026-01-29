@@ -7,12 +7,24 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { flake-utils, rainix, ... }:
+  outputs = { self, flake-utils, rainix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = rainix.pkgs.${system};
+      let
+        pkgs = rainix.pkgs.${system};
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rainix.rust-toolchain.${system};
+          rustc = rainix.rust-toolchain.${system};
+        };
       in rec {
         packages = let rainixPkgs = rainix.packages.${system};
         in rainixPkgs // {
+          server = pkgs.callPackage ./nix/rust.nix {
+            inherit self rustPlatform;
+            repoUrl = "https://github.com/ST0x-Technology/st0x.liquidity";
+            sol-build-inputs = rainix.sol-build-inputs.${system};
+            inherit (pkgs) sqlx-cli;
+          };
+
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
