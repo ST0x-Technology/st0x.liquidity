@@ -28,7 +28,7 @@ use crate::onchain::accumulator::{
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::TradeEvent;
-use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
+use crate::onchain::{EvmConfig, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
@@ -1019,7 +1019,7 @@ async fn process_trade_within_transaction(
 }
 
 fn reconstruct_log_from_queued_event(
-    evm_env: &EvmEnv,
+    evm_env: &EvmConfig,
     queued_event: &crate::queue::QueuedEvent,
 ) -> Log {
     use alloy::primitives::IntoLogData;

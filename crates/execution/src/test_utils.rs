@@ -11,12 +11,12 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
     pool
 }
 
-pub(crate) async fn setup_test_tokens(pool: &SqlitePool, env: &SchwabAuthConfig) {
+pub(crate) async fn setup_test_tokens(pool: &SqlitePool, config: &SchwabAuthConfig) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
         access_token_fetched_at: chrono::Utc::now(),
         refresh_token: "test_refresh_token".to_string(),
         refresh_token_fetched_at: chrono::Utc::now(),
     };
-    tokens.store(pool, &env.encryption_key).await.unwrap();
+    tokens.store(pool, &config.encryption_key).await.unwrap();
 }

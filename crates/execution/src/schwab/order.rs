@@ -49,11 +49,11 @@ impl Order {
 
     pub async fn place(
         &self,
-        env: &SchwabAuthConfig,
+        config: &SchwabAuthConfig,
         pool: &SqlitePool,
     ) -> Result<OrderPlacementResponse, SchwabError> {
-        let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
-        let account_hash = env.get_account_hash(pool).await?;
+        let access_token = SchwabTokens::get_valid_access_token(pool, config).await?;
+        let account_hash = config.get_account_hash(pool).await?;
 
         let headers = [
             (
@@ -70,13 +70,13 @@ impl Order {
         .collect::<HeaderMap>();
 
         let order_json = serde_json::to_string(self)?;
+        let base_url = config.base_url()?;
 
         let client = reqwest::Client::new();
         let response = (|| async {
             client
                 .post(format!(
-                    "{}/trader/v1/accounts/{}/orders",
-                    env.schwab_base_url, account_hash
+                    "{base_url}trader/v1/accounts/{account_hash}/orders",
                 ))
                 .headers(headers.clone())
                 .body(order_json.clone())
@@ -106,11 +106,11 @@ impl Order {
     /// Returns the order status response containing fill information and execution details.
     pub async fn get_order_status(
         order_id: &str,
-        env: &SchwabAuthEnv,
+        config: &SchwabAuthConfig,
         pool: &SqlitePool,
     ) -> Result<OrderStatusResponse, SchwabError> {
-        let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
-        let account_hash = env.get_account_hash(pool).await?;
+        let access_token = SchwabTokens::get_valid_access_token(pool, config).await?;
+        let account_hash = config.get_account_hash(pool).await?;
 
         let headers = [
             (
@@ -122,12 +122,12 @@ impl Order {
         .into_iter()
         .collect::<HeaderMap>();
 
+        let base_url = config.base_url()?;
         let client = reqwest::Client::new();
         let response = (|| async {
             client
                 .get(format!(
-                    "{}/trader/v1/accounts/{}/orders/{}",
-                    env.schwab_base_url, account_hash, order_id
+                    "{base_url}trader/v1/accounts/{account_hash}/orders/{order_id}",
                 ))
                 .headers(headers.clone())
                 .send()
@@ -444,9 +444,9 @@ mod tests {
     #[tokio::test]
     async fn test_place_order_success() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -470,7 +470,7 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -481,9 +481,9 @@ mod tests {
     #[tokio::test]
     async fn test_place_order_failure() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -504,7 +504,7 @@ mod tests {
         });
 
         let order = Order::new("INVALID".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -514,13 +514,13 @@ mod tests {
         );
     }
 
-    fn create_test_env_with_mock_server(mock_server: &httpmock::MockServer) -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_app_key".to_string(),
-            schwab_app_secret: "test_app_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: mock_server.base_url(),
-            schwab_account_index: 0,
+    fn create_test_config_with_mock_server(mock_server: &httpmock::MockServer) -> SchwabAuthConfig {
+        SchwabAuthConfig {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
     }
@@ -528,9 +528,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_success_with_location_header() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -551,7 +551,7 @@ mod tests {
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -562,9 +562,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_missing_location_header() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -584,7 +584,7 @@ mod tests {
         });
 
         let order = Order::new("SPY".to_string(), Instruction::Buy, 25);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -599,9 +599,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_invalid_location_header() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -621,7 +621,7 @@ mod tests {
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -640,9 +640,9 @@ mod tests {
         // we instead test that the order placement handles failures gracefully
 
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -664,7 +664,7 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
 
@@ -686,9 +686,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_server_error_500() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -709,7 +709,7 @@ mod tests {
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -724,9 +724,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_authentication_failure() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -746,7 +746,7 @@ mod tests {
         });
 
         let order = Order::new("SPY".to_string(), Instruction::Buy, 25);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -761,9 +761,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_malformed_json_response() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -772,7 +772,7 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         let error = result.unwrap_err();
@@ -783,9 +783,9 @@ mod tests {
     #[tokio::test]
     async fn test_order_placement_empty_location_header_value() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -806,7 +806,7 @@ mod tests {
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Sell, 50);
-        let result = order.place(&env, &pool).await;
+        let result = order.place(&config, &pool).await;
 
         account_mock.assert();
         order_mock.assert();
@@ -821,9 +821,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_success_filled() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -862,7 +862,7 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -878,9 +878,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_success_working() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -911,7 +911,7 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538456", &env, &pool).await;
+        let result = Order::get_order_status("1004055538456", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -926,9 +926,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_partially_filled() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -975,7 +975,7 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538789", &env, &pool).await;
+        let result = Order::get_order_status("1004055538789", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -995,9 +995,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_order_not_found() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1018,7 +1018,7 @@ mod tests {
                 .json_body(json!({"error": "Order not found"}));
         });
 
-        let result = Order::get_order_status("NONEXISTENT", &env, &pool).await;
+        let result = Order::get_order_status("NONEXISTENT", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1035,9 +1035,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_authentication_failure() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1058,7 +1058,7 @@ mod tests {
                 .json_body(json!({"error": "Unauthorized"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1073,9 +1073,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_server_error() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1096,7 +1096,7 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1111,9 +1111,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_invalid_json_response() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1134,7 +1134,7 @@ mod tests {
                 .body("invalid json response");
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &config, &pool).await;
 
         account_mock.assert();
         order_status_mock.assert();
@@ -1145,9 +1145,9 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_retry_on_transient_failure() {
         let server = httpmock::MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1169,7 +1169,7 @@ mod tests {
                 .json_body(json!({"error": "Bad Gateway"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &env, &pool).await;
+        let result = Order::get_order_status("1004055538123", &config, &pool).await;
 
         account_mock.assert();
         // Should have made at least one request (retry logic is handled by backon)

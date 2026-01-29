@@ -10,7 +10,7 @@ use tracing::{error, warn};
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmEnv;
+use crate::onchain::EvmConfig;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;

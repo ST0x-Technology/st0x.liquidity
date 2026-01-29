@@ -74,16 +74,17 @@ impl std::fmt::Debug for AlpacaTradingApiClient {
 }
 
 impl AlpacaTradingApiClient {
-    pub(crate) fn new(env: &AlpacaTradingApiAuthConfig) -> Result<Self, super::AlpacaTradingApiError> {
-        let base_url = env.base_url();
-        let api_info =
-            apca::ApiInfo::from_parts(&base_url, &env.api_key, &env.api_secret)?;
+    pub(crate) fn new(
+        config: &AlpacaTradingApiAuthConfig,
+    ) -> Result<Self, super::AlpacaTradingApiError> {
+        let base_url = config.base_url();
+        let api_info = apca::ApiInfo::from_parts(&base_url, &config.api_key, &config.api_secret)?;
 
         let client = Client::new(api_info);
 
         Ok(Self {
             client,
-            trading_mode: env.trading_mode(),
+            trading_mode: config.trading_mode(),
         })
     }
 

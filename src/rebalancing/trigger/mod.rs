@@ -5,9 +5,7 @@ mod usdc;
 
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
-use clap::Parser;
 use cqrs_es::{EventEnvelope, Query};
-use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,71 +33,10 @@ pub(crate) use equity::EquityTriggerSkip;
 pub enum RebalancingConfigError {
     #[error("rebalancing requires Alpaca broker")]
     NotAlpacaBroker,
-    #[error(transparent)]
-    Clap(#[from] clap::Error),
-}
-
-/// Environment configuration for rebalancing (parsed via clap).
-#[derive(Parser, Debug, Clone)]
-pub struct RebalancingEnv {
-    /// Target ratio of onchain to total for equity (0.0-1.0)
-    #[clap(long, env, default_value = "0.5")]
-    equity_target_ratio: Decimal,
-    /// Deviation from equity target that triggers rebalancing (0.0-1.0)
-    #[clap(long, env, default_value = "0.2")]
-    equity_deviation: Decimal,
-    /// Target ratio of onchain to total for USDC (0.0-1.0)
-    #[clap(long, env, default_value = "0.5")]
-    usdc_target_ratio: Decimal,
-    /// Deviation from USDC target that triggers rebalancing (0.0-1.0)
-    #[clap(long, env, default_value = "0.3")]
-    usdc_deviation: Decimal,
-    /// Issuer's wallet for tokenized equity redemptions
-    #[clap(long, env)]
-    redemption_wallet: Address,
-    /// Ethereum RPC URL for CCTP operations
-    #[clap(long, env)]
-    ethereum_rpc_url: Url,
-    /// Private key for signing EVM transactions (used on both Ethereum and Base)
-    #[clap(long, env)]
-    evm_private_key: B256,
-    /// Vault ID for USDC deposits to the Raindex vault
-    #[clap(long, env)]
-    usdc_vault_id: B256,
-    /// Alpaca account ID (UUID) for Broker API wallet operations
-    #[clap(long, env, value_parser = AlpacaAccountId::parse)]
-    alpaca_account_id: AlpacaAccountId,
-}
-
-impl RebalancingConfig {
-    /// Parse rebalancing configuration from environment variables.
-    pub(crate) fn from_env() -> Result<Self, RebalancingConfigError> {
-        // clap's try_parse_from expects argv[0] to be the program name, but we only
-        // care about environment variables, so this is just a placeholder.
-        const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
-
-        let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
-
-        Ok(Self {
-            equity_threshold: ImbalanceThreshold {
-                target: env.equity_target_ratio,
-                deviation: env.equity_deviation,
-            },
-            usdc_threshold: ImbalanceThreshold {
-                target: env.usdc_target_ratio,
-                deviation: env.usdc_deviation,
-            },
-            redemption_wallet: env.redemption_wallet,
-            ethereum_rpc_url: env.ethereum_rpc_url,
-            evm_private_key: env.evm_private_key,
-            usdc_vault_id: env.usdc_vault_id,
-            alpaca_account_id: env.alpaca_account_id,
-        })
-    }
 }
 
 /// Configuration for rebalancing operations.
-#[derive(Clone)]
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,

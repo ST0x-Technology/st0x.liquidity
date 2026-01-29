@@ -271,7 +271,7 @@ mod tests {
     use crate::alpaca_wallet::AlpacaAccountId;
     use crate::env::{BrokerConfig, LogLevel};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
 
     fn create_config_without_rebalancing() -> Config {
@@ -279,7 +279,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),

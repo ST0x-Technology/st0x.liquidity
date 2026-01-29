@@ -94,7 +94,7 @@ mod tests {
 
     use super::*;
     use crate::env::{BrokerConfig, Config};
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::test_utils::setup_test_db;
     use st0x_execution::schwab::SchwabAuthConfig;
 
@@ -105,7 +105,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: crate::env::LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
                 order_owner: Some(address!("0x2222222222222222222222222222222222222222")),
@@ -116,9 +116,9 @@ mod tests {
             broker: BrokerConfig::Schwab(SchwabAuthConfig {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
-                redirect_uri: "https://127.0.0.1".to_string(),
-                base_url: mock_server.base_url(),
-                account_index: 0,
+                redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
+                base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+                account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,

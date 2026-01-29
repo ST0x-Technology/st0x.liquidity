@@ -133,14 +133,14 @@ mod tests {
 
     use super::*;
     use crate::env::{BrokerConfig, LogLevel};
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),

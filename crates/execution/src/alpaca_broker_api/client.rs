@@ -30,11 +30,8 @@ impl std::fmt::Debug for AlpacaBrokerApiClient {
 }
 
 impl AlpacaBrokerApiClient {
-    pub(crate) fn new(env: &AlpacaBrokerApiAuthEnv) -> Result<Self, AlpacaBrokerApiError> {
-        let credentials = format!(
-            "{}:{}",
-            env.alpaca_broker_api_key, env.alpaca_broker_api_secret
-        );
+    pub(crate) fn new(config: &AlpacaBrokerApiAuthConfig) -> Result<Self, AlpacaBrokerApiError> {
+        let credentials = format!("{}:{}", config.api_key, config.api_secret);
         let encoded_credentials = BASE64_STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {encoded_credentials}");
 
@@ -51,9 +48,9 @@ impl AlpacaBrokerApiClient {
 
         Ok(Self {
             http_client,
-            base_url: env.base_url().to_string(),
-            account_id: env.alpaca_account_id.clone(),
-            mode: env.alpaca_broker_api_mode.clone(),
+            base_url: config.base_url().to_string(),
+            account_id: config.account_id.clone(),
+            mode: config.mode().clone(),
         })
     }
 

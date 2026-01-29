@@ -180,8 +180,8 @@ where
     let broker_auth = AlpacaBrokerApiAuthConfig {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
-        alpaca_account_id: rebalancing_config.alpaca_account_id.to_string(),
-        mode: broker_mode,
+        account_id: rebalancing_config.alpaca_account_id.to_string(),
+        mode: Some(broker_mode),
     };
 
     let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
@@ -531,7 +531,7 @@ mod tests {
 
     use super::*;
     use crate::env::LogLevel;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::test_utils::setup_test_db;
 
     fn create_config_without_rebalancing() -> Config {
@@ -539,7 +539,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -558,8 +558,8 @@ mod tests {
         config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            alpaca_account_id: "test-account-id".to_string(),
-            mode: AlpacaBrokerApiMode::Sandbox,
+            account_id: "test-account-id".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         });
         config
     }
@@ -701,8 +701,8 @@ mod tests {
         let alpaca_auth = AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            alpaca_account_id: "test-account-id".to_string(),
-            mode: AlpacaBrokerApiMode::Sandbox,
+            account_id: "test-account-id".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -723,8 +723,8 @@ mod tests {
         let alpaca_auth = AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            alpaca_account_id: "test-account-id".to_string(),
-            mode: AlpacaBrokerApiMode::Production,
+            account_id: "test-account-id".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Production),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {

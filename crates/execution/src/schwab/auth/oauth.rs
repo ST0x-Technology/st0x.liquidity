@@ -268,7 +268,7 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_env() -> SchwabAuthConfig {
+    fn create_test_config() -> SchwabAuthConfig {
         SchwabAuthConfig {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
@@ -279,7 +279,7 @@ mod tests {
         }
     }
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
         SchwabAuthConfig {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
@@ -292,14 +292,14 @@ mod tests {
 
     #[test]
     fn test_schwab_auth_env_get_auth_url() {
-        let env = create_test_env();
+        let config = create_test_config();
         let expected_url = "https://api.schwabapi.com/v1/oauth/authorize?client_id=test_app_key&redirect_uri=https%3A%2F%2F127.0.0.1%2F";
-        assert_eq!(env.get_auth_url().unwrap(), expected_url);
+        assert_eq!(config.get_auth_url().unwrap(), expected_url);
     }
 
     #[test]
     fn test_schwab_auth_env_get_auth_url_custom_base_url() {
-        let env = SchwabAuthConfig {
+        let config = SchwabAuthConfig {
             app_key: "custom_key".to_string(),
             app_secret: "custom_secret".to_string(),
             redirect_uri: Some(Url::parse("https://custom.redirect.com").expect("test url")),
@@ -308,12 +308,12 @@ mod tests {
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let expected_url = "https://custom.api.com/v1/oauth/authorize?client_id=custom_key&redirect_uri=https%3A%2F%2Fcustom.redirect.com%2F";
-        assert_eq!(env.get_auth_url().unwrap(), expected_url);
+        assert_eq!(config.get_auth_url().unwrap(), expected_url);
     }
 
     #[test]
     fn test_schwab_auth_env_get_auth_url_with_special_characters() {
-        let env = SchwabAuthConfig {
+        let config = SchwabAuthConfig {
             app_key: "test key with spaces & symbols!".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: Some(
@@ -325,13 +325,13 @@ mod tests {
             encryption_key: TEST_ENCRYPTION_KEY,
         };
         let expected_url = "https://api.schwabapi.com/v1/oauth/authorize?client_id=test%20key%20with%20spaces%20%26%20symbols%21&redirect_uri=https%3A%2F%2Fexample.com%2Fcallback%3Fparam%3Dvalue%26other%3Dtest";
-        assert_eq!(env.get_auth_url().unwrap(), expected_url);
+        assert_eq!(config.get_auth_url().unwrap(), expected_url);
     }
 
     #[tokio::test]
     async fn test_get_tokens_success() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "test_access_token",
@@ -354,7 +354,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_tokens_from_code("test_code").await;
+        let result = config.get_tokens_from_code("test_code").await;
 
         mock.assert();
 
@@ -370,7 +370,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_http_error() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -379,7 +379,7 @@ mod tests {
                 .json_body(json!({"error": "invalid_request"}));
         });
 
-        let result = env.get_tokens_from_code("invalid_code").await;
+        let result = config.get_tokens_from_code("invalid_code").await;
 
         mock.assert();
         assert!(matches!(
@@ -392,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_json_parse_error() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -401,7 +401,7 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = env.get_tokens_from_code("test_code").await;
+        let result = config.get_tokens_from_code("test_code").await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
@@ -410,7 +410,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_missing_fields() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "test_access_token"
@@ -423,7 +423,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_tokens_from_code("test_code").await;
+        let result = config.get_tokens_from_code("test_code").await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
@@ -432,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_with_special_characters() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "access_token_with_special_chars_!@#$%^&*()",
@@ -446,7 +446,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env
+        let result = config
             .get_tokens_from_code("code_with_special_chars_!@#$%^&*()")
             .await;
 
@@ -465,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_tokens_success() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "new_access_token",
@@ -487,7 +487,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.refresh_tokens("old_refresh_token").await;
+        let result = config.refresh_tokens("old_refresh_token").await;
 
         mock.assert();
 
@@ -503,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_tokens_http_error() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -512,7 +512,7 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = env.refresh_tokens("invalid_refresh_token").await;
+        let result = config.refresh_tokens("invalid_refresh_token").await;
 
         mock.assert();
         assert!(matches!(
@@ -524,7 +524,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_tokens_json_parse_error() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -533,7 +533,7 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = env.refresh_tokens("test_refresh_token").await;
+        let result = config.refresh_tokens("test_refresh_token").await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
@@ -542,7 +542,7 @@ mod tests {
     #[tokio::test]
     async fn test_refresh_tokens_missing_fields() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock_response = json!({
             "access_token": "new_access_token"
@@ -555,7 +555,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.refresh_tokens("test_refresh_token").await;
+        let result = config.refresh_tokens("test_refresh_token").await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
@@ -590,7 +590,7 @@ mod tests {
 
     #[test]
     fn test_schwab_auth_config_defaults() {
-        let env = SchwabAuthConfig {
+        let config = SchwabAuthConfig {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -599,18 +599,21 @@ mod tests {
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
-        assert_eq!(env.redirect_uri().unwrap().as_str(), "https://127.0.0.1/");
         assert_eq!(
-            env.base_url().unwrap().as_str(),
+            config.redirect_uri().unwrap().as_str(),
+            "https://127.0.0.1/"
+        );
+        assert_eq!(
+            config.base_url().unwrap().as_str(),
             "https://api.schwabapi.com/"
         );
-        assert_eq!(env.account_index(), 0);
+        assert_eq!(config.account_index(), 0);
     }
 
     #[tokio::test]
     async fn test_get_account_hash_success() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -635,7 +638,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = config.get_account_hash(&pool).await;
 
         mock.assert();
         assert_eq!(result.unwrap(), "ABC123DEF456");
@@ -644,8 +647,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_account_hash_with_custom_index() {
         let server = MockServer::start();
-        let mut env = create_test_env_with_mock_server(&server);
-        env.account_index = Some(1);
+        let mut config = create_test_config_with_mock_server(&server);
+        config.account_index = Some(1);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -670,7 +673,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = config.get_account_hash(&pool).await;
 
         mock.assert();
         assert_eq!(result.unwrap(), "XYZ789GHI012");
@@ -679,8 +682,8 @@ mod tests {
     #[tokio::test]
     async fn test_get_account_hash_index_out_of_bounds() {
         let server = MockServer::start();
-        let mut env = create_test_env_with_mock_server(&server);
-        env.account_index = Some(2);
+        let mut config = create_test_config_with_mock_server(&server);
+        config.account_index = Some(2);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -698,7 +701,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = config.get_account_hash(&pool).await;
 
         mock.assert();
         assert!(matches!(
@@ -710,7 +713,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_account_hash_no_accounts() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool).await;
 
@@ -721,7 +724,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let result = env.get_account_hash(&pool).await;
+        let result = config.get_account_hash(&pool).await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::NoAccountsFound));
@@ -730,14 +733,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_no_retries_on_failure() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
             then.status(500);
         });
 
-        let result = env.get_tokens_from_code("test_code").await;
+        let result = config.get_tokens_from_code("test_code").await;
 
         assert_eq!(mock.hits(), 1);
         match result {

@@ -171,8 +171,8 @@ where
         let broker_auth = AlpacaBrokerApiAuthConfig {
             api_key: alpaca_auth.api_key.clone(),
             api_secret: alpaca_auth.api_secret.clone(),
-            alpaca_account_id: config.alpaca_account_id.to_string(),
-            mode: broker_api_mode,
+            account_id: config.alpaca_account_id.to_string(),
+            mode: Some(broker_api_mode),
         };
         let broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
 
@@ -463,8 +463,8 @@ mod tests {
         let broker_auth = AlpacaBrokerApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            alpaca_account_id: config.alpaca_account_id.to_string(),
-            mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+            account_id: config.alpaca_account_id.to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_config(broker_auth)
@@ -587,8 +587,8 @@ mod tests {
         let broker_auth = AlpacaBrokerApiAuthConfig {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
-            alpaca_account_id: config.alpaca_account_id.to_string(),
-            mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+            account_id: config.alpaca_account_id.to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 
         let result = AlpacaBrokerApi::try_from_config(broker_auth).await;

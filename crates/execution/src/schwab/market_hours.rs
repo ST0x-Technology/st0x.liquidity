@@ -128,11 +128,11 @@ struct TimeRange {
 /// Uses the `/marketdata/v1/markets/{marketId}` endpoint with "equity" as the market ID.
 /// Returns market hours in Eastern timezone per the API specification.
 pub async fn fetch_market_hours(
-    env: &SchwabAuthEnv,
+    config: &SchwabAuthConfig,
     pool: &SqlitePool,
     date: Option<&str>,
 ) -> Result<MarketHours, SchwabError> {
-    let access_token = SchwabTokens::get_valid_access_token(pool, env).await?;
+    let access_token = SchwabTokens::get_valid_access_token(pool, config).await?;
 
     let headers = [
         (
@@ -144,7 +144,7 @@ pub async fn fetch_market_hours(
     .into_iter()
     .collect::<HeaderMap>();
 
-    let mut url = format!("{}/marketdata/v1/markets/equity", env.schwab_base_url);
+    let mut url = format!("{}marketdata/v1/markets/equity", config.base_url()?);
 
     if let Some(date_param) = date {
         use std::fmt::Write;
@@ -293,13 +293,13 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_app_key".to_string(),
-            schwab_app_secret: "test_app_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: mock_server.base_url(),
-            schwab_account_index: 0,
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
+        SchwabAuthConfig {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
     }
@@ -307,9 +307,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_open_market() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let mock_response = json!({
             "equity": {
@@ -349,7 +349,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&env, &pool, None).await;
+        let result = fetch_market_hours(&config, &pool, None).await;
 
         mock.assert();
         let market_hours = result.unwrap();
@@ -366,9 +366,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_closed_market() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let mock_response = json!({
             "equity": {
@@ -395,7 +395,7 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&env, &pool, Some("2025-01-04")).await;
+        let result = fetch_market_hours(&config, &pool, Some("2025-01-04")).await;
 
         mock.assert();
         let market_hours = result.unwrap();
@@ -413,9 +413,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_api_error() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/marketdata/v1/markets/equity");
@@ -424,7 +424,7 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = fetch_market_hours(&env, &pool, None).await;
+        let result = fetch_market_hours(&config, &pool, None).await;
 
         mock.assert();
         assert!(matches!(
@@ -437,9 +437,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_market_hours_invalid_response() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, &env).await;
+        setup_test_tokens(&pool, &config).await;
 
         let mock = server.mock(|when, then| {
             when.method(GET).path("/marketdata/v1/markets/equity");
@@ -448,7 +448,7 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = fetch_market_hours(&env, &pool, None).await;
+        let result = fetch_market_hours(&config, &pool, None).await;
 
         mock.assert();
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));

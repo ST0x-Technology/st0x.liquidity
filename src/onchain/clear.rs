@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::{
-    EvmEnv,
+    EvmConfig,
     pyth::FeedIdCache,
     trade::{OnchainTrade, OrderFill},
 };

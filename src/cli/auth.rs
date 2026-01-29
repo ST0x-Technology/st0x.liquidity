@@ -79,7 +79,7 @@ async fn run_oauth_flow(
 ) -> Result<(), SchwabError> {
     println!(
         "Authenticate portfolio brokerage account (not dev account) and paste URL: {}",
-        schwab_auth.get_auth_url()
+        schwab_auth.get_auth_url()?
     );
     print!("Paste the full redirect URL you were sent to: ");
     std::io::stdout().flush()?;
@@ -105,7 +105,7 @@ mod tests {
 
     use super::*;
     use crate::env::{Config, LogLevel};
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -114,9 +114,9 @@ mod tests {
         let schwab_auth = SchwabAuthConfig {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
-            redirect_uri: "https://127.0.0.1".to_string(),
-            base_url: mock_server.base_url(),
-            account_index: 0,
+            redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
+            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+            account_index: Some(0),
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
@@ -124,7 +124,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),

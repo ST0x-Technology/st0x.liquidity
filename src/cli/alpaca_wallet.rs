@@ -432,7 +432,7 @@ mod tests {
     use crate::cli::ConvertDirection;
     use crate::env::LogLevel;
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
 
     fn create_config_without_alpaca() -> Config {
@@ -440,7 +440,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -459,8 +459,8 @@ mod tests {
         config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            alpaca_account_id: "test-account-id".to_string(),
-            mode: AlpacaBrokerApiMode::Sandbox,
+            account_id: "test-account-id".to_string(),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         });
         config
     }
@@ -471,7 +471,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -482,8 +482,8 @@ mod tests {
             broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
-                alpaca_account_id: alpaca_account_id.to_string(),
-                mode: AlpacaBrokerApiMode::Sandbox,
+                account_id: alpaca_account_id.to_string(),
+                mode: Some(AlpacaBrokerApiMode::Sandbox),
             }),
             hyperdx: None,
             rebalancing: Some(RebalancingConfig {

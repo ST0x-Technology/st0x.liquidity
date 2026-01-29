@@ -298,10 +298,10 @@ pub struct CliEnv {
 }
 
 impl CliEnv {
-    /// Parse CLI arguments and convert to internal Config struct
+    /// Parse CLI arguments, load config from file, and return with subcommand.
     pub fn parse_and_convert() -> anyhow::Result<(Config, Commands)> {
         let cli_env = Self::parse();
-        let config = cli_env.env.into_config()?;
+        let config = Config::load_file(&cli_env.env.config_file)?;
         Ok((config, cli_env.command))
     }
 }
@@ -618,7 +618,7 @@ mod tests {
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::env::{BrokerConfig, LogLevel};
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
 
@@ -1067,7 +1067,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(address!("0x0000000000000000000000000000000000000000")),
@@ -1078,9 +1078,9 @@ mod tests {
             broker: BrokerConfig::Schwab(SchwabAuthConfig {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
-                redirect_uri: "https://127.0.0.1".to_string(),
-                base_url: mock_server.base_url(),
-                account_index: 0,
+                redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
+                base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+                account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,
