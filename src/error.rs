@@ -11,7 +11,7 @@ use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
     EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
-    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive, Symbol,
+    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
@@ -134,8 +134,6 @@ pub(crate) enum EventProcessingError {
     EmptySymbol(#[from] EmptySymbolError),
     #[error("Config error: {0}")]
     Config(#[from] ConfigError),
-    #[error("Token address not found in cache for symbol: {0}")]
-    TokenNotInCache(Symbol),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] AggregateError<VaultRegistryError>),
 }

@@ -205,7 +205,7 @@ pub(crate) async fn load_position(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{Address, fixed_bytes};
     use chrono::Utc;
     use rust_decimal::Decimal;
     use st0x_execution::{
@@ -234,6 +234,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -283,6 +284,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -331,6 +333,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -389,6 +392,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -449,6 +453,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -579,6 +584,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 2.5,
             direction: Direction::Buy,
             price: Usdc::new(150.0).unwrap(),

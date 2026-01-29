@@ -188,6 +188,7 @@ where
             self.common.executor.clone(),
             self.common.pool.clone(),
             self.common.dual_write_context.clone(),
+            self.common.inventory.clone(),
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,

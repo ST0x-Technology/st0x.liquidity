@@ -6,8 +6,11 @@ mod usdc;
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use clap::Parser;
-use cqrs_es::{EventEnvelope, Query};
+use cqrs_es::persist::PersistedEventStore;
+use cqrs_es::{Aggregate, EventEnvelope, EventStore, Query};
 use rust_decimal::Decimal;
+use sqlite_es::SqliteEventRepository;
+use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +24,7 @@ use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
 use crate::shares::{ArithmeticError, FractionalShares};
-use crate::symbol::cache::SymbolCache;
+use crate::vault_registry::VaultRegistry;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
@@ -166,7 +169,9 @@ pub(crate) enum TriggeredOperation {
 /// Trigger that monitors inventory and sends rebalancing operations.
 pub(crate) struct RebalancingTrigger {
     config: RebalancingTriggerConfig,
-    symbol_cache: SymbolCache,
+    pool: SqlitePool,
+    orderbook: Address,
+    order_owner: Address,
     inventory: Arc<RwLock<InventoryView>>,
     equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     usdc_in_progress: Arc<AtomicBool>,
@@ -176,13 +181,17 @@ pub(crate) struct RebalancingTrigger {
 impl RebalancingTrigger {
     pub(crate) fn new(
         config: RebalancingTriggerConfig,
-        symbol_cache: SymbolCache,
+        pool: SqlitePool,
+        orderbook: Address,
+        order_owner: Address,
         inventory: Arc<RwLock<InventoryView>>,
         sender: mpsc::Sender<TriggeredOperation>,
     ) -> Self {
         Self {
             config,
-            symbol_cache,
+            pool,
+            orderbook,
+            order_owner,
             inventory,
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),

@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
+use st0x_execution::{Direction, EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
@@ -56,7 +56,6 @@ struct VaultDiscoveryContext<'a> {
     vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
     orderbook: Address,
     order_owner: Address,
-    cache: &'a SymbolCache,
 }
 
 pub(crate) struct Conductor {
@@ -263,7 +262,6 @@ impl Conductor {
                         pool.clone(),
                         rebalancing_config,
                         provider.clone(),
-                        cache.clone(),
                         config.evm.orderbook,
                         RebalancerContext {
                             event_broadcast: Some(event_sender),
@@ -752,7 +750,6 @@ async fn process_next_queued_event<P: Provider + Clone>(
         vault_registry_cqrs: queue_context.vault_registry_cqrs,
         orderbook: config.evm.orderbook,
         order_owner: config.order_owner()?,
-        cache: queue_context.cache,
     };
 
     process_valid_trade(
@@ -789,11 +786,7 @@ async fn discover_vaults_for_trade(
 ) -> Result<(), EventProcessingError> {
     let tx_hash = queued_event.tx_hash;
     let base_symbol = trade.symbol.base();
-
-    let expected_equity_token = context
-        .cache
-        .get_address(&base_symbol.to_string())
-        .ok_or_else(|| EventProcessingError::TokenNotInCache(base_symbol.clone()))?;
+    let expected_equity_token = trade.equity_token;
 
     let owned_vaults = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => extract_vaults_from_clear(clear_event),
@@ -1560,6 +1553,7 @@ mod tests {
             ),
             log_index: 293,
             symbol: tokenized_symbol!("AAPL0x"),
+            equity_token: Address::ZERO,
             amount: 5.0,
             direction: Direction::Sell,
             price: Usdc::new(20000.0).unwrap(),
@@ -3295,13 +3289,6 @@ mod tests {
         }
     }
 
-    fn setup_symbol_cache_with_equity(cache: &SymbolCache, token: Address, symbol: &str) {
-        cache
-            .map
-            .write()
-            .expect("Test cache lock poisoned")
-            .insert(token, symbol.to_string());
-    }
 
     async fn get_vault_registry_events(pool: &SqlitePool) -> Vec<String> {
         sqlx::query_scalar!("SELECT event_type FROM events WHERE aggregate_type = 'VaultRegistry'")
@@ -3314,25 +3301,23 @@ mod tests {
         let tokenized_symbol = format!("{symbol}0x");
         OnchainTradeBuilder::default()
             .with_symbol(&tokenized_symbol)
+            .with_equity_token(TEST_EQUITY_TOKEN)
             .build()
     }
 
-    fn create_vault_discovery_context<'a>(
-        vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
-        cache: &'a SymbolCache,
-    ) -> VaultDiscoveryContext<'a> {
+    fn create_vault_discovery_context(
+        vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
+    ) -> VaultDiscoveryContext<'_> {
         VaultDiscoveryContext {
             vault_registry_cqrs,
             orderbook: TEST_ORDERBOOK,
             order_owner: ORDER_OWNER,
-            cache,
         }
     }
 
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -3341,9 +3326,7 @@ mod tests {
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let context = create_vault_discovery_context(&vault_registry_cqrs);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -3361,7 +3344,6 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -3370,9 +3352,7 @@ mod tests {
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let context = create_vault_discovery_context(&vault_registry_cqrs);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -3390,7 +3370,6 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -3398,9 +3377,7 @@ mod tests {
         let queued_event = create_queued_take_event(order);
         let trade = create_test_trade("MSFT");
 
-        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "MSFT");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let context = create_vault_discovery_context(&vault_registry_cqrs);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -3424,7 +3401,6 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -3433,9 +3409,7 @@ mod tests {
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let context = create_vault_discovery_context(&vault_registry_cqrs);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed even when no vaults match");
@@ -3449,30 +3423,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_discover_vaults_for_trade_fails_when_token_not_in_cache() {
-        let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
-
-        let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
-        let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
-        let queued_event = create_queued_clear_event(alice, bob);
-        let trade = create_test_trade("AAPL");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
-        let result = discover_vaults_for_trade(&queued_event, &trade, &context).await;
-
-        assert!(
-            matches!(result, Err(EventProcessingError::TokenNotInCache(_))),
-            "Expected TokenNotInCache error, got: {result:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -3481,9 +3433,7 @@ mod tests {
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "AAPL");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let context = create_vault_discovery_context(&vault_registry_cqrs);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed");
@@ -3508,7 +3458,6 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
-        let cache = SymbolCache::default();
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -3517,9 +3466,7 @@ mod tests {
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("GOOG");
 
-        setup_symbol_cache_with_equity(&cache, TEST_EQUITY_TOKEN, "GOOG");
-
-        let context = create_vault_discovery_context(&vault_registry_cqrs, &cache);
+        let context = create_vault_discovery_context(&vault_registry_cqrs);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed");

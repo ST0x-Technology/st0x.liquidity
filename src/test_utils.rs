@@ -115,6 +115,7 @@ impl OnchainTradeBuilder {
                 ),
                 log_index: 1,
                 symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+                equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
                 amount: 1.0,
                 direction: Direction::Buy,
                 price: Usdc::new(150.0).unwrap(),
@@ -133,6 +134,12 @@ impl OnchainTradeBuilder {
     #[must_use]
     pub(crate) fn with_symbol(mut self, symbol: &str) -> Self {
         self.trade.symbol = symbol.parse::<TokenizedEquitySymbol>().unwrap();
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_equity_token(mut self, token: alloy::primitives::Address) -> Self {
+        self.trade.equity_token = token;
         self
     }
 
