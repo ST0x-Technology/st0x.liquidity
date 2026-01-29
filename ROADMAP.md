@@ -2,6 +2,12 @@
 
 ## Current Development Focus
 
+**Wrapped Token Handling:**
+
+- [ ] [#260 Add support for wrapping and unwrapping of the 1-to-1 share equivalent tokens into/from split/dividend compatibility vault](https://github.com/ST0x-Technology/st0x.liquidity/issues/260)
+  - PR:
+    [#241 Wrapped Token Handling](https://github.com/ST0x-Technology/st0x.liquidity/pull/241)
+
 **Alpaca Trading Improvements:**
 
 - [ ] [#212 Integrate Alpaca list assets endpoint and use it to check that the asset is active before trading](https://github.com/ST0x-Technology/st0x.liquidity/issues/212)
