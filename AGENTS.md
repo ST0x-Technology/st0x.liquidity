@@ -406,6 +406,20 @@ Environment variables (can be set via `.env` file):
     event sourcing pattern
   - If you see existing code writing directly to `events` table, that code is
     incorrect and should be refactored to use CqrsFramework
+- **CRITICAL: Single CQRS Framework Instance Per Aggregate**: In the main bot
+  flow, each aggregate type must have exactly ONE `SqliteCqrs<A>` instance,
+  constructed once during startup in `Conductor::start`, then passed to all
+  consumers. This prevents silent production bugs where missing query processors
+  cause events to persist without triggering required side effects.
+  - **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` anywhere in
+    the server binary's code path outside `Conductor::start`
+  - **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
+    aggregate type in the bot flow
+  - **REQUIRED**: When adding a new query processor, add it to the framework
+    construction in `Conductor::start`
+  - **ALLOWED**: Direct construction in test code, CLI code, and migration code
+    (different execution contexts with intentionally different query processor
+    needs)
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -506,19 +520,10 @@ Environment variables (can be set via `.env` file):
 **This is a mission-critical financial application. The following patterns are
 STRICTLY FORBIDDEN and can result in catastrophic financial losses:**
 
-**NEVER** write code that silently provides wrong values, hides conversion
-errors, or masks failures in any way. This includes but is not limited to:
-
-- Defensive value capping that hides overflow/underflow
-- Fallback to default values on conversion failure
-- Silent truncation of precision
-- Using `unwrap_or(default_value)` on financial calculations
-- Using `unwrap_or_default()` on monetary values
-- Conversion functions that "gracefully degrade" instead of failing
-
-**ALL financial operations must use explicit error handling with proper error
-propagation. Here are examples of forbidden patterns and their correct
-alternatives:**
+**NEVER** silently mask failures: no defensive capping, fallback defaults,
+precision truncation, `unwrap_or()`, `unwrap_or_default()`, or graceful
+degradation on financial values. ALL financial operations must use explicit
+error handling with proper error propagation.
 
 #### Error Categories That Must Fail Fast
 
@@ -644,65 +649,12 @@ you MUST fix the underlying code problems, not suppress the warnings.
 3. **Improve code structure** to meet clippy's standards
 4. **Use proper error handling** instead of suppressing warnings
 
-**Examples of FORBIDDEN practices:**
+When encountering a clippy issue: understand why it's flagged, refactor to
+address the root cause, and ask permission before suppressing if you believe
+it's incorrect.
 
-```rust
-// ❌ NEVER DO THIS - Suppressing lints is forbidden
-#[allow(clippy::too_many_lines)]
-fn large_function() { /* ... */ }
-
-#[allow(clippy::needless_continue)]
-// ❌ NEVER DO THIS - Fix the code structure instead
-```
-
-**Required approach:**
-
-```rust
-// ✅ CORRECT - Refactor to address the issue
-fn process_data() -> Result<(), Error> {
-    let data = get_data()?;
-    validate_data(&data)?;
-    save_data(&data)?;
-    Ok(())
-}
-
-fn validate_data(data: &Data) -> Result<(), Error> {
-    // Extracted validation logic
-}
-
-fn save_data(data: &Data) -> Result<(), Error> {
-    // Extracted saving logic
-}
-```
-
-**If you encounter a clippy issue:**
-
-1. Understand WHY clippy is flagging the code
-2. Refactor the code to address the underlying problem
-3. If you believe a lint is incorrect, ask for permission before suppressing it
-4. Document your reasoning if given permission to suppress a specific lint
-
-**Exception for third-party macro-generated code:**
-
-When using third-party macros, such as `sol!` to generate Rust code , lint
-suppression is acceptable for issues that originate from the contract's function
-signatures, which we cannot control.
-
-For example, to deal with a function generated from a smart contract's ABI, we
-can add `allow` inside the `sol!` macro invocation.
-
-```rust
-// ✅ CORRECT - Suppressing lint for third-party ABI generated code
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[allow(clippy::too_many_arguments)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
-);
-```
-
-This policy ensures code quality remains high and prevents technical debt
-accumulation through lint suppression.
+**Exception**: Lint suppression inside `sol!` macros is acceptable for issues
+from contract ABI signatures we cannot control.
 
 ### Commenting Guidelines
 
