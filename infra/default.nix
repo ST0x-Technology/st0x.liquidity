@@ -1,7 +1,7 @@
 { pkgs, ragenix, rainix, system }:
 
 let
-  buildInputs = [ pkgs.terraform ragenix.packages.${system}.default ];
+  buildInputs = [ pkgs.terraform pkgs.rage ragenix.packages.${system}.default ];
 
   tfState = "infra/terraform.tfstate";
   tfVars = "infra/terraform.tfvars";

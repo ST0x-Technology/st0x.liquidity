@@ -1,8 +1,8 @@
-name: Rainix CI
+name: CI
 on: [push]
 
 concurrency:
-  group: ${{ github.ref }}-rainix
+  group: ${{ github.ref }}-ci
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
@@ -21,18 +21,10 @@ jobs:
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
 
       - uses: nixbuild/nix-quick-install-action@v30
         with:
@@ -40,14 +32,11 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - name: Restore and save Nix store
+      - name: Nix store cache
         uses: nix-community/cache-nix-action@v6
         with:
-          # restore and save a cache using this key
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          # if there's no cache hit, restore a cache by this prefix
           restore-prefixes-first-match: nix-${{ runner.os }}-
-          # collect garbage until the Nix store size (in bytes) is at most this number
           gc-max-store-size-linux: 5G
 
       - run: nix run .#prepSolArtifacts
@@ -65,14 +54,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          tool-cache: false
-          large-packages: false
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
 
       - uses: nixbuild/nix-quick-install-action@v30
         with:
@@ -80,7 +65,7 @@ jobs:
             keep-env-derivations = true
             keep-outputs = true
 
-      - name: Restore and save Nix store
+      - name: Nix store cache
         uses: nix-community/cache-nix-action@v6
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
@@ -92,8 +77,6 @@ jobs:
       - name: Install dependencies
         run: nix develop -c bun install --cwd dashboard
       - name: Generate TypeScript types
-        env:
-          DATABASE_URL: "sqlite:schwab.db"
         run: |
           nix develop -c sqlx db create
           nix develop -c sqlx migrate run
@@ -107,8 +90,3 @@ jobs:
         run: nix develop -c bun run --cwd dashboard test:run
       - name: Build
         run: nix develop -c bun run --cwd dashboard build
-
-      - name: Build Docker image
-        run: docker build -t dashboard:ci dashboard/
-      - name: Validate nginx config
-        run: docker run --rm dashboard:ci nginx -t

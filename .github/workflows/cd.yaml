@@ -18,18 +18,10 @@ jobs:
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
-        with:
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: false
-          docker-images: false
-          swap-storage: false
 
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-          fetch-depth: 0
 
       - uses: nixbuild/nix-quick-install-action@v30
         with:
@@ -42,7 +34,7 @@ jobs:
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5G
+          gc-max-store-size-linux: 10G
 
       - name: Setup SSH
         run: |
@@ -56,5 +48,5 @@ jobs:
       - name: Build Solidity artifacts
         run: nix run .#prepSolArtifacts
 
-      - name: Deploy
+      - name: Build and deploy
         run: nix run .#deployService

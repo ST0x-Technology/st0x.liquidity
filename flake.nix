@@ -141,7 +141,7 @@
             '';
           };
 
-          deployService = pkgs.writeShellApplication {
+          deploy = pkgs.writeShellApplication {
             name = "deploy";
             runtimeInputs = infraPkgs.buildInputs
               ++ [ deploy-rs.packages.${system}.deploy-rs ];
@@ -174,7 +174,7 @@
               ragenix.packages.${system}.default
               packages.prepSolArtifacts
               packages.remote
-              packages.deployService
+              packages.deploy
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });
