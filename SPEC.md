@@ -247,12 +247,11 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 - **Terraform**: Provisions single DigitalOcean droplet. Standard HCL, version
   pinned via flake.lock.
 
-- **nixos-generators**: Builds custom NixOS VM images for DigitalOcean. Base
-  image with OS essentials, uploaded as custom image for droplet creation.
-
-- **deploy-rs**: Deploys to NixOS (or non-NixOS) hosts via SSH. Supports two
-  activation types: `activate.nixos` for full system configs, `activate.custom`
-  for standalone packages with an auto-rollback on failed deployments.
+- **deploy-rs**: Deploys to NixOS hosts via SSH. Two activation types:
+  `activate.nixos` for full system configuration (SSH, firewall, systemd units,
+  Grafana, ragenix), `activate.custom` for standalone service binaries. Includes
+  auto-rollback on failed deployments ("magic rollback" reverts if SSH is lost
+  during activation).
 
 - (r)**agenix**: Age-encrypted secrets for NixOS, using existing SSH keys. CLI
   encrypts secrets locally into `.age` files you commit to git. NixOS module
@@ -264,20 +263,20 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Architecture
 
-Stable infrastructure (base image) is separated from frequently changing
-application code (service deployments):
+Terraform provisions infrastructure (droplet, volume, reserved IP) from a
+stock NixOS image. deploy-rs handles all system and application deployment
+over SSH.
 
-_Base NixOS image_ (rebuilt occasionally when adding services or changing
-infra):
+_System configuration_ (deploy-rs `activate.nixos`):
 
 - OS essentials: SSH, firewall, users
-- Systemd unit definitions for application services (pointing to deployment
-  paths)
+- Systemd unit definitions for application services (pointing to deploy-rs
+  profile paths)
 - Grafana as a NixOS native service
 - ragenix integration for secret decryption
+- Nix configuration (flakes, garbage collection)
 
-_Per-service deploy-rs profiles_ (deployed independently, 1-to-1 with systemd
-units):
+_Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
 - `server-schwab` - hedging bot for Schwab executor
 - `server-alpaca` - hedging bot for Alpaca executor
@@ -288,9 +287,6 @@ units):
 Each profile deploys its binary to a known path and restarts the corresponding
 systemd unit. This allows updating one service without touching others.
 
-Grafana runs as a NixOS native service (part of base image configuration, not a
-deploy-rs profile).
-
 _Configuration management_:
 
 - Single TOML config file per service containing complete configuration
@@ -299,8 +295,9 @@ _Configuration management_:
 
 _Infrastructure_:
 
-- Terraform (standard HCL) provisions single droplet
+- Terraform (standard HCL) provisions single droplet from stock NixOS image
 - Nix wraps Terraform for reproducible, version-pinned execution
+- Terraform state encrypted with age and committed to git
 
 #### Rollback
 
@@ -310,9 +307,7 @@ new profile generation:
 
 - `nix profile history` shows deployment history with timestamps
 - `nix profile rollback` reverts to previous generation
-- Retention configured declaratively via NixOS `nix.gc.*` options deploy-rs
-  "magic rollback" is a separate safety net: auto-reverts if SSH connection is
-  lost during activation.
+- Retention configured declaratively via NixOS `nix.gc.*` options
 
 #### CI/CD Credential Management
 
