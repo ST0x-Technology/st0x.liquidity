@@ -26,7 +26,7 @@ let
 
   encryptState = ''
     nix eval --raw --file ${
-      ./keys.nix
+      ../keys.nix
     } roles.infra --apply 'builtins.concatStringsSep "\n"' \
       | rage -e -R /dev/stdin -o ${tfState}.age ${tfState}
   '';
