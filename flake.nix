@@ -9,10 +9,20 @@
       url = "github:nix-community/bun2nix?tag=2.0.7";
       inputs.nixpkgs.follows = "rainix/nixpkgs";
     };
+    nixos-generators = {
+      url = "github:nix-community/nixos-generators";
+      inputs.nixpkgs.follows = "rainix/nixpkgs";
+    };
   };
 
-  outputs = { flake-utils, rainix, bun2nix, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
+  outputs = { self, flake-utils, rainix, bun2nix, nixos-generators, ... }:
+    {
+      nixosConfigurations.st0x-liquidity =
+        rainix.inputs.nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [ ./nix/nixos/configuration.nix ];
+        };
+    } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
           inherit system;
@@ -96,7 +106,14 @@
               exec terraform -chdir=infra destroy "$@"
             '';
           };
-        };
+        } // (if system == "x86_64-linux" then {
+          doImage = nixos-generators.nixosGenerate {
+            system = "x86_64-linux";
+            format = "do";
+            modules = [ ./nix/nixos/configuration.nix ];
+          };
+        } else
+          { });
 
         devShell = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
