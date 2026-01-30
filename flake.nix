@@ -9,19 +9,22 @@
       url = "github:nix-community/bun2nix?tag=2.0.7";
       inputs.nixpkgs.follows = "rainix/nixpkgs";
     };
-    nixos-generators = {
-      url = "github:nix-community/nixos-generators";
-      inputs.nixpkgs.follows = "rainix/nixpkgs";
-    };
+    deploy-rs.url = "github:serokell/deploy-rs";
   };
 
-  outputs = { self, flake-utils, rainix, bun2nix, nixos-generators, ... }:
+  outputs = { self, flake-utils, rainix, bun2nix, deploy-rs, ... }:
     {
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
           modules = [ ./nix/nixos.nix ];
         };
+
+      deploy = import ./nix/deploy.nix { inherit deploy-rs self; };
+
+      checks = builtins.mapAttrs
+        (system: deployLib: deployLib.deployChecks self.deploy)
+        deploy-rs.lib;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -106,14 +109,16 @@
               exec terraform -chdir=infra destroy "$@"
             '';
           };
-        } // (if system == "x86_64-linux" then {
-          doImage = nixos-generators.nixosGenerate {
-            system = "x86_64-linux";
-            format = "do";
-            modules = [ ./nix/nixos.nix ];
+
+          deployNixOs = rainix.mkTask.${system} {
+            name = "deploy-nixos";
+            additionalBuildInputs =
+              [ deploy-rs.packages.${system}.deploy-rs ];
+            body = ''
+              exec deploy ".#st0x-liquidity.system" -- --impure "$@"
+            '';
           };
-        } else
-          { });
+        };
 
         devShell = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
