@@ -12,9 +12,3 @@ tarpaulin-report.html
 .sqlx/
 
 docker-compose.yaml
-
-# Terraform
-infra/.terraform/
-infra/*.tfstate*
-infra/terraform.tfvars
-infra/tfplan

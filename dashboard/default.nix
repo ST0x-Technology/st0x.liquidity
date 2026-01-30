@@ -1,6 +1,6 @@
 { pkgs, bun2nix, codegen }:
 
-let bunDeps = bun2nix.fetchBunDeps { bunNix = ../dashboard/bun.nix; };
+let bunDeps = bun2nix.fetchBunDeps { bunNix = ./bun.nix; };
 in pkgs.stdenv.mkDerivation {
   pname = "st0x-dashboard";
   version = "0.1.0";

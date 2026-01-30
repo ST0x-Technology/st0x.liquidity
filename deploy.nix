@@ -2,11 +2,11 @@
 
 let
   system = "x86_64-linux";
-  activate = deploy-rs.lib.${system}.activate;
+  inherit (deploy-rs.lib.${system}) activate;
 
 in {
   nodes.st0x-liquidity = {
-    hostname = "FIXME";
+    hostname = "209.38.48.141";
     sshUser = "root";
     user = "root";
 
