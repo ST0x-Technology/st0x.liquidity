@@ -329,8 +329,6 @@ impl FractionalShares {
     ///
     /// Divides by 10^18 to convert from raw token units to decimal shares.
     pub fn from_u256_18_decimals(value: U256) -> Result<Self, SharesConversionError> {
-        use std::str::FromStr;
-
         if value.is_zero() {
             return Ok(Self::ZERO);
         }

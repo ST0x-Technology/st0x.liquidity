@@ -11,6 +11,7 @@ mod ratio;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::sol_types::SolEvent;
+use st0x_execution::{EmptySymbolError, Symbol};
 use std::collections::HashSet;
 use std::sync::RwLock;
 
@@ -70,14 +71,29 @@ impl<P> VaultService<P>
 where
     P: Provider + Clone,
 {
-    /// Creates a new VaultService with the given provider and registry.
-    pub(crate) fn new(provider: P, registry: WrappedTokenRegistry) -> Self {
-        Self {
+    /// Creates a new VaultService with the hardcoded registry.
+    pub(crate) fn new(provider: P) -> Result<Self, EmptySymbolError> {
+        Ok(Self {
             provider,
             cache: RatioCache::new(),
-            registry,
+            registry: WrappedTokenRegistry::hardcoded()?,
             approvals: RwLock::new(HashSet::new()),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_registry(mut self, registry: WrappedTokenRegistry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// Pre-seeds the ratio cache for a wrapped token address.
+    ///
+    /// Allows tests to exercise the full `get_ratio_for_symbol` -> cache lookup
+    /// path with a non-empty registry without requiring a live RPC endpoint.
+    #[cfg(test)]
+    pub(crate) fn seed_ratio(&self, wrapped_token: Address, ratio: VaultRatio) {
+        self.cache.set(wrapped_token, ratio);
     }
 
     /// Fetches the current conversion ratio for a wrapped token.
@@ -237,10 +253,7 @@ where
     }
 
     /// Gets the wrapped token config for a symbol.
-    pub(crate) fn get_config_by_symbol(
-        &self,
-        symbol: &st0x_execution::Symbol,
-    ) -> Option<&WrappedTokenConfig> {
+    pub(crate) fn get_config_by_symbol(&self, symbol: &Symbol) -> Option<&WrappedTokenConfig> {
         self.registry.get_by_symbol(symbol)
     }
 
