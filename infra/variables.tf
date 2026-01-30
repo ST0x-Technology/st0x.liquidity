@@ -4,9 +4,10 @@ variable "do_token" {
   sensitive   = true
 }
 
-variable "ssh_key_fingerprint" {
-  description = "Fingerprint of the SSH key to add to the droplet"
+variable "ssh_key_name" {
+  description = "Name of the SSH key in DigitalOcean to add to the droplet"
   type        = string
+  default     = "st0x-op"
 }
 
 variable "region" {

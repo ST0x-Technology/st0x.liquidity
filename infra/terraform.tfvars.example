@@ -1,8 +1,4 @@
 # Copy to terraform.tfvars and fill in values.
 # NEVER commit terraform.tfvars — it contains secrets.
 
-do_token             = ""
-ssh_key_fingerprint  = ""
-region               = "nyc3"
-droplet_size         = "s-2vcpu-2gb"
-volume_size_gb       = 5
+do_token = ""

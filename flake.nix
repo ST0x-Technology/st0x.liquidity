@@ -14,7 +14,11 @@
   outputs = { flake-utils, rainix, bun2nix, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = rainix.pkgs.${system};
+        pkgs = import rainix.inputs.nixpkgs {
+          inherit system;
+          config.allowUnfreePredicate = pkg:
+            builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
+        };
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rainix.rust-toolchain.${system};
           rustc = rainix.rust-toolchain.${system};
@@ -58,6 +62,38 @@
             additionalBuildInputs = [ pkgs.gettext pkgs.docker ];
             body = ''
               exec ./.github/workflows/prep-docker-compose.sh "$@"
+            '';
+          };
+
+          tfInit = rainix.mkTask.${system} {
+            name = "tf-init";
+            additionalBuildInputs = [ pkgs.terraform ];
+            body = ''
+              exec terraform -chdir=infra init "$@"
+            '';
+          };
+
+          tfPlan = rainix.mkTask.${system} {
+            name = "tf-plan";
+            additionalBuildInputs = [ pkgs.terraform ];
+            body = ''
+              exec terraform -chdir=infra plan -out=tfplan "$@"
+            '';
+          };
+
+          tfApply = rainix.mkTask.${system} {
+            name = "tf-apply";
+            additionalBuildInputs = [ pkgs.terraform ];
+            body = ''
+              exec terraform -chdir=infra apply "$@" tfplan
+            '';
+          };
+
+          tfDestroy = rainix.mkTask.${system} {
+            name = "tf-destroy";
+            additionalBuildInputs = [ pkgs.terraform ];
+            body = ''
+              exec terraform -chdir=infra destroy "$@"
             '';
           };
         };

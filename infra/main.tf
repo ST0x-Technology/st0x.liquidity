@@ -1,5 +1,5 @@
 data "digitalocean_ssh_key" "deploy" {
-  name = var.ssh_key_fingerprint
+  name = var.ssh_key_name
 }
 
 resource "digitalocean_volume" "data" {
