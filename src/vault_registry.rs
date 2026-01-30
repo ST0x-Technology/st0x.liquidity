@@ -247,8 +247,15 @@ impl DomainEvent for VaultRegistryEvent {
 mod tests {
     use alloy::primitives::{address, b256};
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use cqrs_es::{EventEnvelope, Query};
+    use sqlite_es::sqlite_cqrs;
 
     use super::*;
+    use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
     const TEST_OWNER: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -588,5 +595,67 @@ mod tests {
 
         assert_eq!(registry.token_by_symbol(&test_symbol()), Some(TEST_TOKEN));
         assert_eq!(registry.token_by_symbol(&msft), Some(token_2));
+    }
+
+    /// Tracks how many events a query processor receives via dispatch.
+    struct EventCounter(Arc<AtomicUsize>);
+
+    #[async_trait]
+    impl Query<VaultRegistryAggregate> for EventCounter {
+        async fn dispatch(&self, _id: &str, _events: &[EventEnvelope<VaultRegistryAggregate>]) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Proves that query processors only receive events from commands
+    /// executed AFTER the framework is constructed -- existing events
+    /// in the store are NOT replayed on construction.
+    #[tokio::test]
+    async fn query_processors_only_see_new_events_not_historical() {
+        let pool = setup_test_db().await;
+        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
+
+        // Phase 1: emit an event with NO query processors
+        let bare_cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+
+        bare_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: TEST_TOKEN,
+                    vault_id: TEST_VAULT_ID,
+                    discovered_in: TEST_TX_HASH,
+                    symbol: test_symbol(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Phase 2: create a NEW framework with a counting query processor
+        let counter = Arc::new(AtomicUsize::new(0));
+        let query = EventCounter(counter.clone());
+        let observed_cqrs =
+            sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![Box::new(query)], ());
+
+        // Phase 3: emit one more event through the new framework
+        let new_vault_id =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+        observed_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverUsdcVault {
+                    vault_id: new_vault_id,
+                    discovered_in: TEST_TX_HASH,
+                },
+            )
+            .await
+            .unwrap();
+
+        // The counter should be 1 (only the new event), not 2
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "Query processor should only see events emitted after construction, not historical ones"
+        );
     }
 }

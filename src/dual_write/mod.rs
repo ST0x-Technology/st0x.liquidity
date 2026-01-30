@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use alloy::primitives::TxHash;
 use cqrs_es::AggregateError;
-use sqlite_es::{SqliteCqrs, sqlite_cqrs};
+use sqlite_es::SqliteCqrs;
+#[cfg(test)]
+use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
 use st0x_execution::PersistenceError;
 
@@ -69,22 +71,29 @@ pub(crate) struct DualWriteContext {
 }
 
 impl DualWriteContext {
-    /// Creates a new context with the default threshold (1 share).
     #[cfg(test)]
     pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self::with_threshold(pool, ExecutionThreshold::whole_share())
-    }
-
-    /// Creates a new context with a specific execution threshold.
-    pub(crate) fn with_threshold(
-        pool: SqlitePool,
-        execution_threshold: ExecutionThreshold,
-    ) -> Self {
         Self {
             pool: pool.clone(),
             onchain_trade: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             position: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             offchain_order: Arc::new(sqlite_cqrs(pool, vec![], ())),
+            execution_threshold: ExecutionThreshold::whole_share(),
+        }
+    }
+
+    pub(crate) fn with_threshold(
+        pool: SqlitePool,
+        onchain_trade: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
+        position: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>>,
+        offchain_order: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
+        execution_threshold: ExecutionThreshold,
+    ) -> Self {
+        Self {
+            pool,
+            onchain_trade,
+            position,
+            offchain_order,
             execution_threshold,
         }
     }

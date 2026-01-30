@@ -1,17 +1,19 @@
 //! Trading order execution and transaction processing CLI commands.
 
+use std::io::Write;
+use std::sync::Arc;
+
 use alloy::primitives::B256;
 use alloy::providers::Provider;
-use sqlx::SqlitePool;
-use std::io::Write;
-use tracing::{error, info};
-
 use rust_decimal::Decimal;
+use sqlite_es::sqlite_cqrs;
+use sqlx::SqlitePool;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
     Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig, OrderPlacement,
     OrderState, Positive, Symbol, TryIntoExecutor,
 };
+use tracing::{error, info};
 
 use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
@@ -275,8 +277,13 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let dual_write_context =
-        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
+    let dual_write_context = DualWriteContext::with_threshold(
+        pool.clone(),
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+        config.execution_threshold,
+    );
 
     update_position_aggregate(
         &dual_write_context,

@@ -7,13 +7,11 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{CqrsFramework, Query};
-use sqlite_es::SqliteEventRepository;
-use sqlx::SqlitePool;
+use cqrs_es::Query;
+use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
@@ -23,8 +21,8 @@ use st0x_execution::{AlpacaBrokerApi, Executor};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
-    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RebalancingTriggerConfig,
-    RedemptionManager,
+    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RedemptionManager,
+    TriggeredOperation,
 };
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
@@ -32,20 +30,11 @@ use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
-use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
-
-/// Runtime context passed to the rebalancer.
-///
-/// Groups optional runtime dependencies that are shared across the system.
-pub(crate) struct RebalancerContext {
-    pub(crate) event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-    pub(crate) inventory: Arc<RwLock<InventoryView>>,
-}
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -80,13 +69,20 @@ type ConfiguredRebalancer<BP> = Rebalancer<
     UsdcRebalanceManager<BP, UsdcEventStore>,
 >;
 
+pub(crate) struct RebalancingCqrsFrameworks {
+    pub(crate) mint: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
+    pub(crate) redemption: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
+    pub(crate) usdc: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+}
+
 /// Spawns the rebalancing infrastructure.
 pub(crate) async fn spawn_rebalancer<BP>(
-    pool: SqlitePool,
     config: &RebalancingConfig,
     base_provider: BP,
     orderbook: Address,
-    context: RebalancerContext,
+    market_maker_wallet: Address,
+    operation_receiver: mpsc::Receiver<TriggeredOperation>,
+    frameworks: RebalancingCqrsFrameworks,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -103,14 +99,13 @@ where
     )
     .await?;
 
-    let market_maker_wallet = signer.address();
     let rebalancer = services.into_rebalancer(
-        pool,
         config,
-        orderbook,
-        context.event_broadcast,
         market_maker_wallet,
-        context.inventory,
+        operation_receiver,
+        frameworks.mint,
+        frameworks.redemption,
+        frameworks.usdc,
     );
 
     let handle = tokio::spawn(async move {
@@ -204,54 +199,13 @@ where
 
     fn into_rebalancer(
         self,
-        pool: SqlitePool,
         config: &RebalancingConfig,
-        orderbook: Address,
-        event_broadcast: Option<broadcast::Sender<ServerMessage>>,
         market_maker_wallet: Address,
-        inventory: Arc<RwLock<InventoryView>>,
+        operation_receiver: mpsc::Receiver<TriggeredOperation>,
+        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
+        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
+        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
     ) -> ConfiguredRebalancer<BP> {
-        const OPERATION_CHANNEL_CAPACITY: usize = 100;
-
-        let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
-
-        let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
-        };
-
-        let trigger = Arc::new(RebalancingTrigger::new(
-            trigger_config,
-            pool.clone(),
-            orderbook,
-            market_maker_wallet,
-            inventory,
-            operation_sender,
-        ));
-
-        let mint_store =
-            PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-        let mint_cqrs = Arc::new(CqrsFramework::new(
-            mint_store,
-            build_mint_queries(trigger.clone(), event_broadcast.clone()),
-            (),
-        ));
-
-        let redemption_store =
-            PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-        let redemption_cqrs = Arc::new(CqrsFramework::new(
-            redemption_store,
-            build_redemption_queries(trigger.clone(), event_broadcast.clone()),
-            (),
-        ));
-
-        let usdc_store = PersistedEventStore::new_event_store(SqliteEventRepository::new(pool));
-        let usdc_cqrs = Arc::new(CqrsFramework::new(
-            usdc_store,
-            build_usdc_queries(trigger, event_broadcast),
-            (),
-        ));
-
         let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
 
         let redemption_manager =
@@ -277,27 +231,23 @@ where
     }
 }
 
-macro_rules! build_queries {
-    ($name:ident, $aggregate:ty) => {
-        fn $name(
-            trigger: Arc<RebalancingTrigger>,
-            event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-        ) -> Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> {
-            let mut queries: Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> =
-                vec![Box::new(trigger)];
+pub(crate) fn build_rebalancing_queries<A>(
+    trigger: Arc<RebalancingTrigger>,
+    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+) -> Vec<Box<dyn Query<Lifecycle<A, Never>>>>
+where
+    Lifecycle<A, Never>: cqrs_es::Aggregate,
+    RebalancingTrigger: Query<Lifecycle<A, Never>>,
+    EventBroadcaster: Query<Lifecycle<A, Never>>,
+{
+    let mut queries: Vec<Box<dyn Query<Lifecycle<A, Never>>>> = vec![Box::new(trigger)];
 
-            if let Some(sender) = event_broadcast {
-                queries.push(Box::new(EventBroadcaster::new(sender)));
-            }
+    if let Some(sender) = event_broadcast {
+        queries.push(Box::new(EventBroadcaster::new(sender)));
+    }
 
-            queries
-        }
-    };
+    queries
 }
-
-build_queries!(build_mint_queries, TokenizedEquityMint);
-build_queries!(build_redemption_queries, EquityRedemption);
-build_queries!(build_usdc_queries, UsdcRebalance);
 
 #[cfg(test)]
 mod tests {
@@ -308,6 +258,7 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
     use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
     use uuid::Uuid;
@@ -315,6 +266,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
+    use crate::rebalancing::RebalancingTriggerConfig;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -521,15 +473,19 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
-        let orderbook = address!("0x1111111111111111111111111111111111111111");
+
+        let (_tx, rx) = mpsc::channel(100);
+        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let redemption_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let usdc_cqrs = Arc::new(sqlite_cqrs(pool, vec![], ()));
+
         let _rebalancer = services.into_rebalancer(
-            pool,
             &config,
-            orderbook,
-            None,
             market_maker_wallet,
-            inventory,
+            rx,
+            mint_cqrs,
+            redemption_cqrs,
+            usdc_cqrs,
         );
     }
 

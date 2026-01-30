@@ -4,8 +4,8 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
+use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -16,19 +16,25 @@ use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::error::EventProcessingError;
-use crate::inventory::InventoryView;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
 
 use super::{
-    Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
-    spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    Conductor, InventorySnapshotAggregate, VaultRegistryAggregate, spawn_event_processor,
+    spawn_inventory_poller, spawn_onchain_event_receiver, spawn_order_poller,
+    spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
 type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
+
+pub(crate) struct CqrsFrameworks {
+    pub(crate) dual_write_context: DualWriteContext,
+    pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
+    pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+}
 
 struct CommonFields<P, E> {
     config: Config,
@@ -36,8 +42,7 @@ struct CommonFields<P, E> {
     cache: SymbolCache,
     provider: P,
     executor: E,
-    dual_write_context: DualWriteContext,
-    inventory: Arc<RwLock<InventoryView>>,
+    frameworks: CqrsFrameworks,
 }
 
 pub(crate) struct Initial;
@@ -69,8 +74,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
         cache: SymbolCache,
         provider: P,
         executor: E,
-        dual_write_context: DualWriteContext,
-        inventory: Arc<RwLock<InventoryView>>,
+        frameworks: CqrsFrameworks,
     ) -> Self {
         Self {
             common: CommonFields {
@@ -79,8 +83,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 cache,
                 provider,
                 executor,
-                dual_write_context,
-                inventory,
+                frameworks,
             },
             state: Initial,
         }
@@ -162,7 +165,7 @@ where
                     self.common.executor.clone(),
                     self.common.config.evm.orderbook,
                     order_owner,
-                    self.common.inventory.clone(),
+                    self.common.frameworks.snapshot_cqrs,
                 ))
             }
             Err(error) => {
@@ -176,6 +179,7 @@ where
             &self.common.config,
             &self.common.pool,
             self.common.executor.clone(),
+            self.common.frameworks.dual_write_context.clone(),
         );
         let dex_event_receiver = spawn_onchain_event_receiver(
             self.state.event_sender,
@@ -187,7 +191,7 @@ where
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
             self.common.pool.clone(),
-            self.common.dual_write_context.clone(),
+            self.common.frameworks.dual_write_context.clone(),
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,
@@ -195,6 +199,8 @@ where
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
+            self.common.frameworks.dual_write_context,
+            self.common.frameworks.vault_registry_cqrs,
         );
 
         Conductor {
