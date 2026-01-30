@@ -152,11 +152,10 @@ impl Executor for SchwabExecutor {
         let handle = tokio::spawn(async move {
             let refresh_handle = spawn_automatic_token_refresh(pool_clone, auth_clone);
 
-            match refresh_handle.await {
-                Err(e) if !e.is_cancelled() => {
-                    error!("Token refresh task panicked: {e}");
-                }
-                _ => {}
+            if let Err(e) = refresh_handle.await
+                && !e.is_cancelled()
+            {
+                error!("Token refresh task panicked: {e}");
             }
         });
 
