@@ -16,15 +16,12 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{AggregateContext, AggregateError, EventStore, Query};
+use cqrs_es::{AggregateContext, AggregateError, EventStore};
 use futures_util::future::try_join_all;
-use sqlite_es::{SqliteCqrs, SqliteEventRepository, sqlite_cqrs};
+use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
-
-/// Type alias for queries that subscribe to InventorySnapshot events.
-pub(crate) type InventorySnapshotQueries = Vec<Box<dyn Query<InventorySnapshotAggregate>>>;
 
 type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
@@ -70,10 +67,8 @@ where
         pool: SqlitePool,
         orderbook: Address,
         order_owner: Address,
-        queries: InventorySnapshotQueries,
+        snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
     ) -> Self {
-        let snapshot_cqrs = sqlite_cqrs::<InventorySnapshotAggregate>(pool.clone(), queries, ());
-
         Self {
             vault_service,
             executor,
@@ -263,6 +258,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
+    use sqlite_es::sqlite_cqrs;
     use sqlx::Row;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
@@ -326,7 +322,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -373,7 +369,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -416,7 +412,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -448,7 +444,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         // Should succeed without error
@@ -497,7 +493,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -544,7 +540,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -585,7 +581,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -665,7 +661,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -709,7 +705,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -754,7 +750,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -798,7 +794,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -829,7 +825,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            vec![],
+            sqlite_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();

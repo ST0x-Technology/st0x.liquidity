@@ -25,7 +25,8 @@ pub(crate) mod usdc;
 pub(crate) use mint::manager::MintManager;
 pub(crate) use rebalancer::Rebalancer;
 pub(crate) use redemption::manager::RedemptionManager;
-pub(crate) use spawn::{RebalancerContext, spawn_rebalancer};
+pub(crate) use spawn::{RebalancingCqrsFrameworks, build_rebalancing_queries, spawn_rebalancer};
 pub(crate) use trigger::{
     RebalancingConfig, RebalancingConfigError, RebalancingTrigger, RebalancingTriggerConfig,
+    TriggeredOperation,
 };

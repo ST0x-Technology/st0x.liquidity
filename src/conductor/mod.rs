@@ -6,6 +6,7 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
+use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use cqrs_es::Query;
 use futures_util::{Stream, StreamExt};
@@ -13,6 +14,7 @@ use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -25,6 +27,7 @@ use crate::cctp::USDC_BASE;
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::env::Config;
+use crate::equity_redemption::EquityRedemption;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
@@ -42,11 +45,16 @@ use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_fro
 use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
-use crate::rebalancing::{RebalancerContext, spawn_rebalancer};
+use crate::rebalancing::{
+    RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
+    build_rebalancing_queries, spawn_rebalancer,
+};
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
+use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
-pub(crate) use builder::ConductorBuilder;
+pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 
 type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
@@ -249,29 +257,47 @@ impl Conductor {
 
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
 
-        let dual_write_context =
-            DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
+        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let offchain_order_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+
+        let dual_write_context = DualWriteContext::with_threshold(
+            pool.clone(),
+            onchain_trade_cqrs,
+            position_cqrs,
+            offchain_order_cqrs,
+            config.execution_threshold,
+        );
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
+        let snapshot_query = InventorySnapshotQuery::new(inventory.clone());
+        let snapshot_cqrs = sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(snapshot_query) as Box<dyn Query<InventorySnapshotAggregate>>],
+            (),
+        );
+
         let rebalancer = match config.rebalancing_config() {
-            Some(rebalancing_config) => {
-                info!("Initializing rebalancing infrastructure");
-                Some(
-                    spawn_rebalancer(
-                        pool.clone(),
-                        rebalancing_config,
-                        provider.clone(),
-                        config.evm.orderbook,
-                        RebalancerContext {
-                            event_broadcast: Some(event_sender),
-                            inventory: inventory.clone(),
-                        },
-                    )
-                    .await?,
+            Some(rebalancing_config) => Some(
+                spawn_rebalancing_infrastructure(
+                    rebalancing_config,
+                    pool,
+                    config,
+                    &inventory,
+                    event_sender,
+                    &provider,
                 )
-            }
+                .await?,
+            ),
             None => None,
+        };
+
+        let frameworks = CqrsFrameworks {
+            dual_write_context,
+            vault_registry_cqrs,
+            snapshot_cqrs,
         };
 
         let mut builder = ConductorBuilder::new(
@@ -280,8 +306,7 @@ impl Conductor {
             cache,
             provider,
             executor,
-            dual_write_context,
-            inventory,
+            frameworks,
         )
         .with_executor_maintenance(executor_maintenance)
         .with_dex_event_streams(clear_stream, take_stream);
@@ -339,6 +364,68 @@ impl Conductor {
     }
 }
 
+async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
+    rebalancing_config: &RebalancingConfig,
+    pool: &SqlitePool,
+    config: &Config,
+    inventory: &Arc<RwLock<InventoryView>>,
+    event_sender: broadcast::Sender<ServerMessage>,
+    provider: &P,
+) -> anyhow::Result<JoinHandle<()>> {
+    info!("Initializing rebalancing infrastructure");
+
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let market_maker_wallet = signer.address();
+
+    const OPERATION_CHANNEL_CAPACITY: usize = 100;
+    let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
+
+    let trigger = Arc::new(RebalancingTrigger::new(
+        RebalancingTriggerConfig {
+            equity_threshold: rebalancing_config.equity_threshold,
+            usdc_threshold: rebalancing_config.usdc_threshold,
+        },
+        pool.clone(),
+        config.evm.orderbook,
+        market_maker_wallet,
+        inventory.clone(),
+        operation_sender,
+    ));
+
+    let event_broadcast = Some(event_sender);
+
+    let frameworks = RebalancingCqrsFrameworks {
+        mint: Arc::new(sqlite_cqrs(
+            pool.clone(),
+            build_rebalancing_queries::<TokenizedEquityMint>(
+                trigger.clone(),
+                event_broadcast.clone(),
+            ),
+            (),
+        )),
+        redemption: Arc::new(sqlite_cqrs(
+            pool.clone(),
+            build_rebalancing_queries::<EquityRedemption>(trigger.clone(), event_broadcast.clone()),
+            (),
+        )),
+        usdc: Arc::new(sqlite_cqrs(
+            pool.clone(),
+            build_rebalancing_queries::<UsdcRebalance>(trigger, event_broadcast),
+            (),
+        )),
+    };
+
+    Ok(spawn_rebalancer(
+        rebalancing_config,
+        provider.clone(),
+        config.evm.orderbook,
+        market_maker_wallet,
+        operation_receiver,
+        frameworks,
+    )
+    .await?)
+}
+
 async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
     let Some(handle) = handle else { return };
 
@@ -359,6 +446,7 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     config: &Config,
     pool: &SqlitePool,
     executor: E,
+    dual_write_context: DualWriteContext,
 ) -> JoinHandle<()> {
     let poller_config = config.get_order_poller_config();
     info!(
@@ -366,8 +454,6 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_config.polling_interval, poller_config.max_jitter
     );
 
-    let dual_write_context =
-        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
     let poller = OrderStatusPoller::new(poller_config, pool.clone(), executor, dual_write_context);
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
@@ -419,6 +505,8 @@ fn spawn_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
+    dual_write_context: DualWriteContext,
+    vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -429,8 +517,6 @@ where
     let config_clone = config.clone();
     let pool_clone = pool.clone();
     let cache_clone = cache.clone();
-    let dual_write_context =
-        DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
     tokio::spawn(async move {
         run_queue_processor(
@@ -440,6 +526,7 @@ where
             &cache_clone,
             provider,
             &dual_write_context,
+            &vault_registry_cqrs,
         )
         .await;
     })
@@ -480,7 +567,7 @@ fn spawn_inventory_poller<P, E>(
     executor: E,
     orderbook: Address,
     order_owner: Address,
-    inventory: Arc<RwLock<InventoryView>>,
+    snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -488,16 +575,13 @@ where
 {
     info!("Starting inventory poller");
 
-    let snapshot_query = InventorySnapshotQuery::new(inventory);
-    let queries = vec![Box::new(snapshot_query) as Box<dyn Query<InventorySnapshotAggregate>>];
-
     let service = InventoryPollingService::new(
         vault_service,
         executor,
         pool,
         orderbook,
         order_owner,
-        queries,
+        snapshot_cqrs,
     );
 
     tokio::spawn(async move {
@@ -637,6 +721,7 @@ async fn run_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     dual_write_context: &DualWriteContext,
+    vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -645,8 +730,6 @@ async fn run_queue_processor<P, E>(
     info!("Starting queue processor service");
 
     let feed_id_cache = FeedIdCache::default();
-    let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-        sqlite_cqrs(pool.clone(), vec![], ());
 
     log_unprocessed_event_count(pool).await;
 
@@ -655,7 +738,7 @@ async fn run_queue_processor<P, E>(
     let queue_context = QueueProcessingContext {
         cache,
         feed_id_cache: &feed_id_cache,
-        vault_registry_cqrs: &vault_registry_cqrs,
+        vault_registry_cqrs,
     };
 
     loop {
@@ -1444,6 +1527,7 @@ mod tests {
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
     use futures_util::stream;
+    use sqlite_es::sqlite_cqrs;
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
@@ -2657,21 +2741,16 @@ mod tests {
         let take_stream = stream::empty();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .spawn();
 
         assert!(!conductor.order_poller.is_finished());
         assert!(!conductor.event_processor.is_finished());
@@ -2695,21 +2774,16 @@ mod tests {
         let take_stream = stream::empty();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .spawn();
 
         let order_handle = conductor.order_poller;
         let event_handle = conductor.event_processor;
@@ -2748,21 +2822,16 @@ mod tests {
         let start_time = std::time::Instant::now();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .spawn();
 
         let elapsed = start_time.elapsed();
 
@@ -2786,21 +2855,16 @@ mod tests {
         let take_stream = stream::empty();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .spawn();
 
         assert!(conductor.rebalancer.is_none());
         abort_all_conductor_tasks(conductor);
@@ -2818,8 +2882,11 @@ mod tests {
         let take_stream = stream::empty();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         let rebalancer_handle = tokio::spawn(async {
             loop {
@@ -2827,19 +2894,11 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .with_rebalancer(rebalancer_handle)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .with_rebalancer(rebalancer_handle)
+            .spawn();
 
         assert!(conductor.rebalancer.is_some());
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
@@ -2859,8 +2918,11 @@ mod tests {
         let take_stream = stream::empty();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         let rebalancer_handle = tokio::spawn(async {
             loop {
@@ -2868,19 +2930,11 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .with_rebalancer(rebalancer_handle)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .with_rebalancer(rebalancer_handle)
+            .spawn();
 
         let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_ref.is_finished());
@@ -2902,8 +2956,11 @@ mod tests {
         let take_stream = stream::empty();
 
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let dual_write_context = DualWriteContext::new(pool.clone());
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let frameworks = CqrsFrameworks {
+            dual_write_context: DualWriteContext::new(pool.clone()),
+            vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+            snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
+        };
 
         let rebalancer_handle = tokio::spawn(async {
             loop {
@@ -2911,19 +2968,11 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(
-            config,
-            pool,
-            cache,
-            provider,
-            executor,
-            dual_write_context,
-            inventory,
-        )
-        .with_executor_maintenance(None)
-        .with_dex_event_streams(clear_stream, take_stream)
-        .with_rebalancer(rebalancer_handle)
-        .spawn();
+        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+            .with_executor_maintenance(None)
+            .with_dex_event_streams(clear_stream, take_stream)
+            .with_rebalancer(rebalancer_handle)
+            .spawn();
 
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 
