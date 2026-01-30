@@ -33,6 +33,14 @@ impl CacheEntry {
     fn is_expired(&self) -> bool {
         Instant::now() >= self.expires_at
     }
+
+    #[cfg(test)]
+    fn permanent(ratio: VaultRatio) -> Self {
+        Self {
+            ratio,
+            expires_at: Instant::now() + Duration::from_secs(3600),
+        }
+    }
 }
 
 /// Cache for vault ratios with 2-second TTL.
@@ -77,6 +85,20 @@ impl RatioCache {
         };
 
         entries.insert(wrapped_token, CacheEntry::new(ratio));
+    }
+
+    /// Stores a ratio in the cache without expiration (for tests).
+    ///
+    /// Unlike `set`, this entry won't expire after 2 seconds, avoiding
+    /// flaky test failures when test setup takes longer than the TTL.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, wrapped_token: Address, ratio: VaultRatio) {
+        let mut entries = match self.entries.write() {
+            Ok(guard) => guard,
+            Err(poison) => poison.into_inner(),
+        };
+
+        entries.insert(wrapped_token, CacheEntry::permanent(ratio));
     }
 
     /// Removes a ratio from the cache.

@@ -50,7 +50,7 @@ impl VaultRatio {
         Ok(Self { assets_per_share })
     }
 
-    /// Creates a 1:1 ratio (used when no wrapping is needed).
+    #[cfg(test)]
     pub(crate) fn one_to_one() -> Self {
         Self {
             assets_per_share: RATIO_ONE,
