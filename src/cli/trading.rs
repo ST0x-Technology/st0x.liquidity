@@ -161,6 +161,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     stdout: &mut W,
     provider: &P,
     cache: &SymbolCache,
+    vault_service: &VaultService<P>,
 ) -> anyhow::Result<()> {
     let evm_env = &config.evm;
     let feed_id_cache = FeedIdCache::new();
@@ -177,7 +178,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     .await
     {
         Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, config, pool, stdout, provider).await?;
+            process_found_trade(onchain_trade, config, pool, stdout, vault_service).await?;
         }
         Ok(None) => {
             writeln!(
@@ -271,7 +272,7 @@ pub(super) async fn process_found_trade<W: Write, P: Provider + Clone>(
     config: &Config,
     pool: &SqlitePool,
     stdout: &mut W,
-    provider: &P,
+    vault_service: &VaultService<P>,
 ) -> anyhow::Result<()> {
     display_trade_details(&onchain_trade, stdout)?;
 
@@ -287,7 +288,6 @@ pub(super) async fn process_found_trade<W: Write, P: Provider + Clone>(
     )
     .await;
 
-    let vault_service = VaultService::new(provider.clone())?;
     let vault_ratio = vault_service
         .get_ratio_for_symbol(onchain_trade.symbol.base())
         .await?;

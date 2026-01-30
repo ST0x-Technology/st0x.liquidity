@@ -290,8 +290,8 @@ async fn execute_position(
         Direction::Sell => AccumulationBucket::LongExposure,
         Direction::Buy => AccumulationBucket::ShortExposure,
     };
-    // The accumulator tracks wrapped token amounts. Convert to unwrapped
-    // (real equity) amounts before sending to the broker.
+    // For wrapped tokens, convert to unwrapped (real equity) amounts
+    // before sending to the broker.
     let unwrapped_shares = vault_ratio.wrapped_to_unwrapped_fractional(shares.inner())?;
     let unwrapped_positive = Positive::new(unwrapped_shares)?;
 
@@ -817,14 +817,6 @@ mod tests {
 
     const TEST_WRAPPED_TOKEN: Address = address!("0x1111111111111111111111111111111111111111");
     const TEST_UNWRAPPED_TOKEN: Address = address!("0x2222222222222222222222222222222222222222");
-
-    fn create_test_vault_service() -> VaultService<impl Provider + Clone> {
-        let provider =
-            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
-        VaultService::new(provider)
-            .unwrap()
-            .with_registry(WrappedTokenRegistry::empty())
-    }
 
     fn create_test_vault_service_with_ratio(
         symbol: &str,
@@ -2327,7 +2319,7 @@ mod tests {
             &pool,
             &dual_write_context,
             SupportedExecutor::Schwab,
-            &create_test_vault_service(),
+            &create_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
         )
         .await
         .unwrap();
@@ -2349,7 +2341,7 @@ mod tests {
             &pool,
             &dual_write_context,
             SupportedExecutor::Schwab,
-            &create_test_vault_service(),
+            &create_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
         )
         .await
         .unwrap();
@@ -2398,7 +2390,7 @@ mod tests {
             &pool,
             &dual_write_context,
             SupportedExecutor::Schwab,
-            &create_test_vault_service(),
+            &create_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
         )
         .await
         .unwrap();
@@ -2689,7 +2681,7 @@ mod tests {
             &pool,
             &dual_write_context,
             SupportedExecutor::Schwab,
-            &create_test_vault_service(),
+            &create_test_vault_service_with_ratio("SPLG", VaultRatio::one_to_one()),
         )
         .await
         .unwrap();
@@ -2776,7 +2768,7 @@ mod tests {
             &pool,
             &dual_write_context,
             SupportedExecutor::Schwab,
-            &create_test_vault_service(),
+            &create_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
         )
         .await
         .unwrap();

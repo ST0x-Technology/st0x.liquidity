@@ -20,6 +20,7 @@ use crate::env::{Config, Env};
 use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
+use crate::vault::VaultService;
 
 /// Direction for transferring assets between trading venues.
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -579,8 +580,17 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
             let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache)
-                .await
+            let vault_service = VaultService::new(provider.clone())?;
+            trading::process_tx_with_provider(
+                tx_hash,
+                config,
+                pool,
+                stdout,
+                &provider,
+                &cache,
+                &vault_service,
+            )
+            .await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
@@ -636,6 +646,7 @@ async fn run_provider_command<W: Write>(
 mod tests {
     use alloy::hex;
     use alloy::primitives::{FixedBytes, IntoLogData, U256, address, fixed_bytes};
+    use alloy::providers::Provider;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types::{SolCall, SolEvent};
     use clap::CommandFactory;
@@ -655,8 +666,26 @@ mod tests {
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
+    use crate::vault::{VaultRatio, WrappedTokenConfig, WrappedTokenRegistry};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
+
+    fn make_test_vault_service<P: Provider + Clone>(provider: &P, symbol: &str) -> VaultService<P> {
+        let registry = WrappedTokenRegistry::new(vec![WrappedTokenConfig {
+            equity_symbol: Symbol::new(symbol).unwrap(),
+            wrapped_token: address!("0x1111111111111111111111111111111111111111"),
+            unwrapped_token: address!("0x2222222222222222222222222222222222222222"),
+        }]);
+
+        let service = VaultService::new(provider.clone())
+            .unwrap()
+            .with_registry(registry);
+        service.seed_ratio(
+            address!("0x1111111111111111111111111111111111111111"),
+            VaultRatio::one_to_one(),
+        );
+        service
+    }
 
     fn get_schwab_auth_from_config(config: &Config) -> &SchwabAuthEnv {
         match &config.broker {
@@ -1646,6 +1675,7 @@ mod tests {
         asserter.push_success(&json!(null));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
+        let vault_service = VaultService::new(provider.clone()).unwrap();
 
         let result = trading::process_tx_with_provider(
             tx_hash,
@@ -1654,6 +1684,7 @@ mod tests {
             &mut stdout,
             &provider,
             &cache,
+            &vault_service,
         )
         .await;
 
@@ -1749,6 +1780,7 @@ mod tests {
 
         let provider = setup_mock_provider_for_process_tx(&mock_data, "USDC", "AAPL0x");
         let cache = SymbolCache::default();
+        let vault_service = make_test_vault_service(&provider, "AAPL");
 
         let mut stdout = Vec::new();
 
@@ -1759,6 +1791,7 @@ mod tests {
             &mut stdout,
             &provider,
             &cache,
+            &vault_service,
         )
         .await;
 
@@ -1867,6 +1900,7 @@ mod tests {
 
         let provider1 = ProviderBuilder::new().connect_mocked_client(asserter1);
         let cache1 = SymbolCache::default();
+        let vault_service1 = make_test_vault_service(&provider1, "TSLA");
 
         let mut stdout1 = Vec::new();
 
@@ -1877,6 +1911,7 @@ mod tests {
             &mut stdout1,
             &provider1,
             &cache1,
+            &vault_service1,
         )
         .await;
         assert!(
@@ -1909,6 +1944,7 @@ mod tests {
 
         let provider2 = ProviderBuilder::new().connect_mocked_client(asserter2);
         let cache2 = SymbolCache::default();
+        let vault_service2 = make_test_vault_service(&provider2, "TSLA");
 
         let mut stdout2 = Vec::new();
 
@@ -1919,6 +1955,7 @@ mod tests {
             &mut stdout2,
             &provider2,
             &cache2,
+            &vault_service2,
         )
         .await;
         assert!(

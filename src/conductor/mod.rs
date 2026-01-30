@@ -1317,7 +1317,7 @@ mod tests {
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
-    use crate::vault::WrappedTokenRegistry;
+    use crate::vault::{WrappedTokenConfig, WrappedTokenRegistry};
     use rust_decimal::Decimal;
     use st0x_execution::{
         Direction, FractionalShares, MockExecutorConfig, OrderState, OrderStatus, Positive,
@@ -1492,7 +1492,6 @@ mod tests {
             {
                 let dual_write_context = DualWriteContext::new(pool.clone());
                 let vault_ratio = VaultRatio::one_to_one();
-
                 let mut sql_tx = pool.begin().await.unwrap();
                 let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
                     &mut sql_tx,
@@ -2949,9 +2948,16 @@ mod tests {
 
         let provider =
             ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
-        let vault_service = VaultService::new(provider)
-            .unwrap()
-            .with_registry(WrappedTokenRegistry::empty());
+        let registry = WrappedTokenRegistry::new(vec![WrappedTokenConfig {
+            equity_symbol: Symbol::new("RKLB").unwrap(),
+            wrapped_token: address!("0x1111111111111111111111111111111111111111"),
+            unwrapped_token: address!("0x2222222222222222222222222222222222222222"),
+        }]);
+        let vault_service = VaultService::new(provider).unwrap().with_registry(registry);
+        vault_service.seed_ratio(
+            address!("0x1111111111111111111111111111111111111111"),
+            VaultRatio::one_to_one(),
+        );
 
         check_and_execute_accumulated_positions(
             &executor,

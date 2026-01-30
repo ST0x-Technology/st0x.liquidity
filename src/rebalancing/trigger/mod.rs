@@ -646,16 +646,6 @@ mod tests {
 
     const TEST_WRAPPED_TOKEN: Address = address!("0x1111111111111111111111111111111111111111");
 
-    fn make_test_vault_service() -> Arc<VaultService<TestProvider>> {
-        let provider =
-            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
-        Arc::new(
-            VaultService::new(provider)
-                .unwrap()
-                .with_registry(WrappedTokenRegistry::empty()),
-        )
-    }
-
     fn make_test_vault_service_with_ratio(
         symbol: &str,
         ratio: VaultRatio,
@@ -697,7 +687,7 @@ mod tests {
                 symbol_cache,
                 inventory,
                 sender,
-                make_test_vault_service(),
+                make_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
             ),
             receiver,
         )
@@ -802,7 +792,10 @@ mod tests {
         RebalancingTrigger<TestProvider>,
         mpsc::Receiver<TriggeredOperation>,
     ) {
-        make_trigger_with_inventory_and_vault(inventory, make_test_vault_service())
+        make_trigger_with_inventory_and_vault(
+            inventory,
+            make_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
+        )
     }
 
     fn make_trigger_with_inventory_and_vault(
@@ -2321,7 +2314,7 @@ mod tests {
             symbol_cache,
             inventory,
             sender,
-            make_test_vault_service(),
+            make_test_vault_service_with_ratio("AAPL", VaultRatio::one_to_one()),
         ));
 
         // Set in_progress flag

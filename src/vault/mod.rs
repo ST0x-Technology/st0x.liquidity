@@ -47,6 +47,9 @@ pub(crate) enum VaultError {
 
     #[error("Failed to decode event log: {0}")]
     EventDecode(#[from] alloy::sol_types::Error),
+
+    #[error("Symbol {0} not found in wrapped token registry")]
+    SymbolNotInRegistry(Symbol),
 }
 
 /// Service for managing ERC-4626 vault operations.
@@ -93,7 +96,7 @@ where
     /// path with a non-empty registry without requiring a live RPC endpoint.
     #[cfg(test)]
     pub(crate) fn seed_ratio(&self, wrapped_token: Address, ratio: VaultRatio) {
-        self.cache.set(wrapped_token, ratio);
+        self.cache.seed(wrapped_token, ratio);
     }
 
     /// Fetches the current conversion ratio for a wrapped token.
@@ -262,43 +265,35 @@ where
         self.registry.get_by_wrapped(wrapped)
     }
 
-    /// Fetches the VaultRatio for a symbol.
+    /// Fetches the VaultRatio for a symbol if it is a wrapped token.
     ///
-    /// Returns the actual ratio for wrapped tokens, or `VaultRatio::one_to_one()`
-    /// for non-wrapped tokens (which leaves values unchanged when applied).
-    pub(crate) async fn get_ratio_for_symbol(&self, symbol: &st0x_execution::Symbol) -> VaultRatio {
-        let Some(config) = self.get_config_by_symbol(symbol) else {
-            return VaultRatio::one_to_one();
-        };
+    /// Returns `Ok(None)` if the symbol is not in the wrapped token registry.
+    /// Returns `Ok(Some(ratio))` for wrapped tokens.
+    /// Returns `Err` if the RPC call to fetch the ratio fails.
+    pub(crate) async fn get_ratio_for_symbol(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<VaultRatio, VaultError> {
+        let config = self
+            .get_config_by_symbol(symbol)
+            .ok_or_else(|| VaultError::SymbolNotInRegistry(symbol.clone()))?;
 
-        let wrapped_token = config.wrapped_token;
-
-        match self.get_ratio(wrapped_token).await {
-            Ok(ratio) => ratio,
-            Err(e) => {
-                tracing::warn!(
-                    symbol = %symbol,
-                    wrapped_token = %wrapped_token,
-                    error = %e,
-                    "Failed to fetch VaultRatio, using 1:1 ratio"
-                );
-                VaultRatio::one_to_one()
-            }
-        }
+        self.get_ratio(config.wrapped_token).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
+    use alloy::providers::ProviderBuilder;
 
     use super::*;
 
     fn create_test_registry() -> WrappedTokenRegistry {
         let config = WrappedTokenConfig {
-            equity_symbol: st0x_execution::Symbol::new("AAPL").unwrap(),
-            wrapped_token: address!("1111111111111111111111111111111111111111"),
-            unwrapped_token: address!("2222222222222222222222222222222222222222"),
+            equity_symbol: Symbol::new("AAPL").unwrap(),
+            wrapped_token: address!("0x1111111111111111111111111111111111111111"),
+            unwrapped_token: address!("0x2222222222222222222222222222222222222222"),
         };
 
         WrappedTokenRegistry::new(vec![config])
@@ -307,10 +302,42 @@ mod tests {
     #[test]
     fn get_config_by_symbol_returns_correct_config() {
         let registry = create_test_registry();
-        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
 
         let config = registry.get_by_symbol(&symbol);
         assert!(config.is_some());
         assert_eq!(config.unwrap().equity_symbol, symbol);
+    }
+
+    #[test]
+    fn get_ratio_for_symbol_errors_for_unconfigured_symbol() {
+        let registry = create_test_registry();
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let service = VaultService::new(provider).unwrap().with_registry(registry);
+        let symbol = Symbol::new("TSLA").unwrap();
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(service.get_ratio_for_symbol(&symbol));
+
+        assert!(matches!(
+            result.unwrap_err(),
+            VaultError::SymbolNotInRegistry(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn get_ratio_for_symbol_returns_error_for_unreachable_rpc() {
+        let registry = create_test_registry();
+        let provider = ProviderBuilder::new().connect_http("http://127.0.0.1:1".parse().unwrap());
+        let service = VaultService::new(provider).unwrap().with_registry(registry);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let result = service.get_ratio_for_symbol(&symbol).await;
+
+        assert!(
+            result.is_err(),
+            "Expected error for unreachable RPC, got: {result:?}"
+        );
     }
 }

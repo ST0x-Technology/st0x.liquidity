@@ -262,8 +262,7 @@ impl InventoryView {
     /// Checks a single equity for imbalance against the threshold.
     ///
     /// The onchain balance is converted from wrapped to unwrapped-equivalent using
-    /// the vault_ratio before comparison with offchain balance. For non-wrapped tokens,
-    /// pass `VaultRatio::one_to_one()` which returns the value unchanged.
+    /// the vault_ratio before comparison with offchain balance.
     ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
     pub(crate) fn check_equity_imbalance(
@@ -1753,10 +1752,9 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), inventory(50, 0, 50, 0))]);
         let thresh = threshold("0.5", "0.2");
-        let ratio = VaultRatio::one_to_one();
 
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &ratio)
+            view.check_equity_imbalance(&aapl, &thresh, &VaultRatio::one_to_one())
                 .is_none()
         );
     }
@@ -1766,9 +1764,8 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
-        let ratio = VaultRatio::one_to_one();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &VaultRatio::one_to_one());
 
         assert!(matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })));
     }
@@ -1778,9 +1775,8 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), inventory(20, 0, 80, 0))]);
         let thresh = threshold("0.5", "0.2");
-        let ratio = VaultRatio::one_to_one();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &VaultRatio::one_to_one());
 
         assert!(matches!(imbalance, Some(Imbalance::TooMuchOffchain { .. })));
     }
@@ -1791,10 +1787,9 @@ mod tests {
         let msft = Symbol::new("MSFT").unwrap();
         let view = make_view(vec![(aapl, inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
-        let ratio = VaultRatio::one_to_one();
 
         assert!(
-            view.check_equity_imbalance(&msft, &thresh, &ratio)
+            view.check_equity_imbalance(&msft, &thresh, &VaultRatio::one_to_one())
                 .is_none()
         );
     }
@@ -1804,10 +1799,9 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), inventory(60, 20, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
-        let ratio = VaultRatio::one_to_one();
 
         assert!(
-            view.check_equity_imbalance(&aapl, &thresh, &ratio)
+            view.check_equity_imbalance(&aapl, &thresh, &VaultRatio::one_to_one())
                 .is_none()
         );
     }
