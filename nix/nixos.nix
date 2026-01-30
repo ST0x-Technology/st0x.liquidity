@@ -105,6 +105,7 @@ in {
     settings = {
       experimental-features = [ "nix-command" "flakes" ];
       auto-optimise-store = true;
+      download-buffer-size = 268435456;
     };
 
     gc = {
@@ -121,7 +122,9 @@ in {
     reporter-alpaca = mkService "reporter-alpaca" "reporter";
   };
 
-  environment.systemPackages = with pkgs; [ curl htop ];
+  environment.systemPackages = with pkgs; [ bat curl htop magic-wormhole zellij ];
+
+  programs.bash.interactiveShellInit = "set -o vi";
 
   system.stateVersion = "24.11";
 }

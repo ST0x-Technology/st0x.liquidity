@@ -131,12 +131,12 @@
             name = "deploy-nixos";
             additionalBuildInputs = [ deploy-rs.packages.${system}.deploy-rs ];
             body = ''
-              exec deploy ".#st0x-liquidity.system" -- --impure "$@"
+              exec deploy "$@" ".#st0x-liquidity.system" -- --impure
             '';
           };
         };
 
-        devShell = pkgs.mkShell {
+        devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           buildInputs = with pkgs;
