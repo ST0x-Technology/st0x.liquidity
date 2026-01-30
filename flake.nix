@@ -66,6 +66,13 @@
             codegen = packages.st0x-liquidity;
           };
 
+          dummy = pkgs.writeShellScriptBin "dummy" ''
+            while true; do
+              echo "hello from dummy service v2"
+              sleep 5
+            done
+          '';
+
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};
@@ -135,14 +142,16 @@
             '';
           };
 
-          deployNixOs = rainix.mkTask.${system} {
-            name = "deploy-nixos";
-            additionalBuildInputs = infraPkgs.buildInputs
+          deployService = pkgs.writeShellApplication {
+            name = "deploy";
+            runtimeInputs = infraPkgs.buildInputs
               ++ [ deploy-rs.packages.${system}.deploy-rs ];
-            body = ''
+            text = ''
               ${infraPkgs.resolveIp}
               export DEPLOY_HOST="$host_ip"
-              deploy "$@" ".#st0x-liquidity.system" -- --impure
+              target="''${1:-.#st0x-liquidity}"
+              shift || true
+              deploy "$@" "$target" -- --impure
             '';
           };
         };
@@ -160,6 +169,7 @@
               ragenix.packages.${system}.default
               packages.prepSolArtifacts
               packages.remote
+              packages.deployService
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });

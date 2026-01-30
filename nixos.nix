@@ -108,7 +108,23 @@
     };
   };
 
+  system.activationScripts.per-service-profiles.text =
+    "mkdir -p /nix/var/nix/profiles/per-service";
+
   age.secrets."example.toml".file = ./config/example.toml.age;
+
+  systemd.services.dummy = {
+    description = "Dummy service for testing deploy-rs profiles";
+    wantedBy = [ "multi-user.target" ];
+    unitConfig.ConditionPathExists =
+      "/nix/var/nix/profiles/per-service/dummy/bin/dummy";
+    serviceConfig = {
+      DynamicUser = true;
+      ExecStart = "/nix/var/nix/profiles/per-service/dummy/bin/dummy";
+      Restart = "always";
+      RestartSec = 5;
+    };
+  };
 
   environment.systemPackages = with pkgs; [
     bat

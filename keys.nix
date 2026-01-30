@@ -3,7 +3,7 @@ rec {
     gleb =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHepyxN9hvXzbCY/z0amzldy7DXjNdyetnVaQexRgDEX";
     host =
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICHL9ptsIpEU7eB/o4c3yooWw2bnkd1BaZSJ14ZxDblN";
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM3C0/VnY1XpfNG+KUtWpNgwGoj9tu41gMkoJQSz1PC";
   };
 
   roles = {
