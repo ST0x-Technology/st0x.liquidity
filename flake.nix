@@ -20,7 +20,7 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          modules = [ ./nix/nixos/configuration.nix ];
+          modules = [ ./nix/nixos.nix ];
         };
     } // flake-utils.lib.eachDefaultSystem (system:
       let
@@ -110,7 +110,7 @@
           doImage = nixos-generators.nixosGenerate {
             system = "x86_64-linux";
             format = "do";
-            modules = [ ./nix/nixos/configuration.nix ];
+            modules = [ ./nix/nixos.nix ];
           };
         } else
           { });

@@ -23,21 +23,6 @@ the limit, condense explanations without removing any rules.
   output. If you need the user to review something, explicitly ask them to look
   at it. Do not run `git diff` expecting the user to see output.
 
-## Planning Hierarchy
-
-The project uses a strict document hierarchy:
-
-1. **SPEC.md** - Source of truth for system behavior. Features documented here
-   before implementation.
-2. **GitHub Issues / Roadmap (#2)** - Downstream from spec. Describe problems,
-   not solutions.
-3. **Planning** - Downstream from issues. Implementation plans before coding.
-4. **Tests** - Downstream from plan. Written before implementation (TDD).
-5. **Implementation** - Makes the tests pass.
-
-**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → plan
-the implementation.
-
 ## Plan & Review
 
 ### While implementing

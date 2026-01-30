@@ -1,5 +1,9 @@
 # SPEC.md
 
+System specification for st0x liquidity. Covers architecture, behavior, and
+design decisions at a level sufficient to understand the system without
+prescribing exact commands or code.
+
 ## Background
 
 Early-stage onchain tokenized equity markets typically suffer from poor price
@@ -238,57 +242,10 @@ This section specifies infrastructure, deployment, and secrets management.
 Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 `5ede2d47465d3621b351c73c9c1af33d20a7c879`.
 
-#### Design Goals
+#### Tools
 
-- Declarative infrastructure management (eliminate DigitalOcean UI dependency)
-- Declarative secret management (eliminate GitHub Secrets UI dependency)
-- Structured configuration management (replace scattered env vars with validated
-  config files)
-- Easy addition of staging environments
-- Independent service deployment and rollback
-- Reliable rollback mechanism (replace brittle rollback scripts)
-- Balanced complexity: more robust than bash scripts, less complex than
-  Kubernetes
-- Support potential future microservices architecture
-- Thin GitHub Actions workflows with minimal bash
-
-#### Current Setup and Pain Points
-
-**Current infrastructure:**
-
-- Single DigitalOcean droplet running Ubuntu
-- Services deployed via Docker Compose
-- Deployment and rollback via bash scripts
-- Secrets stored in GitHub Secrets, injected as environment variables
-- Configuration scattered across multiple env var definitions
-
-**Pain points:**
-
-- **Fragile foundation:** The bash deployment scripts "kinda work" but feel
-  brittle - not a robust foundation to build serious production-grade systems
-  on. Adding a new env var with no default is stressful. Increasing deployment
-  complexity means touching scripts that only run in CI and haven't been
-  meaningfully tested.
-- **Manual infrastructure:** Droplet provisioning requires DigitalOcean UI
-- **Secret management friction:** Adding/updating secrets requires GitHub UI
-- **Configuration sprawl:** Env vars scattered across multiple places, different
-  vars required based on values of other vars that can be set in countless
-  different places without any ultimate source of truth
-- **Deployment coupling:** Updating one service requires redeploying everything
-- **No staging:** Adding a staging environment would require significant manual
-  work
-- **Rollback uncertainty:** Rollback scripts exist but haven't been
-  battle-tested enough to trust them in an emergency
-
-#### Approach
-
-Extend Nix from development environments and builds to infrastructure,
-deployment, and secrets management.
-
-**Key Tools:**
-
-- **Terraform**: Provisions single DigitalOcean droplet (matching current
-  architecture). Standard HCL, version pinned via flake.lock.
+- **Terraform**: Provisions single DigitalOcean droplet. Standard HCL, version
+  pinned via flake.lock.
 
 - **nixos-generators**: Builds custom NixOS VM images for DigitalOcean. Base
   image with OS essentials, uploaded as custom image for droplet creation.
@@ -305,10 +262,10 @@ deployment, and secrets management.
   other config. Ragenix is a Rust drop-in for agenix but is less documented, so
   it's best to follow agenix documentation but use ragenix instead.
 
-**Architecture:**
+#### Architecture
 
-The approach separates stable infrastructure (base image) from frequently
-changing application code (service deployments):
+Stable infrastructure (base image) is separated from frequently changing
+application code (service deployments):
 
 _Base NixOS image_ (rebuilt occasionally when adding services or changing
 infra):
@@ -338,15 +295,14 @@ _Configuration management_:
 
 - Single TOML config file per service containing complete configuration
 - Files encrypted with ragenix, decrypted at activation to `/run/agenix/`
-- Services use `clap-config-file` crate to load config via `--config-file` flag
-- Secrets marked `config_only` so they cannot be passed via CLI args
+- Services use `serde` + `toml` to load config via `--config-file` flag
 
 _Infrastructure_:
 
 - Terraform (standard HCL) provisions single droplet
-- Nix wraps Terraform for reproducible execution (pinned version via flake.lock)
+- Nix wraps Terraform for reproducible, version-pinned execution
 
-**Rollback:**
+#### Rollback
 
 deploy-rs deploys each service to a nix profile (e.g.,
 `/nix/var/nix/profiles/per-service/server-schwab`). Each deployment creates a
@@ -354,13 +310,11 @@ new profile generation:
 
 - `nix profile history` shows deployment history with timestamps
 - `nix profile rollback` reverts to previous generation
-- Retention configured declaratively via NixOS `nix.gc.*` options
-- Same tooling used for dev environments - no new mental model
+- Retention configured declaratively via NixOS `nix.gc.*` options deploy-rs
+  "magic rollback" is a separate safety net: auto-reverts if SSH connection is
+  lost during activation.
 
-deploy-rs "magic rollback" is a separate safety net: auto-reverts if SSH
-connection is lost during activation.
-
-**CI/CD Credential Management:**
+#### CI/CD Credential Management
 
 | Secret Type | Storage               | When Used           | Example                |
 | ----------- | --------------------- | ------------------- | ---------------------- |
@@ -370,32 +324,12 @@ connection is lost during activation.
 Use GitHub Actions environment protection (require approval for production,
 restrict to master branch).
 
-**SSH Key Management:**
+#### SSH Key Management
 
 Hybrid approach: DigitalOcean injects team SSH keys at droplet creation for
 emergency access; automation keys (CI/CD, deploy-rs) managed via ragenix
 (`authorized_keys.age`) for audit trail. Emergency access preserved even if
 ragenix deployment fails.
-
-**Trade-offs:**
-
-Pros:
-
-- Single language (Nix) for images, deployments, secrets, dev environments
-- Consistent dependency versions in all environments managed by a single source
-  of truth
-- Atomic updates - system never in half-broken state
-- Robust rollback via nix profile generations (built-in, not custom scripts)
-- Secrets in git with audit trail
-- Nix provides many benefits of containerization while being more lightweight
-- Nix derivations can be converted to Docker images using
-  `dockerTools.buildImage`, but not vice versa
-
-Cons:
-
-- (r)agenix requires NixOS on target
-- deploy-rs is less mature than some alternatives
-- There is a learning curve if you're not already familiar with Nix
 
 ## Crate Architecture
 
