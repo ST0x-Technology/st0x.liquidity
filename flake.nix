@@ -10,21 +10,29 @@
       inputs.nixpkgs.follows = "rainix/nixpkgs";
     };
     deploy-rs.url = "github:serokell/deploy-rs";
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "rainix/nixpkgs";
+    };
+    nixos-anywhere = {
+      url = "github:nix-community/nixos-anywhere";
+      inputs.nixpkgs.follows = "rainix/nixpkgs";
+    };
   };
 
-  outputs = { self, flake-utils, rainix, bun2nix, deploy-rs, ... }:
+  outputs = { self, flake-utils, rainix, bun2nix, deploy-rs, disko
+    , nixos-anywhere, ... }:
     {
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          modules = [ ./nix/nixos.nix ];
+          modules = [ disko.nixosModules.disko ./nix/nixos.nix ];
         };
 
       deploy = import ./nix/deploy.nix { inherit deploy-rs self; };
 
       checks = builtins.mapAttrs
-        (system: deployLib: deployLib.deployChecks self.deploy)
-        deploy-rs.lib;
+        (system: deployLib: deployLib.deployChecks self.deploy) deploy-rs.lib;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -110,10 +118,18 @@
             '';
           };
 
+          bootstrap = rainix.mkTask.${system} {
+            name = "bootstrap-nixos";
+            additionalBuildInputs =
+              [ nixos-anywhere.packages.${system}.default ];
+            body = ''
+              exec nixos-anywhere --flake ".#st0x-liquidity" "$@"
+            '';
+          };
+
           deployNixOs = rainix.mkTask.${system} {
             name = "deploy-nixos";
-            additionalBuildInputs =
-              [ deploy-rs.packages.${system}.deploy-rs ];
+            additionalBuildInputs = [ deploy-rs.packages.${system}.deploy-rs ];
             body = ''
               exec deploy ".#st0x-liquidity.system" -- --impure "$@"
             '';

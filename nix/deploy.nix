@@ -13,8 +13,7 @@ in {
     profilesOrder = [ "system" ];
 
     profiles = {
-      system.path =
-        activate.nixos self.nixosConfigurations.st0x-liquidity;
+      system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
     };
   };
 }

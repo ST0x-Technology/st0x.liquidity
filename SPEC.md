@@ -244,8 +244,14 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Tools
 
-- **Terraform**: Provisions single DigitalOcean droplet. Standard HCL, version
-  pinned via flake.lock.
+- **Terraform**: Provisions DigitalOcean infrastructure (droplet, volume,
+  reserved IP). Standard HCL, version pinned via flake.lock. Droplet boots
+  Ubuntu; nixos-anywhere converts it to NixOS.
+
+- **nixos-anywhere** + **disko**: One-time bootstrap that installs NixOS on the
+  Ubuntu droplet over SSH. Uses kexec to boot a NixOS installer in RAM,
+  partitions the disk via disko, and runs nixos-install with the flake's NixOS
+  configuration. After bootstrap, deploy-rs manages all updates.
 
 - **deploy-rs**: Deploys to NixOS hosts via SSH. Two activation types:
   `activate.nixos` for full system configuration (SSH, firewall, systemd units,
@@ -263,9 +269,9 @@ Alternative approaches (Ansible, Kamal) were evaluated and documented in commit
 
 #### Architecture
 
-Terraform provisions infrastructure (droplet, volume, reserved IP) from a
-stock NixOS image. deploy-rs handles all system and application deployment
-over SSH.
+Terraform provisions infrastructure (droplet, volume, reserved IP) with an
+Ubuntu image. nixos-anywhere bootstraps NixOS on the droplet (one-time).
+deploy-rs handles all subsequent system and application deployment over SSH.
 
 _System configuration_ (deploy-rs `activate.nixos`):
 
@@ -295,7 +301,8 @@ _Configuration management_:
 
 _Infrastructure_:
 
-- Terraform (standard HCL) provisions single droplet from stock NixOS image
+- Terraform (standard HCL) provisions droplet with Ubuntu image
+- nixos-anywhere converts Ubuntu to NixOS (one-time bootstrap)
 - Nix wraps Terraform for reproducible, version-pinned execution
 - Terraform state encrypted with age and committed to git
 
