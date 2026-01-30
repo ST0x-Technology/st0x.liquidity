@@ -108,10 +108,7 @@
     };
   };
 
-  age.secrets.example = {
-    file = ./config/example.toml.age;
-    path = "/run/agenix/example.toml";
-  };
+  age.secrets."example.toml".file = ./config/example.toml.age;
 
   environment.systemPackages = with pkgs; [
     bat

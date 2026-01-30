@@ -34,8 +34,9 @@
 
       deploy = import ./deploy.nix { inherit deploy-rs self; };
 
-      checks = builtins.mapAttrs
-        (_: deployLib: deployLib.deployChecks self.deploy) deploy-rs.lib;
+      checks =
+        builtins.mapAttrs (_: deployLib: deployLib.deployChecks self.deploy)
+        deploy-rs.lib;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
@@ -88,10 +89,31 @@
 
           bootstrap = rainix.mkTask.${system} {
             name = "bootstrap-nixos";
-            additionalBuildInputs =
-              [ nixos-anywhere.packages.${system}.default ];
+            additionalBuildInputs = infraPkgs.buildInputs
+              ++ [ nixos-anywhere.packages.${system}.default ];
             body = ''
-              exec nixos-anywhere --flake ".#st0x-liquidity" "$@"
+              ${infraPkgs.resolveIp}
+              nixos-anywhere --flake ".#st0x-liquidity" --target-host "root@$host_ip" "$@"
+
+              ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5"
+
+              echo "Waiting for host to come back up..."
+              until ssh $ssh_opts "root@$host_ip" true 2>/dev/null; do
+                sleep 5
+              done
+
+              new_key=$(
+                ssh $ssh_opts "root@$host_ip" \
+                  cat /etc/ssh/ssh_host_ed25519_key.pub \
+                  | awk '{print $1 " " $2}'
+              )
+
+              ${pkgs.gnused}/bin/sed -i \
+                '/host =/{n;s|"ssh-ed25519 [A-Za-z0-9+/=]*"|"'"$new_key"'"|;}' \
+                keys.nix
+
+              echo "Updated host key in keys.nix, rekeying secrets..."
+              ragenix --rules ./config/secrets.nix -r
             '';
           };
 
@@ -104,11 +126,23 @@
             '';
           };
 
+          remote = pkgs.writeShellApplication {
+            name = "remote";
+            runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
+            text = ''
+              ${infraPkgs.resolveIp}
+              exec ssh "root@$host_ip" "$@"
+            '';
+          };
+
           deployNixOs = rainix.mkTask.${system} {
             name = "deploy-nixos";
-            additionalBuildInputs = [ deploy-rs.packages.${system}.deploy-rs ];
+            additionalBuildInputs = infraPkgs.buildInputs
+              ++ [ deploy-rs.packages.${system}.deploy-rs ];
             body = ''
-              exec deploy "$@" ".#st0x-liquidity.system" -- --impure
+              ${infraPkgs.resolveIp}
+              export DEPLOY_HOST="$host_ip"
+              deploy "$@" ".#st0x-liquidity.system" -- --impure
             '';
           };
         };
@@ -125,6 +159,7 @@
               terraform
               ragenix.packages.${system}.default
               packages.prepSolArtifacts
+              packages.remote
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });

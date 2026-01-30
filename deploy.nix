@@ -6,7 +6,7 @@ let
 
 in {
   nodes.st0x-liquidity = {
-    hostname = "209.38.48.141";
+    hostname = builtins.getEnv "DEPLOY_HOST";
     sshUser = "root";
     user = "root";
 
