@@ -1,7 +1,9 @@
 use futures_util::SinkExt;
+use rocket::serde::json::Json;
 use rocket::{Route, State, get, routes};
 use rocket_ws::{Channel, Message, WebSocket};
 use serde::Serialize;
+use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tracing::warn;
 use ts_rs::TS;
@@ -22,7 +24,7 @@ pub use ts::export_bindings;
 
 use auth::AuthStatus;
 use circuit_breaker::CircuitBreakerStatus;
-use event::EventStoreEntry;
+use event::{EventStoreEntry, load_events_before, load_recent_events};
 use inventory::Inventory;
 use performance::PerformanceMetrics;
 use rebalance::RebalanceOperation;
@@ -53,10 +55,12 @@ pub(crate) struct InitialState {
     recent_rebalances: Vec<RebalanceOperation>,
     auth_status: AuthStatus,
     circuit_breaker: CircuitBreakerStatus,
+    recent_events: Vec<EventStoreEntry>,
 }
 
 impl InitialState {
-    pub(crate) fn stub() -> Self {
+    #[cfg(test)]
+    fn stub() -> Self {
         Self {
             recent_trades: Vec::new(),
             inventory: Inventory::empty(),
@@ -66,24 +70,98 @@ impl InitialState {
             recent_rebalances: Vec::new(),
             auth_status: AuthStatus::NotConfigured,
             circuit_breaker: CircuitBreakerStatus::Active,
+            recent_events: Vec::new(),
         }
     }
+}
+
+/// Paginated response for the events HTTP endpoint.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EventsPage {
+    events: Vec<EventStoreEntry>,
+    has_more: bool,
 }
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,
 }
 
+const DEFAULT_PAGE_SIZE: i64 = 50;
+
+/// HTTP endpoint for paginated events.
+///
+/// - `GET /events` - Returns the first page (newest events)
+/// - `GET /events?before=123` - Returns events with rowid < 123 (older events)
+/// - `GET /events?limit=25` - Customize page size (default 50)
+#[get("/events?<limit>&<before>")]
+async fn get_events(
+    pool: &State<SqlitePool>,
+    limit: Option<i64>,
+    before: Option<i64>,
+) -> Json<EventsPage> {
+    let page_size = limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    // Request one extra to determine if there are more pages
+    let fetch_limit = page_size + 1;
+
+    let mut events = match before {
+        Some(cursor) => match load_events_before(pool.inner(), cursor, fetch_limit).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to load_events_before: {e}");
+                Vec::new()
+            }
+        },
+        None => match load_recent_events(pool.inner(), fetch_limit).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("Failed to load_recent_events: {e}");
+                Vec::new()
+            }
+        },
+    };
+
+    let page_size_usize = usize::try_from(page_size).unwrap_or(usize::MAX);
+    let has_more = events.len() > page_size_usize;
+    if has_more {
+        events.pop();
+    }
+
+    Json(EventsPage { events, has_more })
+}
+
 #[get("/ws")]
-fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
+fn ws_endpoint<'a>(
+    ws: WebSocket,
+    broadcast: &'a State<Broadcast>,
+    pool: &'a State<SqlitePool>,
+) -> Channel<'a> {
     let mut receiver = broadcast.sender.subscribe();
+    let pool = pool.inner().clone();
 
     ws.channel(move |mut stream| {
         Box::pin(async move {
-            // Stub initial state for dashboard skeleton. Real data will be populated as
-            // each panel is implemented: #178 (metrics), #179 (inventory), #180 (spreads),
-            // #181 (trades), #182 (rebalances), #183 (circuit breaker), #184 (auth).
-            let initial = ServerMessage::Initial(Box::new(InitialState::stub()));
+            let recent_events = match event::load_recent_events(&pool, 100).await {
+                Ok(events) => events,
+                Err(e) => {
+                    warn!("Failed to load recent events: {e}");
+                    Vec::new()
+                }
+            };
+
+            let initial = ServerMessage::Initial(Box::new(InitialState {
+                recent_trades: Vec::new(),
+                inventory: Inventory::empty(),
+                metrics: PerformanceMetrics::zero(),
+                spreads: Vec::new(),
+                active_rebalances: Vec::new(),
+                recent_rebalances: Vec::new(),
+                auth_status: AuthStatus::NotConfigured,
+                circuit_breaker: CircuitBreakerStatus::Active,
+                recent_events,
+            }));
+
             let json = match serde_json::to_string(&initial) {
                 Ok(j) => j,
                 Err(e) => {
@@ -128,7 +206,7 @@ fn ws_endpoint(ws: WebSocket, broadcast: &State<Broadcast>) -> Channel<'_> {
 }
 
 pub(crate) fn routes() -> Vec<Route> {
-    routes![ws_endpoint]
+    routes![get_events, ws_endpoint]
 }
 
 #[cfg(test)]
@@ -138,6 +216,7 @@ mod tests {
     use futures_util::future::join_all;
     use rocket::config::Config;
     use rocket::fairing::AdHoc;
+    use rocket::local::asynchronous::Client;
     use tokio::sync::oneshot;
     use tokio_tungstenite::connect_async;
 
@@ -155,6 +234,10 @@ mod tests {
         assert!(json.contains("metrics"));
         assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
+        assert!(
+            json.contains("recentEvents"),
+            "InitialState should include recentEvents field"
+        );
     }
 
     #[tokio::test]
@@ -202,14 +285,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_routes_returns_one_route() {
+    async fn routes_includes_events_and_websocket() {
         let route_list = routes();
-        assert_eq!(route_list.len(), 1);
+        assert_eq!(route_list.len(), 2);
+    }
+
+    async fn create_test_pool() -> SqlitePool {
+        let pool = SqlitePool::connect(":memory:")
+            .await
+            .expect("create in-memory db");
+        sqlx::migrate!().run(&pool).await.expect("run migrations");
+        pool
     }
 
     #[tokio::test]
     async fn websocket_endpoint_sends_initial_message() {
         let broadcast = create_test_broadcast();
+        let pool = create_test_pool().await;
 
         let config = Config {
             port: 0, // Let OS assign a random available port
@@ -224,6 +316,7 @@ mod tests {
             .configure(config)
             .mount("/api", routes())
             .manage(broadcast)
+            .manage(pool)
             .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
                 Box::pin(async move {
                     let maybe_tx = port_tx.lock().unwrap().take();
@@ -268,6 +361,7 @@ mod tests {
         let broadcast_clone = Broadcast {
             sender: broadcast.sender.clone(),
         };
+        let pool = create_test_pool().await;
 
         let config = Config {
             port: 0,
@@ -282,6 +376,7 @@ mod tests {
             .configure(config)
             .mount("/api", routes())
             .manage(broadcast_clone)
+            .manage(pool)
             .attach(AdHoc::on_liftoff("Port Sender", move |rocket| {
                 Box::pin(async move {
                     let maybe_tx = port_tx.lock().unwrap().take();
@@ -364,7 +459,7 @@ mod tests {
             aggregate_id: "test-123".to_string(),
             sequence: 1,
             event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
+            rowid: 0,
         };
         let broadcast_msg = ServerMessage::Event(event);
         broadcast
@@ -423,7 +518,7 @@ mod tests {
             aggregate_id: "after-disconnect".to_string(),
             sequence: 1,
             event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
+            rowid: 0,
         };
         broadcast
             .sender
@@ -465,7 +560,7 @@ mod tests {
             aggregate_id: "before-client2".to_string(),
             sequence: 1,
             event_type: "TestEvent".to_string(),
-            timestamp: chrono::Utc::now(),
+            rowid: 0,
         };
         broadcast
             .sender
@@ -495,5 +590,167 @@ mod tests {
         );
 
         shutdown_handle.notify();
+    }
+
+    #[tokio::test]
+    async fn get_events_returns_empty_page_when_no_events() {
+        let pool = create_test_pool().await;
+        let broadcast = create_test_broadcast();
+
+        let rocket = rocket::build()
+            .mount("/api", routes())
+            .manage(broadcast)
+            .manage(pool);
+
+        let client = Client::tracked(rocket).await.expect("valid rocket");
+        let response = client.get("/api/events").dispatch().await;
+
+        assert_eq!(response.status(), rocket::http::Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn get_events_returns_events_in_descending_rowid_order() {
+        let pool = create_test_pool().await;
+        let broadcast = create_test_broadcast();
+
+        // Insert some test events
+        for i in 1..=5 {
+            sqlx::query(
+                r"INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
+                   VALUES ('TestAggregate', 'agg', ?, ?, '1.0', '{}', '{}')",
+            )
+            .bind(i)
+            .bind(format!("Event{i}"))
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+
+        let rocket = rocket::build()
+            .mount("/api", routes())
+            .manage(broadcast)
+            .manage(pool);
+
+        let client = Client::tracked(rocket).await.expect("valid rocket");
+        let response = client.get("/api/events").dispatch().await;
+
+        assert_eq!(response.status(), rocket::http::Status::Ok);
+
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let events = parsed["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 5);
+        assert_eq!(events[0]["event_type"], "Event5", "newest event first");
+        assert_eq!(events[4]["event_type"], "Event1", "oldest event last");
+
+        // Verify rowids are in descending order
+        let rowid0 = events[0]["rowid"].as_i64().unwrap();
+        let rowid4 = events[4]["rowid"].as_i64().unwrap();
+        assert!(rowid0 > rowid4, "rowids should be descending");
+    }
+
+    #[tokio::test]
+    async fn get_events_with_before_cursor_returns_older_events() {
+        let pool = create_test_pool().await;
+        let broadcast = create_test_broadcast();
+
+        // Insert 10 test events
+        for i in 1..=10 {
+            sqlx::query(
+                r"INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
+                   VALUES ('TestAggregate', 'agg', ?, ?, '1.0', '{}', '{}')",
+            )
+            .bind(i)
+            .bind(format!("Event{i}"))
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+
+        let rocket = rocket::build()
+            .mount("/api", routes())
+            .manage(broadcast)
+            .manage(pool);
+
+        let client = Client::tracked(rocket).await.expect("valid rocket");
+
+        // First request: get all events to find a cursor
+        let response = client.get("/api/events?limit=5").dispatch().await;
+        let body = response.into_string().await.expect("response body");
+        let first_page: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let events = first_page["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 5);
+        assert!(first_page["hasMore"].as_bool().unwrap());
+
+        // Get the last event's rowid as cursor for next page
+        let cursor = events[4]["rowid"].as_i64().unwrap();
+
+        // Second request: get events before cursor
+        let response = client
+            .get(format!("/api/events?before={cursor}"))
+            .dispatch()
+            .await;
+        let body = response.into_string().await.expect("response body");
+        let second_page: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        let events = second_page["events"].as_array().expect("events array");
+        assert_eq!(events.len(), 5, "should return remaining 5 events");
+        assert!(!second_page["hasMore"].as_bool().unwrap());
+
+        // All events should have rowid < cursor
+        for event in events {
+            let rowid = event["rowid"].as_i64().unwrap();
+            assert!(rowid < cursor, "all events should have rowid < {cursor}");
+        }
+    }
+
+    #[tokio::test]
+    async fn get_events_has_more_indicates_additional_pages() {
+        let pool = create_test_pool().await;
+        let broadcast = create_test_broadcast();
+
+        // Insert exactly 3 events
+        for i in 1..=3 {
+            sqlx::query(
+                r"INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata)
+                   VALUES ('TestAggregate', 'agg', ?, ?, '1.0', '{}', '{}')",
+            )
+            .bind(i)
+            .bind(format!("Event{i}"))
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+
+        let rocket = rocket::build()
+            .mount("/api", routes())
+            .manage(broadcast)
+            .manage(pool);
+
+        let client = Client::tracked(rocket).await.expect("valid rocket");
+
+        // Request with limit=3, should get all events and hasMore=false
+        let response = client.get("/api/events?limit=3").dispatch().await;
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 3);
+        assert!(!parsed["hasMore"].as_bool().unwrap());
+
+        // Request with limit=2, should get 2 events and hasMore=true
+        let response = client.get("/api/events?limit=2").dispatch().await;
+        let body = response.into_string().await.expect("response body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+
+        assert_eq!(parsed["events"].as_array().unwrap().len(), 2);
+        assert!(parsed["hasMore"].as_bool().unwrap());
     }
 }
