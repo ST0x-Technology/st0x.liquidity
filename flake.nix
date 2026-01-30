@@ -66,13 +66,6 @@
             codegen = packages.st0x-liquidity;
           };
 
-          dummy = pkgs.writeShellScriptBin "dummy" ''
-            while true; do
-              echo "hello from dummy service v2"
-              sleep 5
-            done
-          '';
-
           prepSolArtifacts = rainix.mkTask.${system} {
             name = "prep-sol-artifacts";
             additionalBuildInputs = rainix.sol-build-inputs.${system};

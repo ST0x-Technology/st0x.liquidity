@@ -6,8 +6,9 @@ let
 
   profileBase = "/nix/var/nix/profiles/per-service";
 
-  mkServiceProfile = name: package:
-    activate.custom package "systemctl restart ${name}";
+  mkServiceProfile = { package, services }:
+    activate.custom package (builtins.concatStringsSep " && "
+      (map (s: "systemctl restart ${s}") services));
 
 in {
   nodes.st0x-liquidity = {
@@ -15,14 +16,25 @@ in {
     sshUser = "root";
     user = "root";
 
-    profilesOrder = [ "system" "dummy" ];
+    profilesOrder = [ "system" "server" "reporter" ];
 
     profiles = {
       system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
 
-      dummy = {
-        path = mkServiceProfile "dummy" self.packages.${system}.dummy;
-        profilePath = "${profileBase}/dummy";
+      server = {
+        path = mkServiceProfile {
+          package = self.packages.${system}.st0x-liquidity;
+          services = [ "server-schwab" "server-alpaca" ];
+        };
+        profilePath = "${profileBase}/server";
+      };
+
+      reporter = {
+        path = mkServiceProfile {
+          package = self.packages.${system}.st0x-liquidity;
+          services = [ "reporter-schwab" "reporter-alpaca" ];
+        };
+        profilePath = "${profileBase}/reporter";
       };
     };
   };

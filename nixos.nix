@@ -111,19 +111,55 @@
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";
 
-  age.secrets."example.toml".file = ./config/example.toml.age;
+  age.secrets = {
+    "server-schwab.toml".file = ./config/server-schwab.toml.age;
+    "server-alpaca.toml".file = ./config/server-alpaca.toml.age;
+    "reporter-schwab.toml".file = ./config/reporter-schwab.toml.age;
+    "reporter-alpaca.toml".file = ./config/reporter-alpaca.toml.age;
+  };
 
-  systemd.services.dummy = {
-    description = "Dummy service for testing deploy-rs profiles";
-    wantedBy = [ "multi-user.target" ];
-    unitConfig.ConditionPathExists =
-      "/nix/var/nix/profiles/per-service/dummy/bin/dummy";
-    serviceConfig = {
-      DynamicUser = true;
-      ExecStart = "/nix/var/nix/profiles/per-service/dummy/bin/dummy";
-      Restart = "always";
-      RestartSec = 5;
+  systemd.services = let
+    mkServer = name: {
+      description = "st0x hedging bot (${name})";
+      wantedBy = [ "multi-user.target" ];
+      unitConfig.ConditionPathExists =
+        "/nix/var/nix/profiles/per-service/server/bin/server";
+      serviceConfig = {
+        DynamicUser = true;
+        ExecStart = builtins.concatStringsSep " " [
+          "/nix/var/nix/profiles/per-service/server/bin/server"
+          "--config-file"
+          "/run/agenix/${name}.toml"
+        ];
+        Restart = "always";
+        RestartSec = 5;
+        ReadWritePaths = [ "/mnt/data" ];
+      };
     };
+
+    mkReporter = name: {
+      description = "st0x position reporter (${name})";
+      wantedBy = [ "multi-user.target" ];
+      unitConfig.ConditionPathExists =
+        "/nix/var/nix/profiles/per-service/reporter/bin/reporter";
+      serviceConfig = {
+        DynamicUser = true;
+        ExecStart = builtins.concatStringsSep " " [
+          "/nix/var/nix/profiles/per-service/reporter/bin/reporter"
+          "--config-file"
+          "/run/agenix/${name}.toml"
+        ];
+        Restart = "always";
+        RestartSec = 5;
+        ReadWritePaths = [ "/mnt/data" ];
+      };
+    };
+
+  in {
+    server-schwab = mkServer "server-schwab";
+    server-alpaca = mkServer "server-alpaca";
+    reporter-schwab = mkReporter "reporter-schwab";
+    reporter-alpaca = mkReporter "reporter-alpaca";
   };
 
   environment.systemPackages = with pkgs; [
