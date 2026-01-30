@@ -7,6 +7,7 @@ services:
     environment:
       - EXECUTOR=${SCHWAB_EXECUTOR}
       - REBALANCING_ENABLED=false
+      - DEPLOYMENT_BLOCK=34844164
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/schwab.db
       - ENCRYPTION_KEY
@@ -27,6 +28,7 @@ services:
       - EXECUTOR=${ALPACA_EXECUTOR}
       - ALPACA_BROKER_API_MODE=${ALPACA_BROKER_API_MODE}
       - REBALANCING_ENABLED=true
+      - DEPLOYMENT_BLOCK=40850446
       - OTEL_METRICS_EXPORTER_ENDPOINT=http://grafana:4318
       - DATABASE_URL=sqlite:///data/alpaca.db
     env_file:
