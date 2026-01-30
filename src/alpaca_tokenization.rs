@@ -653,8 +653,11 @@ pub(crate) mod tests {
     use std::time::Duration;
     use uuid::uuid;
 
+    use std::sync::Arc;
+
     use super::*;
     use crate::bindings::TestERC20;
+    use crate::vault::{VaultService, WrappedTokenRegistry};
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
@@ -675,6 +678,42 @@ pub(crate) mod tests {
         let endpoint = anvil.endpoint();
         let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         (anvil, endpoint, private_key)
+    }
+
+    pub(crate) async fn create_test_provider() -> (AnvilInstance, impl Provider + Clone) {
+        let (anvil, endpoint, key) = setup_anvil();
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer);
+
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        (anvil, provider)
+    }
+
+    pub(crate) fn create_test_setup<P: Provider + Clone>(
+        server: &MockServer,
+        provider: P,
+    ) -> (Arc<AlpacaTokenizationService<P>>, Arc<VaultService<P>>) {
+        let service = Arc::new(AlpacaTokenizationService::new(
+            server.base_url(),
+            TEST_ACCOUNT_ID,
+            "test_api_key".to_string(),
+            "test_api_secret".to_string(),
+            provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+
+        let vault_service = Arc::new(
+            VaultService::new(provider)
+                .unwrap()
+                .with_registry(WrappedTokenRegistry::empty()),
+        );
+
+        (service, vault_service)
     }
 
     async fn create_test_client(
@@ -714,17 +753,6 @@ pub(crate) mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
         AlpacaTokenizationService::new_with_client(client, config)
-    }
-
-    pub(crate) async fn create_test_service_from_mock(
-        server: &MockServer,
-        anvil_endpoint: &str,
-        private_key: &B256,
-        redemption_wallet: Address,
-    ) -> AlpacaTokenizationService<impl Provider + Clone + use<>> {
-        let client =
-            create_test_client(server, anvil_endpoint, private_key, redemption_wallet).await;
-        create_test_service(client)
     }
 
     fn create_mint_request() -> MintRequest {

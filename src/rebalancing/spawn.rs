@@ -22,7 +22,7 @@ use crate::dashboard::{EventBroadcaster, ServerMessage};
 use st0x_execution::alpaca_broker_api::{
     AlpacaBrokerApiAuthEnv, AlpacaBrokerApiError, AlpacaBrokerApiMode,
 };
-use st0x_execution::{AlpacaBrokerApi, Executor};
+use st0x_execution::{AlpacaBrokerApi, EmptySymbolError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
@@ -55,6 +55,8 @@ pub(crate) enum SpawnRebalancerError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] crate::cctp::CctpError),
+    #[error("invalid wrapped token symbol: {0}")]
+    WrappedTokenSymbol(#[from] EmptySymbolError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -207,10 +209,7 @@ where
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
         let rain_vault = Arc::new(RainVaultService::new(base_provider.clone(), orderbook));
-        let erc4626_vault = Arc::new(Erc4626VaultService::new(
-            base_provider,
-            config.wrapped_token_registry.clone(),
-        ));
+        let erc4626_vault = Arc::new(Erc4626VaultService::new(base_provider)?);
 
         Ok(Self {
             tokenization,
@@ -345,8 +344,6 @@ mod tests {
 
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
-    use crate::vault::WrappedTokenRegistry;
-
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_config() -> RebalancingConfig {
@@ -368,7 +365,6 @@ mod tests {
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
             alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
-            wrapped_token_registry: WrappedTokenRegistry::empty(),
         }
     }
 
@@ -527,10 +523,7 @@ mod tests {
             RainVaultService::new(base_provider.clone(), TEST_ORDERBOOK)
                 .with_required_confirmations(1),
         );
-        let erc4626_vault = Arc::new(Erc4626VaultService::new(
-            base_provider,
-            config.wrapped_token_registry.clone(),
-        ));
+        let erc4626_vault = Arc::new(Erc4626VaultService::new(base_provider).unwrap());
 
         let services = Services {
             tokenization,

@@ -33,6 +33,7 @@ use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_
 use crate::rebalancing::spawn_rebalancer;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
+use crate::vault::{VaultRatio, VaultService};
 pub(crate) use builder::ConductorBuilder;
 
 pub(crate) struct Conductor {
@@ -265,7 +266,7 @@ impl Conductor {
             builder = builder.with_rebalancer(rebalancer_handle);
         }
 
-        Ok(builder.spawn())
+        Ok(builder.spawn()?)
     }
 
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
@@ -388,7 +389,7 @@ fn spawn_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-) -> JoinHandle<()>
+) -> Result<JoinHandle<()>, EmptySymbolError>
 where
     P: Provider + Clone + Send + Sync + 'static,
     E: Executor + Clone + Send + 'static,
@@ -401,15 +402,9 @@ where
     let dual_write_context =
         DualWriteContext::with_threshold(pool.clone(), config.execution_threshold);
 
-    let wrapped_token_registry = config
-        .rebalancing
-        .as_ref()
-        .map(|r| r.wrapped_token_registry.clone())
-        .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
+    let vault_service = VaultService::new(provider.clone())?;
 
-    let vault_service = crate::vault::VaultService::new(provider.clone(), wrapped_token_registry);
-
-    tokio::spawn(async move {
+    Ok(tokio::spawn(async move {
         run_queue_processor(
             &executor,
             &config_clone,
@@ -420,14 +415,14 @@ where
             &vault_service,
         )
         .await;
-    })
+    }))
 }
 
 fn spawn_periodic_accumulated_position_check<E, P>(
     executor: E,
     pool: SqlitePool,
     dual_write_context: DualWriteContext,
-    vault_service: crate::vault::VaultService<P>,
+    vault_service: VaultService<P>,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -573,6 +568,52 @@ async fn process_live_event(
     Ok(())
 }
 
+struct TradeConversionContext<'a, P> {
+    config: &'a Config,
+    cache: &'a SymbolCache,
+    provider: &'a P,
+    feed_id_cache: &'a FeedIdCache,
+}
+
+impl<P: Provider + Clone> TradeConversionContext<'_, P> {
+    #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+    async fn convert_event_to_trade(
+        &self,
+        queued_event: &QueuedEvent,
+    ) -> Result<Option<OnchainTrade>, EventProcessingError> {
+        let reconstructed_log = reconstruct_log_from_queued_event(&self.config.evm, queued_event);
+        let order_owner = self.config.order_owner()?;
+
+        let onchain_trade = match &queued_event.event {
+            TradeEvent::ClearV3(clear_event) => {
+                OnchainTrade::try_from_clear_v3(
+                    &self.config.evm,
+                    self.cache,
+                    self.provider,
+                    *clear_event.clone(),
+                    reconstructed_log,
+                    self.feed_id_cache,
+                    order_owner,
+                )
+                .await?
+            }
+            TradeEvent::TakeOrderV3(take_event) => {
+                OnchainTrade::try_from_take_order_if_target_owner(
+                    self.cache,
+                    self.provider,
+                    *take_event.clone(),
+                    reconstructed_log,
+                    order_owner,
+                    self.feed_id_cache,
+                )
+                .await?
+            }
+        };
+
+        Ok(onchain_trade)
+    }
+}
+
 async fn run_queue_processor<P, E>(
     executor: &E,
     config: &Config,
@@ -580,7 +621,7 @@ async fn run_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     dual_write_context: &DualWriteContext,
-    vault_service: &crate::vault::VaultService<P>,
+    vault_service: &VaultService<P>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -593,15 +634,18 @@ async fn run_queue_processor<P, E>(
     log_unprocessed_event_count(pool).await;
 
     let executor_type = executor.to_supported_executor();
+    let conversion_ctx = TradeConversionContext {
+        config,
+        cache,
+        provider: &provider,
+        feed_id_cache: &feed_id_cache,
+    };
 
     loop {
         let result = process_next_queued_event(
             executor_type,
-            config,
             pool,
-            cache,
-            &provider,
-            &feed_id_cache,
+            &conversion_ctx,
             dual_write_context,
             vault_service,
         )
@@ -651,13 +695,10 @@ async fn handle_queue_processing_result<E>(
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 async fn process_next_queued_event<P: Provider + Clone>(
     executor_type: SupportedExecutor,
-    config: &Config,
     pool: &SqlitePool,
-    cache: &SymbolCache,
-    provider: &P,
-    feed_id_cache: &FeedIdCache,
+    conversion_ctx: &TradeConversionContext<'_, P>,
     dual_write_context: &DualWriteContext,
-    vault_service: &crate::vault::VaultService<P>,
+    vault_service: &VaultService<P>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -666,8 +707,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
 
     let event_id = extract_event_id(&queued_event)?;
 
-    let onchain_trade =
-        convert_event_to_trade(config, cache, provider, &queued_event, feed_id_cache).await?;
+    let onchain_trade = conversion_ctx.convert_event_to_trade(&queued_event).await?;
 
     let Some(trade) = onchain_trade else {
         return handle_filtered_event(pool, &queued_event, event_id).await;
@@ -675,7 +715,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
 
     let vault_ratio = vault_service
         .get_ratio_for_symbol(trade.symbol.base())
-        .await;
+        .await?;
 
     process_valid_trade(
         executor_type,
@@ -693,46 +733,6 @@ fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingEr
     queued_event
         .id
         .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn convert_event_to_trade<P: Provider + Clone>(
-    config: &Config,
-    cache: &SymbolCache,
-    provider: &P,
-    queued_event: &QueuedEvent,
-    feed_id_cache: &FeedIdCache,
-) -> Result<Option<OnchainTrade>, EventProcessingError> {
-    let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, queued_event);
-    let order_owner = config.order_owner()?;
-
-    let onchain_trade = match &queued_event.event {
-        TradeEvent::ClearV3(clear_event) => {
-            OnchainTrade::try_from_clear_v3(
-                &config.evm,
-                cache,
-                provider,
-                *clear_event.clone(),
-                reconstructed_log,
-                feed_id_cache,
-                order_owner,
-            )
-            .await?
-        }
-        TradeEvent::TakeOrderV3(take_event) => {
-            OnchainTrade::try_from_take_order_if_target_owner(
-                cache,
-                provider,
-                *take_event.clone(),
-                reconstructed_log,
-                order_owner,
-                feed_id_cache,
-            )
-            .await?
-        }
-    };
-
-    Ok(onchain_trade)
 }
 
 #[tracing::instrument(skip(pool, queued_event), fields(event_id), level = tracing::Level::DEBUG)]
@@ -776,7 +776,7 @@ async fn process_valid_trade(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
-    vault_ratio: &crate::vault::VaultRatio,
+    vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -971,7 +971,7 @@ async fn process_trade_within_transaction(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
-    vault_ratio: &crate::vault::VaultRatio,
+    vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_initialize_position(dual_write_context, &trade).await;
@@ -1072,7 +1072,7 @@ async fn check_and_execute_accumulated_positions<E, P>(
     executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
-    vault_service: &crate::vault::VaultService<P>,
+    vault_service: &VaultService<P>,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
@@ -1317,6 +1317,7 @@ mod tests {
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
+    use crate::vault::WrappedTokenRegistry;
     use rust_decimal::Decimal;
     use st0x_execution::{
         Direction, FractionalShares, MockExecutorConfig, OrderState, OrderStatus, Positive,
@@ -1490,7 +1491,7 @@ mod tests {
             .await
             {
                 let dual_write_context = DualWriteContext::new(pool.clone());
-                let vault_ratio = crate::vault::VaultRatio::one_to_one();
+                let vault_ratio = VaultRatio::one_to_one();
 
                 let mut sql_tx = pool.begin().await.unwrap();
                 let TradeProcessingResult { .. } = accumulator::process_onchain_trade(
@@ -1954,18 +1955,21 @@ mod tests {
 
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let vault_service = crate::vault::VaultService::new(
-            provider.clone(),
-            crate::vault::WrappedTokenRegistry::empty(),
-        );
+        let vault_service = VaultService::new(provider.clone())
+            .unwrap()
+            .with_registry(WrappedTokenRegistry::empty());
+
+        let conversion_ctx = TradeConversionContext {
+            config: &config,
+            cache: &cache,
+            provider: &provider,
+            feed_id_cache: &feed_id_cache,
+        };
 
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
-            &config,
             &pool,
-            &cache,
-            &provider,
-            &feed_id_cache,
+            &conversion_ctx,
             &dual_write_context,
             &vault_service,
         )
@@ -2520,7 +2524,8 @@ mod tests {
             ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         assert!(!conductor.order_poller.is_finished());
         assert!(!conductor.event_processor.is_finished());
@@ -2550,7 +2555,8 @@ mod tests {
             ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         let order_handle = conductor.order_poller;
         let event_handle = conductor.event_processor;
@@ -2595,7 +2601,8 @@ mod tests {
             ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         let elapsed = start_time.elapsed();
 
@@ -2625,7 +2632,8 @@ mod tests {
             ConductorBuilder::new(config, pool, cache, provider, executor, dual_write_context)
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         assert!(conductor.rebalancer.is_none());
         abort_all_conductor_tasks(conductor);
@@ -2657,7 +2665,8 @@ mod tests {
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .with_rebalancer(rebalancer_handle)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         assert!(conductor.rebalancer.is_some());
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
@@ -2690,7 +2699,8 @@ mod tests {
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .with_rebalancer(rebalancer_handle)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_ref.is_finished());
@@ -2725,7 +2735,8 @@ mod tests {
                 .with_executor_maintenance(None)
                 .with_dex_event_streams(clear_stream, take_stream)
                 .with_rebalancer(rebalancer_handle)
-                .spawn();
+                .spawn()
+                .unwrap();
 
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 
@@ -2782,18 +2793,21 @@ mod tests {
             .await
             .unwrap();
 
-        let vault_service = crate::vault::VaultService::new(
-            provider.clone(),
-            crate::vault::WrappedTokenRegistry::empty(),
-        );
+        let vault_service = VaultService::new(provider.clone())
+            .unwrap()
+            .with_registry(WrappedTokenRegistry::empty());
+
+        let conversion_ctx = TradeConversionContext {
+            config: &config,
+            cache: &cache,
+            provider: &provider,
+            feed_id_cache: &feed_id_cache,
+        };
 
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
-            &config,
             &pool,
-            &cache,
-            &provider,
-            &feed_id_cache,
+            &conversion_ctx,
             &dual_write_context,
             &vault_service,
         )
@@ -2836,18 +2850,21 @@ mod tests {
             .await
             .unwrap();
 
-        let vault_service = crate::vault::VaultService::new(
-            provider.clone(),
-            crate::vault::WrappedTokenRegistry::empty(),
-        );
+        let vault_service = VaultService::new(provider.clone())
+            .unwrap()
+            .with_registry(WrappedTokenRegistry::empty());
+
+        let conversion_ctx = TradeConversionContext {
+            config: &config,
+            cache: &cache,
+            provider: &provider,
+            feed_id_cache: &feed_id_cache,
+        };
 
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
-            &config,
             &pool,
-            &cache,
-            &provider,
-            &feed_id_cache,
+            &conversion_ctx,
             &dual_write_context,
             &vault_service,
         )
@@ -2932,8 +2949,9 @@ mod tests {
 
         let provider =
             ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
-        let vault_service =
-            crate::vault::VaultService::new(provider, crate::vault::WrappedTokenRegistry::empty());
+        let vault_service = VaultService::new(provider)
+            .unwrap()
+            .with_registry(WrappedTokenRegistry::empty());
 
         check_and_execute_accumulated_positions(
             &executor,

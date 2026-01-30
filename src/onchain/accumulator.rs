@@ -263,16 +263,10 @@ async fn try_create_execution_if_ready(
 
     let execution_shares = Positive::new(shares)?;
 
-    let execution_type = match direction {
-        Direction::Sell => AccumulationBucket::LongExposure,
-        Direction::Buy => AccumulationBucket::ShortExposure,
-    };
-
     execute_position(
         &mut *sql_tx,
         base_symbol,
         calculator,
-        execution_type,
         execution_shares,
         direction,
         executor_type,
@@ -285,12 +279,17 @@ async fn execute_position(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
-    execution_type: AccumulationBucket,
     shares: Positive<FractionalShares>,
     direction: Direction,
     executor_type: SupportedExecutor,
     vault_ratio: &VaultRatio,
 ) -> Result<Option<OffchainExecution>, OnChainError> {
+    // Execution reduces the bucket opposite to the trade direction:
+    // selling reduces long exposure, buying reduces short exposure
+    let execution_type = match direction {
+        Direction::Sell => AccumulationBucket::LongExposure,
+        Direction::Buy => AccumulationBucket::ShortExposure,
+    };
     // The accumulator tracks wrapped token amounts. Convert to unwrapped
     // (real equity) amounts before sending to the broker.
     let unwrapped_shares = vault_ratio.wrapped_to_unwrapped_fractional(shares.inner())?;
@@ -373,6 +372,7 @@ async fn create_trade_execution_linkages(
         LEFT JOIN trade_execution_links tel ON ot.id = tel.trade_id
         WHERE (ot.symbol = ?1 OR ot.symbol = ?2 OR ot.symbol = ?3) AND ot.direction = ?4
         GROUP BY ot.id, ot.amount, ot.created_at
+        -- Has remaining allocation
         HAVING (ot.amount - COALESCE(SUM(tel.contributed_shares), 0.0)) > 0.001
         ORDER BY ot.created_at ASC
         "#,
@@ -655,7 +655,7 @@ pub(crate) async fn check_all_accumulated_positions<P: Provider + Clone>(
     for row in candidate_symbols {
         let symbol = Symbol::new(&row.symbol)?;
 
-        let vault_ratio = vault_service.get_ratio_for_symbol(&symbol).await;
+        let vault_ratio = vault_service.get_ratio_for_symbol(&symbol).await?;
 
         if let Some(execution) = check_symbol_for_execution(
             pool,
@@ -758,16 +758,10 @@ async fn process_symbol_execution(
 ) -> Result<Option<OffchainExecution>, OnChainError> {
     let mut calculator = get_or_create_within_transaction(sql_tx, symbol).await?;
 
-    let execution_type = match direction {
-        Direction::Sell => AccumulationBucket::LongExposure,
-        Direction::Buy => AccumulationBucket::ShortExposure,
-    };
-
     let result = execute_position(
         sql_tx,
         symbol,
         &mut calculator,
-        execution_type,
         shares,
         direction,
         executor_type,
@@ -799,7 +793,7 @@ async fn process_symbol_execution(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{FixedBytes, U256, fixed_bytes};
+    use alloy::primitives::{Address, B256, FixedBytes, U256, address, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use backon::{ExponentialBuilder, Retryable};
     use chrono::Utc;
@@ -819,12 +813,34 @@ mod tests {
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
     use crate::trade_execution_link::TradeExecutionLink;
-    use crate::vault::WrappedTokenRegistry;
+    use crate::vault::{WrappedTokenConfig, WrappedTokenRegistry};
 
-    fn create_test_vault_service() -> VaultService<impl alloy::providers::Provider + Clone> {
+    const TEST_WRAPPED_TOKEN: Address = address!("0x1111111111111111111111111111111111111111");
+    const TEST_UNWRAPPED_TOKEN: Address = address!("0x2222222222222222222222222222222222222222");
+
+    fn create_test_vault_service() -> VaultService<impl Provider + Clone> {
         let provider =
             ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
-        VaultService::new(provider, WrappedTokenRegistry::empty())
+        VaultService::new(provider)
+            .unwrap()
+            .with_registry(WrappedTokenRegistry::empty())
+    }
+
+    fn create_test_vault_service_with_ratio(
+        symbol: &str,
+        ratio: VaultRatio,
+    ) -> VaultService<impl Provider + Clone> {
+        let registry = WrappedTokenRegistry::new(vec![WrappedTokenConfig {
+            equity_symbol: Symbol::new(symbol).unwrap(),
+            wrapped_token: TEST_WRAPPED_TOKEN,
+            unwrapped_token: TEST_UNWRAPPED_TOKEN,
+        }]);
+
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        let service = VaultService::new(provider).unwrap().with_registry(registry);
+        service.seed_ratio(TEST_WRAPPED_TOKEN, ratio);
+        service
     }
 
     fn create_test_onchain_trade(symbol: &str, tx_hash_byte: u8) -> OnchainTrade {
@@ -987,11 +1003,12 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // 1.5 wrapped shares * 1.05 ratio = 1.575 unwrapped shares, floored to 1 whole share
+        // Position floors 1.5 wrapped to 1 whole share, then vault ratio converts:
+        // 1 wrapped * 1.05 = 1.05 unwrapped shares sent to broker
         assert_eq!(
             execution.shares,
-            Positive::new(FractionalShares::new(dec!(1))).unwrap(),
-            "Execution should be 1 whole share (floored from 1.575 unwrapped)"
+            Positive::new(FractionalShares::new(dec!(1.05))).unwrap(),
+            "Execution should be 1.05 unwrapped shares (1 wrapped * 1.05 ratio)"
         );
 
         // Accumulator should still track wrapped amounts
@@ -1489,7 +1506,7 @@ mod tests {
     fn create_test_trade(tx_hash_byte: u8, symbol: &str, amount: f64) -> OnchainTrade {
         OnchainTrade {
             id: None,
-            tx_hash: alloy::primitives::B256::repeat_byte(tx_hash_byte),
+            tx_hash: B256::repeat_byte(tx_hash_byte),
             log_index: 1,
             symbol: tokenized_symbol!(symbol),
             amount,
@@ -2772,6 +2789,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_all_accumulated_positions_resolves_ratio_from_registry() {
+        let pool = setup_test_db().await;
+        let dual_write_context = DualWriteContext::new(pool.clone());
+
+        // Vault service with NVDA in registry, 1.05 ratio seeded in cache
+        let assets_per_share = U256::from(1_050_000_000_000_000_000u64);
+        let ratio = VaultRatio::new(assets_per_share).unwrap();
+        let vault_service = create_test_vault_service_with_ratio("NVDA", ratio);
+
+        // Accumulate 0.8 shares (below threshold, no execution)
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: fixed_bytes!(
+                "0xcccc111111111111111111111111111111111111111111111111111111111111"
+            ),
+            log_index: 1,
+            symbol: tokenized_symbol!("NVDA0x"),
+            amount: 0.8,
+            direction: Direction::Sell,
+            price: Usdc::new(500.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: Some(40000),
+            effective_gas_price: Some(1_000_000_000),
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        let result = process_trade_with_tx(&pool, trade, &VaultRatio::one_to_one())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+
+        // check_all_accumulated_positions looks up NVDA in the registry,
+        // finds it, and fetches the 1.05 ratio from the seeded cache.
+        // Since net 0.8 is below threshold, no execution is created.
+        let executions = check_all_accumulated_positions(
+            &pool,
+            &dual_write_context,
+            SupportedExecutor::Schwab,
+            &vault_service,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(executions.len(), 0);
+    }
+
+    #[tokio::test]
     async fn test_mark_execution_as_timed_out_returns_none_when_execution_already_filled() {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2955,7 +3023,7 @@ mod tests {
 
         let trade = OnchainTrade {
             id: None,
-            tx_hash: alloy::primitives::B256::repeat_byte(0xaa),
+            tx_hash: B256::repeat_byte(0xaa),
             log_index: 1,
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.5,
@@ -2999,7 +3067,7 @@ mod tests {
 
         let trade = OnchainTrade {
             id: None,
-            tx_hash: alloy::primitives::B256::repeat_byte(0xbb),
+            tx_hash: B256::repeat_byte(0xbb),
             log_index: 1,
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 1.5,
@@ -3071,7 +3139,7 @@ mod tests {
 
         let trade = OnchainTrade {
             id: None,
-            tx_hash: alloy::primitives::B256::repeat_byte(0xcc),
+            tx_hash: B256::repeat_byte(0xcc),
             log_index: 1,
             symbol: tokenized_symbol!("AAPL0x"),
             amount: 0.3,
@@ -3129,7 +3197,7 @@ mod tests {
 
         let trade = OnchainTrade {
             id: None,
-            tx_hash: alloy::primitives::B256::repeat_byte(0xee),
+            tx_hash: B256::repeat_byte(0xee),
             log_index: 1,
             symbol: tokenized_symbol!("INTC0x"),
             amount: 1.5,

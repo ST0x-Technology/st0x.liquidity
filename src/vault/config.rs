@@ -4,9 +4,9 @@
 
 use std::collections::HashMap;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, address};
 use serde::{Deserialize, Serialize};
-use st0x_execution::Symbol;
+use st0x_execution::{EmptySymbolError, Symbol};
 
 /// Configuration for a single wrapped token pair.
 ///
@@ -52,9 +52,24 @@ impl WrappedTokenRegistry {
         Self { symbols, wrapped }
     }
 
-    /// Creates an empty registry (no wrapped tokens configured).
+    /// Creates an empty registry (for tests that don't involve wrapped tokens).
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self::default()
+    }
+
+    /// Returns the hardcoded wrapped token registry.
+    ///
+    /// Temporary until onchain contract lookups or new config format replaces this.
+    pub(crate) fn hardcoded() -> Result<Self, EmptySymbolError> {
+        Ok(Self::new(vec![
+            // TODO: replace placeholder addresses with real ones
+            WrappedTokenConfig {
+                equity_symbol: Symbol::new("RKLB")?,
+                wrapped_token: address!("0x0000000000000000000000000000000000000001"),
+                unwrapped_token: address!("0x0000000000000000000000000000000000000002"),
+            },
+        ]))
     }
 
     /// Looks up config by equity symbol.
@@ -77,8 +92,8 @@ mod tests {
     fn create_test_config() -> WrappedTokenConfig {
         WrappedTokenConfig {
             equity_symbol: Symbol::new("AAPL").unwrap(),
-            wrapped_token: address!("1111111111111111111111111111111111111111"),
-            unwrapped_token: address!("2222222222222222222222222222222222222222"),
+            wrapped_token: address!("0x1111111111111111111111111111111111111111"),
+            unwrapped_token: address!("0x2222222222222222222222222222222222222222"),
         }
     }
 
@@ -104,7 +119,7 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap(), &config);
 
-        let other_address = address!("3333333333333333333333333333333333333333");
+        let other_address = address!("0x3333333333333333333333333333333333333333");
         let not_found = registry.get_by_wrapped(&other_address);
         assert!(not_found.is_none());
     }
@@ -124,13 +139,13 @@ mod tests {
     fn multiple_configs() {
         let aapl = WrappedTokenConfig {
             equity_symbol: Symbol::new("AAPL").unwrap(),
-            wrapped_token: address!("1111111111111111111111111111111111111111"),
-            unwrapped_token: address!("2222222222222222222222222222222222222222"),
+            wrapped_token: address!("0x1111111111111111111111111111111111111111"),
+            unwrapped_token: address!("0x2222222222222222222222222222222222222222"),
         };
         let tsla = WrappedTokenConfig {
             equity_symbol: Symbol::new("TSLA").unwrap(),
-            wrapped_token: address!("3333333333333333333333333333333333333333"),
-            unwrapped_token: address!("4444444444444444444444444444444444444444"),
+            wrapped_token: address!("0x3333333333333333333333333333333333333333"),
+            unwrapped_token: address!("0x4444444444444444444444444444444444444444"),
         };
 
         let registry = WrappedTokenRegistry::new(vec![aapl.clone(), tsla.clone()]);

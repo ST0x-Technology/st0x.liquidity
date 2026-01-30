@@ -15,6 +15,7 @@ use st0x_execution::{
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::env::ConfigError;
+use crate::vault::{VaultError, VaultRatioError};
 
 /// Business logic validation errors for trade processing rules.
 #[derive(Debug, thiserror::Error)]
@@ -188,8 +189,8 @@ pub(crate) enum OnChainError {
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] crate::shares::SharesConversionError),
 
-    #[error("Vault ratio error: {0}")]
-    VaultRatio(#[from] crate::vault::VaultRatioError),
+    #[error("Vault error: {0}")]
+    Vault(#[from] VaultError),
 }
 
 impl From<sqlx::Error> for OnChainError {
@@ -213,6 +214,18 @@ impl From<ParseFloatError> for OnChainError {
 impl From<FromUintError<usize>> for OnChainError {
     fn from(err: FromUintError<usize>) -> Self {
         Self::Validation(TradeValidationError::InvalidIndex(err))
+    }
+}
+
+impl From<VaultError> for EventProcessingError {
+    fn from(err: VaultError) -> Self {
+        Self::OnChain(OnChainError::from(err))
+    }
+}
+
+impl From<VaultRatioError> for OnChainError {
+    fn from(err: VaultRatioError) -> Self {
+        Self::Vault(VaultError::from(err))
     }
 }
 

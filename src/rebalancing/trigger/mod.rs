@@ -4,7 +4,6 @@ mod equity;
 mod usdc;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,7 +30,6 @@ use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault::VaultService;
-use crate::vault::{WrappedTokenConfig, WrappedTokenRegistry};
 
 pub(crate) use equity::EquityTriggerSkip;
 
@@ -42,16 +40,6 @@ pub enum RebalancingConfigError {
     NotAlpacaBroker,
     #[error(transparent)]
     Clap(#[from] clap::Error),
-    #[error("failed to read wrapped tokens config file")]
-    WrappedTokensRead(#[source] std::io::Error),
-    #[error("failed to parse wrapped tokens config")]
-    WrappedTokensParse(#[source] serde_json::Error),
-}
-
-/// JSON structure for wrapped tokens config file.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct WrappedTokensFileConfig {
-    tokens: Vec<WrappedTokenConfig>,
 }
 
 /// Environment configuration for rebalancing (parsed via clap).
@@ -84,10 +72,6 @@ pub struct RebalancingEnv {
     /// Alpaca account ID (UUID) for Broker API wallet operations
     #[clap(long, env, value_parser = AlpacaAccountId::parse)]
     alpaca_account_id: AlpacaAccountId,
-    /// Path to JSON file containing wrapped token configurations (optional).
-    /// If not provided, no wrapped token support is enabled.
-    #[clap(long, env)]
-    wrapped_tokens_config: Option<PathBuf>,
 }
 
 impl RebalancingConfig {
@@ -98,18 +82,6 @@ impl RebalancingConfig {
         const DUMMY_PROGRAM_NAME: &[&str] = &["rebalancing"];
 
         let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
-
-        // Load wrapped tokens config from JSON file if path is provided
-        let wrapped_token_registry = match &env.wrapped_tokens_config {
-            Some(path) => {
-                let contents = std::fs::read_to_string(path)
-                    .map_err(RebalancingConfigError::WrappedTokensRead)?;
-                let config: WrappedTokensFileConfig = serde_json::from_str(&contents)
-                    .map_err(RebalancingConfigError::WrappedTokensParse)?;
-                WrappedTokenRegistry::new(config.tokens)
-            }
-            None => WrappedTokenRegistry::empty(),
-        };
 
         Ok(Self {
             equity_threshold: ImbalanceThreshold {
@@ -125,7 +97,6 @@ impl RebalancingConfig {
             evm_private_key: env.evm_private_key,
             usdc_vault_id: env.usdc_vault_id,
             alpaca_account_id: env.alpaca_account_id,
-            wrapped_token_registry,
         })
     }
 }
@@ -142,8 +113,6 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc_vault_id: B256,
     /// Alpaca AP (Authorized Participant) account ID for Broker API operations.
     pub(crate) alpaca_account_id: AlpacaAccountId,
-    /// Registry of wrapped token configurations for ERC-4626 vault operations.
-    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
 }
 
 impl std::fmt::Debug for RebalancingConfig {
@@ -156,7 +125,6 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("evm_private_key", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
-            .field("wrapped_token_registry", &self.wrapped_token_registry)
             .finish()
     }
 }
@@ -365,7 +333,12 @@ where
     }
 
     async fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
-        let vault_ratio = self.get_vault_ratio_for_symbol(symbol).await;
+        let vault_ratio = self
+            .vault_service
+            .get_ratio_for_symbol(symbol)
+            .await
+            .inspect_err(|e| error!(symbol = %symbol, error = %e, "Failed to fetch vault ratio"))
+            .ok()?;
 
         match equity::check_imbalance_and_build_operation(
             symbol,
@@ -381,31 +354,6 @@ where
             Err(EquityTriggerSkip::TokenNotInCache) => {
                 error!(symbol = %symbol, "Skipped equity trigger: token not in cache");
                 None
-            }
-        }
-    }
-
-    /// Fetches the VaultRatio for a symbol.
-    ///
-    /// Returns the actual ratio for wrapped tokens, or `VaultRatio::one_to_one()`
-    /// for non-wrapped tokens (which leaves values unchanged when applied).
-    async fn get_vault_ratio_for_symbol(&self, symbol: &Symbol) -> crate::vault::VaultRatio {
-        let Some(config) = self.vault_service.get_config_by_symbol(symbol) else {
-            return crate::vault::VaultRatio::one_to_one();
-        };
-
-        let wrapped_token = config.wrapped_token;
-
-        match self.vault_service.get_ratio(wrapped_token).await {
-            Ok(ratio) => ratio,
-            Err(e) => {
-                warn!(
-                    symbol = %symbol,
-                    wrapped_token = %wrapped_token,
-                    error = %e,
-                    "Failed to fetch VaultRatio, using 1:1 ratio"
-                );
-                crate::vault::VaultRatio::one_to_one()
             }
         }
     }
@@ -655,7 +603,11 @@ where
 mod tests {
     use alloy::network::Ethereum;
     use alloy::primitives::fixed_bytes;
-    use alloy::primitives::{TxHash, address};
+    use alloy::primitives::{Address, TxHash, U256, address};
+    use alloy::providers::Identity;
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
+    };
     use alloy::providers::{ProviderBuilder, RootProvider};
     use chrono::Utc;
     use cqrs_es::mem_store::MemStore;
@@ -679,12 +631,7 @@ mod tests {
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
-    use crate::vault::WrappedTokenRegistry;
-    use alloy::primitives::{Address, U256};
-    use alloy::providers::Identity;
-    use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
-    };
+    use crate::vault::{VaultRatio, WrappedTokenConfig, WrappedTokenRegistry};
 
     /// Test provider type. Uses HTTP transport but won't be called since tests
     /// use empty WrappedTokenRegistry (no wrapped tokens configured).
@@ -697,11 +644,33 @@ mod tests {
         Ethereum,
     >;
 
+    const TEST_WRAPPED_TOKEN: Address = address!("0x1111111111111111111111111111111111111111");
+
     fn make_test_vault_service() -> Arc<VaultService<TestProvider>> {
-        // Create a provider with a dummy URL - it won't be called since the registry is empty
         let provider =
             ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
-        Arc::new(VaultService::new(provider, WrappedTokenRegistry::empty()))
+        Arc::new(
+            VaultService::new(provider)
+                .unwrap()
+                .with_registry(WrappedTokenRegistry::empty()),
+        )
+    }
+
+    fn make_test_vault_service_with_ratio(
+        symbol: &str,
+        ratio: VaultRatio,
+    ) -> Arc<VaultService<TestProvider>> {
+        let registry = WrappedTokenRegistry::new(vec![WrappedTokenConfig {
+            equity_symbol: Symbol::new(symbol).unwrap(),
+            wrapped_token: TEST_WRAPPED_TOKEN,
+            unwrapped_token: address!("0x2222222222222222222222222222222222222222"),
+        }]);
+
+        let provider =
+            ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
+        let service = VaultService::new(provider).unwrap().with_registry(registry);
+        service.seed_ratio(TEST_WRAPPED_TOKEN, ratio);
+        Arc::new(service)
     }
 
     fn make_trigger() -> (
@@ -833,6 +802,16 @@ mod tests {
         RebalancingTrigger<TestProvider>,
         mpsc::Receiver<TriggeredOperation>,
     ) {
+        make_trigger_with_inventory_and_vault(inventory, make_test_vault_service())
+    }
+
+    fn make_trigger_with_inventory_and_vault(
+        inventory: InventoryView,
+        vault_service: Arc<VaultService<TestProvider>>,
+    ) -> (
+        RebalancingTrigger<TestProvider>,
+        mpsc::Receiver<TriggeredOperation>,
+    ) {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(inventory));
         let symbol_cache = SymbolCache::default();
@@ -848,13 +827,7 @@ mod tests {
         };
 
         (
-            RebalancingTrigger::new(
-                config,
-                symbol_cache,
-                inventory,
-                sender,
-                make_test_vault_service(),
-            ),
+            RebalancingTrigger::new(config, symbol_cache, inventory, sender, vault_service),
             receiver,
         )
     }
@@ -955,6 +928,41 @@ mod tests {
         assert!(
             matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
             "Expected Mint operation, got {triggered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn imbalance_triggers_mint_with_populated_registry() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut inventory = InventoryView::default().with_equity(symbol.clone());
+
+        // 1.05 ratio: 1 wrapped = 1.05 unwrapped
+        let assets_per_share = U256::from(1_050_000_000_000_000_000u64);
+        let ratio = VaultRatio::new(assets_per_share).unwrap();
+        let vault_service = make_test_vault_service_with_ratio("AAPL", ratio);
+
+        // Build imbalanced state: 20 onchain, 80 offchain.
+        // With 1.05 ratio, onchain is worth 21 unwrapped equivalent.
+        // Ratio = 21 / (21 + 80) = ~20.8%, below the 30% lower threshold.
+        inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(20), Direction::Buy))
+            .unwrap();
+        inventory = inventory
+            .apply_position_event(&symbol, &make_offchain_fill(shares(80), Direction::Buy))
+            .unwrap();
+
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_and_vault(inventory, vault_service);
+
+        let event = make_onchain_fill(shares(1), Direction::Buy);
+        trigger
+            .apply_position_event_and_check(&symbol, &event)
+            .await;
+
+        let triggered = receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "Expected Mint operation with populated registry, got {triggered:?}"
         );
     }
 
@@ -1166,6 +1174,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         }
     }
 
@@ -1777,7 +1786,7 @@ mod tests {
             assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
             assert_eq!(
                 config.redemption_wallet,
-                address!("1234567890123456789012345678901234567890")
+                address!("0x1234567890123456789012345678901234567890")
             );
         });
     }

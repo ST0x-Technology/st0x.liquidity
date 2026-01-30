@@ -16,8 +16,7 @@
 //!                                                              Failed <-----Fail----- Failed
 //! ```
 //!
-//! - For wrapped tokens: `UnwrapTokens` → `TokensUnwrapped` → `SendTokens` → `TokensSent` → ...
-//! - For non-wrapped tokens: `SendTokens` → `TokensSent` → ...
+//! - `UnwrapTokens` → `TokensUnwrapped` → `SendTokens` → `TokensSent` → ...
 //! - `TokensSent` and `Pending` can transition to `Failed`
 //! - `Completed` and `Failed` are terminal states
 //!
@@ -75,6 +74,9 @@ pub(crate) enum EquityRedemptionError {
     /// Attempted to unwrap tokens when redemption already started
     #[error("Cannot unwrap tokens: redemption already in progress")]
     CannotUnwrapAlreadyStarted,
+    /// Attempted to send tokens before unwrapping
+    #[error("Cannot send tokens: tokens not unwrapped")]
+    TokensNotUnwrapped,
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -114,7 +116,7 @@ pub(crate) enum EquityRedemptionCommand {
         symbol: Symbol,
         quantity: Decimal,
         wrapped_amount: U256,
-        unwrap_tx_hash: TxHash,
+        unwrapped_in: TxHash,
         unwrapped_amount: U256,
     },
     SendTokens {
@@ -142,7 +144,7 @@ pub(crate) enum EquityRedemptionEvent {
         symbol: Symbol,
         quantity: Decimal,
         wrapped_amount: U256,
-        unwrap_tx_hash: TxHash,
+        unwrapped_in: TxHash,
         unwrapped_amount: U256,
         unwrapped_at: DateTime<Utc>,
     },
@@ -153,6 +155,7 @@ pub(crate) enum EquityRedemptionEvent {
         redemption_wallet: Address,
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
+        unwrapped_in: TxHash,
     },
 
     Detected {
@@ -208,21 +211,19 @@ pub(crate) enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         wrapped_amount: U256,
-        unwrap_tx_hash: TxHash,
+        unwrapped_in: TxHash,
         unwrapped_amount: U256,
         unwrapped_at: DateTime<Utc>,
     },
 
     /// Tokens sent to Alpaca's redemption wallet with transaction hash.
-    /// Optionally contains unwrap info if tokens were unwrapped first.
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
         redemption_wallet: Address,
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
-        /// Present if tokens were unwrapped before sending.
-        unwrap_tx_hash: Option<TxHash>,
+        unwrapped_in: TxHash,
     },
 
     /// Alpaca detected the token transfer and returned tracking identifier
@@ -289,13 +290,13 @@ impl Aggregate for Lifecycle<EquityRedemption, Never> {
                 symbol,
                 quantity,
                 wrapped_amount,
-                unwrap_tx_hash,
+                unwrapped_in,
                 unwrapped_amount,
             } => self.handle_unwrap_tokens(
                 symbol,
                 *quantity,
                 *wrapped_amount,
-                *unwrap_tx_hash,
+                *unwrapped_in,
                 *unwrapped_amount,
             ),
 
@@ -327,7 +328,7 @@ impl Lifecycle<EquityRedemption, Never> {
         symbol: &Symbol,
         quantity: Decimal,
         wrapped_amount: U256,
-        unwrap_tx_hash: TxHash,
+        unwrapped_in: TxHash,
         unwrapped_amount: U256,
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         match self.live() {
@@ -336,7 +337,7 @@ impl Lifecycle<EquityRedemption, Never> {
                     symbol: symbol.clone(),
                     quantity,
                     wrapped_amount,
-                    unwrap_tx_hash,
+                    unwrapped_in,
                     unwrapped_amount,
                     unwrapped_at: Utc::now(),
                 }])
@@ -356,17 +357,11 @@ impl Lifecycle<EquityRedemption, Never> {
         tx_hash: TxHash,
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         match self.live() {
-            // Direct send without unwrapping
-            Err(LifecycleError::Uninitialized) => Ok(vec![EquityRedemptionEvent::TokensSent {
-                symbol: symbol.clone(),
-                quantity,
-                redemption_wallet,
-                tx_hash,
-                sent_at: Utc::now(),
-            }]),
+            Err(LifecycleError::Uninitialized) => Err(EquityRedemptionError::TokensNotUnwrapped),
             Ok(EquityRedemption::TokensUnwrapped {
                 symbol: unwrapped_symbol,
                 quantity: unwrapped_quantity,
+                unwrapped_in,
                 ..
             }) => {
                 if symbol != unwrapped_symbol || quantity != *unwrapped_quantity {
@@ -384,6 +379,7 @@ impl Lifecycle<EquityRedemption, Never> {
                     redemption_wallet,
                     tx_hash,
                     sent_at: Utc::now(),
+                    unwrapped_in: *unwrapped_in,
                 }])
             }
             Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
@@ -487,8 +483,15 @@ impl EquityRedemption {
                 redemption_wallet,
                 tx_hash,
                 sent_at,
+                unwrapped_in,
                 ..
-            } => current.apply_tokens_sent(*redemption_wallet, *tx_hash, *sent_at, event),
+            } => current.apply_tokens_sent(
+                *redemption_wallet,
+                *tx_hash,
+                *sent_at,
+                *unwrapped_in,
+                event,
+            ),
 
             EquityRedemptionEvent::Detected {
                 tokenization_request_id,
@@ -517,31 +520,16 @@ impl EquityRedemption {
                 symbol,
                 quantity,
                 wrapped_amount,
-                unwrap_tx_hash,
+                unwrapped_in,
                 unwrapped_amount,
                 unwrapped_at,
             } => Ok(Self::TokensUnwrapped {
                 symbol: symbol.clone(),
                 quantity: *quantity,
                 wrapped_amount: *wrapped_amount,
-                unwrap_tx_hash: *unwrap_tx_hash,
+                unwrapped_in: *unwrapped_in,
                 unwrapped_amount: *unwrapped_amount,
                 unwrapped_at: *unwrapped_at,
-            }),
-
-            EquityRedemptionEvent::TokensSent {
-                symbol,
-                quantity,
-                redemption_wallet,
-                tx_hash,
-                sent_at,
-            } => Ok(Self::TokensSent {
-                symbol: symbol.clone(),
-                quantity: *quantity,
-                redemption_wallet: *redemption_wallet,
-                tx_hash: *tx_hash,
-                sent_at: *sent_at,
-                unwrap_tx_hash: None,
             }),
 
             _ => Err(LifecycleError::Mismatch {
@@ -557,13 +545,11 @@ impl EquityRedemption {
         redemption_wallet: Address,
         tx_hash: TxHash,
         sent_at: DateTime<Utc>,
+        unwrapped_in: TxHash,
         event: &EquityRedemptionEvent,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::TokensUnwrapped {
-            symbol,
-            quantity,
-            unwrap_tx_hash,
-            ..
+            symbol, quantity, ..
         } = self
         else {
             warn!(
@@ -583,7 +569,7 @@ impl EquityRedemption {
             redemption_wallet,
             tx_hash,
             sent_at,
-            unwrap_tx_hash: Some(*unwrap_tx_hash),
+            unwrapped_in,
         })
     }
 
@@ -723,30 +709,37 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
+    fn unwrapped_event(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensUnwrapped {
+            symbol: symbol.clone(),
+            quantity,
+            wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
+            unwrapped_in: TxHash::random(),
+            unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
+            unwrapped_at: Utc::now(),
+        }
+    }
+
     #[tokio::test]
-    async fn test_send_tokens_from_uninitialized() {
+    async fn test_send_tokens_from_uninitialized_fails() {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let redemption_wallet = Address::random();
-        let tx_hash = TxHash::random();
 
-        let events = aggregate
+        let result = aggregate
             .handle(
                 EquityRedemptionCommand::SendTokens {
-                    symbol: symbol.clone(),
+                    symbol,
                     quantity: dec!(50.25),
-                    redemption_wallet,
-                    tx_hash,
+                    redemption_wallet: Address::random(),
+                    tx_hash: TxHash::random(),
                 },
                 &(),
             )
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::TokensSent { .. }
+            result.unwrap_err(),
+            EquityRedemptionError::TokensNotUnwrapped
         ));
     }
 
@@ -757,12 +750,15 @@ mod tests {
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol,
             quantity: dec!(50.25),
             redemption_wallet,
             tx_hash,
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -787,12 +783,15 @@ mod tests {
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol,
             quantity: dec!(50.25),
             redemption_wallet,
             tx_hash,
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -817,6 +816,23 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
+
+        // Unwrap first
+        let unwrap_events = aggregate
+            .handle(
+                EquityRedemptionCommand::UnwrapTokens {
+                    symbol: symbol.clone(),
+                    quantity: dec!(50.25),
+                    wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
+                    unwrapped_in: TxHash::random(),
+                    unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unwrap_events.len(), 1);
+        aggregate.apply(unwrap_events[0].clone());
 
         let send_events = aggregate
             .handle(
@@ -892,12 +908,15 @@ mod tests {
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol,
             quantity: dec!(50.25),
             redemption_wallet,
             tx_hash,
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -925,12 +944,15 @@ mod tests {
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol,
             quantity: dec!(50.25),
             redemption_wallet,
             tx_hash,
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -964,12 +986,15 @@ mod tests {
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol,
             quantity: dec!(50.25),
             redemption_wallet,
             tx_hash,
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -995,12 +1020,15 @@ mod tests {
         let redemption_wallet = Address::random();
         let tx_hash = TxHash::random();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
             redemption_wallet,
             tx_hash,
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -1107,7 +1135,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
-            unwrap_tx_hash: None,
+            unwrapped_in: TxHash::random(),
         };
 
         let event = EquityRedemptionEvent::Completed {
@@ -1156,7 +1184,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
-            unwrap_tx_hash: None,
+            unwrapped_in: TxHash::random(),
         };
 
         let event = EquityRedemptionEvent::RedemptionRejected {
@@ -1181,7 +1209,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
-            unwrap_tx_hash: None,
+            unwrapped_in: TxHash::random(),
         };
 
         let event = EquityRedemptionEvent::TokensSent {
@@ -1190,6 +1218,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
 
         let err = EquityRedemption::apply_transition(&event, &tokens_sent).unwrap_err();
@@ -1221,7 +1250,7 @@ mod tests {
     async fn test_unwrap_tokens_from_uninitialized() {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let unwrap_tx_hash = TxHash::random();
+        let unwrapped_in = TxHash::random();
 
         let events = aggregate
             .handle(
@@ -1229,7 +1258,7 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: dec!(50.25),
                     wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-                    unwrap_tx_hash,
+                    unwrapped_in,
                     unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
                 },
                 &(),
@@ -1248,13 +1277,13 @@ mod tests {
     async fn test_send_tokens_after_unwrap() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let unwrap_tx_hash = TxHash::random();
+        let unwrapped_in = TxHash::random();
 
         let unwrap_event = EquityRedemptionEvent::TokensUnwrapped {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
             wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-            unwrap_tx_hash,
+            unwrapped_in,
             unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
             unwrapped_at: Utc::now(),
         };
@@ -1287,6 +1316,7 @@ mod tests {
     async fn test_complete_redemption_flow_with_unwrapping() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
+        let unwrap_tx_hash = TxHash::random();
 
         // Step 1: Unwrap tokens
         let unwrap_events = aggregate
@@ -1295,7 +1325,7 @@ mod tests {
                     symbol: symbol.clone(),
                     quantity: dec!(50.25),
                     wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_in: unwrap_tx_hash,
                     unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
                 },
                 &(),
@@ -1324,12 +1354,11 @@ mod tests {
             .unwrap();
         aggregate.apply(send_events[0].clone());
 
-        // Verify unwrap_tx_hash is carried forward
-        let Lifecycle::Live(EquityRedemption::TokensSent { unwrap_tx_hash, .. }) = &aggregate
-        else {
+        // Verify unwrapped_in is carried forward
+        let Lifecycle::Live(EquityRedemption::TokensSent { unwrapped_in, .. }) = &aggregate else {
             panic!("Expected TokensSent state, got {aggregate:?}");
         };
-        assert!(unwrap_tx_hash.is_some());
+        assert_eq!(*unwrapped_in, unwrap_tx_hash);
 
         // Step 3: Detect
         let detect_events = aggregate
@@ -1366,12 +1395,15 @@ mod tests {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
 
+        aggregate.apply(unwrapped_event(&symbol, dec!(50.25)));
+
         let sent_event = EquityRedemptionEvent::TokensSent {
             symbol: symbol.clone(),
             quantity: dec!(50.25),
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
         aggregate.apply(sent_event);
 
@@ -1381,7 +1413,7 @@ mod tests {
                     symbol,
                     quantity: dec!(50.25),
                     wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_in: TxHash::random(),
                     unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
                 },
                 &(),
@@ -1403,7 +1435,7 @@ mod tests {
             symbol,
             quantity: dec!(50.25),
             wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-            unwrap_tx_hash: TxHash::random(),
+            unwrapped_in: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
             unwrapped_at: Utc::now(),
         };
@@ -1423,11 +1455,12 @@ mod tests {
 
     #[test]
     fn test_apply_tokens_sent_from_tokens_unwrapped() {
+        let unwrap_hash = TxHash::random();
         let unwrapped = EquityRedemption::TokensUnwrapped {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-            unwrap_tx_hash: TxHash::random(),
+            unwrapped_in: unwrap_hash,
             unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
             unwrapped_at: Utc::now(),
         };
@@ -1438,14 +1471,15 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
+            unwrapped_in: unwrap_hash,
         };
 
         let result = EquityRedemption::apply_transition(&event, &unwrapped).unwrap();
 
-        let EquityRedemption::TokensSent { unwrap_tx_hash, .. } = result else {
+        let EquityRedemption::TokensSent { unwrapped_in, .. } = result else {
             panic!("Expected TokensSent state, got {result:?}");
         };
-        assert!(unwrap_tx_hash.is_some());
+        assert_eq!(unwrapped_in, unwrap_hash);
     }
 
     #[test]
@@ -1465,6 +1499,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         };
 
         let err = EquityRedemption::apply_transition(&event, &pending).unwrap_err();
@@ -1482,7 +1517,7 @@ mod tests {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-            unwrap_tx_hash: TxHash::random(),
+            unwrapped_in: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
             unwrapped_at: Utc::now(),
         };
@@ -1500,14 +1535,14 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
-            unwrap_tx_hash: None,
+            unwrapped_in: TxHash::random(),
         };
 
         let event = EquityRedemptionEvent::TokensUnwrapped {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: dec!(50.25),
             wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
-            unwrap_tx_hash: TxHash::random(),
+            unwrapped_in: TxHash::random(),
             unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
             unwrapped_at: Utc::now(),
         };
@@ -1519,5 +1554,43 @@ mod tests {
         };
         assert!(state.contains("TokensSent"));
         assert_eq!(evt, "EquityRedemptionEvent::TokensUnwrapped");
+    }
+
+    #[test]
+    fn replay_unwrapped_then_sent_reconstructs_unwrapped_in_from_event() {
+        let unwrapped_in = TxHash::random();
+
+        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+
+        aggregate.apply(EquityRedemptionEvent::TokensUnwrapped {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(50.25),
+            wrapped_amount: U256::from(50_250_000_000_000_000_000u128),
+            unwrapped_in,
+            unwrapped_amount: U256::from(50_250_000_000_000_000_000u128),
+            unwrapped_at: Utc::now(),
+        });
+
+        aggregate.apply(EquityRedemptionEvent::TokensSent {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(50.25),
+            redemption_wallet: Address::random(),
+            tx_hash: TxHash::random(),
+            sent_at: Utc::now(),
+            unwrapped_in,
+        });
+
+        let Lifecycle::Live(EquityRedemption::TokensSent {
+            unwrapped_in: reconstructed,
+            ..
+        }) = aggregate
+        else {
+            panic!("Expected TokensSent state, got {aggregate:?}");
+        };
+
+        assert_eq!(
+            reconstructed, unwrapped_in,
+            "unwrapped_in should be reconstructed from the event, not from prior state"
+        );
     }
 }

@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use st0x_execution::Executor;
+use st0x_execution::{EmptySymbolError, Executor};
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
@@ -15,6 +15,7 @@ use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
 use crate::symbol::cache::SymbolCache;
+use crate::vault::VaultService;
 
 use super::{
     Conductor, spawn_event_processor, spawn_onchain_event_receiver, spawn_order_poller,
@@ -133,7 +134,7 @@ where
         self
     }
 
-    pub(crate) fn spawn(self) -> Conductor {
+    pub(crate) fn spawn(self) -> Result<Conductor, EmptySymbolError> {
         info!("Starting conductor orchestration");
 
         let executor_maintenance = self.state.executor_maintenance;
@@ -154,16 +155,7 @@ where
         );
         let event_processor =
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
-        let wrapped_token_registry = self
-            .common
-            .config
-            .rebalancing
-            .as_ref()
-            .map(|r| r.wrapped_token_registry.clone())
-            .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
-
-        let position_checker_vault_service =
-            crate::vault::VaultService::new(self.common.provider.clone(), wrapped_token_registry);
+        let position_checker_vault_service = VaultService::new(self.common.provider.clone())?;
 
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
@@ -177,9 +169,9 @@ where
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
-        );
+        )?;
 
-        Conductor {
+        Ok(Conductor {
             executor_maintenance,
             order_poller,
             dex_event_receiver,
@@ -187,7 +179,7 @@ where
             position_checker,
             queue_processor,
             rebalancer,
-        }
+        })
     }
 }
 

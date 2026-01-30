@@ -85,10 +85,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let mint_store =
                 PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
             let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
-            let erc4626_vault = Arc::new(Erc4626VaultService::new(
-                base_provider.clone(),
-                rebalancing_config.wrapped_token_registry.clone(),
-            ));
+            let erc4626_vault = Arc::new(Erc4626VaultService::new(base_provider.clone())?);
             let mint_manager = MintManager::new(tokenization_service, mint_cqrs, erc4626_vault);
 
             let issuer_request_id =
@@ -118,10 +115,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let redemption_store =
                 PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
             let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
-            let erc4626_vault = Arc::new(Erc4626VaultService::new(
-                base_provider.clone(),
-                rebalancing_config.wrapped_token_registry.clone(),
-            ));
+            let erc4626_vault = Arc::new(Erc4626VaultService::new(base_provider.clone())?);
             let redemption_manager =
                 RedemptionManager::new(tokenization_service, redemption_cqrs, erc4626_vault);
 

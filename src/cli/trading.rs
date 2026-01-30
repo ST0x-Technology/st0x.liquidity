@@ -20,6 +20,7 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+use crate::vault::VaultService;
 
 use super::auth::ensure_schwab_authentication;
 
@@ -286,16 +287,10 @@ pub(super) async fn process_found_trade<W: Write, P: Provider + Clone>(
     )
     .await;
 
-    let wrapped_token_registry = config
-        .rebalancing
-        .as_ref()
-        .map(|r| r.wrapped_token_registry.clone())
-        .unwrap_or_else(crate::vault::WrappedTokenRegistry::empty);
-
-    let vault_service = crate::vault::VaultService::new(provider.clone(), wrapped_token_registry);
+    let vault_service = VaultService::new(provider.clone())?;
     let vault_ratio = vault_service
         .get_ratio_for_symbol(onchain_trade.symbol.base())
-        .await;
+        .await?;
 
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(

@@ -289,16 +289,10 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
 
-    use alloy::network::EthereumWallet;
-    use alloy::signers::local::PrivateKeySigner;
-
     use super::*;
-    use crate::alpaca_tokenization::AlpacaTokenizationService;
     use crate::alpaca_tokenization::tests::{
-        TEST_ACCOUNT_ID, TEST_REDEMPTION_WALLET, setup_anvil, tokenization_mint_path,
-        tokenization_requests_path,
+        create_test_provider, create_test_setup, tokenization_mint_path, tokenization_requests_path,
     };
-    use crate::vault::WrappedTokenRegistry;
 
     type TestCqrs = CqrsFramework<
         Lifecycle<TokenizedEquityMint, Never>,
@@ -308,42 +302,6 @@ mod tests {
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();
         Arc::new(CqrsFramework::new(store, vec![], ()))
-    }
-
-    /// Creates a test setup with matching provider types for service and vault_service.
-    fn create_test_setup<P: Provider + Clone>(
-        server: &httpmock::MockServer,
-        provider: P,
-    ) -> (Arc<AlpacaTokenizationService<P>>, Arc<VaultService<P>>) {
-        let service = Arc::new(AlpacaTokenizationService::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
-            provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-
-        let vault_service = Arc::new(VaultService::new(provider, WrappedTokenRegistry::empty()));
-
-        (service, vault_service)
-    }
-
-    async fn create_test_provider() -> impl Provider + Clone {
-        let (anvil, endpoint, key) = setup_anvil();
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer);
-
-        let provider = alloy::providers::ProviderBuilder::new()
-            .wallet(wallet)
-            .connect(&endpoint)
-            .await
-            .unwrap();
-
-        // Keep anvil alive by leaking it (it's dropped when the test ends anyway)
-        std::mem::forget(anvil);
-
-        provider
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -408,7 +366,7 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_happy_path() {
         let server = MockServer::start();
-        let provider = create_test_provider().await;
+        let (_anvil, provider) = create_test_provider().await;
         let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(service, cqrs, vault_service);
@@ -444,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_rejected_by_alpaca() {
         let server = MockServer::start();
-        let provider = create_test_provider().await;
+        let (_anvil, provider) = create_test_provider().await;
         let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(service, cqrs, vault_service);
@@ -492,7 +450,7 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_api_error() {
         let server = MockServer::start();
-        let provider = create_test_provider().await;
+        let (_anvil, provider) = create_test_provider().await;
         let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(service, cqrs, vault_service);
@@ -518,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn trait_impl_delegates_to_execute_mint_impl() {
         let server = MockServer::start();
-        let provider = create_test_provider().await;
+        let (_anvil, provider) = create_test_provider().await;
         let (service, vault_service) = create_test_setup(&server, provider);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(service, cqrs, vault_service);

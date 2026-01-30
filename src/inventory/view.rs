@@ -1222,6 +1222,7 @@ mod tests {
             redemption_wallet: Address::random(),
             tx_hash: TxHash::random(),
             sent_at: Utc::now(),
+            unwrapped_in: TxHash::random(),
         }
     }
 
@@ -1828,7 +1829,7 @@ mod tests {
 
         // 1.05 ratio = 1_050_000_000_000_000_000
         // With 1.05 ratio: 52.5/102.5 ≈ 0.512 (still balanced)
-        let assets_per_share = alloy::primitives::U256::from(1_050_000_000_000_000_000u64);
+        let assets_per_share = U256::from(1_050_000_000_000_000_000u64);
         let ratio = VaultRatio::new(assets_per_share).unwrap();
         let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, &ratio);
         assert!(imbalance_with_ratio.is_none());
@@ -1850,7 +1851,7 @@ mod tests {
         // With 1.5 ratio: 65 wrapped = 97.5 unwrapped-equivalent
         // Total = 97.5 + 35 = 132.5
         // Ratio = 97.5 / 132.5 ≈ 0.736 (above 70% upper threshold!)
-        let assets_per_share = alloy::primitives::U256::from(1_500_000_000_000_000_000u64);
+        let assets_per_share = U256::from(1_500_000_000_000_000_000u64);
         let ratio = VaultRatio::new(assets_per_share).unwrap();
 
         let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, &ratio);
