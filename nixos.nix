@@ -1,6 +1,7 @@
 { pkgs, lib, modulesPath, ... }:
 
-{
+let inherit (import ./keys.nix) roles;
+in {
   imports = [
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
     (modulesPath + "/profiles/qemu-guest.nix")
@@ -75,9 +76,7 @@
     };
   };
 
-  users.users.root.openssh.authorizedKeys.keys = [
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBnMyJGDpOBOsOsJsxPsKBwwXLOCPwAZ2bBGqjXFAMgR st0x-op"
-  ];
+  users.users.root.openssh.authorizedKeys.keys = roles.ssh;
 
   networking.firewall = {
     enable = true;

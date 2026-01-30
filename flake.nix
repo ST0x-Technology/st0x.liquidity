@@ -126,6 +126,12 @@
             '';
           };
 
+          rekeyState = rainix.mkTask.${system} {
+            name = "rekey-state";
+            additionalBuildInputs = infraPkgs.buildInputs;
+            body = infraPkgs.rekeyState;
+          };
+
           remote = pkgs.writeShellApplication {
             name = "remote";
             runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
@@ -142,9 +148,15 @@
             text = ''
               ${infraPkgs.resolveIp}
               export DEPLOY_HOST="$host_ip"
+
               target="''${1:-.#st0x-liquidity}"
               shift || true
-              deploy "$@" "$target" -- --impure
+              deploy ${
+                if system == "x86_64-linux" then
+                  ""
+                else
+                  "--skip-checks --remote-build"
+              } "$target" -- --impure "$@"
             '';
           };
         };

@@ -57,8 +57,15 @@ let
     rm -f ${tfState}
   '';
 
+  rekeyState = ''
+    ${parseIdentity}
+    ${decryptState}
+    ${encryptState}
+    ${cleanup}
+  '';
+
 in {
-  inherit buildInputs resolveIp;
+  inherit buildInputs resolveIp rekeyState;
 
   tfInit = rainix.mkTask.${system} {
     name = "tf-init";

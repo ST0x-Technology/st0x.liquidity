@@ -6,8 +6,10 @@ let
 
   profileBase = "/nix/var/nix/profiles/per-service";
 
-  mkServiceProfile = { package, services }:
-    activate.custom package (builtins.concatStringsSep " && "
+  st0xPackage = self.packages.${system}.st0x-liquidity;
+
+  mkServiceProfile = { services }:
+    activate.custom st0xPackage (builtins.concatStringsSep " && "
       (map (s: "systemctl restart ${s}") services));
 
 in {
@@ -22,16 +24,13 @@ in {
       system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
 
       server = {
-        path = mkServiceProfile {
-          package = self.packages.${system}.st0x-liquidity;
-          services = [ "server-schwab" "server-alpaca" ];
-        };
+        path =
+          mkServiceProfile { services = [ "server-schwab" "server-alpaca" ]; };
         profilePath = "${profileBase}/server";
       };
 
       reporter = {
         path = mkServiceProfile {
-          package = self.packages.${system}.st0x-liquidity;
           services = [ "reporter-schwab" "reporter-alpaca" ];
         };
         profilePath = "${profileBase}/reporter";

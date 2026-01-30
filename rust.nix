@@ -11,10 +11,10 @@ in rustPlatform.buildRustPackage {
   pname = "st0x-liquidity";
   version = "0.1.0";
 
-  src = ../.;
+  src = ./.;
 
   cargoLock = {
-    lockFile = ../Cargo.lock;
+    lockFile = ./Cargo.lock;
     outputHashes = {
       "sqlite-es-0.1.0" = "sha256-Pf9nBYz2glSuEvBXnH0+5yqs+ZAOhd7xVTByWt6FMm0=";
       "rain-error-decoding-0.1.0" =
