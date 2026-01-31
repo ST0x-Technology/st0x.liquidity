@@ -32,21 +32,3 @@ Preview the production build:
 ```sh
 bun run preview
 ```
-
-## Docker
-
-Build the dashboard Docker image:
-
-```sh
-docker build -t st0x-dashboard .
-```
-
-Run the container (configure `BACKEND_HOST` to point to the backend server):
-
-```sh
-docker run -p 8080:80 -e BACKEND_HOST=localhost st0x-dashboard
-```
-
-> Note: This project uses `adapter-static` for SPA deployment. The Docker image
-> uses nginx to serve static files and proxy WebSocket connections to the
-> backend.

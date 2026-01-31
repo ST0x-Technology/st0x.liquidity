@@ -328,10 +328,14 @@ restrict to master branch).
 
 #### SSH Key Management
 
-Hybrid approach: DigitalOcean injects team SSH keys at droplet creation for
-emergency access; automation keys (CI/CD, deploy-rs) managed via ragenix
-(`authorized_keys.age`) for audit trail. Emergency access preserved even if
-ragenix deployment fails.
+All SSH keys centralized in `keys.nix` with role-based access:
+
+- `roles.ssh` — keys authorized for root SSH (operator + CI)
+- `roles.infra` — keys that can decrypt terraform state
+- `roles.service` — keys that can decrypt service config secrets
+
+`os.nix` imports `roles.ssh` for `authorizedKeys`. CI uses its key (stored as
+`SSH_KEY` GitHub secret) for both deployment and terraform state decryption.
 
 ## Crate Architecture
 
@@ -3379,24 +3383,9 @@ Public read access with authenticated actions:
 
 #### Deployment
 
-Dashboard can be deployed as:
-
-1. **Static assets served by Rocket**: Build dashboard, copy to `static/`, serve
-   from existing server
-2. **Separate container**: Nginx serving static files with reverse proxy to API
-
-```dockerfile
-# Dashboard Dockerfile
-FROM node:20-alpine AS builder
-WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY . .
-RUN npm run build
-
-FROM nginx:alpine
-COPY --from=builder /app/build /usr/share/nginx/html
-```
+Dashboard is built as a Nix derivation (`st0x-dashboard`) that produces static
+assets. Nginx on the NixOS host serves these files and reverse-proxies API
+requests to the backend.
 
 ### Non-Goals (MVP)
 

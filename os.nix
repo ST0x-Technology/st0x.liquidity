@@ -1,4 +1,4 @@
-{ pkgs, lib, modulesPath, ... }:
+{ pkgs, lib, modulesPath, dashboard, ... }:
 
 let inherit (import ./keys.nix) roles;
 in {
@@ -63,6 +63,30 @@ in {
       };
     };
 
+    nginx = {
+      enable = true;
+      virtualHosts.default = {
+        default = true;
+        root = "${dashboard}";
+
+        locations = let
+          wsProxy = port: {
+            proxyPass = "http://127.0.0.1:${toString port}/api/ws";
+            proxyWebsockets = true;
+            extraConfig = ''
+              proxy_connect_timeout 60;
+              proxy_send_timeout 60;
+              proxy_read_timeout 86400;
+            '';
+          };
+        in {
+          "/".tryFiles = "$uri $uri/ /index.html";
+          "/api/schwab/ws" = wsProxy 8080;
+          "/api/alpaca/ws" = wsProxy 8081;
+        };
+      };
+    };
+
     grafana = {
       enable = true;
       settings.server = {
@@ -82,8 +106,7 @@ in {
     enable = true;
     allowedTCPPorts = [
       22 # SSH
-      80 # HTTP
-      443 # HTTPS
+      80 # Dashboard
       3000 # Grafana
     ];
   };
@@ -110,11 +133,21 @@ in {
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";
 
-  age.secrets = {
-    "server-schwab.toml".file = ./config/server-schwab.toml.age;
-    "server-alpaca.toml".file = ./config/server-alpaca.toml.age;
-    "reporter-schwab.toml".file = ./config/reporter-schwab.toml.age;
-    "reporter-alpaca.toml".file = ./config/reporter-alpaca.toml.age;
+  systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
+
+  users.groups.st0x = { };
+
+  age.secrets = let
+    secret = file: {
+      inherit file;
+      group = "st0x";
+      mode = "0640";
+    };
+  in {
+    "server-schwab.toml" = secret ./config/server-schwab.toml.age;
+    "server-alpaca.toml" = secret ./config/server-alpaca.toml.age;
+    "reporter-schwab.toml" = secret ./config/reporter-schwab.toml.age;
+    "reporter-alpaca.toml" = secret ./config/reporter-alpaca.toml.age;
   };
 
   systemd.services = let
@@ -125,6 +158,7 @@ in {
         "/nix/var/nix/profiles/per-service/server/bin/server";
       serviceConfig = {
         DynamicUser = true;
+        SupplementaryGroups = [ "st0x" ];
         ExecStart = builtins.concatStringsSep " " [
           "/nix/var/nix/profiles/per-service/server/bin/server"
           "--config-file"
@@ -143,6 +177,7 @@ in {
         "/nix/var/nix/profiles/per-service/reporter/bin/reporter";
       serviceConfig = {
         DynamicUser = true;
+        SupplementaryGroups = [ "st0x" ];
         ExecStart = builtins.concatStringsSep " " [
           "/nix/var/nix/profiles/per-service/reporter/bin/reporter"
           "--config-file"

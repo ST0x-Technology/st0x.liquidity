@@ -25,11 +25,14 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
+          specialArgs = {
+            dashboard = self.packages.x86_64-linux.st0x-dashboard;
+          };
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
 
-      deploy = import ./deploy.nix { inherit deploy-rs self; };
+      deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
 
       checks =
         builtins.mapAttrs (_: deployLib: deployLib.deployChecks self.deploy)
@@ -50,7 +53,12 @@
         packages = let
           rainixPkgs = rainix.packages.${system};
           infraPkgs = import ./infra { inherit pkgs ragenix rainix system; };
-        in rainixPkgs // {
+          deployPkgs =
+            (import ./deploy.nix { inherit deploy-rs self; }).wrappers {
+              inherit pkgs infraPkgs;
+              localSystem = system;
+            };
+        in rainixPkgs // deployPkgs // {
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy;
 
           st0x-liquidity = pkgs.callPackage ./rust.nix {
@@ -150,24 +158,6 @@
             '';
           };
 
-          deploy = pkgs.writeShellApplication {
-            name = "deploy";
-            runtimeInputs = infraPkgs.buildInputs
-              ++ [ deploy-rs.packages.${system}.deploy-rs ];
-            text = ''
-              ${infraPkgs.resolveIp}
-              export DEPLOY_HOST="$host_ip"
-
-              target="''${1:-.#st0x-liquidity}"
-              shift || true
-              deploy ${
-                if system == "x86_64-linux" then
-                  ""
-                else
-                  "--skip-checks --remote-build"
-              } "$target" -- --impure "$@"
-            '';
-          };
         };
 
         devShells.default = pkgs.mkShell {
@@ -183,7 +173,9 @@
               ragenix.packages.${system}.default
               packages.prepSolArtifacts
               packages.remote
-              packages.deploy
+              packages.deployNixos
+              packages.deployService
+              packages.deployAll
             ] ++ rainix.devShells.${system}.default.buildInputs;
         };
       });

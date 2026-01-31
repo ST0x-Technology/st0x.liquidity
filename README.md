@@ -72,7 +72,7 @@ export ENCRYPTION_KEY=your_64_char_hex_key
 
 For production deployments, the key should be stored as a secret in your
 deployment system (e.g., GitHub Actions secrets) and passed directly to the
-container environment.
+service configuration.
 
 ## Development
 
@@ -149,7 +149,7 @@ ALPACA_TRADING_MODE=paper  # or 'live' for live trading
 Create a `.env` file with your environment-specific settings:
 
 ```bash
-# Database (for local development - Docker Compose manages paths in containers)
+# Database (for local development)
 DATABASE_URL=sqlite:data/schwab.db
 
 # Blockchain
@@ -162,7 +162,7 @@ DEPLOYMENT_BLOCK=... # Block number where orderbook was deployed
 # Add either Schwab OR Alpaca credentials based on your choice
 ```
 
-See `.env.example` for complete configuration options.
+See `example.toml` for complete configuration options.
 
 ### Step 4: Database Setup
 
@@ -175,20 +175,15 @@ sqlx db create
 sqlx migrate run
 ```
 
-**Note**: If you plan to run both bot instances via Docker Compose, you must
-create both databases before starting the containers:
+To run both executors locally, create both databases:
 
 ```bash
-# Create Schwab database
 sqlx db create --database-url sqlite:data/schwab.db
 sqlx migrate run --database-url sqlite:data/schwab.db
 
-# Create Alpaca database
 sqlx db create --database-url sqlite:data/alpaca.db
 sqlx migrate run --database-url sqlite:data/alpaca.db
 ```
-
-The containers will fail to start if these database files don't exist.
 
 ### Step 5: Authentication
 
@@ -347,83 +342,39 @@ cargo run --bin migrate_to_events -- --database-url sqlite:path/to/other.db
 mv data/schwab.db.backup data/schwab.db
 ```
 
-## Docker Deployment
+## Deployment
 
-The system uses Docker Compose to run two separate bot instances with isolated
-databases:
+The system runs on a NixOS host managed by deploy-rs. Four systemd services run
+independently: `server-schwab`, `server-alpaca`, `reporter-schwab`,
+`reporter-alpaca`. Grafana runs as a native NixOS service.
 
-- **schwarbot**: Charles Schwab instance (uses `data/schwab.db`)
-- **alpacabot**: Alpaca Markets instance (uses `data/alpaca.db`)
-- **grafana**: Observability stack with Grafana, Prometheus, Loki, Tempo, and
-  Pyroscope
-
-### Local Testing
-
-**Prerequisites**: Create both databases before starting containers:
+### Deploy
 
 ```bash
-mkdir -p data
+# Deploy everything (system config + all service binaries)
+nix run .#deployAll
 
-# Create Schwab database
-sqlx db create --database-url sqlite:data/schwab.db
-sqlx migrate run --database-url sqlite:data/schwab.db
+# Deploy only NixOS system configuration
+nix run .#deployNixos
 
-# Create Alpaca database
-sqlx db create --database-url sqlite:data/alpaca.db
-sqlx migrate run --database-url sqlite:data/alpaca.db
+# Deploy a specific service profile
+nix run .#deployService server
+nix run .#deployService reporter
 ```
 
-**Deploy locally**:
+### SSH to host
 
 ```bash
-# Generate docker-compose.yaml and build debug image
-./prep-docker-compose.sh
-
-# Or skip rebuild if image already exists
-./prep-docker-compose.sh --skip-build
-
-# Start containers
-docker compose up -d
-
-# View logs
-docker compose logs -f schwarbot alpacabot
-
-# Stop containers
-docker compose down
+nix run .#remote
 ```
 
-**Note**: In local mode, schwarbot runs in `dry-run` mode (no real trades) and
-alpacabot uses Alpaca paper trading.
+### Rollback
 
-### Production Deployment
-
-**Prerequisites**: On the production server, create both databases in the data
-volume:
+Each service is deployed to a nix profile. To roll back:
 
 ```bash
-# Create Schwab database
-sqlx db create --database-url sqlite:/mnt/volume_path/schwab.db
-sqlx migrate run --database-url sqlite:/mnt/volume_path/schwab.db
-
-# Create Alpaca database
-sqlx db create --database-url sqlite:/mnt/volume_path/alpaca.db
-sqlx migrate run --database-url sqlite:/mnt/volume_path/alpaca.db
-```
-
-**Deploy**:
-
-```bash
-# Set required environment variables
-export REGISTRY_NAME=your_registry
-export SHORT_SHA=git_commit_sha
-export DATA_VOLUME_PATH=/mnt/volume_path
-export GRAFANA_ADMIN_PASSWORD=secure_password
-
-# Generate docker-compose.yaml for production
-./prep-docker-compose.sh --prod
-
-# Deploy
-docker compose up -d
+nix run .#remote -- nix profile rollback --profile /nix/var/nix/profiles/per-service/server
+nix run .#remote -- systemctl restart server-schwab server-alpaca
 ```
 
 ## P&L Tracking and Metrics
