@@ -25,11 +25,8 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          modules = [
-            disko.nixosModules.disko
-            ragenix.nixosModules.default
-            ./nixos.nix
-          ];
+          modules =
+            [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
 
       deploy = import ./deploy.nix { inherit deploy-rs self; };
@@ -53,13 +50,25 @@
         packages = let
           rainixPkgs = rainix.packages.${system};
           infraPkgs = import ./infra { inherit pkgs ragenix rainix system; };
-        in rainixPkgs // infraPkgs // {
+        in rainixPkgs // {
+          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy;
 
           st0x-liquidity = pkgs.callPackage ./rust.nix {
             inherit rustPlatform;
             inherit (pkgs) sqlx-cli;
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
+
+          st0x-clippy = packages.st0x-liquidity.overrideAttrs (_: {
+            pname = "st0x-clippy";
+            buildPhase = ''
+              runHook preBuild
+              cargo clippy --all-targets --all-features -- -D clippy::all
+              runHook postBuild
+            '';
+            installPhase = "touch $out";
+            doCheck = false;
+          });
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;

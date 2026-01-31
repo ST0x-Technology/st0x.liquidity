@@ -6,17 +6,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
-  rainix:
-    env:
-      DATABASE_URL: "sqlite:schwab.db"
-
-    strategy:
-      matrix:
-        os: [ubuntu-latest]
-        task: [rainix-rs-test, rainix-rs-static]
-      fail-fast: false
-
-    runs-on: ${{ matrix.os }}
+  build:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Free disk space
@@ -37,56 +28,19 @@ jobs:
         with:
           primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
           restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5G
+          gc-max-store-size-linux: 10G
 
-      - run: nix run .#prepSolArtifacts
-      - run: nix flake check
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
 
-      - run: nix develop -c sqlx db create
-      - run: nix develop -c sqlx migrate run
-      - name: Run ${{ matrix.task }}
-        run: nix develop -c ${{ matrix.task }}
+      - name: Build and test
+        run: nix build --impure .#st0x-liquidity
 
-  dashboard:
-    env:
-      DATABASE_URL: "sqlite:schwab.db"
+      - name: Clippy
+        run: nix build --impure .#st0x-clippy
 
-    runs-on: ubuntu-latest
-    steps:
-      - uses: jlumbroso/free-disk-space@v1.3.1
+      - name: Dashboard
+        run: nix build --impure .#st0x-dashboard
 
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: nixbuild/nix-quick-install-action@v30
-        with:
-          nix_conf: |
-            keep-env-derivations = true
-            keep-outputs = true
-
-      - name: Nix store cache
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 5G
-
-      - run: nix run .#prepSolArtifacts
-
-      - name: Install dependencies
-        run: nix develop -c bun install --cwd dashboard
-      - name: Generate TypeScript types
-        run: |
-          nix develop -c sqlx db create
-          nix develop -c sqlx migrate run
-          nix develop -c cargo run --bin codegen
-
-      - name: Type check
-        run: nix develop -c bun run --cwd dashboard check
-      - name: Lint
-        run: nix develop -c bun run --cwd dashboard lint
-      - name: Test
-        run: nix develop -c bun run --cwd dashboard test:run
-      - name: Build
-        run: nix develop -c bun run --cwd dashboard build
+      - name: Flake checks
+        run: nix flake check --impure
