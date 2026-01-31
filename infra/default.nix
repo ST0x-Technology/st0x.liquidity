@@ -1,7 +1,8 @@
 { pkgs, ragenix, rainix, system }:
 
 let
-  buildInputs = [ pkgs.terraform pkgs.rage ragenix.packages.${system}.default ];
+  buildInputs =
+    [ pkgs.terraform pkgs.rage pkgs.jq ragenix.packages.${system}.default ];
 
   tfState = "infra/terraform.tfstate";
   tfVars = "infra/terraform.tfvars";
@@ -53,7 +54,7 @@ let
   resolveIp = ''
     ${parseIdentity}
     ${decryptState}
-    host_ip=$(terraform -chdir=infra output -raw droplet_ipv4)
+    host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${tfState})
     rm -f ${tfState}
   '';
 
