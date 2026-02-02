@@ -388,4 +388,53 @@ mod tests {
 
         assert!(matches!(error, AlpacaBrokerApiError::FractionalCents(_)));
     }
+
+    #[tokio::test]
+    async fn fetch_inventory_rounds_sub_cent_market_value() {
+        let server = MockServer::start();
+        let config = create_test_config(&server.base_url());
+
+        // Alpaca's market_value is qty * price, both fractional, so
+        // sub-cent precision is normal (e.g. 6.803019322 * 75.21 = 511.6476).
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "RKLB",
+                        "qty": "6.803019322",
+                        "market_value": "511.6476"
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/test_account_123/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        let rklb = inventory
+            .positions
+            .iter()
+            .find(|p| p.symbol.to_string() == "RKLB")
+            .unwrap();
+        assert_eq!(
+            rklb.market_value_cents,
+            Some(51165),
+            "Sub-cent market value 511.6476 should round to 51165 cents"
+        );
+    }
 }

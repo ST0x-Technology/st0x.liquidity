@@ -3761,4 +3761,58 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn broker_rejection_does_not_leave_position_stuck() {
+        fn failing_order_placer() -> crate::offchain_order::OffchainOrderServices {
+            struct RejectingOrderPlacer;
+
+            #[async_trait::async_trait]
+            impl crate::offchain_order::OrderPlacer for RejectingOrderPlacer {
+                async fn place_market_order(
+                    &self,
+                    _order: MarketOrder,
+                ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    Err("API error (403 Forbidden): trade denied due to pattern day trading protection".into())
+                }
+            }
+
+            Arc::new(RejectingOrderPlacer)
+        }
+
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, failing_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 70).await;
+        let trade = test_trade_with_amount(1.5, 70);
+
+        process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await
+        .unwrap();
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        // The broker rejected the order. The position must NOT be stuck with a
+        // phantom pending order that will never complete.
+        assert_eq!(
+            position.pending_offchain_order_id, None,
+            "Position should not have a pending order after broker rejection, \
+             but got {:?}. This leaves the position permanently stuck.",
+            position.pending_offchain_order_id
+        );
+    }
 }

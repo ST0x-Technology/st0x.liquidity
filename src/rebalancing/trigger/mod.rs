@@ -797,24 +797,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn position_event_for_unknown_symbol_logs_error_without_panic() {
-        let (trigger, mut receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+    async fn position_events_auto_register_symbol_and_trigger_rebalancing() {
+        // Reproduces the production scenario: InventoryView starts empty (no
+        // with_equity call), position events arrive for a symbol that exists
+        // in the vault registry. After accumulating an imbalance, rebalancing
+        // must be triggered.
+        //
+        // In production, InventoryView::default() creates an empty equities
+        // map. Position events arrive as onchain fills are processed. If the
+        // symbol isn't pre-registered, apply_position_event_to_inventory must
+        // handle it (either by auto-registering or by decoupling the
+        // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_onchain_fill(shares(10), Direction::Buy);
+        let (sender, mut receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
 
-        // Should handle the error gracefully without panicking.
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = RebalancingTrigger::new(
+            test_config(),
+            pool,
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+        );
+
+        // Simulate production: onchain fills arrive on an empty inventory.
+        // 20 onchain buys, 80 offchain buys -> 20% onchain ratio.
+        // Threshold: target 50%, deviation 20%, lower bound 30%.
+        // 20% < 30% -> should trigger Mint (too much offchain).
+        for _ in 0..20 {
+            let event = make_onchain_fill(shares(1), Direction::Buy);
+            trigger
+                .apply_position_event_and_check(&symbol, &event)
+                .await;
+        }
+
+        for _ in 0..80 {
+            let event = make_offchain_fill(shares(1), Direction::Buy);
+            trigger
+                .apply_position_event_and_check(&symbol, &event)
+                .await;
+        }
+
+        // Drain any intermediate triggers and do a final check.
+        while receiver.try_recv().is_ok() {}
+        trigger.clear_equity_in_progress(&symbol);
+
+        // One more event to trigger the check after the imbalance is built up.
+        let event = make_onchain_fill(shares(1), Direction::Buy);
         trigger
             .apply_position_event_and_check(&symbol, &event)
             .await;
 
-        // Verify no operation was triggered.
-        trigger.check_and_trigger_equity(&symbol).await;
+        let triggered = receiver.try_recv();
         assert!(
-            matches!(
-                receiver.try_recv().unwrap_err(),
-                mpsc::error::TryRecvError::Empty
-            ),
-            "Expected channel to be empty (no message sent)"
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "Expected Mint for imbalanced inventory starting from empty, got {triggered:?}"
         );
     }
 
