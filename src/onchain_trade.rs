@@ -3,7 +3,7 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::{Direction, Symbol};
@@ -218,15 +218,6 @@ impl Aggregate for Lifecycle<OnChainTrade, Never> {
 
             (Err(e), _) => Err(e.into()),
         }
-    }
-}
-
-impl View<Self> for Lifecycle<OnChainTrade, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, OnChainTrade::apply_transition)
-            .or_initialize(&event.payload, OnChainTrade::from_event);
     }
 }
 

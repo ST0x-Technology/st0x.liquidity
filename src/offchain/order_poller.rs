@@ -6,19 +6,19 @@ use rand::Rng;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use st0x_execution::{
-    ArithmeticError, Executor, ExecutorOrderId, FractionalShares, OrderState, OrderStatus, Symbol,
+    ArithmeticError, Executor, ExecutorOrderId, FractionalShares, OrderState, OrderStatus,
 };
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
 use super::execution::find_executions_by_symbol_status_and_broker;
 use crate::error::OrderPollingError;
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, OffchainOrderView,
-    PriceCents,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, PriceCents,
 };
 use crate::position::{Position, PositionCommand};
+
 type PositionCqrs = SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>;
 
 #[derive(Debug, Clone)]
@@ -100,16 +100,14 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         info!("Polling {} submitted orders", submitted_executions.len());
 
-        for execution in &submitted_executions {
-            let OffchainOrderView::Execution {
-                offchain_order_id, ..
-            } = execution
-            else {
+        for (offchain_order_id, aggregate) in &submitted_executions {
+            let Lifecycle::Live(order) = aggregate else {
+                warn!(%offchain_order_id, "Skipping non-live aggregate");
                 continue;
             };
 
-            if let Err(e) = self.poll_execution_status(execution).await {
-                error!("Failed to poll execution {}: {e}", offchain_order_id);
+            if let Err(e) = self.poll_execution_status(*offchain_order_id, order).await {
+                error!("Failed to poll execution {offchain_order_id}: {e}");
             }
 
             self.add_jittered_delay().await;
@@ -121,21 +119,14 @@ impl<E: Executor> OrderStatusPoller<E> {
 
     async fn poll_execution_status(
         &self,
-        execution: &OffchainOrderView,
+        offchain_order_id: OffchainOrderId,
+        order: &OffchainOrder,
     ) -> Result<(), OrderPollingError> {
-        let OffchainOrderView::Execution {
-            offchain_order_id,
-            executor_order_id,
-            symbol,
-            ..
-        } = execution
-        else {
-            return Ok(());
-        };
+        let symbol = order.symbol();
 
-        let Some(executor_order_id) = executor_order_id else {
+        let Some(executor_order_id) = order.executor_order_id() else {
             warn!(
-                offchain_order_id = %offchain_order_id,
+                %offchain_order_id,
                 %symbol,
                 "Missing executor_order_id for submitted execution"
             );
@@ -160,7 +151,8 @@ impl<E: Executor> OrderStatusPoller<E> {
                 executed_at,
             } => {
                 self.handle_filled_order(
-                    execution,
+                    offchain_order_id,
+                    order,
                     PriceCents(*price_cents),
                     &ExecutorOrderId::new(&order_id),
                     *executed_at,
@@ -171,11 +163,12 @@ impl<E: Executor> OrderStatusPoller<E> {
                 let error_message = error_reason
                     .clone()
                     .unwrap_or_else(|| "Order failed with no error reason".to_string());
-                self.handle_failed_order(execution, error_message).await
+                self.handle_failed_order(offchain_order_id, order, error_message)
+                    .await
             }
             OrderState::Pending | OrderState::Submitted { .. } => {
                 debug!(
-                    offchain_order_id = %offchain_order_id,
+                    %offchain_order_id,
                     %symbol,
                     "Order still pending"
                 );
@@ -186,24 +179,16 @@ impl<E: Executor> OrderStatusPoller<E> {
 
     async fn handle_filled_order(
         &self,
-        execution: &OffchainOrderView,
+        offchain_order_id: OffchainOrderId,
+        order: &OffchainOrder,
         price_cents: PriceCents,
         executor_order_id: &ExecutorOrderId,
         broker_timestamp: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), OrderPollingError> {
-        let OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol,
-            shares,
-            direction,
-            ..
-        } = execution
-        else {
-            return Ok(());
-        };
+        let symbol = order.symbol();
 
         info!(
-            offchain_order_id = %offchain_order_id,
+            %offchain_order_id,
             price_cents = price_cents.0,
             %symbol,
             "Order filled, executing CQRS commands"
@@ -229,9 +214,9 @@ impl<E: Executor> OrderStatusPoller<E> {
             .execute(
                 &position_aggregate_id,
                 PositionCommand::CompleteOffChainOrder {
-                    offchain_order_id: *offchain_order_id,
-                    shares_filled: shares.inner(),
-                    direction: *direction,
+                    offchain_order_id,
+                    shares_filled: order.shares(),
+                    direction: order.direction(),
                     executor_order_id: executor_order_id.clone(),
                     price_cents,
                     broker_timestamp,
@@ -249,20 +234,14 @@ impl<E: Executor> OrderStatusPoller<E> {
 
     async fn handle_failed_order(
         &self,
-        execution: &OffchainOrderView,
+        offchain_order_id: OffchainOrderId,
+        order: &OffchainOrder,
         error_message: String,
     ) -> Result<(), OrderPollingError> {
-        let OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol,
-            ..
-        } = execution
-        else {
-            return Ok(());
-        };
+        let symbol = order.symbol();
 
         info!(
-            offchain_order_id = %offchain_order_id,
+            %offchain_order_id,
             %symbol,
             "Order failed, executing CQRS commands"
         );
@@ -289,7 +268,7 @@ impl<E: Executor> OrderStatusPoller<E> {
             .execute(
                 &position_aggregate_id,
                 PositionCommand::FailOffChainOrder {
-                    offchain_order_id: *offchain_order_id,
+                    offchain_order_id,
                     error: error_message,
                 },
             )
@@ -324,9 +303,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::onchain::OnchainTrade;
-    use crate::onchain::io::Usdc;
-    use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand};
     use crate::position::TradeId;
     use crate::test_utils::{OnchainTradeBuilder, setup_test_db};
     use crate::threshold::ExecutionThreshold;
@@ -463,19 +439,6 @@ mod tests {
         )
         .await;
 
-        let execution = OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: OrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
-            price_cents: None,
-            initiated_at: Utc::now(),
-            completed_at: None,
-        };
-
         let poller = OrderStatusPoller::new(
             config,
             pool.clone(),
@@ -484,9 +447,20 @@ mod tests {
             position_cqrs,
         );
 
+        let order = OffchainOrder::Submitted {
+            symbol: symbol.clone(),
+            shares: shares.inner(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            executor_order_id: ExecutorOrderId::new("ORD123"),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+        };
+
         let result = poller
             .handle_filled_order(
-                &execution,
+                offchain_order_id,
+                &order,
                 PriceCents(15025),
                 &ExecutorOrderId::new("ORD123"),
                 Utc::now(),
@@ -549,19 +523,6 @@ mod tests {
         )
         .await;
 
-        let execution = OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol: symbol.clone(),
-            shares,
-            direction: Direction::Sell,
-            executor: SupportedExecutor::Schwab,
-            status: OrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD456")),
-            price_cents: None,
-            initiated_at: Utc::now(),
-            completed_at: None,
-        };
-
         let poller = OrderStatusPoller::new(
             config,
             pool.clone(),
@@ -570,8 +531,18 @@ mod tests {
             position_cqrs,
         );
 
+        let order = OffchainOrder::Submitted {
+            symbol: symbol.clone(),
+            shares: shares.inner(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::Schwab,
+            executor_order_id: ExecutorOrderId::new("ORD456"),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+        };
+
         let result = poller
-            .handle_failed_order(&execution, "Broker API timeout".to_string())
+            .handle_failed_order(offchain_order_id, &order, "Broker API timeout".to_string())
             .await;
         assert!(result.is_ok());
 

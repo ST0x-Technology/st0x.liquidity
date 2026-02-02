@@ -140,6 +140,8 @@ pub(crate) enum EventProcessingError {
     Config(#[from] ConfigError),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] AggregateError<VaultRegistryError>),
+    #[error(transparent)]
+    InvalidShares(#[from] InvalidSharesError),
 }
 
 /// Order polling errors for order status monitoring.
@@ -221,6 +223,8 @@ pub(crate) enum OnChainError {
     InvalidOrderState { execution_id: i64, expected: String },
     #[error("JSON serde error: {0}")]
     JsonSerde(#[from] serde_json::Error),
+    #[error("UUID parse error: {0}")]
+    Uuid(#[from] uuid::Error),
 }
 
 impl From<sqlx::Error> for OnChainError {

@@ -41,7 +41,7 @@ use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
@@ -524,15 +524,6 @@ impl EquityRedemption {
             sent_at: *sent_at,
             failed_at: rejected_at,
         })
-    }
-}
-
-impl View<Self> for Lifecycle<EquityRedemption, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, EquityRedemption::apply_transition)
-            .or_initialize(&event.payload, EquityRedemption::from_event);
     }
 }
 

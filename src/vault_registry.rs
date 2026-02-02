@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
@@ -169,17 +169,6 @@ impl Aggregate for Lifecycle<VaultRegistry, Never> {
         };
 
         Ok(vec![event])
-    }
-}
-
-impl View<Self> for Lifecycle<VaultRegistry, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, |event, state| {
-                Ok(VaultRegistry::apply_transition(event, state))
-            })
-            .or_initialize(&event.payload, |event| Ok(VaultRegistry::from_event(event)));
     }
 }
 

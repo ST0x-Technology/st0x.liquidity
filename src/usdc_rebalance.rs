@@ -65,7 +65,7 @@ use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
 use uuid::Uuid;
@@ -1501,15 +1501,6 @@ impl UsdcRebalance {
                 event: event.event_type(),
             }),
         }
-    }
-}
-
-impl View<Self> for Lifecycle<UsdcRebalance, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, UsdcRebalance::apply_transition)
-            .or_initialize(&event.payload, UsdcRebalance::from_event);
     }
 }
 

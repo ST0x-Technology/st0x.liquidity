@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, OrderStatus, Positive, SupportedExecutor, Symbol,
@@ -12,9 +12,11 @@ use uuid::Uuid;
 
 use sqlite_es::SqliteCqrs;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never, SqliteQuery};
 
-pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder, Never>>;
+pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder, Never>;
+pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
+pub(crate) type OffchainOrderQuery = SqliteQuery<OffchainOrder, Never>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -81,9 +83,72 @@ impl std::fmt::Display for OffchainOrderId {
     }
 }
 
+impl std::str::FromStr for OffchainOrderId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
 impl OffchainOrder {
     pub(crate) fn aggregate_id() -> OffchainOrderId {
         OffchainOrderId(Uuid::new_v4())
+    }
+
+    pub(crate) fn symbol(&self) -> &Symbol {
+        match self {
+            Self::Pending { symbol, .. }
+            | Self::Submitted { symbol, .. }
+            | Self::PartiallyFilled { symbol, .. }
+            | Self::Filled { symbol, .. }
+            | Self::Failed { symbol, .. } => symbol,
+        }
+    }
+
+    pub(crate) fn shares(&self) -> FractionalShares {
+        match self {
+            Self::Pending { shares, .. }
+            | Self::Submitted { shares, .. }
+            | Self::PartiallyFilled { shares, .. }
+            | Self::Filled { shares, .. }
+            | Self::Failed { shares, .. } => *shares,
+        }
+    }
+
+    pub(crate) fn direction(&self) -> Direction {
+        match self {
+            Self::Pending { direction, .. }
+            | Self::Submitted { direction, .. }
+            | Self::PartiallyFilled { direction, .. }
+            | Self::Filled { direction, .. }
+            | Self::Failed { direction, .. } => *direction,
+        }
+    }
+
+    pub(crate) fn executor(&self) -> SupportedExecutor {
+        match self {
+            Self::Pending { executor, .. }
+            | Self::Submitted { executor, .. }
+            | Self::PartiallyFilled { executor, .. }
+            | Self::Filled { executor, .. }
+            | Self::Failed { executor, .. } => *executor,
+        }
+    }
+
+    pub(crate) fn executor_order_id(&self) -> Option<&ExecutorOrderId> {
+        match self {
+            Self::Pending { .. } | Self::Failed { .. } => None,
+            Self::Submitted {
+                executor_order_id, ..
+            }
+            | Self::PartiallyFilled {
+                executor_order_id, ..
+            }
+            | Self::Filled {
+                executor_order_id, ..
+            } => Some(executor_order_id),
+        }
     }
 
     pub(crate) fn apply_transition(
@@ -524,191 +589,6 @@ fn handle_confirm_submission(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) enum OffchainOrderView {
-    Unavailable,
-    Execution {
-        offchain_order_id: OffchainOrderId,
-        symbol: Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        executor: SupportedExecutor,
-        status: OrderStatus,
-        executor_order_id: Option<ExecutorOrderId>,
-        price_cents: Option<PriceCents>,
-        initiated_at: DateTime<Utc>,
-        completed_at: Option<DateTime<Utc>>,
-    },
-}
-
-impl Default for OffchainOrderView {
-    fn default() -> Self {
-        Self::Unavailable
-    }
-}
-
-impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
-    fn update(&mut self, event: &EventEnvelope<Lifecycle<OffchainOrder, Never>>) {
-        let Ok(offchain_order_id) = event.aggregate_id.parse::<Uuid>().map(OffchainOrderId) else {
-            error!(
-                aggregate_id = %event.aggregate_id,
-                "CRITICAL: OffchainOrder aggregate_id is not a valid UUID. View will remain Unavailable."
-            );
-            return;
-        };
-
-        match &event.payload {
-            OffchainOrderEvent::Migrated {
-                symbol,
-                shares,
-                direction,
-                executor,
-                status,
-                executor_order_id,
-                price_cents,
-                executed_at,
-                migrated_at,
-            } => {
-                let (status, completed_at) = match status {
-                    MigratedOrderStatus::Pending => (OrderStatus::Pending, None),
-                    MigratedOrderStatus::Submitted => (OrderStatus::Submitted, None),
-                    MigratedOrderStatus::Filled => (OrderStatus::Filled, *executed_at),
-                    MigratedOrderStatus::Failed { .. } => (OrderStatus::Failed, *executed_at),
-                };
-
-                *self = Self::Execution {
-                    offchain_order_id,
-                    symbol: symbol.clone(),
-                    shares: *shares,
-                    direction: *direction,
-                    executor: *executor,
-                    status,
-                    executor_order_id: executor_order_id.clone(),
-                    price_cents: *price_cents,
-                    initiated_at: executed_at.unwrap_or(*migrated_at),
-                    completed_at,
-                };
-            }
-            OffchainOrderEvent::Placed {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-            } => {
-                self.handle_placed(
-                    offchain_order_id,
-                    symbol.clone(),
-                    *shares,
-                    *direction,
-                    *executor,
-                    *placed_at,
-                );
-            }
-            OffchainOrderEvent::Submitted {
-                executor_order_id, ..
-            } => {
-                self.handle_submitted(executor_order_id.clone());
-            }
-            OffchainOrderEvent::PartiallyFilled { .. } => {
-                self.handle_partially_filled();
-            }
-            OffchainOrderEvent::Filled {
-                price_cents,
-                filled_at,
-            } => {
-                self.handle_filled(*price_cents, *filled_at);
-            }
-            OffchainOrderEvent::Failed { failed_at, .. } => {
-                self.handle_failed(*failed_at);
-            }
-        }
-    }
-}
-
-impl OffchainOrderView {
-    fn handle_placed(
-        &mut self,
-        offchain_order_id: OffchainOrderId,
-        symbol: Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        executor: SupportedExecutor,
-        placed_at: DateTime<Utc>,
-    ) {
-        *self = Self::Execution {
-            offchain_order_id,
-            symbol,
-            shares,
-            direction,
-            executor,
-            status: OrderStatus::Pending,
-            executor_order_id: None,
-            price_cents: None,
-            initiated_at: placed_at,
-            completed_at: None,
-        };
-    }
-
-    fn handle_submitted(&mut self, executor_order_id: ExecutorOrderId) {
-        let Self::Execution {
-            status,
-            executor_order_id: executor_order_id_ref,
-            ..
-        } = self
-        else {
-            error!("Submitted event received but OffchainOrderView is Unavailable. Event ignored.");
-            return;
-        };
-
-        *status = OrderStatus::Submitted;
-        *executor_order_id_ref = Some(executor_order_id);
-    }
-
-    fn handle_partially_filled(&mut self) {
-        let Self::Execution { status, .. } = self else {
-            error!(
-                "PartiallyFilled event received but OffchainOrderView is Unavailable. Event ignored."
-            );
-            return;
-        };
-
-        *status = OrderStatus::Submitted;
-    }
-
-    fn handle_filled(&mut self, price_cents: PriceCents, filled_at: DateTime<Utc>) {
-        let Self::Execution {
-            status,
-            price_cents: price_cents_ref,
-            completed_at,
-            ..
-        } = self
-        else {
-            error!("Filled event received but OffchainOrderView is Unavailable. Event ignored.");
-            return;
-        };
-
-        *status = OrderStatus::Filled;
-        *price_cents_ref = Some(price_cents);
-        *completed_at = Some(filled_at);
-    }
-
-    fn handle_failed(&mut self, failed_at: DateTime<Utc>) {
-        let Self::Execution {
-            status,
-            completed_at,
-            ..
-        } = self
-        else {
-            error!("Failed event received but OffchainOrderView is Unavailable. Event ignored.");
-            return;
-        };
-
-        *status = OrderStatus::Failed;
-        *completed_at = Some(failed_at);
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OffchainOrderError {
     #[error("Cannot place order: order has already been placed")]
@@ -865,9 +745,7 @@ impl DomainEvent for OffchainOrderEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
-    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_place_order() {
@@ -1406,598 +1284,6 @@ mod tests {
             panic!("Expected Live Failed state");
         };
         assert_eq!(error, "Insufficient funds");
-    }
-
-    #[test]
-    fn test_view_update_from_migrated_event_pending_status() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let migrated_at = chrono::Utc::now();
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol: symbol.clone(),
-            shares: Positive::new(FractionalShares::new(dec!(100.5))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Pending,
-            executor_order_id: None,
-            price_cents: None,
-            executed_at: None,
-            migrated_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = OffchainOrderView::default();
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
-
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            offchain_order_id: view_offchain_order_id,
-            symbol: view_symbol,
-            shares,
-            direction,
-            executor,
-            status,
-            executor_order_id,
-            price_cents,
-            initiated_at,
-            completed_at,
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(view_offchain_order_id, offchain_order_id);
-        assert_eq!(view_symbol, symbol);
-        assert_eq!(
-            shares,
-            Positive::new(FractionalShares::new(dec!(100.5))).unwrap()
-        );
-        assert_eq!(direction, Direction::Buy);
-        assert_eq!(executor, SupportedExecutor::Schwab);
-        assert_eq!(status, OrderStatus::Pending);
-        assert_eq!(executor_order_id, None);
-        assert_eq!(price_cents, None);
-        assert_eq!(initiated_at, migrated_at);
-        assert_eq!(completed_at, None);
-    }
-
-    #[test]
-    fn test_view_update_from_migrated_event_submitted_status() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let migrated_at = chrono::Utc::now();
-        let symbol = Symbol::new("TSLA").unwrap();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(50.0))).unwrap(),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::AlpacaTradingApi,
-            status: MigratedOrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
-            price_cents: None,
-            executed_at: None,
-            migrated_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = OffchainOrderView::default();
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            offchain_order_id: view_offchain_order_id,
-            status,
-            executor_order_id,
-            price_cents,
-            initiated_at,
-            completed_at,
-            ..
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(view_offchain_order_id, offchain_order_id);
-        assert_eq!(status, OrderStatus::Submitted);
-        assert_eq!(executor_order_id, Some(ExecutorOrderId::new("ORD123")));
-        assert_eq!(price_cents, None);
-        assert_eq!(initiated_at, migrated_at);
-        assert_eq!(completed_at, None);
-    }
-
-    #[test]
-    fn test_view_update_from_migrated_event_filled_status() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let executed_at = chrono::Utc::now();
-        let migrated_at = executed_at + chrono::Duration::seconds(10);
-        let symbol = Symbol::new("NVDA").unwrap();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(25.75))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Filled,
-            executor_order_id: Some(ExecutorOrderId::new("ORD456")),
-            price_cents: Some(PriceCents(45025)),
-            executed_at: Some(executed_at),
-            migrated_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = OffchainOrderView::default();
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            offchain_order_id: view_offchain_order_id,
-            status,
-            executor_order_id,
-            price_cents,
-            initiated_at,
-            completed_at,
-            ..
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(view_offchain_order_id, offchain_order_id);
-        assert_eq!(status, OrderStatus::Filled);
-        assert_eq!(executor_order_id, Some(ExecutorOrderId::new("ORD456")));
-        assert_eq!(price_cents, Some(PriceCents(45025)));
-        assert_eq!(initiated_at, executed_at);
-        assert_eq!(completed_at, Some(executed_at));
-    }
-
-    #[test]
-    fn test_view_update_from_migrated_event_failed_status() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let executed_at = chrono::Utc::now();
-        let migrated_at = executed_at + chrono::Duration::seconds(5);
-        let symbol = Symbol::new("AMZN").unwrap();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(10.0))).unwrap(),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::AlpacaTradingApi,
-            status: MigratedOrderStatus::Failed {
-                error: "Insufficient funds".to_string(),
-            },
-            executor_order_id: None,
-            price_cents: None,
-            executed_at: Some(executed_at),
-            migrated_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = OffchainOrderView::default();
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            offchain_order_id: view_offchain_order_id,
-            status,
-            executor_order_id,
-            price_cents,
-            initiated_at,
-            completed_at,
-            ..
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(view_offchain_order_id, offchain_order_id);
-        assert_eq!(status, OrderStatus::Failed);
-        assert_eq!(executor_order_id, None);
-        assert_eq!(price_cents, None);
-        assert_eq!(initiated_at, executed_at);
-        assert_eq!(completed_at, Some(executed_at));
-    }
-
-    #[test]
-    fn test_view_update_from_placed_event() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let placed_at = chrono::Utc::now();
-        let symbol = Symbol::new("MSFT").unwrap();
-
-        let event = OffchainOrderEvent::Placed {
-            symbol: symbol.clone(),
-            shares: Positive::new(FractionalShares::new(dec!(75.25))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            placed_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        let mut view = OffchainOrderView::default();
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            offchain_order_id: view_offchain_order_id,
-            symbol: view_symbol,
-            shares,
-            direction,
-            executor,
-            status,
-            executor_order_id,
-            price_cents,
-            initiated_at,
-            completed_at,
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(view_offchain_order_id, offchain_order_id);
-        assert_eq!(view_symbol, symbol);
-        assert_eq!(
-            shares,
-            Positive::new(FractionalShares::new(dec!(75.25))).unwrap()
-        );
-        assert_eq!(direction, Direction::Buy);
-        assert_eq!(executor, SupportedExecutor::Schwab);
-        assert_eq!(status, OrderStatus::Pending);
-        assert_eq!(executor_order_id, None);
-        assert_eq!(price_cents, None);
-        assert_eq!(initiated_at, placed_at);
-        assert_eq!(completed_at, None);
-    }
-
-    #[test]
-    fn test_view_update_from_submitted_event() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let placed_at = chrono::Utc::now();
-        let submitted_at = placed_at + chrono::Duration::seconds(2);
-        let symbol = Symbol::new("GOOG").unwrap();
-
-        let mut view = OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(50.0))).unwrap(),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::AlpacaTradingApi,
-            status: OrderStatus::Pending,
-            executor_order_id: None,
-            price_cents: None,
-            initiated_at: placed_at,
-            completed_at: None,
-        };
-
-        let event = OffchainOrderEvent::Submitted {
-            executor_order_id: ExecutorOrderId::new("ORD789"),
-            submitted_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 2,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            status,
-            executor_order_id,
-            ..
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(status, OrderStatus::Submitted);
-        assert_eq!(executor_order_id, Some(ExecutorOrderId::new("ORD789")));
-    }
-
-    #[test]
-    fn test_view_update_from_partially_filled_event() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let placed_at = chrono::Utc::now();
-        let partially_filled_at = placed_at + chrono::Duration::seconds(5);
-        let symbol = Symbol::new("META").unwrap();
-
-        let mut view = OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(100.0))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: OrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD999")),
-            price_cents: None,
-            initiated_at: placed_at,
-            completed_at: None,
-        };
-
-        let event = OffchainOrderEvent::PartiallyFilled {
-            shares_filled: FractionalShares::new(dec!(60.0)),
-            avg_price_cents: PriceCents(32500),
-            partially_filled_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 3,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution { status, .. } = view else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(status, OrderStatus::Submitted);
-    }
-
-    #[test]
-    fn test_view_update_from_filled_event() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let placed_at = chrono::Utc::now();
-        let filled_at = placed_at + chrono::Duration::seconds(10);
-        let symbol = Symbol::new("NFLX").unwrap();
-
-        let mut view = OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(30.0))).unwrap(),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::AlpacaTradingApi,
-            status: OrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD111")),
-            price_cents: None,
-            initiated_at: placed_at,
-            completed_at: None,
-        };
-
-        let event = OffchainOrderEvent::Filled {
-            price_cents: PriceCents(48500),
-            filled_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 4,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            status,
-            price_cents,
-            completed_at,
-            ..
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(status, OrderStatus::Filled);
-        assert_eq!(price_cents, Some(PriceCents(48500)));
-        assert_eq!(completed_at, Some(filled_at));
-    }
-
-    #[test]
-    fn test_view_update_from_failed_event() {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-        let placed_at = chrono::Utc::now();
-        let failed_at = placed_at + chrono::Duration::seconds(3);
-        let symbol = Symbol::new("AMD").unwrap();
-
-        let mut view = OffchainOrderView::Execution {
-            offchain_order_id,
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(200.0))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: OrderStatus::Submitted,
-            executor_order_id: Some(ExecutorOrderId::new("ORD222")),
-            price_cents: None,
-            initiated_at: placed_at,
-            completed_at: None,
-        };
-
-        let event = OffchainOrderEvent::Failed {
-            error: "Order rejected".to_string(),
-            failed_at,
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: offchain_order_id.to_string(),
-            sequence: 5,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        let OffchainOrderView::Execution {
-            status,
-            completed_at,
-            ..
-        } = view
-        else {
-            panic!("Expected Execution variant");
-        };
-
-        assert_eq!(status, OrderStatus::Failed);
-        assert_eq!(completed_at, Some(failed_at));
-    }
-
-    #[test]
-    fn test_submitted_on_unavailable_does_not_change_state() {
-        let mut view = OffchainOrderView::Unavailable;
-
-        let event = OffchainOrderEvent::Submitted {
-            executor_order_id: ExecutorOrderId::new("ORD333"),
-            submitted_at: chrono::Utc::now(),
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "51".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
-    }
-
-    #[test]
-    fn test_partially_filled_on_unavailable_does_not_change_state() {
-        let mut view = OffchainOrderView::Unavailable;
-
-        let event = OffchainOrderEvent::PartiallyFilled {
-            shares_filled: FractionalShares::new(dec!(50.0)),
-            avg_price_cents: PriceCents(30000),
-            partially_filled_at: chrono::Utc::now(),
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "52".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
-    }
-
-    #[test]
-    fn test_filled_on_unavailable_does_not_change_state() {
-        let mut view = OffchainOrderView::Unavailable;
-
-        let event = OffchainOrderEvent::Filled {
-            price_cents: PriceCents(35000),
-            filled_at: chrono::Utc::now(),
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "53".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
-    }
-
-    #[test]
-    fn test_failed_on_unavailable_does_not_change_state() {
-        let mut view = OffchainOrderView::Unavailable;
-
-        let event = OffchainOrderEvent::Failed {
-            error: "Broker error".to_string(),
-            failed_at: chrono::Utc::now(),
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "54".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
-    }
-
-    #[test]
-    fn test_migrated_with_invalid_execution_id_remains_unavailable() {
-        let mut view = OffchainOrderView::default();
-        let symbol = Symbol::new("INTC").unwrap();
-
-        let event = OffchainOrderEvent::Migrated {
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(100.0))).unwrap(),
-            direction: Direction::Buy,
-            executor: SupportedExecutor::Schwab,
-            status: MigratedOrderStatus::Pending,
-            executor_order_id: None,
-            price_cents: None,
-            executed_at: None,
-            migrated_at: chrono::Utc::now(),
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "not_a_number".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
-    }
-
-    #[test]
-    fn test_placed_with_invalid_execution_id_remains_unavailable() {
-        let mut view = OffchainOrderView::default();
-        let symbol = Symbol::new("ORCL").unwrap();
-
-        let event = OffchainOrderEvent::Placed {
-            symbol,
-            shares: Positive::new(FractionalShares::new(dec!(50.0))).unwrap(),
-            direction: Direction::Sell,
-            executor: SupportedExecutor::AlpacaTradingApi,
-            placed_at: chrono::Utc::now(),
-        };
-
-        let envelope = EventEnvelope {
-            aggregate_id: "invalid".to_string(),
-            sequence: 1,
-            payload: event,
-            metadata: HashMap::new(),
-        };
-
-        view.update(&envelope);
-
-        assert!(matches!(view, OffchainOrderView::Unavailable));
     }
 
     #[test]

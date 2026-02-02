@@ -3,7 +3,7 @@
 use alloy::primitives::TxHash;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use st0x_execution::{
@@ -12,21 +12,16 @@ use st0x_execution::{
 };
 use tracing::warn;
 
-use cqrs_es::persist::GenericQuery;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository};
+use sqlite_es::SqliteCqrs;
 
 use crate::error::OnChainError;
-use crate::lifecycle::{Lifecycle, LifecycleError};
+use crate::lifecycle::{Lifecycle, LifecycleError, SqliteQuery};
 
 pub(crate) type PositionAggregate = Lifecycle<Position, ArithmeticError<FractionalShares>>;
 
 pub(crate) type PositionCqrs = SqliteCqrs<PositionAggregate>;
 
-pub(crate) type PositionQuery = GenericQuery<
-    SqliteViewRepository<PositionAggregate, PositionAggregate>,
-    PositionAggregate,
-    PositionAggregate,
->;
+pub(crate) type PositionQuery = SqliteQuery<Position, ArithmeticError<FractionalShares>>;
 
 use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
@@ -548,15 +543,6 @@ impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
                 }])
             }
         }
-    }
-}
-
-impl View<Self> for Lifecycle<Position, ArithmeticError<FractionalShares>> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, Position::apply_transition)
-            .or_initialize(&event.payload, Position::from_event);
     }
 }
 

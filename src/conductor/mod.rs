@@ -23,8 +23,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_execution::{
-    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
-    Symbol,
+    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Positive,
+    SupportedExecutor, Symbol,
 };
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
@@ -36,10 +36,11 @@ use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
+use crate::lifecycle::Lifecycle;
 use crate::offchain::execution::find_execution_by_id;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, OffchainOrderView,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
 };
 use crate::onchain::accumulator::{
     ExecutionParams, check_all_positions, check_execution_readiness,
@@ -1493,20 +1494,16 @@ where
 
     info!("Executing offchain order: {execution:?}");
 
-    let OffchainOrderView::Execution {
-        symbol,
-        shares,
-        direction,
-        ..
-    } = &execution
-    else {
+    let Lifecycle::Live(order) = &execution else {
         return Err(EventProcessingError::ExecutionNotFound(offchain_order_id));
     };
 
+    let shares = Positive::new(order.shares())?;
+
     let market_order = MarketOrder {
-        symbol: to_executor_ticker(symbol)?,
-        shares: *shares,
-        direction: *direction,
+        symbol: to_executor_ticker(order.symbol())?,
+        shares,
+        direction: order.direction(),
     };
 
     let placement = executor.place_market_order(market_order).await?;
@@ -1649,9 +1646,7 @@ mod tests {
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::config::tests::create_test_config;
-    use crate::offchain::execution::{
-        OffchainOrderView, find_executions_by_symbol_status_and_broker,
-    };
+    use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
