@@ -158,7 +158,7 @@ binary).
 
 ### Testing
 
-- `cargo test -q` - Run all tests (both main and execution crates)
+- `cargo test --workspace -q` - Run all tests (both main and execution crates)
 - `cargo test -q --lib` - Run library tests only
 - `cargo test -p st0x-execution -q` - Run execution crate tests only
 - `cargo test -p st0x-hedge -q` - Run main crate tests only
@@ -203,8 +203,8 @@ resolution and feature selection.
 ### Development Tools
 
 - `rainix-rs-static` - Run Rust static analysis
-- `cargo clippy --all-targets --all-features -- -D clippy::all` - Run Clippy for
-  linting
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all` -
+  Run Clippy for linting
 - `cargo fmt` - Format code
 
 ### Nix Development Environment
@@ -630,7 +630,7 @@ returning values within expected bounds.
   only documentation/markdown files were changed). Run them in this order to
   fail fast:
   1. `cargo check` - fastest, catches compilation errors first
-  2. `cargo test -q` - only run after check passes
+  2. `cargo test --workspace -q` - only run after check passes
   3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert
