@@ -1,4 +1,5 @@
-{ pkgs, lib, modulesPath, dashboard, ... }:
+{ pkgs, lib, modulesPath, # dashboard,
+... }:
 
 let inherit (import ./keys.nix) roles;
 in {
@@ -63,41 +64,41 @@ in {
       };
     };
 
-    nginx = {
-      enable = true;
-      virtualHosts.default = {
-        default = true;
-        root = "${dashboard}";
+    # nginx = {
+    #   enable = true;
+    #   virtualHosts.default = {
+    #     default = true;
+    #     root = "${dashboard}";
+    #
+    #     locations = let
+    #       wsProxy = port: {
+    #         proxyPass = "http://127.0.0.1:${toString port}/api/ws";
+    #         proxyWebsockets = true;
+    #         extraConfig = ''
+    #           proxy_connect_timeout 60;
+    #           proxy_send_timeout 60;
+    #           proxy_read_timeout 86400;
+    #         '';
+    #       };
+    #     in {
+    #       "/".tryFiles = "$uri $uri/ /index.html";
+    #       "/api/schwab/ws" = wsProxy 8080;
+    #       "/api/alpaca/ws" = wsProxy 8081;
+    #     };
+    #   };
+    # };
 
-        locations = let
-          wsProxy = port: {
-            proxyPass = "http://127.0.0.1:${toString port}/api/ws";
-            proxyWebsockets = true;
-            extraConfig = ''
-              proxy_connect_timeout 60;
-              proxy_send_timeout 60;
-              proxy_read_timeout 86400;
-            '';
-          };
-        in {
-          "/".tryFiles = "$uri $uri/ /index.html";
-          "/api/schwab/ws" = wsProxy 8080;
-          "/api/alpaca/ws" = wsProxy 8081;
-        };
-      };
-    };
-
-    grafana = {
-      enable = true;
-      settings.server = {
-        http_addr = "0.0.0.0";
-        http_port = 3000;
-      };
-      settings.database = {
-        type = "sqlite3";
-        path = "/mnt/data/grafana/grafana.db";
-      };
-    };
+    # grafana = {
+    #   enable = true;
+    #   settings.server = {
+    #     http_addr = "0.0.0.0";
+    #     http_port = 3000;
+    #   };
+    #   settings.database = {
+    #     type = "sqlite3";
+    #     path = "/mnt/data/grafana/grafana.db";
+    #   };
+    # };
   };
 
   users.users.root.openssh.authorizedKeys.keys = roles.ssh;
@@ -106,8 +107,8 @@ in {
     enable = true;
     allowedTCPPorts = [
       22 # SSH
-      80 # Dashboard
-      3000 # Grafana
+      # 80 # Dashboard
+      # 3000 # Grafana
     ];
   };
 
@@ -133,7 +134,7 @@ in {
   system.activationScripts.per-service-profiles.text =
     "mkdir -p /nix/var/nix/profiles/per-service";
 
-  systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
+  # systemd.tmpfiles.rules = [ "d /mnt/data/grafana 0750 grafana grafana -" ];
 
   users.groups.st0x = { };
 
@@ -144,10 +145,10 @@ in {
       mode = "0640";
     };
   in {
-    "server-schwab.toml" = secret ./config/server-schwab.toml.age;
+    # "server-schwab.toml" = secret ./config/server-schwab.toml.age;
     "server-alpaca.toml" = secret ./config/server-alpaca.toml.age;
-    "reporter-schwab.toml" = secret ./config/reporter-schwab.toml.age;
-    "reporter-alpaca.toml" = secret ./config/reporter-alpaca.toml.age;
+    # "reporter-schwab.toml" = secret ./config/reporter-schwab.toml.age;
+    # "reporter-alpaca.toml" = secret ./config/reporter-alpaca.toml.age;
   };
 
   systemd.services = let
@@ -170,30 +171,30 @@ in {
       };
     };
 
-    mkReporter = name: {
-      description = "st0x position reporter (${name})";
-      wantedBy = [ "multi-user.target" ];
-      unitConfig.ConditionPathExists =
-        "/nix/var/nix/profiles/per-service/reporter/bin/reporter";
-      serviceConfig = {
-        DynamicUser = true;
-        SupplementaryGroups = [ "st0x" ];
-        ExecStart = builtins.concatStringsSep " " [
-          "/nix/var/nix/profiles/per-service/reporter/bin/reporter"
-          "--config-file"
-          "/run/agenix/${name}.toml"
-        ];
-        Restart = "always";
-        RestartSec = 5;
-        ReadWritePaths = [ "/mnt/data" ];
-      };
-    };
+    # mkReporter = name: {
+    #   description = "st0x position reporter (${name})";
+    #   wantedBy = [ "multi-user.target" ];
+    #   unitConfig.ConditionPathExists =
+    #     "/nix/var/nix/profiles/per-service/reporter/bin/reporter";
+    #   serviceConfig = {
+    #     DynamicUser = true;
+    #     SupplementaryGroups = [ "st0x" ];
+    #     ExecStart = builtins.concatStringsSep " " [
+    #       "/nix/var/nix/profiles/per-service/reporter/bin/reporter"
+    #       "--config-file"
+    #       "/run/agenix/${name}.toml"
+    #     ];
+    #     Restart = "always";
+    #     RestartSec = 5;
+    #     ReadWritePaths = [ "/mnt/data" ];
+    #   };
+    # };
 
   in {
-    server-schwab = mkServer "server-schwab";
+    # server-schwab = mkServer "server-schwab";
     server-alpaca = mkServer "server-alpaca";
-    reporter-schwab = mkReporter "reporter-schwab";
-    reporter-alpaca = mkReporter "reporter-alpaca";
+    # reporter-schwab = mkReporter "reporter-schwab";
+    # reporter-alpaca = mkReporter "reporter-alpaca";
   };
 
   environment.systemPackages = with pkgs; [
