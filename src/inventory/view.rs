@@ -18,8 +18,6 @@ use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
 /// Error type for inventory view operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum InventoryViewError {
-    #[error("unknown symbol: {0}")]
-    UnknownSymbol(Symbol),
     #[error(transparent)]
     Equity(#[from] InventoryError<FractionalShares>),
     #[error(transparent)]
@@ -360,12 +358,9 @@ impl InventoryView {
         ) -> Result<Inventory<FractionalShares>, InventoryError<FractionalShares>>,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let inventory = self
-            .equities
-            .get(symbol)
-            .ok_or_else(|| InventoryViewError::UnknownSymbol(symbol.clone()))?;
+        let inventory = self.equities.get(symbol).cloned().unwrap_or_default();
 
-        let updated = f(inventory.clone())?;
+        let updated = f(inventory)?;
 
         let mut equities = self.equities;
         equities.insert(symbol.clone(), updated);
@@ -994,14 +989,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_position_event_unknown_symbol_returns_error() {
+    fn apply_position_event_auto_registers_new_symbol() {
         let view = make_view(vec![]);
         let symbol = Symbol::new("AAPL").unwrap();
         let event = make_onchain_fill(shares(10), Direction::Buy);
 
-        let result = view.apply_position_event(&symbol, &event);
+        let updated = view.apply_position_event(&symbol, &event).unwrap();
 
-        assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
+        let equity = updated.equities.get(&symbol).unwrap();
+        assert_eq!(equity.onchain.available(), shares(10));
+        assert_eq!(equity.offchain.available(), shares(0));
     }
 
     #[test]
@@ -1312,14 +1309,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_mint_event_unknown_symbol_returns_error() {
+    fn apply_snapshot_event_auto_registers_new_symbol() {
         let view = make_view(vec![]);
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_mint_accepted();
+        let event = InventorySnapshotEvent::OffchainEquity {
+            positions: BTreeMap::from([(symbol.clone(), shares(50))]),
+            fetched_at: Utc::now(),
+        };
 
-        let result = view.apply_mint_event(&symbol, &event, shares(30), Utc::now());
+        let updated = view.apply_snapshot_event(&event, Utc::now()).unwrap();
 
-        assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
+        let equity = updated.equities.get(&symbol).unwrap();
+        assert_eq!(equity.offchain.available(), shares(50));
     }
 
     fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
@@ -1531,14 +1532,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_redemption_event_unknown_symbol_returns_error() {
+    fn apply_onchain_snapshot_auto_registers_new_symbol() {
         let view = make_view(vec![]);
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_tokens_sent(&symbol, dec!(30));
+        let event = InventorySnapshotEvent::OnchainEquity {
+            balances: BTreeMap::from([(symbol.clone(), shares(25))]),
+            fetched_at: Utc::now(),
+        };
 
-        let result = view.apply_redemption_event(&symbol, &event, shares(30), Utc::now());
+        let updated = view.apply_snapshot_event(&event, Utc::now()).unwrap();
 
-        assert!(matches!(result, Err(InventoryViewError::UnknownSymbol(_))));
+        let equity = updated.equities.get(&symbol).unwrap();
+        assert_eq!(equity.onchain.available(), shares(25));
     }
 
     fn usdc(n: i64) -> Usdc {
