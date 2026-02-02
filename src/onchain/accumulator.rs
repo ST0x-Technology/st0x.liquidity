@@ -9,7 +9,7 @@ use super::OnchainTrade;
 use crate::dual_write::{DualWriteContext, load_position};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_execution_lease};
-use crate::offchain::execution::OffchainExecution;
+use crate::offchain::execution::OffchainOrderView;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
 use crate::trade_execution_link::TradeExecutionLink;
 
@@ -21,7 +21,7 @@ pub(crate) struct CleanedUpExecution {
 }
 
 pub(crate) struct TradeProcessingResult {
-    pub(crate) execution: Option<OffchainExecution>,
+    pub(crate) execution: Option<OffchainOrderView>,
     pub(crate) cleaned_up_executions: Vec<CleanedUpExecution>,
 }
 
@@ -235,7 +235,7 @@ async fn try_create_execution_if_ready(
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     executor_type: SupportedExecutor,
-) -> Result<Option<OffchainExecution>, OnChainError> {
+) -> Result<Option<OffchainOrderView>, OnChainError> {
     let Some(position) = load_position(dual_write_context, base_symbol).await? else {
         debug!(
             symbol = %base_symbol,
@@ -280,7 +280,7 @@ async fn execute_position(
     shares: Positive<FractionalShares>,
     direction: Direction,
     executor_type: SupportedExecutor,
-) -> Result<Option<OffchainExecution>, OnChainError> {
+) -> Result<Option<OffchainOrderView>, OnChainError> {
     let shares_f64 = shares.inner().inner().to_f64().ok_or_else(|| {
         OnChainError::Validation(TradeValidationError::ShareConversionFailed(shares))
     })?;
@@ -414,8 +414,8 @@ async fn create_execution_within_transaction(
     shares: Positive<FractionalShares>,
     direction: Direction,
     executor: SupportedExecutor,
-) -> Result<OffchainExecution, OnChainError> {
-    let execution = OffchainExecution {
+) -> Result<OffchainOrderView, OnChainError> {
+    let execution = OffchainOrderView {
         id: None,
         symbol: symbol.clone(),
         shares,
@@ -604,7 +604,7 @@ pub(crate) async fn check_all_accumulated_positions(
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
     executor_type: SupportedExecutor,
-) -> Result<Vec<OffchainExecution>, OnChainError> {
+) -> Result<Vec<OffchainOrderView>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
 
     let candidate_symbols = sqlx::query!(
@@ -657,7 +657,7 @@ async fn check_symbol_for_execution(
     dual_write_context: &DualWriteContext,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
-) -> Result<Option<OffchainExecution>, OnChainError> {
+) -> Result<Option<OffchainOrderView>, OnChainError> {
     let Some((direction, shares)) =
         get_ready_execution_params(dual_write_context, symbol, executor_type).await?
     else {
@@ -715,7 +715,7 @@ async fn process_symbol_execution(
     direction: Direction,
     shares: Positive<FractionalShares>,
     executor_type: SupportedExecutor,
-) -> Result<Option<OffchainExecution>, OnChainError> {
+) -> Result<Option<OffchainOrderView>, OnChainError> {
     let mut calculator = get_or_create_within_transaction(sql_tx, symbol).await?;
 
     let execution_type = match direction {
@@ -804,7 +804,7 @@ mod tests {
         dual_write_context: &DualWriteContext,
         symbol: &Symbol,
     ) -> i64 {
-        let stale_execution = OffchainExecution {
+        let stale_execution = OffchainOrderView {
             id: None,
             symbol: symbol.clone(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -836,7 +836,7 @@ mod tests {
 
         sql_tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -870,7 +870,7 @@ mod tests {
     async fn process_trade_with_tx(
         pool: &SqlitePool,
         trade: OnchainTrade,
-    ) -> Result<Option<OffchainExecution>, OnChainError> {
+    ) -> Result<Option<OffchainOrderView>, OnChainError> {
         let dual_write_context = DualWriteContext::new(pool.clone());
         let base_symbol = trade.symbol.base();
 
@@ -1178,7 +1178,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // First, create a pending execution for AAPL to trigger the unique constraint
-        let blocking_execution = OffchainExecution {
+        let blocking_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
@@ -1330,7 +1330,7 @@ mod tests {
     async fn process_with_retry(
         pool: &SqlitePool,
         trade: OnchainTrade,
-    ) -> Result<Option<OffchainExecution>, OnChainError> {
+    ) -> Result<Option<OffchainOrderView>, OnChainError> {
         let backoff = ExponentialBuilder::default()
             .with_min_delay(std::time::Duration::from_millis(10))
             .with_max_times(3);
@@ -1768,7 +1768,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Create a submitted execution that is stale
-        let stale_execution = OffchainExecution {
+        let stale_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -1871,7 +1871,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Create a pending execution that is stale (simulates deployment restart mid-execution)
-        let stale_pending_execution = OffchainExecution {
+        let stale_pending_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("NVDA").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -1972,7 +1972,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Create executions at different ages
-        let recent_execution = OffchainExecution {
+        let recent_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("MSFT").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -1983,7 +1983,7 @@ mod tests {
             },
         };
 
-        let stale_execution = OffchainExecution {
+        let stale_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -2070,7 +2070,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Create only recent executions (not stale)
-        let recent_execution = OffchainExecution {
+        let recent_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("NVDA").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(2))).unwrap(),
@@ -2190,7 +2190,7 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Create a pending execution first
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: None,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -2601,7 +2601,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         // Create execution and mark it as FILLED
-        let execution = OffchainExecution {
+        let execution = OffchainOrderView {
             id: None,
             symbol: symbol.clone(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -2656,7 +2656,7 @@ mod tests {
         // Create first execution (the one we'll try to mark as timed out)
         // Use a different symbol to avoid unique constraint on offchain_trades
         let symbol_other = Symbol::new("MSFT").unwrap();
-        let execution1 = OffchainExecution {
+        let execution1 = OffchainOrderView {
             id: None,
             symbol: symbol_other,
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -2666,7 +2666,7 @@ mod tests {
         };
 
         // Create second execution (the one that will be in the accumulator for AAPL)
-        let execution2 = OffchainExecution {
+        let execution2 = OffchainOrderView {
             id: None,
             symbol: symbol.clone(),
             shares: Positive::new(FractionalShares::new(Decimal::from(2))).unwrap(),
@@ -2712,7 +2712,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         // Create execution in PENDING state
-        let execution = OffchainExecution {
+        let execution = OffchainOrderView {
             id: None,
             symbol: symbol.clone(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -2971,7 +2971,7 @@ mod tests {
             .await
             .unwrap();
 
-        let existing_execution = OffchainExecution {
+        let existing_execution = OffchainOrderView {
             id: None,
             symbol: symbol.clone(),
             shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),
@@ -2994,7 +2994,7 @@ mod tests {
 
         crate::dual_write::place_offchain_order(
             &dual_write_context,
-            &OffchainExecution {
+            &OffchainOrderView {
                 id: Some(execution_id),
                 symbol: symbol.clone(),
                 shares: Positive::new(FractionalShares::new(Decimal::from(1))).unwrap(),

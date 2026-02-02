@@ -10,12 +10,16 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
-    EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
-    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive,
+    ArithmeticError, EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
+    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive, SharesConversionError,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::config::ConfigError;
+use crate::lifecycle::LifecycleError;
+use crate::offchain_order::{NegativePriceCents, OffchainOrderError};
+use crate::onchain_trade::OnChainTradeError;
+use crate::position::PositionError;
 use crate::vault_registry::VaultRegistryError;
 
 /// Business logic validation errors for trade processing rules.
@@ -185,12 +189,38 @@ pub(crate) enum OnChainError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Dual write error: {0}")]
-    DualWrite(#[from] crate::dual_write::DualWriteError),
+    #[error("OnChainTrade aggregate error: {0}")]
+    OnChainTradeAggregate(#[from] AggregateError<OnChainTradeError>),
+    #[error("Position aggregate error: {0}")]
+    PositionAggregate(#[from] AggregateError<PositionError>),
+    #[error("OffchainOrder aggregate error: {0}")]
+    OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
     #[error("Position error: {0}")]
-    Position(#[from] crate::position::PositionError),
+    Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
-    SharesConversion(#[from] crate::shares::SharesConversionError),
+    SharesConversion(#[from] SharesConversionError),
+    #[error("Decimal conversion error: {0}")]
+    DecimalConversion(#[from] rust_decimal::Error),
+    #[error("Negative price in cents: {0}")]
+    NegativePriceCents(#[from] NegativePriceCents),
+    #[error("Position aggregate {aggregate_id} is in failed state: {error}")]
+    PositionAggregateFailed {
+        aggregate_id: String,
+        error: LifecycleError<ArithmeticError<FractionalShares>>,
+    },
+    #[error("Missing block timestamp for trade: tx_hash={tx_hash:?}, log_index={log_index}")]
+    MissingBlockTimestamp {
+        tx_hash: alloy::primitives::TxHash,
+        log_index: u64,
+    },
+    #[error("Missing execution ID")]
+    MissingExecutionId,
+    #[error(
+        "Invalid order state for execution {execution_id}: expected {expected}, got different state"
+    )]
+    InvalidOrderState { execution_id: i64, expected: String },
+    #[error("JSON serde error: {0}")]
+    JsonSerde(#[from] serde_json::Error),
 }
 
 impl From<sqlx::Error> for OnChainError {

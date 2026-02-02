@@ -6,19 +6,22 @@ use alloy::sol_types;
 use futures_util::Stream;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
+use st0x_execution::{ArithmeticError, Executor, FractionalShares};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use st0x_execution::Executor;
-
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Config;
-use crate::dual_write::DualWriteContext;
 use crate::error::EventProcessingError;
+use crate::lifecycle::{Lifecycle, Never};
+use crate::offchain_order::OffchainOrder;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
+use crate::onchain_trade::OnChainTrade;
+use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
+use crate::threshold::ExecutionThreshold;
 
 use super::{
     Conductor, InventorySnapshotAggregate, VaultRegistryAggregate, spawn_event_processor,
@@ -31,7 +34,12 @@ type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
 pub(crate) struct CqrsFrameworks {
-    pub(crate) dual_write_context: DualWriteContext,
+    pub(crate) pool: SqlitePool,
+    pub(crate) onchain_trade_cqrs: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
+    pub(crate) position_cqrs:
+        Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>>,
+    pub(crate) offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
+    pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
     pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
@@ -179,7 +187,8 @@ where
             &self.common.config,
             &self.common.pool,
             self.common.executor.clone(),
-            self.common.frameworks.dual_write_context.clone(),
+            self.common.frameworks.offchain_order_cqrs.clone(),
+            self.common.frameworks.position_cqrs.clone(),
         );
         let dex_event_receiver = spawn_onchain_event_receiver(
             self.state.event_sender,
@@ -190,8 +199,10 @@ where
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
-            self.common.pool.clone(),
-            self.common.frameworks.dual_write_context.clone(),
+            self.common.frameworks.pool.clone(),
+            self.common.frameworks.position_cqrs.clone(),
+            self.common.frameworks.offchain_order_cqrs.clone(),
+            self.common.frameworks.execution_threshold,
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,
@@ -199,7 +210,11 @@ where
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
-            self.common.frameworks.dual_write_context,
+            self.common.frameworks.pool,
+            self.common.frameworks.onchain_trade_cqrs,
+            self.common.frameworks.position_cqrs,
+            self.common.frameworks.offchain_order_cqrs,
+            self.common.frameworks.execution_threshold,
             self.common.frameworks.vault_registry_cqrs,
         );
 

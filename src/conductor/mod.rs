@@ -20,7 +20,9 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
+use st0x_execution::{
+    EmptySymbolError, Executor, FractionalShares, MarketOrder, Positive, SupportedExecutor, Symbol,
+};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
@@ -33,9 +35,9 @@ use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
 };
 use crate::lifecycle::{Lifecycle, Never};
-use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
+use crate::offchain::execution::find_execution_by_id;
 use crate::offchain::order_poller::OrderStatusPoller;
-use crate::offchain_order::BrokerOrderId;
+use crate::offchain_order::{BrokerOrderId, OffchainOrderView};
 use crate::onchain::accumulator::{
     CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
 };
@@ -770,7 +772,7 @@ async fn handle_queue_processing_result<E>(
     executor: &E,
     pool: &SqlitePool,
     dual_write_context: &DualWriteContext,
-    result: Result<Option<OffchainExecution>, EventProcessingError>,
+    result: Result<Option<OffchainOrderView>, EventProcessingError>,
 ) where
     E: Executor + Clone,
     EventProcessingError: From<E::Error>,
@@ -808,7 +810,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     provider: &P,
     dual_write_context: &DualWriteContext,
     queue_context: &QueueProcessingContext<'_>,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
         return Ok(None);
@@ -966,7 +968,7 @@ async fn handle_filtered_event(
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     info!(
         "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
         match &queued_event.event {
@@ -1003,7 +1005,7 @@ async fn process_valid_trade(
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
     vault_discovery_context: &VaultDiscoveryContext<'_>,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
         match &queued_event.event {
@@ -1090,7 +1092,7 @@ async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: 
 
 async fn execute_new_execution_dual_write(
     dual_write_context: &DualWriteContext,
-    execution: &OffchainExecution,
+    execution: &OffchainOrderView,
     base_symbol: &Symbol,
 ) {
     execute_place_offchain_order(dual_write_context, execution, base_symbol).await;
@@ -1099,7 +1101,7 @@ async fn execute_new_execution_dual_write(
 
 async fn execute_place_offchain_order(
     dual_write_context: &DualWriteContext,
-    execution: &OffchainExecution,
+    execution: &OffchainOrderView,
     base_symbol: &Symbol,
 ) {
     match crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
@@ -1115,7 +1117,7 @@ async fn execute_place_offchain_order(
     }
 }
 
-async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainExecution) {
+async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainOrderView) {
     match crate::dual_write::place_order(dual_write_context, execution).await {
         Ok(()) => info!(
             "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
@@ -1198,7 +1200,7 @@ async fn process_trade_within_transaction(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
-) -> Result<Option<OffchainExecution>, EventProcessingError> {
+) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_initialize_position(dual_write_context, &trade).await;
     execute_acknowledge_fill(dual_write_context, &trade).await;
@@ -1386,10 +1388,20 @@ where
 
     info!("Executing offchain order: {execution:?}");
 
+    let OffchainOrderView::Execution {
+        symbol,
+        shares,
+        direction,
+        ..
+    } = &execution
+    else {
+        return Err(EventProcessingError::ExecutionNotFound(execution_id));
+    };
+
     let market_order = MarketOrder {
-        symbol: to_executor_ticker(&execution.symbol)?,
-        shares: execution.shares,
-        direction: execution.direction,
+        symbol: to_executor_ticker(symbol)?,
+        shares: Positive::new(*shares)?,
+        direction: *direction,
     };
 
     let placement = executor.place_market_order(market_order).await?;
@@ -1533,7 +1545,7 @@ mod tests {
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::config::tests::create_test_config;
     use crate::offchain::execution::{
-        OffchainExecution, find_executions_by_symbol_status_and_broker,
+        OffchainOrderView, find_executions_by_symbol_status_and_broker,
     };
     use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
@@ -2298,7 +2310,7 @@ mod tests {
             .await
             .unwrap();
 
-        let execution = OffchainExecution {
+        let execution = OffchainOrderView {
             id: Some(42),
             symbol: symbol.clone(),
             shares,
@@ -2368,7 +2380,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,
@@ -2452,7 +2464,7 @@ mod tests {
             "order_id should be None before execution"
         );
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,
@@ -2534,7 +2546,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,
@@ -2596,7 +2608,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,
@@ -2680,7 +2692,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,

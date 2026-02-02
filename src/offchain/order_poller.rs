@@ -7,7 +7,7 @@ use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
 use super::execution::{
-    OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
+    OffchainOrderView, find_execution_by_id, find_executions_by_symbol_status_and_broker,
 };
 use crate::dual_write::DualWriteContext;
 use crate::error::{OnChainError, OrderPollingError};
@@ -107,7 +107,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
     async fn poll_execution_status(
         &self,
-        execution: &OffchainExecution,
+        execution: &OffchainOrderView,
     ) -> Result<(), OrderPollingError> {
         let Some(execution_id) = execution.id else {
             error!("Execution missing ID: {execution:?}");
@@ -189,7 +189,7 @@ impl<E: Executor> OrderStatusPoller<E> {
 
         log_filled_order(execution_id, *price_cents, &execution);
 
-        let execution_with_state = OffchainExecution {
+        let execution_with_state = OffchainOrderView {
             id: Some(execution_id),
             symbol: execution.symbol.clone(),
             shares: execution.shares,
@@ -207,7 +207,7 @@ impl<E: Executor> OrderStatusPoller<E> {
     async fn execute_filled_order_dual_write(
         &self,
         execution_id: i64,
-        execution_with_state: &OffchainExecution,
+        execution_with_state: &OffchainOrderView,
     ) {
         if let Err(e) =
             crate::dual_write::record_fill(&self.dual_write_context, execution_with_state).await
@@ -283,7 +283,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         &self,
         execution_id: i64,
         order_state: &OrderState,
-    ) -> Result<OffchainExecution, OrderPollingError> {
+    ) -> Result<OffchainOrderView, OrderPollingError> {
         let Some(execution) = find_execution_by_id(&self.pool, execution_id).await? else {
             error!("Execution {execution_id} not found in database");
             return Err(OrderPollingError::OnChain(OnChainError::Persistence(
@@ -339,7 +339,7 @@ fn extract_order_id(execution_id: i64, state: &OrderState) -> Option<String> {
     }
 }
 
-fn log_filled_order(execution_id: i64, price_cents: u64, execution: &OffchainExecution) {
+fn log_filled_order(execution_id: i64, price_cents: u64, execution: &OffchainOrderView) {
     let symbol = &execution.symbol;
     info!(
         execution_id,
@@ -391,7 +391,7 @@ mod tests {
 
     async fn setup_offchain_order_aggregate(
         dual_write_context: &DualWriteContext,
-        execution: &OffchainExecution,
+        execution: &OffchainOrderView,
         symbol: &st0x_execution::Symbol,
         order_id: &str,
     ) {
@@ -440,7 +440,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,
@@ -522,7 +522,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,
@@ -696,7 +696,7 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
 
-        let pending_execution = OffchainExecution {
+        let pending_execution = OffchainOrderView {
             id: Some(execution_id),
             symbol: symbol.clone(),
             shares,

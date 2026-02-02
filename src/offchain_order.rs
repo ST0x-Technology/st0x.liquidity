@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, SupportedExecutor, Symbol};
+use st0x_execution::{Direction, OrderStatus, SupportedExecutor, Symbol};
 use tracing::error;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
@@ -520,14 +520,6 @@ fn handle_confirm_submission(
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum ExecutionStatus {
-    Pending,
-    Submitted,
-    Filled,
-    Failed,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) enum OffchainOrderView {
     Unavailable,
@@ -537,7 +529,7 @@ pub(crate) enum OffchainOrderView {
         shares: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
-        status: ExecutionStatus,
+        status: OrderStatus,
         broker_order_id: Option<BrokerOrderId>,
         price_cents: Option<PriceCents>,
         initiated_at: DateTime<Utc>,
@@ -576,10 +568,10 @@ impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
                 migrated_at,
             } => {
                 let (status, completed_at) = match status {
-                    MigratedOrderStatus::Pending => (ExecutionStatus::Pending, None),
-                    MigratedOrderStatus::Submitted => (ExecutionStatus::Submitted, None),
-                    MigratedOrderStatus::Filled => (ExecutionStatus::Filled, *executed_at),
-                    MigratedOrderStatus::Failed { .. } => (ExecutionStatus::Failed, *executed_at),
+                    MigratedOrderStatus::Pending => (OrderStatus::Pending, None),
+                    MigratedOrderStatus::Submitted => (OrderStatus::Submitted, None),
+                    MigratedOrderStatus::Filled => (OrderStatus::Filled, *executed_at),
+                    MigratedOrderStatus::Failed { .. } => (OrderStatus::Failed, *executed_at),
                 };
 
                 *self = Self::Execution {
@@ -648,7 +640,7 @@ impl OffchainOrderView {
             shares,
             direction,
             executor,
-            status: ExecutionStatus::Pending,
+            status: OrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
             initiated_at: placed_at,
@@ -667,7 +659,7 @@ impl OffchainOrderView {
             return;
         };
 
-        *status = ExecutionStatus::Submitted;
+        *status = OrderStatus::Submitted;
         *broker_order_id_ref = Some(broker_order_id);
     }
 
@@ -679,7 +671,7 @@ impl OffchainOrderView {
             return;
         };
 
-        *status = ExecutionStatus::Submitted;
+        *status = OrderStatus::Submitted;
     }
 
     fn handle_filled(&mut self, price_cents: PriceCents, filled_at: DateTime<Utc>) {
@@ -694,7 +686,7 @@ impl OffchainOrderView {
             return;
         };
 
-        *status = ExecutionStatus::Filled;
+        *status = OrderStatus::Filled;
         *price_cents_ref = Some(price_cents);
         *completed_at = Some(filled_at);
     }
@@ -710,7 +702,7 @@ impl OffchainOrderView {
             return;
         };
 
-        *status = ExecutionStatus::Failed;
+        *status = OrderStatus::Failed;
         *completed_at = Some(failed_at);
     }
 }
@@ -1466,7 +1458,7 @@ mod tests {
         assert_eq!(shares, FractionalShares::new(dec!(100.5)));
         assert_eq!(direction, Direction::Buy);
         assert_eq!(executor, SupportedExecutor::Schwab);
-        assert_eq!(status, ExecutionStatus::Pending);
+        assert_eq!(status, OrderStatus::Pending);
         assert_eq!(broker_order_id, None);
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, migrated_at);
@@ -1515,7 +1507,7 @@ mod tests {
         };
 
         assert_eq!(view_execution_id, execution_id);
-        assert_eq!(status, ExecutionStatus::Submitted);
+        assert_eq!(status, OrderStatus::Submitted);
         assert_eq!(broker_order_id, Some(BrokerOrderId("ORD123".to_string())));
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, migrated_at);
@@ -1565,7 +1557,7 @@ mod tests {
         };
 
         assert_eq!(view_execution_id, execution_id);
-        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(status, OrderStatus::Filled);
         assert_eq!(broker_order_id, Some(BrokerOrderId("ORD456".to_string())));
         assert_eq!(price_cents, Some(PriceCents(45025)));
         assert_eq!(initiated_at, executed_at);
@@ -1617,7 +1609,7 @@ mod tests {
         };
 
         assert_eq!(view_execution_id, execution_id);
-        assert_eq!(status, ExecutionStatus::Failed);
+        assert_eq!(status, OrderStatus::Failed);
         assert_eq!(broker_order_id, None);
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, executed_at);
@@ -1669,7 +1661,7 @@ mod tests {
         assert_eq!(shares, FractionalShares::new(dec!(75.25)));
         assert_eq!(direction, Direction::Buy);
         assert_eq!(executor, SupportedExecutor::Schwab);
-        assert_eq!(status, ExecutionStatus::Pending);
+        assert_eq!(status, OrderStatus::Pending);
         assert_eq!(broker_order_id, None);
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, placed_at);
@@ -1689,7 +1681,7 @@ mod tests {
             shares: FractionalShares::new(dec!(50.0)),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
-            status: ExecutionStatus::Pending,
+            status: OrderStatus::Pending,
             broker_order_id: None,
             price_cents: None,
             initiated_at: placed_at,
@@ -1719,7 +1711,7 @@ mod tests {
             panic!("Expected Execution variant");
         };
 
-        assert_eq!(status, ExecutionStatus::Submitted);
+        assert_eq!(status, OrderStatus::Submitted);
         assert_eq!(broker_order_id, Some(BrokerOrderId("ORD789".to_string())));
     }
 
@@ -1736,7 +1728,7 @@ mod tests {
             shares: FractionalShares::new(dec!(100.0)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            status: ExecutionStatus::Submitted,
+            status: OrderStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD999".to_string())),
             price_cents: None,
             initiated_at: placed_at,
@@ -1762,7 +1754,7 @@ mod tests {
             panic!("Expected Execution variant");
         };
 
-        assert_eq!(status, ExecutionStatus::Submitted);
+        assert_eq!(status, OrderStatus::Submitted);
     }
 
     #[test]
@@ -1778,7 +1770,7 @@ mod tests {
             shares: FractionalShares::new(dec!(30.0)),
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
-            status: ExecutionStatus::Submitted,
+            status: OrderStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD111".to_string())),
             price_cents: None,
             initiated_at: placed_at,
@@ -1809,7 +1801,7 @@ mod tests {
             panic!("Expected Execution variant");
         };
 
-        assert_eq!(status, ExecutionStatus::Filled);
+        assert_eq!(status, OrderStatus::Filled);
         assert_eq!(price_cents, Some(PriceCents(48500)));
         assert_eq!(completed_at, Some(filled_at));
     }
@@ -1827,7 +1819,7 @@ mod tests {
             shares: FractionalShares::new(dec!(200.0)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            status: ExecutionStatus::Submitted,
+            status: OrderStatus::Submitted,
             broker_order_id: Some(BrokerOrderId("ORD222".to_string())),
             price_cents: None,
             initiated_at: placed_at,
@@ -1857,7 +1849,7 @@ mod tests {
             panic!("Expected Execution variant");
         };
 
-        assert_eq!(status, ExecutionStatus::Failed);
+        assert_eq!(status, OrderStatus::Failed);
         assert_eq!(completed_at, Some(failed_at));
     }
 
