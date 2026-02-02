@@ -641,13 +641,16 @@ where
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use alloy::json_abi::Error as AlloyError;
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{Address, B256, address, fixed_bytes};
     use alloy::providers::{Provider, ProviderBuilder};
     use alloy::signers::local::PrivateKeySigner;
+    use async_trait::async_trait;
     use httpmock::MockServer;
     use httpmock::prelude::*;
+    use rain_error_decoding::{AbiDecodeFailedErrors, ErrorRegistry};
     use rust_decimal_macros::dec;
     use serde_json::json;
     use std::time::Duration;
@@ -655,6 +658,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
+    use crate::error_decoding::handle_contract_error_with;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
@@ -1069,26 +1073,20 @@ pub(crate) mod tests {
         );
     }
 
+    struct MockErrorRegistry(Vec<AlloyError>);
+
+    #[async_trait]
+    impl ErrorRegistry for MockErrorRegistry {
+        async fn lookup(
+            &self,
+            _selector: [u8; 4],
+        ) -> Result<Vec<AlloyError>, AbiDecodeFailedErrors> {
+            Ok(self.0.clone())
+        }
+    }
+
     #[tokio::test]
     async fn test_send_tokens_for_redemption_insufficient_balance() {
-        use alloy::json_abi::Error as AlloyError;
-        use async_trait::async_trait;
-        use rain_error_decoding::{AbiDecodeFailedErrors, ErrorRegistry};
-
-        use crate::error_decoding::handle_contract_error_with;
-
-        struct MockRegistry(Vec<AlloyError>);
-
-        #[async_trait]
-        impl ErrorRegistry for MockRegistry {
-            async fn lookup(
-                &self,
-                _selector: [u8; 4],
-            ) -> Result<Vec<AlloyError>, AbiDecodeFailedErrors> {
-                Ok(self.0.clone())
-            }
-        }
-
         let (_anvil, endpoint, key) = setup_anvil();
         let signer = PrivateKeySigner::from_bytes(&key).unwrap();
         let wallet = EthereumWallet::from(signer);
@@ -1109,7 +1107,7 @@ pub(crate) mod tests {
             .await
             .expect_err("expected error for insufficient balance");
 
-        let registry = MockRegistry(vec!["Error(string)".parse().unwrap()]);
+        let registry = MockErrorRegistry(vec!["Error(string)".parse().unwrap()]);
         let err: AlpacaTokenizationError =
             handle_contract_error_with(contract_err, Some(&registry)).await;
 

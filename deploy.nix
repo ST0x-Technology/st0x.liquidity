@@ -19,24 +19,29 @@ in {
       sshUser = "root";
       user = "root";
 
-      profilesOrder = [ "system" "server" "reporter" ];
+      profilesOrder = [
+        "system"
+        "server" # "reporter"
+      ];
 
       profiles = {
         system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
 
         server = {
           path = mkServiceProfile {
-            services = [ "server-schwab" "server-alpaca" ];
+            services = [ # "server-schwab"
+              "server-alpaca"
+            ];
           };
           profilePath = "${profileBase}/server";
         };
 
-        reporter = {
-          path = mkServiceProfile {
-            services = [ "reporter-schwab" "reporter-alpaca" ];
-          };
-          profilePath = "${profileBase}/reporter";
-        };
+        # reporter = {
+        #   path = mkServiceProfile {
+        #     services = [ "reporter-schwab" "reporter-alpaca" ];
+        #   };
+        #   profilePath = "${profileBase}/reporter";
+        # };
       };
     };
   };
