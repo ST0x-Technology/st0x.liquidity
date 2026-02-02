@@ -1071,7 +1071,24 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_send_tokens_for_redemption_insufficient_balance() {
-        let server = MockServer::start();
+        use alloy::json_abi::Error as AlloyError;
+        use async_trait::async_trait;
+        use rain_error_decoding::{AbiDecodeFailedErrors, ErrorRegistry};
+
+        use crate::error_decoding::handle_contract_error_with;
+
+        struct MockRegistry(Vec<AlloyError>);
+
+        #[async_trait]
+        impl ErrorRegistry for MockRegistry {
+            async fn lookup(
+                &self,
+                _selector: [u8; 4],
+            ) -> Result<Vec<AlloyError>, AbiDecodeFailedErrors> {
+                Ok(self.0.clone())
+            }
+        }
+
         let (_anvil, endpoint, key) = setup_anvil();
         let signer = PrivateKeySigner::from_bytes(&key).unwrap();
         let wallet = EthereumWallet::from(signer);
@@ -1083,23 +1100,19 @@ pub(crate) mod tests {
             .unwrap();
 
         let token = TestERC20::deploy(&provider).await.unwrap();
-        let token_address = *token.address();
-
-        let client = AlpacaTokenizationClient::new_with_base_url(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_api_key".to_string(),
-            "test_api_secret".to_string(),
-            provider,
-            TEST_REDEMPTION_WALLET,
-        );
+        let erc20 = IERC20::new(*token.address(), provider);
 
         let transfer_amount = U256::from(100_000u64);
-        let result = client
-            .send_tokens_for_redemption(token_address, transfer_amount)
-            .await;
+        let contract_err = erc20
+            .transfer(TEST_REDEMPTION_WALLET, transfer_amount)
+            .send()
+            .await
+            .expect_err("expected error for insufficient balance");
 
-        let err = result.expect_err("expected error for insufficient balance");
+        let registry = MockRegistry(vec!["Error(string)".parse().unwrap()]);
+        let err: AlpacaTokenizationError =
+            handle_contract_error_with(contract_err, Some(&registry)).await;
+
         assert!(
             matches!(err, AlpacaTokenizationError::Revert(_)),
             "expected Revert error variant, got: {err:?}"
