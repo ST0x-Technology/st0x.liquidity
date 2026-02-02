@@ -39,6 +39,12 @@ jobs:
       - name: Clippy
         run: nix build --impure .#st0x-clippy
 
+      - name: Check bun.nix is up to date
+        run: |
+          nix run .#genBunNix
+          nix fmt -- dashboard/bun.nix
+          git diff --exit-code dashboard/bun.nix
+
       - name: Dashboard
         run: nix build --impure .#st0x-dashboard
 

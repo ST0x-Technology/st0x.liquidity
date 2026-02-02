@@ -160,6 +160,8 @@
 
         };
 
+        formatter = pkgs.nixfmt-classic;
+
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
