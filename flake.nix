@@ -118,7 +118,13 @@
                 --target-host "root@$host_ip" "$@"
 
               echo "Waiting for host to come back up..."
+              retries=0
               until ssh $ssh_opts "root@$host_ip" true 2>/dev/null; do
+                retries=$((retries + 1))
+                if [ "$retries" -ge 60 ]; then
+                  echo "Host did not come back up after 5 minutes" >&2
+                  exit 1
+                fi
                 sleep 5
               done
 
