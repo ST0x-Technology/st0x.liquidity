@@ -19,6 +19,7 @@ All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 - [ ] [#142 Cutover reads from old tables to views](https://github.com/ST0x-Technology/st0x.liquidity/issues/142)
 - [ ] [#143 Remove dual-write to old tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/143)
 - [ ] [#144 Drop old CRUD tables](https://github.com/ST0x-Technology/st0x.liquidity/issues/144)
+- [ ] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
 
 ---
 
@@ -62,21 +63,24 @@ boundaries, and reduced coupling. Sequenced around CQRS/ES migration.
 
 Extract external API wrappers (no CQRS/ES dependencies):
 
-- [ ] [#195 Multi-crate architecture: extract integration layer crates](https://github.com/ST0x-Technology/st0x.liquidity/issues/195) -
-      st0x-tokenization, st0x-bridge, st0x-vault crates
+- [x] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
+  - PR:
+    [#193 Pull out bridging logic into st0x-bridge](https://github.com/ST0x-Technology/st0x.liquidity/pull/193)
+- [ ] [#269 Extract st0x-tokenization crate with Tokenizer trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/269)
+- [ ] [#270 Extract st0x-vault crate with Vault trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/270)
 
 **Phase 3: Rebalancing Domain Extraction**
 
 Extract rebalancing logic (already clean CQRS):
 
-- [ ] [#196 Multi-crate architecture: extract st0x-rebalance crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/196)
+- [ ] [#271 Extract st0x-rebalance crate](https://github.com/ST0x-Technology/st0x.liquidity/issues/271)
 
 **Phase 4: Hedging Extraction & Application Layer** (after CQRS migration
 Phase 3)
 
 Extract hedging logic and create application binary:
 
-- [ ] [#197 Multi-crate architecture: extract st0x-hedge library and create st0x-server](https://github.com/ST0x-Technology/st0x.liquidity/issues/197)
+- [ ] [#272 Convert st0x-hedge to library crate and create st0x-server binary](https://github.com/ST0x-Technology/st0x.liquidity/issues/272)
 
 ---
 

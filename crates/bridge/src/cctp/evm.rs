@@ -2,16 +2,25 @@
 
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::Provider;
+use alloy::sol;
 use alloy::sol_types::SolEvent;
 use tracing::{info, trace};
 
 use super::{
-    BridgeDirection, BurnReceipt, CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2,
-    MintReceipt, TokenMessengerV2,
+    CctpError, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt, TokenMessengerV2,
 };
-use crate::bindings::IERC20;
+use crate::BridgeDirection;
 use crate::error_decoding::handle_contract_error;
-use crate::onchain::REQUIRED_CONFIRMATIONS;
+
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    IERC20, "../../lib/forge-std/out/IERC20.sol/IERC20.json"
+);
+
+/// Default number of confirmations to wait for approval transactions.
+/// Higher values help with load-balanced RPC providers like dRPC.
+const REQUIRED_CONFIRMATIONS: u64 = 3;
 
 /// EVM chain connection with contract instances for CCTP operations.
 pub(crate) struct Evm<P>
@@ -94,7 +103,7 @@ where
         recipient: Address,
         direction: BridgeDirection,
         max_fee: U256,
-    ) -> Result<BurnReceipt, CctpError> {
+    ) -> Result<crate::BurnReceipt, CctpError> {
         info!(%max_fee, %amount, "Depositing for burn with fast transfer");
 
         let recipient_bytes32 = FixedBytes::<32>::left_padding_from(recipient.as_slice());
@@ -132,7 +141,7 @@ where
             return Err(CctpError::MessageSentEventNotFound);
         }
 
-        Ok(BurnReceipt {
+        Ok(crate::BurnReceipt {
             tx: receipt.transaction_hash,
             amount,
         })
