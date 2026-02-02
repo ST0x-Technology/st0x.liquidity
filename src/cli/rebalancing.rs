@@ -23,7 +23,7 @@ use crate::bindings::IERC20;
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
-use crate::env::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Config};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
@@ -530,7 +530,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::env::LogLevel;
+    use crate::config::LogLevel;
     use crate::onchain::EvmConfig;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;

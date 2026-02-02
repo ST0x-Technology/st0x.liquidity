@@ -4,7 +4,7 @@ use rocket::serde::{Deserialize, Serialize};
 use rocket::{Route, State, get, post, routes};
 use sqlx::SqlitePool;
 
-use crate::env::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Config};
 use st0x_execution::schwab::extract_code_from_url;
 
 #[derive(Serialize, Deserialize)]
@@ -93,7 +93,7 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::env::{BrokerConfig, Config};
+    use crate::config::{BrokerConfig, Config};
     use crate::onchain::EvmConfig;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -104,7 +104,7 @@ mod tests {
     fn create_test_config_with_mock_server(mock_server: &MockServer) -> Config {
         Config {
             database_url: ":memory:".to_string(),
-            log_level: crate::env::LogLevel::Debug,
+            log_level: crate::config::LogLevel::Debug,
             server_port: 8080,
             evm: EvmConfig {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),

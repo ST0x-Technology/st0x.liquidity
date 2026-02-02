@@ -15,7 +15,7 @@ use st0x_execution::{
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
-use crate::env::ConfigError;
+use crate::config::ConfigError;
 use crate::vault_registry::VaultRegistryError;
 
 /// Business logic validation errors for trade processing rules.

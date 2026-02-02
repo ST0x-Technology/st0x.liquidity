@@ -9,7 +9,7 @@ use std::io::Write;
 use thiserror::Error;
 
 use crate::bindings::IERC20;
-use crate::env::Config;
+use crate::config::Config;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -165,7 +165,7 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::env::{BrokerConfig, LogLevel};
+    use crate::config::{BrokerConfig, LogLevel};
     use crate::onchain::EvmConfig;
     use crate::threshold::ExecutionThreshold;
 

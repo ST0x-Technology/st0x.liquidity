@@ -6,7 +6,7 @@ use tracing::{error, info};
 
 use st0x_execution::schwab::{SchwabAuthConfig, SchwabError, SchwabTokens, extract_code_from_url};
 
-use crate::env::BrokerConfig;
+use crate::config::BrokerConfig;
 
 pub(super) async fn auth_command<W: Write>(
     stdout: &mut W,
@@ -104,7 +104,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::env::{Config, LogLevel};
+    use crate::config::{Config, LogLevel};
     use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;

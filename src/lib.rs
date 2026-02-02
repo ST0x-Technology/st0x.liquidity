@@ -13,9 +13,9 @@ mod bindings;
 mod cctp;
 pub mod cli;
 mod conductor;
+pub mod config;
 pub(crate) mod dashboard;
 mod dual_write;
-pub mod env;
 mod equity_redemption;
 mod error;
 mod error_decoding;
@@ -45,7 +45,7 @@ pub use telemetry::{TelemetryError, TelemetryGuard};
 #[cfg(test)]
 pub mod test_utils;
 
-use crate::env::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Config};
 use st0x_execution::schwab::{SchwabConfig, SchwabError};
 use st0x_execution::{ExecutionError, Executor, MockExecutorConfig, TryIntoExecutor};
 
@@ -269,7 +269,7 @@ mod tests {
     use super::*;
     use alloy::primitives::Address;
 
-    use crate::env::tests::create_test_config;
+    use crate::config::tests::create_test_config;
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();

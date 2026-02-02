@@ -24,9 +24,9 @@ use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor,
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
+use crate::config::Config;
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
-use crate::env::Config;
 use crate::equity_redemption::EquityRedemption;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
@@ -1531,7 +1531,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::env::tests::create_test_config;
+    use crate::config::tests::create_test_config;
     use crate::offchain::execution::{
         OffchainExecution, find_executions_by_symbol_status_and_broker,
     };

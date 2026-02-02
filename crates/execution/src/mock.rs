@@ -318,9 +318,9 @@ mod tests {
             positions: vec![crate::EquityPosition {
                 symbol: Symbol::new("AAPL").unwrap(),
                 quantity: FractionalShares::new(Decimal::from(100)),
-                market_value_cents: Some(15000_00),
+                market_value_cents: Some(1_500_000),
             }],
-            cash_balance_cents: 50_000_00,
+            cash_balance_cents: 5_000_000,
         };
 
         let executor = MockExecutor::new().with_inventory(inventory.clone());
@@ -335,7 +335,7 @@ mod tests {
                     fetched.positions[0].quantity,
                     FractionalShares::new(Decimal::from(100))
                 );
-                assert_eq!(fetched.cash_balance_cents, 50_000_00);
+                assert_eq!(fetched.cash_balance_cents, 5_000_000);
             }
             InventoryResult::Unimplemented => {
                 panic!("Expected Fetched, got Unimplemented")
@@ -357,7 +357,7 @@ mod tests {
     async fn with_inventory_preserves_other_settings() {
         let inventory = crate::Inventory {
             positions: vec![],
-            cash_balance_cents: 100_00,
+            cash_balance_cents: 10_000,
         };
 
         let executor = MockExecutor::new().with_inventory(inventory);

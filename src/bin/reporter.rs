@@ -1,5 +1,5 @@
 use clap::Parser;
-use st0x_hedge::env::{Env, setup_tracing};
+use st0x_hedge::config::{Env, setup_tracing};
 use st0x_hedge::reporter::{self, ReporterConfig};
 
 #[tokio::main]

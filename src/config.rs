@@ -5,8 +5,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use std::process::ExitCode;
-use tracing::{Level, error, info};
+use tracing::Level;
 
 use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
 
@@ -124,8 +123,9 @@ pub enum ConfigError {
     InvalidShares(#[from] st0x_execution::InvalidSharesError),
 }
 
+#[cfg(test)]
 impl ConfigError {
-    pub(crate) fn kind(&self) -> &'static str {
+    fn kind(&self) -> &'static str {
         match self {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
@@ -134,26 +134,6 @@ impl ConfigError {
             Self::Toml(_) => "failed to parse config file",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::InvalidShares(_) => "invalid shares value",
-        }
-    }
-}
-
-/// Parses config from file specified via `--config-file` and validates it.
-///
-/// Returns `ExitCode::SUCCESS` if valid, `ExitCode::FAILURE` otherwise.
-/// Logs success/failure via tracing.
-///
-/// This function is intended exclusively for the `validate_config` binary.
-pub fn validate_config() -> ExitCode {
-    let env = Env::parse();
-    match Config::load_file(&env.config_file) {
-        Ok(_) => {
-            info!("Config validation passed");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            error!(kind = e.kind(), "Config validation failed");
-            ExitCode::FAILURE
         }
     }
 }

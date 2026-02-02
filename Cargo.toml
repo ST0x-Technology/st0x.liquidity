@@ -138,9 +138,5 @@ st0x-execution = { path = "crates/execution", features = ["mock"] }
 tempfile = "3.24.0"
 tracing-test = "0.2.5"
 
-[[bin]]
-name = "validate_config"
-path = "src/bin/validate_config.rs"
-
 [lints]
 workspace = true

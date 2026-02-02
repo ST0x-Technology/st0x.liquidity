@@ -12,7 +12,7 @@ use crate::cctp::{
     BridgeDirection, CctpBridge, CctpError, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
     USDC_BASE, USDC_ETHEREUM,
 };
-use crate::env::Config;
+use crate::config::Config;
 use crate::onchain::http_client_with_retry;
 use crate::rebalancing::RebalancingConfig;
 use crate::threshold::Usdc;
@@ -279,7 +279,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaAccountId;
-    use crate::env::{BrokerConfig, LogLevel};
+    use crate::config::{BrokerConfig, LogLevel};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;

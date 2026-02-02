@@ -15,7 +15,7 @@ use crate::alpaca_wallet::{
 };
 use crate::bindings::IERC20;
 use crate::cctp::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
-use crate::env::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Config};
 use crate::threshold::Usdc;
 
 pub(super) async fn alpaca_deposit_command<W: Write>(
@@ -442,7 +442,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaAccountId;
     use crate::cli::ConvertDirection;
-    use crate::env::LogLevel;
+    use crate::config::LogLevel;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;

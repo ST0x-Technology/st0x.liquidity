@@ -15,8 +15,8 @@ use st0x_execution::{
 };
 use tracing::{error, info};
 
+use crate::config::{BrokerConfig, Config};
 use crate::dual_write::DualWriteContext;
-use crate::env::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
@@ -402,7 +402,7 @@ mod tests {
     use st0x_execution::schwab::SchwabAuthConfig;
 
     use super::*;
-    use crate::env::LogLevel;
+    use crate::config::LogLevel;
     use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;

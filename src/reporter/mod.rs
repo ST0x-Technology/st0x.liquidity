@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
@@ -8,33 +7,35 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info};
 
+use crate::config::{ConfigError, HasSqlite, LogLevel, configure_sqlite_pool};
 use crate::symbol::Symbol;
 use st0x_execution::Direction;
 
 mod pnl;
+use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
 
 #[derive(Debug, Deserialize)]
 pub struct ReporterConfig {
     database_url: String,
     processing_interval_secs: Option<u64>,
-    log_level: Option<crate::env::LogLevel>,
+    log_level: Option<LogLevel>,
 }
 
-impl crate::env::HasSqlite for ReporterConfig {
+impl HasSqlite for ReporterConfig {
     async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
-        crate::env::configure_sqlite_pool(&self.database_url).await
+        configure_sqlite_pool(&self.database_url).await
     }
 }
 
 impl ReporterConfig {
-    pub fn load_file(path: &std::path::Path) -> Result<Self, crate::env::ConfigError> {
+    pub fn load_file(path: &std::path::Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&contents)?;
         Ok(config)
     }
 
-    pub fn log_level(&self) -> crate::env::LogLevel {
-        self.log_level.clone().unwrap_or(crate::env::LogLevel::Info)
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level.clone().unwrap_or(LogLevel::Info)
     }
 
     fn processing_interval(&self) -> Duration {
@@ -389,7 +390,7 @@ pub(crate) async fn process_iteration(pool: &SqlitePool) -> anyhow::Result<usize
 }
 
 pub async fn run(config: ReporterConfig) -> anyhow::Result<()> {
-    use crate::env::HasSqlite;
+    use crate::config::HasSqlite;
 
     let pool = config.get_sqlite_pool().await?;
     let interval = config.processing_interval();

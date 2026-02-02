@@ -16,7 +16,7 @@ use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
-use crate::env::{Config, Env};
+use crate::config::{Config, Env};
 use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
@@ -649,7 +649,7 @@ mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::env::{BrokerConfig, LogLevel};
+    use crate::config::{BrokerConfig, LogLevel};
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmConfig;
     use crate::onchain::trade::OnchainTrade;
