@@ -67,21 +67,6 @@ pub(crate) async fn find_executions_by_symbol_status_and_broker(
         .collect()
 }
 
-pub(crate) async fn find_execution_by_id(
-    pool: &SqlitePool,
-    offchain_order_id: OffchainOrderId,
-) -> Result<Option<OffchainOrderAggregate>, OnChainError> {
-    let id_str = offchain_order_id.to_string();
-    let row: Option<String> =
-        sqlx::query_scalar("SELECT payload FROM offchain_order_view WHERE view_id = ?1")
-            .bind(&id_str)
-            .fetch_optional(pool)
-            .await?;
-
-    row.map(|payload| Ok(serde_json::from_str(&payload)?))
-        .transpose()
-}
-
 fn to_json_str<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
     let json = serde_json::to_string(value)?;
     Ok(json.trim_matches('"').to_string())

@@ -206,17 +206,20 @@ where
             self.common.frameworks.position_query.clone(),
             self.common.frameworks.offchain_order_cqrs.clone(),
         );
+        let trade_cqrs = super::TradeProcessingCqrs {
+            onchain_trade_cqrs: self.common.frameworks.onchain_trade_cqrs,
+            position_cqrs: self.common.frameworks.position_cqrs,
+            position_query: self.common.frameworks.position_query,
+            offchain_order_cqrs: self.common.frameworks.offchain_order_cqrs,
+            execution_threshold: self.common.execution_threshold,
+        };
         let queue_processor = spawn_queue_processor(
             self.common.executor,
             &self.common.config,
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
-            self.common.frameworks.onchain_trade_cqrs,
-            self.common.frameworks.position_cqrs,
-            self.common.frameworks.position_query,
-            self.common.frameworks.offchain_order_cqrs,
-            self.common.execution_threshold,
+            trade_cqrs,
             self.common.frameworks.vault_registry_cqrs,
         );
 

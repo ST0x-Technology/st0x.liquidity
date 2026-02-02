@@ -578,8 +578,17 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
             let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache)
-                .await
+            let order_placer = trading::create_order_placer(config, pool);
+            trading::process_tx_with_provider(
+                tx_hash,
+                config,
+                pool,
+                stdout,
+                &provider,
+                &cache,
+                order_placer,
+            )
+            .await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
@@ -1646,6 +1655,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
 
+        let order_placer = trading::create_order_placer(&config, &pool);
         let result = trading::process_tx_with_provider(
             tx_hash,
             &config,
@@ -1653,6 +1663,7 @@ mod tests {
             &mut stdout,
             &provider,
             &cache,
+            order_placer,
         )
         .await;
 
@@ -1751,6 +1762,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
+        let order_placer = trading::create_order_placer(&config, &pool);
         let result = trading::process_tx_with_provider(
             tx_hash,
             &config,
@@ -1758,6 +1770,7 @@ mod tests {
             &mut stdout,
             &provider,
             &cache,
+            order_placer,
         )
         .await;
 
@@ -1813,6 +1826,8 @@ mod tests {
         let mut config = config;
         config.evm.order_owner = Some(mock_data.order_owner);
 
+        let order_placer = trading::create_order_placer(&config, &pool);
+
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/trader/v1/accounts/accountNumbers");
@@ -1859,6 +1874,7 @@ mod tests {
             &mut stdout1,
             &provider1,
             &cache1,
+            order_placer.clone(),
         )
         .await;
         assert!(
@@ -1895,6 +1911,7 @@ mod tests {
             &mut stdout2,
             &provider2,
             &cache2,
+            order_placer.clone(),
         )
         .await;
         assert!(

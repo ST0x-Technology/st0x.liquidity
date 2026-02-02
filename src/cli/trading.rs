@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use alloy::primitives::B256;
 use alloy::providers::Provider;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
@@ -19,7 +21,9 @@ use tracing::{error, info};
 use crate::config::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::offchain_order::{OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand};
+use crate::offchain_order::{
+    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderServices, OrderPlacer,
+};
 use crate::onchain::OnchainTrade;
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
@@ -28,6 +32,32 @@ use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 
 use super::auth::ensure_schwab_authentication;
+
+/// OrderPlacer for the CLI that delegates to the broker-specific executor
+/// constructed from config. Handles Schwab auth, symbol mapping, etc.
+struct CliOrderPlacer {
+    config: Config,
+    pool: SqlitePool,
+}
+
+#[async_trait]
+impl OrderPlacer for CliOrderPlacer {
+    async fn place_market_order(
+        &self,
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+        let placement =
+            execute_broker_order(&self.config, &self.pool, order, &mut std::io::sink()).await?;
+        Ok(ExecutorOrderId::new(&placement.order_id))
+    }
+}
+
+pub(super) fn create_order_placer(config: &Config, pool: &SqlitePool) -> OffchainOrderServices {
+    Arc::new(CliOrderPlacer {
+        config: config.clone(),
+        pool: pool.clone(),
+    })
+}
 
 pub(super) async fn order_status_command<W: Write>(
     stdout: &mut W,
@@ -166,6 +196,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     stdout: &mut W,
     provider: &P,
     cache: &SymbolCache,
+    order_placer: OffchainOrderServices,
 ) -> anyhow::Result<()> {
     let evm = &config.evm;
     let feed_id_cache = FeedIdCache::new();
@@ -175,7 +206,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
         .await
     {
         Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, config, pool, stdout).await?;
+            process_found_trade(onchain_trade, config, pool, stdout, order_placer).await?;
         }
         Ok(None) => {
             writeln!(
@@ -269,6 +300,7 @@ pub(super) async fn process_found_trade<W: Write>(
     config: &Config,
     pool: &SqlitePool,
     stdout: &mut W,
+    order_placer: OffchainOrderServices,
 ) -> anyhow::Result<()> {
     display_trade_details(&onchain_trade, stdout)?;
 
@@ -295,7 +327,7 @@ pub(super) async fn process_found_trade<W: Write>(
         Arc::new(sqlite_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            (),
+            order_placer,
         ));
 
     update_position_aggregate(&position_cqrs, &onchain_trade, config.execution_threshold).await;
@@ -303,55 +335,9 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor_type = config.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
 
-    if let Some(params) =
+    let Some(params) =
         check_execution_readiness(&position_query, base_symbol, executor_type).await?
-    {
-        let offchain_order_id = OffchainOrder::aggregate_id();
-
-        writeln!(
-            stdout,
-            "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
-        )?;
-
-        let agg_id = offchain_order_id.to_string();
-
-        if let Err(e) = offchain_order_cqrs
-            .execute(
-                &agg_id,
-                OffchainOrderCommand::Place {
-                    symbol: params.symbol.clone(),
-                    shares: params.shares,
-                    direction: params.direction,
-                    executor: params.executor,
-                },
-            )
-            .await
-        {
-            error!(%offchain_order_id, "Failed to execute OffchainOrder::Place: {e}");
-        }
-
-        let market_order = MarketOrder {
-            symbol: params.symbol,
-            shares: params.shares,
-            direction: params.direction,
-        };
-
-        let placement = execute_broker_order(config, pool, market_order, stdout).await?;
-
-        let executor_order_id = ExecutorOrderId::new(&placement.order_id);
-
-        if let Err(e) = offchain_order_cqrs
-            .execute(
-                &agg_id,
-                OffchainOrderCommand::ConfirmSubmission { executor_order_id },
-            )
-            .await
-        {
-            error!(%offchain_order_id, "Failed to execute OffchainOrder::ConfirmSubmission: {e}");
-        }
-
-        writeln!(stdout, "Trade processing completed!")?;
-    } else {
+    else {
         writeln!(
             stdout,
             "Trade accumulated but did not trigger execution yet."
@@ -360,7 +346,50 @@ pub(super) async fn process_found_trade<W: Write>(
             stdout,
             "   (Waiting to accumulate enough shares for a whole share execution)"
         )?;
+        return Ok(());
+    };
+
+    let offchain_order_id = OffchainOrder::aggregate_id();
+
+    writeln!(
+        stdout,
+        "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
+    )?;
+
+    let aggregate_id = Position::aggregate_id(&params.symbol);
+    if let Err(e) = position_cqrs
+        .execute(
+            &aggregate_id,
+            PositionCommand::PlaceOffChainOrder {
+                offchain_order_id,
+                shares: params.shares,
+                direction: params.direction,
+                executor: params.executor,
+            },
+        )
+        .await
+    {
+        error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {e}");
     }
+
+    let agg_id = offchain_order_id.to_string();
+
+    if let Err(e) = offchain_order_cqrs
+        .execute(
+            &agg_id,
+            OffchainOrderCommand::PlaceOrder {
+                symbol: params.symbol.clone(),
+                shares: params.shares,
+                direction: params.direction,
+                executor: params.executor,
+            },
+        )
+        .await
+    {
+        error!(%offchain_order_id, "Failed to execute OffchainOrder::PlaceOrder: {e}");
+    }
+
+    writeln!(stdout, "Trade processing completed!")?;
 
     Ok(())
 }
@@ -373,9 +402,33 @@ async fn update_position_aggregate(
     let base_symbol = onchain_trade.symbol.base();
     let aggregate_id = Position::aggregate_id(base_symbol);
 
+    initialize_position(
+        position_cqrs,
+        &aggregate_id,
+        onchain_trade,
+        execution_threshold,
+    )
+    .await;
+    acknowledge_fill(
+        position_cqrs,
+        &aggregate_id,
+        onchain_trade,
+        execution_threshold,
+    )
+    .await;
+}
+
+async fn initialize_position(
+    position_cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    aggregate_id: &str,
+    onchain_trade: &OnchainTrade,
+    execution_threshold: ExecutionThreshold,
+) {
+    let base_symbol = onchain_trade.symbol.base();
+
     if let Err(e) = position_cqrs
         .execute(
-            &aggregate_id,
+            aggregate_id,
             PositionCommand::Initialize {
                 symbol: base_symbol.clone(),
                 threshold: execution_threshold,
@@ -392,17 +445,18 @@ async fn update_position_aggregate(
             "Failed to initialize position aggregate"
         );
     }
+}
 
-    let block_timestamp = match onchain_trade.block_timestamp {
-        Some(ts) => ts,
-        None => {
-            error!(
-                tx_hash = %onchain_trade.tx_hash,
-                log_index = onchain_trade.log_index,
-                "Missing block timestamp, cannot acknowledge onchain fill"
-            );
-            return;
-        }
+fn extract_fill_params(
+    onchain_trade: &OnchainTrade,
+) -> Option<(FractionalShares, Decimal, DateTime<Utc>)> {
+    let Some(block_timestamp) = onchain_trade.block_timestamp else {
+        error!(
+            tx_hash = %onchain_trade.tx_hash,
+            log_index = onchain_trade.log_index,
+            "Missing block timestamp, cannot acknowledge onchain fill"
+        );
+        return None;
     };
 
     let amount = match Decimal::try_from(onchain_trade.amount) {
@@ -415,7 +469,7 @@ async fn update_position_aggregate(
                 error = ?e,
                 "Failed to convert trade amount to FractionalShares"
             );
-            return;
+            return None;
         }
     };
 
@@ -429,8 +483,23 @@ async fn update_position_aggregate(
                 error = ?e,
                 "Failed to convert trade price to Decimal"
             );
-            return;
+            return None;
         }
+    };
+
+    Some((amount, price_usdc, block_timestamp))
+}
+
+async fn acknowledge_fill(
+    position_cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    aggregate_id: &str,
+    onchain_trade: &OnchainTrade,
+    execution_threshold: ExecutionThreshold,
+) {
+    let base_symbol = onchain_trade.symbol.base();
+
+    let Some((amount, price_usdc, block_timestamp)) = extract_fill_params(onchain_trade) else {
+        return;
     };
 
     let trade_id = TradeId {
@@ -440,7 +509,7 @@ async fn update_position_aggregate(
 
     if let Err(e) = position_cqrs
         .execute(
-            &aggregate_id,
+            aggregate_id,
             PositionCommand::AcknowledgeOnChainFill {
                 trade_id,
                 amount,

@@ -6,7 +6,7 @@ use rand::Rng;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use st0x_execution::{
-    ArithmeticError, Executor, ExecutorOrderId, FractionalShares, OrderState, OrderStatus,
+    ArithmeticError, Executor, ExecutorOrderId, FractionalShares, OrderState, OrderStatus, Symbol,
 };
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
@@ -194,6 +194,26 @@ impl<E: Executor> OrderStatusPoller<E> {
             "Order filled, executing CQRS commands"
         );
 
+        self.complete_offchain_order_fill(offchain_order_id, price_cents)
+            .await;
+
+        self.complete_position_order(
+            offchain_order_id,
+            order,
+            price_cents,
+            executor_order_id,
+            broker_timestamp,
+        )
+        .await;
+
+        Ok(())
+    }
+
+    async fn complete_offchain_order_fill(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        price_cents: PriceCents,
+    ) {
         let offchain_aggregate_id = offchain_order_id.to_string();
         if let Err(e) = self
             .offchain_order_cqrs
@@ -207,7 +227,17 @@ impl<E: Executor> OrderStatusPoller<E> {
                 "Failed to execute OffchainOrder::CompleteFill for execution {offchain_order_id}: {e}"
             );
         }
+    }
 
+    async fn complete_position_order(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        order: &OffchainOrder,
+        price_cents: PriceCents,
+        executor_order_id: &ExecutorOrderId,
+        broker_timestamp: chrono::DateTime<chrono::Utc>,
+    ) {
+        let symbol = order.symbol();
         let position_aggregate_id = Position::aggregate_id(symbol);
         if let Err(e) = self
             .position_cqrs
@@ -228,8 +258,6 @@ impl<E: Executor> OrderStatusPoller<E> {
                 "Failed to execute Position::CompleteOffChainOrder for execution {offchain_order_id}, symbol {symbol}: {e}"
             );
         }
-
-        Ok(())
     }
 
     async fn handle_failed_order(
@@ -246,13 +274,27 @@ impl<E: Executor> OrderStatusPoller<E> {
             "Order failed, executing CQRS commands"
         );
 
+        self.mark_offchain_order_failed(offchain_order_id, &error_message)
+            .await;
+
+        self.fail_position_order(offchain_order_id, symbol, error_message)
+            .await;
+
+        Ok(())
+    }
+
+    async fn mark_offchain_order_failed(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        error_message: &str,
+    ) {
         let offchain_aggregate_id = offchain_order_id.to_string();
         if let Err(e) = self
             .offchain_order_cqrs
             .execute(
                 &offchain_aggregate_id,
                 OffchainOrderCommand::MarkFailed {
-                    error: error_message.clone(),
+                    error: error_message.to_owned(),
                 },
             )
             .await
@@ -261,7 +303,14 @@ impl<E: Executor> OrderStatusPoller<E> {
                 "Failed to execute OffchainOrder::MarkFailed for execution {offchain_order_id}: {e}"
             );
         }
+    }
 
+    async fn fail_position_order(
+        &self,
+        offchain_order_id: OffchainOrderId,
+        symbol: &Symbol,
+        error_message: String,
+    ) {
         let position_aggregate_id = Position::aggregate_id(symbol);
         if let Err(e) = self
             .position_cqrs
@@ -278,8 +327,6 @@ impl<E: Executor> OrderStatusPoller<E> {
                 "Failed to execute Position::FailOffChainOrder for execution {offchain_order_id}, symbol {symbol}: {e}"
             );
         }
-
-        Ok(())
     }
 
     async fn add_jittered_delay(&self) {
@@ -309,7 +356,11 @@ mod tests {
 
     fn create_test_frameworks(pool: &SqlitePool) -> (Arc<OffchainOrderCqrs>, Arc<PositionCqrs>) {
         (
-            Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            Arc::new(sqlite_cqrs(
+                pool.clone(),
+                vec![],
+                crate::offchain_order::noop_order_placer(),
+            )),
             Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
         )
     }
@@ -364,15 +415,19 @@ mod tests {
             .unwrap();
     }
 
+    struct TestOrderParams<'a> {
+        symbol: &'a Symbol,
+        shares: Positive<FractionalShares>,
+        direction: Direction,
+        executor: SupportedExecutor,
+        order_id: &'a str,
+    }
+
     async fn setup_offchain_order_aggregate(
         offchain_order_cqrs: &OffchainOrderCqrs,
         position_cqrs: &PositionCqrs,
         offchain_order_id: OffchainOrderId,
-        symbol: &Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        executor: SupportedExecutor,
-        order_id: &str,
+        params: TestOrderParams<'_>,
     ) {
         let offchain_agg_id = offchain_order_id.to_string();
 
@@ -380,24 +435,24 @@ mod tests {
             .execute(
                 &offchain_agg_id,
                 OffchainOrderCommand::Place {
-                    symbol: symbol.clone(),
-                    shares,
-                    direction,
-                    executor,
+                    symbol: params.symbol.clone(),
+                    shares: params.shares,
+                    direction: params.direction,
+                    executor: params.executor,
                 },
             )
             .await
             .unwrap();
 
-        let position_agg_id = Position::aggregate_id(symbol);
+        let position_agg_id = Position::aggregate_id(params.symbol);
         position_cqrs
             .execute(
                 &position_agg_id,
                 PositionCommand::PlaceOffChainOrder {
                     offchain_order_id,
-                    shares,
-                    direction,
-                    executor,
+                    shares: params.shares,
+                    direction: params.direction,
+                    executor: params.executor,
                 },
             )
             .await
@@ -407,7 +462,7 @@ mod tests {
             .execute(
                 &offchain_agg_id,
                 OffchainOrderCommand::ConfirmSubmission {
-                    executor_order_id: ExecutorOrderId::new(order_id),
+                    executor_order_id: ExecutorOrderId::new(params.order_id),
                 },
             )
             .await
@@ -431,11 +486,13 @@ mod tests {
             &offchain_order_cqrs,
             &position_cqrs,
             offchain_order_id,
-            &symbol,
-            shares,
-            Direction::Buy,
-            SupportedExecutor::Schwab,
-            "ORD123",
+            TestOrderParams {
+                symbol: &symbol,
+                shares,
+                direction: Direction::Buy,
+                executor: SupportedExecutor::Schwab,
+                order_id: "ORD123",
+            },
         )
         .await;
 
@@ -515,11 +572,13 @@ mod tests {
             &offchain_order_cqrs,
             &position_cqrs,
             offchain_order_id,
-            &symbol,
-            shares,
-            Direction::Sell,
-            SupportedExecutor::Schwab,
-            "ORD456",
+            TestOrderParams {
+                symbol: &symbol,
+                shares,
+                direction: Direction::Sell,
+                executor: SupportedExecutor::Schwab,
+                order_id: "ORD456",
+            },
         )
         .await;
 

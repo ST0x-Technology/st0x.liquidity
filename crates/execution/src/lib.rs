@@ -21,7 +21,7 @@ pub use alpaca_broker_api::AlpacaBrokerApi;
 pub use alpaca_trading_api::AlpacaTradingApi;
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorConfig};
-pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
+pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus};
 pub use schwab::SchwabExecutor;
 
 /// The order ID assigned by the executor (broker) when an order is placed.
@@ -74,10 +74,6 @@ pub trait Executor: Send + Sync + 'static {
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
-
-    /// Poll all pending orders for status updates
-    /// More efficient than individual get_order_status calls for multiple orders
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
     /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic

@@ -108,20 +108,6 @@ impl AlpacaBrokerApiClient {
         self.get(&url).await
     }
 
-    /// List open orders
-    pub(super) async fn list_open_orders(
-        &self,
-    ) -> Result<Vec<OrderResponse>, AlpacaBrokerApiError> {
-        let url = format!(
-            "{}/v1/trading/accounts/{}/orders?status=open",
-            self.base_url, self.account_id
-        );
-
-        debug!("Listing open orders from {}", url);
-
-        self.get(&url).await
-    }
-
     /// Place a crypto order (e.g., USDC/USD conversion)
     pub(crate) async fn place_crypto_order(
         &self,

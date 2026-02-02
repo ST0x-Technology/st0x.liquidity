@@ -441,27 +441,7 @@ impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         match (self.live(), &command) {
-            (
-                Err(LifecycleError::Uninitialized),
-                PositionCommand::Migrate {
-                    symbol,
-                    net_position,
-                    accumulated_long,
-                    accumulated_short,
-                    threshold,
-                    last_price_usdc,
-                },
-            ) => Ok(vec![PositionEvent::Migrated {
-                symbol: symbol.clone(),
-                net_position: *net_position,
-                accumulated_long: *accumulated_long,
-                accumulated_short: *accumulated_short,
-                threshold: *threshold,
-                last_price_usdc: *last_price_usdc,
-                migrated_at: Utc::now(),
-            }]),
-
-            (Ok(_), PositionCommand::Migrate { .. } | PositionCommand::Initialize { .. }) => {
+            (Ok(_), PositionCommand::Initialize { .. }) => {
                 Err(LifecycleError::AlreadyInitialized.into())
             }
 
@@ -572,14 +552,6 @@ pub(crate) enum PositionError {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum PositionCommand {
-    Migrate {
-        symbol: Symbol,
-        net_position: FractionalShares,
-        accumulated_long: FractionalShares,
-        accumulated_short: FractionalShares,
-        threshold: ExecutionThreshold,
-        last_price_usdc: Option<Decimal>,
-    },
     Initialize {
         symbol: Symbol,
         threshold: ExecutionThreshold,
@@ -740,7 +712,7 @@ pub(crate) async fn load_position(
         Lifecycle::Live(position) => Ok(Some(position)),
         Lifecycle::Uninitialized => Ok(None),
         Lifecycle::Failed { error, .. } => Err(OnChainError::PositionAggregate(
-            cqrs_es::AggregateError::UserError(PositionError::from(error.clone())),
+            cqrs_es::AggregateError::UserError(PositionError::from(error)),
         )),
     }
 }
@@ -1673,137 +1645,6 @@ mod tests {
         };
 
         assert_eq!(event.timestamp(), timestamp);
-    }
-
-    #[tokio::test]
-    async fn test_migrate_command_creates_migrated_event() {
-        let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let net_position = FractionalShares::new(dec!(5.5));
-        let accumulated_long = FractionalShares::new(dec!(10.0));
-        let accumulated_short = FractionalShares::new(dec!(4.5));
-        let threshold = ExecutionThreshold::whole_share();
-
-        let command = PositionCommand::Migrate {
-            symbol: symbol.clone(),
-            net_position,
-            accumulated_long,
-            accumulated_short,
-            threshold,
-            last_price_usdc: None,
-        };
-
-        let events = position.handle(command, &()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            PositionEvent::Migrated {
-                symbol: event_symbol,
-                net_position: event_net,
-                accumulated_long: event_long,
-                accumulated_short: event_short,
-                threshold: event_threshold,
-                ..
-            } => {
-                assert_eq!(event_symbol, &symbol);
-                assert_eq!(event_net, &net_position);
-                assert_eq!(event_long, &accumulated_long);
-                assert_eq!(event_short, &accumulated_short);
-                assert_eq!(event_threshold, &threshold);
-            }
-            _ => panic!("Expected Migrated event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_migrate_with_zero_position() {
-        let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
-        let symbol = Symbol::new("MSFT").unwrap();
-
-        let command = PositionCommand::Migrate {
-            symbol,
-            net_position: FractionalShares::ZERO,
-            accumulated_long: FractionalShares::ZERO,
-            accumulated_short: FractionalShares::ZERO,
-            threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: None,
-        };
-
-        let events = position.handle(command, &()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            PositionEvent::Migrated {
-                net_position,
-                accumulated_long,
-                accumulated_short,
-                ..
-            } => {
-                assert_eq!(net_position, &FractionalShares::ZERO);
-                assert_eq!(accumulated_long, &FractionalShares::ZERO);
-                assert_eq!(accumulated_short, &FractionalShares::ZERO);
-            }
-            _ => panic!("Expected Migrated event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_migrate_preserves_negative_position() {
-        let position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
-        let symbol = Symbol::new("GOOGL").unwrap();
-        let net_position = FractionalShares::new(dec!(-10.5));
-
-        let command = PositionCommand::Migrate {
-            symbol,
-            net_position,
-            accumulated_long: FractionalShares::new(dec!(5.0)),
-            accumulated_short: FractionalShares::new(dec!(15.5)),
-            threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: None,
-        };
-
-        let events = position.handle(command, &()).await.unwrap();
-
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            PositionEvent::Migrated {
-                net_position: event_net,
-                ..
-            } => {
-                assert_eq!(event_net.inner(), dec!(-10.5));
-                assert!(event_net.inner() < Decimal::ZERO);
-            }
-            _ => panic!("Expected Migrated event"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_cannot_migrate_when_already_initialized() {
-        let mut position = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
-        let symbol = Symbol::new("NVDA").unwrap();
-
-        let initialized_event = PositionEvent::Initialized {
-            symbol: symbol.clone(),
-            threshold: ExecutionThreshold::whole_share(),
-            initialized_at: Utc::now(),
-        };
-        position.apply(initialized_event);
-
-        let command = PositionCommand::Migrate {
-            symbol,
-            net_position: FractionalShares::new(dec!(1.5)),
-            accumulated_long: FractionalShares::new(dec!(1.5)),
-            accumulated_short: FractionalShares::ZERO,
-            threshold: ExecutionThreshold::whole_share(),
-            last_price_usdc: None,
-        };
-
-        let result = position.handle(command, &()).await;
-
-        assert!(matches!(
-            result,
-            Err(PositionError::State(LifecycleError::AlreadyInitialized))
-        ));
     }
 
     #[test]

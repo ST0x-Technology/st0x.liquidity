@@ -16,7 +16,7 @@ use st0x_execution::{
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::config::ConfigError;
-use crate::offchain_order::{NegativePriceCents, OffchainOrderError, OffchainOrderId};
+use crate::offchain_order::{NegativePriceCents, OffchainOrderError};
 use crate::onchain_trade::OnChainTradeError;
 use crate::position::PositionError;
 use crate::vault_registry::VaultRegistryError;
@@ -112,8 +112,6 @@ pub(crate) enum EventProcessingError {
     EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Database transaction error: {0}")]
     Transaction(#[from] sqlx::Error),
-    #[error("Offchain order {0} not found")]
-    ExecutionNotFound(OffchainOrderId),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
