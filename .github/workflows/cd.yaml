@@ -48,5 +48,8 @@ jobs:
       - name: Build Solidity artifacts
         run: nix run .#prepSolArtifacts
 
+      - name: Mask host IP
+        run: echo "::add-mask::$(nix run .#resolveIp)"
+
       - name: Build and deploy
         run: nix run .#deployAll

@@ -158,6 +158,15 @@
             body = infraPkgs.tfRekey;
           };
 
+          resolveIp = pkgs.writeShellApplication {
+            name = "resolve-ip";
+            runtimeInputs = infraPkgs.buildInputs;
+            text = ''
+              ${infraPkgs.resolveIp}
+              echo "$host_ip"
+            '';
+          };
+
           remote = pkgs.writeShellApplication {
             name = "remote";
             runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
