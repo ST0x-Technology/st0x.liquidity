@@ -10,7 +10,7 @@ use fireblocks_sdk::models;
 use fireblocks_sdk::{Client, ClientBuilder};
 use tracing::debug;
 
-use super::config::FireblocksEnv;
+use super::config::{ChainAssetIds, FireblocksEnv};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum FireblocksError {
@@ -53,6 +53,10 @@ pub(crate) enum FireblocksError {
     IncompleteSignature { tx_id: String },
     #[error("failed to parse signature component from Fireblocks response")]
     ParseSignature(#[source] alloy::hex::FromHexError),
+    #[error("no asset ID configured for chain {chain_id}")]
+    UnknownChain { chain_id: u64 },
+    #[error("chain_id not set on signer, cannot determine asset ID")]
+    ChainIdNotSet,
 }
 
 /// Signer that delegates to the Fireblocks RAW signing API.
@@ -63,7 +67,7 @@ pub(crate) enum FireblocksError {
 pub(crate) struct FireblocksSigner {
     client: Client,
     vault_account_id: String,
-    asset_id: String,
+    chain_asset_ids: ChainAssetIds,
     address: Address,
     chain_id: Option<u64>,
 }
@@ -72,7 +76,7 @@ impl std::fmt::Debug for FireblocksSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FireblocksSigner")
             .field("vault_account_id", &self.vault_account_id)
-            .field("asset_id", &self.asset_id)
+            .field("chain_asset_ids", &self.chain_asset_ids)
             .field("address", &self.address)
             .field("chain_id", &self.chain_id)
             .finish_non_exhaustive()
@@ -96,8 +100,10 @@ impl FireblocksSigner {
         }
         let client = builder.build().map_err(FireblocksError::ClientBuild)?;
 
+        let default_asset_id = env.chain_asset_ids.default_asset_id();
+
         let addresses = client
-            .addresses(&env.vault_account_id, &env.asset_id)
+            .addresses(&env.vault_account_id, default_asset_id)
             .await
             .map_err(FireblocksError::FetchAddresses)?;
 
@@ -106,7 +112,7 @@ impl FireblocksSigner {
             .and_then(|a| a.address.as_deref())
             .ok_or_else(|| FireblocksError::NoAddress {
                 vault_id: env.vault_account_id.clone(),
-                asset_id: env.asset_id.clone(),
+                asset_id: default_asset_id.to_string(),
             })?;
 
         let address =
@@ -119,7 +125,7 @@ impl FireblocksSigner {
 
         debug!(
             vault_account_id = %env.vault_account_id,
-            asset_id = %env.asset_id,
+            chain_asset_ids = ?env.chain_asset_ids,
             %address,
             "Fireblocks signer initialized"
         );
@@ -127,7 +133,7 @@ impl FireblocksSigner {
         Ok(Self {
             client,
             vault_account_id: env.vault_account_id.clone(),
-            asset_id: env.asset_id.clone(),
+            chain_asset_ids: env.chain_asset_ids.clone(),
             address,
             chain_id: None,
         })
@@ -135,9 +141,14 @@ impl FireblocksSigner {
 
     /// Sign a 32-byte hash via Fireblocks RAW signing.
     async fn sign_hash_inner(&self, hash: &B256) -> Result<Signature, FireblocksError> {
+        let chain_id = self.chain_id.ok_or(FireblocksError::ChainIdNotSet)?;
+        let asset_id = self
+            .chain_asset_ids
+            .get(chain_id)
+            .ok_or(FireblocksError::UnknownChain { chain_id })?;
         let hash_hex = alloy::hex::encode(hash);
         let tx_request =
-            Self::build_raw_signing_request(&self.asset_id, &self.vault_account_id, &hash_hex);
+            Self::build_raw_signing_request(asset_id, &self.vault_account_id, &hash_hex);
 
         let params = CreateTransactionParams::builder()
             .transaction_request(tx_request)

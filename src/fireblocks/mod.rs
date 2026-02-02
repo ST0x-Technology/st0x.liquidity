@@ -7,7 +7,7 @@ use alloy::signers::Signer;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 
-pub(crate) use config::FireblocksEnv;
+pub(crate) use config::{ChainAssetIds, FireblocksEnv};
 pub(crate) use signer::{FireblocksError, FireblocksSigner};
 
 /// Resolved signer: an `EthereumWallet` and the corresponding address.
@@ -41,9 +41,9 @@ pub(crate) struct SignerEnv {
     #[clap(long, env)]
     fireblocks_vault_account_id: Option<String>,
 
-    /// Fireblocks asset ID for the signing key (e.g. "ETH", "ETH_TEST6", "BASE")
-    #[clap(long, env, default_value = "ETH")]
-    fireblocks_asset_id: String,
+    /// Mapping of chain ID to Fireblocks asset ID, e.g. "1:ETH,8453:BASECHAIN_ETH"
+    #[clap(long, env, default_value = "1:ETH", value_parser = config::parse_chain_asset_ids)]
+    fireblocks_chain_asset_ids: ChainAssetIds,
 
     /// Use Fireblocks sandbox environment
     #[clap(long, env, default_value = "false", action = clap::ArgAction::Set)]
@@ -93,7 +93,7 @@ impl SignerEnv {
                     api_key,
                     secret_path,
                     vault_account_id,
-                    asset_id: self.fireblocks_asset_id,
+                    chain_asset_ids: self.fireblocks_chain_asset_ids,
                     sandbox: self.fireblocks_sandbox,
                 }))
             }
@@ -158,7 +158,7 @@ mod tests {
             fireblocks_api_key: None,
             fireblocks_secret_path: None,
             fireblocks_vault_account_id: None,
-            fireblocks_asset_id: "ETH".to_string(),
+            fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
             fireblocks_sandbox: false,
         };
         let config = env.into_config().unwrap();
@@ -175,7 +175,7 @@ mod tests {
             fireblocks_api_key: None,
             fireblocks_secret_path: None,
             fireblocks_vault_account_id: None,
-            fireblocks_asset_id: "ETH".to_string(),
+            fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
             fireblocks_sandbox: false,
         };
         let result = env.into_config();
@@ -192,7 +192,7 @@ mod tests {
             fireblocks_api_key: Some("test-key".to_string()),
             fireblocks_secret_path: None,
             fireblocks_vault_account_id: Some("0".to_string()),
-            fireblocks_asset_id: "ETH".to_string(),
+            fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
             fireblocks_sandbox: false,
         };
         let result = env.into_config();
