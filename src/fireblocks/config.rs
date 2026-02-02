@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::collections::HashMap;
+use std::num::ParseIntError;
 use std::path::PathBuf;
 
 /// Environment configuration for Fireblocks signing.
@@ -53,22 +54,58 @@ impl ChainAssetIds {
     }
 }
 
-pub(crate) fn parse_chain_asset_ids(s: &str) -> Result<ChainAssetIds, String> {
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ChainAssetIdsParseError {
+    #[error("invalid chain:asset pair: {pair:?}, expected format like 1:ETH")]
+    InvalidFormat { pair: String },
+    #[error("invalid chain ID: {value:?}")]
+    InvalidChainId {
+        value: String,
+        #[source]
+        source: ParseIntError,
+    },
+    #[error("empty asset ID for chain {chain_id}")]
+    EmptyAssetId { chain_id: u64 },
+    #[error("duplicate chain ID: {chain_id}")]
+    DuplicateChainId { chain_id: u64 },
+    #[error("at least one chain:asset pair is required")]
+    EmptyInput,
+}
+
+// clap value_parser requires the error to be convertible to a boxed error,
+// which thiserror's Display + Error impls satisfy. But clap also accepts
+// `Fn(&str) -> Result<T, E>` where E: Into<Box<dyn Error + Send + Sync>>,
+// and our thiserror enum satisfies that.
+pub(crate) fn parse_chain_asset_ids(s: &str) -> Result<ChainAssetIds, ChainAssetIdsParseError> {
     let mut map = HashMap::new();
     let mut default_asset_id = None;
 
     for pair in s.split(',') {
         let pair = pair.trim();
-        let (chain_str, asset_id) = pair.split_once(':').ok_or_else(|| {
-            format!("invalid chain:asset pair: {pair:?}, expected format like 1:ETH")
-        })?;
+        let (chain_str, asset_id) =
+            pair.split_once(':')
+                .ok_or_else(|| ChainAssetIdsParseError::InvalidFormat {
+                    pair: pair.to_string(),
+                })?;
 
-        let chain_id: u64 = chain_str
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid chain ID: {chain_str:?}"))?;
+        let chain_id: u64 =
+            chain_str
+                .trim()
+                .parse()
+                .map_err(|source| ChainAssetIdsParseError::InvalidChainId {
+                    value: chain_str.trim().to_string(),
+                    source,
+                })?;
 
         let asset_id = asset_id.trim().to_string();
+
+        if asset_id.is_empty() {
+            return Err(ChainAssetIdsParseError::EmptyAssetId { chain_id });
+        }
+
+        if map.contains_key(&chain_id) {
+            return Err(ChainAssetIdsParseError::DuplicateChainId { chain_id });
+        }
 
         if default_asset_id.is_none() {
             default_asset_id = Some(asset_id.clone());
@@ -77,8 +114,7 @@ pub(crate) fn parse_chain_asset_ids(s: &str) -> Result<ChainAssetIds, String> {
         map.insert(chain_id, asset_id);
     }
 
-    let default_asset_id =
-        default_asset_id.ok_or_else(|| "at least one chain:asset pair is required".to_string())?;
+    let default_asset_id = default_asset_id.ok_or(ChainAssetIdsParseError::EmptyInput)?;
 
     Ok(ChainAssetIds {
         map,
@@ -115,28 +151,41 @@ mod tests {
 
     #[test]
     fn parse_invalid_format() {
-        let err = parse_chain_asset_ids("ETH").unwrap_err();
-        assert!(
-            err.contains("invalid chain:asset pair"),
-            "Expected 'invalid chain:asset pair' error, got: {err}"
-        );
+        assert!(matches!(
+            parse_chain_asset_ids("ETH").unwrap_err(),
+            ChainAssetIdsParseError::InvalidFormat { .. }
+        ));
     }
 
     #[test]
     fn parse_invalid_chain_id() {
-        let err = parse_chain_asset_ids("abc:ETH").unwrap_err();
-        assert!(
-            err.contains("invalid chain ID"),
-            "Expected 'invalid chain ID' error, got: {err}"
-        );
+        assert!(matches!(
+            parse_chain_asset_ids("abc:ETH").unwrap_err(),
+            ChainAssetIdsParseError::InvalidChainId { .. }
+        ));
     }
 
     #[test]
     fn parse_empty_string() {
-        let err = parse_chain_asset_ids("").unwrap_err();
-        assert!(
-            err.contains("invalid chain:asset pair"),
-            "Expected 'invalid chain:asset pair' error, got: {err}"
-        );
+        assert!(matches!(
+            parse_chain_asset_ids("").unwrap_err(),
+            ChainAssetIdsParseError::InvalidFormat { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_empty_asset_id() {
+        assert!(matches!(
+            parse_chain_asset_ids("1:").unwrap_err(),
+            ChainAssetIdsParseError::EmptyAssetId { chain_id: 1 }
+        ));
+    }
+
+    #[test]
+    fn parse_duplicate_chain_id() {
+        assert!(matches!(
+            parse_chain_asset_ids("1:ETH,1:ETH_TEST").unwrap_err(),
+            ChainAssetIdsParseError::DuplicateChainId { chain_id: 1 }
+        ));
     }
 }

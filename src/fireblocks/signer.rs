@@ -354,3 +354,183 @@ impl TxSigner<Signature> for FireblocksSigner {
         Ok(signature)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use fireblocks_sdk::models::signed_message_signature::V;
+
+    use super::*;
+
+    #[test]
+    fn build_raw_signing_request_sets_expected_fields() {
+        let req = FireblocksSigner::build_raw_signing_request("ETH", "vault_0", "abcd1234");
+
+        assert_eq!(req.operation, Some(models::TransactionOperation::Raw));
+        assert_eq!(req.asset_id.as_deref(), Some("ETH"));
+
+        let source = req.source.unwrap();
+        assert_eq!(source.r#type, models::TransferPeerPathType::VaultAccount);
+        assert_eq!(source.id.as_deref(), Some("vault_0"));
+
+        let extra = req.extra_parameters.unwrap();
+        let raw = extra.raw_message_data.unwrap();
+        let msgs = raw.messages.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "abcd1234");
+
+        assert_eq!(
+            raw.algorithm,
+            Some(models::extra_parameters_raw_message_data::Algorithm::MpcEcdsaSecp256K1)
+        );
+
+        let note = req.note.unwrap();
+        assert!(
+            note.contains("abcd1234"),
+            "note should contain the hash hex, got: {note}"
+        );
+    }
+
+    fn make_completed_response(
+        signed_messages: Option<Vec<models::SignedMessage>>,
+    ) -> models::TransactionResponse {
+        models::TransactionResponse {
+            status: models::TransactionStatus::Completed,
+            signed_messages,
+            ..Default::default()
+        }
+    }
+
+    fn valid_signed_message() -> models::SignedMessage {
+        // 32-byte r and s values as hex (64 hex chars each)
+        let r_hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let s_hex = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+
+        models::SignedMessage {
+            signature: Some(models::SignedMessageSignature {
+                r: Some(r_hex.to_string()),
+                s: Some(s_hex.to_string()),
+                v: Some(V::Variant1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extract_signature_happy_path() {
+        let response = make_completed_response(Some(vec![valid_signed_message()]));
+
+        let sig = FireblocksSigner::extract_signature("tx_1", &response).unwrap();
+
+        // v=1 (Variant1) means y_parity is odd
+        assert!(sig.v());
+    }
+
+    #[test]
+    fn extract_signature_no_signed_messages() {
+        let response = make_completed_response(None);
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::NoSignedMessages { .. }));
+    }
+
+    #[test]
+    fn extract_signature_empty_signed_messages() {
+        let response = make_completed_response(Some(vec![]));
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::NoSignedMessages { .. }));
+    }
+
+    #[test]
+    fn extract_signature_missing_signature_field() {
+        let msg = models::SignedMessage {
+            signature: None,
+            ..Default::default()
+        };
+        let response = make_completed_response(Some(vec![msg]));
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::IncompleteSignature { .. }));
+    }
+
+    #[test]
+    fn extract_signature_missing_r() {
+        let msg = models::SignedMessage {
+            signature: Some(models::SignedMessageSignature {
+                r: None,
+                s: Some("ab".repeat(32)),
+                v: Some(V::Variant0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = make_completed_response(Some(vec![msg]));
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::IncompleteSignature { .. }));
+    }
+
+    #[test]
+    fn extract_signature_missing_v() {
+        let msg = models::SignedMessage {
+            signature: Some(models::SignedMessageSignature {
+                r: Some("ab".repeat(32)),
+                s: Some("cd".repeat(32)),
+                v: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = make_completed_response(Some(vec![msg]));
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::IncompleteSignature { .. }));
+    }
+
+    #[test]
+    fn extract_signature_invalid_hex() {
+        let msg = models::SignedMessage {
+            signature: Some(models::SignedMessageSignature {
+                r: Some("not_valid_hex!".to_string()),
+                s: Some("ab".repeat(32)),
+                v: Some(V::Variant0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = make_completed_response(Some(vec![msg]));
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::ParseSignature(_)));
+    }
+
+    #[test]
+    fn extract_signature_wrong_length_r() {
+        // Valid hex but only 16 bytes instead of 32
+        let msg = models::SignedMessage {
+            signature: Some(models::SignedMessageSignature {
+                r: Some("ab".repeat(16)),
+                s: Some("cd".repeat(32)),
+                v: Some(V::Variant0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let response = make_completed_response(Some(vec![msg]));
+
+        let err = FireblocksSigner::extract_signature("tx_1", &response).unwrap_err();
+        assert!(matches!(*err, FireblocksError::IncompleteSignature { .. }));
+    }
+
+    #[test]
+    fn extract_signature_v0_gives_even_parity() {
+        let mut msg = valid_signed_message();
+        msg.signature.as_mut().unwrap().v = Some(V::Variant0);
+
+        let response = make_completed_response(Some(vec![msg]));
+        let sig = FireblocksSigner::extract_signature("tx_1", &response).unwrap();
+
+        assert!(!sig.v());
+    }
+}
