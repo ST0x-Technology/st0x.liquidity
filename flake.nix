@@ -110,9 +110,12 @@
               ++ [ nixos-anywhere.packages.${system}.default ];
             body = ''
               ${infraPkgs.resolveIp}
-              nixos-anywhere --flake ".#st0x-liquidity" --target-host "root@$host_ip" "$@"
+              ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
 
-              ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5"
+              NIX_CONFIG="pure-eval = false" \
+              nixos-anywhere --flake ".#st0x-liquidity" \
+                --ssh-option "IdentityFile=$identity" \
+                --target-host "root@$host_ip" "$@"
 
               echo "Waiting for host to come back up..."
               until ssh $ssh_opts "root@$host_ip" true 2>/dev/null; do
@@ -130,7 +133,7 @@
                 keys.nix
 
               echo "Updated host key in keys.nix, rekeying secrets..."
-              ragenix --rules ./config/secrets.nix -r
+              ragenix --rules ./config/secrets.nix -i "$identity" -r
             '';
           };
 
@@ -154,7 +157,7 @@
             runtimeInputs = infraPkgs.buildInputs ++ [ pkgs.openssh ];
             text = ''
               ${infraPkgs.resolveIp}
-              exec ssh "root@$host_ip" "$@"
+              exec ssh -i "$identity" "root@$host_ip" "$@"
             '';
           };
 

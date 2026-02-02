@@ -161,16 +161,24 @@ nix run .#remote -- <command> # run a command
 
 ### Rollback
 
-Each service profile maintains a history of deployments. To roll back:
+Each service profile maintains a history of deployments. Rollback requires two
+steps: reverting the nix profile, then restarting the affected services (the
+profile switch alone does not trigger a restart).
+
+deploy-rs uses legacy (`nix-env`-style) profiles internally.
+`nix profile
+rollback` is **not compatible** — you must use `nix-env`.
+
+SSH into the host and run:
 
 ```bash
 # Roll back the server profile to previous deployment
-nix run .#remote -- nix-env --profile /nix/var/nix/profiles/per-service/server --rollback
-nix run .#remote -- systemctl restart server-schwab server-alpaca
+nix-env --profile /nix/var/nix/profiles/per-service/server --rollback
+systemctl restart server-schwab server-alpaca
 
 # Roll back the reporter profile
-nix run .#remote -- nix-env --profile /nix/var/nix/profiles/per-service/reporter --rollback
-nix run .#remote -- systemctl restart reporter-schwab reporter-alpaca
+nix-env --profile /nix/var/nix/profiles/per-service/reporter --rollback
+systemctl restart reporter-schwab reporter-alpaca
 ```
 
 ### Secrets Management

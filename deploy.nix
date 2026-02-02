@@ -49,6 +49,8 @@ in {
       deployPreamble = ''
         ${infraPkgs.resolveIp}
         export DEPLOY_HOST="$host_ip"
+        export NIX_SSHOPTS="-i $identity"
+        ssh_flag="--ssh-opts=-i $identity"
       '';
 
       deployFlags = if localSystem == "x86_64-linux" then
@@ -62,7 +64,7 @@ in {
         runtimeInputs = deployInputs;
         text = ''
           ${deployPreamble}
-          deploy ${deployFlags} .#st0x-liquidity.system \
+          deploy ${deployFlags} "$ssh_flag" .#st0x-liquidity.system \
             -- --impure "$@"
         '';
       };
@@ -74,7 +76,7 @@ in {
           ${deployPreamble}
           profile="''${1:?usage: deploy-service <profile>}"
           shift
-          deploy ${deployFlags} ".#st0x-liquidity.$profile" \
+          deploy ${deployFlags} "$ssh_flag" ".#st0x-liquidity.$profile" \
             -- --impure "$@"
         '';
       };
@@ -84,7 +86,7 @@ in {
         runtimeInputs = deployInputs;
         text = ''
           ${deployPreamble}
-          deploy ${deployFlags} .#st0x-liquidity \
+          deploy ${deployFlags} "$ssh_flag" .#st0x-liquidity \
             -- --impure "$@"
         '';
       };
