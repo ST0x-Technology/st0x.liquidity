@@ -951,4 +951,24 @@ mod tests {
     fn dry_run_supports_fractional_shares() {
         assert!(SupportedExecutor::DryRun.supports_fractional_shares());
     }
+
+    #[test]
+    fn executor_order_id_new_stores_value() {
+        let id = ExecutorOrderId::new("ORD-123");
+        assert_eq!(id.as_ref(), "ORD-123");
+    }
+
+    #[test]
+    fn executor_order_id_display_matches_inner() {
+        let id = ExecutorOrderId::new("ORD-456");
+        assert_eq!(id.to_string(), "ORD-456");
+    }
+
+    #[test]
+    fn executor_order_id_serialization_roundtrip() {
+        let id = ExecutorOrderId::new("ORD-789");
+        let json = serde_json::to_string(&id).unwrap();
+        let deserialized: ExecutorOrderId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
+    }
 }
