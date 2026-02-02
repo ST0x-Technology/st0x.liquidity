@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
 
-use st0x_execution::{FractionalShares, Positive};
-
-use crate::shares::{ArithmeticError, HasZero};
+use st0x_execution::{ArithmeticError, FractionalShares, HasZero, Positive};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
-use st0x_execution::{AlpacaBrokerApi, Executor, Symbol};
+use st0x_execution::{AlpacaBrokerApi, Executor, FractionalShares, Symbol};
 
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
@@ -30,7 +30,6 @@ use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RedemptionManager};
-use crate::shares::FractionalShares;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;

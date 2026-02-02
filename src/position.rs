@@ -6,12 +6,11 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, SupportedExecutor, Symbol};
 use tracing::warn;
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
-use crate::shares::ArithmeticError;
 use crate::threshold::{ExecutionThreshold, Usdc};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

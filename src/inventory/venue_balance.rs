@@ -3,9 +3,8 @@
 use std::ops::{Add, Sub};
 
 use serde::{Deserialize, Serialize};
+use st0x_execution::{ArithmeticError, HasZero};
 use tracing::debug;
-
-use crate::shares::{ArithmeticError, HasZero};
 
 impl<T: HasZero> Default for VenueBalance<T> {
     fn default() -> Self {
@@ -195,8 +194,9 @@ where
 mod tests {
     use rust_decimal::Decimal;
 
+    use st0x_execution::FractionalShares;
+
     use super::*;
-    use crate::shares::FractionalShares;
     use crate::threshold::Usdc;
 
     fn equity_balance(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {

@@ -4,11 +4,10 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, OrderStatus, SupportedExecutor, Symbol};
+use st0x_execution::{Direction, FractionalShares, OrderStatus, SupportedExecutor, Symbol};
 use tracing::error;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::shares::FractionalShares;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExecutionId(pub(crate) i64);

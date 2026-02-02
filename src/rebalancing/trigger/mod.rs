@@ -16,19 +16,19 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
+use chrono::Utc;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
+use st0x_execution::{ArithmeticError, FractionalShares, Symbol};
+
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
-use crate::shares::{ArithmeticError, FractionalShares};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::VaultRegistry;
-use chrono::Utc;
-use st0x_execution::Symbol;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
 
 use crate::vault_registry::VaultRegistryError;
 

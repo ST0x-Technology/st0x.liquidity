@@ -114,7 +114,7 @@ mod tests {
     use super::*;
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
-    use crate::shares::FractionalShares;
+    use st0x_execution::FractionalShares;
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))

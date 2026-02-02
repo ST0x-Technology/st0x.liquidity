@@ -61,12 +61,12 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
 
+    use st0x_execution::{FractionalShares, Symbol};
+
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::view::{Imbalance, ImbalanceThreshold};
-    use crate::shares::FractionalShares;
     use crate::threshold::Usdc;
-    use st0x_execution::Symbol;
 
     fn test_symbol() -> Symbol {
         Symbol::new("AAPL").unwrap()

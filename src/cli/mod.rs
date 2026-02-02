@@ -11,13 +11,12 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, Symbol};
+use st0x_execution::{Direction, FractionalShares, Symbol};
 use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
 use crate::config::{Config, Env};
-use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 
