@@ -212,7 +212,6 @@ where
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
-            self.common.frameworks.pool,
             self.common.frameworks.onchain_trade_cqrs,
             self.common.frameworks.position_cqrs,
             self.common.frameworks.position_query,

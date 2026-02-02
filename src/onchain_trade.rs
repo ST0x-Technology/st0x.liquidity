@@ -319,9 +319,11 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use cqrs_es::{EventEnvelope, View};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+
+    use super::*;
 
     fn make_envelope(
         aggregate_id: &str,

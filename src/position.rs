@@ -747,9 +747,9 @@ pub(crate) async fn load_position(
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::EventEnvelope;
     use cqrs_es::persist::GenericQuery;
     use cqrs_es::test::TestFramework;
+    use cqrs_es::{EventEnvelope, View};
     use rust_decimal_macros::dec;
     use sqlite_es::SqliteViewRepository;
     use sqlx::SqlitePool;
@@ -1964,10 +1964,12 @@ mod tests {
     #[tokio::test]
     async fn position_view_generated_columns_match_lifecycle_serialization() {
         let pool = crate::test_utils::setup_test_db().await;
-        let view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
+        let view_repo = Arc::new(
+            SqliteViewRepository::<PositionAggregate, PositionAggregate>::new(
+                pool.clone(),
+                "position_view".to_string(),
+            ),
+        );
         let position_cqrs: PositionCqrs = sqlite_es::sqlite_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],

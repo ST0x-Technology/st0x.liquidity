@@ -19,11 +19,10 @@ use tracing::{error, info};
 use crate::config::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
+use crate::offchain_order::{OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand};
 use crate::onchain::OnchainTrade;
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain_trade::OnChainTrade;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
@@ -275,8 +274,6 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let onchain_trade_cqrs: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>> =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
     let position_view_repo = Arc::new(SqliteViewRepository::new(
         pool.clone(),
         "position_view".to_string(),
@@ -288,8 +285,18 @@ pub(super) async fn process_found_trade<W: Write>(
             vec![Box::new(GenericQuery::new(position_view_repo))],
             (),
         ));
+    let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+        OffchainOrderAggregate,
+        OffchainOrderAggregate,
+    >::new(
+        pool.clone(), "offchain_order_view".to_string()
+    ));
     let offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>> =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+            (),
+        ));
 
     update_position_aggregate(&position_cqrs, &onchain_trade, config.execution_threshold).await;
 

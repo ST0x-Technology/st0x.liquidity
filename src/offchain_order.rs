@@ -5,18 +5,17 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, OrderStatus, Positive, SupportedExecutor, Symbol,
+    Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
 use tracing::error;
 use uuid::Uuid;
 
 use sqlite_es::SqliteCqrs;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never, SqliteQuery};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
 pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder, Never>;
 pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
-pub(crate) type OffchainOrderQuery = SqliteQuery<OffchainOrder, Never>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
@@ -123,16 +122,6 @@ impl OffchainOrder {
             | Self::PartiallyFilled { direction, .. }
             | Self::Filled { direction, .. }
             | Self::Failed { direction, .. } => *direction,
-        }
-    }
-
-    pub(crate) fn executor(&self) -> SupportedExecutor {
-        match self {
-            Self::Pending { executor, .. }
-            | Self::Submitted { executor, .. }
-            | Self::PartiallyFilled { executor, .. }
-            | Self::Filled { executor, .. }
-            | Self::Failed { executor, .. } => *executor,
         }
     }
 

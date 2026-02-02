@@ -10,13 +10,12 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
-    ArithmeticError, EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
-    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive, SharesConversionError,
+    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
+    InvalidSharesError, PersistenceError, SharesConversionError,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::config::ConfigError;
-use crate::lifecycle::LifecycleError;
 use crate::offchain_order::{NegativePriceCents, OffchainOrderError, OffchainOrderId};
 use crate::onchain_trade::OnChainTradeError;
 use crate::position::PositionError;
@@ -43,13 +42,6 @@ pub(crate) enum TradeValidationError {
         "Expected IO to contain USDC and one tokenized equity (t prefix, 0x or s1 suffix) but got {0} and {1}"
     )]
     InvalidSymbolConfiguration(String, String),
-    #[error(
-        "Could not fully allocate execution shares for symbol {symbol}. Remaining: {remaining_shares}"
-    )]
-    InsufficientTradeAllocation {
-        symbol: String,
-        remaining_shares: f64,
-    },
     #[error("Failed to convert U256 to f64: {0}")]
     U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]
@@ -74,8 +66,6 @@ pub(crate) enum TradeValidationError {
     },
     #[error("Negative shares amount: {0}")]
     NegativeShares(f64),
-    #[error("Share quantity {0} cannot be converted to f64")]
-    ShareConversionFailed(Positive<FractionalShares>),
     #[error("Negative USDC amount: {0}")]
     NegativeUsdc(f64),
     #[error(
@@ -205,22 +195,6 @@ pub(crate) enum OnChainError {
     DecimalConversion(#[from] rust_decimal::Error),
     #[error("Negative price in cents: {0}")]
     NegativePriceCents(#[from] NegativePriceCents),
-    #[error("Position aggregate {aggregate_id} is in failed state: {error}")]
-    PositionAggregateFailed {
-        aggregate_id: String,
-        error: LifecycleError<ArithmeticError<FractionalShares>>,
-    },
-    #[error("Missing block timestamp for trade: tx_hash={tx_hash:?}, log_index={log_index}")]
-    MissingBlockTimestamp {
-        tx_hash: alloy::primitives::TxHash,
-        log_index: u64,
-    },
-    #[error("Missing execution ID")]
-    MissingExecutionId,
-    #[error(
-        "Invalid order state for execution {execution_id}: expected {expected}, got different state"
-    )]
-    InvalidOrderState { execution_id: i64, expected: String },
     #[error("JSON serde error: {0}")]
     JsonSerde(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]

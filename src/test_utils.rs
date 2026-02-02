@@ -153,18 +153,6 @@ impl OnchainTradeBuilder {
         self
     }
 
-    #[must_use]
-    pub(crate) fn with_tx_hash(mut self, hash: alloy::primitives::B256) -> Self {
-        self.trade.tx_hash = hash;
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_log_index(mut self, index: u64) -> Self {
-        self.trade.log_index = index;
-        self
-    }
-
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
     }

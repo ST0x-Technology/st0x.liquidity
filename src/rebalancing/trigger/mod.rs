@@ -612,7 +612,7 @@ mod tests {
     use crate::lifecycle::Lifecycle;
     use st0x_execution::ExecutorOrderId;
 
-    use crate::offchain_order::{ExecutionId, PriceCents};
+    use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -737,7 +737,7 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
+            offchain_order_id: OffchainOrder::aggregate_id(),
             shares_filled,
             direction,
             executor_order_id: ExecutorOrderId::new("ORD1"),

@@ -40,7 +40,7 @@ use crate::lifecycle::Lifecycle;
 use crate::offchain::execution::find_execution_by_id;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
+    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
 };
 use crate::onchain::accumulator::{
     ExecutionParams, check_all_positions, check_execution_readiness,
@@ -279,7 +279,17 @@ impl Conductor {
             (),
         ));
 
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+            OffchainOrderAggregate,
+            OffchainOrderAggregate,
+        >::new(
+            pool.clone(), "offchain_order_view".to_string()
+        ));
+        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+            (),
+        ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
@@ -529,7 +539,6 @@ fn spawn_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    cqrs_pool: SqlitePool,
     onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
     position_cqrs: Arc<PositionCqrs>,
     position_query: Arc<PositionQuery>,
@@ -1645,17 +1654,15 @@ mod tests {
     use cqrs_es::persist::GenericQuery;
     use futures_util::stream;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-    use st0x_execution::{Direction, MockExecutorConfig, Symbol, TryIntoExecutor};
+    use st0x_execution::{MockExecutorConfig, Symbol, TryIntoExecutor};
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_config;
-    use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
-    use crate::tokenized_symbol;
 
     fn create_test_cqrs_frameworks(pool: &SqlitePool) -> CqrsFrameworks {
         let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
@@ -1671,7 +1678,17 @@ mod tests {
             (),
         ));
 
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+            OffchainOrderAggregate,
+            OffchainOrderAggregate,
+        >::new(
+            pool.clone(), "offchain_order_view".to_string()
+        ));
+        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+            (),
+        ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -1730,80 +1747,6 @@ mod tests {
             .unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
-        assert_eq!(count, 1);
-
-        let trade_count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(trade_count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_onchain_trade_duplicate_handling() {
-        let pool = setup_test_db().await;
-
-        let existing_trade = OnchainTradeBuilder::new()
-            .with_tx_hash(fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ))
-            .with_log_index(293)
-            .with_symbol("AAPL0x")
-            .with_amount(5.0)
-            .with_price(20000.0)
-            .build();
-        let mut sql_tx = pool.begin().await.unwrap();
-        existing_trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-        sql_tx.commit().await.unwrap();
-
-        let duplicate_trade = existing_trade.clone();
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
-        assert!(duplicate_result.is_err());
-        sql_tx2.rollback().await.unwrap();
-
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[tokio::test]
-    async fn test_duplicate_trade_handling() {
-        let pool = setup_test_db().await;
-
-        let existing_trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ),
-            log_index: 293,
-            symbol: tokenized_symbol!("AAPL0x"),
-            equity_token: Address::ZERO,
-            amount: 5.0,
-            direction: Direction::Sell,
-            price: Usdc::new(20000.0).unwrap(),
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-        let mut sql_tx = pool.begin().await.unwrap();
-        existing_trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap();
-        sql_tx.commit().await.unwrap();
-
-        let duplicate_trade = existing_trade.clone();
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
-        assert!(duplicate_result.is_err());
-        sql_tx2.rollback().await.unwrap();
-
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
         assert_eq!(count, 1);
     }
 

@@ -1,6 +1,6 @@
--- Fix offchain_order_view generated columns:
--- 1. 'broker' -> 'executor' (wrong JSON path)
--- 2. 'execution_id' INTEGER -> 'offchain_order_id' TEXT (renamed field, now UUID)
+-- Fix offchain_order_view generated columns for Lifecycle<OffchainOrder, Never> wrapping.
+-- The aggregate serializes as {"Live": {"Submitted": {...fields...}}}, so we use
+-- CASE expressions to extract the variant name (status) and COALESCE for shared fields.
 -- SQLite requires table recreation to modify generated columns.
 
 CREATE TABLE offchain_order_view_new (
@@ -8,12 +8,42 @@ CREATE TABLE offchain_order_view_new (
     version BIGINT NOT NULL,
     payload JSON NOT NULL,
 
-    -- STORED generated columns for efficient querying
-    offchain_order_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Execution.offchain_order_id')) STORED,
-    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Execution.symbol')) STORED,
-    status TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Execution.status')) STORED,
-    executor TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Execution.executor')) STORED,
-    executor_order_id TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Execution.executor_order_id')) STORED
+    -- STORED generated columns using Lifecycle serialization paths
+    symbol TEXT GENERATED ALWAYS AS (
+        COALESCE(
+            json_extract(payload, '$.Live.Pending.symbol'),
+            json_extract(payload, '$.Live.Submitted.symbol'),
+            json_extract(payload, '$.Live.PartiallyFilled.symbol'),
+            json_extract(payload, '$.Live.Filled.symbol'),
+            json_extract(payload, '$.Live.Failed.symbol')
+        )
+    ) STORED,
+    status TEXT GENERATED ALWAYS AS (
+        CASE
+            WHEN json_extract(payload, '$.Live.Pending') IS NOT NULL THEN 'Pending'
+            WHEN json_extract(payload, '$.Live.Submitted') IS NOT NULL THEN 'Submitted'
+            WHEN json_extract(payload, '$.Live.PartiallyFilled') IS NOT NULL THEN 'PartiallyFilled'
+            WHEN json_extract(payload, '$.Live.Filled') IS NOT NULL THEN 'Filled'
+            WHEN json_extract(payload, '$.Live.Failed') IS NOT NULL THEN 'Failed'
+            ELSE NULL
+        END
+    ) STORED,
+    executor TEXT GENERATED ALWAYS AS (
+        COALESCE(
+            json_extract(payload, '$.Live.Pending.executor'),
+            json_extract(payload, '$.Live.Submitted.executor'),
+            json_extract(payload, '$.Live.PartiallyFilled.executor'),
+            json_extract(payload, '$.Live.Filled.executor'),
+            json_extract(payload, '$.Live.Failed.executor')
+        )
+    ) STORED,
+    executor_order_id TEXT GENERATED ALWAYS AS (
+        COALESCE(
+            json_extract(payload, '$.Live.Submitted.executor_order_id'),
+            json_extract(payload, '$.Live.PartiallyFilled.executor_order_id'),
+            json_extract(payload, '$.Live.Filled.executor_order_id')
+        )
+    ) STORED
 );
 
 INSERT INTO offchain_order_view_new (view_id, version, payload)
@@ -22,9 +52,6 @@ SELECT view_id, version, payload FROM offchain_order_view;
 DROP TABLE offchain_order_view;
 
 ALTER TABLE offchain_order_view_new RENAME TO offchain_order_view;
-
-CREATE INDEX IF NOT EXISTS idx_offchain_order_view_offchain_order_id
-    ON offchain_order_view(offchain_order_id) WHERE offchain_order_id IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_offchain_order_view_symbol
     ON offchain_order_view(symbol) WHERE symbol IS NOT NULL;

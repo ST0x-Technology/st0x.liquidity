@@ -1506,11 +1506,13 @@ impl UsdcRebalance {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::primitives::fixed_bytes;
+    use cqrs_es::{EventEnvelope, View};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
     use uuid::Uuid;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_initiate_alpaca_to_base() {

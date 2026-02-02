@@ -106,9 +106,7 @@ mod tests {
     use st0x_execution::{FractionalShares, Positive, SupportedExecutor, Symbol};
 
     use super::*;
-    use crate::position::{
-        Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery,
-    };
+    use crate::position::{Position, PositionCommand, PositionCqrs, PositionQuery};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
 
