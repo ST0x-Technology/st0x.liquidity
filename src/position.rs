@@ -747,8 +747,11 @@ pub(crate) async fn load_position(
 
 #[cfg(test)]
 mod tests {
+    use cqrs_es::EventEnvelope;
+    use cqrs_es::persist::GenericQuery;
     use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
+    use sqlite_es::SqliteViewRepository;
     use sqlx::SqlitePool;
     use std::collections::HashMap;
     use std::str::FromStr;

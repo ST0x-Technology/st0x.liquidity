@@ -1,15 +1,13 @@
-use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
-use crate::offchain::execution::OffchainExecution;
-use crate::onchain::OnchainTrade;
-use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 use alloy::primitives::{LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
-use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::OrderState;
+use st0x_execution::Direction;
 use st0x_execution::schwab::{SchwabAuthConfig, SchwabTokens};
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+
+use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
+use crate::onchain::OnchainTrade;
+use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important – only that the
@@ -169,36 +167,5 @@ impl OnchainTradeBuilder {
 
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
-    }
-}
-
-/// Builder for creating OffchainExecution test instances with sensible defaults.
-/// Reduces duplication in test data setup.
-pub(crate) struct OffchainExecutionBuilder {
-    execution: OffchainExecution,
-}
-
-impl Default for OffchainExecutionBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OffchainExecutionBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            execution: OffchainExecution {
-                id: None,
-                symbol: Symbol::new("AAPL").unwrap(),
-                shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
-                direction: Direction::Buy,
-                executor: SupportedExecutor::Schwab,
-                state: OrderState::Pending,
-            },
-        }
-    }
-
-    pub(crate) fn build(self) -> OffchainExecution {
-        self.execution
     }
 }
