@@ -1,7 +1,5 @@
 rec {
   keys = {
-    gleb =
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHepyxN9hvXzbCY/z0amzldy7DXjNdyetnVaQexRgDEX";
     st0x-op =
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPZ56nOYbGDd0ZfbqxeY7AbvaQGQrHnlC80ccpRGpCoj";
     host =
@@ -11,8 +9,8 @@ rec {
   };
 
   roles = {
-    infra = [ keys.gleb keys.st0x-op keys.ci ];
-    service = [ keys.gleb keys.st0x-op keys.host ];
-    ssh = [ keys.gleb keys.st0x-op keys.ci ];
+    infra = [ keys.st0x-op keys.ci ];
+    service = [ keys.st0x-op keys.host ];
+    ssh = [ keys.st0x-op keys.ci ];
   };
 }
