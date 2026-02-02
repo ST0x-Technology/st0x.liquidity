@@ -14,7 +14,7 @@ use st0x_event_sorcery::{Projection, Store};
 use st0x_execution::Executor;
 
 use super::{
-    Conductor, EventProcessingError, spawn_event_processor, spawn_inventory_poller,
+    Conductor, EventProcessingError, TradingTasks, spawn_event_processor, spawn_inventory_poller,
     spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
     spawn_queue_processor,
 };
@@ -226,13 +226,15 @@ where
 
         Conductor {
             executor_maintenance,
-            order_poller,
-            dex_event_receiver,
-            event_processor,
-            position_checker,
-            queue_processor,
             rebalancer,
             inventory_poller,
+            trading_tasks: Some(TradingTasks {
+                order_poller,
+                dex_event_receiver,
+                event_processor,
+                position_checker,
+                queue_processor,
+            }),
         }
     }
 }

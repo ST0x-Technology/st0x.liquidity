@@ -73,13 +73,17 @@ struct TradeProcessingCqrs {
 
 pub(crate) struct Conductor {
     pub(crate) executor_maintenance: Option<JoinHandle<()>>,
+    pub(crate) rebalancer: Option<JoinHandle<()>>,
+    pub(crate) inventory_poller: Option<JoinHandle<()>>,
+    pub(crate) trading_tasks: Option<TradingTasks>,
+}
+
+pub(crate) struct TradingTasks {
     pub(crate) order_poller: JoinHandle<()>,
     pub(crate) dex_event_receiver: JoinHandle<()>,
     pub(crate) event_processor: JoinHandle<()>,
     pub(crate) position_checker: JoinHandle<()>,
     pub(crate) queue_processor: JoinHandle<()>,
-    pub(crate) rebalancer: Option<JoinHandle<()>>,
-    pub(crate) inventory_poller: Option<JoinHandle<()>>,
 }
 
 /// Event processing errors for live event handling.
@@ -222,11 +226,11 @@ where
 }
 
 fn handle_conductor_completion(
-    conductor: &Conductor,
+    conductor: &mut Conductor,
     result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     info!("Conductor completed");
-    conductor.abort_all_tasks();
+    conductor.abort_all();
     result?;
     info!(
         "Conductor completed successfully, \
@@ -371,6 +375,7 @@ impl Conductor {
         Ok(builder.spawn())
     }
 
+impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
         let maintenance_task =
             wait_for_optional_task(&mut self.executor_maintenance, "Executor maintenance");
@@ -378,15 +383,20 @@ impl Conductor {
         let inventory_poller_task =
             wait_for_optional_task(&mut self.inventory_poller, "Inventory poller");
 
+        let Some(tasks) = self.trading_tasks.as_mut() else {
+            tokio::join!(maintenance_task, rebalancer_task, inventory_poller_task);
+            return Ok(());
+        };
+
         let ((), (), (), poller, dex, processor, position, queue) = tokio::join!(
             maintenance_task,
             rebalancer_task,
             inventory_poller_task,
-            &mut self.order_poller,
-            &mut self.dex_event_receiver,
-            &mut self.event_processor,
-            &mut self.position_checker,
-            &mut self.queue_processor
+            &mut tasks.order_poller,
+            &mut tasks.dex_event_receiver,
+            &mut tasks.event_processor,
+            &mut tasks.position_checker,
+            &mut tasks.queue_processor
         );
 
         log_task_result(poller, "Order poller");
@@ -398,21 +408,25 @@ impl Conductor {
         Ok(())
     }
 
-    pub(crate) fn abort_all_tasks(&self) {
-        self.abort_trading_tasks();
-        self.dex_event_receiver.abort();
-        if let Some(ref handle) = self.executor_maintenance {
-            handle.abort();
-        }
+    pub(crate) fn abort_trading_tasks(&mut self) {
+        let Some(tasks) = self.trading_tasks.take() else {
+            info!("No trading tasks to abort");
+            return;
+        };
+
+        info!(
+            "Aborting trading tasks (keeping rebalancer, inventory poller, and broker maintenance alive)"
+        );
+        tasks.order_poller.abort();
+        tasks.dex_event_receiver.abort();
+        tasks.event_processor.abort();
+        tasks.position_checker.abort();
+        tasks.queue_processor.abort();
+        info!("Trading tasks aborted successfully");
     }
 
-    pub(crate) fn abort_trading_tasks(&self) {
-        info!("Aborting trading tasks (keeping broker maintenance and DEX event receiver alive)");
-
-        self.order_poller.abort();
-        self.event_processor.abort();
-        self.position_checker.abort();
-        self.queue_processor.abort();
+    pub(crate) fn abort_all(&mut self) {
+        self.abort_trading_tasks();
 
         if let Some(ref handle) = self.rebalancer {
             handle.abort();
@@ -420,8 +434,9 @@ impl Conductor {
         if let Some(ref handle) = self.inventory_poller {
             handle.abort();
         }
-
-        info!("Trading tasks aborted successfully (DEX events will continue buffering)");
+        if let Some(ref handle) = self.executor_maintenance {
+            handle.abort();
+        }
     }
 }
 
@@ -1226,10 +1241,11 @@ async fn process_queued_trade(
         return Ok(None);
     };
 
-    place_offchain_order(&execution, cqrs).await
+    place_offchain_order(pool, &execution, cqrs).await
 }
 
 async fn place_offchain_order(
+    pool: &SqlitePool,
     execution: &ExecutionCtx,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
@@ -1238,7 +1254,64 @@ async fn place_offchain_order(
     execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
+    if let Some(error) = load_offchain_order_failure(pool, offchain_order_id).await {
+        warn!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            %error,
+            "Broker rejected order, clearing position pending state"
+        );
+        execute_fail_offchain_order_position(&cqrs.position, offchain_order_id, execution, error)
+            .await;
+    }
+
     Ok(Some(offchain_order_id))
+}
+
+async fn load_offchain_order_failure(
+    pool: &SqlitePool,
+    offchain_order_id: OffchainOrderId,
+) -> Option<String> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT payload FROM offchain_order_view WHERE view_id = ?1")
+            .bind(offchain_order_id.to_string())
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+
+    let (payload,) = row?;
+    let aggregate: OffchainOrderAggregate = serde_json::from_str(&payload).ok()?;
+
+    match aggregate {
+        crate::lifecycle::Lifecycle::Live(OffchainOrder::Failed { error, .. }) => Some(error),
+        _ => None,
+    }
+}
+
+async fn execute_fail_offchain_order_position(
+    position: &Store<Position>,
+    offchain_order_id: OffchainOrderId,
+    execution: &ExecutionCtx,
+    error: String,
+) {
+    let command = PositionCommand::FailOffChainOrder {
+        offchain_order_id,
+        error,
+    };
+
+    match position.send(&execution.symbol, command).await {
+        Ok(()) => info!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "Position::FailOffChainOrder succeeded"
+        ),
+        Err(e) => error!(
+            %offchain_order_id,
+            symbol = %execution.symbol,
+            "Position::FailOffChainOrder failed: {e}"
+        ),
+    }
 }
 
 async fn execute_place_offchain_order(
@@ -1358,6 +1431,8 @@ where
             "Executing accumulated position"
         );
 
+        // TODO: add broker rejection handling (load_offchain_order_failure +
+        // execute_fail_offchain_order_position) like in place_offchain_order
         let command = PositionCommand::PlaceOffChainOrder {
             offchain_order_id,
             shares: execution.shares,
@@ -1765,11 +1840,12 @@ mod tests {
         .with_dex_event_streams(clear_stream, take_stream)
         .spawn();
 
-        conductor.order_poller.abort();
-        conductor.event_processor.abort();
-        conductor.position_checker.abort();
-        conductor.queue_processor.abort();
-        conductor.dex_event_receiver.abort();
+        let tasks = conductor.trading_tasks.as_ref().unwrap();
+        tasks.order_poller.abort();
+        tasks.event_processor.abort();
+        tasks.position_checker.abort();
+        tasks.queue_processor.abort();
+        tasks.dex_event_receiver.abort();
     }
 
     #[tokio::test]
@@ -1799,10 +1875,11 @@ mod tests {
         .with_dex_event_streams(clear_stream, take_stream)
         .spawn();
 
-        assert!(!conductor.order_poller.is_finished());
-        assert!(!conductor.event_processor.is_finished());
-        assert!(!conductor.position_checker.is_finished());
-        assert!(!conductor.queue_processor.is_finished());
+        let tasks = conductor.trading_tasks.as_ref().unwrap();
+        assert!(!tasks.order_poller.is_finished());
+        assert!(!tasks.event_processor.is_finished());
+        assert!(!tasks.position_checker.is_finished());
+        assert!(!tasks.queue_processor.is_finished());
 
         conductor.abort_all_tasks();
     }
@@ -1919,7 +1996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
+    async fn test_conductor_rebalancer_survives_abort_trading_tasks() {
         let pool = setup_test_db().await;
         let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
@@ -1938,7 +2015,7 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(
+        let mut conductor = ConductorBuilder::new(
             config,
             pool,
             cache,
@@ -1954,18 +2031,65 @@ mod tests {
 
         conductor.abort_trading_tasks();
 
-        // abort_trading_tasks aborts the rebalancer
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(conductor.rebalancer.as_ref().unwrap().is_finished());
+        // abort_trading_tasks does NOT abort the rebalancer
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 
-        // Clean up remaining tasks
-        conductor.dex_event_receiver.abort();
-        if let Some(executor_maintenance) = conductor.executor_maintenance {
-            executor_maintenance.abort();
-        }
-        if let Some(inventory_poller) = conductor.inventory_poller {
-            inventory_poller.abort();
-        }
+        // Trading tasks should be gone
+        assert!(conductor.trading_tasks.is_none());
+
+        // Clean up remaining infrastructure tasks
+        abort_all_conductor_tasks(conductor);
+    }
+
+    #[tokio::test]
+    async fn test_conductor_trading_tasks_aborted_on_abort_trading_tasks() {
+        let pool = setup_test_db().await;
+        let config = create_test_config();
+        let cache = SymbolCache::default();
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let frameworks = create_test_cqrs_frameworks(&pool);
+
+        let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
+        let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
+
+        let mut conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            ExecutionThreshold::whole_share(),
+            frameworks,
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
+
+        // Capture handles before abort
+        let order_poller = conductor
+            .trading_tasks
+            .as_ref()
+            .unwrap()
+            .order_poller
+            .abort_handle();
+        let event_processor = conductor
+            .trading_tasks
+            .as_ref()
+            .unwrap()
+            .event_processor
+            .abort_handle();
+
+        conductor.abort_trading_tasks();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(order_poller.is_finished());
+        assert!(event_processor.is_finished());
+        assert!(conductor.trading_tasks.is_none());
+
+        abort_all_conductor_tasks(conductor);
     }
 
     #[tokio::test]
