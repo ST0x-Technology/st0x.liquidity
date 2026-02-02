@@ -335,8 +335,13 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor_type = config.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
 
-    let Some(params) =
-        check_execution_readiness(&position_query, base_symbol, executor_type).await?
+    let Some(params) = check_execution_readiness(
+        &position_query,
+        base_symbol,
+        executor_type,
+        &config.execution_threshold,
+    )
+    .await?
     else {
         writeln!(
             stdout,
@@ -365,6 +370,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 shares: params.shares,
                 direction: params.direction,
                 executor: params.executor,
+                threshold: config.execution_threshold,
             },
         )
         .await
@@ -402,13 +408,6 @@ async fn update_position_aggregate(
     let base_symbol = onchain_trade.symbol.base();
     let aggregate_id = Position::aggregate_id(base_symbol);
 
-    initialize_position(
-        position_cqrs,
-        &aggregate_id,
-        onchain_trade,
-        execution_threshold,
-    )
-    .await;
     acknowledge_fill(
         position_cqrs,
         &aggregate_id,
@@ -416,35 +415,6 @@ async fn update_position_aggregate(
         execution_threshold,
     )
     .await;
-}
-
-async fn initialize_position(
-    position_cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
-    aggregate_id: &str,
-    onchain_trade: &OnchainTrade,
-    execution_threshold: ExecutionThreshold,
-) {
-    let base_symbol = onchain_trade.symbol.base();
-
-    if let Err(e) = position_cqrs
-        .execute(
-            aggregate_id,
-            PositionCommand::Initialize {
-                symbol: base_symbol.clone(),
-                threshold: execution_threshold,
-            },
-        )
-        .await
-    {
-        error!(
-            symbol = %base_symbol,
-            execution_threshold = ?execution_threshold,
-            tx_hash = %onchain_trade.tx_hash,
-            log_index = onchain_trade.log_index,
-            error = ?e,
-            "Failed to initialize position aggregate"
-        );
-    }
 }
 
 fn extract_fill_params(

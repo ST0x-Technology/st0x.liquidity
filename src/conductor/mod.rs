@@ -626,6 +626,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     position_cqrs: Arc<PositionCqrs>,
     position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -648,6 +649,7 @@ where
                 &position_cqrs,
                 &position_query,
                 &offchain_order_cqrs,
+                &execution_threshold,
             )
             .await
             {
@@ -1168,31 +1170,6 @@ async fn execute_witness_trade(
     }
 }
 
-async fn execute_initialize_position(
-    position_cqrs: &PositionCqrs,
-    trade: &OnchainTrade,
-    execution_threshold: ExecutionThreshold,
-) {
-    let base_symbol = trade.symbol.base();
-    let aggregate_id = Position::aggregate_id(base_symbol);
-
-    let command = PositionCommand::Initialize {
-        symbol: base_symbol.clone(),
-        threshold: execution_threshold,
-    };
-
-    match position_cqrs.execute(&aggregate_id, command).await {
-        Ok(()) => info!(
-            "Successfully initialized Position aggregate for symbol={}",
-            base_symbol
-        ),
-        Err(e) => debug!(
-            "Position initialization skipped (likely already exists): {e}, symbol={}",
-            base_symbol
-        ),
-    }
-}
-
 async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainTrade) {
     let base_symbol = trade.symbol.base();
     let aggregate_id = Position::aggregate_id(base_symbol);
@@ -1237,8 +1214,10 @@ async fn execute_new_execution_cqrs(
     offchain_order_cqrs: &OffchainOrderCqrs,
     offchain_order_id: OffchainOrderId,
     params: &ExecutionParams,
+    threshold: &ExecutionThreshold,
 ) {
-    execute_place_offchain_order_position(position_cqrs, offchain_order_id, params).await;
+    execute_place_offchain_order_position(position_cqrs, offchain_order_id, params, threshold)
+        .await;
     execute_place_offchain_order(offchain_order_cqrs, offchain_order_id, params).await;
 }
 
@@ -1246,6 +1225,7 @@ async fn execute_place_offchain_order_position(
     position_cqrs: &PositionCqrs,
     offchain_order_id: OffchainOrderId,
     params: &ExecutionParams,
+    threshold: &ExecutionThreshold,
 ) {
     let position_agg_id = Position::aggregate_id(&params.symbol);
 
@@ -1254,6 +1234,7 @@ async fn execute_place_offchain_order_position(
         shares: params.shares,
         direction: params.direction,
         executor: params.executor,
+        threshold: *threshold,
     };
 
     match position_cqrs.execute(&position_agg_id, command).await {
@@ -1307,7 +1288,6 @@ async fn process_queued_trade(
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
-    execute_initialize_position(&cqrs.position_cqrs, &trade, cqrs.execution_threshold).await;
     execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
 
     mark_event_processed(pool, event_id).await.map_err(|e| {
@@ -1324,8 +1304,13 @@ async fn process_queued_trade(
 
     let base_symbol = trade.symbol.base();
 
-    let Some(params) =
-        check_execution_readiness(&cqrs.position_query, base_symbol, executor_type).await?
+    let Some(params) = check_execution_readiness(
+        &cqrs.position_query,
+        base_symbol,
+        executor_type,
+        &cqrs.execution_threshold,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -1336,6 +1321,7 @@ async fn process_queued_trade(
         &cqrs.offchain_order_cqrs,
         offchain_order_id,
         &params,
+        &cqrs.execution_threshold,
     )
     .await;
 
@@ -1377,13 +1363,15 @@ async fn check_and_execute_accumulated_positions<E>(
     position_cqrs: &PositionCqrs,
     position_query: &PositionQuery,
     offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
+    threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions = check_all_positions(pool, position_query, executor_type).await?;
+    let ready_positions =
+        check_all_positions(pool, position_query, executor_type, threshold).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1411,6 +1399,7 @@ where
             offchain_order_cqrs,
             offchain_order_id,
             &params,
+            threshold,
         )
         .await;
     }
@@ -3184,6 +3173,7 @@ mod tests {
             &cqrs.position_cqrs,
             &cqrs.position_query,
             &cqrs.offchain_order_cqrs,
+            &cqrs.execution_threshold,
         )
         .await
         .unwrap();
@@ -3389,16 +3379,6 @@ mod tests {
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
 
         let position_agg_id = Position::aggregate_id(&symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
-                PositionCommand::Initialize {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
 
         // Acknowledge a fill -> fires position events -> trigger should react.
         position_cqrs
@@ -3472,16 +3452,6 @@ mod tests {
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
 
         let position_agg_id = Position::aggregate_id(&symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
-                PositionCommand::Initialize {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
 
         // Add 50 onchain shares via CQRS -> trigger applies to inventory.
         position_cqrs
@@ -3576,16 +3546,6 @@ mod tests {
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
 
         let position_agg_id = Position::aggregate_id(&symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
-                PositionCommand::Initialize {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
 
         // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
         position_cqrs
@@ -3700,18 +3660,6 @@ mod tests {
 
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
 
-        let position_agg_id = Position::aggregate_id(&symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
-                PositionCommand::Initialize {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
         (position_cqrs, receiver, symbol)
     }
 
@@ -3720,13 +3668,13 @@ mod tests {
         let (position_cqrs, mut receiver, symbol) = setup_near_upper_threshold_position().await;
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
-        // Initialize should NOT trigger (65% within 30%-70% bounds).
+        // No position commands yet -> no triggers fired.
         assert!(
             matches!(
                 receiver.try_recv(),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ),
-            "Initialize should not trigger on balanced inventory"
+            "No commands executed yet, channel should be empty"
         );
 
         // +20 onchain: 85 onchain, 35 offchain, total=120, target=60, excess=25.
@@ -3831,16 +3779,6 @@ mod tests {
             let (position_cqrs, position_query) = build_position_cqrs(&pool, None);
 
             let position_agg_id = Position::aggregate_id(&symbol);
-            position_cqrs
-                .execute(
-                    &position_agg_id,
-                    PositionCommand::Initialize {
-                        symbol: symbol.clone(),
-                        threshold: ExecutionThreshold::whole_share(),
-                    },
-                )
-                .await
-                .unwrap();
 
             position_cqrs
                 .execute(

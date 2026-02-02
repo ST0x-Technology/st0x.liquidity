@@ -434,11 +434,9 @@ impl InventoryView {
                 )
             }
 
-            PositionEvent::Initialized { .. }
-            | PositionEvent::Migrated { .. }
+            PositionEvent::Migrated { .. }
             | PositionEvent::OffChainOrderPlaced { .. }
-            | PositionEvent::OffChainOrderFailed { .. }
-            | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
+            | PositionEvent::OffChainOrderFailed { .. } => Ok(Self {
                 last_updated: timestamp,
                 ..self
             }),
@@ -718,7 +716,6 @@ mod tests {
 
     use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
-    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
 
     fn shares(n: i64) -> FractionalShares {
@@ -1020,10 +1017,10 @@ mod tests {
         };
 
         let event_time = original_time + chrono::Duration::hours(1);
-        let event = PositionEvent::Initialized {
-            symbol: symbol.clone(),
-            threshold: ExecutionThreshold::whole_share(),
-            initialized_at: event_time,
+        let event = PositionEvent::OffChainOrderFailed {
+            offchain_order_id: OffchainOrder::aggregate_id(),
+            error: "test".to_string(),
+            failed_at: event_time,
         };
 
         let updated = view.apply_position_event(&symbol, &event).unwrap();

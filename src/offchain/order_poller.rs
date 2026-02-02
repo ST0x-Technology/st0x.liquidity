@@ -373,17 +373,6 @@ mod tests {
     ) {
         let aggregate_id = Position::aggregate_id(symbol);
 
-        position_cqrs
-            .execute(
-                &aggregate_id,
-                PositionCommand::Initialize {
-                    symbol: symbol.clone(),
-                    threshold: ExecutionThreshold::whole_share(),
-                },
-            )
-            .await
-            .unwrap();
-
         let mut onchain_trade = OnchainTradeBuilder::new()
             .with_symbol(tokenized_symbol)
             .with_amount(amount)
@@ -453,6 +442,7 @@ mod tests {
                     shares: params.shares,
                     direction: params.direction,
                     executor: params.executor,
+                    threshold: ExecutionThreshold::whole_share(),
                 },
             )
             .await
@@ -548,11 +538,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(position_events.len(), 4);
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFilled");
+        assert_eq!(position_events.len(), 3);
+        assert_eq!(position_events[0], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[1], "PositionEvent::OffChainOrderPlaced");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderFilled");
     }
 
     #[tokio::test]
@@ -628,10 +617,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(position_events.len(), 4);
-        assert_eq!(position_events[0], "PositionEvent::Initialized");
-        assert_eq!(position_events[1], "PositionEvent::OnChainOrderFilled");
-        assert_eq!(position_events[2], "PositionEvent::OffChainOrderPlaced");
-        assert_eq!(position_events[3], "PositionEvent::OffChainOrderFailed");
+        assert_eq!(position_events.len(), 3);
+        assert_eq!(position_events[0], "PositionEvent::OnChainOrderFilled");
+        assert_eq!(position_events[1], "PositionEvent::OffChainOrderPlaced");
+        assert_eq!(position_events[2], "PositionEvent::OffChainOrderFailed");
     }
 }

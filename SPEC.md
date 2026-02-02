@@ -1185,10 +1185,6 @@ struct TradeId {
 }
 
 enum PositionCommand {
-    Initialize {
-        symbol: Symbol,
-        threshold: ExecutionThreshold,
-    },
     AcknowledgeOnChainFill {
         trade_id: TradeId,
         amount: FractionalShares,
@@ -1201,6 +1197,7 @@ enum PositionCommand {
         shares: FractionalShares,
         direction: Direction,
         broker: SupportedBroker,
+        threshold: ExecutionThreshold,
     },
     CompleteOffChainOrder {
         execution_id: ExecutionId,
@@ -1213,9 +1210,6 @@ enum PositionCommand {
     FailOffChainOrder {
         execution_id: ExecutionId,
         error: String,
-    },
-    UpdateThreshold {
-        threshold: ExecutionThreshold,
     },
 }
 ```
@@ -1231,11 +1225,6 @@ enum PositionEvent {
         accumulated_short: FractionalShares,
         threshold: ExecutionThreshold,
         migrated_at: DateTime<Utc>,
-    },
-    Initialized {
-        symbol: Symbol,
-        threshold: ExecutionThreshold,
-        initialized_at: DateTime<Utc>,
     },
     OnChainOrderFilled {
         trade_id: TradeId,
@@ -1266,11 +1255,6 @@ enum PositionEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
-    ThresholdUpdated {
-        old_threshold: ExecutionThreshold,
-        new_threshold: ExecutionThreshold,
-        updated_at: DateTime<Utc>,
-    },
 }
 
 enum TriggerReason {
@@ -1289,7 +1273,8 @@ enum TriggerReason {
 
 **Business Rules** (enforced in `handle()`):
 
-- Threshold must be configured before processing any fills (Initialize command)
+- `AcknowledgeOnChainFill` serves as the genesis event (initializes the
+  aggregate on first fill)
 - Can only place offchain order when threshold is met:
   - **Shares threshold**: `|net_position| >= threshold` (e.g., 1.0 shares for
     Schwab)
@@ -1299,8 +1284,7 @@ enum TriggerReason {
   net = sell, negative net = buy)
 - Cannot have multiple pending executions for same symbol
 - OnChain fills are always applied (blockchain facts are immutable)
-- Threshold can be updated at any time, emits ThresholdUpdated event for audit
-  trail
+- Threshold is passed as a parameter to commands that need it
 
 #### OffchainOrder Aggregate
 
@@ -2745,7 +2729,6 @@ enum OnChainTradeEvent {
 
 enum PositionEvent {
     // Normal events (future system)
-    Initialized { /* ... */ },
     OnChainOrderFilled { /* ... */ },
     OffChainOrderPlaced { /* ... */ },
     OffChainOrderFilled { /* ... */ },

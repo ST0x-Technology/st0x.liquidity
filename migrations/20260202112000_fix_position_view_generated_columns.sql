@@ -1,5 +1,7 @@
 -- The position aggregate is now wrapped in Lifecycle<Position, E>, which
 -- serializes as {"Live": {...}} instead of {"Position": {...}}.
+-- The `symbol` field was removed from Position state (the aggregate ID
+-- is the symbol, so view_id already holds it).
 -- SQLite doesn't allow ALTER on generated columns, so recreate the table.
 
 -- Preserve existing data
@@ -13,8 +15,8 @@ CREATE TABLE position_view (
     version BIGINT NOT NULL,
     payload JSON NOT NULL,
 
-    -- STORED generated columns using Lifecycle serialization path
-    symbol TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Live.symbol')) STORED,
+    -- view_id IS the symbol (Position::aggregate_id returns symbol.to_string())
+    symbol TEXT GENERATED ALWAYS AS (view_id) STORED,
     net_position TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Live.net')) STORED,
     last_updated TEXT GENERATED ALWAYS AS (json_extract(payload, '$.Live.last_updated')) STORED
 );
