@@ -290,6 +290,17 @@ cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt
 ```
 
+### Dashboard Dependencies
+
+After changing `dashboard/bun.lock`, regenerate and format the Nix lockfile:
+
+```bash
+nix run .#genBunNix
+nix fmt -- dashboard/bun.nix
+```
+
+CI will fail if `bun.nix` is out of sync with `bun.lock`.
+
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Complete technical specification and architecture

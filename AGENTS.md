@@ -349,15 +349,8 @@ tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
-Environment variables (can be set via `.env` file):
-
-- `DATABASE_URL`: SQLite database path
-- `WS_RPC_URL`: WebSocket RPC endpoint for blockchain monitoring
-- `ORDERBOOK`: Raindex orderbook contract address
-- `ORDER_OWNER`: Owner address of orders to monitor for trades
-- `APP_KEY`, `APP_SECRET`: Charles Schwab API credentials
-- `REDIRECT_URI`: OAuth redirect URI (default: https://127.0.0.1)
-- `BASE_URL`: Schwab API base URL (default: https://api.schwabapi.com)
+All configuration is via TOML files passed with `--config-file`. See
+`example.toml` for available options.
 
 ### Code Quality & Best Practices
 
