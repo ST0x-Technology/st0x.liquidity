@@ -25,8 +25,9 @@ use crate::threshold::ExecutionThreshold;
 use crate::vault_registry::VaultRegistryAggregate;
 
 use super::{
-    Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
-    spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    Conductor, TradingTasks, spawn_event_processor, spawn_inventory_poller,
+    spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
+    spawn_queue_processor,
 };
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
@@ -226,13 +227,15 @@ where
 
         Conductor {
             executor_maintenance,
-            order_poller,
-            dex_event_receiver,
-            event_processor,
-            position_checker,
-            queue_processor,
             rebalancer,
             inventory_poller,
+            trading_tasks: Some(TradingTasks {
+                order_poller,
+                dex_event_receiver,
+                event_processor,
+                position_checker,
+                queue_processor,
+            }),
         }
     }
 }

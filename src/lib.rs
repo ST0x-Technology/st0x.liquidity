@@ -255,8 +255,7 @@ where
 {
     let executor_maintenance = executor.run_executor_maintenance().await;
 
-    conductor::run_market_hours_loop(executor, config, pool, executor_maintenance, event_sender)
-        .await
+    conductor::run_conductor(executor, config, pool, executor_maintenance, event_sender).await
 }
 
 #[cfg(test)]
