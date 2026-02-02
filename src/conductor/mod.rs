@@ -3814,5 +3814,37 @@ mod tests {
              but got {:?}. This leaves the position permanently stuck.",
             position.pending_offchain_order_id
         );
+
+        // After clearing the stuck state, the periodic position checker should
+        // find the position still has a net imbalance and place a new order.
+        // Rebuild CQRS with a broker that accepts orders (simulating the
+        // transient PDT restriction being lifted).
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let executor = st0x_execution::MockExecutor::new();
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            &pool,
+            &cqrs.position_cqrs,
+            &cqrs.position_query,
+            &cqrs.offchain_order_cqrs,
+            &cqrs.execution_threshold,
+        )
+        .await
+        .unwrap();
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Periodic checker should retry execution after broker rejection is cleared"
+        );
     }
 }

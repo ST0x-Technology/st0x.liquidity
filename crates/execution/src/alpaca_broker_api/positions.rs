@@ -60,11 +60,12 @@ pub(super) async fn fetch_inventory(
                         .checked_mul(Decimal::from(100))
                         .ok_or_else(conversion_error)?;
 
-                    if !in_cents.fract().is_zero() {
-                        return Err(conversion_error());
-                    }
-
-                    let cents = in_cents.to_i64().ok_or_else(conversion_error)?;
+                    // Alpaca's market_value is qty * price where both are
+                    // fractional, so sub-cent precision is normal (e.g.
+                    // 6.803 * 75.21 = 511.6476). Truncate to whole cents
+                    // since market_value_cents is i64. See #276 for
+                    // switching to Decimal to preserve full precision.
+                    let cents = in_cents.trunc().to_i64().ok_or_else(conversion_error)?;
 
                     Some(cents)
                 }
@@ -315,7 +316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_inventory_returns_error_on_fractional_cents_in_market_value() {
+    async fn fetch_inventory_truncates_sub_cent_market_value() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
@@ -328,7 +329,7 @@ mod tests {
                     {
                         "symbol": "AAPL",
                         "qty": "10.0",
-                        // 1575.005 * 100 = 157500.5 -> fractional cent
+                        // 1575.005 * 100 = 157500.5 -> truncates to 157500
                         "market_value": "1575.005"
                     }
                 ]));
@@ -345,15 +346,21 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let error = fetch_inventory(&client).await.unwrap_err();
+        let inventory = fetch_inventory(&client).await.unwrap();
 
         positions_mock.assert();
         account_mock.assert();
 
-        assert!(matches!(
-            error,
-            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
-        ));
+        let aapl = inventory
+            .positions
+            .iter()
+            .find(|p| p.symbol.to_string() == "AAPL")
+            .unwrap();
+        assert_eq!(
+            aapl.market_value_cents,
+            Some(157_500),
+            "Sub-cent market value 1575.005 should truncate to 157500 cents"
+        );
     }
 
     #[tokio::test]
@@ -433,8 +440,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             rklb.market_value_cents,
-            Some(51165),
-            "Sub-cent market value 511.6476 should round to 51165 cents"
+            Some(51164),
+            "Sub-cent market value 511.6476 should truncate to 51164 cents"
         );
     }
 }
