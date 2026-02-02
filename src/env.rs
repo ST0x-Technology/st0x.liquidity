@@ -1,5 +1,4 @@
 use alloy::primitives::Address;
-use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
@@ -115,8 +114,8 @@ pub(crate) enum ConfigError {
     Clap(#[from] clap::Error),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
-    #[error("failed to derive address from EVM_PRIVATE_KEY")]
-    PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
+    #[error("failed to resolve signer address")]
+    SignerResolve(#[from] Box<crate::fireblocks::SignerResolveError>),
     #[error("Invalid execution threshold: {0}")]
     InvalidThreshold(#[from] InvalidThresholdError),
     #[error("Invalid shares value: {0}")]
@@ -129,7 +128,7 @@ impl ConfigError {
             Self::Rebalancing(_) => "rebalancing configuration error",
             Self::Clap(_) => "missing or invalid environment variable",
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
-            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
+            Self::SignerResolve(_) => "failed to resolve signer address",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::InvalidShares(_) => "invalid shares value",
         }
@@ -295,13 +294,9 @@ impl Config {
         }
     }
 
-    pub(crate) fn order_owner(&self) -> Result<Address, ConfigError> {
+    pub(crate) async fn order_owner(&self) -> Result<Address, ConfigError> {
         match (&self.rebalancing, self.evm.order_owner) {
-            (Some(r), _) => {
-                let signer = PrivateKeySigner::from_bytes(&r.evm_private_key)
-                    .map_err(ConfigError::PrivateKeyDerivation)?;
-                Ok(signer.address())
-            }
+            (Some(r), _) => Ok(r.signer.address().await.map_err(Box::new)?),
             (None, Some(addr)) => Ok(addr),
             (None, None) => Err(ConfigError::MissingOrderOwner),
         }
@@ -542,6 +537,7 @@ pub(crate) mod tests {
                     "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                ("FIREBLOCKS_API_KEY", None),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
                     "BASE_ORDERBOOK",
@@ -605,6 +601,7 @@ pub(crate) mod tests {
                     "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                ("FIREBLOCKS_API_KEY", None),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
                     "BASE_ORDERBOOK",
@@ -651,7 +648,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rebalancing_enabled_missing_evm_private_key_fails() {
+    fn rebalancing_enabled_missing_signer_env_vars_fails() {
         temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
@@ -674,8 +671,9 @@ pub(crate) mod tests {
                     "USDC_VAULT_ID",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
-                // Explicitly unset to avoid env pollution
+                // Explicitly unset both signer env vars
                 ("EVM_PRIVATE_KEY", None),
+                ("FIREBLOCKS_API_KEY", None),
             ],
             || {
                 let args = vec![
@@ -702,9 +700,9 @@ pub(crate) mod tests {
                 assert!(
                     matches!(
                         config_err,
-                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
+                        ConfigError::Rebalancing(RebalancingConfigError::Signer(_))
                     ),
-                    "Expected clap error for missing evm_private_key, got {config_err:?}"
+                    "Expected Signer error for missing signer env vars, got {config_err:?}"
                 );
             },
         );
@@ -940,9 +938,9 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn schwab_with_order_owner_succeeds() {
-        temp_env::with_vars(
+    #[tokio::test]
+    async fn schwab_with_order_owner_succeeds() {
+        let config = temp_env::with_vars(
             [
                 ("SCHWAB_APP_KEY", Some("test_key")),
                 ("SCHWAB_APP_SECRET", Some("test_secret")),
@@ -973,13 +971,14 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let config = env.into_config().unwrap();
-                let order_owner = config.order_owner().unwrap();
-                assert_eq!(
-                    order_owner,
-                    address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-                );
+                env.into_config().unwrap()
             },
+        );
+
+        let order_owner = config.order_owner().await.unwrap();
+        assert_eq!(
+            order_owner,
+            address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
     }
 
@@ -1172,9 +1171,9 @@ pub(crate) mod tests {
         );
     }
 
-    #[test]
-    fn alpaca_rebalancing_without_order_owner_derives_from_private_key() {
-        temp_env::with_vars(
+    #[tokio::test]
+    async fn alpaca_rebalancing_without_order_owner_derives_from_private_key() {
+        let config = temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
@@ -1192,6 +1191,7 @@ pub(crate) mod tests {
                     "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                ("FIREBLOCKS_API_KEY", None::<&str>),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
                     "BASE_ORDERBOOK",
@@ -1223,20 +1223,21 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let config = env.into_config().unwrap();
-                let order_owner = config.order_owner().unwrap();
-                // Address derived from private key 0x...0001
-                assert_eq!(
-                    order_owner,
-                    address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
-                );
+                env.into_config().unwrap()
             },
+        );
+
+        let order_owner = config.order_owner().await.unwrap();
+        // Address derived from private key 0x...0001
+        assert_eq!(
+            order_owner,
+            address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
         );
     }
 
-    #[test]
-    fn alpaca_rebalancing_ignores_order_owner_env_var() {
-        temp_env::with_vars(
+    #[tokio::test]
+    async fn alpaca_rebalancing_ignores_order_owner_env_var() {
+        let config = temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
@@ -1253,6 +1254,7 @@ pub(crate) mod tests {
                     "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
+                ("FIREBLOCKS_API_KEY", None::<&str>),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
                     "BASE_ORDERBOOK",
@@ -1284,21 +1286,22 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let config = env.into_config().unwrap();
-                let order_owner = config.order_owner().unwrap();
-                // Should return derived address, NOT the env var value
-                assert_eq!(
-                    order_owner,
-                    address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
-                    "Expected derived address, not env var. order_owner() should derive from EVM_PRIVATE_KEY when rebalancing is enabled."
-                );
+                env.into_config().unwrap()
             },
+        );
+
+        let order_owner = config.order_owner().await.unwrap();
+        // Should return derived address, NOT the env var value
+        assert_eq!(
+            order_owner,
+            address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
+            "Expected derived address, not env var. order_owner() should derive from EVM_PRIVATE_KEY when rebalancing is enabled."
         );
     }
 
-    #[test]
-    fn alpaca_rebalancing_with_invalid_private_key_fails_with_derivation_error() {
-        temp_env::with_vars(
+    #[tokio::test]
+    async fn alpaca_rebalancing_with_invalid_private_key_fails_with_derivation_error() {
+        let config = temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
                 ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
@@ -1316,6 +1319,7 @@ pub(crate) mod tests {
                     "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000000"),
                 ),
+                ("FIREBLOCKS_API_KEY", None::<&str>),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
                     "BASE_ORDERBOOK",
@@ -1345,13 +1349,14 @@ pub(crate) mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let config = env.into_config().unwrap();
-                let result = config.order_owner();
-                assert!(
-                    matches!(result, Err(ConfigError::PrivateKeyDerivation(_))),
-                    "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
-                );
+                env.into_config().unwrap()
             },
+        );
+
+        let result = config.order_owner().await;
+        assert!(
+            matches!(result, Err(ConfigError::SignerResolve(_))),
+            "Expected SignerResolve error for zero private key, got {result:?}"
         );
     }
 

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
@@ -43,6 +44,7 @@ struct CommonFields<P, E> {
     provider: P,
     executor: E,
     frameworks: CqrsFrameworks,
+    order_owner: Option<Address>,
 }
 
 pub(crate) struct Initial;
@@ -75,6 +77,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
         provider: P,
         executor: E,
         frameworks: CqrsFrameworks,
+        order_owner: Option<Address>,
     ) -> Self {
         Self {
             common: CommonFields {
@@ -84,6 +87,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 provider,
                 executor,
                 frameworks,
+                order_owner,
             },
             state: Initial,
         }
@@ -153,25 +157,22 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
-        let inventory_poller = match self.common.config.order_owner() {
-            Ok(order_owner) => {
-                let vault_service = Arc::new(VaultService::new(
-                    self.common.provider.clone(),
-                    self.common.config.evm.orderbook,
-                ));
-                Some(spawn_inventory_poller(
-                    self.common.pool.clone(),
-                    vault_service,
-                    self.common.executor.clone(),
-                    self.common.config.evm.orderbook,
-                    order_owner,
-                    self.common.frameworks.snapshot_cqrs,
-                ))
-            }
-            Err(error) => {
-                warn!(%error, "Inventory poller disabled: could not resolve order owner");
-                None
-            }
+        let inventory_poller = if let Some(order_owner) = self.common.order_owner {
+            let vault_service = Arc::new(VaultService::new(
+                self.common.provider.clone(),
+                self.common.config.evm.orderbook,
+            ));
+            Some(spawn_inventory_poller(
+                self.common.pool.clone(),
+                vault_service,
+                self.common.executor.clone(),
+                self.common.config.evm.orderbook,
+                order_owner,
+                self.common.frameworks.snapshot_cqrs,
+            ))
+        } else {
+            warn!("Inventory poller disabled: no order owner configured");
+            None
         };
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 

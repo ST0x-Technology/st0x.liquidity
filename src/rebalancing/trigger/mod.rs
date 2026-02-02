@@ -20,6 +20,7 @@ use url::Url;
 
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
+use crate::fireblocks::{SignerConfig, SignerConfigError, SignerEnv};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
@@ -54,6 +55,8 @@ pub enum RebalancingConfigError {
     Clap(#[from] clap::Error),
     #[error("invalid ALPACA_ACCOUNT_ID in broker auth")]
     InvalidAccountId(#[from] uuid::Error),
+    #[error("signer configuration error")]
+    Signer(#[from] SignerConfigError),
 }
 
 /// Environment configuration for rebalancing (parsed via clap).
@@ -77,9 +80,6 @@ pub struct RebalancingEnv {
     /// Ethereum RPC URL for CCTP operations
     #[clap(long, env)]
     ethereum_rpc_url: Url,
-    /// Private key for signing EVM transactions (used on both Ethereum and Base)
-    #[clap(long, env)]
-    evm_private_key: B256,
     /// Vault ID for USDC deposits to the Raindex vault
     #[clap(long, env)]
     usdc_vault_id: B256,
@@ -96,6 +96,9 @@ impl RebalancingConfig {
 
         let env = RebalancingEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
 
+        let signer_env = SignerEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
+        let signer = signer_env.into_config()?;
+
         // Validate the account ID is a valid UUID upfront so callers
         // don't encounter parse failures at runtime.
         let alpaca_account_id = AlpacaAccountId::parse(&alpaca_broker_auth.alpaca_account_id)?;
@@ -111,7 +114,7 @@ impl RebalancingConfig {
             },
             redemption_wallet: env.redemption_wallet,
             ethereum_rpc_url: env.ethereum_rpc_url,
-            evm_private_key: env.evm_private_key,
+            signer,
             usdc_vault_id: env.usdc_vault_id,
             alpaca_account_id,
             alpaca_broker_auth,
@@ -127,7 +130,7 @@ pub(crate) struct RebalancingConfig {
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
+    pub(crate) signer: SignerConfig,
     pub(crate) usdc_vault_id: B256,
     /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
@@ -142,7 +145,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("usdc_threshold", &self.usdc_threshold)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
-            .field("evm_private_key", &"[REDACTED]")
+            .field("signer", &"[REDACTED]")
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
@@ -1901,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn from_env_missing_evm_private_key_fails() {
+    fn from_env_missing_signer_env_vars_fails() {
         let vars = [
             (
                 "REDEMPTION_WALLET",
@@ -1909,6 +1912,7 @@ mod tests {
             ),
             ("ETHEREUM_RPC_URL", Some("https://eth.example.com")),
             ("EVM_PRIVATE_KEY", None),
+            ("FIREBLOCKS_API_KEY", None),
             ("BASE_RPC_URL", Some("https://base.example.com")),
             (
                 "BASE_ORDERBOOK",
@@ -1927,8 +1931,8 @@ mod tests {
         temp_env::with_vars(vars, || {
             let result = RebalancingConfig::from_env(test_broker_auth());
             assert!(
-                matches!(result, Err(RebalancingConfigError::Clap(_))),
-                "Expected Clap error, got {result:?}"
+                result.is_err(),
+                "Expected error when both signer env vars are missing, got {result:?}"
             );
         });
     }

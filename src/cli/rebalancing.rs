@@ -1,9 +1,7 @@
 //! Transfer equity and USDC rebalancing CLI commands.
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::signers::local::PrivateKeySigner;
 use cqrs_es::CqrsFramework;
 use cqrs_es::persist::PersistedEventStore;
 use sqlite_es::SqliteEventRepository;
@@ -89,8 +87,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
 
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let wallet = signer.address();
+            let wallet = rebalancing_config.signer.address().await?;
 
             writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
@@ -161,14 +158,14 @@ where
 
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let resolved = rebalancing_config.signer.resolve().await?;
 
     let ethereum_provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer.clone()))
+        .wallet(resolved.wallet.clone())
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
     let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer.clone()))
+        .wallet(resolved.wallet)
         .connect_provider(base_provider);
 
     let broker_mode = if alpaca_auth.is_sandbox() {
@@ -193,7 +190,7 @@ where
         alpaca_auth.alpaca_broker_api_secret.clone(),
     ));
 
-    let owner = signer.address();
+    let owner = resolved.address;
 
     let ethereum_evm = Evm::new(
         ethereum_provider,
@@ -277,8 +274,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let receiving_wallet = signer.address();
+    let receiving_wallet = rebalancing_config.signer.address().await?;
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let erc20 = IERC20::new(token, provider.clone());
@@ -382,9 +378,9 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     let redemption_wallet = rebalancing_config.redemption_wallet;
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let resolved = rebalancing_config.signer.resolve().await?;
     let provider_with_wallet = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer))
+        .wallet(resolved.wallet)
         .connect_provider(provider);
 
     let tokenization_service = AlpacaTokenizationService::new(

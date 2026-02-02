@@ -1,9 +1,7 @@
 //! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist, transfers, convert).
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
-use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use st0x_execution::Executor;
 use st0x_execution::alpaca_broker_api::ConversionDirection;
@@ -36,14 +34,12 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let ethereum_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let resolved = rebalancing_config.signer.resolve().await?;
 
-    writeln!(stdout, "   Sender wallet: {sender_address}")?;
+    writeln!(stdout, "   Sender wallet: {}", resolved.address)?;
 
     let ethereum_provider = ProviderBuilder::new()
-        .wallet(ethereum_wallet)
+        .wallet(resolved.wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
     let broker_api_base_url = if alpaca_auth.is_sandbox() {
@@ -77,7 +73,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
     let usdc = IERC20::IERC20Instance::new(usdc_address, &ethereum_provider);
 
-    let balance = usdc.balanceOf(sender_address).call().await?;
+    let balance = usdc.balanceOf(resolved.address).call().await?;
     writeln!(stdout, "   Current USDC balance: {balance}")?;
 
     if balance < amount_u256 {
@@ -140,15 +136,13 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let ethereum_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let resolved = rebalancing_config.signer.resolve().await?;
 
-    let destination = to_address.unwrap_or(sender_address);
+    let destination = to_address.unwrap_or(resolved.address);
     writeln!(stdout, "   Destination address: {destination}")?;
 
     let ethereum_provider = ProviderBuilder::new()
-        .wallet(ethereum_wallet)
+        .wallet(resolved.wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
     let (usdc_address, network) = if alpaca_auth.is_sandbox() {
@@ -247,9 +241,8 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let sender_address = signer.address();
-    let target_address = address.unwrap_or(sender_address);
+    let signer_address = rebalancing_config.signer.address().await?;
+    let target_address = address.unwrap_or(signer_address);
 
     writeln!(stdout, "Whitelisting address for Alpaca withdrawals")?;
     writeln!(stdout, "   Address: {target_address}")?;
@@ -443,6 +436,7 @@ mod tests {
     use crate::alpaca_wallet::AlpacaAccountId;
     use crate::cli::ConvertDirection;
     use crate::env::LogLevel;
+    use crate::fireblocks::SignerConfig;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
@@ -501,7 +495,7 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: Some(RebalancingConfig {
-                evm_private_key: B256::ZERO,
+                signer: SignerConfig::Local(B256::ZERO),
                 ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,

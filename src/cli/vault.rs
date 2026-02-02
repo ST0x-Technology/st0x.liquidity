@@ -1,9 +1,7 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
-use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 use thiserror::Error;
@@ -62,21 +60,19 @@ pub(super) async fn vault_deposit_command<
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let base_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let resolved = rebalancing_config.signer.resolve().await?;
 
-    writeln!(stdout, "   Sender wallet: {sender_address}")?;
+    writeln!(stdout, "   Sender wallet: {}", resolved.address)?;
     writeln!(stdout, "   Orderbook: {}", config.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
     let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(base_wallet)
+        .wallet(resolved.wallet)
         .connect_provider(base_provider);
 
     let token_contract = IERC20::IERC20Instance::new(token, &base_provider_with_wallet);
 
-    let balance = token_contract.balanceOf(sender_address).call().await?;
+    let balance = token_contract.balanceOf(resolved.address).call().await?;
     writeln!(stdout, "   Current token balance: {balance}")?;
 
     let amount_u256 = decimal_to_u256(amount, decimals)?;
@@ -131,16 +127,14 @@ pub(super) async fn vault_withdraw_command<
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let base_wallet = EthereumWallet::from(signer.clone());
-    let sender_address = signer.address();
+    let resolved = rebalancing_config.signer.resolve().await?;
 
-    writeln!(stdout, "   Recipient wallet: {sender_address}")?;
+    writeln!(stdout, "   Recipient wallet: {}", resolved.address)?;
     writeln!(stdout, "   Orderbook: {}", config.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
     let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(base_wallet)
+        .wallet(resolved.wallet)
         .connect_provider(base_provider);
 
     let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);

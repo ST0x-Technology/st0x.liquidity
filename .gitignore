@@ -12,3 +12,4 @@ tarpaulin-report.html
 .sqlx/
 
 docker-compose.yaml
+setup.md
