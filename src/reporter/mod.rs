@@ -99,7 +99,7 @@ impl Trade {
     fn from_offchain_row(
         id: i64,
         symbol: String,
-        shares: i64,
+        shares: f64,
         direction: &str,
         price_cents: Option<i64>,
         executed_at: Option<chrono::NaiveDateTime>,
@@ -110,7 +110,7 @@ impl Trade {
         let price_cents =
             price_cents.ok_or_else(|| anyhow::anyhow!("FILLED execution missing price_cents"))?;
 
-        let quantity = Decimal::from(shares);
+        let quantity = Decimal::try_from(shares)?;
 
         let price_per_share = Decimal::from(price_cents)
             .checked_div(Decimal::from(100))
@@ -489,7 +489,7 @@ mod tests {
         let trade = Trade::from_offchain_row(
             2,
             "AAPL".to_string(),
-            5,
+            5.0,
             "SELL",
             Some(10500),
             Some(naive_dt),

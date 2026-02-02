@@ -7,27 +7,22 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{CqrsFramework, Query};
-use sqlite_es::SqliteEventRepository;
-use sqlx::SqlitePool;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
+use cqrs_es::Query;
+use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
-use st0x_execution::alpaca_broker_api::{
-    AlpacaBrokerApiAuthConfig, AlpacaBrokerApiError, AlpacaBrokerApiMode,
-};
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{AlpacaBrokerApi, Executor};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
-    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RebalancingTriggerConfig,
-    RedemptionManager,
+    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RedemptionManager,
+    TriggeredOperation,
 };
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
@@ -35,10 +30,9 @@ use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
-use crate::inventory::InventoryView;
 use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
-use crate::symbol::cache::SymbolCache;
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 
@@ -75,15 +69,20 @@ type ConfiguredRebalancer<BP> = Rebalancer<
     UsdcRebalanceManager<BP, UsdcEventStore>,
 >;
 
+pub(crate) struct RebalancingCqrsFrameworks {
+    pub(crate) mint: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
+    pub(crate) redemption: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
+    pub(crate) usdc: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+}
+
 /// Spawns the rebalancing infrastructure.
 pub(crate) async fn spawn_rebalancer<BP>(
-    pool: SqlitePool,
     config: &RebalancingConfig,
-    alpaca_auth: &AlpacaTradingApiAuthConfig,
     base_provider: BP,
-    symbol_cache: SymbolCache,
     orderbook: Address,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+    market_maker_wallet: Address,
+    operation_receiver: mpsc::Receiver<TriggeredOperation>,
+    frameworks: RebalancingCqrsFrameworks,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -93,7 +92,6 @@ where
 
     let services = Services::new(
         config,
-        alpaca_auth,
         &ethereum_wallet,
         signer.address(),
         base_provider,
@@ -101,13 +99,13 @@ where
     )
     .await?;
 
-    let market_maker_wallet = signer.address();
     let rebalancer = services.into_rebalancer(
-        pool,
         config,
-        symbol_cache,
-        event_broadcast,
         market_maker_wallet,
+        operation_receiver,
+        frameworks.mint,
+        frameworks.redemption,
+        frameworks.usdc,
     );
 
     let handle = tokio::spawn(async move {
@@ -142,7 +140,6 @@ where
 {
     async fn new(
         config: &RebalancingConfig,
-        alpaca_auth: &AlpacaTradingApiAuthConfig,
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
@@ -150,38 +147,26 @@ where
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
-            .connect_http(config.ethereum_rpc_url.clone());
+            .connect_client(http_client_with_retry(config.ethereum_rpc_url.clone()));
+
+        let broker_auth = &config.alpaca_broker_auth;
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
-            alpaca_auth.base_url(),
+            broker_auth.base_url().to_string(),
             config.alpaca_account_id,
-            alpaca_auth.api_key.clone(),
-            alpaca_auth.api_secret.clone(),
+            broker_auth.api_key.clone(),
+            broker_auth.api_secret.clone(),
             base_provider.clone(),
             config.redemption_wallet,
         ));
 
-        // Broker API mode is derived from trading mode to ensure consistency
-        let broker_api_mode = if alpaca_auth.is_paper_trading() {
-            AlpacaBrokerApiMode::Sandbox
-        } else {
-            AlpacaBrokerApiMode::Production
-        };
-
-        let broker_auth = AlpacaBrokerApiAuthConfig {
-            api_key: alpaca_auth.api_key.clone(),
-            api_secret: alpaca_auth.api_secret.clone(),
-            account_id: config.alpaca_account_id.to_string(),
-            mode: Some(broker_api_mode),
-        };
         let broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
 
-        // Wallet service uses Broker API, not Trading API
         let wallet = Arc::new(AlpacaWalletService::new(
             broker_auth.base_url().to_string(),
             config.alpaca_account_id,
-            alpaca_auth.api_key.clone(),
-            alpaca_auth.api_secret.clone(),
+            broker_auth.api_key.clone(),
+            broker_auth.api_secret.clone(),
         ));
 
         let ethereum_evm = Evm::new(
@@ -214,53 +199,13 @@ where
 
     fn into_rebalancer(
         self,
-        pool: SqlitePool,
         config: &RebalancingConfig,
-        symbol_cache: SymbolCache,
-        event_broadcast: Option<broadcast::Sender<ServerMessage>>,
         market_maker_wallet: Address,
+        operation_receiver: mpsc::Receiver<TriggeredOperation>,
+        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
+        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
+        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
     ) -> ConfiguredRebalancer<BP> {
-        const OPERATION_CHANNEL_CAPACITY: usize = 100;
-
-        let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
-
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
-
-        let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
-        };
-
-        let trigger = Arc::new(RebalancingTrigger::new(
-            trigger_config,
-            symbol_cache,
-            inventory,
-            operation_sender,
-        ));
-
-        let mint_store =
-            PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-        let mint_cqrs = Arc::new(CqrsFramework::new(
-            mint_store,
-            build_mint_queries(trigger.clone(), event_broadcast.clone()),
-            (),
-        ));
-
-        let redemption_store =
-            PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-        let redemption_cqrs = Arc::new(CqrsFramework::new(
-            redemption_store,
-            build_redemption_queries(trigger.clone(), event_broadcast.clone()),
-            (),
-        ));
-
-        let usdc_store = PersistedEventStore::new_event_store(SqliteEventRepository::new(pool));
-        let usdc_cqrs = Arc::new(CqrsFramework::new(
-            usdc_store,
-            build_usdc_queries(trigger, event_broadcast),
-            (),
-        ));
-
         let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
 
         let redemption_manager =
@@ -286,44 +231,42 @@ where
     }
 }
 
-macro_rules! build_queries {
-    ($name:ident, $aggregate:ty) => {
-        fn $name(
-            trigger: Arc<RebalancingTrigger>,
-            event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-        ) -> Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> {
-            let mut queries: Vec<Box<dyn Query<Lifecycle<$aggregate, Never>>>> =
-                vec![Box::new(trigger)];
+pub(crate) fn build_rebalancing_queries<A>(
+    trigger: Arc<RebalancingTrigger>,
+    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+) -> Vec<Box<dyn Query<Lifecycle<A, Never>>>>
+where
+    Lifecycle<A, Never>: cqrs_es::Aggregate,
+    RebalancingTrigger: Query<Lifecycle<A, Never>>,
+    EventBroadcaster: Query<Lifecycle<A, Never>>,
+{
+    let mut queries: Vec<Box<dyn Query<Lifecycle<A, Never>>>> = vec![Box::new(trigger)];
 
-            if let Some(sender) = event_broadcast {
-                queries.push(Box::new(EventBroadcaster::new(sender)));
-            }
+    if let Some(sender) = event_broadcast {
+        queries.push(Box::new(EventBroadcaster::new(sender)));
+    }
 
-            queries
-        }
-    };
+    queries
 }
-
-build_queries!(build_mint_queries, TokenizedEquityMint);
-build_queries!(build_redemption_queries, EquityRedemption);
-build_queries!(build_usdc_queries, UsdcRebalance);
 
 #[cfg(test)]
 mod tests {
-    use httpmock::Method::GET;
-    use serde_json::json;
-
-    use super::*;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{address, b256};
     use alloy::providers::ProviderBuilder;
+    use httpmock::Method::GET;
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
+    use serde_json::json;
+    use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use uuid::Uuid;
 
+    use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
+    use crate::rebalancing::RebalancingTriggerConfig;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -346,6 +289,12 @@ mod tests {
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
             alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
+            alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+                account_id: Uuid::nil().to_string(),
+                mode: Some(AlpacaBrokerApiMode::Sandbox),
+            },
         }
     }
 
@@ -487,7 +436,8 @@ mod tests {
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
@@ -495,10 +445,13 @@ mod tests {
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        );
+        )
+        .with_required_confirmations(1);
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
-        let vault = Arc::new(VaultService::new(base_provider, TEST_ORDERBOOK));
+        let vault = Arc::new(
+            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
+        );
 
         let services = Services {
             tokenization,
@@ -520,54 +473,19 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
 
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
+
+        let (_tx, rx) = mpsc::channel(100);
+        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let redemption_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let usdc_cqrs = Arc::new(sqlite_cqrs(pool, vec![], ()));
+
         let _rebalancer = services.into_rebalancer(
-            pool,
             &config,
-            SymbolCache::default(),
-            None,
             market_maker_wallet,
-        );
-    }
-
-    #[test]
-    fn broker_mode_sandbox_when_paper_trading() {
-        let auth = AlpacaTradingApiAuthConfig {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            trading_mode: Some(st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Paper),
-        };
-
-        let broker_api_mode = if auth.is_paper_trading() {
-            AlpacaBrokerApiMode::Sandbox
-        } else {
-            AlpacaBrokerApiMode::Production
-        };
-
-        assert_eq!(
-            broker_api_mode,
-            AlpacaBrokerApiMode::Sandbox,
-            "Paper trading should map to Sandbox mode"
-        );
-    }
-
-    #[test]
-    fn broker_mode_production_when_live_trading() {
-        let auth = AlpacaTradingApiAuthConfig {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            trading_mode: Some(st0x_execution::alpaca_trading_api::AlpacaTradingApiMode::Live),
-        };
-
-        let broker_api_mode = if auth.is_paper_trading() {
-            AlpacaBrokerApiMode::Sandbox
-        } else {
-            AlpacaBrokerApiMode::Production
-        };
-
-        assert_eq!(
-            broker_api_mode,
-            AlpacaBrokerApiMode::Production,
-            "Live trading should map to Production mode"
+            rx,
+            mint_cqrs,
+            redemption_cqrs,
+            usdc_cqrs,
         );
     }
 

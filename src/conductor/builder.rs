@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
+use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use st0x_execution::Executor;
 
@@ -14,10 +17,12 @@ use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
+use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
 
 use super::{
-    Conductor, spawn_event_processor, spawn_onchain_event_receiver, spawn_order_poller,
+    Conductor, InventorySnapshotAggregate, VaultRegistryAggregate, spawn_event_processor,
+    spawn_inventory_poller, spawn_onchain_event_receiver, spawn_order_poller,
     spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
 
@@ -25,13 +30,19 @@ type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error
 type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
+pub(crate) struct CqrsFrameworks {
+    pub(crate) dual_write_context: DualWriteContext,
+    pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
+    pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+}
+
 struct CommonFields<P, E> {
     config: Config,
     pool: SqlitePool,
     cache: SymbolCache,
     provider: P,
     executor: E,
-    dual_write_context: DualWriteContext,
+    frameworks: CqrsFrameworks,
 }
 
 pub(crate) struct Initial;
@@ -63,7 +74,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
         cache: SymbolCache,
         provider: P,
         executor: E,
-        dual_write_context: DualWriteContext,
+        frameworks: CqrsFrameworks,
     ) -> Self {
         Self {
             common: CommonFields {
@@ -72,7 +83,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 cache,
                 provider,
                 executor,
-                dual_write_context,
+                frameworks,
             },
             state: Initial,
         }
@@ -142,10 +153,33 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
+        let inventory_poller = match self.common.config.order_owner() {
+            Ok(order_owner) => {
+                let vault_service = Arc::new(VaultService::new(
+                    self.common.provider.clone(),
+                    self.common.config.evm.orderbook,
+                ));
+                Some(spawn_inventory_poller(
+                    self.common.pool.clone(),
+                    vault_service,
+                    self.common.executor.clone(),
+                    self.common.config.evm.orderbook,
+                    order_owner,
+                    self.common.frameworks.snapshot_cqrs,
+                ))
+            }
+            Err(error) => {
+                warn!(%error, "Inventory poller disabled: could not resolve order owner");
+                None
+            }
+        };
+        log_optional_task_status("inventory poller", inventory_poller.is_some());
+
         let order_poller = spawn_order_poller(
             &self.common.config,
             &self.common.pool,
             self.common.executor.clone(),
+            self.common.frameworks.dual_write_context.clone(),
         );
         let dex_event_receiver = spawn_onchain_event_receiver(
             self.state.event_sender,
@@ -157,7 +191,7 @@ where
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
             self.common.pool.clone(),
-            self.common.dual_write_context.clone(),
+            self.common.frameworks.dual_write_context.clone(),
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,
@@ -165,6 +199,8 @@ where
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
+            self.common.frameworks.dual_write_context,
+            self.common.frameworks.vault_registry_cqrs,
         );
 
         Conductor {
@@ -175,6 +211,7 @@ where
             position_checker,
             queue_processor,
             rebalancer,
+            inventory_poller,
         }
     }
 }

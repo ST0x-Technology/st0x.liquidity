@@ -58,7 +58,6 @@ impl AlpacaBrokerApiClient {
         &self.base_url
     }
 
-    #[cfg(test)]
     pub(crate) fn account_id(&self) -> &str {
         &self.account_id
     }

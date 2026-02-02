@@ -4,6 +4,7 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
+use rust_decimal::Decimal;
 use st0x_execution::Executor;
 use st0x_execution::alpaca_broker_api::ConversionDirection;
 use std::io::Write;
@@ -415,6 +416,17 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     if let Some(filled_qty) = order.filled_quantity {
         writeln!(stdout, "   Filled Quantity: {filled_qty}")?;
     }
+    if let (Some(price), Some(qty)) = (order.filled_average_price, order.filled_quantity) {
+        match Decimal::try_from(price) {
+            Ok(price_decimal) => {
+                let usd_amount = price_decimal * qty;
+                writeln!(stdout, "   USD Amount: ${usd_amount}")?;
+            }
+            Err(e) => {
+                writeln!(stdout, "   USD Amount: (conversion error: {e})")?;
+            }
+        }
+    }
     writeln!(stdout, "   Created: {}", order.created_at)?;
 
     Ok(())
@@ -434,6 +446,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_alpaca() -> Config {
         Config {
@@ -451,6 +464,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -500,7 +514,14 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
+                alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+                    api_key: "test-key".to_string(),
+                    api_secret: "test-secret".to_string(),
+                    account_id: alpaca_account_id.to_string(),
+                    mode: Some(AlpacaBrokerApiMode::Sandbox),
+                },
             }),
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

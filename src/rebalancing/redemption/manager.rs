@@ -74,7 +74,7 @@ where
                 &aggregate_id.0,
                 EquityRedemptionCommand::SendTokens {
                     symbol,
-                    quantity: quantity.0,
+                    quantity: quantity.inner(),
                     redemption_wallet: self.service.redemption_wallet(),
                     tx_hash,
                 },
@@ -213,7 +213,7 @@ mod tests {
         let manager = RedemptionManager::new(service, cqrs);
 
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(dec!(100.0));
+        let quantity = FractionalShares::new(dec!(100.0));
         let token = address!("0x1234567890abcdef1234567890abcdef12345678");
         let amount = U256::from(100_000_000_000_000_000_000_u128);
 
@@ -246,7 +246,7 @@ mod tests {
             .execute_redemption(
                 &RedemptionAggregateId::new("trait-test"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(50.0)),
+                FractionalShares::new(dec!(50.0)),
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
                 U256::from(50_000_000_000_000_000_000_u128),
             )

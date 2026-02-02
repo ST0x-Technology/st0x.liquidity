@@ -79,7 +79,7 @@ pub fn decrypt_token(
         .decrypt(nonce, encrypted_data)
         .map_err(|_| EncryptionError::DecryptionFailed)?;
 
-    String::from_utf8(plaintext_bytes).map_err(|e| EncryptionError::Utf8Error(e.to_string()))
+    Ok(String::from_utf8(plaintext_bytes)?)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,7 +91,7 @@ pub enum EncryptionError {
     #[error("Invalid ciphertext: {0}")]
     InvalidCiphertext(String),
     #[error("Decrypted data is not valid UTF-8: {0}")]
-    Utf8Error(String),
+    Utf8(#[from] std::string::FromUtf8Error),
     #[error("Hex decoding error: {0}")]
     Hex(#[from] alloy::hex::FromHexError),
 }

@@ -13,6 +13,7 @@ use crate::cctp::{
     USDC_BASE, USDC_ETHEREUM,
 };
 use crate::env::Config;
+use crate::onchain::http_client_with_retry;
 use crate::rebalancing::RebalancingConfig;
 use crate::threshold::Usdc;
 
@@ -47,8 +48,8 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     let amount_u256 = if all {
         let balance = match from {
             CctpChain::Ethereum => {
-                let provider =
-                    ProviderBuilder::new().connect_http(rebalancing.ethereum_rpc_url.clone());
+                let provider = ProviderBuilder::new()
+                    .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
                 IERC20::IERC20Instance::new(USDC_ETHEREUM, provider)
                     .balanceOf(wallet)
                     .call()
@@ -100,10 +101,14 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
 
     writeln!(stdout, "\n3. Minting USDC on {dest:?}...")?;
-    let mint_tx = cctp_bridge
+    let mint_receipt = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
-    writeln!(stdout, "Bridge complete! Mint tx: {mint_tx}")?;
+    writeln!(
+        stdout,
+        "Bridge complete! Mint tx: {}\n  Amount received: {} (fee: {})",
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+    )?;
 
     Ok(())
 }
@@ -117,7 +122,7 @@ fn build_cctp_bridge<BP: Provider + Clone>(
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(rebalancing.ethereum_rpc_url.clone());
+        .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
     let base_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
@@ -178,10 +183,14 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     )?;
 
     writeln!(stdout, "   Calling receiveMessage on {dest_chain:?}...")?;
-    let mint_tx = cctp_bridge
+    let mint_receipt = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
-    writeln!(stdout, "CCTP transfer recovered! Mint tx: {mint_tx}")?;
+    writeln!(
+        stdout,
+        "CCTP transfer recovered! Mint tx: {}\n  Amount received: {} (fee: {})",
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+    )?;
 
     Ok(())
 }
@@ -215,7 +224,7 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         CctpChain::Ethereum => {
             let provider = ProviderBuilder::new()
                 .wallet(wallet)
-                .connect_http(rebalancing.ethereum_rpc_url.clone());
+                .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
             reset_allowance(stdout, usdc_address, owner, spender, &provider).await
         }
         CctpChain::Base => {
@@ -264,6 +273,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use std::str::FromStr;
     use uuid::uuid;
 
@@ -273,6 +283,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -290,6 +301,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -308,6 +320,12 @@ mod tests {
             usdc_threshold: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
+            },
+            alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+                account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+                mode: Some(AlpacaBrokerApiMode::Sandbox),
             },
         });
         config

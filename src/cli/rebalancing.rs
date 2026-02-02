@@ -533,6 +533,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::onchain::EvmConfig;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -550,6 +551,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -574,7 +576,7 @@ mod tests {
         let config = create_config_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -600,7 +602,7 @@ mod tests {
         let config = create_alpaca_config_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(

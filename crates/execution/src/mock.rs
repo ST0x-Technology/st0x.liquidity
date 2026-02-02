@@ -7,8 +7,8 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderUpdate,
-    SupportedExecutor, TryIntoExecutor,
+    ExecutionError, Executor, Inventory, InventoryResult, MarketOrder, OrderPlacement, OrderState,
+    OrderUpdate, SupportedExecutor, TryIntoExecutor,
 };
 
 /// Configuration for MockExecutor
@@ -21,6 +21,7 @@ pub struct MockExecutor {
     order_counter: Arc<AtomicU64>,
     should_fail: bool,
     failure_message: String,
+    inventory_result: InventoryResult,
 }
 
 impl MockExecutor {
@@ -29,6 +30,7 @@ impl MockExecutor {
             order_counter: Arc::new(AtomicU64::new(1)),
             should_fail: false,
             failure_message: String::new(),
+            inventory_result: InventoryResult::Unimplemented,
         }
     }
 
@@ -37,7 +39,15 @@ impl MockExecutor {
             order_counter: Arc::new(AtomicU64::new(1)),
             should_fail: true,
             failure_message: message.into(),
+            inventory_result: InventoryResult::Unimplemented,
         }
+    }
+
+    /// Configures the executor to return the specified inventory when `get_inventory()` is called.
+    #[must_use]
+    pub fn with_inventory(mut self, inventory: Inventory) -> Self {
+        self.inventory_result = InventoryResult::Fetched(inventory);
+        self
     }
 
     fn generate_order_id(&self) -> String {
@@ -140,6 +150,16 @@ impl Executor for MockExecutor {
     async fn run_executor_maintenance(&self) -> Option<JoinHandle<()>> {
         None
     }
+
+    async fn get_inventory(&self) -> Result<InventoryResult, Self::Error> {
+        if self.should_fail {
+            return Err(ExecutionError::MockFailure {
+                message: self.failure_message.clone(),
+            });
+        }
+
+        Ok(self.inventory_result.clone())
+    }
 }
 
 #[async_trait]
@@ -155,9 +175,10 @@ impl TryIntoExecutor for MockExecutorConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use rust_decimal::Decimal;
 
-    use crate::{Direction, Shares, Symbol};
+    use super::*;
+    use crate::{Direction, FractionalShares, Positive, Symbol};
 
     #[tokio::test]
     async fn test_try_from_config_success() {
@@ -205,9 +226,10 @@ mod tests {
     #[tokio::test]
     async fn test_place_market_order_success() {
         let executor = MockExecutor::new();
+        let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(10).unwrap(),
+            shares,
             direction: Direction::Buy,
         };
 
@@ -216,7 +238,10 @@ mod tests {
 
         assert!(placement.order_id.starts_with("TEST_"));
         assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
-        assert_eq!(placement.shares, Shares::new(10).unwrap());
+        assert_eq!(
+            placement.shares,
+            Positive::new(FractionalShares::new(Decimal::from(10))).unwrap()
+        );
         assert_eq!(placement.direction, Direction::Buy);
     }
 
@@ -225,7 +250,7 @@ mod tests {
         let executor = MockExecutor::with_failure("Simulated API error");
         let order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
-            shares: Shares::new(10).unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Buy,
         };
 
@@ -273,5 +298,71 @@ mod tests {
             result.unwrap_err(),
             ExecutionError::OrderNotFound { order_id } if order_id == "TEST_1"
         ));
+    }
+
+    #[tokio::test]
+    async fn get_inventory_returns_unimplemented_by_default() {
+        let executor = MockExecutor::new();
+
+        let result = executor.get_inventory().await.unwrap();
+
+        assert!(
+            matches!(result, InventoryResult::Unimplemented),
+            "Expected Unimplemented, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_inventory_returns_configured_inventory() {
+        let inventory = crate::Inventory {
+            positions: vec![crate::EquityPosition {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: FractionalShares::new(Decimal::from(100)),
+                market_value_cents: Some(15000_00),
+            }],
+            cash_balance_cents: 50_000_00,
+        };
+
+        let executor = MockExecutor::new().with_inventory(inventory.clone());
+
+        let result = executor.get_inventory().await.unwrap();
+
+        match result {
+            InventoryResult::Fetched(fetched) => {
+                assert_eq!(fetched.positions.len(), 1);
+                assert_eq!(fetched.positions[0].symbol, Symbol::new("AAPL").unwrap());
+                assert_eq!(
+                    fetched.positions[0].quantity,
+                    FractionalShares::new(Decimal::from(100))
+                );
+                assert_eq!(fetched.cash_balance_cents, 50_000_00);
+            }
+            InventoryResult::Unimplemented => {
+                panic!("Expected Fetched, got Unimplemented")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_inventory_returns_error_when_should_fail() {
+        let executor = MockExecutor::with_failure("Inventory fetch failed");
+
+        assert!(matches!(
+            executor.get_inventory().await.unwrap_err(),
+            ExecutionError::MockFailure { message } if message == "Inventory fetch failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn with_inventory_preserves_other_settings() {
+        let inventory = crate::Inventory {
+            positions: vec![],
+            cash_balance_cents: 100_00,
+        };
+
+        let executor = MockExecutor::new().with_inventory(inventory);
+
+        assert!(!executor.should_fail);
+        assert_eq!(executor.to_supported_executor(), SupportedExecutor::DryRun);
     }
 }

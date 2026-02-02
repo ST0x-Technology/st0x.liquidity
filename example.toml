@@ -27,6 +27,12 @@ evm_private_key = "0x00000000000000000000000000000000000000000000000000000000000
 usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
+[rebalancing.alpaca_broker_auth]
+api_key = "test_key"
+api_secret = "test_secret"
+account_id = "904837e3-3b76-47ec-b432-046db621571b"
+mode = "sandbox"
+
 [rebalancing.equity_threshold]
 target = "0.5"
 deviation = "0.2"

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
+use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::EquityRedemptionEvent;
 use crate::position::PositionEvent;
@@ -24,6 +25,8 @@ pub(crate) enum InventoryViewError {
     Equity(#[from] InventoryError<FractionalShares>),
     #[error(transparent)]
     Usdc(#[from] InventoryError<Usdc>),
+    #[error("failed to convert cash balance cents {0} to USDC")]
+    CashBalanceConversion(i64),
 }
 
 /// Imbalance requiring rebalancing action.
@@ -52,6 +55,20 @@ struct Inventory<T> {
     last_rebalancing: Option<DateTime<Utc>>,
 }
 
+/// Impl block with minimal bounds for `has_inflight` - shared by all other impl blocks.
+impl<T> Inventory<T>
+where
+    T: Add<Output = Result<T, ArithmeticError<T>>>
+        + Sub<Output = Result<T, ArithmeticError<T>>>
+        + Copy
+        + HasZero
+        + std::fmt::Debug,
+{
+    fn has_inflight(&self) -> bool {
+        self.onchain.has_inflight() || self.offchain.has_inflight()
+    }
+}
+
 impl<T> Inventory<T>
 where
     T: Add<Output = Result<T, ArithmeticError<T>>>
@@ -59,7 +76,8 @@ where
         + std::ops::Mul<Decimal, Output = Result<T, ArithmeticError<T>>>
         + Copy
         + HasZero
-        + Into<Decimal>,
+        + Into<Decimal>
+        + std::fmt::Debug,
 {
     /// Returns the ratio of onchain to total inventory.
     /// Returns `None` if total is zero.
@@ -73,10 +91,6 @@ where
         }
 
         Some(onchain / total)
-    }
-
-    fn has_inflight(&self) -> bool {
-        self.onchain.has_inflight() || self.offchain.has_inflight()
     }
 
     /// Detects imbalance based on threshold configuration.
@@ -127,7 +141,9 @@ where
     T: Add<Output = Result<T, ArithmeticError<T>>>
         + Sub<Output = Result<T, ArithmeticError<T>>>
         + Copy
-        + HasZero,
+        + HasZero
+        + PartialOrd
+        + std::fmt::Debug,
 {
     fn add_onchain_available(self, amount: T) -> Result<Self, InventoryError<T>> {
         Ok(Self {
@@ -194,16 +210,90 @@ where
         })
     }
 
+    /// Complete a transfer from offchain to onchain, accounting for fees.
+    /// Confirms `amount_sent` left offchain, adds `amount_received` to onchain.
+    /// The difference is the fee lost in transit (e.g., CCTP bridging fees).
+    fn transfer_offchain_to_onchain_with_fee(
+        self,
+        amount_sent: T,
+        amount_received: T,
+    ) -> Result<Self, InventoryError<T>> {
+        if amount_received > amount_sent {
+            return Err(InventoryError::NegativeFee {
+                amount_sent,
+                amount_received,
+            });
+        }
+
+        Ok(Self {
+            offchain: self.offchain.confirm_inflight(amount_sent)?,
+            onchain: self.onchain.add_available(amount_received)?,
+            ..self
+        })
+    }
+
+    /// Complete a transfer from onchain to offchain, accounting for fees.
+    /// Confirms `amount_sent` left onchain, adds `amount_received` to offchain.
+    /// The difference is the fee lost in transit (e.g., CCTP bridging fees).
+    fn transfer_onchain_to_offchain_with_fee(
+        self,
+        amount_sent: T,
+        amount_received: T,
+    ) -> Result<Self, InventoryError<T>> {
+        if amount_received > amount_sent {
+            return Err(InventoryError::NegativeFee {
+                amount_sent,
+                amount_received,
+            });
+        }
+
+        Ok(Self {
+            onchain: self.onchain.confirm_inflight(amount_sent)?,
+            offchain: self.offchain.add_available(amount_received)?,
+            ..self
+        })
+    }
+
     fn with_last_rebalancing(self, timestamp: DateTime<Utc>) -> Self {
         Self {
             last_rebalancing: Some(timestamp),
             ..self
         }
     }
+
+    /// Apply a fetched onchain venue snapshot.
+    /// Skips if ANY venue (onchain or offchain) has inflight operations,
+    /// because we cannot distinguish between "transfer completed but not
+    /// confirmed" vs "unrelated inventory change".
+    fn apply_onchain_snapshot(self, snapshot_balance: T) -> Self {
+        if self.has_inflight() {
+            return self;
+        }
+
+        Self {
+            onchain: self.onchain.apply_snapshot(snapshot_balance),
+            ..self
+        }
+    }
+
+    /// Apply a fetched offchain venue snapshot.
+    /// Skips if ANY venue (onchain or offchain) has inflight operations,
+    /// because we cannot distinguish between "transfer completed but not
+    /// confirmed" vs "unrelated inventory change".
+    fn apply_offchain_snapshot(self, snapshot_balance: T) -> Self {
+        if self.has_inflight() {
+            return self;
+        }
+
+        Self {
+            offchain: self.offchain.apply_snapshot(snapshot_balance),
+            ..self
+        }
+    }
 }
 
 /// Cross-aggregate projection tracking inventory across venues.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
     usdc: Inventory<Usdc>,
     equities: HashMap<Symbol, Inventory<FractionalShares>>,
@@ -488,12 +578,24 @@ impl InventoryView {
                 self.update_usdc(|inv| inv.move_onchain_to_inflight(amount), now)
             }
 
-            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::AlpacaToBase) => {
-                self.update_usdc(|inv| inv.transfer_offchain_inflight_to_onchain(amount), now)
-            }
-            (UsdcRebalanceEvent::Bridged { .. }, RebalanceDirection::BaseToAlpaca) => {
-                self.update_usdc(|inv| inv.transfer_onchain_inflight_to_offchain(amount), now)
-            }
+            (
+                UsdcRebalanceEvent::Bridged {
+                    amount_received, ..
+                },
+                RebalanceDirection::AlpacaToBase,
+            ) => self.update_usdc(
+                |inv| inv.transfer_offchain_to_onchain_with_fee(amount, *amount_received),
+                now,
+            ),
+            (
+                UsdcRebalanceEvent::Bridged {
+                    amount_received, ..
+                },
+                RebalanceDirection::BaseToAlpaca,
+            ) => self.update_usdc(
+                |inv| inv.transfer_onchain_to_offchain_with_fee(amount, *amount_received),
+                now,
+            ),
 
             (
                 UsdcRebalanceEvent::DepositConfirmed {
@@ -506,9 +608,29 @@ impl InventoryView {
                 now,
             ),
 
+            // ConversionConfirmed affects offchain USDC:
+            // - AlpacaToBase (USD->USDC): Adds USDC to offchain (arrived in crypto wallet)
+            // - BaseToAlpaca (USDC->USD): Removes USDC from offchain (converted to USD)
+            (
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    filled_amount,
+                    ..
+                },
+                _,
+            ) => self.update_usdc(|inv| inv.add_offchain_available(*filled_amount), now),
+
+            (
+                UsdcRebalanceEvent::ConversionConfirmed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    filled_amount,
+                    ..
+                },
+                _,
+            ) => self.update_usdc(|inv| inv.remove_offchain_available(*filled_amount), now),
+
             (
                 UsdcRebalanceEvent::ConversionInitiated { .. }
-                | UsdcRebalanceEvent::ConversionConfirmed { .. }
                 | UsdcRebalanceEvent::ConversionFailed { .. }
                 | UsdcRebalanceEvent::WithdrawalConfirmed { .. }
                 | UsdcRebalanceEvent::WithdrawalFailed { .. }
@@ -524,22 +646,82 @@ impl InventoryView {
             }),
         }
     }
+
+    /// Applies an inventory snapshot event to reconcile tracked inventory with fetched actuals.
+    ///
+    /// **Skips reconciliation when ANY venue has inflight operations** (not just the venue being
+    /// updated). This is because we cannot distinguish between "transfer completed but not
+    /// confirmed" vs "unrelated inventory change". When no venue has inflight, sets the
+    /// venue's available balance to the snapshot value directly.
+    ///
+    /// - `OnchainEquity`: Sets onchain available to snapshot value (if no inflight anywhere).
+    /// - `OnchainCash`: Sets onchain USDC available to snapshot value (if no inflight anywhere).
+    /// - `OffchainEquity`: Sets offchain available to snapshot value (if no inflight anywhere).
+    /// - `OffchainCash`: Converts cents to Usdc and sets offchain available (if no inflight anywhere).
+    pub(crate) fn apply_snapshot_event(
+        self,
+        event: &InventorySnapshotEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        match event {
+            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
+                balances
+                    .iter()
+                    .try_fold(self, |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            |inventory| Ok(inventory.apply_onchain_snapshot(*snapshot_balance)),
+                            now,
+                        )
+                    })
+            }
+
+            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => self.update_usdc(
+                |inventory| Ok(inventory.apply_onchain_snapshot(*usdc_balance)),
+                now,
+            ),
+
+            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
+                positions
+                    .iter()
+                    .try_fold(self, |view, (symbol, snapshot_balance)| {
+                        view.update_equity(
+                            symbol,
+                            |inventory| Ok(inventory.apply_offchain_snapshot(*snapshot_balance)),
+                            now,
+                        )
+                    })
+            }
+
+            InventorySnapshotEvent::OffchainCash {
+                cash_balance_cents, ..
+            } => {
+                let usdc = Usdc::from_cents(*cash_balance_cents).ok_or(
+                    InventoryViewError::CashBalanceConversion(*cash_balance_cents),
+                )?;
+                self.update_usdc(|inventory| Ok(inventory.apply_offchain_snapshot(usdc)), now)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use alloy::primitives::{Address, TxHash, U256};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
 
     fn shares(n: i64) -> FractionalShares {
-        FractionalShares(Decimal::from(n))
+        FractionalShares::new(Decimal::from(n))
     }
 
     fn venue(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
@@ -748,8 +930,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(110));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(110));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     #[test]
@@ -761,8 +943,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(90));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(90));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     #[test]
@@ -774,8 +956,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(110));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(110));
     }
 
     #[test]
@@ -787,8 +969,8 @@ mod tests {
         let updated = view.apply_position_event(&symbol, &event).unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(90));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(90));
     }
 
     #[test]
@@ -804,10 +986,13 @@ mod tests {
         let updated = view.apply_position_event(&aapl, &event).unwrap();
 
         let aapl_inv = updated.equities.get(&aapl).unwrap();
-        assert_eq!(aapl_inv.onchain.total().unwrap().0, Decimal::from(110));
+        assert_eq!(
+            aapl_inv.onchain.total().unwrap().inner(),
+            Decimal::from(110)
+        );
 
         let msft_inv = updated.equities.get(&msft).unwrap();
-        assert_eq!(msft_inv.onchain.total().unwrap().0, Decimal::from(50));
+        assert_eq!(msft_inv.onchain.total().unwrap().inner(), Decimal::from(50));
     }
 
     #[test]
@@ -846,8 +1031,8 @@ mod tests {
         assert_eq!(updated.last_updated, event_time);
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     fn make_mint_requested(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
@@ -907,8 +1092,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
     }
 
     #[test]
@@ -922,8 +1107,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -939,8 +1124,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(130));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(70));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(130));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(70));
         assert!(!inv.has_inflight());
     }
 
@@ -969,8 +1154,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(!inv.has_inflight());
     }
 
@@ -985,8 +1170,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(!inv.has_inflight());
     }
 
@@ -1008,16 +1193,16 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
 
         // MintAccepted: Move 30 from offchain available to inflight
         let view = view
             .apply_mint_event(&symbol, &make_mint_accepted(), quantity, Utc::now())
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
 
         // TokensReceived: Remove from offchain inflight, add to onchain available
@@ -1030,8 +1215,8 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(130));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(70));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(130));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(70));
         assert!(!inv.has_inflight());
 
         // MintCompleted: Update last_rebalancing
@@ -1073,8 +1258,8 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(!inv.has_inflight());
     }
 
@@ -1187,8 +1372,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1204,8 +1389,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1221,8 +1406,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(70));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(70));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(130));
         assert!(!inv.has_inflight());
         assert!(inv.last_rebalancing.is_some());
     }
@@ -1238,8 +1423,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1254,8 +1439,8 @@ mod tests {
             .unwrap();
 
         let inv = updated.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
     }
 
@@ -1277,7 +1462,7 @@ mod tests {
             )
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
 
         // Detected: No balance change
@@ -1285,7 +1470,7 @@ mod tests {
             .apply_redemption_event(&symbol, &make_redemption_detected(), quantity, Utc::now())
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(100));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
 
         // Completed: Remove from onchain inflight, add to offchain available
@@ -1293,8 +1478,8 @@ mod tests {
             .apply_redemption_event(&symbol, &make_redemption_completed(), quantity, Utc::now())
             .unwrap();
         let inv = view.equities.get(&symbol).unwrap();
-        assert_eq!(inv.onchain.total().unwrap().0, Decimal::from(70));
-        assert_eq!(inv.offchain.total().unwrap().0, Decimal::from(130));
+        assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(70));
+        assert_eq!(inv.offchain.total().unwrap().inner(), Decimal::from(130));
         assert!(!inv.has_inflight());
         assert!(inv.last_rebalancing.is_some());
     }
@@ -1389,9 +1574,11 @@ mod tests {
         }
     }
 
-    fn make_bridged_event() -> UsdcRebalanceEvent {
+    fn make_bridged_event(amount_received: Usdc, fee_collected: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Bridged {
             mint_tx_hash: TxHash::random(),
+            amount_received,
+            fee_collected,
             minted_at: Utc::now(),
         }
     }
@@ -1418,10 +1605,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1000));
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(1000)
+        );
         assert!(updated.usdc.offchain.has_inflight());
         assert!(!updated.usdc.onchain.has_inflight());
     }
@@ -1440,9 +1630,12 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1000));
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(1000)
+        );
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
         assert!(updated.usdc.onchain.has_inflight());
@@ -1452,7 +1645,7 @@ mod tests {
     #[test]
     fn apply_usdc_bridged_alpaca_to_base_transfers_to_onchain() {
         let view = make_usdc_view(1000, 0, 900, 100);
-        let event = make_bridged_event();
+        let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
             .apply_usdc_rebalance_event(
@@ -1463,15 +1656,21 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(1100));
-        assert_eq!(updated.usdc.offchain.total().unwrap().0, Decimal::from(900));
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(1100)
+        );
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().inner(),
+            Decimal::from(900)
+        );
         assert!(!updated.usdc.offchain.has_inflight());
     }
 
     #[test]
     fn apply_usdc_bridged_base_to_alpaca_transfers_to_offchain() {
         let view = make_usdc_view(900, 100, 1000, 0);
-        let event = make_bridged_event();
+        let event = make_bridged_event(usdc(100), Usdc(dec!(0)));
 
         let updated = view
             .apply_usdc_rebalance_event(
@@ -1483,10 +1682,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            updated.usdc.offchain.total().unwrap().0,
+            updated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1100)
         );
-        assert_eq!(updated.usdc.onchain.total().unwrap().0, Decimal::from(900));
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            Decimal::from(900)
+        );
         assert!(!updated.usdc.onchain.has_inflight());
     }
 
@@ -1513,20 +1715,25 @@ mod tests {
             .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
             .unwrap();
         assert_eq!(
-            after_initiated.usdc.offchain.total().unwrap().0,
+            after_initiated.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .apply_usdc_rebalance_event(
+                &make_bridged_event(amount, Usdc(dec!(0))),
+                &direction,
+                amount,
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(
-            after_bridged.usdc.onchain.total().unwrap().0,
+            after_bridged.usdc.onchain.total().unwrap().inner(),
             Decimal::from(1200)
         );
         assert_eq!(
-            after_bridged.usdc.offchain.total().unwrap().0,
+            after_bridged.usdc.offchain.total().unwrap().inner(),
             Decimal::from(800)
         );
         assert!(!after_bridged.usdc.has_inflight());
@@ -1552,20 +1759,25 @@ mod tests {
             .apply_usdc_rebalance_event(&make_initiated_event(), &direction, amount, Utc::now())
             .unwrap();
         assert_eq!(
-            after_initiated.usdc.onchain.total().unwrap().0,
+            after_initiated.usdc.onchain.total().unwrap().inner(),
             Decimal::from(1000)
         );
         assert!(after_initiated.usdc.has_inflight());
 
         let after_bridged = after_initiated
-            .apply_usdc_rebalance_event(&make_bridged_event(), &direction, amount, Utc::now())
+            .apply_usdc_rebalance_event(
+                &make_bridged_event(amount, Usdc(dec!(0))),
+                &direction,
+                amount,
+                Utc::now(),
+            )
             .unwrap();
         assert_eq!(
-            after_bridged.usdc.offchain.total().unwrap().0,
+            after_bridged.usdc.offchain.total().unwrap().inner(),
             Decimal::from(1200)
         );
         assert_eq!(
-            after_bridged.usdc.onchain.total().unwrap().0,
+            after_bridged.usdc.onchain.total().unwrap().inner(),
             Decimal::from(800)
         );
         assert!(!after_bridged.usdc.has_inflight());
@@ -1760,44 +1972,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_conversion_confirmed_updates_timestamp_only() {
-        let now = Utc::now();
-        let before = now - chrono::Duration::hours(1);
-
-        let view = InventoryView {
-            usdc: Inventory {
-                onchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
-                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
-                last_rebalancing: None,
-            },
-            equities: HashMap::new(),
-            last_updated: before,
-        };
-
-        let event = UsdcRebalanceEvent::ConversionConfirmed {
-            direction: RebalanceDirection::BaseToAlpaca,
-            converted_at: now,
-        };
-
-        let updated = view
-            .apply_usdc_rebalance_event(
-                &event,
-                &RebalanceDirection::BaseToAlpaca,
-                Usdc(dec!(500)),
-                now,
-            )
-            .unwrap();
-
-        // Timestamp should be updated
-        assert_eq!(updated.last_updated, now);
-
-        // USDC balances should NOT change for conversion events
-        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
-        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
-    }
-
-    #[test]
-    fn apply_conversion_failed_updates_timestamp_only() {
+    fn apply_conversion_failed_keeps_balances_unchanged() {
+        // ConversionFailed should not change any balances - it just updates timestamp.
+        // The conversion order failed, so no USDC was added/removed.
         let now = Utc::now();
         let before = now - chrono::Duration::hours(1);
 
@@ -1819,7 +1996,7 @@ mod tests {
         let updated = view
             .apply_usdc_rebalance_event(
                 &event,
-                &RebalanceDirection::AlpacaToBase,
+                &RebalanceDirection::BaseToAlpaca,
                 Usdc(dec!(500)),
                 now,
             )
@@ -1828,9 +2005,55 @@ mod tests {
         // Timestamp should be updated
         assert_eq!(updated.last_updated, now);
 
-        // USDC balances should NOT change for conversion failure
+        // USDC balances should NOT change for failed conversion
         assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(1000)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(1000)));
+    }
+
+    #[test]
+    fn apply_usdc_bridged_uses_amount_received_not_requested_amount() {
+        // BUG TEST: When CCTP fees are deducted, inventory should reflect actual received amount
+        // Request: 100 USDC, Fee: 0.01 USDC, Actual received: 99.99 USDC
+        let requested_amount = usdc(100);
+        let amount_received = Usdc(dec!(99.99));
+        let fee_collected = Usdc(dec!(0.01));
+
+        // Start with 100 inflight (the requested amount)
+        let view = make_usdc_view(1000, 0, 900, 100);
+
+        // The Bridged event should contain the actual amount received
+        let event = UsdcRebalanceEvent::Bridged {
+            mint_tx_hash: TxHash::random(),
+            minted_at: Utc::now(),
+            amount_received,
+            fee_collected,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                requested_amount, // This should be ignored - event's amount_received should be used
+                Utc::now(),
+            )
+            .unwrap();
+
+        // Onchain should receive the ACTUAL amount (99.99), not the requested (100)
+        assert_eq!(
+            updated.usdc.onchain.total().unwrap().inner(),
+            dec!(1099.99),
+            "onchain should have 1000 + 99.99 (actual received), not 1000 + 100 (requested)"
+        );
+
+        // Offchain should have the fee deducted from total
+        // Started with 900 available + 100 inflight = 1000 total
+        // After bridge: 100 inflight consumed, but only 99.99 arrived at destination
+        // So offchain total is now 900 (the 0.01 fee was lost in transit)
+        assert_eq!(
+            updated.usdc.offchain.total().unwrap().inner(),
+            dec!(900),
+            "offchain should have 900 (inflight consumed)"
+        );
     }
 
     #[test]
@@ -1868,5 +2091,581 @@ mod tests {
         // Inflight should remain unchanged - conversion is a separate concern from bridging
         assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
         assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(400)));
+    }
+
+    #[test]
+    fn conversion_confirmed_base_to_alpaca_removes_usdc_from_offchain() {
+        // BUG TEST: For BaseToAlpaca flow, ConversionConfirmed (USDC->USD) should
+        // remove USDC from offchain. Currently, it just updates the timestamp.
+        //
+        // Scenario: After BaseToAlpaca deposit, we have 1000 USDC in offchain (Alpaca wallet).
+        // We convert 100 USDC to USD. Due to slippage (~17 bps), the filled amount
+        // might be slightly different, but for USDC->USD we're selling USDC so
+        // filled_amount represents the USDC sold (should be same as requested for full fills).
+        //
+        // After conversion, offchain should have 900 USDC (1000 - 100).
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Request: 100 USDC → USD conversion
+        // Filled: 100 USDC sold (full fill for market order)
+        let filled_amount = Usdc(dec!(100));
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::BaseToAlpaca,
+            filled_amount,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::BaseToAlpaca,
+                Usdc(dec!(100)),
+                now,
+            )
+            .unwrap();
+
+        // Offchain should have 900 USDC (1000 - 100)
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "ConversionConfirmed(BaseToAlpaca) should remove filled_amount USDC from offchain"
+        );
+
+        // Onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn conversion_confirmed_alpaca_to_base_adds_usdc_to_offchain() {
+        // BUG TEST: For AlpacaToBase flow, ConversionConfirmed (USD->USDC) should
+        // add USDC to offchain. Currently, it just updates the timestamp.
+        //
+        // Scenario: We're converting USD to USDC before withdrawal.
+        // Request: 1000 USD worth of USDC
+        // Filled: 998.3 USDC (17 bps slippage - we got less USDC than expected)
+        //
+        // After conversion, offchain should increase by the filled_amount (998.3), not the requested.
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(1000)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // Request: 1000 USD → USDC conversion
+        // Filled: 998.3 USDC (slippage of ~17 bps)
+        let filled_amount = Usdc(dec!(998.3));
+
+        let event = UsdcRebalanceEvent::ConversionConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            filled_amount,
+            converted_at: now,
+        };
+
+        let updated = view
+            .apply_usdc_rebalance_event(
+                &event,
+                &RebalanceDirection::AlpacaToBase,
+                Usdc(dec!(1000)),
+                now,
+            )
+            .unwrap();
+
+        // Offchain should have 1998.3 USDC (1000 + 998.3)
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(1998.3)),
+            "ConversionConfirmed(AlpacaToBase) should add filled_amount USDC to offchain"
+        );
+
+        // Onchain unchanged
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn snapshot_onchain_equity_skips_when_inflight_nonzero() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(10)),
+                    offchain: VenueBalance::new(shares(50), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(95));
+
+        let event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.onchain.available(),
+            shares(90),
+            "should be unchanged"
+        );
+        assert_eq!(equity.onchain.inflight(), shares(10), "should be unchanged");
+        assert_eq!(
+            equity.offchain.available(),
+            shares(50),
+            "should be unchanged"
+        );
+    }
+
+    #[test]
+    fn snapshot_onchain_equity_skips_when_offchain_has_inflight() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(0)),
+                    offchain: VenueBalance::new(shares(40), shares(10)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(95));
+
+        let event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.onchain.available(),
+            shares(90),
+            "should be unchanged because offchain has inflight"
+        );
+        assert_eq!(equity.onchain.inflight(), shares(0));
+        assert_eq!(equity.offchain.inflight(), shares(10));
+    }
+
+    #[test]
+    fn snapshot_onchain_equity_reconciles_when_inflight_zero() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(0)),
+                    offchain: VenueBalance::new(shares(50), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(95));
+
+        let event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(equity.onchain.available(), shares(95));
+        assert_eq!(equity.onchain.inflight(), shares(0));
+        assert_eq!(equity.offchain.available(), shares(50));
+    }
+
+    #[test]
+    fn snapshot_onchain_cash_skips_when_inflight_nonzero() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(100))),
+                offchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(dec!(950)),
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.onchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.onchain.inflight(),
+            Usdc(dec!(100)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(500)),
+            "should be unchanged"
+        );
+    }
+
+    #[test]
+    fn snapshot_onchain_cash_skips_when_offchain_has_inflight() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(400)), Usdc(dec!(100))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(dec!(950)),
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.onchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged because offchain has inflight"
+        );
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(100)));
+    }
+
+    #[test]
+    fn snapshot_onchain_cash_reconciles_when_inflight_zero() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(dec!(950)),
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(950)));
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn snapshot_offchain_equity_skips_when_inflight_nonzero() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(100), shares(0)),
+                    offchain: VenueBalance::new(shares(40), shares(10)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(55));
+
+        let event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.offchain.available(),
+            shares(40),
+            "should be unchanged"
+        );
+        assert_eq!(
+            equity.offchain.inflight(),
+            shares(10),
+            "should be unchanged"
+        );
+        assert_eq!(
+            equity.onchain.available(),
+            shares(100),
+            "should be unchanged"
+        );
+    }
+
+    #[test]
+    fn snapshot_offchain_equity_skips_when_onchain_has_inflight() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(90), shares(10)),
+                    offchain: VenueBalance::new(shares(50), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(55));
+
+        let event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(
+            equity.offchain.available(),
+            shares(50),
+            "should be unchanged because onchain has inflight"
+        );
+        assert_eq!(equity.offchain.inflight(), shares(0));
+        assert_eq!(equity.onchain.inflight(), shares(10));
+    }
+
+    #[test]
+    fn snapshot_offchain_equity_reconciles_when_inflight_zero() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([(
+                aapl.clone(),
+                Inventory {
+                    onchain: VenueBalance::new(shares(100), shares(0)),
+                    offchain: VenueBalance::new(shares(40), shares(0)),
+                    last_rebalancing: None,
+                },
+            )]),
+            last_updated: now,
+        };
+
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), shares(55));
+
+        let event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        let equity = updated.equities.get(&aapl).unwrap();
+        assert_eq!(equity.offchain.available(), shares(55));
+        assert_eq!(equity.offchain.inflight(), shares(0));
+        assert_eq!(equity.onchain.available(), shares(100));
+    }
+
+    #[test]
+    fn snapshot_offchain_cash_skips_when_inflight_nonzero() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(100))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 95000,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.offchain.inflight(),
+            Usdc(dec!(100)),
+            "should be unchanged"
+        );
+        assert_eq!(
+            updated.usdc.onchain.available(),
+            Usdc(dec!(500)),
+            "should be unchanged"
+        );
+    }
+
+    #[test]
+    fn snapshot_offchain_cash_skips_when_onchain_has_inflight() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(400)), Usdc(dec!(100))),
+                offchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        let event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 95000,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.usdc.offchain.available(),
+            Usdc(dec!(900)),
+            "should be unchanged because onchain has inflight"
+        );
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.onchain.inflight(), Usdc(dec!(100)));
+    }
+
+    #[test]
+    fn snapshot_offchain_cash_reconciles_when_inflight_zero() {
+        let now = Utc::now();
+
+        let view = InventoryView {
+            usdc: Inventory {
+                onchain: VenueBalance::new(Usdc(dec!(500)), Usdc(dec!(0))),
+                offchain: VenueBalance::new(Usdc(dec!(900)), Usdc(dec!(0))),
+                last_rebalancing: None,
+            },
+            equities: HashMap::new(),
+            last_updated: now,
+        };
+
+        // 95000 cents = $950.00
+        let event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 95000,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(updated.usdc.offchain.available(), Usdc(dec!(950)));
+        assert_eq!(updated.usdc.offchain.inflight(), Usdc(dec!(0)));
+        assert_eq!(updated.usdc.onchain.available(), Usdc(dec!(500)));
+    }
+
+    #[test]
+    fn snapshot_multiple_symbols_reconciled_in_single_event() {
+        let now = Utc::now();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+
+        let view = InventoryView {
+            usdc: Inventory::default(),
+            equities: HashMap::from([
+                (
+                    aapl.clone(),
+                    Inventory {
+                        onchain: VenueBalance::new(shares(100), shares(0)),
+                        offchain: VenueBalance::new(shares(50), shares(0)),
+                        last_rebalancing: None,
+                    },
+                ),
+                (
+                    msft.clone(),
+                    Inventory {
+                        onchain: VenueBalance::new(shares(200), shares(0)),
+                        offchain: VenueBalance::new(shares(75), shares(0)),
+                        last_rebalancing: None,
+                    },
+                ),
+            ]),
+            last_updated: now,
+        };
+
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), shares(80));
+        balances.insert(msft.clone(), shares(180));
+
+        let event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: now,
+        };
+
+        let updated = view.apply_snapshot_event(&event, now).unwrap();
+
+        assert_eq!(
+            updated.equities.get(&aapl).unwrap().onchain.available(),
+            shares(80)
+        );
+        assert_eq!(
+            updated.equities.get(&msft).unwrap().onchain.available(),
+            shares(180)
+        );
     }
 }

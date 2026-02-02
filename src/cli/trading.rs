@@ -1,22 +1,27 @@
 //! Trading order execution and transaction processing CLI commands.
 
+use std::io::Write;
+use std::sync::Arc;
+
 use alloy::primitives::B256;
 use alloy::providers::Provider;
+use rust_decimal::Decimal;
+use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
-use std::io::Write;
-use tracing::{error, info};
-
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
-    Direction, Executor, MarketOrder, MockExecutorConfig, OrderPlacement, OrderState, Shares,
-    Symbol, TryIntoExecutor,
+    Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig, OrderPlacement,
+    OrderState, Positive, Symbol, TryIntoExecutor,
 };
+use tracing::{error, info};
 
+use crate::dual_write::DualWriteContext;
 use crate::env::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
+use crate::threshold::ExecutionThreshold;
 
 use super::auth::ensure_schwab_authentication;
 
@@ -114,7 +119,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Shares::new(quantity)?,
+        shares: Positive::new(FractionalShares::new(Decimal::from(quantity)))?,
         direction,
     };
 
@@ -265,9 +270,25 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
+    let dual_write_context = DualWriteContext::with_threshold(
+        pool.clone(),
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+        config.execution_threshold,
+    );
+
+    update_position_aggregate(
+        &dual_write_context,
+        &onchain_trade,
+        config.execution_threshold,
+    )
+    .await;
+
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
+        &dual_write_context,
         onchain_trade,
         config.broker.to_supported_executor(),
     )
@@ -316,6 +337,43 @@ pub(super) async fn process_found_trade<W: Write>(
     Ok(())
 }
 
+async fn update_position_aggregate(
+    dual_write_context: &DualWriteContext,
+    onchain_trade: &OnchainTrade,
+    execution_threshold: ExecutionThreshold,
+) {
+    if let Err(e) = crate::dual_write::initialize_position(
+        dual_write_context,
+        onchain_trade.symbol.base(),
+        execution_threshold,
+    )
+    .await
+    {
+        error!(
+            symbol = %onchain_trade.symbol.base(),
+            execution_threshold = ?execution_threshold,
+            tx_hash = %onchain_trade.tx_hash,
+            log_index = onchain_trade.log_index,
+            error = ?e,
+            "Failed to initialize position aggregate"
+        );
+    }
+
+    if let Err(e) =
+        crate::dual_write::acknowledge_onchain_fill(dual_write_context, onchain_trade).await
+    {
+        error!(
+            symbol = %onchain_trade.symbol.base(),
+            execution_threshold = ?execution_threshold,
+            tx_hash = %onchain_trade.tx_hash,
+            log_index = onchain_trade.log_index,
+            block_timestamp = ?onchain_trade.block_timestamp,
+            error = ?e,
+            "Failed to acknowledge onchain fill in position aggregate"
+        );
+    }
+}
+
 fn display_trade_details<W: Write>(
     onchain_trade: &OnchainTrade,
     stdout: &mut W,
@@ -347,6 +405,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
+    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -373,6 +432,7 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

@@ -107,6 +107,7 @@ mod tests {
     use crate::env::{Config, LogLevel};
     use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
+    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -135,6 +136,7 @@ mod tests {
             broker: BrokerConfig::Schwab(schwab_auth.clone()),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         };
 
         (config, schwab_auth)

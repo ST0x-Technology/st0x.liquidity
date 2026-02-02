@@ -13,6 +13,8 @@ use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use thiserror::Error;
 
+use alloy::primitives::ruint::FromUintError;
+
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::cctp::CctpError;
 use crate::onchain::vault::VaultError;
@@ -42,6 +44,10 @@ pub(crate) enum UsdcRebalanceManagerError {
     ArithmeticOverflow(String),
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
+    #[error("U256 to u128 conversion error: {0}")]
+    U256ToU128(#[from] FromUintError<u128>),
+    #[error("Conversion order {order_id} filled but filled_quantity is missing")]
+    MissingFilledQuantity { order_id: uuid::Uuid },
 }
 
 /// Trait for executing USDC rebalance operations.

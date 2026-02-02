@@ -1,16 +1,20 @@
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use tracing::Level;
+use std::process::ExitCode;
+use tracing::{Level, error, info};
+
+use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmConfig;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
 use crate::telemetry::HyperDxConfig;
-use st0x_execution::SupportedExecutor;
+use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
 use st0x_execution::schwab::SchwabAuthConfig;
@@ -114,6 +118,44 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("failed to parse config file")]
     Toml(#[from] toml::de::Error),
+    #[error("Invalid execution threshold: {0}")]
+    InvalidThreshold(#[from] InvalidThresholdError),
+    #[error("Invalid shares value: {0}")]
+    InvalidShares(#[from] st0x_execution::InvalidSharesError),
+}
+
+impl ConfigError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
+            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
+            Self::Io(_) => "failed to read config file",
+            Self::Toml(_) => "failed to parse config file",
+            Self::InvalidThreshold(_) => "invalid execution threshold",
+            Self::InvalidShares(_) => "invalid shares value",
+        }
+    }
+}
+
+/// Parses config from file specified via `--config-file` and validates it.
+///
+/// Returns `ExitCode::SUCCESS` if valid, `ExitCode::FAILURE` otherwise.
+/// Logs success/failure via tracing.
+///
+/// This function is intended exclusively for the `validate_config` binary.
+pub fn validate_config() -> ExitCode {
+    let env = Env::parse();
+    match Config::load_file(&env.config_file) {
+        Ok(_) => {
+            info!("Config validation passed");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(kind = e.kind(), "Config validation failed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +169,7 @@ pub struct Config {
     pub(crate) broker: BrokerConfig,
     pub hyperdx: Option<HyperDxConfig>,
     pub(crate) rebalancing: Option<RebalancingConfig>,
+    pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 impl<'de> Deserialize<'de> for Config {
@@ -151,6 +194,21 @@ impl<'de> Deserialize<'de> for Config {
 
         let log_level = fields.log_level.unwrap_or(LogLevel::Debug);
 
+        // Execution threshold is determined by broker capabilities:
+        // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
+        // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
+        //   for slippage, fees, and price discrepancies that could push fills below $1.
+        // - DryRun uses shares threshold for testing
+        let execution_threshold = match &fields.broker {
+            BrokerConfig::Schwab(_) | BrokerConfig::DryRun => {
+                ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+            }
+            BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
+                ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))
+                    .map_err(serde::de::Error::custom)?
+            }
+        };
+
         Ok(Self {
             database_url: fields.database_url,
             log_level,
@@ -161,6 +219,7 @@ impl<'de> Deserialize<'de> for Config {
             broker: fields.broker,
             hyperdx: fields.hyperdx,
             rebalancing: fields.rebalancing,
+            execution_threshold,
         })
     }
 }
@@ -189,6 +248,10 @@ impl Config {
 
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
         configure_sqlite_pool(&self.database_url).await
+    }
+
+    pub(crate) fn rebalancing_config(&self) -> Option<&RebalancingConfig> {
+        self.rebalancing.as_ref()
     }
 
     pub const fn get_order_poller_config(&self) -> OrderPollerConfig {
@@ -231,12 +294,15 @@ pub fn setup_tracing(log_level: &LogLevel) {
 }
 
 #[cfg(test)]
-pub mod tests {
-    use super::*;
-    use crate::onchain::EvmConfig;
+pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use st0x_execution::schwab::{SchwabAuthConfig, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
+    use tracing_test::traced_test;
+
+    use super::*;
+    use crate::onchain::EvmConfig;
+    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -263,6 +329,7 @@ pub mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -444,6 +511,11 @@ pub mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
             alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            [rebalancing.alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
             [rebalancing.equity_threshold]
             target = "0.5"
             deviation = "0.2"
@@ -545,5 +617,124 @@ pub mod tests {
         let hyperdx = config.hyperdx.as_ref().expect("hyperdx should be Some");
         assert_eq!(hyperdx.api_key, "test-api-key");
         assert_eq!(hyperdx.service_name, "test-service");
+    }
+
+    #[test]
+    fn default_execution_threshold_is_one_share_for_dry_run() {
+        let config = Config::load(&dry_run_toml()).unwrap();
+        assert_eq!(
+            config.execution_threshold,
+            ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+        );
+    }
+
+    #[test]
+    fn schwab_executor_uses_shares_threshold() {
+        let config = Config::load(&schwab_toml()).unwrap();
+        assert_eq!(
+            config.execution_threshold,
+            ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+        );
+    }
+
+    #[test]
+    fn alpaca_trading_api_executor_uses_dollar_threshold() {
+        let toml = minimal_toml_with_broker(
+            r#"
+            [broker]
+            type = "alpaca-trading-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            "#,
+        );
+
+        let config = Config::load(&toml).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        assert_eq!(config.execution_threshold, expected);
+    }
+
+    #[test]
+    fn alpaca_broker_api_executor_uses_dollar_threshold() {
+        let toml = minimal_toml_with_broker(
+            r#"
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "test-key"
+            api_secret = "test-secret"
+            account_id = "test-account-id"
+            "#,
+        );
+
+        let config = Config::load(&toml).unwrap();
+        let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+        assert_eq!(config.execution_threshold, expected);
+    }
+
+    #[test]
+    fn config_error_kind_rebalancing() {
+        let err = ConfigError::Rebalancing(RebalancingConfigError::NotAlpacaBroker);
+        assert_eq!(err.kind(), "rebalancing configuration error");
+    }
+
+    #[test]
+    fn config_error_kind_invalid_threshold() {
+        let err = ConfigError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
+        assert_eq!(err.kind(), "invalid execution threshold");
+    }
+
+    #[traced_test]
+    #[test]
+    fn rebalancing_with_schwab_logs_error_kind() {
+        let toml = r#"
+            database_url = ":memory:"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+            [broker]
+            type = "schwab"
+            app_key = "test_key"
+            app_secret = "test_secret"
+            encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+            [rebalancing]
+            redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            ethereum_rpc_url = "https://mainnet.infura.io"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            [rebalancing.alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
+            [rebalancing.equity_threshold]
+            target = "0.5"
+            deviation = "0.2"
+            [rebalancing.usdc_threshold]
+            target = "0.5"
+            deviation = "0.3"
+        "#;
+
+        let result = Config::load(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn rebalancing_config_returns_some_when_present() {
+        let config = Config::load(example_toml()).unwrap();
+        assert!(
+            config.rebalancing_config().is_some(),
+            "rebalancing_config() should return Some when rebalancing is configured"
+        );
+    }
+
+    #[test]
+    fn rebalancing_config_returns_none_when_absent() {
+        let config = Config::load(&dry_run_toml()).unwrap();
+        assert!(
+            config.rebalancing_config().is_none(),
+            "rebalancing_config() should return None when rebalancing is not configured"
+        );
     }
 }
