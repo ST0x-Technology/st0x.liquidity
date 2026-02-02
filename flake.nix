@@ -59,7 +59,7 @@
               localSystem = system;
             };
         in rainixPkgs // deployPkgs // {
-          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy;
+          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
           st0x-liquidity = pkgs.callPackage ./rust.nix {
             inherit rustPlatform;

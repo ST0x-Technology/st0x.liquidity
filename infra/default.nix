@@ -106,4 +106,22 @@ in {
       terraform -chdir=infra destroy "$@"
     '';
   };
+
+  tfEditVars = rainix.mkTask.${system} {
+    name = "tf-edit-vars";
+    additionalBuildInputs = buildInputs;
+    body = ''
+      ${parseIdentity}
+      on_exit() { rm -f ${tfVars}; }
+      trap on_exit EXIT
+
+      rage -d -i "$identity" ${tfVars}.age > ${tfVars}
+      ''${EDITOR:-vi} ${tfVars}
+
+      nix eval --raw --file ${
+        ../keys.nix
+      } roles.infra --apply 'builtins.concatStringsSep "\n"' \
+        | rage -e -R /dev/stdin -o ${tfVars}.age ${tfVars}
+    '';
+  };
 }
