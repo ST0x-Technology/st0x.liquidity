@@ -4,9 +4,8 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
-use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_execution::{ArithmeticError, Executor, FractionalShares};
+use st0x_execution::Executor;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
@@ -14,19 +13,19 @@ use tracing::{info, warn};
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Config;
 use crate::error::EventProcessingError;
-use crate::lifecycle::{Lifecycle, Never};
-use crate::offchain_order::OffchainOrder;
+use crate::inventory::InventorySnapshotAggregate;
+use crate::offchain_order::OffchainOrderCqrs;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
-use crate::onchain_trade::OnChainTrade;
-use crate::position::Position;
+use crate::onchain_trade::OnChainTradeCqrs;
+use crate::position::PositionCqrs;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
+use crate::vault_registry::VaultRegistryAggregate;
 
 use super::{
-    Conductor, InventorySnapshotAggregate, VaultRegistryAggregate, spawn_event_processor,
-    spawn_inventory_poller, spawn_onchain_event_receiver, spawn_order_poller,
-    spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
+    spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
@@ -35,10 +34,9 @@ type TakeStream =
 
 pub(crate) struct CqrsFrameworks {
     pub(crate) pool: SqlitePool,
-    pub(crate) onchain_trade_cqrs: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>>,
-    pub(crate) position_cqrs:
-        Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>>,
-    pub(crate) offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>>,
+    pub(crate) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
+    pub(crate) position_cqrs: Arc<PositionCqrs>,
+    pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
     pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
     pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,

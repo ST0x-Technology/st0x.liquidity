@@ -21,23 +21,26 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_execution::{
-    EmptySymbolError, Executor, FractionalShares, MarketOrder, Positive, SupportedExecutor, Symbol,
+    ArithmeticError, EmptySymbolError, Executor, FractionalShares, MarketOrder, Positive,
+    SupportedExecutor, Symbol,
 };
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::Config;
 use crate::dashboard::ServerMessage;
-use crate::dual_write::DualWriteContext;
 use crate::equity_redemption::EquityRedemption;
-use crate::error::{EventProcessingError, EventQueueError};
+use crate::error::{EventProcessingError, EventQueueError, OnChainError};
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
+    InventoryPollingService, InventorySnapshot, InventorySnapshotAggregate, InventorySnapshotQuery,
+    InventoryView,
 };
-use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain::execution::find_execution_by_id;
 use crate::offchain::order_poller::OrderStatusPoller;
-use crate::offchain_order::{BrokerOrderId, OffchainOrderView};
+use crate::offchain_order::{
+    BrokerOrderId, ExecutionId, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs,
+    OffchainOrderView, PriceCents,
+};
 use crate::onchain::accumulator::{
     CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
 };
@@ -46,6 +49,8 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmConfig, OnchainTrade, accumulator};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
+use crate::position::{Position, PositionCommand, PositionCqrs, TradeId};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
@@ -53,13 +58,11 @@ use crate::rebalancing::{
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
+use crate::threshold::ExecutionThreshold;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
-
-type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
-type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
 /// Context for vault discovery operations during trade processing.
 struct VaultDiscoveryContext<'a> {
@@ -448,7 +451,8 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     config: &Config,
     pool: &SqlitePool,
     executor: E,
-    dual_write_context: DualWriteContext,
+    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    position_cqrs: Arc<PositionCqrs>,
 ) -> JoinHandle<()> {
     let poller_config = config.get_order_poller_config();
     info!(
@@ -456,7 +460,13 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_config.polling_interval, poller_config.max_jitter
     );
 
-    let poller = OrderStatusPoller::new(poller_config, pool.clone(), executor, dual_write_context);
+    let poller = OrderStatusPoller::new(
+        poller_config,
+        pool.clone(),
+        executor,
+        offchain_order_cqrs,
+        position_cqrs,
+    );
     tokio::spawn(async move {
         if let Err(e) = poller.run().await {
             error!("Order poller failed: {e}");
@@ -507,7 +517,11 @@ fn spawn_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    dual_write_context: DualWriteContext,
+    cqrs_pool: SqlitePool,
+    onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
+    position_cqrs: Arc<PositionCqrs>,
+    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    execution_threshold: ExecutionThreshold,
     vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
 ) -> JoinHandle<()>
 where
@@ -527,7 +541,10 @@ where
             &pool_clone,
             &cache_clone,
             provider,
-            &dual_write_context,
+            &onchain_trade_cqrs,
+            &position_cqrs,
+            &offchain_order_cqrs,
+            execution_threshold,
             &vault_registry_cqrs,
         )
         .await;
@@ -537,7 +554,9 @@ where
 fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     pool: SqlitePool,
-    dual_write_context: DualWriteContext,
+    position_cqrs: Arc<PositionCqrs>,
+    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -554,8 +573,14 @@ where
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) =
-                check_and_execute_accumulated_positions(&executor, &pool, &dual_write_context).await
+            if let Err(e) = check_and_execute_accumulated_positions(
+                &executor,
+                &pool,
+                &position_cqrs,
+                &offchain_order_cqrs,
+                execution_threshold,
+            )
+            .await
             {
                 error!("Periodic accumulated position check failed: {e}");
             }
@@ -722,7 +747,10 @@ async fn run_queue_processor<P, E>(
     pool: &SqlitePool,
     cache: &SymbolCache,
     provider: P,
-    dual_write_context: &DualWriteContext,
+    onchain_trade_cqrs: &OnChainTradeCqrs,
+    position_cqrs: &PositionCqrs,
+    offchain_order_cqrs: &OffchainOrderCqrs,
+    execution_threshold: ExecutionThreshold,
     vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
 ) where
     P: Provider + Clone,
@@ -749,12 +777,15 @@ async fn run_queue_processor<P, E>(
             config,
             pool,
             &provider,
-            dual_write_context,
+            onchain_trade_cqrs,
+            position_cqrs,
+            offchain_order_cqrs,
+            execution_threshold,
             &queue_context,
         )
         .await;
 
-        handle_queue_processing_result(executor, pool, dual_write_context, result).await;
+        handle_queue_processing_result(executor, pool, offchain_order_cqrs, result).await;
     }
 }
 
@@ -771,23 +802,28 @@ async fn log_unprocessed_event_count(pool: &SqlitePool) {
 async fn handle_queue_processing_result<E>(
     executor: &E,
     pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
+    offchain_order_cqrs: &OffchainOrderCqrs,
     result: Result<Option<OffchainOrderView>, EventProcessingError>,
 ) where
     E: Executor + Clone,
     EventProcessingError: From<E::Error>,
 {
     match result {
-        Ok(Some(execution)) => {
-            if let Some(exec_id) = execution.id
-                && let Err(e) =
-                    execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
-                        .await
+        Ok(Some(OffchainOrderView::Execution { execution_id, .. })) => {
+            if let Err(e) = execute_pending_offchain_execution(
+                executor,
+                pool,
+                offchain_order_cqrs,
+                execution_id.0,
+            )
+            .await
             {
-                error!("Failed to execute offchain order {exec_id}: {e}");
+                error!("Failed to execute offchain order {}: {e}", execution_id.0);
             }
         }
-        Ok(None) => sleep(Duration::from_millis(100)).await,
+        Ok(Some(OffchainOrderView::Unavailable) | None) => {
+            sleep(Duration::from_millis(100)).await;
+        }
         Err(e) => {
             error!("Error processing queued event: {e}");
             sleep(Duration::from_millis(500)).await;
@@ -808,7 +844,10 @@ async fn process_next_queued_event<P: Provider + Clone>(
     config: &Config,
     pool: &SqlitePool,
     provider: &P,
-    dual_write_context: &DualWriteContext,
+    onchain_trade_cqrs: &OnChainTradeCqrs,
+    position_cqrs: &PositionCqrs,
+    offchain_order_cqrs: &OffchainOrderCqrs,
+    execution_threshold: ExecutionThreshold,
     queue_context: &QueueProcessingContext<'_>,
 ) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
@@ -1550,8 +1589,8 @@ mod tests {
     use crate::onchain::io::Usdc;
     use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
-    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_symbol;
+    use ExecutionThreshold;
     use rust_decimal::Decimal;
     use st0x_execution::{
         Direction, FractionalShares, MockExecutorConfig, OrderState, OrderStatus, Positive,

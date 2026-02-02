@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::inventory::snapshot::{
-    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
+    InventorySnapshot, InventorySnapshotAggregate, InventorySnapshotCommand, InventorySnapshotError,
 };
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
@@ -22,8 +22,6 @@ use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
-
-type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]

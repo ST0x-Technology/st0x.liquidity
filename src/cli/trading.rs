@@ -6,20 +6,23 @@ use std::sync::Arc;
 use alloy::primitives::B256;
 use alloy::providers::Provider;
 use rust_decimal::Decimal;
-use sqlite_es::sqlite_cqrs;
+use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
-    Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig, OrderPlacement,
-    OrderState, Positive, Symbol, TryIntoExecutor,
+    ArithmeticError, Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig,
+    OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
 use tracing::{error, info};
 
 use crate::config::{BrokerConfig, Config};
-use crate::dual_write::DualWriteContext;
 use crate::error::OnChainError;
+use crate::lifecycle::{Lifecycle, Never};
+use crate::offchain_order::{OffchainOrder, OffchainOrderView};
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
+use crate::onchain_trade::OnChainTrade;
+use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 
@@ -270,20 +273,14 @@ pub(super) async fn process_found_trade<W: Write>(
 
     writeln!(stdout, "🔄 Processing trade with TradeAccumulator...")?;
 
-    let dual_write_context = DualWriteContext::with_threshold(
-        pool.clone(),
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        config.execution_threshold,
-    );
+    let onchain_trade_cqrs: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>> =
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+    let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>> =
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+    let offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>> =
+        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
-    update_position_aggregate(
-        &dual_write_context,
-        &onchain_trade,
-        config.execution_threshold,
-    )
-    .await;
+    update_position_aggregate(&position_cqrs, &onchain_trade, config.execution_threshold).await;
 
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
@@ -295,20 +292,25 @@ pub(super) async fn process_found_trade<W: Write>(
     .await?;
     sql_tx.commit().await?;
 
-    if let Some(execution) = execution.execution {
-        let execution_id = execution
-            .id
-            .ok_or_else(|| anyhow::anyhow!("OffchainExecution missing ID after accumulation"))?;
+    if let Some(OffchainOrderView::Execution {
+        execution_id,
+        symbol,
+        shares,
+        direction,
+        ..
+    }) = execution.execution
+    {
         writeln!(
             stdout,
-            "✅ Trade triggered execution for {:?} (ID: {execution_id})",
-            config.broker.to_supported_executor()
+            "✅ Trade triggered execution for {:?} (ID: {})",
+            config.broker.to_supported_executor(),
+            execution_id.0
         )?;
 
         let market_order = MarketOrder {
-            symbol: execution.symbol,
-            shares: execution.shares,
-            direction: execution.direction,
+            symbol,
+            shares,
+            direction,
         };
 
         let placement = execute_broker_order(config, pool, market_order, stdout).await?;
@@ -319,7 +321,7 @@ pub(super) async fn process_found_trade<W: Write>(
 
         let mut sql_tx = pool.begin().await?;
         submitted_state
-            .store_update(&mut sql_tx, execution_id)
+            .store_update(&mut sql_tx, execution_id.0)
             .await?;
         sql_tx.commit().await?;
         writeln!(stdout, "🎯 Trade processing completed!")?;
@@ -338,19 +340,25 @@ pub(super) async fn process_found_trade<W: Write>(
 }
 
 async fn update_position_aggregate(
-    dual_write_context: &DualWriteContext,
+    position_cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
     onchain_trade: &OnchainTrade,
     execution_threshold: ExecutionThreshold,
 ) {
-    if let Err(e) = crate::dual_write::initialize_position(
-        dual_write_context,
-        onchain_trade.symbol.base(),
-        execution_threshold,
-    )
-    .await
+    let base_symbol = onchain_trade.symbol.base();
+    let aggregate_id = Position::aggregate_id(base_symbol);
+
+    if let Err(e) = position_cqrs
+        .execute(
+            &aggregate_id,
+            PositionCommand::Initialize {
+                symbol: base_symbol.clone(),
+                threshold: execution_threshold,
+            },
+        )
+        .await
     {
         error!(
-            symbol = %onchain_trade.symbol.base(),
+            symbol = %base_symbol,
             execution_threshold = ?execution_threshold,
             tx_hash = %onchain_trade.tx_hash,
             log_index = onchain_trade.log_index,
@@ -359,11 +367,66 @@ async fn update_position_aggregate(
         );
     }
 
-    if let Err(e) =
-        crate::dual_write::acknowledge_onchain_fill(dual_write_context, onchain_trade).await
+    let block_timestamp = match onchain_trade.block_timestamp {
+        Some(ts) => ts,
+        None => {
+            error!(
+                tx_hash = %onchain_trade.tx_hash,
+                log_index = onchain_trade.log_index,
+                "Missing block timestamp, cannot acknowledge onchain fill"
+            );
+            return;
+        }
+    };
+
+    let amount = match Decimal::try_from(onchain_trade.amount) {
+        Ok(d) => FractionalShares::new(d),
+        Err(e) => {
+            error!(
+                amount = onchain_trade.amount,
+                tx_hash = %onchain_trade.tx_hash,
+                log_index = onchain_trade.log_index,
+                error = ?e,
+                "Failed to convert trade amount to FractionalShares"
+            );
+            return;
+        }
+    };
+
+    let price_usdc = match Decimal::try_from(onchain_trade.price.value()) {
+        Ok(price) => price,
+        Err(e) => {
+            error!(
+                price = onchain_trade.price.value(),
+                tx_hash = %onchain_trade.tx_hash,
+                log_index = onchain_trade.log_index,
+                error = ?e,
+                "Failed to convert trade price to Decimal"
+            );
+            return;
+        }
+    };
+
+    let trade_id = TradeId {
+        tx_hash: onchain_trade.tx_hash,
+        log_index: onchain_trade.log_index,
+    };
+
+    if let Err(e) = position_cqrs
+        .execute(
+            &aggregate_id,
+            PositionCommand::AcknowledgeOnChainFill {
+                trade_id,
+                amount,
+                direction: onchain_trade.direction,
+                price_usdc,
+                block_timestamp,
+            },
+        )
+        .await
     {
         error!(
-            symbol = %onchain_trade.symbol.base(),
+            symbol = %base_symbol,
             execution_threshold = ?execution_threshold,
             tx_hash = %onchain_trade.tx_hash,
             log_index = onchain_trade.log_index,

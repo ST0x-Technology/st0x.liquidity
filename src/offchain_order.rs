@@ -4,10 +4,16 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, FractionalShares, OrderStatus, SupportedExecutor, Symbol};
+use st0x_execution::{
+    Direction, FractionalShares, OrderStatus, Positive, SupportedExecutor, Symbol,
+};
 use tracing::error;
 
+use sqlite_es::SqliteCqrs;
+
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+
+pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder, Never>>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExecutionId(pub(crate) i64);
@@ -525,7 +531,7 @@ pub(crate) enum OffchainOrderView {
     Execution {
         execution_id: ExecutionId,
         symbol: Symbol,
-        shares: FractionalShares,
+        shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
         status: OrderStatus,

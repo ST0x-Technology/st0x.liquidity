@@ -9,7 +9,11 @@ use serde::{Deserialize, Serialize};
 use st0x_execution::{ArithmeticError, Direction, FractionalShares, SupportedExecutor, Symbol};
 use tracing::warn;
 
+use sqlite_es::SqliteCqrs;
+
 use crate::lifecycle::{Lifecycle, LifecycleError};
+
+pub(crate) type PositionCqrs = SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>;
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
