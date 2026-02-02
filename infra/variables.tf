@@ -19,7 +19,7 @@ variable "region" {
 variable "droplet_size" {
   description = "Droplet size slug"
   type        = string
-  default     = "s-2vcpu-4gb"
+  default     = "s-4vcpu-8gb"
 }
 
 variable "volume_size_gb" {
