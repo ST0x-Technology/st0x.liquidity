@@ -6,7 +6,6 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
-use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use cqrs_es::Query;
 use futures_util::{Stream, StreamExt};
@@ -300,6 +299,8 @@ impl Conductor {
             snapshot_cqrs,
         };
 
+        let order_owner = config.order_owner().await.ok();
+
         let mut builder = ConductorBuilder::new(
             config.clone(),
             pool.clone(),
@@ -307,6 +308,7 @@ impl Conductor {
             provider,
             executor,
             frameworks,
+            order_owner,
         )
         .with_executor_maintenance(executor_maintenance)
         .with_dex_event_streams(clear_stream, take_stream);
@@ -374,8 +376,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
 ) -> anyhow::Result<JoinHandle<()>> {
     info!("Initializing rebalancing infrastructure");
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let market_maker_wallet = signer.address();
+    let market_maker_wallet = rebalancing_config.signer.address().await?;
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -777,12 +778,13 @@ async fn handle_queue_processing_result<E>(
 {
     match result {
         Ok(Some(execution)) => {
-            if let Some(exec_id) = execution.id
-                && let Err(e) =
+            if let Some(exec_id) = execution.id {
+                if let Err(e) =
                     execute_pending_offchain_execution(executor, pool, dual_write_context, exec_id)
                         .await
-            {
-                error!("Failed to execute offchain order {exec_id}: {e}");
+                {
+                    error!("Failed to execute offchain order {exec_id}: {e}");
+                }
             }
         }
         Ok(None) => sleep(Duration::from_millis(100)).await,
@@ -814,7 +816,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return Ok(None);
     };
 
-    let event_id = extract_event_id(&queued_event)?;
+    let event_id = extract_event_id(&queued_event).map_err(|e| *e)?;
 
     let onchain_trade = convert_event_to_trade(
         config,
@@ -832,7 +834,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     let vault_discovery_context = VaultDiscoveryContext {
         vault_registry_cqrs: queue_context.vault_registry_cqrs,
         orderbook: config.evm.orderbook,
-        order_owner: config.order_owner()?,
+        order_owner: config.order_owner().await?,
     };
 
     process_valid_trade(
@@ -847,10 +849,10 @@ async fn process_next_queued_event<P: Provider + Clone>(
     .await
 }
 
-fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
+fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, Box<EventProcessingError>> {
     queued_event
         .id
-        .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
+        .ok_or_else(|| Box::new(EventProcessingError::Queue(EventQueueError::MissingEventId)))
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -930,7 +932,7 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     feed_id_cache: &FeedIdCache,
 ) -> Result<Option<OnchainTrade>, EventProcessingError> {
     let reconstructed_log = reconstruct_log_from_queued_event(&config.evm, queued_event);
-    let order_owner = config.order_owner()?;
+    let order_owner = config.order_owner().await?;
 
     let onchain_trade = match &queued_event.event {
         TradeEvent::ClearV3(clear_event) => {
@@ -1705,7 +1707,7 @@ mod tests {
                 ProviderBuilder::new().connect_http("http://localhost:8545".parse().unwrap());
 
             let feed_id_cache = FeedIdCache::default();
-            let order_owner = config.order_owner().unwrap();
+            let order_owner = config.order_owner().await.unwrap();
             if let Ok(Some(trade)) = OnchainTrade::try_from_clear_v3(
                 &config.evm,
                 &cache,
@@ -2747,10 +2749,18 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         assert!(!conductor.order_poller.is_finished());
         assert!(!conductor.event_processor.is_finished());
@@ -2780,10 +2790,18 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         let order_handle = conductor.order_poller;
         let event_handle = conductor.event_processor;
@@ -2828,10 +2846,18 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         let elapsed = start_time.elapsed();
 
@@ -2861,10 +2887,18 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .spawn();
 
         assert!(conductor.rebalancer.is_none());
         abort_all_conductor_tasks(conductor);
@@ -2894,11 +2928,19 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .with_rebalancer(rebalancer_handle)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(rebalancer_handle)
+        .spawn();
 
         assert!(conductor.rebalancer.is_some());
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
@@ -2930,11 +2972,19 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .with_rebalancer(rebalancer_handle)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(rebalancer_handle)
+        .spawn();
 
         let rebalancer_ref = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_ref.is_finished());
@@ -2968,11 +3018,19 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
-            .with_executor_maintenance(None)
-            .with_dex_event_streams(clear_stream, take_stream)
-            .with_rebalancer(rebalancer_handle)
-            .spawn();
+        let conductor = ConductorBuilder::new(
+            config,
+            pool,
+            cache,
+            provider,
+            executor,
+            frameworks,
+            Some(Address::ZERO),
+        )
+        .with_executor_maintenance(None)
+        .with_dex_event_streams(clear_stream, take_stream)
+        .with_rebalancer(rebalancer_handle)
+        .spawn();
 
         assert!(!conductor.rebalancer.as_ref().unwrap().is_finished());
 

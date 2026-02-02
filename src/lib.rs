@@ -20,6 +20,7 @@ pub mod env;
 mod equity_redemption;
 mod error;
 mod error_decoding;
+mod fireblocks;
 mod inventory;
 mod lifecycle;
 mod lock;
@@ -175,11 +176,13 @@ async fn run(
                 break Ok(());
             }
             Err(e) => {
-                if let Some(execution_error) = e.downcast_ref::<ExecutionError>()
-                    && matches!(
-                        execution_error,
-                        ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
-                    )
+                if e.downcast_ref::<ExecutionError>()
+                    .is_some_and(|execution_error| {
+                        matches!(
+                            execution_error,
+                            ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
+                        )
+                    })
                 {
                     warn!("Refresh token expired, retrying in {RERUN_DELAY_SECS} seconds");
                     tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;

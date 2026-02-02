@@ -3,7 +3,6 @@
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
-use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
@@ -42,8 +41,8 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-bridge requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
-    let wallet = signer.address();
+    let resolved = rebalancing.signer.resolve().await?;
+    let wallet = resolved.address;
 
     let amount_u256 = if all {
         let balance = match from {
@@ -84,7 +83,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
     writeln!(stdout, "   Wallet: {wallet}")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer.clone())?;
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, resolved.wallet)?;
 
     let direction = from.to_bridge_direction();
 
@@ -116,15 +115,15 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
 fn build_cctp_bridge<BP: Provider + Clone>(
     rebalancing: &RebalancingConfig,
     base_provider: BP,
-    signer: PrivateKeySigner,
+    wallet: EthereumWallet,
 ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, CctpError> {
-    let owner = signer.address();
+    let owner = wallet.default_signer().address();
 
     let ethereum_provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer.clone()))
+        .wallet(wallet.clone())
         .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
     let base_provider = ProviderBuilder::new()
-        .wallet(EthereumWallet::from(signer))
+        .wallet(wallet)
         .connect_provider(base_provider);
 
     let ethereum = Evm::new(
@@ -161,7 +160,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-recover requires rebalancing configuration"))?;
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
+    let resolved = rebalancing.signer.resolve().await?;
 
     let direction = source_chain.to_bridge_direction();
     let dest_chain = match source_chain {
@@ -171,7 +170,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     writeln!(stdout, "   Destination chain: {dest_chain:?}")?;
     writeln!(stdout, "   Polling V2 attestation API...")?;
 
-    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, signer)?;
+    let cctp_bridge = build_cctp_bridge(rebalancing, base_provider, resolved.wallet)?;
 
     // Use the V2 API which returns both message and attestation from tx hash
     let response = cctp_bridge.poll_attestation(direction, burn_tx).await?;
@@ -206,9 +205,8 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("reset-allowance requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
-    let wallet = EthereumWallet::from(signer.clone());
-    let owner = signer.address();
+    let resolved = rebalancing.signer.resolve().await?;
+    let owner = resolved.address;
 
     let (usdc_address, spender, chain_name) = match chain {
         CctpChain::Ethereum => (USDC_ETHEREUM, config.evm.orderbook, "Ethereum"),
@@ -223,13 +221,13 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
     match chain {
         CctpChain::Ethereum => {
             let provider = ProviderBuilder::new()
-                .wallet(wallet)
+                .wallet(resolved.wallet)
                 .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
             reset_allowance(stdout, usdc_address, owner, spender, &provider).await
         }
         CctpChain::Base => {
             let provider = ProviderBuilder::new()
-                .wallet(wallet)
+                .wallet(resolved.wallet)
                 .connect_provider(base_provider);
             reset_allowance(stdout, usdc_address, owner, spender, &provider).await
         }
@@ -280,6 +278,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaAccountId;
     use crate::env::{BrokerConfig, LogLevel};
+    use crate::fireblocks::SignerConfig;
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
@@ -308,7 +307,7 @@ mod tests {
     fn create_config_with_rebalancing() -> Config {
         let mut config = create_config_without_rebalancing();
         config.rebalancing = Some(RebalancingConfig {
-            evm_private_key: B256::ZERO,
+            signer: SignerConfig::Local(B256::ZERO),
             ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,

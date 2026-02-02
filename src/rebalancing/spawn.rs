@@ -6,7 +6,6 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-use alloy::signers::local::PrivateKeySigner;
 use cqrs_es::Query;
 use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
@@ -16,6 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
+use crate::fireblocks::SignerResolveError;
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{AlpacaBrokerApi, Executor};
 
@@ -39,8 +39,8 @@ use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpawnRebalancerError {
-    #[error("invalid Ethereum private key: {0}")]
-    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("failed to resolve signer")]
+    Signer(#[from] SignerResolveError),
     #[error("failed to create Alpaca wallet service: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
     #[error("failed to create Alpaca broker API: {0}")]
@@ -87,13 +87,12 @@ pub(crate) async fn spawn_rebalancer<BP>(
 where
     BP: Provider + Clone + Send + Sync + 'static,
 {
-    let signer = PrivateKeySigner::from_bytes(&config.evm_private_key)?;
-    let ethereum_wallet = EthereumWallet::from(signer.clone());
+    let resolved = config.signer.resolve().await?;
 
     let services = Services::new(
         config,
-        &ethereum_wallet,
-        signer.address(),
+        &resolved.wallet,
+        resolved.address,
         base_provider,
         orderbook,
     )
@@ -265,6 +264,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
+    use crate::fireblocks::SignerConfig;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
 
@@ -282,9 +282,9 @@ mod tests {
             },
             redemption_wallet: address!("0x1234567890123456789012345678901234567890"),
             ethereum_rpc_url: "https://eth.example.com".parse().unwrap(),
-            evm_private_key: b256!(
+            signer: SignerConfig::Local(b256!(
                 "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-            ),
+            )),
             usdc_vault_id: b256!(
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
@@ -299,15 +299,16 @@ mod tests {
     }
 
     #[test]
-    fn spawn_rebalancer_error_display_invalid_private_key() {
-        let err =
-            SpawnRebalancerError::InvalidPrivateKey(alloy::signers::k256::ecdsa::Error::new());
+    fn spawn_rebalancer_error_display_signer_resolve() {
+        let err = SpawnRebalancerError::Signer(SignerResolveError::InvalidPrivateKey(
+            alloy::signers::k256::ecdsa::Error::new(),
+        ));
 
         let display = format!("{err}");
 
         assert!(
-            display.contains("invalid Ethereum private key"),
-            "Expected error message to contain 'invalid Ethereum private key', got: {display}"
+            display.contains("failed to resolve signer"),
+            "Expected error message to contain 'failed to resolve signer', got: {display}"
         );
     }
 
@@ -351,11 +352,11 @@ mod tests {
         assert_eq!(trigger_config.usdc_threshold.deviation, dec!(0.15));
     }
 
-    #[test]
-    fn private_key_signer_from_valid_bytes_succeeds() {
+    #[tokio::test]
+    async fn private_key_signer_from_valid_bytes_succeeds() {
         let config = make_config();
 
-        let result = PrivateKeySigner::from_bytes(&config.evm_private_key);
+        let result = config.signer.resolve().await;
 
         assert!(
             result.is_ok(),
@@ -363,11 +364,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn private_key_signer_from_zero_bytes_fails() {
-        let zero_key = b256!("0x0000000000000000000000000000000000000000000000000000000000000000");
+    #[tokio::test]
+    async fn private_key_signer_from_zero_bytes_fails() {
+        let zero_config = SignerConfig::Local(b256!(
+            "0x0000000000000000000000000000000000000000000000000000000000000000"
+        ));
 
-        let result = PrivateKeySigner::from_bytes(&zero_key);
+        let result = zero_config.resolve().await;
 
         assert!(result.is_err(), "Expected zero private key to fail parsing");
     }
@@ -379,8 +382,8 @@ mod tests {
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let config = make_config();
-        let signer = PrivateKeySigner::from_bytes(&config.evm_private_key).unwrap();
-        let ethereum_wallet = EthereumWallet::from(signer.clone());
+        let resolved = config.signer.resolve().await.unwrap();
+        let ethereum_wallet = resolved.wallet;
 
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet)
@@ -428,7 +431,7 @@ mod tests {
             "test_secret".into(),
         ));
 
-        let owner = signer.address();
+        let owner = resolved.address;
 
         let ethereum_evm = Evm::new(
             ethereum_provider,
