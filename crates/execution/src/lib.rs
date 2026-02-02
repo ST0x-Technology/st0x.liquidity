@@ -24,6 +24,30 @@ pub use mock::{MockExecutor, MockExecutorConfig};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
 pub use schwab::SchwabExecutor;
 
+/// The order ID assigned by the executor (broker) when an order is placed.
+///
+/// Wraps the executor's string order ID for type safety in the CQRS domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorOrderId(String);
+
+impl ExecutorOrderId {
+    pub fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl AsRef<str> for ExecutorOrderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ExecutorOrderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;

@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use st0x_execution::{OrderStatus, SupportedExecutor, Symbol};
 
 use crate::error::OnChainError;
-use crate::offchain_order::OffchainOrderView;
+use crate::offchain_order::{OffchainOrderId, OffchainOrderView};
 
 pub(crate) async fn find_executions_by_symbol_status_and_broker(
     pool: &SqlitePool,
@@ -36,11 +36,12 @@ pub(crate) async fn find_executions_by_symbol_status_and_broker(
 
 pub(crate) async fn find_execution_by_id(
     pool: &SqlitePool,
-    execution_id: i64,
+    offchain_order_id: OffchainOrderId,
 ) -> Result<Option<OffchainOrderView>, OnChainError> {
+    let id_str = offchain_order_id.to_string();
     let row: Option<String> =
-        sqlx::query_scalar("SELECT payload FROM offchain_order_view WHERE execution_id = ?1")
-            .bind(execution_id)
+        sqlx::query_scalar("SELECT payload FROM offchain_order_view WHERE view_id = ?1")
+            .bind(&id_str)
             .fetch_optional(pool)
             .await?;
 
@@ -52,7 +53,7 @@ async fn query_by_status(pool: &SqlitePool, status_str: &str) -> Result<Vec<Stri
     sqlx::query_scalar(
         "SELECT payload FROM offchain_order_view \
          WHERE status = ?1 \
-         ORDER BY execution_id ASC",
+         ORDER BY offchain_order_id ASC",
     )
     .bind(status_str)
     .fetch_all(pool)
@@ -67,7 +68,7 @@ async fn query_by_status_and_executor(
     sqlx::query_scalar(
         "SELECT payload FROM offchain_order_view \
          WHERE status = ?1 AND executor = ?2 \
-         ORDER BY execution_id ASC",
+         ORDER BY offchain_order_id ASC",
     )
     .bind(status_str)
     .bind(executor_str)
@@ -83,7 +84,7 @@ async fn query_by_symbol_and_status(
     sqlx::query_scalar(
         "SELECT payload FROM offchain_order_view \
          WHERE symbol = ?1 AND status = ?2 \
-         ORDER BY execution_id ASC",
+         ORDER BY offchain_order_id ASC",
     )
     .bind(symbol_str)
     .bind(status_str)
@@ -100,7 +101,7 @@ async fn query_by_symbol_status_and_executor(
     sqlx::query_scalar(
         "SELECT payload FROM offchain_order_view \
          WHERE symbol = ?1 AND status = ?2 AND executor = ?3 \
-         ORDER BY execution_id ASC",
+         ORDER BY offchain_order_id ASC",
     )
     .bind(symbol_str)
     .bind(status_str)
@@ -316,7 +317,7 @@ mod tests {
         let OffchainOrderView::Execution {
             shares,
             direction,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             ..
         } = &filled_aapl[0]
@@ -325,7 +326,7 @@ mod tests {
         };
         assert_eq!(*shares, FractionalShares::new(Decimal::from(25)));
         assert_eq!(*direction, Direction::Sell);
-        assert_eq!(broker_order_id.as_ref().unwrap().0, "1004055538123");
+        assert_eq!(executor_order_id.as_ref().unwrap().0, "1004055538123");
         assert_eq!(price_cents.as_ref().unwrap().0, 15025);
     }
 

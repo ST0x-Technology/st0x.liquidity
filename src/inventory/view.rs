@@ -714,7 +714,9 @@ mod tests {
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use st0x_execution::ExecutorOrderId;
+
+    use crate::offchain_order::{ExecutionId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -914,7 +916,7 @@ mod tests {
             execution_id: ExecutionId(1),
             shares_filled,
             direction,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             broker_timestamp: Utc::now(),
         }

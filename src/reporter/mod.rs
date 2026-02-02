@@ -578,7 +578,7 @@ mod tests {
 
         sqlx::query!(
             "INSERT INTO offchain_trades (
-                broker_order_id,
+                executor_order_id,
                 symbol,
                 shares,
                 direction,

@@ -11,17 +11,18 @@ use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
-    ArithmeticError, Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig,
-    OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    ArithmeticError, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
+    MockExecutorConfig, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
 use tracing::{error, info};
 
 use crate::config::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::offchain_order::{OffchainOrder, OffchainOrderView};
+use crate::offchain_order::{OffchainOrder, OffchainOrderCommand};
+use crate::onchain::OnchainTrade;
+use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
-use crate::onchain::{OnchainTrade, accumulator};
 use crate::onchain_trade::OnChainTrade;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::symbol::cache::SymbolCache;
@@ -292,53 +293,61 @@ pub(super) async fn process_found_trade<W: Write>(
 
     update_position_aggregate(&position_cqrs, &onchain_trade, config.execution_threshold).await;
 
-    let mut sql_tx = pool.begin().await?;
-    let execution = accumulator::process_onchain_trade(
-        &mut sql_tx,
-        &position_query,
-        onchain_trade,
-        config.broker.to_supported_executor(),
-    )
-    .await?;
-    sql_tx.commit().await?;
+    let executor_type = config.broker.to_supported_executor();
+    let base_symbol = onchain_trade.symbol.base();
 
-    if let Some(OffchainOrderView::Execution {
-        execution_id,
-        symbol,
-        shares,
-        direction,
-        ..
-    }) = execution.execution
+    if let Some(params) =
+        check_execution_readiness(&position_query, base_symbol, executor_type).await?
     {
+        let offchain_order_id = OffchainOrder::aggregate_id();
+
         writeln!(
             stdout,
-            "✅ Trade triggered execution for {:?} (ID: {})",
-            config.broker.to_supported_executor(),
-            execution_id.0
+            "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
         )?;
 
+        let agg_id = offchain_order_id.to_string();
+
+        if let Err(e) = offchain_order_cqrs
+            .execute(
+                &agg_id,
+                OffchainOrderCommand::Place {
+                    symbol: params.symbol.clone(),
+                    shares: params.shares,
+                    direction: params.direction,
+                    executor: params.executor,
+                },
+            )
+            .await
+        {
+            error!(%offchain_order_id, "Failed to execute OffchainOrder::Place: {e}");
+        }
+
         let market_order = MarketOrder {
-            symbol,
-            shares,
-            direction,
+            symbol: params.symbol,
+            shares: params.shares,
+            direction: params.direction,
         };
 
         let placement = execute_broker_order(config, pool, market_order, stdout).await?;
 
-        let submitted_state = OrderState::Submitted {
-            order_id: placement.order_id.clone(),
-        };
+        let executor_order_id = ExecutorOrderId::new(&placement.order_id);
 
-        let mut sql_tx = pool.begin().await?;
-        submitted_state
-            .store_update(&mut sql_tx, execution_id.0)
-            .await?;
-        sql_tx.commit().await?;
-        writeln!(stdout, "🎯 Trade processing completed!")?;
+        if let Err(e) = offchain_order_cqrs
+            .execute(
+                &agg_id,
+                OffchainOrderCommand::ConfirmSubmission { executor_order_id },
+            )
+            .await
+        {
+            error!(%offchain_order_id, "Failed to execute OffchainOrder::ConfirmSubmission: {e}");
+        }
+
+        writeln!(stdout, "Trade processing completed!")?;
     } else {
         writeln!(
             stdout,
-            "📊 Trade accumulated but did not trigger execution yet."
+            "Trade accumulated but did not trigger execution yet."
         )?;
         writeln!(
             stdout,

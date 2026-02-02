@@ -20,7 +20,6 @@ mod error;
 mod error_decoding;
 mod inventory;
 mod lifecycle;
-mod lock;
 mod offchain;
 mod offchain_order;
 mod onchain;
@@ -33,7 +32,6 @@ mod symbol;
 mod telemetry;
 mod threshold;
 mod tokenized_equity_mint;
-mod trade_execution_link;
 mod usdc_rebalance;
 mod vault_registry;
 

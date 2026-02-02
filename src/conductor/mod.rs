@@ -23,8 +23,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_execution::{
-    ArithmeticError, EmptySymbolError, Executor, FractionalShares, MarketOrder, Positive,
-    SupportedExecutor, Symbol,
+    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
+    Symbol,
 };
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
@@ -32,25 +32,23 @@ use crate::cctp::USDC_BASE;
 use crate::config::Config;
 use crate::dashboard::ServerMessage;
 use crate::equity_redemption::EquityRedemption;
-use crate::error::{EventProcessingError, EventQueueError, OnChainError};
+use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotAggregate, InventorySnapshotQuery,
-    InventoryView,
+    InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
 use crate::offchain::execution::find_execution_by_id;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
-    BrokerOrderId, ExecutionId, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs,
-    OffchainOrderView,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, OffchainOrderView,
 };
 use crate::onchain::accumulator::{
-    CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
+    ExecutionParams, check_all_positions, check_execution_readiness,
 };
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmConfig, OnchainTrade, accumulator};
+use crate::onchain::{EvmConfig, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
@@ -820,25 +818,25 @@ async fn handle_queue_processing_result<E>(
     executor: &E,
     pool: &SqlitePool,
     offchain_order_cqrs: &OffchainOrderCqrs,
-    result: Result<Option<OffchainOrderView>, EventProcessingError>,
+    result: Result<Option<OffchainOrderId>, EventProcessingError>,
 ) where
     E: Executor + Clone,
     EventProcessingError: From<E::Error>,
 {
     match result {
-        Ok(Some(OffchainOrderView::Execution { execution_id, .. })) => {
+        Ok(Some(offchain_order_id)) => {
             if let Err(e) = execute_pending_offchain_execution(
                 executor,
                 pool,
                 offchain_order_cqrs,
-                execution_id.0,
+                offchain_order_id,
             )
             .await
             {
-                error!("Failed to execute offchain order {}: {e}", execution_id.0);
+                error!(%offchain_order_id, "Failed to execute offchain order: {e}");
             }
         }
-        Ok(Some(OffchainOrderView::Unavailable) | None) => {
+        Ok(None) => {
             sleep(Duration::from_millis(100)).await;
         }
         Err(e) => {
@@ -867,7 +865,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     offchain_order_cqrs: &OffchainOrderCqrs,
     execution_threshold: ExecutionThreshold,
     queue_context: &QueueProcessingContext<'_>,
-) -> Result<Option<OffchainOrderView>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
         return Ok(None);
@@ -1029,7 +1027,7 @@ async fn handle_filtered_event(
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
-) -> Result<Option<OffchainOrderView>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     info!(
         "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
         match &queued_event.event {
@@ -1070,7 +1068,7 @@ async fn process_valid_trade(
     offchain_order_cqrs: &OffchainOrderCqrs,
     execution_threshold: ExecutionThreshold,
     vault_discovery_context: &VaultDiscoveryContext<'_>,
-) -> Result<Option<OffchainOrderView>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
         match &queued_event.event {
@@ -1251,148 +1249,61 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
 async fn execute_new_execution_cqrs(
     position_cqrs: &PositionCqrs,
     offchain_order_cqrs: &OffchainOrderCqrs,
-    execution: &OffchainOrderView,
-    base_symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+    params: &ExecutionParams,
 ) {
-    execute_place_offchain_order(position_cqrs, execution, base_symbol).await;
-    execute_place_order(offchain_order_cqrs, execution).await;
+    execute_place_offchain_order(position_cqrs, offchain_order_id, params).await;
+    execute_place_order(offchain_order_cqrs, offchain_order_id, params).await;
 }
 
 async fn execute_place_offchain_order(
     position_cqrs: &PositionCqrs,
-    execution: &OffchainOrderView,
-    base_symbol: &Symbol,
+    offchain_order_id: OffchainOrderId,
+    params: &ExecutionParams,
 ) {
-    let OffchainOrderView::Execution {
-        execution_id,
-        shares,
-        direction,
-        executor,
-        ..
-    } = execution
-    else {
-        error!("Expected Execution variant for PlaceOffChainOrder, got Unavailable");
-        return;
-    };
-
-    let aggregate_id = Position::aggregate_id(base_symbol);
+    let aggregate_id = Position::aggregate_id(&params.symbol);
 
     let command = PositionCommand::PlaceOffChainOrder {
-        execution_id: *execution_id,
-        shares: shares.clone().into_inner(),
-        direction: *direction,
-        executor: *executor,
+        offchain_order_id,
+        shares: params.shares,
+        direction: params.direction,
+        executor: params.executor,
     };
 
     match position_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
-            "Successfully executed Position::PlaceOffChainOrder command: execution_id={}, symbol={}",
-            execution_id.0, base_symbol
+            "Successfully executed Position::PlaceOffChainOrder command: offchain_order_id={offchain_order_id}, symbol={}",
+            params.symbol
         ),
         Err(e) => error!(
-            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={}, symbol={}",
-            execution_id.0, base_symbol
+            "Failed to execute Position::PlaceOffChainOrder command: {e}, offchain_order_id={offchain_order_id}, symbol={}",
+            params.symbol
         ),
     }
 }
 
 async fn execute_place_order(
     offchain_order_cqrs: &OffchainOrderCqrs,
-    execution: &OffchainOrderView,
+    offchain_order_id: OffchainOrderId,
+    params: &ExecutionParams,
 ) {
-    let OffchainOrderView::Execution {
-        execution_id,
-        symbol,
-        shares,
-        direction,
-        executor,
-        ..
-    } = execution
-    else {
-        error!("Expected Execution variant for OffchainOrder::Place, got Unavailable");
-        return;
-    };
-
-    let aggregate_id = OffchainOrder::aggregate_id(execution_id.0);
+    let aggregate_id = offchain_order_id.to_string();
 
     let command = OffchainOrderCommand::Place {
-        symbol: symbol.clone(),
-        shares: shares.clone().into_inner(),
-        direction: *direction,
-        executor: *executor,
+        symbol: params.symbol.clone(),
+        shares: params.shares,
+        direction: params.direction,
+        executor: params.executor,
     };
 
     match offchain_order_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
-            "Successfully executed OffchainOrder::Place command: execution_id={}, symbol={}",
-            execution_id.0, symbol
+            "Successfully executed OffchainOrder::Place command: offchain_order_id={offchain_order_id}, symbol={}",
+            params.symbol
         ),
         Err(e) => error!(
-            "Failed to execute OffchainOrder::Place command: {e}, execution_id={}, symbol={}",
-            execution_id.0, symbol
-        ),
-    }
-}
-
-async fn execute_stale_execution_cleanup(
-    position_cqrs: &PositionCqrs,
-    offchain_order_cqrs: &OffchainOrderCqrs,
-    cleaned_up_executions: Vec<CleanedUpExecution>,
-) {
-    for cleaned_up in cleaned_up_executions {
-        execute_single_stale_cleanup(position_cqrs, offchain_order_cqrs, cleaned_up).await;
-    }
-}
-
-async fn execute_single_stale_cleanup(
-    position_cqrs: &PositionCqrs,
-    offchain_order_cqrs: &OffchainOrderCqrs,
-    cleaned_up: CleanedUpExecution,
-) {
-    execute_mark_stale_failed(offchain_order_cqrs, &cleaned_up).await;
-    execute_fail_stale_offchain(position_cqrs, &cleaned_up).await;
-}
-
-async fn execute_mark_stale_failed(
-    offchain_order_cqrs: &OffchainOrderCqrs,
-    cleaned_up: &CleanedUpExecution,
-) {
-    let execution_id = cleaned_up.execution_id;
-    let aggregate_id = OffchainOrder::aggregate_id(execution_id);
-
-    let command = OffchainOrderCommand::MarkFailed {
-        error: cleaned_up.error_reason.clone(),
-    };
-
-    match offchain_order_cqrs.execute(&aggregate_id, command).await {
-        Ok(()) => info!(
-            "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
-        ),
-        Err(e) => error!(
-            "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
-        ),
-    }
-}
-
-async fn execute_fail_stale_offchain(
-    position_cqrs: &PositionCqrs,
-    cleaned_up: &CleanedUpExecution,
-) {
-    let execution_id = cleaned_up.execution_id;
-    let symbol = &cleaned_up.symbol;
-    let aggregate_id = Position::aggregate_id(symbol);
-
-    let command = PositionCommand::FailOffChainOrder {
-        execution_id: ExecutionId(execution_id),
-        error: cleaned_up.error_reason.clone(),
-    };
-
-    match position_cqrs.execute(&aggregate_id, command).await {
-        Ok(()) => info!(
-            "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
-        ),
-        Err(e) => error!(
-            "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
+            "Failed to execute OffchainOrder::Place command: {e}, offchain_order_id={offchain_order_id}, symbol={}",
+            params.symbol
         ),
     }
 }
@@ -1408,7 +1319,7 @@ async fn process_trade_within_transaction(
     position_query: &PositionQuery,
     offchain_order_cqrs: &OffchainOrderCqrs,
     execution_threshold: ExecutionThreshold,
-) -> Result<Option<OffchainOrderView>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
     execute_initialize_position(position_cqrs, &trade, execution_threshold).await;
     execute_acknowledge_fill(position_cqrs, &trade).await;
@@ -1417,28 +1328,6 @@ async fn process_trade_within_transaction(
         .begin()
         .await
         .inspect_err(|e| error!("Failed to begin transaction for event processing: {e}"))?;
-
-    info!(
-        "Started transaction for atomic event processing: event_id={}, tx_hash={:?}, log_index={}",
-        event_id, queued_event.tx_hash, queued_event.log_index
-    );
-
-    let TradeProcessingResult {
-        execution,
-        cleaned_up_executions,
-    } = accumulator::process_onchain_trade(
-        &mut sql_tx,
-        position_query,
-        trade.clone(),
-        executor_type,
-    )
-    .await
-    .inspect_err(|e| {
-        error!(
-            "Failed to process trade through accumulator: {e}, tx_hash={:?}, log_index={}",
-            queued_event.tx_hash, queued_event.log_index
-        );
-    })?;
 
     mark_event_processed(&mut sql_tx, event_id)
         .await
@@ -1455,22 +1344,30 @@ async fn process_trade_within_transaction(
     })?;
 
     info!(
-        "Successfully committed atomic event processing: event_id={}, tx_hash={:?}, log_index={}",
+        "Successfully committed event processing: event_id={}, tx_hash={:?}, log_index={}",
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    // Record OnChainTrade event (Position already updated above)
     execute_witness_trade(onchain_trade_cqrs, &trade, queued_event.block_number).await;
 
-    if let Some(ref exec) = execution {
-        let base_symbol = trade.symbol.base();
-        execute_new_execution_cqrs(position_cqrs, offchain_order_cqrs, exec, base_symbol).await;
-    }
+    let base_symbol = trade.symbol.base();
 
-    execute_stale_execution_cleanup(position_cqrs, offchain_order_cqrs, cleaned_up_executions)
-        .await;
+    let Some(params) =
+        check_execution_readiness(position_query, base_symbol, executor_type).await?
+    else {
+        return Ok(None);
+    };
 
-    Ok(execution)
+    let offchain_order_id = OffchainOrder::aggregate_id();
+    execute_new_execution_cqrs(
+        position_cqrs,
+        offchain_order_cqrs,
+        offchain_order_id,
+        &params,
+    )
+    .await;
+
+    Ok(Some(offchain_order_id))
 }
 
 fn reconstruct_log_from_queued_event(
@@ -1509,63 +1406,59 @@ async fn check_and_execute_accumulated_positions<E>(
     pool: &SqlitePool,
     position_cqrs: &PositionCqrs,
     position_query: &PositionQuery,
-    offchain_order_cqrs: &OffchainOrderCqrs,
+    offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let executions = check_all_accumulated_positions(pool, position_query, executor_type).await?;
+    let ready_positions = check_all_positions(pool, position_query, executor_type).await?;
 
-    if executions.is_empty() {
+    if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
         return Ok(());
     }
 
     info!(
         "Found {} accumulated positions ready for execution",
-        executions.len()
+        ready_positions.len()
     );
 
-    for execution in executions {
-        let OffchainOrderView::Execution {
-            execution_id,
-            symbol,
-            shares,
-            direction,
-            ..
-        } = &execution
-        else {
-            error!("Execution returned from check_all_accumulated_positions is Unavailable");
-            continue;
-        };
+    for params in ready_positions {
+        let offchain_order_id = OffchainOrder::aggregate_id();
 
         info!(
-            "Executing accumulated position for symbol={symbol}, shares={shares}, direction={direction:?}, execution_id={}",
-            execution_id.0
+            symbol = %params.symbol,
+            shares = %params.shares,
+            direction = ?params.direction,
+            %offchain_order_id,
+            "Executing accumulated position"
         );
 
-        // Emit Placed event BEFORE spawning execution task.
-        // This ensures the OffchainOrder aggregate is initialized before ConfirmSubmission is attempted.
-        execute_new_execution_cqrs(position_cqrs, offchain_order_cqrs, &execution, symbol).await;
+        execute_new_execution_cqrs(
+            position_cqrs,
+            offchain_order_cqrs,
+            offchain_order_id,
+            &params,
+        )
+        .await;
 
         let pool_clone = pool.clone();
         let executor_clone = executor.clone();
-        let eid = execution_id.0;
-        let offchain_order_cqrs_clone = Arc::new(offchain_order_cqrs.clone());
+        let offchain_order_cqrs_clone = Arc::clone(offchain_order_cqrs);
         tokio::spawn(async move {
             if let Err(e) = execute_pending_offchain_execution(
                 &executor_clone,
                 &pool_clone,
                 &offchain_order_cqrs_clone,
-                eid,
+                offchain_order_id,
             )
             .await
             {
-                error!("Failed to execute accumulated position for execution_id {eid}: {e}");
+                error!(%offchain_order_id, "Failed to execute accumulated position: {e}");
             } else {
-                info!("Successfully executed accumulated position for execution_id {eid}");
+                info!(%offchain_order_id, "Successfully executed accumulated position");
             }
         });
     }
@@ -1588,15 +1481,15 @@ async fn execute_pending_offchain_execution<E>(
     executor: &E,
     pool: &SqlitePool,
     offchain_order_cqrs: &OffchainOrderCqrs,
-    execution_id: i64,
+    offchain_order_id: OffchainOrderId,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    let execution = find_execution_by_id(pool, execution_id)
+    let execution = find_execution_by_id(pool, offchain_order_id)
         .await?
-        .ok_or(EventProcessingError::ExecutionNotFound(execution_id))?;
+        .ok_or(EventProcessingError::ExecutionNotFound(offchain_order_id))?;
 
     info!("Executing offchain order: {execution:?}");
 
@@ -1607,12 +1500,12 @@ where
         ..
     } = &execution
     else {
-        return Err(EventProcessingError::ExecutionNotFound(execution_id));
+        return Err(EventProcessingError::ExecutionNotFound(offchain_order_id));
     };
 
     let market_order = MarketOrder {
         symbol: to_executor_ticker(symbol)?,
-        shares: shares.clone(),
+        shares: *shares,
         direction: *direction,
     };
 
@@ -1620,21 +1513,23 @@ where
 
     info!("Order placed with ID: {}", placement.order_id);
 
-    let broker_order_id = BrokerOrderId::new(&placement.order_id);
-    let aggregate_id = OffchainOrder::aggregate_id(execution_id);
+    let executor_order_id = ExecutorOrderId::new(&placement.order_id);
+    let aggregate_id = offchain_order_id.to_string();
 
     let command = OffchainOrderCommand::ConfirmSubmission {
-        broker_order_id: broker_order_id.clone(),
+        executor_order_id: executor_order_id.clone(),
     };
 
     match offchain_order_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
-            "Successfully executed OffchainOrder::ConfirmSubmission command: \
-            execution_id={execution_id}, order_id={broker_order_id:?}"
+            %offchain_order_id,
+            ?executor_order_id,
+            "Successfully executed OffchainOrder::ConfirmSubmission command"
         ),
         Err(e) => error!(
-            "Failed to execute OffchainOrder::ConfirmSubmission command: {e}, \
-            execution_id={execution_id}, order_id={broker_order_id:?}"
+            %offchain_order_id,
+            ?executor_order_id,
+            "Failed to execute OffchainOrder::ConfirmSubmission command: {e}"
         ),
     }
 

@@ -112,7 +112,9 @@ mod tests {
     use st0x_execution::Direction;
 
     use super::*;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use st0x_execution::ExecutorOrderId;
+
+    use crate::offchain_order::{ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
     use st0x_execution::FractionalShares;
 
@@ -139,7 +141,7 @@ mod tests {
             execution_id: ExecutionId(1),
             shares_filled,
             direction,
-            broker_order_id: BrokerOrderId("ORD1".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD1"),
             price_cents: PriceCents(15000),
             broker_timestamp: chrono::Utc::now(),
         }
