@@ -79,7 +79,7 @@ let
   '';
 
 in {
-  inherit buildInputs resolveIp tfRekey;
+  inherit buildInputs parseIdentity resolveIp tfRekey;
 
   tfInit = rainix.mkTask.${system} {
     name = "tf-init";

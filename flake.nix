@@ -147,8 +147,9 @@
             name = "secret";
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
-              ragenix --rules ./config/secrets.nix -e "$@"
-              exec ragenix --rules ./config/secrets.nix -r
+              ${infraPkgs.parseIdentity}
+              ragenix --rules ./config/secrets.nix -i "$identity" -e "$@"
+              exec ragenix --rules ./config/secrets.nix -i "$identity" -r
             '';
           };
 
