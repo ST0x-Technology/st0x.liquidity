@@ -318,23 +318,7 @@ impl Conductor {
             None => (None, None),
         };
 
-        let position_view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let position_query = GenericQuery::new(position_view_repo.clone());
-
-        let position_queries: Vec<Box<dyn Query<PositionAggregate>>> =
-            std::iter::once(Box::new(GenericQuery::new(position_view_repo))
-                as Box<dyn Query<PositionAggregate>>)
-            .chain(
-                trigger
-                    .iter()
-                    .map(|t| Box::new(Arc::clone(t)) as Box<dyn Query<PositionAggregate>>),
-            )
-            .collect();
-
-        let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), position_queries, ()));
+        let (position_cqrs, position_query) = build_position_cqrs(pool, trigger);
 
         let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
             OffchainOrderAggregate,
@@ -361,7 +345,7 @@ impl Conductor {
             pool: pool.clone(),
             onchain_trade_cqrs,
             position_cqrs,
-            position_query: Arc::new(position_query),
+            position_query,
             offchain_order_cqrs,
             vault_registry_cqrs,
             snapshot_cqrs,
@@ -508,6 +492,35 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
     if let Err(e) = result {
         error!("{task_name} task panicked: {e}");
     }
+}
+
+/// Constructs the position CQRS framework with its view query and optional
+/// rebalancing trigger. Used by `Conductor::start` and integration tests to
+/// ensure the same wiring is tested as runs in production.
+fn build_position_cqrs(
+    pool: &SqlitePool,
+    trigger: Option<Arc<RebalancingTrigger>>,
+) -> (Arc<PositionCqrs>, Arc<PositionQuery>) {
+    let position_view_repo = Arc::new(SqliteViewRepository::new(
+        pool.clone(),
+        "position_view".to_string(),
+    ));
+    let position_query = GenericQuery::new(position_view_repo.clone());
+
+    let position_queries: Vec<Box<dyn Query<PositionAggregate>>> = std::iter::once(Box::new(
+        GenericQuery::new(position_view_repo),
+    )
+        as Box<dyn Query<PositionAggregate>>)
+    .chain(
+        trigger
+            .iter()
+            .map(|t| Box::new(Arc::clone(t)) as Box<dyn Query<PositionAggregate>>),
+    )
+    .collect();
+
+    let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), position_queries, ()));
+
+    (position_cqrs, Arc::new(position_query))
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
@@ -3373,18 +3386,7 @@ mod tests {
             operation_sender,
         ));
 
-        let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
-        >::new(pool.clone(), "position_view".to_string()));
-        let position_cqrs: PositionCqrs = sqlite_cqrs(
-            pool.clone(),
-            vec![
-                Box::new(GenericQuery::new(position_view_repo)),
-                Box::new(trigger) as Box<dyn Query<PositionAggregate>>,
-            ],
-            (),
-        );
+        let (position_cqrs, _) = build_position_cqrs(&pool, Some(trigger));
 
         let position_agg_id = Position::aggregate_id(&symbol);
         position_cqrs
@@ -3421,5 +3423,541 @@ mod tests {
             matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
             "Expected Mint operation from trigger on position event, got {triggered:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn inventory_updated_after_fill_via_cqrs() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        // Seed inventory with 50 offchain shares. CQRS will add 50 onchain.
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    shares_filled: FractionalShares::new(dec!(50)),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("SEED"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, _operation_receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: threshold.clone(),
+                usdc_threshold: threshold.clone(),
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            Arc::clone(&inventory),
+            operation_sender,
+        ));
+
+        let (position_cqrs, _) = build_position_cqrs(&pool, Some(trigger));
+
+        let position_agg_id = Position::aggregate_id(&symbol);
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Add 50 onchain shares via CQRS -> trigger applies to inventory.
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(50)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // 50 onchain / 50 offchain = 50% ratio, within 30%-70% bounds -> balanced.
+        let inv = inventory.read().await;
+        assert!(
+            inv.check_equity_imbalance(&symbol, &threshold).is_none(),
+            "50/50 inventory should be balanced (no imbalance detected)"
+        );
+    }
+
+    #[tokio::test]
+    async fn balanced_position_event_does_not_trigger_rebalancing() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+
+        // Start balanced: 50 onchain, 50 offchain.
+        let mut initial_inventory = InventoryView::default().with_equity(symbol.clone());
+        initial_inventory = initial_inventory
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(50)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        initial_inventory = initial_inventory
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    shares_filled: FractionalShares::new(dec!(50)),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, mut receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let (position_cqrs, _) = build_position_cqrs(&pool, Some(trigger));
+
+        let position_agg_id = Position::aggregate_id(&symbol);
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 99,
+                    },
+                    amount: FractionalShares::new(dec!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "Balanced position event should not trigger rebalancing"
+        );
+    }
+
+    #[tokio::test]
+    async fn position_event_causing_imbalance_triggers_redemption() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        // Seed vault registry so the trigger can resolve the token address.
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+        vault_registry_cqrs
+            .execute(
+                &VaultRegistry::aggregate_id(orderbook, order_owner),
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: test_token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Start near the upper edge but within bounds: 65 onchain, 35 offchain = 65% < 70%.
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(65)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    shares_filled: FractionalShares::new(dec!(35)),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, mut receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let (position_cqrs, _) = build_position_cqrs(&pool, Some(trigger));
+
+        let position_agg_id = Position::aggregate_id(&symbol);
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Initialize should NOT trigger (65% within 30%-70% bounds).
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "Initialize should not trigger on balanced inventory"
+        );
+
+        // +20 onchain: 85 onchain, 35 offchain, total=120, target=60, excess=25.
+        // 85/120 = 70.8% > 70% upper bound -> triggers Redemption.
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 99,
+                    },
+                    amount: FractionalShares::new(dec!(20)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let triggered = receiver.try_recv().unwrap();
+        assert_eq!(
+            triggered,
+            TriggeredOperation::Redemption {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(dec!(25)),
+                token: test_token,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn in_progress_guard_blocks_duplicate_trigger() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        // Seed vault registry.
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+        vault_registry_cqrs
+            .execute(
+                &VaultRegistry::aggregate_id(orderbook, order_owner),
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: test_token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Start near the upper edge: 65 onchain, 35 offchain (65%, within bounds).
+        let initial_inventory = InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(65)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+            .apply_position_event(
+                &symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    shares_filled: FractionalShares::new(dec!(35)),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(initial_inventory));
+        let (operation_sender, mut receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let (position_cqrs, _) = build_position_cqrs(&pool, Some(trigger));
+
+        let position_agg_id = Position::aggregate_id(&symbol);
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // First fill pushes over: 85/120 = 70.8% > 70% -> triggers Redemption(25).
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(dec!(20)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let first = receiver.try_recv().unwrap();
+        assert_eq!(
+            first,
+            TriggeredOperation::Redemption {
+                symbol: symbol.clone(),
+                quantity: FractionalShares::new(dec!(25)),
+                token: test_token,
+            }
+        );
+
+        // Second fill while in-progress NOT cleared -> no second trigger.
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 2,
+                    },
+                    amount: FractionalShares::new(dec!(5)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "In-progress guard should block duplicate trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_hydrates_position_view_from_persisted_events() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        // First "session": create position_cqrs, execute commands.
+        {
+            let (position_cqrs, position_query) = build_position_cqrs(&pool, None);
+
+            let position_agg_id = Position::aggregate_id(&symbol);
+            position_cqrs
+                .execute(
+                    &position_agg_id,
+                    PositionCommand::Initialize {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            position_cqrs
+                .execute(
+                    &position_agg_id,
+                    PositionCommand::AcknowledgeOnChainFill {
+                        trade_id: TradeId {
+                            tx_hash: TxHash::random(),
+                            log_index: 0,
+                        },
+                        amount: FractionalShares::new(dec!(10)),
+                        direction: Direction::Buy,
+                        price_usdc: dec!(150.0),
+                        block_timestamp: chrono::Utc::now(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            let position = crate::position::load_position(&position_query, &symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after first session");
+
+            assert_eq!(position.net, FractionalShares::new(dec!(10)));
+            assert_eq!(position.accumulated_long, FractionalShares::new(dec!(10)));
+        }
+        // position_cqrs dropped here, simulating shutdown.
+
+        // Second "session": create NEW position_cqrs against the same pool.
+        {
+            let (_position_cqrs, position_query) = build_position_cqrs(&pool, None);
+
+            let position = crate::position::load_position(&position_query, &symbol)
+                .await
+                .unwrap()
+                .expect("position should exist after restart");
+
+            assert_eq!(
+                position.net,
+                FractionalShares::new(dec!(10)),
+                "Net position should survive restart via persisted view"
+            );
+            assert_eq!(
+                position.accumulated_long,
+                FractionalShares::new(dec!(10)),
+                "Accumulated long should survive restart via persisted view"
+            );
+        }
     }
 }
