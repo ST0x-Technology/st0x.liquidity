@@ -6,11 +6,11 @@ use st0x_execution::{
 use tracing::{debug, info, warn};
 
 use super::OnchainTrade;
-use crate::dual_write::{DualWriteContext, load_position};
 use crate::error::{OnChainError, TradeValidationError};
 use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_execution_lease};
 use crate::offchain::execution::OffchainOrderView;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
+use crate::position::{PositionQuery, load_position};
 use crate::trade_execution_link::TradeExecutionLink;
 
 #[derive(Debug, Clone)]
@@ -37,13 +37,13 @@ pub(crate) struct TradeProcessingResult {
 /// Returns `TradeProcessingResult` containing the new execution (if created) and any
 /// cleaned up stale executions. The transaction must be committed by the caller.
 #[tracing::instrument(
-    skip(sql_tx, dual_write_context, trade),
+    skip(sql_tx, position_query, trade),
     fields(symbol = %trade.symbol, amount = %trade.amount, direction = ?trade.direction),
     level = tracing::Level::INFO
 )]
 pub(crate) async fn process_onchain_trade(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    dual_write_context: &DualWriteContext,
+    position_query: &PositionQuery,
     trade: OnchainTrade,
     executor_type: SupportedExecutor,
 ) -> Result<TradeProcessingResult, OnChainError> {
@@ -114,7 +114,7 @@ pub(crate) async fn process_onchain_trade(
     let execution = if try_acquire_execution_lease(sql_tx, base_symbol).await? {
         let result = try_create_execution_if_ready(
             sql_tx,
-            dual_write_context,
+            position_query,
             base_symbol,
             &mut calculator,
             executor_type,
@@ -231,12 +231,12 @@ pub(crate) async fn save_within_transaction(
 
 async fn try_create_execution_if_ready(
     sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    dual_write_context: &DualWriteContext,
+    position_query: &PositionQuery,
     base_symbol: &Symbol,
     calculator: &mut PositionCalculator,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainOrderView>, OnChainError> {
-    let Some(position) = load_position(dual_write_context, base_symbol).await? else {
+    let Some(position) = load_position(position_query, base_symbol).await? else {
         debug!(
             symbol = %base_symbol,
             "Position aggregate not found, cannot check threshold"
@@ -596,13 +596,13 @@ async fn mark_execution_as_timed_out(
 /// It prevents positions from sitting idle indefinitely when they've accumulated
 /// enough shares to execute but the triggering trade didn't push them over the threshold.
 #[tracing::instrument(
-    skip(pool, dual_write_context),
+    skip(pool, position_query),
     fields(executor_type = %executor_type),
     level = tracing::Level::DEBUG
 )]
 pub(crate) async fn check_all_accumulated_positions(
     pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
+    position_query: &PositionQuery,
     executor_type: SupportedExecutor,
 ) -> Result<Vec<OffchainOrderView>, OnChainError> {
     info!("Checking all accumulated positions for ready executions");
@@ -634,7 +634,7 @@ pub(crate) async fn check_all_accumulated_positions(
         let symbol = Symbol::new(&row.symbol)?;
 
         if let Some(execution) =
-            check_symbol_for_execution(pool, dual_write_context, &symbol, executor_type).await?
+            check_symbol_for_execution(pool, position_query, &symbol, executor_type).await?
         {
             executions.push(execution);
         }
@@ -654,12 +654,12 @@ pub(crate) async fn check_all_accumulated_positions(
 
 async fn check_symbol_for_execution(
     pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
+    position_query: &PositionQuery,
     symbol: &Symbol,
     executor_type: SupportedExecutor,
 ) -> Result<Option<OffchainOrderView>, OnChainError> {
     let Some((direction, shares)) =
-        get_ready_execution_params(dual_write_context, symbol, executor_type).await?
+        get_ready_execution_params(position_query, symbol, executor_type).await?
     else {
         return Ok(None);
     };
@@ -686,11 +686,11 @@ async fn check_symbol_for_execution(
 }
 
 async fn get_ready_execution_params(
-    dual_write_context: &DualWriteContext,
+    position_query: &PositionQuery,
     symbol: &Symbol,
     executor: SupportedExecutor,
 ) -> Result<Option<(Direction, Positive<FractionalShares>)>, OnChainError> {
-    let Some(position) = load_position(dual_write_context, symbol).await? else {
+    let Some(position) = load_position(position_query, symbol).await? else {
         debug!(symbol = %symbol, "Position aggregate not found, skipping");
         return Ok(None);
     };

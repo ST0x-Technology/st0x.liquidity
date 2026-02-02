@@ -4,6 +4,7 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
+use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use st0x_execution::Executor;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -18,7 +19,7 @@ use crate::offchain_order::OffchainOrderCqrs;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
 use crate::onchain_trade::OnChainTradeCqrs;
-use crate::position::PositionCqrs;
+use crate::position::{PositionCqrs, PositionQuery};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::vault_registry::VaultRegistryAggregate;
@@ -36,8 +37,8 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) pool: SqlitePool,
     pub(crate) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
     pub(crate) position_cqrs: Arc<PositionCqrs>,
+    pub(crate) position_query: Arc<PositionQuery>,
     pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    pub(crate) execution_threshold: ExecutionThreshold,
     pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
     pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
@@ -48,6 +49,7 @@ struct CommonFields<P, E> {
     cache: SymbolCache,
     provider: P,
     executor: E,
+    execution_threshold: ExecutionThreshold,
     frameworks: CqrsFrameworks,
 }
 
@@ -80,6 +82,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
         cache: SymbolCache,
         provider: P,
         executor: E,
+        execution_threshold: ExecutionThreshold,
         frameworks: CqrsFrameworks,
     ) -> Self {
         Self {
@@ -89,6 +92,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
                 cache,
                 provider,
                 executor,
+                execution_threshold,
                 frameworks,
             },
             state: Initial,
@@ -199,8 +203,8 @@ where
             self.common.executor.clone(),
             self.common.frameworks.pool.clone(),
             self.common.frameworks.position_cqrs.clone(),
+            self.common.frameworks.position_query.clone(),
             self.common.frameworks.offchain_order_cqrs.clone(),
-            self.common.frameworks.execution_threshold,
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,
@@ -211,8 +215,9 @@ where
             self.common.frameworks.pool,
             self.common.frameworks.onchain_trade_cqrs,
             self.common.frameworks.position_cqrs,
+            self.common.frameworks.position_query,
             self.common.frameworks.offchain_order_cqrs,
-            self.common.frameworks.execution_threshold,
+            self.common.execution_threshold,
             self.common.frameworks.vault_registry_cqrs,
         );
 

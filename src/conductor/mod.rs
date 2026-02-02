@@ -9,8 +9,10 @@ use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
 use cqrs_es::Query;
+use cqrs_es::persist::GenericQuery;
 use futures_util::{Stream, StreamExt};
-use sqlite_es::{SqliteCqrs, sqlite_cqrs};
+use rust_decimal::Decimal;
+use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
@@ -39,7 +41,7 @@ use crate::offchain::execution::find_execution_by_id;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     BrokerOrderId, ExecutionId, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs,
-    OffchainOrderView, PriceCents,
+    OffchainOrderView,
 };
 use crate::onchain::accumulator::{
     CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
@@ -50,7 +52,9 @@ use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_fro
 use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmConfig, OnchainTrade, accumulator};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
-use crate::position::{Position, PositionCommand, PositionCqrs, TradeId};
+use crate::position::{
+    Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
+};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
@@ -263,17 +267,21 @@ impl Conductor {
         backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
 
         let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+
+        let position_view_repo = Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ));
+        let position_query = GenericQuery::new(position_view_repo.clone());
+        let position_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(position_view_repo))
+                as Box<dyn Query<PositionAggregate>>],
+            (),
+        ));
+
         let offchain_order_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-
-        let dual_write_context = DualWriteContext::with_threshold(
-            pool.clone(),
-            onchain_trade_cqrs,
-            position_cqrs,
-            offchain_order_cqrs,
-            config.execution_threshold,
-        );
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
@@ -300,7 +308,11 @@ impl Conductor {
         };
 
         let frameworks = CqrsFrameworks {
-            dual_write_context,
+            pool: pool.clone(),
+            onchain_trade_cqrs,
+            position_cqrs,
+            position_query: Arc::new(position_query),
+            offchain_order_cqrs,
             vault_registry_cqrs,
             snapshot_cqrs,
         };
@@ -311,6 +323,7 @@ impl Conductor {
             cache,
             provider,
             executor,
+            config.execution_threshold,
             frameworks,
         )
         .with_executor_maintenance(executor_maintenance)
@@ -520,6 +533,7 @@ fn spawn_queue_processor<P, E>(
     cqrs_pool: SqlitePool,
     onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
     position_cqrs: Arc<PositionCqrs>,
+    position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
     execution_threshold: ExecutionThreshold,
     vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
@@ -543,6 +557,7 @@ where
             provider,
             &onchain_trade_cqrs,
             &position_cqrs,
+            &position_query,
             &offchain_order_cqrs,
             execution_threshold,
             &vault_registry_cqrs,
@@ -555,8 +570,8 @@ fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     pool: SqlitePool,
     position_cqrs: Arc<PositionCqrs>,
+    position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
     E: Executor + Clone + Send + 'static,
@@ -577,8 +592,8 @@ where
                 &executor,
                 &pool,
                 &position_cqrs,
+                &position_query,
                 &offchain_order_cqrs,
-                execution_threshold,
             )
             .await
             {
@@ -749,6 +764,7 @@ async fn run_queue_processor<P, E>(
     provider: P,
     onchain_trade_cqrs: &OnChainTradeCqrs,
     position_cqrs: &PositionCqrs,
+    position_query: &PositionQuery,
     offchain_order_cqrs: &OffchainOrderCqrs,
     execution_threshold: ExecutionThreshold,
     vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
@@ -779,6 +795,7 @@ async fn run_queue_processor<P, E>(
             &provider,
             onchain_trade_cqrs,
             position_cqrs,
+            position_query,
             offchain_order_cqrs,
             execution_threshold,
             &queue_context,
@@ -846,6 +863,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     provider: &P,
     onchain_trade_cqrs: &OnChainTradeCqrs,
     position_cqrs: &PositionCqrs,
+    position_query: &PositionQuery,
     offchain_order_cqrs: &OffchainOrderCqrs,
     execution_threshold: ExecutionThreshold,
     queue_context: &QueueProcessingContext<'_>,
@@ -882,7 +900,11 @@ async fn process_next_queued_event<P: Provider + Clone>(
         &queued_event,
         event_id,
         trade,
-        dual_write_context,
+        onchain_trade_cqrs,
+        position_cqrs,
+        position_query,
+        offchain_order_cqrs,
+        execution_threshold,
         &vault_discovery_context,
     )
     .await
@@ -1032,7 +1054,7 @@ async fn handle_filtered_event(
 }
 
 #[tracing::instrument(
-    skip(pool, queued_event, trade, dual_write_context, vault_discovery_context),
+    skip(pool, queued_event, trade, onchain_trade_cqrs, position_cqrs, position_query, offchain_order_cqrs, vault_discovery_context),
     fields(event_id, symbol = %trade.symbol),
     level = tracing::Level::INFO
 )]
@@ -1042,7 +1064,11 @@ async fn process_valid_trade(
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
-    dual_write_context: &DualWriteContext,
+    onchain_trade_cqrs: &OnChainTradeCqrs,
+    position_cqrs: &PositionCqrs,
+    position_query: &PositionQuery,
+    offchain_order_cqrs: &OffchainOrderCqrs,
+    execution_threshold: ExecutionThreshold,
     vault_discovery_context: &VaultDiscoveryContext<'_>,
 ) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     info!(
@@ -1073,17 +1099,62 @@ async fn process_valid_trade(
         queued_event,
         event_id,
         trade,
-        dual_write_context,
+        onchain_trade_cqrs,
+        position_cqrs,
+        position_query,
+        offchain_order_cqrs,
+        execution_threshold,
     )
     .await
 }
 
 async fn execute_witness_trade(
-    dual_write_context: &DualWriteContext,
+    onchain_trade_cqrs: &OnChainTradeCqrs,
     trade: &OnchainTrade,
     block_number: u64,
 ) {
-    match crate::dual_write::witness_trade(dual_write_context, trade, block_number).await {
+    let aggregate_id = OnChainTrade::aggregate_id(trade.tx_hash, trade.log_index);
+
+    let amount = match Decimal::try_from(trade.amount) {
+        Ok(d) => d,
+        Err(e) => {
+            error!(
+                "Failed to convert trade amount to Decimal: {e}, tx_hash={:?}",
+                trade.tx_hash
+            );
+            return;
+        }
+    };
+
+    let price_usdc = match Decimal::try_from(trade.price.value()) {
+        Ok(d) => d,
+        Err(e) => {
+            error!(
+                "Failed to convert trade price to Decimal: {e}, tx_hash={:?}",
+                trade.tx_hash
+            );
+            return;
+        }
+    };
+
+    let Some(block_timestamp) = trade.block_timestamp else {
+        error!(
+            "Missing block_timestamp for OnChainTrade::Witness: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        );
+        return;
+    };
+
+    let command = OnChainTradeCommand::Witness {
+        symbol: trade.symbol.base().clone(),
+        amount,
+        direction: trade.direction,
+        price_usdc,
+        block_number,
+        block_timestamp,
+    };
+
+    match onchain_trade_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
             "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
@@ -1095,16 +1166,20 @@ async fn execute_witness_trade(
     }
 }
 
-async fn execute_initialize_position(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
+async fn execute_initialize_position(
+    position_cqrs: &PositionCqrs,
+    trade: &OnchainTrade,
+    execution_threshold: ExecutionThreshold,
+) {
     let base_symbol = trade.symbol.base();
+    let aggregate_id = Position::aggregate_id(base_symbol);
 
-    match crate::dual_write::initialize_position(
-        dual_write_context,
-        base_symbol,
-        dual_write_context.execution_threshold(),
-    )
-    .await
-    {
+    let command = PositionCommand::Initialize {
+        symbol: base_symbol.clone(),
+        threshold: execution_threshold,
+    };
+
+    match position_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
             "Successfully initialized Position aggregate for symbol={}",
             base_symbol
@@ -1116,8 +1191,52 @@ async fn execute_initialize_position(dual_write_context: &DualWriteContext, trad
     }
 }
 
-async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
-    match crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
+async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainTrade) {
+    let base_symbol = trade.symbol.base();
+    let aggregate_id = Position::aggregate_id(base_symbol);
+
+    let amount = match Decimal::try_from(trade.amount) {
+        Ok(d) => FractionalShares::new(d),
+        Err(e) => {
+            error!(
+                "Failed to convert trade amount to Decimal: {e}, tx_hash={:?}",
+                trade.tx_hash
+            );
+            return;
+        }
+    };
+
+    let price_usdc = match Decimal::try_from(trade.price.value()) {
+        Ok(d) => d,
+        Err(e) => {
+            error!(
+                "Failed to convert trade price to Decimal: {e}, tx_hash={:?}",
+                trade.tx_hash
+            );
+            return;
+        }
+    };
+
+    let Some(block_timestamp) = trade.block_timestamp else {
+        error!(
+            "Missing block_timestamp for Position::AcknowledgeOnChainFill: tx_hash={:?}, log_index={}",
+            trade.tx_hash, trade.log_index
+        );
+        return;
+    };
+
+    let command = PositionCommand::AcknowledgeOnChainFill {
+        trade_id: TradeId {
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        },
+        amount,
+        direction: trade.direction,
+        price_usdc,
+        block_timestamp,
+    };
+
+    match position_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
             "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
@@ -1129,76 +1248,123 @@ async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: 
     }
 }
 
-async fn execute_new_execution_dual_write(
-    dual_write_context: &DualWriteContext,
+async fn execute_new_execution_cqrs(
+    position_cqrs: &PositionCqrs,
+    offchain_order_cqrs: &OffchainOrderCqrs,
     execution: &OffchainOrderView,
     base_symbol: &Symbol,
 ) {
-    execute_place_offchain_order(dual_write_context, execution, base_symbol).await;
-    execute_place_order(dual_write_context, execution).await;
+    execute_place_offchain_order(position_cqrs, execution, base_symbol).await;
+    execute_place_order(offchain_order_cqrs, execution).await;
 }
 
 async fn execute_place_offchain_order(
-    dual_write_context: &DualWriteContext,
+    position_cqrs: &PositionCqrs,
     execution: &OffchainOrderView,
     base_symbol: &Symbol,
 ) {
-    match crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
-    {
+    let OffchainOrderView::Execution {
+        execution_id,
+        shares,
+        direction,
+        executor,
+        ..
+    } = execution
+    else {
+        error!("Expected Execution variant for PlaceOffChainOrder, got Unavailable");
+        return;
+    };
+
+    let aggregate_id = Position::aggregate_id(base_symbol);
+
+    let command = PositionCommand::PlaceOffChainOrder {
+        execution_id: *execution_id,
+        shares: shares.clone().into_inner(),
+        direction: *direction,
+        executor: *executor,
+    };
+
+    match position_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
-            "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
-            execution.id, base_symbol
+            "Successfully executed Position::PlaceOffChainOrder command: execution_id={}, symbol={}",
+            execution_id.0, base_symbol
         ),
         Err(e) => error!(
-            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
-            execution.id, base_symbol
+            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={}, symbol={}",
+            execution_id.0, base_symbol
         ),
     }
 }
 
-async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainOrderView) {
-    match crate::dual_write::place_order(dual_write_context, execution).await {
+async fn execute_place_order(
+    offchain_order_cqrs: &OffchainOrderCqrs,
+    execution: &OffchainOrderView,
+) {
+    let OffchainOrderView::Execution {
+        execution_id,
+        symbol,
+        shares,
+        direction,
+        executor,
+        ..
+    } = execution
+    else {
+        error!("Expected Execution variant for OffchainOrder::Place, got Unavailable");
+        return;
+    };
+
+    let aggregate_id = OffchainOrder::aggregate_id(execution_id.0);
+
+    let command = OffchainOrderCommand::Place {
+        symbol: symbol.clone(),
+        shares: shares.clone().into_inner(),
+        direction: *direction,
+        executor: *executor,
+    };
+
+    match offchain_order_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
-            "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
-            execution.id, execution.symbol
+            "Successfully executed OffchainOrder::Place command: execution_id={}, symbol={}",
+            execution_id.0, symbol
         ),
         Err(e) => error!(
-            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
-            execution.id, execution.symbol
+            "Failed to execute OffchainOrder::Place command: {e}, execution_id={}, symbol={}",
+            execution_id.0, symbol
         ),
     }
 }
 
-async fn execute_stale_execution_cleanup_dual_write(
-    dual_write_context: &DualWriteContext,
+async fn execute_stale_execution_cleanup(
+    position_cqrs: &PositionCqrs,
+    offchain_order_cqrs: &OffchainOrderCqrs,
     cleaned_up_executions: Vec<CleanedUpExecution>,
 ) {
     for cleaned_up in cleaned_up_executions {
-        execute_single_stale_cleanup(dual_write_context, cleaned_up).await;
+        execute_single_stale_cleanup(position_cqrs, offchain_order_cqrs, cleaned_up).await;
     }
 }
 
 async fn execute_single_stale_cleanup(
-    dual_write_context: &DualWriteContext,
+    position_cqrs: &PositionCqrs,
+    offchain_order_cqrs: &OffchainOrderCqrs,
     cleaned_up: CleanedUpExecution,
 ) {
-    execute_mark_stale_failed(dual_write_context, &cleaned_up).await;
-    execute_fail_stale_offchain(dual_write_context, &cleaned_up).await;
+    execute_mark_stale_failed(offchain_order_cqrs, &cleaned_up).await;
+    execute_fail_stale_offchain(position_cqrs, &cleaned_up).await;
 }
 
 async fn execute_mark_stale_failed(
-    dual_write_context: &DualWriteContext,
+    offchain_order_cqrs: &OffchainOrderCqrs,
     cleaned_up: &CleanedUpExecution,
 ) {
     let execution_id = cleaned_up.execution_id;
+    let aggregate_id = OffchainOrder::aggregate_id(execution_id);
 
-    match crate::dual_write::mark_failed(
-        dual_write_context,
-        execution_id,
-        cleaned_up.error_reason.clone(),
-    )
-    .await
-    {
+    let command = OffchainOrderCommand::MarkFailed {
+        error: cleaned_up.error_reason.clone(),
+    };
+
+    match offchain_order_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
             "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
         ),
@@ -1209,20 +1375,19 @@ async fn execute_mark_stale_failed(
 }
 
 async fn execute_fail_stale_offchain(
-    dual_write_context: &DualWriteContext,
+    position_cqrs: &PositionCqrs,
     cleaned_up: &CleanedUpExecution,
 ) {
     let execution_id = cleaned_up.execution_id;
     let symbol = &cleaned_up.symbol;
+    let aggregate_id = Position::aggregate_id(symbol);
 
-    match crate::dual_write::fail_offchain_order(
-        dual_write_context,
-        execution_id,
-        symbol,
-        cleaned_up.error_reason.clone(),
-    )
-    .await
-    {
+    let command = PositionCommand::FailOffChainOrder {
+        execution_id: ExecutionId(execution_id),
+        error: cleaned_up.error_reason.clone(),
+    };
+
+    match position_cqrs.execute(&aggregate_id, command).await {
         Ok(()) => info!(
             "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
         ),
@@ -1238,11 +1403,15 @@ async fn process_trade_within_transaction(
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
-    dual_write_context: &DualWriteContext,
+    onchain_trade_cqrs: &OnChainTradeCqrs,
+    position_cqrs: &PositionCqrs,
+    position_query: &PositionQuery,
+    offchain_order_cqrs: &OffchainOrderCqrs,
+    execution_threshold: ExecutionThreshold,
 ) -> Result<Option<OffchainOrderView>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
-    execute_initialize_position(dual_write_context, &trade).await;
-    execute_acknowledge_fill(dual_write_context, &trade).await;
+    execute_initialize_position(position_cqrs, &trade, execution_threshold).await;
+    execute_acknowledge_fill(position_cqrs, &trade).await;
 
     let mut sql_tx = pool
         .begin()
@@ -1259,7 +1428,7 @@ async fn process_trade_within_transaction(
         cleaned_up_executions,
     } = accumulator::process_onchain_trade(
         &mut sql_tx,
-        dual_write_context,
+        position_query,
         trade.clone(),
         executor_type,
     )
@@ -1291,14 +1460,15 @@ async fn process_trade_within_transaction(
     );
 
     // Record OnChainTrade event (Position already updated above)
-    execute_witness_trade(dual_write_context, &trade, queued_event.block_number).await;
+    execute_witness_trade(onchain_trade_cqrs, &trade, queued_event.block_number).await;
 
     if let Some(ref exec) = execution {
         let base_symbol = trade.symbol.base();
-        execute_new_execution_dual_write(dual_write_context, exec, base_symbol).await;
+        execute_new_execution_cqrs(position_cqrs, offchain_order_cqrs, exec, base_symbol).await;
     }
 
-    execute_stale_execution_cleanup_dual_write(dual_write_context, cleaned_up_executions).await;
+    execute_stale_execution_cleanup(position_cqrs, offchain_order_cqrs, cleaned_up_executions)
+        .await;
 
     Ok(execution)
 }
@@ -1337,15 +1507,16 @@ fn reconstruct_log_from_queued_event(
 async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
     pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
+    position_cqrs: &PositionCqrs,
+    position_query: &PositionQuery,
+    offchain_order_cqrs: &OffchainOrderCqrs,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let executions =
-        check_all_accumulated_positions(pool, dual_write_context, executor_type).await?;
+    let executions = check_all_accumulated_positions(pool, position_query, executor_type).await?;
 
     if executions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1358,41 +1529,43 @@ where
     );
 
     for execution in executions {
-        let Some(execution_id) = execution.id else {
-            error!("Execution returned from check_all_accumulated_positions has None ID");
+        let OffchainOrderView::Execution {
+            execution_id,
+            symbol,
+            shares,
+            direction,
+            ..
+        } = &execution
+        else {
+            error!("Execution returned from check_all_accumulated_positions is Unavailable");
             continue;
         };
 
         info!(
-            "Executing accumulated position for symbol={}, shares={}, direction={:?}, execution_id={}",
-            execution.symbol, execution.shares, execution.direction, execution_id
+            "Executing accumulated position for symbol={symbol}, shares={shares}, direction={direction:?}, execution_id={}",
+            execution_id.0
         );
 
         // Emit Placed event BEFORE spawning execution task.
         // This ensures the OffchainOrder aggregate is initialized before ConfirmSubmission is attempted.
-        execute_new_execution_dual_write(dual_write_context, &execution, &execution.symbol).await;
+        execute_new_execution_cqrs(position_cqrs, offchain_order_cqrs, &execution, symbol).await;
 
         let pool_clone = pool.clone();
         let executor_clone = executor.clone();
-        let dual_write_clone = dual_write_context.clone();
+        let eid = execution_id.0;
+        let offchain_order_cqrs_clone = Arc::new(offchain_order_cqrs.clone());
         tokio::spawn(async move {
             if let Err(e) = execute_pending_offchain_execution(
                 &executor_clone,
                 &pool_clone,
-                &dual_write_clone,
-                execution_id,
+                &offchain_order_cqrs_clone,
+                eid,
             )
             .await
             {
-                error!(
-                    "Failed to execute accumulated position for execution_id {}: {e}",
-                    execution_id
-                );
+                error!("Failed to execute accumulated position for execution_id {eid}: {e}");
             } else {
-                info!(
-                    "Successfully executed accumulated position for execution_id {}",
-                    execution_id
-                );
+                info!("Successfully executed accumulated position for execution_id {eid}");
             }
         });
     }
@@ -1401,7 +1574,7 @@ where
 }
 
 /// Maps database symbols to current executor-recognized tickers.
-/// Handles corporate actions like SPLG → SPYM rename (Oct 31, 2025).
+/// Handles corporate actions like SPLG -> SPYM rename (Oct 31, 2025).
 /// Remove once proper tSPYM tokens are issued onchain.
 fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
     match symbol.to_string().as_str() {
@@ -1410,11 +1583,11 @@ fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
     }
 }
 
-#[tracing::instrument(skip(executor, pool, dual_write_context), level = tracing::Level::INFO)]
+#[tracing::instrument(skip(executor, pool, offchain_order_cqrs), level = tracing::Level::INFO)]
 async fn execute_pending_offchain_execution<E>(
     executor: &E,
     pool: &SqlitePool,
-    dual_write_context: &DualWriteContext,
+    offchain_order_cqrs: &OffchainOrderCqrs,
     execution_id: i64,
 ) -> Result<(), EventProcessingError>
 where
@@ -1439,7 +1612,7 @@ where
 
     let market_order = MarketOrder {
         symbol: to_executor_ticker(symbol)?,
-        shares: Positive::new(*shares)?,
+        shares: shares.clone(),
         direction: *direction,
     };
 
@@ -1448,23 +1621,21 @@ where
     info!("Order placed with ID: {}", placement.order_id);
 
     let broker_order_id = BrokerOrderId::new(&placement.order_id);
+    let aggregate_id = OffchainOrder::aggregate_id(execution_id);
 
-    if let Err(e) = crate::dual_write::confirm_submission(
-        dual_write_context,
-        execution_id,
-        broker_order_id.clone(),
-    )
-    .await
-    {
-        error!(
-            "Failed to execute OffchainOrder::ConfirmSubmission command: {e}, \
-            execution_id={execution_id}, order_id={broker_order_id:?}"
-        );
-    } else {
-        info!(
+    let command = OffchainOrderCommand::ConfirmSubmission {
+        broker_order_id: broker_order_id.clone(),
+    };
+
+    match offchain_order_cqrs.execute(&aggregate_id, command).await {
+        Ok(()) => info!(
             "Successfully executed OffchainOrder::ConfirmSubmission command: \
             execution_id={execution_id}, order_id={broker_order_id:?}"
-        );
+        ),
+        Err(e) => error!(
+            "Failed to execute OffchainOrder::ConfirmSubmission command: {e}, \
+            execution_id={execution_id}, order_id={broker_order_id:?}"
+        ),
     }
 
     Ok(())

@@ -2208,21 +2208,18 @@ symbol and position status.
 
 ##### View State
 
-```rust
-enum PositionView {
-    Unavailable,
-    Position {
-        symbol: Symbol,
-        net: FractionalShares,
-        accumulated_long: FractionalShares,
-        accumulated_short: FractionalShares,
-        pending_execution_id: Option<ExecutionId>,
-        last_updated: DateTime<Utc>,
-    },
-}
-```
+The position view type is
+`Lifecycle<Position, ArithmeticError<FractionalShares>>` -- the aggregate itself
+implements `View<Self>`, so the view is the aggregate's current state serialized
+to the `position_view` table. This avoids a separate view type and keeps the
+read model exactly in sync with the aggregate state.
 
-**Projection Logic**: Updates on `PositionEvent::*`
+The view is materialized via a `GenericQuery<SqliteViewRepository<...>>`
+registered as a query processor on the `PositionCqrs`. Loading position state
+for reads goes through `GenericQuery::load()` rather than replaying events.
+
+**Projection Logic**: Updates on `PositionEvent::*` via `Lifecycle::transition`
+and `Lifecycle::or_initialize`.
 
 #### OffchainTradeView
 
@@ -2883,7 +2880,7 @@ fn test_view_updates_from_events() {
     let event = PositionEvent::OnChainOrderFilled { /* ... */ };
     let envelope = EventEnvelope { /* ... */ };
 
-    let mut view = PositionView::default();
+    let mut view = Lifecycle::<Position, ArithmeticError<FractionalShares>>::default();
     view.update(&envelope);
 
     // Assert view state matches expected

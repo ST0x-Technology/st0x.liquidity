@@ -9,11 +9,22 @@ use serde::{Deserialize, Serialize};
 use st0x_execution::{ArithmeticError, Direction, FractionalShares, SupportedExecutor, Symbol};
 use tracing::warn;
 
-use sqlite_es::SqliteCqrs;
+use cqrs_es::persist::GenericQuery;
+use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 
+use crate::error::OnChainError;
 use crate::lifecycle::{Lifecycle, LifecycleError};
 
-pub(crate) type PositionCqrs = SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>;
+pub(crate) type PositionAggregate = Lifecycle<Position, ArithmeticError<FractionalShares>>;
+
+pub(crate) type PositionCqrs = SqliteCqrs<PositionAggregate>;
+
+pub(crate) type PositionQuery = GenericQuery<
+    SqliteViewRepository<PositionAggregate, PositionAggregate>,
+    PositionAggregate,
+    PositionAggregate,
+>;
+
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
@@ -720,13 +731,34 @@ pub(crate) enum TriggerReason {
     },
 }
 
+pub(crate) async fn load_position(
+    position_query: &PositionQuery,
+    symbol: &Symbol,
+) -> Result<Option<Position>, OnChainError> {
+    let aggregate_id = Position::aggregate_id(symbol);
+
+    let Some(lifecycle) = position_query.load(&aggregate_id).await else {
+        return Ok(None);
+    };
+
+    match lifecycle {
+        Lifecycle::Live(position) => Ok(Some(position)),
+        Lifecycle::Uninitialized => Ok(None),
+        Lifecycle::Failed { error, .. } => Err(OnChainError::PositionAggregate(
+            cqrs_es::AggregateError::UserError(LifecycleError::Failed(error.clone())),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
+    use sqlx::SqlitePool;
     use st0x_execution::Positive;
     use std::collections::HashMap;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use super::*;
     use crate::threshold::Usdc;
@@ -1882,5 +1914,60 @@ mod tests {
             "Alpaca executor should return full fractional shares: expected 2.567, got {}",
             shares.inner()
         );
+    }
+
+    #[tokio::test]
+    async fn load_position_returns_none_when_no_events() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let position_query = create_test_position_query(&pool);
+
+        let result = load_position(&position_query, &Symbol::new("AAPL").unwrap()).await;
+
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn load_position_returns_position_from_view() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let view_repo = Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ));
+        let position_query = GenericQuery::new(view_repo.clone());
+        let position_cqrs: PositionCqrs = sqlite_es::sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(view_repo))],
+            (),
+        );
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = one_share_threshold();
+
+        position_cqrs
+            .execute(
+                &Position::aggregate_id(&symbol),
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        let position = load_position(&position_query, &symbol)
+            .await
+            .unwrap()
+            .expect("position should exist after initialization");
+
+        assert_eq!(position.symbol, symbol);
+        assert_eq!(position.net, FractionalShares::ZERO);
+    }
+
+    fn create_test_position_query(pool: &SqlitePool) -> PositionQuery {
+        let view_repo = Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ));
+        GenericQuery::new(view_repo)
     }
 }

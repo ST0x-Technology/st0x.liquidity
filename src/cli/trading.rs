@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use alloy::primitives::B256;
 use alloy::providers::Provider;
+use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
-use sqlite_es::{SqliteCqrs, sqlite_cqrs};
+use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
@@ -275,8 +276,17 @@ pub(super) async fn process_found_trade<W: Write>(
 
     let onchain_trade_cqrs: Arc<SqliteCqrs<Lifecycle<OnChainTrade, Never>>> =
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+    let position_view_repo = Arc::new(SqliteViewRepository::new(
+        pool.clone(),
+        "position_view".to_string(),
+    ));
+    let position_query = GenericQuery::new(position_view_repo.clone());
     let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>> =
-        Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(position_view_repo))],
+            (),
+        ));
     let offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder, Never>>> =
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
@@ -285,7 +295,7 @@ pub(super) async fn process_found_trade<W: Write>(
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
-        &dual_write_context,
+        &position_query,
         onchain_trade,
         config.broker.to_supported_executor(),
     )
