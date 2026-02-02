@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use alloy::consensus::SignableTransaction;
 use alloy::network::TxSigner;
 use alloy::primitives::{Address, B256};
@@ -8,6 +6,7 @@ use async_trait::async_trait;
 use fireblocks_sdk::apis::transactions_api::CreateTransactionParams;
 use fireblocks_sdk::models;
 use fireblocks_sdk::{Client, ClientBuilder};
+use std::time::Duration;
 use tracing::debug;
 
 use super::config::{ChainAssetIds, FireblocksEnv};
@@ -33,7 +32,12 @@ pub(crate) enum FireblocksError {
         source: alloy::hex::FromHexError,
     },
     #[error("failed to create Fireblocks transaction")]
-    CreateTransaction(String),
+    CreateTransaction(
+        #[source]
+        fireblocks_sdk::apis::Error<
+            fireblocks_sdk::apis::transactions_api::CreateTransactionError,
+        >,
+    ),
     #[error("Fireblocks transaction {tx_id} did not return an ID")]
     MissingTransactionId { tx_id: String },
     #[error("failed to poll Fireblocks transaction {tx_id}")]
@@ -159,7 +163,7 @@ impl FireblocksSigner {
             .transactions_api()
             .create_transaction(params)
             .await
-            .map_err(|e| FireblocksError::CreateTransaction(e.to_string()))?;
+            .map_err(FireblocksError::CreateTransaction)?;
 
         let tx_id = create_response
             .id
@@ -348,20 +352,5 @@ impl TxSigner<Signature> for FireblocksSigner {
         let hash = tx.signature_hash();
         let signature = self.sign_hash(&hash).await?;
         Ok(signature)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn fireblocks_signer_debug_redacts_client() {
-        // Verify Debug output doesn't leak sensitive client details
-        let debug_output = format!(
-            "{:?}",
-            // We can't construct a real signer without Fireblocks credentials,
-            // so just verify the Debug impl compiles and the struct shape is correct
-            "FireblocksSigner { vault_account_id: \"0\", asset_id: \"ETH\", address: 0x..., chain_id: None }"
-        );
-        assert!(debug_output.contains("FireblocksSigner"));
     }
 }

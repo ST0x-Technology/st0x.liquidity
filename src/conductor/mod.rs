@@ -25,7 +25,7 @@ use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
-use crate::env::Config;
+use crate::env::{Config, ConfigError};
 use crate::equity_redemption::EquityRedemption;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
@@ -299,7 +299,11 @@ impl Conductor {
             snapshot_cqrs,
         };
 
-        let order_owner = config.order_owner().await.ok();
+        let order_owner = match config.order_owner().await {
+            Ok(addr) => Some(addr),
+            Err(ConfigError::MissingOrderOwner) => None,
+            Err(e) => return Err(e.into()),
+        };
 
         let mut builder = ConductorBuilder::new(
             config.clone(),
@@ -785,6 +789,8 @@ async fn handle_queue_processing_result<E>(
                 {
                     error!("Failed to execute offchain order {exec_id}: {e}");
                 }
+            } else {
+                warn!("OffchainExecution missing id, skipping: {execution:?}");
             }
         }
         Ok(None) => sleep(Duration::from_millis(100)).await,

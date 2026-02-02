@@ -13,6 +13,7 @@ pub(crate) use signer::{FireblocksError, FireblocksSigner};
 /// Resolved signer: an `EthereumWallet` and the corresponding address.
 ///
 /// Consumers don't need to know which backend produced the wallet.
+#[derive(Debug)]
 pub(crate) struct ResolvedSigner {
     pub(crate) wallet: EthereumWallet,
     pub(crate) address: Address,
@@ -178,11 +179,26 @@ mod tests {
             fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
             fireblocks_sandbox: false,
         };
-        let result = env.into_config();
-        assert!(
-            matches!(result, Err(SignerConfigError::NeitherConfigured)),
-            "Expected NeitherConfigured error, got {result:?}"
-        );
+        assert!(matches!(
+            env.into_config().unwrap_err(),
+            SignerConfigError::NeitherConfigured
+        ));
+    }
+
+    #[test]
+    fn signer_env_with_both_configured_fails() {
+        let env = SignerEnv {
+            evm_private_key: Some(B256::from([1u8; 32])),
+            fireblocks_api_key: Some("test-key".to_string()),
+            fireblocks_secret_path: Some("/tmp/key.pem".into()),
+            fireblocks_vault_account_id: Some("0".to_string()),
+            fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
+            fireblocks_sandbox: false,
+        };
+        assert!(matches!(
+            env.into_config().unwrap_err(),
+            SignerConfigError::BothConfigured
+        ));
     }
 
     #[test]
@@ -195,11 +211,26 @@ mod tests {
             fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
             fireblocks_sandbox: false,
         };
-        let result = env.into_config();
-        assert!(
-            matches!(result, Err(SignerConfigError::MissingSecretPath)),
-            "Expected MissingSecretPath error, got {result:?}"
-        );
+        assert!(matches!(
+            env.into_config().unwrap_err(),
+            SignerConfigError::MissingSecretPath
+        ));
+    }
+
+    #[test]
+    fn signer_env_with_fireblocks_missing_vault_account_id_fails() {
+        let env = SignerEnv {
+            evm_private_key: None,
+            fireblocks_api_key: Some("test-key".to_string()),
+            fireblocks_secret_path: Some("/tmp/key.pem".into()),
+            fireblocks_vault_account_id: None,
+            fireblocks_chain_asset_ids: config::parse_chain_asset_ids("1:ETH").unwrap(),
+            fireblocks_sandbox: false,
+        };
+        assert!(matches!(
+            env.into_config().unwrap_err(),
+            SignerConfigError::MissingVaultAccountId
+        ));
     }
 
     #[tokio::test]

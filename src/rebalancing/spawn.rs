@@ -370,9 +370,12 @@ mod tests {
             "0x0000000000000000000000000000000000000000000000000000000000000000"
         ));
 
-        let result = zero_config.resolve().await;
+        let err = zero_config.resolve().await.unwrap_err();
 
-        assert!(result.is_err(), "Expected zero private key to fail parsing");
+        assert!(
+            matches!(err, SignerResolveError::InvalidPrivateKey(_)),
+            "Expected InvalidPrivateKey error, got: {err:?}"
+        );
     }
 
     async fn make_services_with_mock_wallet(

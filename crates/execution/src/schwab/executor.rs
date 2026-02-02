@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::schwab::SchwabAuthEnv;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
@@ -251,7 +251,10 @@ impl Executor for SchwabExecutor {
                 Err(e) if !e.is_cancelled() => {
                     error!("Token refresh task panicked: {e}");
                 }
-                _ => {}
+                Err(_) => {
+                    debug!("Token refresh task cancelled");
+                }
+                Ok(()) => {}
             }
         });
 

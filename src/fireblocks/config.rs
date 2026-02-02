@@ -1,7 +1,6 @@
+use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
-
-use clap::Parser;
 
 /// Environment configuration for Fireblocks signing.
 #[derive(Parser, Debug, Clone)]
@@ -116,19 +115,28 @@ mod tests {
 
     #[test]
     fn parse_invalid_format() {
-        let result = parse_chain_asset_ids("ETH");
-        assert!(result.is_err());
+        let err = parse_chain_asset_ids("ETH").unwrap_err();
+        assert!(
+            err.contains("invalid chain:asset pair"),
+            "Expected 'invalid chain:asset pair' error, got: {err}"
+        );
     }
 
     #[test]
     fn parse_invalid_chain_id() {
-        let result = parse_chain_asset_ids("abc:ETH");
-        assert!(result.is_err());
+        let err = parse_chain_asset_ids("abc:ETH").unwrap_err();
+        assert!(
+            err.contains("invalid chain ID"),
+            "Expected 'invalid chain ID' error, got: {err}"
+        );
     }
 
     #[test]
     fn parse_empty_string() {
-        let result = parse_chain_asset_ids("");
-        assert!(result.is_err());
+        let err = parse_chain_asset_ids("").unwrap_err();
+        assert!(
+            err.contains("invalid chain:asset pair"),
+            "Expected 'invalid chain:asset pair' error, got: {err}"
+        );
     }
 }
