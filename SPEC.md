@@ -284,14 +284,13 @@ _System configuration_ (deploy-rs `activate.nixos`):
 
 _Per-service profiles_ (deploy-rs `activate.custom`, deployed independently):
 
-- `server-schwab` - hedging bot for Schwab executor
-- `server-alpaca` - hedging bot for Alpaca executor
-- `reporter-schwab` - position reporter for Schwab
-- `reporter-alpaca` - position reporter for Alpaca
-- `dashboard` - operations dashboard (single instance, switches executors in UI)
+- `server` - hedging bot binary (serves both Schwab and Alpaca instances)
+- `reporter` - position reporter binary (serves both Schwab and Alpaca
+  instances)
 
-Each profile deploys its binary to a known path and restarts the corresponding
-systemd unit. This allows updating one service without touching others.
+Each profile is independently deployable and rollback-able without affecting
+other profiles. The dashboard is served as static files by nginx (part of the
+system configuration).
 
 _Configuration management_:
 
@@ -308,13 +307,11 @@ _Infrastructure_:
 
 #### Rollback
 
-deploy-rs deploys each service to a nix profile (e.g.,
-`/nix/var/nix/profiles/per-service/server-schwab`). Each deployment creates a
-new profile generation:
-
-- `nix profile history` shows deployment history with timestamps
-- `nix profile rollback` reverts to previous generation
-- Retention configured declaratively via NixOS `nix.gc.*` options
+deploy-rs deploys each service to a nix profile. Each deployment creates a new
+profile generation that can be rolled back to. deploy-rs uses legacy
+(`nix-env`-style) profiles internally, not the new Nix CLI profiles. Old
+generations are cleaned up by the NixOS garbage collector on a configured
+schedule.
 
 #### CI/CD Credential Management
 

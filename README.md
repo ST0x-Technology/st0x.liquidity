@@ -17,14 +17,13 @@ markets by providing continuous two-sided liquidity.
 
 ## Features
 
-- **Multiple Brokerages**: Execute hedges through Charles Schwab, Alpaca Trading
-  API (individual accounts), Alpaca Broker API (managed accounts), or dry-run
-  mode for testing
+- **Multiple Brokerages**: Execute hedges through Alpaca Broker API (managed
+  accounts, auto-rebalancing), Alpaca Trading API (individual accounts), Charles
+  Schwab, or dry-run mode for testing
 - **Real-Time Hedging**: WebSocket-based monitoring for near instant execution
   when onchain liquidity is taken
-- **Fractional Share Batching**: Accumulates fractional onchain trades until
-  whole shares can be executed (required for Schwab; used uniformly across all
-  brokerages in current implementation)
+- **Fractional Share Support**: Executes fractional shares on Alpaca; batches
+  until whole shares for Schwab
 - **Complete Audit Trail**: Database tracking linking every onchain trade to
   offchain hedge executions
 - **Exposure Hedging**: Automatically executes offsetting trades to reduce
@@ -34,327 +33,118 @@ markets by providing continuous two-sided liquidity.
 
 ### Prerequisites
 
-Before you begin, ensure you have:
-
 - **Nix with flakes enabled** - For reproducible development environment
-- **Brokerage account** - Either:
-  - Charles Schwab account with API access
-  - Alpaca Markets account (simpler setup, supports paper trading)
+- **Brokerage account** - Alpaca Broker API (managed accounts), Alpaca Trading
+  API (individual accounts), or Charles Schwab (API access)
 - **Ethereum node** - WebSocket RPC endpoint for blockchain monitoring
 
-Follow the steps in the **Development** section below for complete setup
-instructions.
+### Development Setup
 
-## Security
+```bash
+git clone --recurse-submodules https://github.com/ST0x-Technology/st0x.liquidity.git
+cd st0x.liquidity
+nix develop
+nix run .#prepSolArtifacts  # build Solidity artifacts required for compilation
+cargo check                  # verify setup
+```
 
-### Token Encryption
+### Configuration
 
-OAuth tokens (access tokens and refresh tokens) are encrypted at rest using
-AES-256-GCM authenticated encryption. This prevents unauthorized access to
-sensitive authentication credentials stored in the database.
+The application uses TOML configuration files. See `example.toml` for all
+available options. Each service instance takes a `--config-file` flag pointing
+to its config:
 
-**Generating an encryption key:**
+```bash
+cargo run --bin server -- --config-file path/to/config.toml
+cargo run --bin reporter -- --config-file path/to/config.toml
+```
+
+For local development, set up the database first:
+
+```bash
+mkdir -p data
+export DATABASE_URL=sqlite:data/local.db
+sqlx db create
+sqlx migrate run
+```
+
+### Brokerage Setup
+
+**Charles Schwab** (3-5 day approval):
+
+1. Create account at [schwab.com](https://www.schwab.com/)
+2. Register at [Schwab Developer Portal](https://developer.schwab.com/)
+3. Request "Trader API" access under API Products -> Individual Developers
+4. After approval, run `cargo run --bin cli -- auth` for one-time OAuth setup
+
+**Alpaca Broker API** (managed accounts, supports auto-rebalancing):
+
+For managed/omnibus accounts. Requires Broker API access from Alpaca. This is
+the only integration that supports automatic portfolio rebalancing (USDC/equity
+threshold-based).
+
+**Alpaca Trading API** (instant, paper trading available):
+
+For individual accounts. Create an account at
+[alpaca.markets](https://alpaca.markets/) and generate API keys from the
+dashboard.
+
+Add credentials to your TOML config file under the `[broker]` section (see
+`example.toml`).
+
+### Token Encryption (Schwab only)
+
+Schwab OAuth tokens are encrypted at rest using AES-256-GCM. Generate a key and
+add it to your config:
 
 ```bash
 openssl rand -hex 32
 ```
 
-This generates a 32-byte (256-bit) key encoded as 64 hexadecimal characters.
-
-**Setting the encryption key:**
-
-The encryption key must be provided via the `ENCRYPTION_KEY` environment
-variable. The key is never written to disk in plain text.
-
-```bash
-export ENCRYPTION_KEY=your_64_char_hex_key
-```
-
-For production deployments, the key should be stored as a secret in your
-deployment system (e.g., GitHub Actions secrets) and passed directly to the
-service configuration.
-
-## Development
-
-### With Nix
-
-Enter the development shell with all dependencies:
-
-```bash
-git clone https://github.com/ST0x-Technology/st0x.liquidity.git
-cd st0x.liquidity
-nix develop
-```
-
-This enters a reproducible development environment with all dependencies (Rust,
-SQLx, etc.).
-
-Build Solidity artifacts required for compilation:
-
-```bash
-nix run .#prepSolArtifacts
-```
-
-Verify your setup:
-
-```bash
-cargo build
-```
-
-### Step 2: Brokerage Setup
-
-Choose a brokerage and complete its setup:
-
-#### Option A: Charles Schwab
-
-**Note**: Approval process takes 3-5 business days.
-
-1. Create a trading account at [Charles Schwab](https://www.schwab.com/) (or
-   [Schwab International](https://international.schwab.com/) if outside US)
-2. Register at [Schwab Developer Portal](https://developer.schwab.com/) using
-   the same credentials
-3. Select "Individual" setup option
-4. Request "Trader API" access under API Products → Individual Developers
-5. Include your Schwab account number in the request
-6. Wait for approval (typically 3-5 days)
-
-After approval, add your credentials to `.env`:
-
-```bash
-SCHWAB_APP_KEY=your_app_key
-SCHWAB_APP_SECRET=your_app_secret
-SCHWAB_BASE_URL=https://api.schwabapi.com
-SCHWAB_REDIRECT_URI=https://127.0.0.1
-```
-
-#### Option B: Alpaca Markets (Recommended for Testing)
-
-**Instant setup with paper trading support.**
-
-1. Create an account at [Alpaca Markets](https://alpaca.markets/)
-2. Navigate to dashboard → Generate API keys
-3. For paper trading, use paper trading keys (recommended for initial testing)
-4. For live trading, enable live trading in account settings first
-
-Add credentials to `.env`:
-
-```bash
-ALPACA_API_KEY=your_api_key
-ALPACA_API_SECRET=your_secret
-ALPACA_TRADING_MODE=paper  # or 'live' for live trading
-```
-
-### Step 3: Configuration
-
-Create a `.env` file with your environment-specific settings:
-
-```bash
-# Database (for local development)
-DATABASE_URL=sqlite:data/schwab.db
-
-# Blockchain
-WS_RPC_URL=wss://your-ethereum-node.com
-ORDERBOOK=0x... # Raindex orderbook contract address
-ORDER_OWNER=0x... # Order owner address to monitor
-DEPLOYMENT_BLOCK=... # Block number where orderbook was deployed
-
-# Brokerage API credentials (from Step 2)
-# Add either Schwab OR Alpaca credentials based on your choice
-```
-
-See `example.toml` for complete configuration options.
-
-### Step 4: Database Setup
-
-Create the data directory and initialize the database:
-
-```bash
-mkdir -p data
-export DATABASE_URL=sqlite:data/schwab.db
-sqlx db create
-sqlx migrate run
-```
-
-To run both executors locally, create both databases:
-
-```bash
-sqlx db create --database-url sqlite:data/schwab.db
-sqlx migrate run --database-url sqlite:data/schwab.db
-
-sqlx db create --database-url sqlite:data/alpaca.db
-sqlx migrate run --database-url sqlite:data/alpaca.db
-```
-
-### Step 5: Authentication
-
-**For Charles Schwab only** - Complete one-time OAuth flow:
-
-```bash
-cargo run --bin cli -- auth
-```
-
-This will open your browser to complete OAuth authentication and store tokens in
-the database.
-
-**For Alpaca Markets** - No additional auth needed; API keys from `.env` are
-sufficient.
-
-### Step 6: Run the Bot
-
-Start the arbitrage bot with your chosen brokerage:
-
-```bash
-# Charles Schwab
-cargo run --bin server -- --executor schwab
-
-# Alpaca Trading API
-cargo run --bin server -- --executor alpaca-trading-api
-
-# Alpaca Broker API (for managed accounts)
-cargo run --bin server -- --executor alpaca-broker-api
-
-# Dry-run mode (testing without real trades)
-cargo run --bin server -- --executor dry-run
-```
-
-The bot will now monitor blockchain events and execute offsetting trades
-automatically.
-
-## Data Migration (One-Time)
-
-**Note**: This section applies if you're migrating from a pre-CQRS/ES version of
-the system. New installations can skip this section.
-
-The `migrate_to_events` binary converts legacy CRUD data to event-sourced
-aggregates. This is a one-time operation required before enabling the
-event-sourced system.
-
-### When to Run Migration
-
-- Migrating from legacy CRUD tables (`onchain_trades`, `trade_accumulators`,
-  `offchain_trades`, `schwab_auth`)
-- Before enabling event-sourced aggregates in production
-- After completing database setup but before running the bot
-
-### Prerequisites
-
-1. **Create database backup**:
-   ```bash
-   cp data/schwab.db data/schwab.db.backup
-   ```
-
-2. **Ensure database migrations are current**:
-   ```bash
-   sqlx migrate run
-   ```
-
-### Migration Workflow
-
-**1. Dry run (preview without persisting):**
-
-```bash
-cargo run --bin migrate_to_events -- --execution dry-run
-```
-
-This shows what would be migrated without actually writing events. Review the
-output for:
-
-- Number of trades, positions, orders to migrate
-- Any warnings about pending executions
-- Expected event counts
-
-**2. Run migration:**
-
-```bash
-cargo run --bin migrate_to_events
-```
-
-You'll be prompted to:
-
-- Confirm you've created a database backup
-- Confirm if existing events are detected (if re-running)
-
-The migration will log progress every 100 items and show a summary:
-
-```
-Migration complete:
-  OnChainTrade: 1523
-  Position: 12
-  OffchainOrder: 1498
-  SchwabAuth: migrated
-```
-
-**3. Verify migration (optional but recommended):**
-
-```bash
-# Check event counts
-sqlite3 data/schwab.db "SELECT aggregate_type, COUNT(*) FROM events GROUP BY aggregate_type;"
-```
-
-### Options
-
-| Flag             | Values                           | Description                                                    |
-| ---------------- | -------------------------------- | -------------------------------------------------------------- |
-| `--execution`    | `commit` (default), `dry-run`    | Whether to persist events or just preview                      |
-| `--confirmation` | `interactive` (default), `force` | Whether to prompt for confirmations or skip prompts            |
-| `--clean`        | `preserve` (default), `delete`   | Whether to keep existing events or delete all before migrating |
-| `--database-url` | Path                             | SQLite database path (or set `DATABASE_URL` env var)           |
-
-### Common Scenarios
-
-**Re-run migration after fixing data:**
-
-```bash
-# Clean all events and re-migrate
-cargo run --bin migrate_to_events -- --clean delete --confirmation force
-```
-
-**Automated/CI usage:**
-
-```bash
-# Skip all prompts
-cargo run --bin migrate_to_events -- --confirmation force
-```
-
-**Migration from different database:**
-
-```bash
-cargo run --bin migrate_to_events -- --database-url sqlite:path/to/other.db
-```
-
-### Troubleshooting
-
-**"Events detected for OnChainTrade. Continue? [y/N]"**
-
-- Already migrated. Use `--confirmation force` to proceed anyway
-- Or use `--clean delete` to remove existing events and re-migrate
-
-**Migration fails with data validation error:**
-
-- Migration uses fail-fast behavior for data integrity
-- Check error message for specific issue (invalid symbol, negative amount, etc.)
-- Fix source data in legacy tables and re-run
-
-**Rollback:**
-
-```bash
-# Restore from backup
-mv data/schwab.db.backup data/schwab.db
-```
-
 ## Deployment
 
-The system runs on a NixOS host managed by deploy-rs. Four systemd services run
-independently: `server-schwab`, `server-alpaca`, `reporter-schwab`,
-`reporter-alpaca`. Grafana runs as a native NixOS service.
+The system runs on a NixOS host on DigitalOcean, managed by deploy-rs. All
+infrastructure is defined declaratively in Nix and Terraform.
 
-### Deploy
+### Architecture
+
+```
+GitHub Actions (CI/CD)
+  |
+  | deploy-rs over SSH
+  v
+NixOS host (DigitalOcean droplet)
+  ├── server-schwab    (systemd, hedging bot)
+  ├── server-alpaca    (systemd, hedging bot)
+  ├── reporter-schwab  (systemd, P&L reporter)
+  ├── reporter-alpaca  (systemd, P&L reporter)
+  ├── nginx            (dashboard + WebSocket proxy)
+  └── grafana          (metrics visualization)
+```
+
+Services are deployed as independent nix profiles, allowing per-service updates
+and rollbacks without affecting other services.
+
+### Key Files
+
+| File                 | Purpose                                                |
+| -------------------- | ------------------------------------------------------ |
+| `os.nix`             | NixOS system configuration (services, firewall, users) |
+| `deploy.nix`         | deploy-rs profiles and deployment wrappers             |
+| `rust.nix`           | Nix derivation for Rust binaries                       |
+| `keys.nix`           | SSH public keys and role-based access                  |
+| `config/secrets.nix` | ragenix secret declarations                            |
+| `config/*.toml.age`  | Encrypted service configs (decrypted at deploy)        |
+| `infra/`             | Terraform for DigitalOcean infrastructure              |
+| `disko.nix`          | Disk partitioning for nixos-anywhere bootstrap         |
+
+### Deploy Commands
 
 ```bash
 # Deploy everything (system config + all service binaries)
 nix run .#deployAll
 
-# Deploy only NixOS system configuration
+# Deploy only NixOS system configuration (SSH, firewall, systemd units, nginx)
 nix run .#deployNixos
 
 # Deploy a specific service profile
@@ -362,20 +152,77 @@ nix run .#deployService server
 nix run .#deployService reporter
 ```
 
-### SSH to host
+### SSH Access
 
 ```bash
-nix run .#remote
+nix run .#remote              # interactive shell
+nix run .#remote -- <command> # run a command
 ```
 
 ### Rollback
 
-Each service is deployed to a nix profile. To roll back:
+Each service profile maintains a history of deployments. To roll back:
 
 ```bash
-nix run .#remote -- nix profile rollback --profile /nix/var/nix/profiles/per-service/server
+# Roll back the server profile to previous deployment
+nix run .#remote -- nix-env --profile /nix/var/nix/profiles/per-service/server --rollback
 nix run .#remote -- systemctl restart server-schwab server-alpaca
+
+# Roll back the reporter profile
+nix run .#remote -- nix-env --profile /nix/var/nix/profiles/per-service/reporter --rollback
+nix run .#remote -- systemctl restart reporter-schwab reporter-alpaca
 ```
+
+### Secrets Management
+
+Service configs are encrypted with ragenix (age encryption using SSH keys) and
+committed to git as `.age` files. The NixOS host decrypts them at activation
+using its SSH key, mounting cleartext to `/run/agenix/` (tmpfs).
+
+```bash
+# Edit an encrypted config
+nix run .#secret config/server-schwab.toml.age
+
+# Re-encrypt all secrets after key changes
+ragenix --rules ./config/secrets.nix -r
+```
+
+Key access is managed via roles in `keys.nix`:
+
+- `roles.ssh` - SSH access to the host (operator + CI)
+- `roles.infra` - can decrypt terraform state (operator + CI)
+- `roles.service` - can decrypt service configs (operator + host)
+
+### Infrastructure Provisioning
+
+Infrastructure is managed with Terraform, wrapped in Nix for reproducibility:
+
+```bash
+nix run .#tfInit     # initialize terraform
+nix run .#tfPlan     # preview changes
+nix run .#tfApply    # apply changes
+nix run .#tfDestroy  # tear down infrastructure
+```
+
+Terraform state is encrypted with age and committed to git.
+
+### Bootstrap (One-Time)
+
+For initial setup of a new host, Terraform provisions a DigitalOcean Ubuntu
+droplet. nixos-anywhere then converts it to NixOS over SSH:
+
+```bash
+nix run .#tfApply     # provision Ubuntu droplet
+nix run .#bootstrap   # convert to NixOS (updates host key + rekeys secrets)
+nix run .#deployAll   # first deployment
+```
+
+### CI/CD
+
+- **CI** (`.github/workflows/ci.yaml`): Builds all packages, runs tests and
+  clippy inside nix derivations, builds dashboard. Runs on every push.
+- **CD** (`.github/workflows/cd.yaml`): Deploys to the NixOS host via
+  `nix run .#deployAll`. Runs on push to master.
 
 ## P&L Tracking and Metrics
 
@@ -400,52 +247,36 @@ to the `metrics_pnl` table, which is optimized for Grafana visualization.
 
 ## Project Structure
 
-This is a Cargo workspace with two crates:
+### Cargo Workspace
 
-### `st0x-hedge` (Main Application)
+Two Rust crates:
 
-The arbitrage bot application:
+- **`st0x-hedge`** (root) - Main arbitrage bot: event loop, CQRS/ES aggregates,
+  conductor, reporter, CLI
+- **`st0x-execution`** (`crates/execution/`) - Standalone `Executor` trait
+  abstraction with Schwab, Alpaca Trading API, Alpaca Broker API, and mock
+  implementations
 
-```
-src/
-├── lib.rs              # Main event loop and orchestration
-├── bin/
-│   ├── server.rs       # Arbitrage bot server
-│   ├── reporter.rs     # P&L reporter
-│   └── cli.rs          # CLI for manual operations
-├── position.rs         # Position aggregate (CQRS/ES)
-├── onchain_trade.rs    # OnChain trade aggregate (CQRS/ES)
-├── offchain_order.rs   # OffChain order aggregate (CQRS/ES)
-├── onchain/            # Blockchain event processing
-├── offchain/           # Off-chain order execution
-├── conductor/          # Trade accumulation and execution orchestration
-├── reporter/           # FIFO P&L calculation and metrics
-├── symbol/             # Token symbol caching and locking
-├── alpaca_wallet/      # Alpaca cryptocurrency wallet management
-├── shares.rs           # Fractional shares newtype and arithmetic
-├── threshold.rs        # Execution threshold logic
-├── queue.rs            # Event queue for idempotent processing
-├── api.rs              # REST API endpoints
-├── env.rs              # Environment configuration
-└── cctp.rs             # Cross-chain token bridge (Circle CCTP)
-migrations/             # SQLite database schema
-data/                   # SQLite databases (created at runtime)
-├── schwab.db           # Schwab instance database
-└── alpaca.db           # Alpaca instance database
-```
-
-### `st0x-execution` (Trade Execution Library)
-
-Standalone library for executing trades across different brokerages:
+### Infrastructure
 
 ```
-src/
-├── lib.rs                 # Executor trait, domain types, exports
-├── schwab/                # Charles Schwab integration (with auth/ submodule)
-├── alpaca_trading_api/    # Alpaca Trading API integration
-├── alpaca_broker_api/     # Alpaca Broker API integration (managed accounts)
-├── order/                 # Shared order types (MarketOrder, OrderState)
-└── mock.rs                # Mock implementation for testing
+flake.nix                  # Nix flake: packages, devShell, NixOS config
+os.nix                     # NixOS system configuration
+deploy.nix                 # deploy-rs profiles and wrappers
+rust.nix                   # Rust package derivation
+disko.nix                  # Disk partitioning for bootstrap
+keys.nix                   # SSH keys and role-based access
+config/
+├── secrets.nix            # ragenix secret declarations
+├── server-schwab.toml.age # encrypted service configs
+├── server-alpaca.toml.age
+├── reporter-schwab.toml.age
+└── reporter-alpaca.toml.age
+infra/                     # Terraform (DigitalOcean)
+dashboard/                 # SvelteKit operations dashboard
+.github/workflows/
+├── ci.yaml                # Build, test, clippy, dashboard
+└── cd.yaml                # Deploy to NixOS host
 ```
 
 ## Development
@@ -453,35 +284,17 @@ src/
 ### Building and Testing
 
 ```bash
-# Build all workspace members
-cargo build
-
-# Run all tests
-cargo test -q
-
-# Run specific crate tests
-cargo test -p st0x-hedge -q
-cargo test -p st0x-execution -q
-```
-
-### Code Quality
-
-```bash
-# Format code
+cargo check                  # fast compilation check
+cargo test --workspace -q    # run all tests
+cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt
-
-# Lint with clippy
-cargo clippy --all-targets --all-features -- -D clippy::all
-
-# Run static analysis
-rainix-rs-static
 ```
 
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Complete technical specification and architecture
-  details
 - **[AGENTS.md](AGENTS.md)** - Development guidelines for AI-assisted coding
+- **[example.toml](example.toml)** - Configuration reference
 
 ## P&L Reporter
 
@@ -545,7 +358,8 @@ and offchain execution).
    liquidity onchain
 3. **Parse Trade**: Extract details (symbol, amount, direction, price) from
    blockchain events
-4. **Accumulate**: Batch fractional positions in database until ≥1.0 shares
+4. **Accumulate**: Batch fractional positions until the executor's minimum
+   threshold (immediate for Alpaca fractional shares, ≥1.0 for Schwab)
 5. **Hedge**: Execute offsetting market order on traditional brokerage to reduce
    exposure
 6. **Track**: Maintain complete audit trail linking onchain fills to offchain
@@ -555,7 +369,6 @@ and offchain execution).
 onchain order price and offchain hedge execution price) while hedging
 directional exposure.
 
-**Note**: While Alpaca Markets supports fractional share trading (minimum $1
-worth), the current implementation uses uniform batching logic for all
-brokerages. This may be reconfigured in the future to allow immediate fractional
-execution when using Alpaca.
+**Note**: Alpaca supports fractional share execution (minimum $1 worth). Schwab
+requires whole shares, so fractional onchain trades are batched until they
+accumulate to at least 1.0 shares before hedging.
