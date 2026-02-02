@@ -153,6 +153,18 @@ impl OnchainTradeBuilder {
         self
     }
 
+    #[must_use]
+    pub(crate) fn with_log_index(mut self, log_index: u64) -> Self {
+        self.trade.log_index = log_index;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_block_timestamp(mut self, ts: chrono::DateTime<chrono::Utc>) -> Self {
+        self.trade.block_timestamp = Some(ts);
+        self
+    }
+
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
     }

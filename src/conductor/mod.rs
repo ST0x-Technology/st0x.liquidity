@@ -3,7 +3,7 @@ mod builder;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::Address;
+use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
@@ -1032,15 +1032,7 @@ async fn handle_filtered_event(
         queued_event.log_index
     );
 
-    let mut sql_tx = pool.begin().await.inspect_err(|e| {
-        error!("Failed to begin transaction for filtered event: {e}");
-    })?;
-
-    mark_event_processed(&mut sql_tx, event_id).await?;
-
-    sql_tx.commit().await.inspect_err(|e| {
-        error!("Failed to commit transaction for filtered event: {e}");
-    })?;
+    mark_event_processed(pool, event_id).await?;
 
     Ok(None)
 }
@@ -1081,7 +1073,7 @@ async fn process_valid_trade(
         trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
     );
 
-    process_trade_within_transaction(executor_type, pool, queued_event, event_id, trade, cqrs).await
+    process_queued_trade(executor_type, pool, queued_event, event_id, trade, cqrs).await
 }
 
 /// Extracts amount and price as Decimals from a trade, logging errors on failure.
@@ -1281,7 +1273,7 @@ async fn execute_place_offchain_order(
     }
 }
 
-async fn process_trade_within_transaction(
+async fn process_queued_trade(
     executor_type: SupportedExecutor,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
@@ -1293,27 +1285,13 @@ async fn process_trade_within_transaction(
     execute_initialize_position(&cqrs.position_cqrs, &trade, cqrs.execution_threshold).await;
     execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
 
-    let mut sql_tx = pool
-        .begin()
-        .await
-        .inspect_err(|e| error!("Failed to begin transaction for event processing: {e}"))?;
-
-    mark_event_processed(&mut sql_tx, event_id)
-        .await
-        .map_err(|e| {
-            error!("Failed to mark event {event_id} as processed: {e}");
-            EventProcessingError::Queue(e)
-        })?;
-
-    sql_tx.commit().await.inspect_err(|e| {
-        error!(
-            "Failed to commit transaction for event processing: {e}, event_id={}, tx_hash={:?}",
-            event_id, queued_event.tx_hash
-        );
+    mark_event_processed(pool, event_id).await.map_err(|e| {
+        error!("Failed to mark event {event_id} as processed: {e}");
+        EventProcessingError::Queue(e)
     })?;
 
     info!(
-        "Successfully committed event processing: event_id={}, tx_hash={:?}, log_index={}",
+        "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
@@ -2085,11 +2063,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
+        crate::queue::mark_event_processed(&pool, queued_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
 
         crate::queue::enqueue(&pool, &event1, &log1).await.unwrap();
@@ -2105,11 +2081,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next_event.log_index, 2);
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, next_event.id.unwrap())
+        crate::queue::mark_event_processed(&pool, next_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -2151,11 +2125,9 @@ mod tests {
                 .unwrap();
             assert_eq!(event.block_number, expected_block);
             assert_eq!(event.log_index, expected_log_idx);
-            let mut sql_tx = pool.begin().await.unwrap();
-            crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
+            crate::queue::mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
         }
 
         assert!(
@@ -2203,11 +2175,9 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let mut sql_tx = pool.begin().await.unwrap();
-            crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
+            crate::queue::mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
         }
 
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 3);
@@ -2217,11 +2187,9 @@ mod tests {
             .await
             .unwrap()
         {
-            let mut sql_tx = pool.begin().await.unwrap();
-            crate::queue::mark_event_processed(&mut sql_tx, event.id.unwrap())
+            crate::queue::mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
             processed_count += 1;
         }
 
@@ -2284,11 +2252,9 @@ mod tests {
         let original_log_data = clear_event.into_log_data();
         assert_eq!(reconstructed_log.inner.data, original_log_data);
 
-        let mut sql_tx = pool.begin().await.unwrap();
-        crate::queue::mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
+        crate::queue::mark_event_processed(&pool, queued_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
         assert_eq!(crate::queue::count_unprocessed(&pool).await.unwrap(), 0);
     }
 
@@ -2770,6 +2736,541 @@ mod tests {
             equity_event.1.contains("GOOG"),
             "Equity vault should use the trade's symbol (GOOG), got payload: {}",
             equity_event.1
+        );
+    }
+
+    fn succeeding_order_placer() -> crate::offchain_order::OffchainOrderServices {
+        struct TestOrderPlacer;
+
+        #[async_trait::async_trait]
+        impl crate::offchain_order::OrderPlacer for TestOrderPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(ExecutorOrderId::new("TEST_BROKER_ORD"))
+            }
+        }
+
+        Arc::new(TestOrderPlacer)
+    }
+
+    fn create_cqrs_frameworks_with_order_placer(
+        pool: &SqlitePool,
+        order_placer: crate::offchain_order::OffchainOrderServices,
+    ) -> CqrsFrameworks {
+        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+
+        let position_view_repo = Arc::new(SqliteViewRepository::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ));
+        let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
+        let position_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(position_view_repo))],
+            (),
+        ));
+
+        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+            OffchainOrderAggregate,
+            OffchainOrderAggregate,
+        >::new(
+            pool.clone(), "offchain_order_view".to_string()
+        ));
+        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+            order_placer,
+        ));
+        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+        let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+
+        CqrsFrameworks {
+            pool: pool.clone(),
+            onchain_trade_cqrs,
+            position_cqrs,
+            position_query,
+            offchain_order_cqrs,
+            vault_registry_cqrs,
+            snapshot_cqrs,
+        }
+    }
+
+    fn trade_processing_cqrs_with_threshold(
+        frameworks: &CqrsFrameworks,
+        threshold: ExecutionThreshold,
+    ) -> TradeProcessingCqrs {
+        TradeProcessingCqrs {
+            onchain_trade_cqrs: frameworks.onchain_trade_cqrs.clone(),
+            position_cqrs: frameworks.position_cqrs.clone(),
+            position_query: frameworks.position_query.clone(),
+            offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
+            execution_threshold: threshold,
+        }
+    }
+
+    /// Enqueues a ClearV3 event into the event_queue and returns the
+    /// queued event with its database-assigned ID.
+    async fn enqueue_and_fetch(pool: &SqlitePool, log_index: u64) -> (QueuedEvent, i64) {
+        let event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let mut log = get_test_log();
+        log.log_index = Some(log_index);
+        let mut hash_bytes = [0u8; 32];
+        hash_bytes[31] = u8::try_from(log_index).unwrap_or(0);
+        log.transaction_hash = Some(B256::from(hash_bytes));
+
+        crate::queue::enqueue(pool, &event, &log).await.unwrap();
+
+        let queued = crate::queue::get_next_unprocessed_event(pool)
+            .await
+            .unwrap()
+            .expect("should have unprocessed event");
+
+        let event_id = queued.id.expect("queued event should have id");
+        (queued, event_id)
+    }
+
+    fn test_trade_with_amount(amount: f64, log_index: u64) -> OnchainTrade {
+        OnchainTradeBuilder::default()
+            .with_symbol("AAPL0x")
+            .with_amount(amount)
+            .with_price(150.0)
+            .with_log_index(log_index)
+            .with_block_timestamp(chrono::Utc::now())
+            .build()
+    }
+
+    #[tokio::test]
+    async fn trade_below_threshold_does_not_place_order() {
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 10).await;
+        let trade = test_trade_with_amount(0.5, 10);
+
+        let result = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "0.5 shares should not trigger execution with 1-share threshold"
+        );
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert_eq!(
+            position.net.inner(),
+            rust_decimal_macros::dec!(0.5),
+            "Position net should reflect the accumulated trade"
+        );
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "No offchain order should be pending"
+        );
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Event should be marked as processed"
+        );
+    }
+
+    #[tokio::test]
+    async fn trade_above_threshold_places_offchain_order() {
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 20).await;
+        let trade = test_trade_with_amount(1.5, 20);
+
+        let result = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await;
+
+        let offchain_order_id = result
+            .unwrap()
+            .expect("1.5 shares should trigger execution with 1-share threshold");
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert_eq!(position.net.inner(), rust_decimal_macros::dec!(1.5));
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(offchain_order_id),
+            "Position should track the pending offchain order"
+        );
+
+        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+            OffchainOrderAggregate,
+            OffchainOrderAggregate,
+        >::new(
+            pool.clone(), "offchain_order_view".to_string()
+        ));
+        let offchain_order_query = GenericQuery::new(offchain_order_view_repo);
+
+        let offchain_lifecycle = offchain_order_query
+            .load(&offchain_order_id.to_string())
+            .await
+            .expect("offchain order view should exist");
+
+        let offchain_order = offchain_lifecycle
+            .live()
+            .expect("offchain order should be in Live state");
+
+        assert!(
+            matches!(offchain_order, OffchainOrder::Submitted { .. }),
+            "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_trades_accumulate_then_trigger() {
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 30).await;
+        let trade_1 = test_trade_with_amount(0.5, 30);
+
+        let result_1 = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            trade_1,
+            &cqrs,
+        )
+        .await;
+
+        assert_eq!(
+            result_1.unwrap(),
+            None,
+            "First trade of 0.5 shares should not trigger"
+        );
+
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 31).await;
+        let trade_2 = test_trade_with_amount(0.7, 31);
+
+        let result_2 = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            trade_2,
+            &cqrs,
+        )
+        .await;
+
+        assert!(
+            result_2.unwrap().is_some(),
+            "Accumulated 1.2 shares should trigger execution with 1-share threshold"
+        );
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert_eq!(position.net.inner(), rust_decimal_macros::dec!(1.2));
+        assert!(position.pending_offchain_order_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_order_blocks_new_execution() {
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 40).await;
+        let trade_1 = test_trade_with_amount(1.5, 40);
+
+        let first_order_id = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            trade_1,
+            &cqrs,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
+
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 41).await;
+        let trade_2 = test_trade_with_amount(1.5, 41);
+
+        let result_2 = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            trade_2,
+            &cqrs,
+        )
+        .await;
+
+        assert_eq!(
+            result_2.unwrap(),
+            None,
+            "Second trade should not trigger execution while first order is pending"
+        );
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert_eq!(
+            position.net.inner(),
+            rust_decimal_macros::dec!(3.0),
+            "Both fills should be accumulated"
+        );
+        assert_eq!(
+            position.pending_offchain_order_id,
+            Some(first_order_id),
+            "Only the first order should be pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_checker_executes_after_order_completion() {
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        // Process first trade -> places order
+        let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 50).await;
+        let trade_1 = test_trade_with_amount(1.5, 50);
+
+        let first_order_id = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_1,
+            event_id_1,
+            trade_1,
+            &cqrs,
+        )
+        .await
+        .unwrap()
+        .expect("first trade should place an order");
+
+        // Process second trade -> blocked by pending order
+        let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 51).await;
+        let trade_2 = test_trade_with_amount(1.5, 51);
+
+        process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event_2,
+            event_id_2,
+            trade_2,
+            &cqrs,
+        )
+        .await
+        .unwrap();
+
+        // Complete the first order via CQRS
+        let position_agg_id =
+            crate::position::Position::aggregate_id(&Symbol::new("AAPL").unwrap());
+
+        cqrs.position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::CompleteOffChainOrder {
+                    offchain_order_id: first_order_id,
+                    shares_filled: FractionalShares::new(rust_decimal_macros::dec!(1.5)),
+                    direction: st0x_execution::Direction::Sell,
+                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                    price_cents: crate::offchain_order::PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Verify position is unblocked
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_none(),
+            "Order should be cleared after completion"
+        );
+
+        // Run the periodic checker - it should find the remaining net and place a new order
+        let executor = st0x_execution::MockExecutor::new();
+
+        check_and_execute_accumulated_positions(
+            &executor,
+            &pool,
+            &cqrs.position_cqrs,
+            &cqrs.position_query,
+            &cqrs.offchain_order_cqrs,
+        )
+        .await
+        .unwrap();
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert!(
+            position.pending_offchain_order_id.is_some(),
+            "Periodic checker should have placed a new order for remaining net position"
+        );
+        assert_ne!(
+            position.pending_offchain_order_id.unwrap(),
+            first_order_id,
+            "New order should have a different ID than the completed one"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_recovery_processes_unprocessed_queue_items() {
+        let pool = setup_test_db().await;
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
+        let cqrs =
+            trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
+
+        // Enqueue an event (simulating events persisted before a crash)
+        let (queued_event, event_id) = enqueue_and_fetch(&pool, 60).await;
+        let trade = test_trade_with_amount(2.0, 60);
+
+        // Simulate restart: process the unprocessed event
+        let result = process_queued_trade(
+            SupportedExecutor::DryRun,
+            &pool,
+            &queued_event,
+            event_id,
+            trade,
+            &cqrs,
+        )
+        .await;
+
+        assert!(
+            result.unwrap().is_some(),
+            "Recovered event should trigger execution"
+        );
+
+        let position =
+            crate::position::load_position(&cqrs.position_query, &Symbol::new("AAPL").unwrap())
+                .await
+                .unwrap()
+                .expect("position should exist");
+
+        assert_eq!(position.net.inner(), rust_decimal_macros::dec!(2.0));
+        assert!(position.pending_offchain_order_id.is_some());
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "All events should be marked as processed after recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_event_queue_prevents_double_processing() {
+        let pool = setup_test_db().await;
+
+        let event = ClearV3 {
+            sender: address!("0x1111111111111111111111111111111111111111"),
+            alice: get_test_order(),
+            bob: get_test_order(),
+            clearConfig: ClearConfigV2 {
+                aliceInputIOIndex: U256::from(0),
+                aliceOutputIOIndex: U256::from(1),
+                bobInputIOIndex: U256::from(1),
+                bobOutputIOIndex: U256::from(0),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let log = get_test_log();
+
+        // Enqueue same event twice (same tx_hash + log_index -> INSERT OR IGNORE)
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            1,
+            "Duplicate enqueue should result in only 1 row"
+        );
+
+        // Process and mark as processed
+        let queued = crate::queue::get_next_unprocessed_event(&pool)
+            .await
+            .unwrap()
+            .expect("should have one event");
+
+        crate::queue::mark_event_processed(&pool, queued.id.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "No unprocessed events should remain"
+        );
+
+        // Re-enqueue same event after processing
+        crate::queue::enqueue(&pool, &event, &log).await.unwrap();
+
+        assert_eq!(
+            crate::queue::count_unprocessed(&pool).await.unwrap(),
+            0,
+            "Re-enqueue of already processed event should be ignored"
         );
     }
 }

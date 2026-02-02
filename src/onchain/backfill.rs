@@ -700,11 +700,9 @@ mod tests {
         assert_eq!(first_event.block_number, 50);
 
         // Mark as processed and get the second event
-        let mut sql_tx = pool.begin().await.unwrap();
-        mark_event_processed(&mut sql_tx, first_event.id.unwrap())
+        mark_event_processed(&pool, first_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(second_event.tx_hash, tx_hash2);
@@ -1083,11 +1081,9 @@ mod tests {
         assert_eq!(first_event.tx_hash, tx_hash1);
         assert_eq!(first_event.block_number, 50);
 
-        let mut sql_tx = pool.begin().await.unwrap();
-        mark_event_processed(&mut sql_tx, first_event.id.unwrap())
+        mark_event_processed(&pool, first_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert_eq!(second_event.tx_hash, tx_hash2);

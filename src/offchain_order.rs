@@ -549,6 +549,96 @@ fn handle_confirm_submission(
     }
 }
 
+async fn handle_place_order(
+    services: &OffchainOrderServices,
+    symbol: &Symbol,
+    shares: Positive<FractionalShares>,
+    direction: Direction,
+    executor: SupportedExecutor,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    let market_order = MarketOrder {
+        symbol: symbol.clone(),
+        shares,
+        direction,
+    };
+
+    let executor_order_id = services
+        .place_market_order(market_order)
+        .await
+        .map_err(OffchainOrderError::BrokerPlacement)?;
+
+    let now = Utc::now();
+
+    Ok(vec![
+        OffchainOrderEvent::Placed {
+            symbol: symbol.clone(),
+            shares,
+            direction,
+            executor,
+            placed_at: now,
+        },
+        OffchainOrderEvent::Submitted {
+            executor_order_id,
+            submitted_at: now,
+        },
+    ])
+}
+
+fn handle_partial_fill(
+    order: &OffchainOrder,
+    shares_filled: FractionalShares,
+    avg_price_cents: PriceCents,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    match order {
+        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
+            Ok(vec![OffchainOrderEvent::PartiallyFilled {
+                shares_filled,
+                avg_price_cents,
+                partially_filled_at: Utc::now(),
+            }])
+        }
+        OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+        OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
+            Err(OffchainOrderError::AlreadyCompleted)
+        }
+    }
+}
+
+fn handle_complete_fill(
+    order: &OffchainOrder,
+    price_cents: PriceCents,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    match order {
+        OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
+            Ok(vec![OffchainOrderEvent::Filled {
+                price_cents,
+                filled_at: Utc::now(),
+            }])
+        }
+        OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+        OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
+            Err(OffchainOrderError::AlreadyCompleted)
+        }
+    }
+}
+
+fn handle_mark_failed(
+    order: &OffchainOrder,
+    error: &str,
+) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
+    match order {
+        OffchainOrder::Pending { .. }
+        | OffchainOrder::Submitted { .. }
+        | OffchainOrder::PartiallyFilled { .. } => Ok(vec![OffchainOrderEvent::Failed {
+            error: error.to_owned(),
+            failed_at: Utc::now(),
+        }]),
+        OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
+            Err(OffchainOrderError::AlreadyCompleted)
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OffchainOrderError {
     #[error("Cannot place order: order has already been placed")]
@@ -1260,6 +1350,253 @@ mod tests {
         order.apply(event);
 
         assert!(matches!(order, Lifecycle::Failed { .. }));
+    }
+
+    fn succeeding_order_placer() -> OffchainOrderServices {
+        struct SucceedingOrderPlacer;
+
+        #[async_trait]
+        impl OrderPlacer for SucceedingOrderPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+                Ok(ExecutorOrderId::new("BROKER_ORD_42"))
+            }
+        }
+
+        Arc::new(SucceedingOrderPlacer)
+    }
+
+    fn failing_order_placer() -> OffchainOrderServices {
+        struct FailingOrderPlacer;
+
+        #[async_trait]
+        impl OrderPlacer for FailingOrderPlacer {
+            async fn place_market_order(
+                &self,
+                _order: MarketOrder,
+            ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+                Err("broker connection refused".into())
+            }
+        }
+
+        Arc::new(FailingOrderPlacer)
+    }
+
+    #[tokio::test]
+    async fn test_place_order_command_emits_placed_and_submitted() {
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let command = OffchainOrderCommand::PlaceOrder {
+            symbol: symbol.clone(),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+        };
+
+        let events = order
+            .handle(command, &succeeding_order_placer())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], OffchainOrderEvent::Placed { .. }));
+        assert!(matches!(events[1], OffchainOrderEvent::Submitted { .. }));
+
+        if let OffchainOrderEvent::Submitted {
+            executor_order_id, ..
+        } = &events[1]
+        {
+            assert_eq!(executor_order_id, &ExecutorOrderId::new("BROKER_ORD_42"));
+        }
+
+        for event in events {
+            order.apply(event);
+        }
+
+        let Lifecycle::Live(OffchainOrder::Submitted {
+            executor_order_id, ..
+        }) = &order
+        else {
+            panic!("Expected Submitted state after PlaceOrder, got {order:?}");
+        };
+        assert_eq!(executor_order_id, &ExecutorOrderId::new("BROKER_ORD_42"));
+    }
+
+    #[tokio::test]
+    async fn test_place_order_command_broker_failure() {
+        let order = Lifecycle::<OffchainOrder, Never>::default();
+
+        let command = OffchainOrderCommand::PlaceOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+        };
+
+        let result = order.handle(command, &failing_order_placer()).await;
+
+        assert!(matches!(
+            result,
+            Err(OffchainOrderError::BrokerPlacement(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_place_order_when_already_placed() {
+        let order = Lifecycle::Live(OffchainOrder::Submitted {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            executor_order_id: ExecutorOrderId::new("ORD123"),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::PlaceOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+        };
+
+        let result = order.handle(command, &succeeding_order_placer()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_confirm_submission_on_filled_order() {
+        let order = Lifecycle::Live(OffchainOrder::Filled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            executor_order_id: ExecutorOrderId::new("ORD123"),
+            price_cents: PriceCents(15000),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+            filled_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::ConfirmSubmission {
+            executor_order_id: ExecutorOrderId::new("ORD456"),
+        };
+
+        let result = order.handle(command, &services()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadySubmitted)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_partial_fill_pending_order() {
+        let order = Lifecycle::Live(OffchainOrder::Pending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            placed_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::UpdatePartialFill {
+            shares_filled: FractionalShares::new(dec!(50)),
+            avg_price_cents: PriceCents(15000),
+        };
+
+        let result = order.handle(command, &services()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_partial_fill_filled_order() {
+        let order = Lifecycle::Live(OffchainOrder::Filled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            executor_order_id: ExecutorOrderId::new("ORD123"),
+            price_cents: PriceCents(15000),
+            placed_at: Utc::now(),
+            submitted_at: Utc::now(),
+            filled_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::UpdatePartialFill {
+            shares_filled: FractionalShares::new(dec!(50)),
+            avg_price_cents: PriceCents(15000),
+        };
+
+        let result = order.handle(command, &services()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_partial_fill_failed_order() {
+        let order = Lifecycle::Live(OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            error: "Market closed".to_string(),
+            placed_at: Utc::now(),
+            failed_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::UpdatePartialFill {
+            shares_filled: FractionalShares::new(dec!(50)),
+            avg_price_cents: PriceCents(15000),
+        };
+
+        let result = order.handle(command, &services()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_complete_fill_failed_order() {
+        let order = Lifecycle::Live(OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            error: "Market closed".to_string(),
+            placed_at: Utc::now(),
+            failed_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::CompleteFill {
+            price_cents: PriceCents(15000),
+        };
+
+        let result = order.handle(command, &services()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_fail_already_failed_order() {
+        let order = Lifecycle::Live(OffchainOrder::Failed {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: FractionalShares::new(dec!(100)),
+            direction: Direction::Buy,
+            executor: SupportedExecutor::Schwab,
+            error: "Market closed".to_string(),
+            placed_at: Utc::now(),
+            failed_at: Utc::now(),
+        });
+
+        let command = OffchainOrderCommand::MarkFailed {
+            error: "Another error".to_string(),
+        };
+
+        let result = order.handle(command, &services()).await;
+
+        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
     }
 
     /// Bug: ConfirmSubmission is not idempotent, blocking recovery after partial
