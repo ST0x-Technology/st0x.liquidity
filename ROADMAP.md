@@ -28,6 +28,7 @@ All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 - [ ] [#288 Remove the legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/issues/288)
   - PR:
     [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
+- [ ] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
 
 ---
 
@@ -77,7 +78,7 @@ boundaries, and reduced coupling. Sequenced around CQRS/ES migration.
 
 Extract external API wrappers (no CQRS/ES dependencies):
 
-- [ ] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
+- [x] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
   - PR:
     [#193 Pull out bridging logic into st0x-bridge](https://github.com/ST0x-Technology/st0x.liquidity/pull/193)
 - [ ] [#269 Extract st0x-tokenization crate with Tokenizer trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/269)
@@ -95,6 +96,7 @@ Phase 3)
 Extract hedging logic and create application binary:
 
 - [ ] [#272 Convert st0x-hedge to library crate and create st0x-server binary](https://github.com/ST0x-Technology/st0x.liquidity/issues/272)
+
 
 ---
 

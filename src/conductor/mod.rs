@@ -32,8 +32,8 @@ use st0x_execution::{
 };
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
-use crate::cctp::USDC_BASE;
 use crate::config::{Ctx, CtxError};
+use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
@@ -42,6 +42,7 @@ use crate::inventory::{
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::BrokerOrderId;
+use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{
     CleanedUpExecution, TradeProcessingResult, check_all_accumulated_positions,
 };
@@ -3343,7 +3344,7 @@ mod tests {
     }
 
     use crate::bindings::IOrderBookV5::TakeOrderConfigV4;
-    use crate::cctp::USDC_BASE;
+    use crate::onchain::USDC_BASE;
     use crate::queue::QueuedEvent;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
