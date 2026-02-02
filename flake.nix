@@ -112,8 +112,8 @@
               ${infraPkgs.resolveIp}
               ssh_opts="-o StrictHostKeyChecking=no -o ConnectTimeout=5 -i $identity"
 
-              NIX_CONFIG="pure-eval = false" \
               nixos-anywhere --flake ".#st0x-liquidity" \
+                --option pure-eval false \
                 --ssh-option "IdentityFile=$identity" \
                 --target-host "root@$host_ip" "$@"
 
