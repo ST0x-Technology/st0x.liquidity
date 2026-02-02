@@ -38,7 +38,7 @@ let
     ${parseIdentity}
     on_exit() { ${cleanup}; }
     trap on_exit EXIT
-    rage -d -i "$identity" ${tfVars}.age > ${tfVars}
+    ${decryptVars}
   '';
 
   preambleWithEncrypt = ''
@@ -48,7 +48,7 @@ let
       ${cleanup}
     }
     trap on_exit EXIT
-    rage -d -i "$identity" ${tfVars}.age > ${tfVars}
+    ${decryptVars}
   '';
 
   resolveIp = ''
@@ -58,15 +58,28 @@ let
     rm -f ${tfState}
   '';
 
-  rekeyState = ''
+  decryptVars = ''
+    rage -d -i "$identity" ${tfVars}.age > ${tfVars}
+  '';
+
+  encryptVars = ''
+    nix eval --raw --file ${
+      ../keys.nix
+    } roles.infra --apply 'builtins.concatStringsSep "\n"' \
+      | rage -e -R /dev/stdin -o ${tfVars}.age ${tfVars}
+  '';
+
+  tfRekey = ''
     ${parseIdentity}
     ${decryptState}
     ${encryptState}
+    ${decryptVars}
+    ${encryptVars}
     ${cleanup}
   '';
 
 in {
-  inherit buildInputs resolveIp rekeyState;
+  inherit buildInputs resolveIp tfRekey;
 
   tfInit = rainix.mkTask.${system} {
     name = "tf-init";
@@ -115,13 +128,9 @@ in {
       on_exit() { rm -f ${tfVars}; }
       trap on_exit EXIT
 
-      rage -d -i "$identity" ${tfVars}.age > ${tfVars}
+      ${decryptVars}
       ''${EDITOR:-vi} ${tfVars}
-
-      nix eval --raw --file ${
-        ../keys.nix
-      } roles.infra --apply 'builtins.concatStringsSep "\n"' \
-        | rage -e -R /dev/stdin -o ${tfVars}.age ${tfVars}
+      ${encryptVars}
     '';
   };
 }

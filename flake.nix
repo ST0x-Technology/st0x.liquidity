@@ -143,10 +143,10 @@
             '';
           };
 
-          rekeyState = rainix.mkTask.${system} {
-            name = "rekey-state";
+          tfRekey = rainix.mkTask.${system} {
+            name = "tf-rekey";
             additionalBuildInputs = infraPkgs.buildInputs;
-            body = infraPkgs.rekeyState;
+            body = infraPkgs.tfRekey;
           };
 
           remote = pkgs.writeShellApplication {
