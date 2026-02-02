@@ -295,17 +295,46 @@ impl Conductor {
 
         let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        let (trigger, rebalancer) = match config.rebalancing_config() {
+            Some(rebalancing_config) => {
+                let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+                let market_maker_wallet = signer.address();
+
+                let (trigger, rebalancer_handle) = spawn_rebalancing_infrastructure(
+                    rebalancing_config,
+                    pool,
+                    config,
+                    &inventory,
+                    event_sender,
+                    &provider,
+                    market_maker_wallet,
+                )
+                .await?;
+
+                (Some(trigger), Some(rebalancer_handle))
+            }
+            None => (None, None),
+        };
+
         let position_view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
             "position_view".to_string(),
         ));
         let position_query = GenericQuery::new(position_view_repo.clone());
-        let position_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(position_view_repo))
-                as Box<dyn Query<PositionAggregate>>],
-            (),
-        ));
+
+        let position_queries: Vec<Box<dyn Query<PositionAggregate>>> =
+            std::iter::once(Box::new(GenericQuery::new(position_view_repo))
+                as Box<dyn Query<PositionAggregate>>)
+            .chain(
+                trigger
+                    .iter()
+                    .map(|t| Box::new(Arc::clone(t)) as Box<dyn Query<PositionAggregate>>),
+            )
+            .collect();
+
+        let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), position_queries, ()));
 
         let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
             OffchainOrderAggregate,
@@ -321,29 +350,12 @@ impl Conductor {
         ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        let inventory = Arc::new(RwLock::new(InventoryView::default()));
-
         let snapshot_query = InventorySnapshotQuery::new(inventory.clone());
         let snapshot_cqrs = sqlite_cqrs(
             pool.clone(),
             vec![Box::new(snapshot_query) as Box<dyn Query<InventorySnapshotAggregate>>],
             (),
         );
-
-        let rebalancer = match config.rebalancing_config() {
-            Some(rebalancing_config) => Some(
-                spawn_rebalancing_infrastructure(
-                    rebalancing_config,
-                    pool,
-                    config,
-                    &inventory,
-                    event_sender,
-                    &provider,
-                )
-                .await?,
-            ),
-            None => None,
-        };
 
         let frameworks = CqrsFrameworks {
             pool: pool.clone(),
@@ -427,11 +439,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     inventory: &Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
-) -> anyhow::Result<JoinHandle<()>> {
+    market_maker_wallet: Address,
+) -> anyhow::Result<(Arc<RebalancingTrigger>, JoinHandle<()>)> {
     info!("Initializing rebalancing infrastructure");
-
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-    let market_maker_wallet = signer.address();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
@@ -466,12 +476,12 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         )),
         usdc: Arc::new(sqlite_cqrs(
             pool.clone(),
-            build_rebalancing_queries::<UsdcRebalance>(trigger, event_broadcast),
+            build_rebalancing_queries::<UsdcRebalance>(trigger.clone(), event_broadcast),
             (),
         )),
     };
 
-    Ok(spawn_rebalancer(
+    let handle = spawn_rebalancer(
         rebalancing_config,
         provider.clone(),
         config.evm.orderbook,
@@ -479,7 +489,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         operation_receiver,
         frameworks,
     )
-    .await?)
+    .await?;
+
+    Ok((trigger, handle))
 }
 
 async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
@@ -1508,20 +1520,25 @@ async fn buffer_live_events<S1, S2>(
 mod tests {
     use std::sync::Arc;
 
-    use alloy::primitives::{B256, IntoLogData, U256, address, bytes, fixed_bytes};
+    use alloy::primitives::{B256, IntoLogData, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
     use cqrs_es::persist::GenericQuery;
     use futures_util::stream;
+    use rust_decimal_macros::dec;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
-    use st0x_execution::{MockExecutorConfig, Symbol, TryIntoExecutor};
+    use st0x_execution::{Direction, MockExecutorConfig, Symbol, TryIntoExecutor};
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_config;
+    use crate::inventory::ImbalanceThreshold;
+    use crate::offchain_order::PriceCents;
     use crate::onchain::trade::OnchainTrade;
+    use crate::position::PositionEvent;
+    use crate::rebalancing::TriggeredOperation;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
@@ -3271,6 +3288,138 @@ mod tests {
             crate::queue::count_unprocessed(&pool).await.unwrap(),
             0,
             "Re-enqueue of already processed event should be ignored"
+        );
+    }
+
+    /// Builds an `InventoryView` with an equity imbalance: 20% onchain, 80% offchain.
+    /// With a 50% target +/- 20% deviation, 20% < 30% lower bound -> TooMuchOffchain.
+    fn imbalanced_inventory(symbol: &Symbol) -> InventoryView {
+        InventoryView::default()
+            .with_equity(symbol.clone())
+            .apply_position_event(
+                symbol,
+                &PositionEvent::OnChainOrderFilled {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(dec!(20)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                    seen_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+            .apply_position_event(
+                symbol,
+                &PositionEvent::OffChainOrderFilled {
+                    offchain_order_id: OffchainOrder::aggregate_id(),
+                    shares_filled: FractionalShares::new(dec!(80)),
+                    direction: Direction::Buy,
+                    executor_order_id: ExecutorOrderId::new("ORD1"),
+                    price_cents: PriceCents(15000),
+                    broker_timestamp: chrono::Utc::now(),
+                },
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn position_events_reach_rebalancing_trigger() {
+        let pool = setup_test_db().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let orderbook = address!("0x0000000000000000000000000000000000000001");
+        let order_owner = address!("0x0000000000000000000000000000000000000002");
+        let test_token = address!("0x1234567890123456789012345678901234567890");
+
+        // Seed vault registry so the trigger can resolve the token address.
+        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
+            sqlite_cqrs(pool.clone(), vec![], ());
+        vault_registry_cqrs
+            .execute(
+                &VaultRegistry::aggregate_id(orderbook, order_owner),
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: test_token,
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: symbol.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = Arc::new(RwLock::new(imbalanced_inventory(&symbol)));
+        let (operation_sender, mut operation_receiver) = mpsc::channel(10);
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+                usdc_threshold: ImbalanceThreshold {
+                    target: dec!(0.5),
+                    deviation: dec!(0.2),
+                },
+            },
+            pool.clone(),
+            orderbook,
+            order_owner,
+            inventory,
+            operation_sender,
+        ));
+
+        let position_view_repo = Arc::new(SqliteViewRepository::<
+            PositionAggregate,
+            PositionAggregate,
+        >::new(pool.clone(), "position_view".to_string()));
+        let position_cqrs: PositionCqrs = sqlite_cqrs(
+            pool.clone(),
+            vec![
+                Box::new(GenericQuery::new(position_view_repo)),
+                Box::new(trigger) as Box<dyn Query<PositionAggregate>>,
+            ],
+            (),
+        );
+
+        let position_agg_id = Position::aggregate_id(&symbol);
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Acknowledge a fill -> fires position events -> trigger should react.
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::AcknowledgeOnChainFill {
+                    trade_id: TradeId {
+                        tx_hash: TxHash::random(),
+                        log_index: 99,
+                    },
+                    amount: FractionalShares::new(dec!(1)),
+                    direction: Direction::Buy,
+                    price_usdc: dec!(150.0),
+                    block_timestamp: chrono::Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let triggered = operation_receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "Expected Mint operation from trigger on position event, got {triggered:?}"
         );
     }
 }
