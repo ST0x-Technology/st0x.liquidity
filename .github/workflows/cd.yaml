@@ -9,7 +9,14 @@ concurrency:
   group: deploy
   cancel-in-progress: false
 
+# Setting any permission drops all others to "none" by default,
+# so we explicitly list every permission we need.
 permissions:
+  # Required by magic-nix-cache-action to authenticate
+  # with the GitHub Actions cache API.
+  id-token: write
+
+  # check out the repository
   contents: read
 
 jobs:
@@ -23,18 +30,8 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: nixbuild/nix-quick-install-action@v30
-        with:
-          nix_conf: |
-            keep-env-derivations = true
-            keep-outputs = true
-
-      - name: Nix store cache
-        uses: nix-community/cache-nix-action@v6
-        with:
-          primary-key: nix-${{ runner.os }}-${{ hashFiles('**/*.nix', '**/flake.lock') }}
-          restore-prefixes-first-match: nix-${{ runner.os }}-
-          gc-max-store-size-linux: 10G
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Setup SSH
         run: |
