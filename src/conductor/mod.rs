@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod builder;
+mod wire;
 
 use std::sync::Arc;
 use std::time::Duration;
