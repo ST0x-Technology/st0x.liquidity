@@ -6,6 +6,7 @@ mod usdc;
 use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -50,6 +51,14 @@ pub enum RebalancingCtxError {
     InvalidAccountId(#[from] uuid::Error),
 }
 
+/// USDC rebalancing configuration with explicit enable/disable.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum UsdcRebalancingConfig {
+    Enabled { target: Decimal, deviation: Decimal },
+    Disabled,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
@@ -57,11 +66,11 @@ pub(crate) struct RebalancingSecrets {
     pub(crate) evm_private_key: B256,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
 }
@@ -71,7 +80,7 @@ pub(crate) struct RebalancingConfig {
 #[derive(Clone)]
 pub(crate) struct RebalancingCtx {
     pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
@@ -97,7 +106,7 @@ impl RebalancingCtx {
 
         Ok(Self {
             equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            usdc: config.usdc,
             redemption_wallet: config.redemption_wallet,
             ethereum_rpc_url: secrets.ethereum_rpc_url,
             evm_private_key: secrets.evm_private_key,
@@ -112,7 +121,7 @@ impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingCtx")
             .field("equity_threshold", &self.equity_threshold)
-            .field("usdc_threshold", &self.usdc_threshold)
+            .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
@@ -126,8 +135,8 @@ impl std::fmt::Debug for RebalancingCtx {
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -288,7 +297,7 @@ impl RebalancingTrigger {
 
         equity::check_imbalance_and_build_operation(
             symbol,
-            &self.config.equity_threshold,
+            &self.config.equity,
             &self.inventory,
             token_address,
         )
@@ -314,15 +323,19 @@ impl RebalancingTrigger {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        let UsdcRebalancingConfig::Enabled { target, deviation } = self.config.usdc else {
+            return;
+        };
+
         let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
         else {
             debug!("Skipped USDC trigger: already in progress");
             return;
         };
 
+        let threshold = ImbalanceThreshold { target, deviation };
         let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&self.config.usdc_threshold, &self.inventory)
-                .await
+            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory).await
         else {
             return;
         };
@@ -554,11 +567,11 @@ mod tests {
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancingConfig::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -1472,7 +1485,8 @@ mod tests {
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -1502,8 +1516,12 @@ mod tests {
 
         assert_eq!(config.equity_threshold.target, dec!(0.5));
         assert_eq!(config.equity_threshold.deviation, dec!(0.2));
-        assert_eq!(config.usdc_threshold.target, dec!(0.5));
-        assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
+
+        let UsdcRebalancingConfig::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.5));
+        assert_eq!(deviation, dec!(0.3));
         assert_eq!(
             config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -1557,7 +1575,8 @@ mod tests {
             target = "0.6"
             deviation = "0.1"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#,
@@ -1569,8 +1588,12 @@ mod tests {
 
         assert_eq!(ctx.equity_threshold.target, dec!(0.6));
         assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));
-        assert_eq!(ctx.usdc_threshold.target, dec!(0.4));
-        assert_eq!(ctx.usdc_threshold.deviation, dec!(0.15));
+
+        let UsdcRebalancingConfig::Enabled { target, deviation } = ctx.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.4));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -1582,9 +1605,8 @@ mod tests {
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -1608,14 +1630,13 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_missing_equity_threshold_fails() {
+    fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
@@ -1623,6 +1644,25 @@ mod tests {
             error.message().contains("equity_threshold"),
             "Expected missing equity_threshold error, got: {error}"
         );
+    }
+
+    #[test]
+    fn deserialize_usdc_disabled() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
+            [equity_threshold]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#;
+
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(matches!(config.usdc, UsdcRebalancingConfig::Disabled));
     }
 
     /// Spy reactor that records all dispatched events for verification.

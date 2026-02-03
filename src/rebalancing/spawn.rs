@@ -257,10 +257,11 @@ mod tests {
     use st0x_event_sorcery::test_store;
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
     use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::vault_registry::VaultRegistryAggregate;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
@@ -271,7 +272,7 @@ mod tests {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancingConfig::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
@@ -310,8 +311,8 @@ mod tests {
 
     #[test]
     fn spawn_rebalancer_error_display_alpaca_wallet() {
-        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::InvalidAmount {
-            amount: dec!(0),
+        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::TransferNotFound {
+            transfer_id: AlpacaTransferId::from(Uuid::nil()),
         });
 
         let display = format!("{err}");
@@ -320,6 +321,35 @@ mod tests {
             display.contains("failed to create Alpaca wallet service"),
             "Expected error message to contain 'failed to create Alpaca wallet service', got: {display}"
         );
+    }
+
+    #[test]
+    fn trigger_config_uses_equity_from_ctx() {
+        let ctx = make_ctx();
+
+        let trigger_config = RebalancingTriggerConfig {
+            equity: ctx.equity_threshold,
+            usdc: ctx.usdc.clone(),
+        };
+
+        assert_eq!(trigger_config.equity.target, dec!(0.5));
+        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
+    }
+
+    #[test]
+    fn trigger_config_uses_usdc_from_ctx() {
+        let ctx = make_ctx();
+
+        let trigger_config = RebalancingTriggerConfig {
+            equity: ctx.equity_threshold,
+            usdc: ctx.usdc.clone(),
+        };
+
+        let UsdcRebalancingConfig::Enabled { target, deviation } = trigger_config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.6));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]

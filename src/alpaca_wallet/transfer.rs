@@ -11,6 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
+use crate::threshold::Usdc;
+use st0x_execution::Positive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
@@ -162,33 +164,31 @@ where
     raw.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-fn validate_amount(amount: Decimal) -> Result<(), AlpacaWalletError> {
-    if amount <= Decimal::ZERO {
-        return Err(AlpacaWalletError::InvalidAmount { amount });
-    }
-
-    Ok(())
+#[derive(Serialize)]
+struct WithdrawalRequest<'a> {
+    #[serde(serialize_with = "serialize_decimal_as_string")]
+    amount: Decimal,
+    asset: &'a TokenSymbol,
+    address: &'a Address,
 }
 
-#[derive(Serialize)]
-struct WithdrawalRequest {
-    amount: String,
-    asset: String,
-    address: String,
+fn serialize_decimal_as_string<S>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_string())
 }
 
 pub(super) async fn initiate_withdrawal(
     client: &AlpacaWalletClient,
-    amount: Decimal,
-    asset: &str,
-    address: &str,
+    amount: Positive<Usdc>,
+    asset: &TokenSymbol,
+    address: &Address,
 ) -> Result<Transfer, AlpacaWalletError> {
-    validate_amount(amount)?;
-
     let request = WithdrawalRequest {
-        amount: amount.to_string(),
-        asset: asset.to_string(),
-        address: address.to_string(),
+        amount: amount.inner().0,
+        asset,
+        address,
     };
 
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
@@ -252,8 +252,9 @@ pub(super) async fn find_transfer_by_tx_hash(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use std::str::FromStr;
     use uuid::uuid;
@@ -267,13 +268,15 @@ mod tests {
     async fn test_initiate_withdrawal_successful() {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST)
                 .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .json_body(json!({
                     "amount": "100.5",
                     "asset": "USDC",
-                    "address": "0x1234567890abcdef1234567890abcdef12345678"
+                    "address": to_address
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -301,15 +304,12 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Decimal::new(1005, 1);
-        let transfer = initiate_withdrawal(
-            &client,
-            amount,
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await
-        .unwrap();
+        let amount = Positive::new(Usdc(dec!(100.5))).unwrap();
+        let asset = TokenSymbol::new("USDC");
+
+        let transfer = initiate_withdrawal(&client, amount, &asset, &to_address)
+            .await
+            .unwrap();
 
         let expected_address =
             Address::from_str("0x1234567890abcdef1234567890abcdef12345678").unwrap();

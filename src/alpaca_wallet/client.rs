@@ -8,7 +8,6 @@
 
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
-use rust_decimal::Decimal;
 use thiserror::Error;
 use tracing::debug;
 
@@ -25,8 +24,6 @@ pub enum AlpacaWalletError {
     ParseError(#[from] serde_json::Error),
     #[error(transparent)]
     FromHex(#[from] FromHexError),
-    #[error("Amount must be positive and non-zero, got: {amount}")]
-    InvalidAmount { amount: Decimal },
     #[error("Transfer not found: {transfer_id}")]
     TransferNotFound { transfer_id: AlpacaTransferId },
     #[error("Transfer {transfer_id} timed out after {elapsed:?}")]

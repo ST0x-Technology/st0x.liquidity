@@ -504,13 +504,8 @@ impl Conductor {
     }
 }
 
-<<<<<<< HEAD
-async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
-    rebalancing_ctx: &RebalancingCtx,
-=======
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
-    rebalancing_config: &RebalancingConfig,
->>>>>>> 5147a11a (withdraw before redeeming)
+    rebalancing_ctx: &RebalancingCtx,
     pool: &SqlitePool,
     ctx: &Ctx,
     inventory: &Arc<RwLock<InventoryView>>,
@@ -529,8 +524,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let manifest = QueryManifest::new(
         RebalancingTriggerConfig {
-            equity_threshold: rebalancing_ctx.equity_threshold,
-            usdc_threshold: rebalancing_ctx.usdc_threshold,
+            equity: rebalancing_ctx.equity_threshold,
+            usdc: rebalancing_ctx.usdc.clone(),
         },
         pool.clone(),
         ctx.evm.orderbook,
@@ -543,25 +538,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let (built, wired) = manifest.wire(pool.clone()).await?;
 
     let frameworks = RebalancingCqrsFrameworks {
-<<<<<<< HEAD
         mint: Arc::new(built.mint),
-        redemption: Arc::new(built.redemption),
         usdc: Arc::new(built.usdc),
-=======
-        mint: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<TokenizedEquityMint>(
-                trigger.clone(),
-                event_broadcast.clone(),
-            ),
-            (),
-        )),
-        usdc: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<UsdcRebalance>(trigger.clone(), event_broadcast.clone()),
-            (),
-        )),
->>>>>>> 5147a11a (withdraw before redeeming)
     };
 
     let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
@@ -573,15 +551,15 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
     // Create services needed for redemption CQRS
-    let broker_auth = &rebalancing_config.alpaca_broker_auth;
-    let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
+    let broker_auth = &rebalancing_ctx.alpaca_broker_auth;
+    let vault_service = Arc::new(VaultService::new(provider.clone(), ctx.evm.orderbook));
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         broker_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
+        rebalancing_ctx.alpaca_account_id,
         broker_auth.api_key.clone(),
         broker_auth.api_secret.clone(),
         provider.clone(),
-        rebalancing_config.redemption_wallet,
+        rebalancing_ctx.redemption_wallet,
     ));
 
     // Create RedemptionService for use by both the aggregate and the manager.
@@ -591,7 +569,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         vault_service.clone(),
         tokenization_service.clone(),
         vault_registry_query.clone(),
-        config.evm.orderbook,
+        ctx.evm.orderbook,
         market_maker_wallet,
     ));
     let redemption_service_for_cqrs: Arc<dyn Redeemer> = redemption_service.clone();
@@ -626,10 +604,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let handle = spawn_rebalancer(
         rebalancing_ctx,
         provider.clone(),
-<<<<<<< HEAD
         ctx.evm.orderbook,
-=======
->>>>>>> 5147a11a (withdraw before redeeming)
         market_maker_wallet,
         operation_receiver,
         frameworks,
@@ -1758,7 +1733,7 @@ mod tests {
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
-
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
@@ -1772,52 +1747,8 @@ mod tests {
         }
     }
 
-<<<<<<< HEAD
-=======
-    fn create_test_cqrs_frameworks(pool: &SqlitePool) -> CqrsFrameworks {
-        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
-        let position_view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(position_view_repo))],
-            (),
-        ));
 
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            crate::offchain_order::noop_order_placer(),
-        ));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-
-        CqrsFrameworks {
-            pool: pool.clone(),
-            onchain_trade_cqrs,
-            position_cqrs,
-            position_query,
-            offchain_order_cqrs,
-            vault_registry_cqrs,
-            snapshot_cqrs,
-        }
-    }
-
-    fn abort_all_conductor_tasks(mut conductor: Conductor) {
-        conductor.abort_all();
-    }
-
->>>>>>> 5147a11a (withdraw before redeeming)
     #[tokio::test]
     async fn test_event_enqueued_when_trade_conversion_returns_none() {
         let pool = setup_test_db().await;
@@ -3041,7 +2972,6 @@ mod tests {
                 .unwrap(),
         );
 
-<<<<<<< HEAD
         let offchain_order_projection = Projection::<OffchainOrder>::sqlite(pool.clone()).unwrap();
         let offchain_order = Arc::new(
             StoreBuilder::<OffchainOrder>::new(pool.clone())
@@ -3071,31 +3001,6 @@ mod tests {
             },
             offchain_order_projection,
         )
-=======
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            order_placer,
-        ));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-
-        CqrsFrameworks {
-            pool: pool.clone(),
-            onchain_trade_cqrs,
-            position_cqrs,
-            position_query,
-            offchain_order_cqrs,
-            vault_registry_cqrs,
-            snapshot_cqrs,
-        }
->>>>>>> 5147a11a (withdraw before redeeming)
     }
 
     fn trade_processing_cqrs_with_threshold(
@@ -3634,11 +3539,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3721,8 +3626,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: threshold,
-                usdc_threshold: threshold,
+                equity: threshold,
+                usdc: UsdcRebalancingConfig::Enabled {
+                    target: threshold.target,
+                    deviation: threshold.deviation,
+                },
             },
             pool.clone(),
             orderbook,
@@ -3817,11 +3725,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3942,11 +3850,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },

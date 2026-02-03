@@ -168,7 +168,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 
     writeln!(stdout, "   Initiating withdrawal...")?;
     let transfer = alpaca_wallet
-        .initiate_withdrawal(amount_decimal, &usdc_asset, &destination)
+        .initiate_withdrawal(positive_amount, &usdc_asset, &destination)
         .await?;
 
     writeln!(stdout, "   Withdrawal initiated: {}", transfer.id)?;
@@ -498,6 +498,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::threshold::ExecutionThreshold;
 
     fn create_ctx_without_alpaca() -> Ctx {
@@ -562,14 +563,11 @@ mod tests {
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,
                 alpaca_account_id,
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc_threshold: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.1),
-                },
+                usdc: UsdcRebalancingConfig::Disabled,
                 alpaca_broker_auth: AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),

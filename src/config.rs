@@ -630,6 +630,7 @@ pub(crate) mod tests {
             app_key = "test_key"
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
             [rebalancing]
             ethereum_rpc_url = "https://mainnet.infura.io"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -643,12 +644,13 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+
+            [rebalancing.usdc]
+            mode = "disabled"
         "#;
 
         let result = Ctx::from_toml(config, secrets);
@@ -756,6 +758,7 @@ pub(crate) mod tests {
     fn telemetry_config_without_secrets_fails() {
         let config = r#"
             database_url = ":memory:"
+
             [evm]
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -809,12 +812,13 @@ pub(crate) mod tests {
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+
+            [rebalancing.usdc]
+            mode = "disabled"
         "#;
 
         let secrets = r#"

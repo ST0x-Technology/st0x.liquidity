@@ -304,11 +304,11 @@ where
         amount: Usdc,
     ) -> Result<Transfer, UsdcRebalanceManagerError> {
         let usdc = TokenSymbol::new("USDC");
-        let decimal_amount = amount.0;
+        let positive_amount = Positive::new(amount)?;
 
         let transfer = match self
             .alpaca_wallet
-            .initiate_withdrawal(decimal_amount, &usdc, &self.market_maker_wallet)
+            .initiate_withdrawal(positive_amount, &usdc, &self.market_maker_wallet)
             .await
         {
             Ok(t) => t,

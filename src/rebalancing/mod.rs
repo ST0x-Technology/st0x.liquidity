@@ -20,7 +20,7 @@ pub(crate) mod mint;
 mod rebalancer;
 pub(crate) mod redemption;
 mod spawn;
-mod trigger;
+pub(crate) mod trigger;
 pub(crate) mod usdc;
 
 pub(crate) use mint::manager::MintManager;
