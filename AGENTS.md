@@ -413,6 +413,10 @@ All configuration is via TOML files passed with `--config-file`. See
   - **ALLOWED**: Direct construction in test code, CLI code, and migration code
     (different execution contexts with intentionally different query processor
     needs)
+- **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
+  `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
+  `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
+  `OffchainOrder`/`OrderPlacer`
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -863,9 +867,7 @@ impl Task<Start> { fn begin(self) -> Task<InProgress> { ... } }
 impl Task<InProgress> { fn complete(self) -> Task<Complete> { ... } }
 ```
 
-Use typestate for protocol enforcement (`Connection<Unauthenticated>` →
-`Connection<Authenticated>`) and builder patterns (`RequestBuilder<NoUrl>` →
-`RequestBuilder<HasUrl>`).
+Use typestate for protocol enforcement and builder patterns.
 
 #### Avoid deep nesting
 
