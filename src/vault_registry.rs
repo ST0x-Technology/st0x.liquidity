@@ -115,6 +115,8 @@ pub(crate) struct VaultRegistry {
     pub(crate) last_updated: DateTime<Utc>,
 }
 
+pub(crate) type VaultRegistryQuery = SqliteQuery<VaultRegistry, Never>;
+
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DiscoveredEquityVault {
@@ -139,6 +141,10 @@ impl VaultRegistry {
             .values()
             .find(|vault| vault.symbol == *symbol)
             .map(|vault| vault.token)
+    }
+
+    pub(crate) fn vault_id_by_token(&self, token: Address) -> Option<B256> {
+        self.equity_vaults.get(&token).map(|v| v.vault_id)
     }
 
     fn empty(timestamp: DateTime<Utc>) -> Self {

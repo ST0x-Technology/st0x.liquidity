@@ -41,6 +41,7 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
     pub(crate) offchain_order_projection: Arc<Projection<OffchainOrder>>,
     pub(crate) vault_registry: Store<VaultRegistry>,
+    pub(crate) vault_registry_projection: Arc<Projection<VaultRegistry>>,
     pub(crate) snapshot: Store<InventorySnapshot>,
 }
 

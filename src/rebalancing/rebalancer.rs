@@ -11,7 +11,7 @@ use st0x_execution::{FractionalShares, Symbol};
 
 use super::mint::Mint;
 use super::redemption::Redeem;
-use super::trigger::{RebalancingTrigger, TriggeredOperation};
+use super::trigger::TriggeredOperation;
 use super::usdc::UsdcRebalance;
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::tokenized_equity_mint::IssuerRequestId;
@@ -27,7 +27,6 @@ where
     mint_manager: Arc<M>,
     redemption_manager: Arc<R>,
     usdc_manager: Arc<U>,
-    trigger: Arc<RebalancingTrigger>,
     receiver: mpsc::Receiver<TriggeredOperation>,
     wallet: Address,
 }
@@ -42,7 +41,6 @@ where
         mint_manager: Arc<M>,
         redemption_manager: Arc<R>,
         usdc_manager: Arc<U>,
-        trigger: Arc<RebalancingTrigger>,
         receiver: mpsc::Receiver<TriggeredOperation>,
         wallet: Address,
     ) -> Self {
@@ -50,7 +48,6 @@ where
             mint_manager,
             redemption_manager,
             usdc_manager,
-            trigger,
             receiver,
             wallet,
         }
@@ -112,7 +109,6 @@ where
             }
             Err(error) => {
                 error!(%symbol, error = %error, "Mint operation failed");
-                self.trigger.clear_equity_in_progress(&symbol);
             }
         }
     }
@@ -127,7 +123,6 @@ where
                     error = %error,
                     "Redemption operation failed: share conversion error"
                 );
-                self.trigger.clear_equity_in_progress(&symbol);
                 return;
             }
         };
@@ -144,7 +139,6 @@ where
             Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
             Err(e) => {
                 error!(%symbol, error = %e, "Redemption operation failed");
-                self.trigger.clear_equity_in_progress(&symbol);
             }
         }
     }
@@ -160,7 +154,6 @@ where
             }
             Err(error) => {
                 error!(error = %error, "USDC Alpaca to Base rebalance failed");
-                self.trigger.clear_usdc_in_progress();
             }
         }
     }
@@ -176,7 +169,6 @@ where
             }
             Err(error) => {
                 error!(error = %error, "USDC Base to Alpaca rebalance failed");
-                self.trigger.clear_usdc_in_progress();
             }
         }
     }
@@ -204,54 +196,25 @@ mod tests {
     use alloy::primitives::address;
     use rust_decimal_macros::dec;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
-    use tokio::sync::RwLock;
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::rebalancing::mint::mock::MockMint;
     use crate::rebalancing::redemption::mock::MockRedeem;
-    use crate::rebalancing::trigger::RebalancingTriggerConfig;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::threshold::Usdc;
-
-    async fn make_test_trigger() -> Arc<RebalancingTrigger> {
-        let (sender, _receiver) = mpsc::channel(10);
-        let pool = crate::test_utils::setup_test_db().await;
-
-        Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
-                },
-                usdc_threshold: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.2),
-                },
-            },
-            pool,
-            Address::ZERO,
-            Address::ZERO,
-            Arc::new(RwLock::new(InventoryView::default())),
-            sender,
-        ))
-    }
 
     #[tokio::test]
     async fn dispatch_mint_calls_mint_manager() {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&mint),
             Arc::clone(&redeem),
             Arc::clone(&usdc),
-            trigger,
             rx,
             Address::ZERO,
         );
@@ -277,14 +240,12 @@ mod tests {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&mint),
             Arc::clone(&redeem),
             Arc::clone(&usdc),
-            trigger,
             rx,
             Address::ZERO,
         );
@@ -311,14 +272,12 @@ mod tests {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&mint),
             Arc::clone(&redeem),
             Arc::clone(&usdc),
-            trigger,
             rx,
             Address::ZERO,
         );
@@ -343,14 +302,12 @@ mod tests {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&mint),
             Arc::clone(&redeem),
             Arc::clone(&usdc),
-            trigger,
             rx,
             Address::ZERO,
         );
@@ -375,14 +332,12 @@ mod tests {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&mint),
             Arc::clone(&redeem),
             Arc::clone(&usdc),
-            trigger,
             rx,
             Address::ZERO,
         );
@@ -435,10 +390,9 @@ mod tests {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
-        let rebalancer = Rebalancer::new(mint, redeem, usdc, trigger, rx, Address::ZERO);
+        let rebalancer = Rebalancer::new(mint, redeem, usdc, rx, Address::ZERO);
 
         drop(tx);
         rebalancer.run().await;
@@ -449,14 +403,12 @@ mod tests {
         let mint = Arc::new(MockMint::new());
         let redeem = Arc::new(MockRedeem::new());
         let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
         let (tx, rx) = mpsc::channel(10);
 
         let rebalancer = Rebalancer::new(
             Arc::clone(&mint),
             Arc::clone(&redeem),
             Arc::clone(&usdc),
-            trigger,
             rx,
             Address::ZERO,
         );
@@ -483,159 +435,5 @@ mod tests {
         assert_eq!(redeem.calls(), 0);
         // But the subsequent mint should still be processed
         assert_eq!(mint.calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn failed_mint_clears_equity_in_progress() {
-        let mint = Arc::new(MockMint::failing());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
-        let (tx, rx) = mpsc::channel(10);
-
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        // Pre-set the in-progress flag to verify it gets cleared on failure.
-        {
-            let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
-        }
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            Arc::clone(&trigger),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::Mint {
-            symbol: symbol.clone(),
-            quantity: FractionalShares::new(dec!(100)),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(mint.calls(), 1);
-        assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
-            "equity in-progress flag should be cleared after mint failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_redemption_clears_equity_in_progress() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::failing());
-        let usdc = Arc::new(MockUsdcRebalance::new());
-        let trigger = make_test_trigger().await;
-        let (tx, rx) = mpsc::channel(10);
-
-        let symbol = Symbol::new("AAPL").unwrap();
-
-        {
-            let mut guard = trigger.equity_in_progress.write().unwrap();
-            guard.insert(symbol.clone());
-        }
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            Arc::clone(&trigger),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::Redemption {
-            symbol: symbol.clone(),
-            quantity: FractionalShares::new(dec!(50)),
-            token: address!("0x1234567890123456789012345678901234567890"),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(redeem.calls(), 1);
-        assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
-            "equity in-progress flag should be cleared after redemption failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_usdc_alpaca_to_base_clears_usdc_in_progress() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::failing_alpaca_to_base());
-        let trigger = make_test_trigger().await;
-        let (tx, rx) = mpsc::channel(10);
-
-        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            Arc::clone(&trigger),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::UsdcAlpacaToBase {
-            amount: Usdc(dec!(1000)),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(usdc.alpaca_to_base_calls(), 1);
-        assert!(
-            !trigger.usdc_in_progress.load(Ordering::SeqCst),
-            "usdc in-progress flag should be cleared after alpaca-to-base failure"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_usdc_base_to_alpaca_clears_usdc_in_progress() {
-        let mint = Arc::new(MockMint::new());
-        let redeem = Arc::new(MockRedeem::new());
-        let usdc = Arc::new(MockUsdcRebalance::failing_base_to_alpaca());
-        let trigger = make_test_trigger().await;
-        let (tx, rx) = mpsc::channel(10);
-
-        trigger.usdc_in_progress.store(true, Ordering::SeqCst);
-
-        let rebalancer = Rebalancer::new(
-            Arc::clone(&mint),
-            Arc::clone(&redeem),
-            Arc::clone(&usdc),
-            Arc::clone(&trigger),
-            rx,
-            Address::ZERO,
-        );
-
-        tx.send(TriggeredOperation::UsdcBaseToAlpaca {
-            amount: Usdc(dec!(2000)),
-        })
-        .await
-        .unwrap();
-
-        drop(tx);
-        rebalancer.run().await;
-
-        assert_eq!(usdc.base_to_alpaca_calls(), 1);
-        assert!(
-            !trigger.usdc_in_progress.load(Ordering::SeqCst),
-            "usdc in-progress flag should be cleared after base-to-alpaca failure"
-        );
     }
 }

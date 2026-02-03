@@ -538,13 +538,21 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         usdc: Arc::new(built.usdc),
     };
 
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
     let handle = spawn_rebalancer(
         rebalancing_ctx,
         provider.clone(),
         ctx.evm.orderbook,
         market_maker_wallet,
         operation_receiver,
-        trigger.clone(),
+        vault_registry_query,
         frameworks,
     )
     .await?;
@@ -2916,6 +2924,8 @@ mod tests {
                 .unwrap(),
         );
 
+        let vault_registry_projection =
+            Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone()).unwrap());
         let vault_registry = st0x_event_sorcery::test_store(pool.clone(), ());
         let snapshot = st0x_event_sorcery::test_store(pool.clone(), ());
 
@@ -2929,6 +2939,7 @@ mod tests {
                 offchain_order,
                 offchain_order_projection: offchain_order_projection.clone(),
                 vault_registry,
+                vault_registry_projection,
                 snapshot,
             },
             offchain_order_projection,

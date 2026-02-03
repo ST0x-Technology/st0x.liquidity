@@ -32,6 +32,7 @@ use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::vault_registry::VaultRegistryAggregate;
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
@@ -103,8 +104,23 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let owner = signer.address();
+            let vault = Arc::new(VaultService::new(base_provider, config.evm.orderbook));
+
             let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
+
+            let vault_registry_query =
+                Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
+
+            let redemption_manager = RedemptionManager::new(
+                tokenization_service,
+                vault,
+                redemption_store,
+                vault_registry_query,
+                config.evm.orderbook,
+                owner,
+            );
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
