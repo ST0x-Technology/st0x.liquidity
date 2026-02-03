@@ -11,7 +11,6 @@ pub(crate) mod service;
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use thiserror::Error;
-use tokio::sync::broadcast;
 
 use st0x_execution::{FractionalShares, Symbol};
 

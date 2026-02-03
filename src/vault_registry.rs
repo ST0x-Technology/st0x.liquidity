@@ -285,6 +285,7 @@ mod tests {
     use st0x_event_sorcery::{Reactor, StoreBuilder, TestHarness, replay};
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");

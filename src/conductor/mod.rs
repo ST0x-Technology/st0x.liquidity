@@ -37,7 +37,7 @@ use crate::equity_redemption::{EquityRedemption, Redeemer};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
 };
-use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
+use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -455,6 +455,188 @@ impl Conductor {
 // to support the TradingTasks separation architecture from our branch.
 // The functions below use old types (Config, sqlite_cqrs, SqliteViewRepository,
 // GenericQuery, PositionCqrs, OffchainOrderCqrs) that no longer exist.
+=======
+    let cache = SymbolCache::default();
+    let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+    let (onchain_trade_cqrs, ()) =
+        CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(());
+    let onchain_trade_cqrs = Arc::new(onchain_trade_cqrs);
+
+    let (position_cqrs, position_query, trigger, rebalancer) =
+        if let Some(rebalancing_config) = config.rebalancing_config() {
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let market_maker_wallet = signer.address();
+
+            let infra = spawn_rebalancing_infrastructure(
+                rebalancing_config,
+                pool,
+                config,
+                &inventory,
+                event_sender,
+                &provider,
+                market_maker_wallet,
+            )
+            .await?;
+
+            (
+                infra.position_cqrs,
+                infra.position_query,
+                Some(infra.rebalancing_trigger),
+                Some(infra.handle),
+            )
+        } else {
+            let position_view_repo = Arc::new(SqliteViewRepository::new(
+                pool.clone(),
+                "position_view".to_string(),
+            ));
+            let position_view: UnwiredQuery<_, Cons<PositionAggregate, Nil>> =
+                UnwiredQuery::new(GenericQuery::new(position_view_repo.clone()));
+            let (position_cqrs, (position_view, ())) =
+                CqrsBuilder::new(pool.clone()).wire(position_view).build(());
+            let position_query = Arc::new(GenericQuery::new(position_view_repo));
+            let _position_view = position_view.into_inner();
+
+            (Arc::new(position_cqrs), position_query, None, None)
+        };
+
+    let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+        OffchainOrderAggregate,
+        OffchainOrderAggregate,
+    >::new(
+        pool.clone(), "offchain_order_view".to_string()
+    ));
+    let offchain_order_view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
+        UnwiredQuery::new(GenericQuery::new(offchain_order_view_repo));
+
+    let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor.clone()));
+    let (offchain_order_cqrs, (offchain_order_view, ())) = CqrsBuilder::new(pool.clone())
+        .wire(offchain_order_view)
+        .build(order_placer);
+    let _offchain_order_view = offchain_order_view.into_inner();
+    let offchain_order_cqrs = Arc::new(offchain_order_cqrs);
+
+    let inventory_poller = match config.order_owner() {
+        Ok(order_owner) => {
+            let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
+
+            let snapshot_query: UnwiredQuery<_, Cons<InventorySnapshotAggregate, Nil>> =
+                UnwiredQuery::new(InventorySnapshotQuery::new(inventory.clone(), trigger));
+            let (snapshot_cqrs, (snapshot_query, ())) = CqrsBuilder::new(pool.clone())
+                .wire(snapshot_query)
+                .build(());
+            let _snapshot_query = snapshot_query.into_inner();
+
+            Some(spawn_inventory_poller(
+                pool.clone(),
+                vault_service,
+                executor,
+                config.evm.orderbook,
+                order_owner,
+                snapshot_cqrs,
+            ))
+        }
+        Err(error) => {
+            warn!(%error, "Inventory poller disabled: could not resolve order owner");
+            None
+        }
+    };
+
+    let shared = SharedState {
+        cache,
+        onchain_trade_cqrs,
+        position_cqrs,
+        position_query,
+        offchain_order_cqrs,
+        execution_threshold: config.execution_threshold,
+    };
+
+    let conductor = Conductor {
+        executor_maintenance,
+        rebalancer,
+        inventory_poller,
+        trading_tasks: None,
+    };
+
+    Ok((conductor, shared))
+}
+
+async fn start_trading_tasks<E>(
+    config: &Config,
+    pool: &SqlitePool,
+    executor: E,
+    shared: &SharedState,
+) -> anyhow::Result<TradingTasks>
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
+    let provider = ProviderBuilder::new().connect_ws(ws).await?;
+    let orderbook = IOrderBookV5Instance::new(config.evm.orderbook, &provider);
+
+    let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
+    let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
+
+    let cutoff_block =
+        get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
+
+    backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
+
+    let (event_sender, event_receiver) =
+        tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();
+
+    let (vault_registry_cqrs, ()) =
+        CqrsBuilder::<VaultRegistryAggregate>::new(pool.clone()).build(());
+
+    let order_poller = spawn_order_poller(
+        config,
+        pool,
+        executor.clone(),
+        shared.offchain_order_cqrs.clone(),
+        shared.position_cqrs.clone(),
+    );
+
+    let dex_event_receiver = spawn_onchain_event_receiver(event_sender, clear_stream, take_stream);
+
+    let event_processor = spawn_event_processor(pool.clone(), event_receiver);
+
+    let position_checker = spawn_periodic_accumulated_position_check(
+        executor.clone(),
+        pool.clone(),
+        shared.position_cqrs.clone(),
+        shared.position_query.clone(),
+        shared.offchain_order_cqrs.clone(),
+        shared.execution_threshold,
+    );
+
+    let trade_cqrs = TradeProcessingCqrs {
+        onchain_trade_cqrs: shared.onchain_trade_cqrs.clone(),
+        position_cqrs: shared.position_cqrs.clone(),
+        position_query: shared.position_query.clone(),
+        offchain_order_cqrs: shared.offchain_order_cqrs.clone(),
+        execution_threshold: shared.execution_threshold,
+    };
+
+    let queue_processor = spawn_queue_processor(
+        executor,
+        config,
+        pool,
+        &shared.cache,
+        provider,
+        trade_cqrs,
+        vault_registry_cqrs,
+    );
+
+    Ok(TradingTasks {
+        order_poller,
+        dex_event_receiver,
+        event_processor,
+        position_checker,
+        queue_processor,
+    })
+}
+>>>>>>> 10d75012 (force centralized query wiring at compile time)
 
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
@@ -504,6 +686,13 @@ impl Conductor {
     }
 }
 
+struct RebalancingInfrastructure {
+    position_cqrs: Arc<PositionCqrs>,
+    position_query: Arc<PositionQuery>,
+    rebalancing_trigger: Arc<RebalancingTrigger>,
+    handle: JoinHandle<()>,
+}
+
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
     rebalancing_ctx: &RebalancingCtx,
     pool: &SqlitePool,
@@ -542,14 +731,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         usdc: Arc::new(built.usdc),
     };
 
-    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-        VaultRegistryAggregate,
-        VaultRegistryAggregate,
-    >::new(
-        pool.clone(), "vault_registry_view".to_string()
-    ));
-    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
-
     // Create services needed for redemption CQRS
     let broker_auth = &rebalancing_ctx.alpaca_broker_auth;
     let vault_service = Arc::new(VaultService::new(provider.clone(), ctx.evm.orderbook));
@@ -562,9 +743,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_ctx.redemption_wallet,
     ));
 
-    // Create RedemptionService for use by both the aggregate and the manager.
-    // The concrete type is needed by RedemptionManager for alpaca() access.
-    // The trait object is needed by the CQRS framework for aggregate command handling.
     let redemption_service = Arc::new(RedemptionService::new(
         vault_service.clone(),
         tokenization_service.clone(),
@@ -572,33 +750,12 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         ctx.evm.orderbook,
         market_maker_wallet,
     ));
-    let redemption_service_for_cqrs: Arc<dyn Redeemer> = redemption_service.clone();
-
-    // Create redemption CQRS with all required query processors
-    let redemption_view_repo = Arc::new(SqliteViewRepository::<
-        Lifecycle<EquityRedemption, Never>,
-        Lifecycle<EquityRedemption, Never>,
-    >::new(
-        pool.clone(), "equity_redemption_view".to_string()
-    ));
-    let redemption_query: Arc<SqliteQuery<EquityRedemption, Never>> =
-        Arc::new(GenericQuery::new(redemption_view_repo.clone()));
-    let redemption_cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        build_redemption_queries(
-            trigger.clone(),
-            event_broadcast.clone(),
-            redemption_view_repo,
-        ),
-        redemption_service_for_cqrs,
-    ));
 
     let redemption_deps = RedemptionDependencies {
         vault_service,
         tokenization_service,
         service: redemption_service,
-        cqrs: redemption_cqrs,
-        query: redemption_query,
+        cqrs: Arc::new(built.redemption),
     };
 
     let handle = spawn_rebalancer(
@@ -1746,6 +1903,7 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
+
 
 
 

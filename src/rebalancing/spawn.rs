@@ -258,6 +258,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
+    use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -531,8 +532,8 @@ mod tests {
         });
 
         let pool = crate::test_utils::setup_test_db().await;
-        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let usdc_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+        let usdc_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
 
         let redemption_view_repo = Arc::new(SqliteViewRepository::<
             Lifecycle<EquityRedemption, Never>,
@@ -541,7 +542,7 @@ mod tests {
             pool.clone(), "equity_redemption_view".to_string()
         ));
         let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
-        let redemption_cqrs = Arc::new(sqlite_cqrs(
+        let redemption_cqrs = Arc::new(test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(redemption_view_repo))],
             mock_redeemer_services(),
