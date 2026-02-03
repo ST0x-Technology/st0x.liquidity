@@ -415,6 +415,7 @@ mod tests {
         assert!(positions.is_empty(), "Expected empty positions map");
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
@@ -452,6 +453,12 @@ mod tests {
         assert!(
             !has_offchain_cash,
             "Should NOT emit OffchainCash when executor returns Unimplemented"
+        );
+        assert!(
+            logs_contain(
+                "Executor returned non-fetched inventory result, skipping offchain polling"
+            ),
+            "Should log debug message explaining why offchain polling was skipped"
         );
     }
 
@@ -644,6 +651,7 @@ mod tests {
             .unwrap();
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_onchain_when_vault_registry_not_initialized() {
         let pool = setup_test_db().await;
@@ -680,8 +688,13 @@ mod tests {
             !has_onchain_cash,
             "Should NOT emit OnchainCash when VaultRegistry not initialized"
         );
+        assert!(
+            logs_contain("Vault registry not initialized, skipping onchain polling"),
+            "Should log debug message explaining why onchain polling was skipped"
+        );
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_onchain_equity_when_no_equity_vaults_discovered() {
         let pool = setup_test_db().await;
@@ -717,8 +730,13 @@ mod tests {
             !has_onchain_equity,
             "Should NOT emit OnchainEquity when no equity vaults discovered"
         );
+        assert!(
+            logs_contain("No equity vaults discovered, skipping onchain equity polling"),
+            "Should log debug message explaining why equity polling was skipped"
+        );
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_onchain_cash_when_no_usdc_vault_discovered() {
         let pool = setup_test_db().await;
@@ -761,6 +779,10 @@ mod tests {
         assert!(
             !has_onchain_cash,
             "Should NOT emit OnchainCash when no USDC vault discovered"
+        );
+        assert!(
+            logs_contain("No USDC vault discovered, skipping onchain cash polling"),
+            "Should log debug message explaining why cash polling was skipped"
         );
     }
 

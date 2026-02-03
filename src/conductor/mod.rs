@@ -120,17 +120,87 @@ where
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
-    let timeout = wait_for_market_open(&executor).await?;
+    let (mut conductor, shared) = start_infrastructure(
+        &ctx,
+        &pool,
+        executor.clone(),
+        executor_maintenance,
+        event_sender,
+    )
+    .await?;
 
-    let mut conductor =
-        match start_conductor(&executor, &ctx, &pool, executor_maintenance, &event_sender).await {
-            Ok(conductor) => conductor,
-            Err(error) => {
-                return retry_after_failure(executor, ctx, pool, event_sender, error).await;
-            }
-        };
+    loop {
+        let timeout = wait_for_market_open(&executor).await?;
 
-    run_until_market_close(&mut conductor, timeout, executor, ctx, pool, event_sender).await
+        if !try_start_trading(&mut conductor, &ctx, &pool, &executor, &shared).await {
+            continue;
+        }
+
+        if let Some(result) = run_trading_session(&mut conductor, timeout).await {
+            return result;
+        }
+    }
+}
+
+async fn try_start_trading<E>(
+    conductor: &mut Conductor,
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    executor: &E,
+    shared: &SharedState,
+) -> bool
+where
+    E: Executor + Clone + Send + 'static,
+    EventProcessingError: From<E::Error>,
+{
+    const RETRY_DELAY_SECS: u64 = 10;
+
+    match start_trading_tasks(ctx, pool, executor.clone(), shared).await {
+        Ok(tasks) => {
+            conductor.trading_tasks = Some(tasks);
+            true
+        }
+        Err(e) => {
+            error!("Failed to start trading tasks: {e}, retrying in {RETRY_DELAY_SECS} seconds");
+            tokio::time::sleep(Duration::from_secs(RETRY_DELAY_SECS)).await;
+            conductor.executor_maintenance = executor.run_executor_maintenance().await;
+            false
+        }
+    }
+}
+
+enum SessionOutcome {
+    TaskCompleted(anyhow::Result<()>),
+    MarketClosed,
+}
+
+async fn await_session_outcome(conductor: &mut Conductor, timeout: Duration) -> SessionOutcome {
+    tokio::select! {
+        result = conductor.wait_for_completion() => SessionOutcome::TaskCompleted(result),
+        () = tokio::time::sleep(timeout) => SessionOutcome::MarketClosed,
+    }
+}
+
+/// Runs until market close or a task crashes. Returns `Some` if the conductor
+/// should exit, `None` if it should loop back for the next session.
+async fn run_trading_session(
+    conductor: &mut Conductor,
+    timeout: Duration,
+) -> Option<anyhow::Result<()>> {
+    info!("Market opened, conductor running");
+
+    match await_session_outcome(conductor, timeout).await {
+        SessionOutcome::TaskCompleted(result) => {
+            conductor.abort_all();
+            Some(result)
+        }
+        SessionOutcome::MarketClosed => {
+            info!("Market closed, shutting down trading tasks");
+            conductor.abort_trading_tasks();
+            info!("Trading tasks shutdown, waiting for next market open");
+            None
+        }
+    }
 }
 
 const RERUN_DELAY_SECS: u64 = 10;
@@ -375,37 +445,26 @@ impl Conductor {
         Ok(builder.spawn())
     }
 
+// TODO: start_infrastructure and start_trading_tasks need to be reimplemented
+// with HEAD's refactored types (Store<T>, StoreBuilder, Projection, Ctx)
+// to support the TradingTasks separation architecture from our branch.
+// The functions below use old types (Config, sqlite_cqrs, SqliteViewRepository,
+// GenericQuery, PositionCqrs, OffchainOrderCqrs) that no longer exist.
+
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
-        let maintenance_task =
-            wait_for_optional_task(&mut self.executor_maintenance, "Executor maintenance");
-        let rebalancer_task = wait_for_optional_task(&mut self.rebalancer, "Rebalancer");
-        let inventory_poller_task =
-            wait_for_optional_task(&mut self.inventory_poller, "Inventory poller");
-
-        let Some(tasks) = self.trading_tasks.as_mut() else {
-            tokio::join!(maintenance_task, rebalancer_task, inventory_poller_task);
-            return Ok(());
-        };
-
-        let ((), (), (), poller, dex, processor, position, queue) = tokio::join!(
-            maintenance_task,
-            rebalancer_task,
-            inventory_poller_task,
-            &mut tasks.order_poller,
-            &mut tasks.dex_event_receiver,
-            &mut tasks.event_processor,
-            &mut tasks.position_checker,
-            &mut tasks.queue_processor
+        let infra = wait_for_infrastructure(
+            &mut self.executor_maintenance,
+            &mut self.rebalancer,
+            &mut self.inventory_poller,
         );
 
-        log_task_result(poller, "Order poller");
-        log_task_result(dex, "DEX event receiver");
-        log_task_result(processor, "Event processor");
-        log_task_result(position, "Position checker");
-        log_task_result(queue, "Queue processor");
-
-        Ok(())
+        if let Some(tasks) = self.trading_tasks.as_mut() {
+            wait_for_all_tasks(infra, tasks).await
+        } else {
+            infra.await;
+            Ok(())
+        }
     }
 
     pub(crate) fn abort_trading_tasks(&mut self) {
@@ -485,6 +544,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         ctx.evm.orderbook,
         market_maker_wallet,
         operation_receiver,
+        trigger.clone(),
         frameworks,
     )
     .await?;
@@ -494,6 +554,40 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         Arc::new(wired.position_view),
         handle,
     ))
+}
+
+async fn wait_for_infrastructure(
+    executor_maintenance: &mut Option<JoinHandle<()>>,
+    rebalancer: &mut Option<JoinHandle<()>>,
+    inventory_poller: &mut Option<JoinHandle<()>>,
+) {
+    tokio::join!(
+        wait_for_optional_task(executor_maintenance, "Executor maintenance"),
+        wait_for_optional_task(rebalancer, "Rebalancer"),
+        wait_for_optional_task(inventory_poller, "Inventory poller"),
+    );
+}
+
+async fn wait_for_all_tasks(
+    infrastructure: impl std::future::Future<Output = ()>,
+    tasks: &mut TradingTasks,
+) -> anyhow::Result<()> {
+    let ((), poller, dex, processor, position, queue) = tokio::join!(
+        infrastructure,
+        &mut tasks.order_poller,
+        &mut tasks.dex_event_receiver,
+        &mut tasks.event_processor,
+        &mut tasks.position_checker,
+        &mut tasks.queue_processor
+    );
+
+    log_task_result(poller, "Order poller");
+    log_task_result(dex, "DEX event receiver");
+    log_task_result(processor, "Event processor");
+    log_task_result(position, "Position checker");
+    log_task_result(queue, "Queue processor");
+
+    Ok(())
 }
 
 async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: &str) {
