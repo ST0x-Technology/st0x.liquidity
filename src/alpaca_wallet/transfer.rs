@@ -37,7 +37,6 @@ impl std::fmt::Display for TokenSymbol {
 pub(crate) struct AlpacaAccountId(Uuid);
 
 impl AlpacaAccountId {
-    #[cfg(test)]
     pub(crate) const fn new(uuid: Uuid) -> Self {
         Self(uuid)
     }

@@ -11,7 +11,7 @@ use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmConfig;
-use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
+use crate::rebalancing::{RebalancingConfig, RebalancingConfigError, RebalancingTomlFields};
 use crate::telemetry::HyperDxConfig;
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
@@ -167,7 +167,7 @@ impl<'de> Deserialize<'de> for Config {
             order_polling_max_jitter: Option<u64>,
             broker: BrokerConfig,
             hyperdx: Option<HyperDxConfig>,
-            rebalancing: Option<RebalancingConfig>,
+            rebalancing: Option<RebalancingTomlFields>,
         }
 
         let fields = ConfigFields::deserialize(deserializer)?;
@@ -189,6 +189,26 @@ impl<'de> Deserialize<'de> for Config {
             }
         };
 
+        // Construct RebalancingConfig from TOML fields + broker's Alpaca auth.
+        // This ensures alpaca credentials are configured exactly once (in [broker])
+        // and rebalancing uses the same credentials, eliminating duplication.
+        //
+        // The type system enforces: RebalancingConfig can ONLY be constructed with
+        // AlpacaBrokerApiAuthConfig, making it impossible to have rebalancing
+        // without the correct broker type.
+        let rebalancing = match (fields.rebalancing, &fields.broker) {
+            (Some(toml_fields), BrokerConfig::AlpacaBrokerApi(broker_auth)) => Some(
+                RebalancingConfig::from_toml_and_broker(toml_fields, broker_auth.clone())
+                    .map_err(serde::de::Error::custom)?,
+            ),
+            (Some(_), _) => {
+                return Err(serde::de::Error::custom(
+                    RebalancingConfigError::NotAlpacaBroker,
+                ));
+            }
+            (None, _) => None,
+        };
+
         Ok(Self {
             database_url: fields.database_url,
             log_level,
@@ -198,7 +218,7 @@ impl<'de> Deserialize<'de> for Config {
             order_polling_max_jitter: fields.order_polling_max_jitter.unwrap_or(5),
             broker: fields.broker,
             hyperdx: fields.hyperdx,
-            rebalancing: fields.rebalancing,
+            rebalancing,
             execution_threshold,
         })
     }
@@ -212,12 +232,6 @@ impl Config {
 
     pub fn load(toml_str: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(toml_str)?;
-
-        if config.rebalancing.is_some()
-            && !matches!(config.broker, BrokerConfig::AlpacaBrokerApi(_))
-        {
-            return Err(RebalancingConfigError::NotAlpacaBroker.into());
-        }
 
         if config.rebalancing.is_none() && config.evm.order_owner.is_none() {
             return Err(ConfigError::MissingOrderOwner);
@@ -490,12 +504,6 @@ pub(crate) mod tests {
             ethereum_rpc_url = "https://mainnet.infura.io"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            [rebalancing.alpaca_broker_auth]
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            mode = "sandbox"
             [rebalancing.equity_threshold]
             target = "0.5"
             deviation = "0.2"
@@ -506,13 +514,8 @@ pub(crate) mod tests {
 
         let result = Config::load(toml);
         assert!(
-            matches!(
-                result,
-                Err(ConfigError::Rebalancing(
-                    RebalancingConfigError::NotAlpacaBroker
-                ))
-            ),
-            "Expected NotAlpacaBroker error, got {result:?}"
+            matches!(result, Err(ConfigError::Toml(_))),
+            "Expected Toml error for rebalancing with non-Alpaca broker, got {result:?}"
         );
     }
 
@@ -682,12 +685,6 @@ pub(crate) mod tests {
             ethereum_rpc_url = "https://mainnet.infura.io"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            [rebalancing.alpaca_broker_auth]
-            api_key = "test_key"
-            api_secret = "test_secret"
-            account_id = "904837e3-3b76-47ec-b432-046db621571b"
-            mode = "sandbox"
             [rebalancing.equity_threshold]
             target = "0.5"
             deviation = "0.2"

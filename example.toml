@@ -15,23 +15,19 @@ type = "alpaca-broker-api"
 api_key = "test_key"
 api_secret = "test_secret"
 account_id = "904837e3-3b76-47ec-b432-046db621571b"
+mode = "sandbox"
 
 [hyperdx]
 api_key = "test-hyperdx-key"
 service_name = "st0x-hedge"
 
+# Rebalancing uses Alpaca credentials from [broker] section above.
+# No need to configure them twice - this eliminates duplication and ensures consistency.
 [rebalancing]
 redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 ethereum_rpc_url = "https://mainnet.infura.io"
 evm_private_key = "0x0000000000000000000000000000000000000000000000000000000000000001"
 usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
-
-[rebalancing.alpaca_broker_auth]
-api_key = "test_key"
-api_secret = "test_secret"
-account_id = "904837e3-3b76-47ec-b432-046db621571b"
-mode = "sandbox"
 
 [rebalancing.equity_threshold]
 target = "0.5"
