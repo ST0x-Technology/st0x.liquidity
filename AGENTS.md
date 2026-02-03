@@ -448,6 +448,10 @@ is the source of truth for terminology and naming conventions.
   - **ALLOWED**: Direct construction in test code, CLI code, and migration code
     (different execution contexts with intentionally different query processor
     needs)
+- **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
+  `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
+  `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
+  `OffchainOrder`/`OrderPlacer`
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
