@@ -14,10 +14,11 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::persist::GenericQuery;
+use cqrs_es::persist::{GenericQuery, QueryReplay};
+use cqrs_es::{Aggregate, Query, View};
 use futures_util::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository};
+use sqlite_es::{SqliteCqrs, SqliteEventRepository, SqliteViewRepository};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
@@ -265,6 +266,11 @@ where
     let cache = SymbolCache::default();
     let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
+    // Replay historical events to populate views before starting CQRS frameworks.
+    // This recovers from any wiring bugs where events were persisted without
+    // updating their corresponding views.
+    replay_all_views(pool).await?;
+
     let (onchain_trade_cqrs, ()) =
         CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(());
     let onchain_trade_cqrs = Arc::new(onchain_trade_cqrs);
@@ -367,6 +373,82 @@ where
     Ok((conductor, shared))
 }
 
+/// Replays historical events through a GenericQuery to populate its view.
+///
+/// This is used to recover from wiring bugs where events were persisted
+/// without a query processor attached, leaving views empty. It creates a
+/// fresh GenericQuery (not wired to any CQRS framework) to avoid triggering
+/// side effects like rebalancing operations.
+///
+/// Safe to call on every startup - GenericQuery uses optimistic locking
+/// so replaying already-processed events is idempotent.
+async fn replay_view<A>(pool: SqlitePool, view_table: &str) -> anyhow::Result<()>
+where
+    A: Aggregate
+        + View<A>
+        + Default
+        + Clone
+        + Send
+        + Sync
+        + serde::Serialize
+        + serde::de::DeserializeOwned,
+    A::Error: Send + Sync + 'static,
+    Arc<GenericQuery<SqliteViewRepository<A, A>, A, A>>: Query<A>,
+{
+    let view_repo = Arc::new(SqliteViewRepository::<A, A>::new(
+        pool.clone(),
+        view_table.to_string(),
+    ));
+    let query = GenericQuery::new(view_repo);
+
+    let event_repo = SqliteEventRepository::new(pool);
+    let replay = QueryReplay::new(event_repo, query);
+    replay.replay_all().await?;
+
+    Ok(())
+}
+
+/// Replays historical events for all view tables.
+///
+/// This ensures views are populated even if events were persisted before
+/// their query processors were properly wired. Must be called BEFORE
+/// starting CQRS frameworks to avoid race conditions.
+///
+/// Only replays through GenericQuery views (safe, no side effects).
+/// Does NOT replay through RebalancingTrigger or EventBroadcaster.
+async fn replay_all_views(pool: &SqlitePool) -> anyhow::Result<()> {
+    info!("Replaying historical events to populate views");
+
+    replay_view::<PositionAggregate>(pool.clone(), "position_view").await?;
+    replay_view::<OffchainOrderAggregate>(pool.clone(), "offchain_order_view").await?;
+    replay_view::<VaultRegistryAggregate>(pool.clone(), "vault_registry_view").await?;
+    replay_view::<Lifecycle<crate::equity_redemption::EquityRedemption>>(
+        pool.clone(),
+        "equity_redemption_view",
+    )
+    .await?;
+
+    info!("View replay complete");
+    Ok(())
+}
+
+/// Sets up the VaultRegistry CQRS framework with a view query processor.
+fn setup_vault_registry(pool: SqlitePool) -> SqliteCqrs<VaultRegistryAggregate> {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(pool.clone(), "vault_registry_view".to_string()));
+
+    let view_query: UnwiredQuery<_, Cons<VaultRegistryAggregate, Nil>> =
+        UnwiredQuery::new(GenericQuery::new(view_repo));
+
+    let (cqrs, (view_query, ())) = CqrsBuilder::new(pool).wire(view_query).build(());
+
+    let _view_query = view_query.into_inner();
+
+    cqrs
+}
+
 async fn start_trading_tasks<E>(
     config: &Config,
     pool: &SqlitePool,
@@ -392,8 +474,7 @@ where
     let (event_sender, event_receiver) =
         tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();
 
-    let (vault_registry_cqrs, ()) =
-        CqrsBuilder::<VaultRegistryAggregate>::new(pool.clone()).build(());
+    let vault_registry_cqrs = setup_vault_registry(pool.clone());
 
     let order_poller = spawn_order_poller(
         config,
@@ -1700,7 +1781,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::sol_types;
-    use cqrs_es::persist::GenericQuery;
+    use cqrs_es::persist::{GenericQuery, ViewRepository};
     use futures_util::stream;
     use rust_decimal_macros::dec;
     use sqlite_es::SqliteViewRepository;
@@ -1711,6 +1792,7 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_config;
     use crate::inventory::ImbalanceThreshold;
+    use crate::lifecycle::Lifecycle;
     use crate::offchain_order::PriceCents;
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
@@ -4189,6 +4271,141 @@ mod tests {
         assert!(
             position.pending_offchain_order_id.is_some(),
             "Periodic checker should retry execution after broker rejection is cleared"
+        );
+    }
+
+    /// Tests that `replay_all_views` populates views from historical events.
+    ///
+    /// This test reproduces the production bug where:
+    /// 1. Events were persisted without their query processors wired
+    /// 2. After fixing the wiring, views remain empty because cqrs-es
+    ///    doesn't automatically replay historical events
+    ///
+    /// The test verifies that `replay_all_views` recovers from this state.
+    #[tokio::test]
+    async fn replay_all_views_populates_views_from_historical_events() {
+        let pool = setup_test_db().await;
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let owner = address!("0x2222222222222222222222222222222222222222");
+        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+
+        // Step 1: Create historical events WITHOUT a query processor
+        // (simulating events created before the wiring fix)
+        let bare_cqrs = wire::test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+
+        bare_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: address!("0x3333333333333333333333333333333333333333"),
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 2: Call the production replay function
+        super::replay_all_views(&pool).await.unwrap();
+
+        // Step 3: Verify the view is populated from historical events
+        let view_repo = SqliteViewRepository::<VaultRegistryAggregate, VaultRegistryAggregate>::new(
+            pool,
+            "vault_registry_view".to_string(),
+        );
+        let view = view_repo.load(&aggregate_id).await.unwrap();
+
+        assert!(
+            view.is_some(),
+            "View should be populated after replay_all_views"
+        );
+    }
+
+    /// Tests that wired CQRS frameworks correctly pick up from where replay left off.
+    ///
+    /// This verifies the handoff between:
+    /// 1. Unwired GenericQuery instances used during replay
+    /// 2. Wired GenericQuery instances in the CQRS framework
+    ///
+    /// The wired framework must process new events without re-processing
+    /// already-replayed events or corrupting the view state.
+    #[tokio::test]
+    async fn wired_cqrs_picks_up_after_replay() {
+        let pool = setup_test_db().await;
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let owner = address!("0x2222222222222222222222222222222222222222");
+        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+
+        // Step 1: Create historical event WITHOUT a query processor
+        let bare_cqrs = wire::test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+
+        let first_token = address!("0x3333333333333333333333333333333333333333");
+        let first_vault_id =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        bare_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: first_token,
+                    vault_id: first_vault_id,
+                    discovered_in: TxHash::ZERO,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 2: Run replay to populate view from historical events
+        super::replay_all_views(&pool).await.unwrap();
+
+        // Step 3: Create a properly wired CQRS framework (simulating post-startup)
+        let wired_cqrs = super::setup_vault_registry(pool.clone());
+
+        // Step 4: Execute a NEW command through the wired framework
+        let second_token = address!("0x4444444444444444444444444444444444444444");
+        let second_vault_id =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        wired_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: second_token,
+                    vault_id: second_vault_id,
+                    discovered_in: TxHash::ZERO,
+                    symbol: Symbol::new("GOOGL").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 5: Verify the view contains BOTH vaults
+        let view_repo = SqliteViewRepository::<VaultRegistryAggregate, VaultRegistryAggregate>::new(
+            pool,
+            "vault_registry_view".to_string(),
+        );
+        let lifecycle = view_repo.load(&aggregate_id).await.unwrap().unwrap();
+
+        let Lifecycle::Live(view) = lifecycle else {
+            panic!("Expected Live state, got: {lifecycle:?}");
+        };
+
+        assert!(
+            view.equity_vaults.contains_key(&first_token),
+            "View should contain vault from replayed event"
+        );
+        assert!(
+            view.equity_vaults.contains_key(&second_token),
+            "View should contain vault from post-replay event"
+        );
+        assert_eq!(
+            view.equity_vaults.len(),
+            2,
+            "View should have exactly 2 vaults"
         );
     }
 }
