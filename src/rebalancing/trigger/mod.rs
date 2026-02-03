@@ -466,7 +466,7 @@ impl RebalancingTrigger {
         events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
     ) -> Option<(Symbol, FractionalShares)> {
         for envelope in events {
-            if let EquityRedemptionEvent::TokensSent {
+            if let EquityRedemptionEvent::VaultWithdrawn {
                 symbol, quantity, ..
             } = &envelope.payload
             {
@@ -484,6 +484,7 @@ impl RebalancingTrigger {
             matches!(
                 envelope.payload,
                 EquityRedemptionEvent::Completed { .. }
+                    | EquityRedemptionEvent::SendFailed { .. }
                     | EquityRedemptionEvent::DetectionFailed { .. }
                     | EquityRedemptionEvent::RedemptionRejected { .. }
             )
@@ -1190,12 +1191,20 @@ mod tests {
         assert!(!RebalancingTrigger::has_terminal_mint_event(&events));
     }
 
-    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokensSent {
+    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawn {
             symbol: symbol.clone(),
             quantity,
+            token: Address::random(),
+            vault_withdraw_tx: TxHash::random(),
+            withdrawn_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_sent() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
             redemption_wallet: Address::random(),
-            tx_hash: TxHash::random(),
+            redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
         }
     }
@@ -1256,11 +1265,7 @@ mod tests {
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger
-            .apply_redemption_event_to_inventory(
-                &symbol,
-                &make_tokens_sent(&symbol, dec!(30)),
-                shares(30),
-            )
+            .apply_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1287,7 +1292,7 @@ mod tests {
 
         // Create event batch with TokensSent and Completed.
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_redemption_completed()),
         ];
 
@@ -1301,10 +1306,8 @@ mod tests {
 
     #[test]
     fn redemption_detection_failure_clears_in_progress_flag() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_detection_failed()),
         ];
 
@@ -1313,10 +1316,8 @@ mod tests {
 
     #[test]
     fn redemption_rejection_clears_in_progress_flag() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_redemption_detected()),
             make_redemption_envelope(make_redemption_rejected()),
         ];
@@ -1327,7 +1328,7 @@ mod tests {
     #[test]
     fn extract_redemption_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let events = vec![make_redemption_envelope(make_tokens_sent(
+        let events = vec![make_redemption_envelope(make_vault_withdrawn(
             &symbol,
             dec!(42.5),
         ))];
@@ -1350,9 +1351,8 @@ mod tests {
 
     #[test]
     fn has_terminal_redemption_event_returns_false_for_non_terminal() {
-        let symbol = Symbol::new("AAPL").unwrap();
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_redemption_detected()),
         ];
 

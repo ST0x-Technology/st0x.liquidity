@@ -28,15 +28,17 @@ use st0x_execution::{
     Symbol,
 };
 
+use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::Config;
 use crate::dashboard::ServerMessage;
-use crate::equity_redemption::EquityRedemption;
+use crate::equity_redemption::{EquityRedemption, Redeemer};
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
+use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
@@ -55,9 +57,10 @@ use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::rebalancing::redemption::{RedemptionService, build_redemption_queries};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
-    build_rebalancing_queries, spawn_rebalancer,
+    RedemptionDependencies, build_rebalancing_queries, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -465,7 +468,7 @@ impl Conductor {
     }
 }
 
-async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
+async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
     rebalancing_config: &RebalancingConfig,
     pool: &SqlitePool,
     config: &Config,
@@ -502,14 +505,9 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
             ),
             (),
         )),
-        redemption: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<EquityRedemption>(trigger.clone(), event_broadcast.clone()),
-            (),
-        )),
         usdc: Arc::new(sqlite_cqrs(
             pool.clone(),
-            build_rebalancing_queries::<UsdcRebalance>(trigger.clone(), event_broadcast),
+            build_rebalancing_queries::<UsdcRebalance>(trigger.clone(), event_broadcast.clone()),
             (),
         )),
     };
@@ -522,14 +520,64 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
+    // Create services needed for redemption CQRS
+    let broker_auth = &rebalancing_config.alpaca_broker_auth;
+    let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
+    let tokenization_service = Arc::new(AlpacaTokenizationService::new(
+        broker_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        broker_auth.api_key.clone(),
+        broker_auth.api_secret.clone(),
+        provider.clone(),
+        rebalancing_config.redemption_wallet,
+    ));
+
+    // Create RedemptionService for use by both the aggregate and the manager.
+    // The concrete type is needed by RedemptionManager for alpaca() access.
+    // The trait object is needed by the CQRS framework for aggregate command handling.
+    let redemption_service = Arc::new(RedemptionService::new(
+        vault_service.clone(),
+        tokenization_service.clone(),
+        vault_registry_query.clone(),
+        config.evm.orderbook,
+        market_maker_wallet,
+    ));
+    let redemption_service_for_cqrs: Arc<dyn Redeemer> = redemption_service.clone();
+
+    // Create redemption CQRS with all required query processors
+    let redemption_view_repo = Arc::new(SqliteViewRepository::<
+        Lifecycle<EquityRedemption, Never>,
+        Lifecycle<EquityRedemption, Never>,
+    >::new(
+        pool.clone(), "equity_redemption_view".to_string()
+    ));
+    let redemption_query: Arc<SqliteQuery<EquityRedemption, Never>> =
+        Arc::new(GenericQuery::new(redemption_view_repo.clone()));
+    let redemption_cqrs = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        build_redemption_queries(
+            trigger.clone(),
+            event_broadcast.clone(),
+            redemption_view_repo,
+        ),
+        redemption_service_for_cqrs,
+    ));
+
+    let redemption_deps = RedemptionDependencies {
+        vault_service,
+        tokenization_service,
+        service: redemption_service,
+        cqrs: redemption_cqrs,
+        query: redemption_query,
+    };
+
     let handle = spawn_rebalancer(
         rebalancing_config,
         provider.clone(),
-        config.evm.orderbook,
         market_maker_wallet,
         operation_receiver,
-        vault_registry_query,
         frameworks,
+        redemption_deps,
     )
     .await?;
 
@@ -1733,13 +1781,6 @@ mod tests {
             crate::offchain_order::noop_order_placer(),
         ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
@@ -1749,7 +1790,6 @@ mod tests {
             position_query,
             offchain_order_cqrs,
             vault_registry_cqrs,
-            vault_registry_query,
             snapshot_cqrs,
         }
     }
@@ -2997,13 +3037,6 @@ mod tests {
             order_placer,
         ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
@@ -3013,7 +3046,6 @@ mod tests {
             position_query,
             offchain_order_cqrs,
             vault_registry_cqrs,
-            vault_registry_query,
             snapshot_cqrs,
         }
     }

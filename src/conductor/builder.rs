@@ -22,7 +22,7 @@ use crate::onchain_trade::OnChainTradeCqrs;
 use crate::position::{PositionCqrs, PositionQuery};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
-use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
+use crate::vault_registry::VaultRegistryAggregate;
 
 use super::{
     Conductor, TradingTasks, spawn_event_processor, spawn_inventory_poller,
@@ -41,7 +41,6 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) position_query: Arc<PositionQuery>,
     pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
     pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
-    pub(crate) vault_registry_query: Arc<VaultRegistryQuery>,
     pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
 

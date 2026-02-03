@@ -6,16 +6,46 @@
 pub(crate) mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
+pub(crate) mod service;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
+use cqrs_es::persist::GenericQuery;
+use cqrs_es::{AggregateError, Query};
+use sqlite_es::SqliteViewRepository;
 use st0x_execution::{FractionalShares, Symbol};
+use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::broadcast;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
-use crate::onchain::vault::VaultError;
+use crate::dashboard::{EventBroadcaster, ServerMessage};
+use crate::equity_redemption::{EquityRedemption, EquityRedemptionError, RedemptionAggregateId};
+use crate::lifecycle::{Lifecycle, Never};
+use crate::rebalancing::RebalancingTrigger;
+
+pub(crate) use service::RedemptionService;
+
+/// Builds the query processors for the EquityRedemption aggregate CQRS framework.
+pub(crate) fn build_redemption_queries(
+    trigger: Arc<RebalancingTrigger>,
+    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
+    view_repo: Arc<
+        SqliteViewRepository<
+            Lifecycle<EquityRedemption, Never>,
+            Lifecycle<EquityRedemption, Never>,
+        >,
+    >,
+) -> Vec<Box<dyn Query<Lifecycle<EquityRedemption, Never>>>> {
+    let mut queries: Vec<Box<dyn Query<Lifecycle<EquityRedemption, Never>>>> =
+        vec![Box::new(trigger), Box::new(GenericQuery::new(view_repo))];
+
+    if let Some(sender) = event_broadcast {
+        queries.push(Box::new(EventBroadcaster::new(sender)));
+    }
+
+    queries
+}
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -23,10 +53,12 @@ pub(crate) enum RedemptionError {
     Alpaca(#[from] AlpacaTokenizationError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<EquityRedemptionError>),
-    #[error("Vault operation error: {0}")]
-    Vault(#[from] VaultError),
-    #[error("Token {token} not found in vault registry")]
-    VaultNotFound { token: Address },
+    #[error("Aggregate not found after command execution")]
+    AggregateNotFound,
+    #[error("Unexpected aggregate state after command")]
+    UnexpectedState,
+    #[error("Send to Alpaca failed: {reason}")]
+    SendFailed { reason: String },
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
 }
