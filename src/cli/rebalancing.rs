@@ -5,8 +5,8 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
 use cqrs_es::CqrsFramework;
-use cqrs_es::persist::PersistedEventStore;
-use sqlite_es::SqliteEventRepository;
+use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository};
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::vault_registry::VaultRegistryAggregate;
 
 use super::TransferDirection;
 
@@ -109,10 +110,31 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let owner = signer.address();
+            let vault = Arc::new(VaultService::new(base_provider, config.evm.orderbook));
+
             let redemption_store =
                 PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
             let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_cqrs);
+
+            let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+                VaultRegistryAggregate,
+                VaultRegistryAggregate,
+            >::new(
+                pool.clone(),
+                "vault_registry_view".to_string(),
+            ));
+            let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+            let redemption_manager = RedemptionManager::new(
+                tokenization_service,
+                vault,
+                redemption_cqrs,
+                vault_registry_query,
+                config.evm.orderbook,
+                owner,
+            );
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));

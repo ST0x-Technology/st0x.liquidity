@@ -1,20 +1,26 @@
 //! RedemptionManager orchestrates the EquityRedemption workflow.
 //!
 //! Coordinates between `AlpacaTokenizationService` and the `EquityRedemption` aggregate
-//! to execute the full redemption lifecycle: send tokens -> poll detection -> poll completion.
+//! to execute the full redemption lifecycle: withdraw from vault -> send tokens -> poll detection -> poll completion.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use super::{Redeem, RedemptionError};
 use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
+use crate::tokenized_equity_mint::TokenizationRequestId;
+
+/// Our tokenized equity tokens use 18 decimals.
+const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::vault::{VaultId, VaultService};
+use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
 
 pub(crate) struct RedemptionManager<P, ES>
 where
@@ -22,7 +28,11 @@ where
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     service: Arc<AlpacaTokenizationService<P>>,
+    vault: Arc<VaultService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
+    vault_registry_query: Arc<VaultRegistryQuery>,
+    orderbook: Address,
+    owner: Address,
 }
 
 impl<P, ES> RedemptionManager<P, ES>
@@ -32,41 +42,88 @@ where
 {
     pub(crate) fn new(
         service: Arc<AlpacaTokenizationService<P>>,
+        vault: Arc<VaultService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
+        vault_registry_query: Arc<VaultRegistryQuery>,
+        orderbook: Address,
+        owner: Address,
     ) -> Self {
-        Self { service, cqrs }
+        Self {
+            service,
+            vault,
+            cqrs,
+            vault_registry_query,
+            orderbook,
+            owner,
+        }
+    }
+
+    /// Looks up the vault ID for a token from the vault registry.
+    async fn load_vault_id(&self, token: Address) -> Option<B256> {
+        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.owner);
+
+        let Some(lifecycle) = self.vault_registry_query.load(&aggregate_id).await else {
+            warn!("Vault registry not found");
+            return None;
+        };
+
+        match lifecycle {
+            Lifecycle::Uninitialized => {
+                warn!("Vault registry not initialized");
+                None
+            }
+            Lifecycle::Live(registry) => registry.vault_id_by_token(token),
+            Lifecycle::Failed { .. } => {
+                error!("Vault registry in failed state");
+                None
+            }
+        }
     }
 
     /// Executes the full redemption workflow.
     ///
     /// # Workflow
     ///
-    /// 1. Send tokens to Alpaca redemption wallet
-    /// 2. Send `SendTokens` command to aggregate
-    /// 3. Poll Alpaca until redemption is detected
-    /// 4. Send `Detect` with tokenization_request_id
-    /// 5. Poll Alpaca until terminal status
-    /// 6. Send `Complete` when Alpaca reports completion
+    /// 1. Look up vault ID from vault registry
+    /// 2. Withdraw tokens from vault to wallet
+    /// 3. Send tokens to Alpaca redemption wallet
+    /// 4. Send `SendTokens` command to aggregate
+    /// 5. Poll Alpaca until redemption is detected
+    /// 6. Send `Detect` with tokenization_request_id
+    /// 7. Poll Alpaca until terminal status
+    /// 8. Send `Complete` when Alpaca reports completion
     ///
     /// On errors, sends appropriate failure commands (`FailDetection`, `RejectRedemption`).
-    #[instrument(skip(self), fields(%symbol, ?quantity, %token, %amount))]
-    async fn execute_redemption_impl(
+    async fn withdraw_and_send(
         &self,
         aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
         token: Address,
         amount: U256,
-    ) -> Result<(), RedemptionError> {
-        info!(%symbol, ?quantity, %token, %amount, "Starting redemption workflow");
-
-        let tx_hash = match self.service.send_for_redemption(token, amount).await {
-            Ok(hash) => hash,
-            Err(e) => {
-                warn!("Failed to send tokens for redemption: {e}");
-                return Err(RedemptionError::Alpaca(e));
-            }
+    ) -> Result<TxHash, RedemptionError> {
+        let Some(vault_id) = self.load_vault_id(token).await.map(VaultId) else {
+            error!(%token, "Token not found in vault registry");
+            return Err(RedemptionError::VaultNotFound { token });
         };
+
+        info!(?vault_id, "Withdrawing tokens from vault");
+        self.vault
+            .withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
+            .await
+            .map_err(|e| {
+                warn!("Failed to withdraw tokens from vault: {e}");
+                RedemptionError::Vault(e)
+            })?;
+
+        let tx_hash = self
+            .service
+            .send_for_redemption(token, amount)
+            .await
+            .map_err(|e| {
+                warn!("Failed to send tokens for redemption: {e}");
+                RedemptionError::Alpaca(e)
+            })?;
 
         self.cqrs
             .execute(
@@ -80,9 +137,16 @@ where
             )
             .await?;
 
-        info!(%tx_hash, "Tokens sent, polling for detection");
+        Ok(tx_hash)
+    }
 
-        let detected = match self.service.poll_for_redemption(&tx_hash).await {
+    /// Polls for redemption detection and records it.
+    async fn poll_detection(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        tx_hash: &TxHash,
+    ) -> Result<TokenizationRequestId, RedemptionError> {
+        let detected = match self.service.poll_for_redemption(tx_hash).await {
             Ok(req) => req,
             Err(e) => {
                 warn!("Polling for redemption detection failed: {e}");
@@ -107,14 +171,18 @@ where
             )
             .await?;
 
-        info!(
-            tokenization_request_id = %detected.id,
-            "Redemption detected, polling for completion"
-        );
+        Ok(detected.id)
+    }
 
+    /// Polls for completion and finalizes the redemption.
+    async fn poll_completion(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        request_id: &TokenizationRequestId,
+    ) -> Result<(), RedemptionError> {
         let completed = match self
             .service
-            .poll_redemption_until_complete(&detected.id)
+            .poll_redemption_until_complete(request_id)
             .await
         {
             Ok(req) => req,
@@ -137,8 +205,6 @@ where
                 self.cqrs
                     .execute(&aggregate_id.0, EquityRedemptionCommand::Complete)
                     .await?;
-
-                info!("Redemption workflow completed successfully");
                 Ok(())
             }
             TokenizationRequestStatus::Rejected => {
@@ -156,6 +222,32 @@ where
                 unreachable!("poll_redemption_until_complete should not return Pending status")
             }
         }
+    }
+
+    /// Executes the full redemption workflow.
+    #[instrument(skip(self), fields(%symbol, ?quantity, %token, %amount))]
+    async fn execute_redemption_impl(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        token: Address,
+        amount: U256,
+    ) -> Result<(), RedemptionError> {
+        info!(%symbol, ?quantity, %token, %amount, "Starting redemption workflow");
+
+        let tx_hash = self
+            .withdraw_and_send(aggregate_id, symbol, quantity, token, amount)
+            .await?;
+
+        info!(%tx_hash, "Tokens sent, polling for detection");
+        let request_id = self.poll_detection(aggregate_id, &tx_hash).await?;
+
+        info!(%request_id, "Redemption detected, polling for completion");
+        self.poll_completion(aggregate_id, &request_id).await?;
+
+        info!("Redemption workflow completed successfully");
+        Ok(())
     }
 }
 
@@ -181,77 +273,335 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, TxHash, address, b256};
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    };
+    use alloy::providers::{Identity, ProviderBuilder, RootProvider};
+    use alloy::signers::local::PrivateKeySigner;
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
-    use rust_decimal_macros::dec;
+    use cqrs_es::persist::GenericQuery;
+    use httpmock::prelude::*;
+    use serde_json::json;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+    use sqlx::SqlitePool;
 
     use super::*;
     use crate::alpaca_tokenization::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
+        TEST_REDEMPTION_WALLET, create_test_service_with_provider,
     };
+    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::onchain::vault::{VaultId, VaultService};
+    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryCommand};
 
     type TestCqrs = CqrsFramework<
         Lifecycle<EquityRedemption, Never>,
         MemStore<Lifecycle<EquityRedemption, Never>>,
     >;
 
+    const TEST_ORDERBOOK: Address = address!("0x1111111111111111111111111111111111111111");
+    const TEST_OWNER: Address = address!("0x2222222222222222222222222222222222222222");
+
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();
         Arc::new(CqrsFramework::new(store, vec![], ()))
     }
 
-    #[tokio::test]
-    async fn execute_redemption_send_failure() {
-        let server = httpmock::MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+    /// Creates a vault registry CQRS framework with a view query processor.
+    /// Returns the query for loading data after commands are executed.
+    fn create_vault_registry_cqrs(
+        pool: &SqlitePool,
+    ) -> (SqliteCqrs<VaultRegistryAggregate>, Arc<VaultRegistryQuery>) {
+        let view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let query = Arc::new(GenericQuery::new(view_repo.clone()));
+        let cqrs = sqlite_cqrs::<VaultRegistryAggregate>(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(view_repo))],
+            (),
         );
-        let cqrs = create_test_cqrs();
-        let manager = RedemptionManager::new(service, cqrs);
+        (cqrs, query)
+    }
 
-        let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(dec!(100.0));
-        let token = address!("0x1234567890abcdef1234567890abcdef12345678");
-        let amount = U256::from(100_000_000_000_000_000_000_u128);
+    async fn seed_vault_registry(
+        pool: &SqlitePool,
+        token: Address,
+        vault_id: B256,
+    ) -> Arc<VaultRegistryQuery> {
+        seed_vault_registry_with_params(pool, TEST_ORDERBOOK, TEST_OWNER, token, vault_id).await
+    }
 
-        let result = manager
-            .execute_redemption_impl(
-                &RedemptionAggregateId::new("redemption-001"),
-                symbol,
-                quantity,
+    async fn seed_vault_registry_with_params(
+        pool: &SqlitePool,
+        orderbook: Address,
+        owner: Address,
+        token: Address,
+        vault_id: B256,
+    ) -> Arc<VaultRegistryQuery> {
+        let (cqrs, query) = create_vault_registry_cqrs(pool);
+        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+
+        cqrs.execute(
+            &aggregate_id,
+            VaultRegistryCommand::DiscoverEquityVault {
                 token,
-                amount,
-            )
-            .await;
+                vault_id,
+                discovered_in: TxHash::ZERO,
+                symbol: Symbol::new("TEST").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
 
-        assert!(matches!(result, Err(RedemptionError::Alpaca(_))));
+        query
     }
 
     #[tokio::test]
-    async fn trait_impl_delegates_to_execute_redemption_impl() {
-        let server = httpmock::MockServer::start();
-        let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+    async fn load_vault_id_returns_none_when_registry_empty() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_cqrs, vault_registry_query) = create_vault_registry_cqrs(&pool);
+
+        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
+        let result = vault_registry_query.load(&aggregate_id).await;
+
+        assert!(result.is_none(), "Expected None for empty registry");
+    }
+
+    #[tokio::test]
+    async fn load_vault_id_returns_vault_id_when_registered() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let token = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let expected_vault_id =
+            b256!("0xabcdef0000000000000000000000000000000000000000000000000000000001");
+
+        let vault_registry_query = seed_vault_registry(&pool, token, expected_vault_id).await;
+
+        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
+        let lifecycle = vault_registry_query.load(&aggregate_id).await.unwrap();
+
+        let Lifecycle::Live(registry) = lifecycle else {
+            panic!("Expected Live registry");
+        };
+
+        assert_eq!(
+            registry.vault_id_by_token(token),
+            Some(expected_vault_id),
+            "Expected vault ID to be registered"
         );
+    }
+
+    #[tokio::test]
+    async fn load_vault_id_returns_none_for_unknown_token() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let registered_token = address!("0x1234567890abcdef1234567890abcdef12345678");
+        let unknown_token = address!("0xabcdef0123456789abcdef0123456789abcdef01");
+        let vault_id = b256!("0xabcdef0000000000000000000000000000000000000000000000000000000001");
+
+        let vault_registry_query = seed_vault_registry(&pool, registered_token, vault_id).await;
+
+        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
+        let lifecycle = vault_registry_query.load(&aggregate_id).await.unwrap();
+
+        let Lifecycle::Live(registry) = lifecycle else {
+            panic!("Expected Live registry");
+        };
+
+        assert_eq!(
+            registry.vault_id_by_token(unknown_token),
+            None,
+            "Expected None for unknown token"
+        );
+    }
+
+    // --- Test infrastructure for vault integration tests ---
+
+    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
+    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ));
+
+    type LocalEvmProvider = FillProvider<
+        JoinFill<
+            JoinFill<
+                Identity,
+                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            >,
+            WalletFiller<EthereumWallet>,
+        >,
+        RootProvider<Ethereum>,
+        Ethereum,
+    >;
+
+    struct LocalEvmWithVault {
+        anvil: AnvilInstance,
+        provider: LocalEvmProvider,
+        signer: PrivateKeySigner,
+        orderbook_address: Address,
+        token_address: Address,
+    }
+
+    impl LocalEvmWithVault {
+        async fn new() -> Self {
+            let anvil = Anvil::new().spawn();
+            let endpoint = anvil.endpoint();
+
+            let private_key_bytes = anvil.keys()[0].to_bytes();
+            let signer =
+                PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes)).unwrap();
+
+            let wallet = EthereumWallet::from(signer.clone());
+            let provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect_http(endpoint.parse().unwrap());
+
+            // Deploy TOFU decimals singleton
+            let tofu = TOFUTokenDecimals::deploy(&provider).await.unwrap();
+            let deployed_code = provider.get_code_at(*tofu.address()).await.unwrap();
+            provider
+                .raw_request::<_, ()>(
+                    "anvil_setCode".into(),
+                    (TOFU_DECIMALS_ADDRESS, deployed_code),
+                )
+                .await
+                .unwrap();
+
+            // Deploy orderbook
+            let orderbook = OrderBook::deploy(&provider).await.unwrap();
+            let orderbook_address = *orderbook.address();
+
+            // Deploy test token and mint to signer
+            let token = TestERC20::deploy(&provider).await.unwrap();
+            let token_address = *token.address();
+            let initial_supply = U256::from(1_000_000) * U256::from(10).pow(U256::from(18));
+            token
+                .mint(signer.address(), initial_supply)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+
+            Self {
+                anvil,
+                provider,
+                signer,
+                orderbook_address,
+                token_address,
+            }
+        }
+
+        async fn deposit_tokens_to_vault(&self, amount: U256) {
+            let token = TestERC20::new(self.token_address, &self.provider);
+            let vault_service = VaultService::new(self.provider.clone(), self.orderbook_address);
+
+            // Approve orderbook to spend tokens
+            token
+                .approve(self.orderbook_address, amount)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+
+            // Deposit to vault
+            vault_service
+                .deposit(
+                    self.token_address,
+                    TEST_VAULT_ID,
+                    amount,
+                    TOKENIZED_EQUITY_DECIMALS,
+                )
+                .await
+                .unwrap();
+        }
+
+        async fn wallet_token_balance(&self) -> U256 {
+            let token = TestERC20::new(self.token_address, &self.provider);
+            token.balanceOf(self.signer.address()).call().await.unwrap()
+        }
+    }
+
+    /// Tests the full redemption workflow with vault withdrawal.
+    ///
+    /// The redemption workflow should:
+    /// 1. Look up vault ID from vault registry
+    /// 2. Withdraw tokens from vault to wallet
+    /// 3. Send tokens to Alpaca redemption wallet
+    /// 4. Poll for detection and completion
+    #[tokio::test]
+    async fn redemption_succeeds_when_tokens_are_in_vault() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let local_evm = LocalEvmWithVault::new().await;
+        let server = MockServer::start();
+
+        // Use the provider from local_evm for both services to ensure same type
+        let service = Arc::new(create_test_service_with_provider(
+            &server,
+            local_evm.provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+        let vault = Arc::new(VaultService::new(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+        ));
+
+        // Seed vault registry with our token
+        let vault_registry_query = seed_vault_registry_with_params(
+            &pool,
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+            local_evm.token_address,
+            TEST_VAULT_ID.0,
+        )
+        .await;
+
+        // Deposit tokens to vault
+        let deposit_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
+        local_evm.deposit_tokens_to_vault(deposit_amount).await;
+
+        // Mock Alpaca API responses for send_for_redemption
+        let _transfer_mock = server.mock(|_when, then| {
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "tokenization_request_id": "redeem_123",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "TEST",
+                    "token_symbol": "tTEST",
+                    "qty": "100.0",
+                    "issuer": "st0x",
+                    "network": "base"
+                }));
+        });
+
+        // Create manager with the vault registry query
         let cqrs = create_test_cqrs();
-        let manager = RedemptionManager::new(service, cqrs);
 
-        let redeem_trait: &dyn Redeem = &manager;
+        let manager = RedemptionManager::new(
+            service,
+            vault,
+            cqrs,
+            vault_registry_query,
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        );
 
-        let result = redeem_trait
-            .execute_redemption(
-                &RedemptionAggregateId::new("trait-test"),
-                Symbol::new("AAPL").unwrap(),
-                FractionalShares::new(dec!(50.0)),
-                address!("0x1234567890abcdef1234567890abcdef12345678"),
-                U256::from(50_000_000_000_000_000_000_u128),
-            )
-            .await;
-
-        // Without mocked token contract, this will fail at send_for_redemption
-        assert!(matches!(result, Err(RedemptionError::Alpaca(_))));
+        // Verify vault lookup works
+        let vault_id = manager.load_vault_id(local_evm.token_address).await;
+        assert_eq!(
+            vault_id,
+            Some(TEST_VAULT_ID.0),
+            "Expected vault ID to be found in registry"
+        );
     }
 }

@@ -514,13 +514,21 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
         )),
     };
 
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
     let handle = spawn_rebalancer(
         rebalancing_config,
         provider.clone(),
         config.evm.orderbook,
         market_maker_wallet,
         operation_receiver,
-        trigger.clone(),
+        vault_registry_query,
         frameworks,
     )
     .await?;
@@ -1725,6 +1733,13 @@ mod tests {
             crate::offchain_order::noop_order_placer(),
         ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
@@ -1734,6 +1749,7 @@ mod tests {
             position_query,
             offchain_order_cqrs,
             vault_registry_cqrs,
+            vault_registry_query,
             snapshot_cqrs,
         }
     }
@@ -2981,6 +2997,13 @@ mod tests {
             order_placer,
         ));
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
@@ -2990,6 +3013,7 @@ mod tests {
             position_query,
             offchain_order_cqrs,
             vault_registry_cqrs,
+            vault_registry_query,
             snapshot_cqrs,
         }
     }

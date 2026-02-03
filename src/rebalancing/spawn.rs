@@ -35,6 +35,7 @@ use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
+use crate::vault_registry::VaultRegistryQuery;
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +83,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
     orderbook: Address,
     market_maker_wallet: Address,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
-    trigger: Arc<RebalancingTrigger>,
+    vault_registry_query: Arc<VaultRegistryQuery>,
     frameworks: RebalancingCqrsFrameworks,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
@@ -104,7 +105,8 @@ where
         config,
         market_maker_wallet,
         operation_receiver,
-        trigger,
+        vault_registry_query,
+        orderbook,
         frameworks,
     );
 
@@ -202,14 +204,19 @@ where
         config: &RebalancingConfig,
         market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        trigger: Arc<RebalancingTrigger>,
+        vault_registry_query: Arc<VaultRegistryQuery>,
+        orderbook: Address,
         frameworks: RebalancingCqrsFrameworks,
     ) -> ConfiguredRebalancer<BP> {
         let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), frameworks.mint));
 
         let redemption_manager = Arc::new(RedemptionManager::new(
             self.tokenization,
+            self.vault.clone(),
             frameworks.redemption,
+            vault_registry_query,
+            orderbook,
+            market_maker_wallet,
         ));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
@@ -226,7 +233,6 @@ where
             mint_manager,
             redemption_manager,
             usdc_manager,
-            trigger,
             operation_receiver,
             config.redemption_wallet,
         )
@@ -256,20 +262,21 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{address, b256};
     use alloy::providers::ProviderBuilder;
+    use cqrs_es::persist::GenericQuery;
     use httpmock::Method::GET;
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::sqlite_cqrs;
+    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use sqlx::SqlitePool;
     use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use uuid::Uuid;
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
-    use crate::inventory::{ImbalanceThreshold, InventoryView};
+    use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
-    use tokio::sync::RwLock;
+    use crate::vault_registry::VaultRegistryAggregate;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -477,28 +484,29 @@ mod tests {
 
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
 
-        let (trigger_tx, _trigger_rx) = mpsc::channel(10);
-        let trigger = Arc::new(RebalancingTrigger::new(
-            RebalancingTriggerConfig {
-                equity_threshold: config.equity_threshold,
-                usdc_threshold: config.usdc_threshold,
-            },
-            pool.clone(),
-            TEST_ORDERBOOK,
-            Address::ZERO,
-            Arc::new(RwLock::new(InventoryView::default())),
-            trigger_tx,
-        ));
-
         let (_tx, rx) = mpsc::channel(100);
         let frameworks = RebalancingCqrsFrameworks {
             mint: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
             redemption: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-            usdc: Arc::new(sqlite_cqrs(pool, vec![], ())),
+            usdc: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
         };
 
-        let _rebalancer =
-            services.into_rebalancer(&config, market_maker_wallet, rx, trigger, frameworks);
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+        let _rebalancer = services.into_rebalancer(
+            &config,
+            market_maker_wallet,
+            rx,
+            vault_registry_query,
+            TEST_ORDERBOOK,
+            frameworks,
+        );
     }
 
     #[tokio::test]

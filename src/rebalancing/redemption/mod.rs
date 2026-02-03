@@ -15,15 +15,18 @@ use thiserror::Error;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
+use crate::onchain::vault::VaultError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
     #[error("Alpaca API error: {0}")]
     Alpaca(#[from] AlpacaTokenizationError),
-
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<EquityRedemptionError>),
-
+    #[error("Vault operation error: {0}")]
+    Vault(#[from] VaultError),
+    #[error("Token {token} not found in vault registry")]
+    VaultNotFound { token: Address },
     #[error("Redemption was rejected by Alpaca")]
     Rejected,
 }
