@@ -6597,6 +6597,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-dto"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "ts-rs",
+]
+
+[[package]]
 name = "st0x-execution"
 version = "0.1.0"
 dependencies = [
@@ -6668,6 +6679,7 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
+ "st0x-dto",
  "st0x-execution",
  "temp-env",
  "tempfile",
