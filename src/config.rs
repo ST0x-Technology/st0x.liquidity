@@ -17,7 +17,7 @@ use url::Url;
 
 use st0x_execution::{
     AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx, AlpacaTradingApiMode,
-    FractionalShares, Positive, SchwabCtx, SupportedExecutor,
+    FractionalShares, Positive, SchwabCtx, SupportedExecutor, TimeInForce,
 };
 
 use crate::offchain::order_poller::OrderPollerConfig;
@@ -177,6 +177,8 @@ impl From<BrokerSecrets> for BrokerCtx {
                 api_secret,
                 account_id,
                 mode,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::default(),
             }),
 
             BrokerSecrets::DryRun => Self::DryRun,

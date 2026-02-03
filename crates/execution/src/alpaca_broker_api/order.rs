@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::AlpacaBrokerApiError;
 use super::client::AlpacaBrokerApiClient;
+use super::{AlpacaBrokerApiError, TimeInForce};
 use crate::{
     Direction, FractionalShares, MarketOrder, OrderPlacement, OrderStatus, OrderUpdate, Positive,
     Symbol,
@@ -209,10 +209,11 @@ where
 pub(super) async fn place_market_order(
     client: &AlpacaBrokerApiClient,
     market_order: MarketOrder,
+    time_in_force: TimeInForce,
 ) -> Result<OrderPlacement<String>, AlpacaBrokerApiError> {
     debug!(
-        "Placing Alpaca Broker API market order: {} {} shares of {}",
-        market_order.direction, market_order.shares, market_order.symbol
+        "Placing Alpaca Broker API market order: {} {} shares of {} (time_in_force: {:?})",
+        market_order.direction, market_order.shares, market_order.symbol, time_in_force
     );
 
     let side = match market_order.direction {
@@ -225,7 +226,7 @@ pub(super) async fn place_market_order(
         quantity: market_order.shares,
         side,
         order_type: "market",
-        time_in_force: "day",
+        time_in_force: time_in_force.as_api_str(),
         // Alpaca only allows extended_hours=true for limit orders, not market orders
         extended_hours: false,
     };
@@ -454,6 +455,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -492,7 +495,9 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let placement = place_market_order(&client, market_order).await.unwrap();
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
 
         mock.assert();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
@@ -536,7 +541,9 @@ mod tests {
             direction: Direction::Sell,
         };
 
-        let placement = place_market_order(&client, market_order).await.unwrap();
+        let placement = place_market_order(&client, market_order, TimeInForce::Day)
+            .await
+            .unwrap();
 
         mock.assert();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
