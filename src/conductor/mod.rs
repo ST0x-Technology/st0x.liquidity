@@ -484,8 +484,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
 
     let trigger = Arc::new(RebalancingTrigger::new(
         RebalancingTriggerConfig {
-            equity_threshold: rebalancing_config.equity_threshold,
-            usdc_threshold: rebalancing_config.usdc_threshold,
+            equity: rebalancing_config.equity,
+            usdc: rebalancing_config.usdc.clone(),
         },
         pool.clone(),
         config.evm.orderbook,
@@ -1742,6 +1742,7 @@ mod tests {
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::TriggeredOperation;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
 
@@ -3594,11 +3595,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3673,8 +3674,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: threshold,
-                usdc_threshold: threshold,
+                equity: threshold,
+                usdc: UsdcRebalancingConfig::Enabled {
+                    target: threshold.target,
+                    deviation: threshold.deviation,
+                },
             },
             pool.clone(),
             orderbook,
@@ -3761,11 +3765,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
@@ -3876,11 +3880,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.2),
                 },

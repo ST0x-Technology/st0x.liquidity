@@ -23,8 +23,8 @@ use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
-use st0x_execution::AlpacaBrokerApi;
 use st0x_execution::alpaca_broker_api::ConversionDirection;
+use st0x_execution::{AlpacaBrokerApi, Positive};
 
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
@@ -306,11 +306,11 @@ where
         amount: Usdc,
     ) -> Result<Transfer, UsdcRebalanceManagerError> {
         let usdc = TokenSymbol::new("USDC");
-        let decimal_amount = amount.0;
+        let positive_amount = Positive::new(amount)?;
 
         let transfer = match self
             .alpaca_wallet
-            .initiate_withdrawal(decimal_amount, &usdc, &self.market_maker_wallet)
+            .initiate_withdrawal(positive_amount, &usdc, &self.market_maker_wallet)
             .await
         {
             Ok(t) => t,
@@ -840,22 +840,14 @@ where
 /// or values exceeding U256::MAX).
 fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     if usdc.0.is_sign_negative() {
-        return Err(UsdcRebalanceManagerError::InvalidAmount(format!(
-            "USDC amount cannot be negative: {}",
-            usdc.0
-        )));
+        return Err(UsdcRebalanceManagerError::NegativeUsdc { amount: usdc.0 });
     }
 
     // USDC has 6 decimals
     let scaled = usdc
         .0
-        .checked_mul(rust_decimal::Decimal::from(1_000_000u64))
-        .ok_or_else(|| {
-            UsdcRebalanceManagerError::ArithmeticOverflow(format!(
-                "USDC amount overflow during scaling: {}",
-                usdc.0
-            ))
-        })?;
+        .checked_mul(Decimal::from(1_000_000u64))
+        .ok_or(UsdcRebalanceManagerError::ArithmeticOverflow { amount: usdc.0 })?;
 
     let integer = scaled.trunc().to_string();
 
@@ -1329,13 +1321,10 @@ mod tests {
     fn test_usdc_to_u256_negative_amount() {
         let amount = Usdc(dec!(-100));
         let result = usdc_to_u256(amount);
-        assert!(
-            matches!(
-                &result,
-                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-100")
-            ),
-            "Expected InvalidAmount error mentioning -100, got: {result:?}"
-        );
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceManagerError::NegativeUsdc { amount } if amount == dec!(-100)
+        ),);
     }
 
     #[test]
@@ -1380,13 +1369,10 @@ mod tests {
 
         let result = manager.execute_base_to_alpaca(&id, amount).await;
 
-        assert!(
-            matches!(
-                &result,
-                Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-500")
-            ),
-            "Expected InvalidAmount error mentioning -500, got: {result:?}"
-        );
+        assert!(matches!(
+            result.unwrap_err(),
+            UsdcRebalanceManagerError::NegativeUsdc { amount } if amount == dec!(-500)
+        ),);
     }
 
     #[tokio::test]

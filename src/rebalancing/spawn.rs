@@ -294,21 +294,22 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
     use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::vault_registry::VaultRegistryAggregate;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_config() -> RebalancingConfig {
         RebalancingConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancingConfig::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
@@ -345,8 +346,8 @@ mod tests {
 
     #[test]
     fn spawn_rebalancer_error_display_alpaca_wallet() {
-        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::InvalidAmount {
-            amount: dec!(0),
+        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::TransferNotFound {
+            transfer_id: AlpacaTransferId::from(Uuid::nil()),
         });
 
         let display = format!("{err}");
@@ -358,29 +359,32 @@ mod tests {
     }
 
     #[test]
-    fn trigger_config_uses_equity_threshold_from_config() {
+    fn trigger_config_uses_equity_from_config() {
         let config = make_config();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity: config.equity,
+            usdc: config.usdc,
         };
 
-        assert_eq!(trigger_config.equity_threshold.target, dec!(0.5));
-        assert_eq!(trigger_config.equity_threshold.deviation, dec!(0.2));
+        assert_eq!(trigger_config.equity.target, dec!(0.5));
+        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
     }
 
     #[test]
-    fn trigger_config_uses_usdc_threshold_from_config() {
+    fn trigger_config_uses_usdc_from_config() {
         let config = make_config();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity: config.equity,
+            usdc: config.usdc,
         };
 
-        assert_eq!(trigger_config.usdc_threshold.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc_threshold.deviation, dec!(0.15));
+        let UsdcRebalancingConfig::Enabled { target, deviation } = trigger_config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.6));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]

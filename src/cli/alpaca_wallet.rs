@@ -6,6 +6,7 @@ use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use st0x_execution::Executor;
+use st0x_execution::Positive;
 use st0x_execution::alpaca_broker_api::ConversionDirection;
 use std::io::Write;
 
@@ -177,11 +178,11 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     );
 
     let usdc_asset = TokenSymbol::new("USDC");
-    let amount_decimal: rust_decimal::Decimal = amount.into();
+    let positive_amount = Positive::new(amount)?;
 
     writeln!(stdout, "   Initiating withdrawal...")?;
     let transfer = alpaca_wallet
-        .initiate_withdrawal(amount_decimal, &usdc_asset, &destination)
+        .initiate_withdrawal(positive_amount, &usdc_asset, &destination)
         .await?;
 
     writeln!(stdout, "   Withdrawal initiated: {}", transfer.id)?;
@@ -446,6 +447,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_alpaca() -> Config {
@@ -506,14 +508,11 @@ mod tests {
                 usdc_vault_id: B256::ZERO,
                 redemption_wallet: Address::ZERO,
                 alpaca_account_id,
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc_threshold: ImbalanceThreshold {
-                    target: dec!(0.5),
-                    deviation: dec!(0.1),
-                },
+                usdc: UsdcRebalancingConfig::Disabled,
                 alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),

@@ -18,120 +18,11 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
 use st0x_execution::schwab::SchwabAuthConfig;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum BrokerConfig {
-    Schwab(SchwabAuthConfig),
-    AlpacaTradingApi(AlpacaTradingApiAuthConfig),
-    AlpacaBrokerApi(AlpacaBrokerApiAuthConfig),
-    DryRun,
-}
-
-impl BrokerConfig {
-    pub fn to_supported_executor(&self) -> SupportedExecutor {
-        match self {
-            Self::Schwab(_) => SupportedExecutor::Schwab,
-            Self::AlpacaTradingApi(_) => SupportedExecutor::AlpacaTradingApi,
-            Self::AlpacaBrokerApi(_) => SupportedExecutor::AlpacaBrokerApi,
-            Self::DryRun => SupportedExecutor::DryRun,
-        }
-    }
-}
-
-pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let pool = SqlitePool::connect(database_url).await?;
-
-    // SQLite Concurrency Configuration:
-    //
-    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
-    // all processes. When both main bot and reporter try to write simultaneously,
-    // one will block until the other completes. This is a fundamental SQLite
-    // limitation.
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(&pool)
-        .await?;
-
-    // Busy Timeout: 10 seconds - when a write is blocked by another process,
-    // SQLite will wait up to 10 seconds before failing with "database is locked".
-    // This prevents immediate failures when main bot and reporter write concurrently.
-    //
-    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
-    // to avoid blocking mission-critical main bot operations.
-    //
-    // Future: This limitation will be eliminated when migrating to Kafka +
-    // Elasticsearch with CQRS pattern for separate read/write paths.
-    sqlx::query("PRAGMA busy_timeout = 10000")
-        .execute(&pool)
-        .await?;
-
-    Ok(pool)
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum LogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-impl From<LogLevel> for Level {
-    fn from(log_level: LogLevel) -> Self {
-        match log_level {
-            LogLevel::Trace => Self::TRACE,
-            LogLevel::Debug => Self::DEBUG,
-            LogLevel::Info => Self::INFO,
-            LogLevel::Warn => Self::WARN,
-            LogLevel::Error => Self::ERROR,
-        }
-    }
-}
-
-impl From<&LogLevel> for Level {
-    fn from(log_level: &LogLevel) -> Self {
-        match log_level {
-            LogLevel::Trace => Self::TRACE,
-            LogLevel::Debug => Self::DEBUG,
-            LogLevel::Info => Self::INFO,
-            LogLevel::Warn => Self::WARN,
-            LogLevel::Error => Self::ERROR,
-        }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error(transparent)]
-    Rebalancing(#[from] RebalancingConfigError),
-    #[error("ORDER_OWNER required when rebalancing is disabled")]
-    MissingOrderOwner,
-    #[error("failed to derive address from EVM_PRIVATE_KEY")]
-    PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
-    #[error("failed to read config file")]
-    Io(#[from] std::io::Error),
-    #[error("failed to parse config file")]
-    Toml(#[from] toml::de::Error),
-    #[error("Invalid execution threshold: {0}")]
-    InvalidThreshold(#[from] InvalidThresholdError),
-    #[error("Invalid shares value: {0}")]
-    InvalidShares(#[from] st0x_execution::InvalidSharesError),
-}
-
-#[cfg(test)]
-impl ConfigError {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Rebalancing(_) => "rebalancing configuration error",
-            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
-            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
-            Self::Io(_) => "failed to read config file",
-            Self::Toml(_) => "failed to parse config file",
-            Self::InvalidThreshold(_) => "invalid execution threshold",
-            Self::InvalidShares(_) => "invalid shares value",
-        }
-    }
+#[derive(Parser, Debug)]
+pub struct Env {
+    /// Path to TOML configuration file
+    #[clap(long)]
+    pub config_file: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -264,11 +155,120 @@ impl Config {
     }
 }
 
-#[derive(Parser, Debug)]
-pub struct Env {
-    /// Path to TOML configuration file
-    #[clap(long)]
-    pub config_file: PathBuf,
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum BrokerConfig {
+    Schwab(SchwabAuthConfig),
+    AlpacaTradingApi(AlpacaTradingApiAuthConfig),
+    AlpacaBrokerApi(AlpacaBrokerApiAuthConfig),
+    DryRun,
+}
+
+impl BrokerConfig {
+    pub fn to_supported_executor(&self) -> SupportedExecutor {
+        match self {
+            Self::Schwab(_) => SupportedExecutor::Schwab,
+            Self::AlpacaTradingApi(_) => SupportedExecutor::AlpacaTradingApi,
+            Self::AlpacaBrokerApi(_) => SupportedExecutor::AlpacaBrokerApi,
+            Self::DryRun => SupportedExecutor::DryRun,
+        }
+    }
+}
+
+pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let pool = SqlitePool::connect(database_url).await?;
+
+    // SQLite Concurrency Configuration:
+    //
+    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
+    // all processes. When both main bot and reporter try to write simultaneously,
+    // one will block until the other completes. This is a fundamental SQLite
+    // limitation.
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
+
+    // Busy Timeout: 10 seconds - when a write is blocked by another process,
+    // SQLite will wait up to 10 seconds before failing with "database is locked".
+    // This prevents immediate failures when main bot and reporter write concurrently.
+    //
+    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
+    // to avoid blocking mission-critical main bot operations.
+    //
+    // Future: This limitation will be eliminated when migrating to Kafka +
+    // Elasticsearch with CQRS pattern for separate read/write paths.
+    sqlx::query("PRAGMA busy_timeout = 10000")
+        .execute(&pool)
+        .await?;
+
+    Ok(pool)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl From<LogLevel> for Level {
+    fn from(log_level: LogLevel) -> Self {
+        match log_level {
+            LogLevel::Trace => Self::TRACE,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Error => Self::ERROR,
+        }
+    }
+}
+
+impl From<&LogLevel> for Level {
+    fn from(log_level: &LogLevel) -> Self {
+        match log_level {
+            LogLevel::Trace => Self::TRACE,
+            LogLevel::Debug => Self::DEBUG,
+            LogLevel::Info => Self::INFO,
+            LogLevel::Warn => Self::WARN,
+            LogLevel::Error => Self::ERROR,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(transparent)]
+    Rebalancing(#[from] RebalancingConfigError),
+    #[error("ORDER_OWNER required when rebalancing is disabled")]
+    MissingOrderOwner,
+    #[error("failed to derive address from EVM_PRIVATE_KEY")]
+    PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
+    #[error("failed to read config file")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse config file")]
+    Toml(#[from] toml::de::Error),
+    #[error("Invalid execution threshold: {0}")]
+    InvalidThreshold(#[from] InvalidThresholdError),
+    #[error("Invalid shares value: {0}")]
+    InvalidShares(#[from] st0x_execution::InvalidSharesError),
+}
+
+#[cfg(test)]
+impl ConfigError {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
+            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
+            Self::Io(_) => "failed to read config file",
+            Self::Toml(_) => "failed to parse config file",
+            Self::InvalidThreshold(_) => "invalid execution threshold",
+            Self::InvalidShares(_) => "invalid shares value",
+        }
+    }
 }
 
 pub fn setup_tracing(log_level: &LogLevel) {
@@ -486,26 +486,30 @@ pub(crate) mod tests {
     fn rebalancing_with_schwab_fails() {
         let toml = r#"
             database_url = ":memory:"
+
             [evm]
             ws_rpc_url = "ws://localhost:8545"
             orderbook = "0x1111111111111111111111111111111111111111"
             deployment_block = 1
+
             [broker]
             type = "schwab"
             app_key = "test_key"
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ethereum_rpc_url = "https://mainnet.infura.io"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+
+            [rebalancing.usdc]
+            mode = "disabled"
         "#;
 
         let result = Config::load(toml);
@@ -666,27 +670,31 @@ pub(crate) mod tests {
     fn rebalancing_with_schwab_logs_error_kind() {
         let toml = r#"
             database_url = ":memory:"
+
             [evm]
             ws_rpc_url = "ws://localhost:8545"
             orderbook = "0x1111111111111111111111111111111111111111"
             order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             deployment_block = 1
+
             [broker]
             type = "schwab"
             app_key = "test_key"
             app_secret = "test_secret"
             encryption_key = "0x0000000000000000000000000000000000000000000000000000000000000000"
+
             [rebalancing]
             redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
             ethereum_rpc_url = "https://mainnet.infura.io"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000000001"
-            [rebalancing.equity_threshold]
+
+            [rebalancing.equity]
             target = "0.5"
             deviation = "0.2"
-            [rebalancing.usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+
+            [rebalancing.usdc]
+            mode = "disabled"
         "#;
 
         let result = Config::load(toml);

@@ -103,6 +103,7 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::inventory::view::{Imbalance, ImbalanceThreshold};
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
     use crate::threshold::Usdc;
 
@@ -140,11 +141,11 @@ mod tests {
 
         let trigger = Arc::new(RebalancingTrigger::new(
             RebalancingTriggerConfig {
-                equity_threshold: ImbalanceThreshold {
+                equity: ImbalanceThreshold {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                usdc_threshold: ImbalanceThreshold {
+                usdc: UsdcRebalancingConfig::Enabled {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
@@ -340,7 +341,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn onchain_cash_snapshot_triggers_usdc_rebalancing_check(pool: SqlitePool) {
+    async fn onchain_cash_snapshot_triggers_usdc_check(pool: SqlitePool) {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
@@ -366,7 +367,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn offchain_cash_snapshot_triggers_usdc_rebalancing_check(pool: SqlitePool) {
+    async fn offchain_cash_snapshot_triggers_usdc_check(pool: SqlitePool) {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
@@ -541,7 +542,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn trigger_receives_correct_usdc_rebalancing_amount(pool: SqlitePool) {
+    async fn trigger_receives_correct_usdc_amount(pool: SqlitePool) {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));

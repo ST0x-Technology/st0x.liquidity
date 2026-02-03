@@ -7,6 +7,7 @@ use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
+use rust_decimal::Decimal;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -52,9 +53,15 @@ pub enum RebalancingConfigError {
     InvalidAccountId(#[from] uuid::Error),
 }
 
-/// TOML fields for rebalancing configuration.
-/// Alpaca auth is NOT included here - it's derived from the broker config
-/// to eliminate duplication and ensure consistency.
+/// USDC rebalancing configuration with explicit enable/disable.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum UsdcRebalancingConfig {
+    Enabled { target: Decimal, deviation: Decimal },
+    Disabled,
+}
+
+/// Configuration for rebalancing operations.
 #[derive(Clone, serde::Deserialize)]
 pub(crate) struct RebalancingTomlFields {
     pub(crate) equity_threshold: ImbalanceThreshold,
@@ -69,8 +76,8 @@ pub(crate) struct RebalancingTomlFields {
 /// Constructed from `RebalancingTomlFields` + broker's `AlpacaBrokerApiAuthConfig`.
 #[derive(Clone)]
 pub(crate) struct RebalancingConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
@@ -109,8 +116,8 @@ impl RebalancingConfig {
 impl std::fmt::Debug for RebalancingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingConfig")
-            .field("equity_threshold", &self.equity_threshold)
-            .field("usdc_threshold", &self.usdc_threshold)
+            .field("equity", &self.equity)
+            .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
@@ -124,8 +131,8 @@ impl std::fmt::Debug for RebalancingConfig {
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -321,7 +328,7 @@ impl RebalancingTrigger {
 
         equity::check_imbalance_and_build_operation(
             symbol,
-            &self.config.equity_threshold,
+            &self.config.equity,
             &self.inventory,
             token_address,
         )
@@ -351,15 +358,19 @@ impl RebalancingTrigger {
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
+        let UsdcRebalancingConfig::Enabled { target, deviation } = self.config.usdc else {
+            return;
+        };
+
         let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
         else {
             debug!("Skipped USDC trigger: already in progress");
             return;
         };
 
+        let threshold = ImbalanceThreshold { target, deviation };
         let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&self.config.usdc_threshold, &self.inventory)
-                .await
+            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory).await
         else {
             return;
         };
@@ -625,11 +636,11 @@ mod tests {
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancingConfig::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -1799,11 +1810,12 @@ mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
@@ -1814,18 +1826,19 @@ mod tests {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            mode: Some(st0x_execution::alpaca_broker_api::AlpacaBrokerApiMode::Sandbox),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         }
     }
 
-    #[test]
-    fn deserialize_toml_fields_succeeds() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+        assert_eq!(config.equity.target, dec!(0.5));
+        assert_eq!(config.equity.deviation, dec!(0.2));
 
-        assert_eq!(toml_fields.equity_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.equity_threshold.deviation, dec!(0.2));
-        assert_eq!(toml_fields.usdc_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.usdc_threshold.deviation, dec!(0.3));
+        let UsdcRebalancingConfig::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.5));
+        assert_eq!(deviation, dec!(0.3));
+
         assert_eq!(
             toml_fields.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
@@ -1869,11 +1882,12 @@ mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.6"
             deviation = "0.1"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#;
@@ -1882,10 +1896,14 @@ mod tests {
         let config =
             RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
 
-        assert_eq!(config.equity_threshold.target, dec!(0.6));
-        assert_eq!(config.equity_threshold.deviation, dec!(0.1));
-        assert_eq!(config.usdc_threshold.target, dec!(0.4));
-        assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
+        assert_eq!(config.equity.target, dec!(0.6));
+        assert_eq!(config.equity.deviation, dec!(0.1));
+
+        let UsdcRebalancingConfig::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.4));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -1895,13 +1913,12 @@ mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
@@ -1914,32 +1931,58 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
     }
 
     #[test]
-    fn deserialize_missing_equity_threshold_fails() {
+    fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
         assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+    }
+
+    #[test]
+    fn deserialize_usdc_disabled() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#;
+
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(matches!(config.usdc, UsdcRebalancingConfig::Disabled));
     }
 
     type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;
