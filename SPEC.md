@@ -1668,22 +1668,50 @@ shares at Alpaca.
 
 **Aggregate ID**: UUID for each redeem request
 
+**Lifecycle Pattern**: Uses `Lifecycle<EquityRedemption, Never>` wrapper and
+cqrs-es Services for atomic side-effect execution.
+
+**Services**: `Arc<dyn Redeemer>` - handles vault withdraw and token transfer.
+
+##### State Flow
+
+```text
+(start) --Redeem--> VaultWithdrawn ---> TokensSent ---> Pending ---> Completed
+             |              |               |             |
+             v              v               v             v
+           Failed        Failed          Failed        Failed
+```
+
+- `Redeem` command atomically withdraws from vault and sends to Alpaca
+- `VaultWithdrawn` tracks tokens that left the vault but aren't yet sent
+- `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
+- `Pending` indicates Alpaca detected the transfer
+- `Completed` and `Failed` are terminal states
+
 ##### States
 
 ```rust
 enum EquityRedemption {
-    NotStarted,
+    VaultWithdrawn {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        withdrawn_at: DateTime<Utc>,
+    },
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
         redemption_wallet: Address,
-        tx_hash: TxHash,
+        redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
     },
     Pending {
         symbol: Symbol,
         quantity: Decimal,
-        tx_hash: TxHash,
+        redemption_tx: TxHash,
         tokenization_request_id: String,
         sent_at: DateTime<Utc>,
         detected_at: DateTime<Utc>,
@@ -1691,17 +1719,17 @@ enum EquityRedemption {
     Completed {
         symbol: Symbol,
         quantity: Decimal,
-        tx_hash: TxHash,
+        redemption_tx: TxHash,
         tokenization_request_id: String,
         completed_at: DateTime<Utc>,
     },
     Failed {
         symbol: Symbol,
         quantity: Decimal,
-        tx_hash: Option<TxHash>,
+        vault_withdraw_tx: Option<TxHash>,
+        redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<String>,
         reason: String,
-        sent_at: Option<DateTime<Utc>>,
         failed_at: DateTime<Utc>,
     },
 }
@@ -1711,16 +1739,21 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    SendTokens {
+    // Atomic command: withdraws from vault and sends to Alpaca via Redeemer
+    Redeem {
         symbol: Symbol,
         quantity: Decimal,
-        redemption_wallet: Address,
+        token: Address,
+        amount: U256,
     },
     Detect {
         tokenization_request_id: String,
     },
     Complete,
-    Fail {
+    FailDetection {
+        reason: String,
+    },
+    RejectRedemption {
         reason: String,
     },
 }
@@ -1730,36 +1763,71 @@ enum EquityRedemptionCommand {
 
 ```rust
 enum EquityRedemptionEvent {
-    TokensSent {
+    VaultWithdrawn {
         symbol: Symbol,
         quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        withdrawn_at: DateTime<Utc>,
+    },
+    TokensSent {
         redemption_wallet: Address,
-        tx_hash: TxHash,
+        redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
     },
     Detected {
         tokenization_request_id: String,
         detected_at: DateTime<Utc>,
     },
+    DetectionFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
     Completed {
         completed_at: DateTime<Utc>,
     },
-    Failed {
+    RedemptionRejected {
         reason: String,
-        failed_at: DateTime<Utc>,
+        rejected_at: DateTime<Utc>,
     },
 }
 ```
 
+##### Redeemer Service Trait
+
+The aggregate uses cqrs-es Services to execute side effects atomically:
+
+```rust
+#[async_trait]
+trait Redeemer: Send + Sync {
+    async fn withdraw_from_vault(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<TxHash, RedeemError>;
+
+    async fn send_for_redemption(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<(Address, TxHash), RedeemError>;
+}
+```
+
+`RedemptionService` implements `Redeemer` by composing `VaultService` and
+`AlpacaTokenizationService`.
+
 ##### Business Rules
 
-- Can only send tokens from NotStarted state
-- Redemption transitions to Pending when detected in Alpaca API (via polling GET
-  /v2/tokenization/requests)
-- API returns status values: "pending", "completed", or "rejected"
-- Completed state indicates shares have been journaled to AP's account
-- Can mark failed from any non-terminal state (captures both API rejections and
-  internal failures)
+- `Redeem` command calls `Redeemer::withdraw_from_vault`, emits `VaultWithdrawn`
+- On success, calls `Redeemer::send_for_redemption`, emits `TokensSent`
+- If vault withdraw succeeds but send fails, aggregate stays in `VaultWithdrawn`
+  (tokens are in wallet, not stranded)
+- `Detect` only valid from `TokensSent` state
+- `Complete` only valid from `Pending` state
+- `FailDetection` only valid from `TokensSent` state
+- `RejectRedemption` only valid from `Pending` state
+- Terminal states (`Completed`, `Failed`) reject all commands
 
 #### UsdcRebalance Aggregate
 
@@ -2174,11 +2242,13 @@ know about cross-venue inventory.
   available
 - `TokenizedEquityMintEvent::MintFailed` - Reconciles inflight back to offchain
   available
-- `EquityRedemptionEvent::TokensSent` - Moves tokens to inflight (sent to
-  redemption wallet)
+- `EquityRedemptionEvent::VaultWithdrawn` - Moves tokens to inflight (left
+  vault)
+- `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
 - `EquityRedemptionEvent::Completed` - Moves from inflight to offchain available
-- `EquityRedemptionEvent::Failed` - Reconciles inflight back to onchain
-  available
+- `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
+- `EquityRedemptionEvent::RedemptionRejected` - Reconciles inflight back to
+  onchain available (tokens returned by Alpaca)
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::RebalancingCompleted` - Moves from inflight to
