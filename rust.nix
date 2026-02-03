@@ -87,6 +87,18 @@ let
   '';
 
 in {
+  # DTO crate - needs submodules for workspace resolution but not sqlx
+  dto = craneLib.buildPackage (commonArgs // {
+    pname = "st0x-dto";
+    cargoExtraArgs = "-p st0x-dto";
+    # No sqlx setup needed, no tests
+    doCheck = false;
+    meta = {
+      description = "st0x DTO types for TypeScript codegen";
+      homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
+    };
+  });
+
   # Main package with all binaries
   package = craneLib.buildPackage (commonArgs // {
     inherit cargoArtifacts;

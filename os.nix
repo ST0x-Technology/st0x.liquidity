@@ -11,6 +11,7 @@ let
   mkService = name: cfg: {
     description = "st0x ${cfg.bin} (${name})";
     wantedBy = [ "multi-user.target" ];
+    restartIfChanged = false;
     unitConfig.ConditionPathExists =
       "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
     serviceConfig = {

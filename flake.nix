@@ -66,13 +66,15 @@
         in rainixPkgs // deployPkgs // {
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
+          st0x-dto = st0xRust.dto;
+
           st0x-liquidity = st0xRust.package;
 
           st0x-clippy = st0xRust.clippy;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
-            codegen = packages.st0x-liquidity;
+            codegen = packages.st0x-dto;
           };
 
           prepSolArtifacts = rainix.mkTask.${system} {

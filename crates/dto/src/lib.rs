@@ -11,7 +11,7 @@ use ts_rs::TS;
 
 /// Messages sent from the server to WebSocket clients.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum ServerMessage {
     Initial(Box<InitialState>),
@@ -19,7 +19,7 @@ pub enum ServerMessage {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct InitialState {
     pub recent_trades: Vec<Trade>,
@@ -48,7 +48,7 @@ impl InitialState {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 pub struct EventStoreEntry {
     pub aggregate_type: String,
     pub aggregate_id: String,
@@ -60,7 +60,7 @@ pub struct EventStoreEntry {
 
 /// Placeholder for trade information.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct Trade {
     pub id: String,
@@ -68,7 +68,7 @@ pub struct Trade {
 
 /// Position information for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct Position {
     pub symbol: String,
@@ -77,7 +77,7 @@ pub struct Position {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct SymbolInventory {
     pub symbol: String,
@@ -90,7 +90,7 @@ pub struct SymbolInventory {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct UsdcInventory {
     #[ts(type = "string")]
@@ -100,7 +100,7 @@ pub struct UsdcInventory {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct Inventory {
     pub per_symbol: Vec<SymbolInventory>,
@@ -120,7 +120,7 @@ impl Inventory {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 pub struct PnL {
     #[ts(type = "string")]
     pub absolute: Decimal,
@@ -129,7 +129,7 @@ pub struct PnL {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct TimeframeMetrics {
     #[ts(type = "string")]
@@ -172,7 +172,7 @@ impl TimeframeMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 pub struct PerformanceMetrics {
     #[serde(rename = "1h")]
     pub one_hour: TimeframeMetrics,
@@ -199,7 +199,7 @@ impl PerformanceMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadSummary {
     pub symbol: String,
@@ -215,7 +215,7 @@ pub struct SpreadSummary {
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct SpreadUpdate {
     pub symbol: String,
@@ -232,7 +232,7 @@ pub struct SpreadUpdate {
 
 /// Placeholder for rebalance operation tracking.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
 pub struct RebalanceOperation {
     pub id: String,
@@ -240,7 +240,7 @@ pub struct RebalanceOperation {
 
 /// Circuit breaker status for the trading system.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CircuitBreakerStatus {
     Active,
@@ -248,7 +248,7 @@ pub enum CircuitBreakerStatus {
 
 /// Authentication status for broker connections.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
+#[ts(export, export_to = "../../../dashboard/src/lib/api/")]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AuthStatus {
     NotConfigured,

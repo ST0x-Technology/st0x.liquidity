@@ -5,20 +5,13 @@ concurrency:
   group: ${{ github.ref }}-ci
   cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
-# Setting any permission drops all others to "none" by default,
-# so we explicitly list every permission we need.
 permissions:
-  # Required by magic-nix-cache-action to authenticate
-  # with the GitHub Actions cache API.
   id-token: write
-
-  # check out the repository
   contents: read
 
 jobs:
-  build:
+  rust:
     runs-on: ubuntu-latest
-
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -39,6 +32,22 @@ jobs:
       - name: Clippy
         run: nix build --impure .#st0x-clippy
 
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
       - name: Check bun.nix is up to date
         run: |
           nix run .#genBunNix
@@ -47,6 +56,22 @@ jobs:
 
       - name: Dashboard
         run: nix build --impure .#st0x-dashboard
+
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
 
       - name: Flake checks
         run: nix flake check --impure
