@@ -201,10 +201,6 @@ fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintErro
         .ok_or(MintError::DecimalOverflow(value))?;
     let truncated = scaled.trunc();
 
-    if scaled != truncated {
-        return Err(MintError::PrecisionLoss(value));
-    }
-
     Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
 }
 
