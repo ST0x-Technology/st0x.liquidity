@@ -2,7 +2,5 @@
 
 /**
  * Placeholder for rebalance operation tracking.
- *
- * Note: Full type structure will be added when rebalance panel is implemented.
  */
 export type RebalanceOperation = { id: string, };

@@ -74,7 +74,6 @@
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
-            codegen = packages.st0x-dto;
           };
 
           prepSolArtifacts = rainix.mkTask.${system} {
@@ -176,8 +175,11 @@
         formatter = pkgs.nixfmt-classic;
 
         devShells.default = pkgs.mkShell {
-          inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
+          shellHook = ''
+            ${rainix.devShells.${system}.default.shellHook}
+            export TS_RS_EXPORT_DIR="$PWD"
+          '';
           DATABASE_URL = "sqlite:liquidity.db";
           buildInputs = with pkgs;
             [

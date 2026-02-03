@@ -2,7 +2,5 @@
 
 /**
  * Placeholder for trade information.
- *
- * Note: Full type structure will be added when trades panel is implemented.
  */
 export type Trade = { id: string, };

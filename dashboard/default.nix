@@ -1,4 +1,4 @@
-{ pkgs, bun2nix, codegen }:
+{ pkgs, bun2nix }:
 
 let bunDeps = bun2nix.fetchBunDeps { bunNix = ./bun.nix; };
 in pkgs.stdenv.mkDerivation {
@@ -19,11 +19,6 @@ in pkgs.stdenv.mkDerivation {
   dontRunLifecycleScripts = true;
 
   buildPhase = ''
-    set -eo pipefail
-
-    # Generate TypeScript types from Rust definitions
-    ${codegen}/bin/codegen
-
     cd dashboard
     bun run build
   '';

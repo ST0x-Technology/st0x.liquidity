@@ -2,7 +2,5 @@
 
 /**
  * Position information for a symbol.
- *
- * Note: Fields will be expanded when position tracking is implemented.
  */
 export type Position = { symbol: string, net: string, };

@@ -2,7 +2,5 @@
 
 /**
  * Circuit breaker status for the trading system.
- *
- * Note: Tripped variant will be added when circuit breaker logic is implemented.
  */
 export type CircuitBreakerStatus = { "status": "active" };

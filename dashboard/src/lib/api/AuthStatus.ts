@@ -2,8 +2,5 @@
 
 /**
  * Authentication status for broker connections.
- *
- * Note: Additional variants (Valid, ExpiringSoon, Expired) will be added
- * when auth status monitoring is implemented.
  */
 export type AuthStatus = { "status": "not_configured" };

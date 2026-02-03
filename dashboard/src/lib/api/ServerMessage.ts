@@ -4,8 +4,5 @@ import type { InitialState } from "./InitialState";
 
 /**
  * Messages sent from the server to WebSocket clients.
- *
- * Note: Variants for future message types (trades, positions, metrics, etc.)
- * will be added as their respective dashboard panels are implemented.
  */
 export type ServerMessage = { "type": "initial", "data": InitialState } | { "type": "event", "data": EventStoreEntry };
