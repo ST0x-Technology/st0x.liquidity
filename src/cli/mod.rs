@@ -1,4 +1,10 @@
 //! CLI commands for trading, asset transfers, and authentication.
+//!
+//! CLI code doesn't run in production event processing paths and doesn't share
+//! persistence with the server. The wiring bugs that `disallowed_methods` guards
+//! against aren't a concern here.
+
+#![allow(clippy::disallowed_methods)]
 
 mod alpaca_wallet;
 mod auth;

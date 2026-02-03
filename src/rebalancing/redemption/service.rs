@@ -111,11 +111,12 @@ where
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, address, b256};
     use cqrs_es::persist::GenericQuery;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
     use sqlx::SqlitePool;
     use st0x_execution::Symbol;
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryCommand};
 
@@ -136,7 +137,7 @@ mod tests {
         ));
 
         let query = Arc::new(GenericQuery::new(view_repo.clone()));
-        let cqrs = sqlite_cqrs::<VaultRegistryAggregate>(
+        let cqrs = test_cqrs::<VaultRegistryAggregate>(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),

@@ -1,20 +1,23 @@
 #[cfg(test)]
 mod builder;
-mod wire;
+mod manifest;
+pub(crate) mod wire;
 
 use std::sync::Arc;
+
+use manifest::QueryManifest;
 use std::time::Duration;
+use wire::{Cons, CqrsBuilder, Nil, UnwiredQuery};
 
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::Query;
 use cqrs_es::persist::GenericQuery;
 use futures_util::{Stream, StreamExt};
 use rust_decimal::Decimal;
-use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tokio::sync::broadcast;
@@ -34,12 +37,12 @@ use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::Config;
 use crate::dashboard::ServerMessage;
-use crate::equity_redemption::{EquityRedemption, Redeemer};
+use crate::equity_redemption::Redeemer;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
-use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
+use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
@@ -58,16 +61,14 @@ use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
-use crate::rebalancing::redemption::{RedemptionService, build_redemption_queries};
+use crate::rebalancing::redemption::RedemptionService;
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
-    RedemptionDependencies, build_rebalancing_queries, spawn_rebalancer,
+    RedemptionDependencies, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
-use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
 #[cfg(test)]
 pub(crate) use builder::ConductorBuilder;
@@ -263,14 +264,17 @@ where
 
     let cache = SymbolCache::default();
     let inventory = Arc::new(RwLock::new(InventoryView::default()));
-    let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 
-    let (trigger, rebalancer) = match config.rebalancing_config() {
-        Some(rebalancing_config) => {
+    let (onchain_trade_cqrs, ()) =
+        CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(());
+    let onchain_trade_cqrs = Arc::new(onchain_trade_cqrs);
+
+    let (position_cqrs, position_query, trigger, rebalancer) =
+        if let Some(rebalancing_config) = config.rebalancing_config() {
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let market_maker_wallet = signer.address();
 
-            let (trigger, rebalancer_handle) = spawn_rebalancing_infrastructure(
+            let infra = spawn_rebalancing_infrastructure(
                 rebalancing_config,
                 pool,
                 config,
@@ -281,12 +285,26 @@ where
             )
             .await?;
 
-            (Some(trigger), Some(rebalancer_handle))
-        }
-        None => (None, None),
-    };
+            (
+                infra.position_cqrs,
+                infra.position_query,
+                Some(infra.rebalancing_trigger),
+                Some(infra.handle),
+            )
+        } else {
+            let position_view_repo = Arc::new(SqliteViewRepository::new(
+                pool.clone(),
+                "position_view".to_string(),
+            ));
+            let position_view: UnwiredQuery<_, Cons<PositionAggregate, Nil>> =
+                UnwiredQuery::new(GenericQuery::new(position_view_repo.clone()));
+            let (position_cqrs, (position_view, ())) =
+                CqrsBuilder::new(pool.clone()).wire(position_view).build(());
+            let position_query = Arc::new(GenericQuery::new(position_view_repo));
+            let _position_view = position_view.into_inner();
 
-    let (position_cqrs, position_query) = build_position_cqrs(pool, trigger.as_ref());
+            (Arc::new(position_cqrs), position_query, None, None)
+        };
 
     let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
         OffchainOrderAggregate,
@@ -294,23 +312,26 @@ where
     >::new(
         pool.clone(), "offchain_order_view".to_string()
     ));
+    let offchain_order_view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
+        UnwiredQuery::new(GenericQuery::new(offchain_order_view_repo));
+
     let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor.clone()));
-    let offchain_order_cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-        order_placer,
-    ));
+    let (offchain_order_cqrs, (offchain_order_view, ())) = CqrsBuilder::new(pool.clone())
+        .wire(offchain_order_view)
+        .build(order_placer);
+    let _offchain_order_view = offchain_order_view.into_inner();
+    let offchain_order_cqrs = Arc::new(offchain_order_cqrs);
 
     let inventory_poller = match config.order_owner() {
         Ok(order_owner) => {
             let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
 
-            let snapshot_query = InventorySnapshotQuery::new(inventory.clone(), trigger);
-            let snapshot_cqrs = sqlite_cqrs(
-                pool.clone(),
-                vec![Box::new(snapshot_query) as Box<dyn Query<InventorySnapshotAggregate>>],
-                (),
-            );
+            let snapshot_query: UnwiredQuery<_, Cons<InventorySnapshotAggregate, Nil>> =
+                UnwiredQuery::new(InventorySnapshotQuery::new(inventory.clone(), trigger));
+            let (snapshot_cqrs, (snapshot_query, ())) = CqrsBuilder::new(pool.clone())
+                .wire(snapshot_query)
+                .build(());
+            let _snapshot_query = snapshot_query.into_inner();
 
             Some(spawn_inventory_poller(
                 pool.clone(),
@@ -371,7 +392,8 @@ where
     let (event_sender, event_receiver) =
         tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();
 
-    let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+    let (vault_registry_cqrs, ()) =
+        CqrsBuilder::<VaultRegistryAggregate>::new(pool.clone()).build(());
 
     let order_poller = spawn_order_poller(
         config,
@@ -469,6 +491,13 @@ impl Conductor {
     }
 }
 
+struct RebalancingInfrastructure {
+    position_cqrs: Arc<PositionCqrs>,
+    position_query: Arc<PositionQuery>,
+    rebalancing_trigger: Arc<RebalancingTrigger>,
+    handle: JoinHandle<()>,
+}
+
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
     rebalancing_config: &RebalancingConfig,
     pool: &SqlitePool,
@@ -477,13 +506,13 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
     market_maker_wallet: Address,
-) -> anyhow::Result<(Arc<RebalancingTrigger>, JoinHandle<()>)> {
+) -> anyhow::Result<RebalancingInfrastructure> {
     info!("Initializing rebalancing infrastructure");
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
     let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
 
-    let trigger = Arc::new(RebalancingTrigger::new(
+    let manifest = QueryManifest::new(
         RebalancingTriggerConfig {
             equity: rebalancing_config.equity,
             usdc: rebalancing_config.usdc.clone(),
@@ -493,25 +522,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         market_maker_wallet,
         inventory.clone(),
         operation_sender,
-    ));
-
-    let event_broadcast = Some(event_sender);
-
-    let frameworks = RebalancingCqrsFrameworks {
-        mint: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<TokenizedEquityMint>(
-                trigger.clone(),
-                event_broadcast.clone(),
-            ),
-            (),
-        )),
-        usdc: Arc::new(sqlite_cqrs(
-            pool.clone(),
-            build_rebalancing_queries::<UsdcRebalance>(trigger.clone(), event_broadcast.clone()),
-            (),
-        )),
-    };
+        event_sender,
+    );
 
     let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
         VaultRegistryAggregate,
@@ -521,7 +533,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    // Create services needed for redemption CQRS
     let broker_auth = &rebalancing_config.alpaca_broker_auth;
     let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
@@ -533,9 +544,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_config.redemption_wallet,
     ));
 
-    // Create RedemptionService for use by both the aggregate and the manager.
-    // The concrete type is needed by RedemptionManager for alpaca() access.
-    // The trait object is needed by the CQRS framework for aggregate command handling.
     let redemption_service = Arc::new(RedemptionService::new(
         vault_service.clone(),
         tokenization_service.clone(),
@@ -545,31 +553,19 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     ));
     let redemption_service_for_cqrs: Arc<dyn Redeemer> = redemption_service.clone();
 
-    // Create redemption CQRS with all required query processors
-    let redemption_view_repo = Arc::new(SqliteViewRepository::<
-        Lifecycle<EquityRedemption, Never>,
-        Lifecycle<EquityRedemption, Never>,
-    >::new(
-        pool.clone(), "equity_redemption_view".to_string()
-    ));
-    let redemption_query: Arc<SqliteQuery<EquityRedemption, Never>> =
-        Arc::new(GenericQuery::new(redemption_view_repo.clone()));
-    let redemption_cqrs = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        build_redemption_queries(
-            trigger.clone(),
-            event_broadcast.clone(),
-            redemption_view_repo,
-        ),
-        redemption_service_for_cqrs,
-    ));
+    let (frameworks, queries) = manifest.wire(pool.clone(), redemption_service_for_cqrs);
+
+    let rebalancing_frameworks = RebalancingCqrsFrameworks {
+        mint: frameworks.mint,
+        usdc: frameworks.usdc,
+    };
 
     let redemption_deps = RedemptionDependencies {
         vault_service,
         tokenization_service,
         service: redemption_service,
-        cqrs: redemption_cqrs,
-        query: redemption_query,
+        cqrs: frameworks.redemption,
+        query: queries.redemption_view,
     };
 
     let handle = spawn_rebalancer(
@@ -577,12 +573,17 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         provider.clone(),
         market_maker_wallet,
         operation_receiver,
-        frameworks,
+        rebalancing_frameworks,
         redemption_deps,
     )
     .await?;
 
-    Ok((trigger, handle))
+    Ok(RebalancingInfrastructure {
+        position_cqrs: frameworks.position,
+        position_query: queries.position_view,
+        rebalancing_trigger: queries.rebalancing_trigger,
+        handle,
+    })
 }
 
 async fn wait_for_infrastructure(
@@ -633,35 +634,6 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
     if let Err(e) = result {
         error!("{task_name} task panicked: {e}");
     }
-}
-
-/// Constructs the position CQRS framework with its view query and optional
-/// rebalancing trigger. Used by `start_infrastructure` and integration tests
-/// to ensure the same wiring is tested as runs in production.
-fn build_position_cqrs(
-    pool: &SqlitePool,
-    trigger: Option<&Arc<RebalancingTrigger>>,
-) -> (Arc<PositionCqrs>, Arc<PositionQuery>) {
-    let position_view_repo = Arc::new(SqliteViewRepository::new(
-        pool.clone(),
-        "position_view".to_string(),
-    ));
-    let position_query = GenericQuery::new(position_view_repo.clone());
-
-    let position_queries: Vec<Box<dyn Query<PositionAggregate>>> = std::iter::once(Box::new(
-        GenericQuery::new(position_view_repo),
-    )
-        as Box<dyn Query<PositionAggregate>>)
-    .chain(
-        trigger
-            .iter()
-            .map(|t| Box::new(Arc::clone(t)) as Box<dyn Query<PositionAggregate>>),
-    )
-    .collect();
-
-    let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), position_queries, ()));
-
-    (position_cqrs, Arc::new(position_query))
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
@@ -1731,7 +1703,7 @@ mod tests {
     use cqrs_es::persist::GenericQuery;
     use futures_util::stream;
     use rust_decimal_macros::dec;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::SqliteViewRepository;
     use st0x_execution::{Direction, MockExecutorConfig, Symbol, TryIntoExecutor};
 
     use super::*;
@@ -1758,14 +1730,14 @@ mod tests {
     }
 
     fn create_test_cqrs_frameworks(pool: &SqlitePool) -> CqrsFrameworks {
-        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let onchain_trade_cqrs = Arc::new(wire::test_cqrs(pool.clone(), vec![], ()));
 
         let position_view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
             "position_view".to_string(),
         ));
         let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position_cqrs = Arc::new(sqlite_cqrs(
+        let position_cqrs = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(position_view_repo))],
             (),
@@ -1777,13 +1749,13 @@ mod tests {
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
+        let offchain_order_cqrs = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
             crate::offchain_order::noop_order_placer(),
         ));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
+        let snapshot_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
             pool: pool.clone(),
@@ -2823,7 +2795,7 @@ mod tests {
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2849,7 +2821,7 @@ mod tests {
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2875,7 +2847,7 @@ mod tests {
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let queued_event = create_queued_take_event(order);
@@ -2906,7 +2878,7 @@ mod tests {
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2930,7 +2902,7 @@ mod tests {
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -2963,7 +2935,7 @@ mod tests {
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -3014,14 +2986,14 @@ mod tests {
         pool: &SqlitePool,
         order_placer: crate::offchain_order::OffchainOrderServices,
     ) -> CqrsFrameworks {
-        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let onchain_trade_cqrs = Arc::new(wire::test_cqrs(pool.clone(), vec![], ()));
 
         let position_view_repo = Arc::new(SqliteViewRepository::new(
             pool.clone(),
             "position_view".to_string(),
         ));
         let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position_cqrs = Arc::new(sqlite_cqrs(
+        let position_cqrs = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(position_view_repo))],
             (),
@@ -3033,13 +3005,13 @@ mod tests {
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
+        let offchain_order_cqrs = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
             order_placer,
         ));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
+        let vault_registry_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
+        let snapshot_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
             pool: pool.clone(),
@@ -3575,7 +3547,7 @@ mod tests {
 
         // Seed vault registry so the trigger can resolve the token address.
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
         vault_registry_cqrs
             .execute(
                 &VaultRegistry::aggregate_id(orderbook, order_owner),
@@ -3612,7 +3584,19 @@ mod tests {
             operation_sender,
         ));
 
-        let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
+        let position_view_repo = Arc::new(SqliteViewRepository::<
+            PositionAggregate,
+            PositionAggregate,
+        >::new(pool.clone(), "position_view".to_string()));
+        let position_cqrs = Arc::new(wire::test_cqrs(
+            pool.clone(),
+            vec![
+                Box::new(GenericQuery::new(position_view_repo))
+                    as Box<dyn cqrs_es::Query<PositionAggregate>>,
+                Box::new(trigger.clone()) as Box<dyn cqrs_es::Query<PositionAggregate>>,
+            ],
+            (),
+        ));
 
         let position_agg_id = Position::aggregate_id(&symbol);
 
@@ -3688,7 +3672,19 @@ mod tests {
             operation_sender,
         ));
 
-        let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
+        let position_view_repo = Arc::new(SqliteViewRepository::<
+            PositionAggregate,
+            PositionAggregate,
+        >::new(pool.clone(), "position_view".to_string()));
+        let position_cqrs = Arc::new(wire::test_cqrs(
+            pool.clone(),
+            vec![
+                Box::new(GenericQuery::new(position_view_repo))
+                    as Box<dyn cqrs_es::Query<PositionAggregate>>,
+                Box::new(trigger.clone()) as Box<dyn cqrs_es::Query<PositionAggregate>>,
+            ],
+            (),
+        ));
 
         let position_agg_id = Position::aggregate_id(&symbol);
 
@@ -3782,7 +3778,19 @@ mod tests {
             operation_sender,
         ));
 
-        let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
+        let position_view_repo = Arc::new(SqliteViewRepository::<
+            PositionAggregate,
+            PositionAggregate,
+        >::new(pool.clone(), "position_view".to_string()));
+        let position_cqrs = Arc::new(wire::test_cqrs(
+            pool.clone(),
+            vec![
+                Box::new(GenericQuery::new(position_view_repo))
+                    as Box<dyn cqrs_es::Query<PositionAggregate>>,
+                Box::new(trigger.clone()) as Box<dyn cqrs_es::Query<PositionAggregate>>,
+            ],
+            (),
+        ));
 
         let position_agg_id = Position::aggregate_id(&symbol);
 
@@ -3815,7 +3823,7 @@ mod tests {
 
     /// Sets up an initialized position with 65% onchain / 35% offchain inventory
     /// (within the 30%-70% threshold bounds), a seeded vault registry, and the
-    /// trigger wired into `position_cqrs` via `build_position_cqrs`.
+    /// trigger wired into `position_cqrs`.
     async fn setup_near_upper_threshold_position() -> (
         Arc<PositionCqrs>,
         mpsc::Receiver<TriggeredOperation>,
@@ -3829,7 +3837,7 @@ mod tests {
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            sqlite_cqrs(pool.clone(), vec![], ());
+            wire::test_cqrs(pool.clone(), vec![], ());
         vault_registry_cqrs
             .execute(
                 &VaultRegistry::aggregate_id(orderbook, order_owner),
@@ -3897,7 +3905,19 @@ mod tests {
             operation_sender,
         ));
 
-        let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
+        let position_view_repo = Arc::new(SqliteViewRepository::<
+            PositionAggregate,
+            PositionAggregate,
+        >::new(pool.clone(), "position_view".to_string()));
+        let position_cqrs = Arc::new(wire::test_cqrs(
+            pool.clone(),
+            vec![
+                Box::new(GenericQuery::new(position_view_repo))
+                    as Box<dyn cqrs_es::Query<PositionAggregate>>,
+                Box::new(trigger) as Box<dyn cqrs_es::Query<PositionAggregate>>,
+            ],
+            (),
+        ));
 
         (position_cqrs, receiver, symbol)
     }
@@ -4015,7 +4035,16 @@ mod tests {
 
         // First "session": create position_cqrs, execute commands.
         {
-            let (position_cqrs, position_query) = build_position_cqrs(&pool, None);
+            let position_view_repo = Arc::new(SqliteViewRepository::new(
+                pool.clone(),
+                "position_view".to_string(),
+            ));
+            let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
+            let position_cqrs = Arc::new(wire::test_cqrs(
+                pool.clone(),
+                vec![Box::new(GenericQuery::new(position_view_repo))],
+                (),
+            ));
 
             let position_agg_id = Position::aggregate_id(&symbol);
 
@@ -4048,7 +4077,16 @@ mod tests {
 
         // Second "session": create NEW position_cqrs against the same pool.
         {
-            let (_position_cqrs, position_query) = build_position_cqrs(&pool, None);
+            let position_view_repo = Arc::new(SqliteViewRepository::new(
+                pool.clone(),
+                "position_view".to_string(),
+            ));
+            let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
+            let _position_cqrs: Arc<PositionCqrs> = Arc::new(wire::test_cqrs(
+                pool.clone(),
+                vec![Box::new(GenericQuery::new(position_view_repo))],
+                (),
+            ));
 
             let position = crate::position::load_position(&position_query, &symbol)
                 .await

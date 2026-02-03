@@ -10,42 +10,14 @@ pub(crate) mod service;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
-use cqrs_es::persist::GenericQuery;
-use cqrs_es::{AggregateError, Query};
-use sqlite_es::SqliteViewRepository;
+use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
-use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::broadcast;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::dashboard::{EventBroadcaster, ServerMessage};
-use crate::equity_redemption::{EquityRedemption, EquityRedemptionError, RedemptionAggregateId};
-use crate::lifecycle::{Lifecycle, Never};
-use crate::rebalancing::RebalancingTrigger;
+use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
 
 pub(crate) use service::RedemptionService;
-
-/// Builds the query processors for the EquityRedemption aggregate CQRS framework.
-pub(crate) fn build_redemption_queries(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-    view_repo: Arc<
-        SqliteViewRepository<
-            Lifecycle<EquityRedemption, Never>,
-            Lifecycle<EquityRedemption, Never>,
-        >,
-    >,
-) -> Vec<Box<dyn Query<Lifecycle<EquityRedemption, Never>>>> {
-    let mut queries: Vec<Box<dyn Query<Lifecycle<EquityRedemption, Never>>>> =
-        vec![Box::new(trigger), Box::new(GenericQuery::new(view_repo))];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
-}
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {

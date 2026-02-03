@@ -7,10 +7,8 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::Query;
 use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
@@ -19,16 +17,12 @@ use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{AlpacaBrokerApi, Executor};
 
 use super::usdc::UsdcRebalanceManager;
-use super::{
-    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RedemptionManager,
-    TriggeredOperation,
-};
+use super::{MintManager, Rebalancer, RebalancingConfig, RedemptionManager, TriggeredOperation};
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
-use crate::dashboard::{EventBroadcaster, ServerMessage};
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
 use crate::onchain::http_client_with_retry;
@@ -260,24 +254,6 @@ where
     }
 }
 
-pub(crate) fn build_rebalancing_queries<A>(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<A, Never>>>>
-where
-    Lifecycle<A, Never>: cqrs_es::Aggregate,
-    RebalancingTrigger: Query<Lifecycle<A, Never>>,
-    EventBroadcaster: Query<Lifecycle<A, Never>>,
-{
-    let mut queries: Vec<Box<dyn Query<Lifecycle<A, Never>>>> = vec![Box::new(trigger)];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::node_bindings::Anvil;
@@ -288,13 +264,14 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::SqliteViewRepository;
     use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use st0x_execution::{FractionalShares, Symbol};
     use uuid::Uuid;
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
+    use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
@@ -559,8 +536,8 @@ mod tests {
         });
 
         let pool = crate::test_utils::setup_test_db().await;
-        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let usdc_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+        let usdc_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
 
         let redemption_view_repo = Arc::new(SqliteViewRepository::<
             Lifecycle<EquityRedemption, Never>,
@@ -569,7 +546,7 @@ mod tests {
             pool.clone(), "equity_redemption_view".to_string()
         ));
         let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
-        let redemption_cqrs = Arc::new(sqlite_cqrs(
+        let redemption_cqrs = Arc::new(test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(redemption_view_repo))],
             mock_redeemer_services(),

@@ -256,11 +256,11 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use sqlite_es::sqlite_cqrs;
     use sqlx::Row;
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::VaultRegistryCommand;
@@ -320,7 +320,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -367,7 +367,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -410,7 +410,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -443,7 +443,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         // Should succeed without error
@@ -498,7 +498,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -545,7 +545,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -586,7 +586,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -615,7 +615,7 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = test_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
 
         cqrs.execute(
@@ -637,7 +637,7 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = test_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
 
         cqrs.execute(
@@ -667,7 +667,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -716,7 +716,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -766,7 +766,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -814,7 +814,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -845,7 +845,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();

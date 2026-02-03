@@ -238,7 +238,7 @@ mod tests {
     use cqrs_es::persist::GenericQuery;
     use httpmock::prelude::*;
     use serde_json::json;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
     use sqlx::SqlitePool;
 
     use super::*;
@@ -246,6 +246,7 @@ mod tests {
         TEST_REDEMPTION_WALLET, create_test_service_with_provider,
     };
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::RedemptionServices;
     use crate::equity_redemption::mock::MockRedeemer;
     use crate::onchain::vault::{VaultId, VaultService};
@@ -269,7 +270,7 @@ mod tests {
             pool.clone(), "vault_registry_view".to_string()
         ));
         let query = Arc::new(GenericQuery::new(view_repo.clone()));
-        let cqrs = sqlite_cqrs::<VaultRegistryAggregate>(
+        let cqrs = test_cqrs::<VaultRegistryAggregate>(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),
@@ -291,7 +292,7 @@ mod tests {
             pool.clone(), "equity_redemption_view".to_string()
         ));
         let query = Arc::new(GenericQuery::new(view_repo.clone()));
-        let cqrs = sqlite_cqrs(
+        let cqrs = test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             services,

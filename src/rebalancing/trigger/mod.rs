@@ -605,14 +605,13 @@ impl RebalancingTrigger {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
-    use alloy::primitives::{TxHash, address};
+    use alloy::primitives::{Address, TxHash, U256, address};
     use chrono::Utc;
     use cqrs_es::mem_store::MemStore;
     use cqrs_es::{CqrsFramework, Query};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use sqlite_es::sqlite_cqrs;
-    use st0x_execution::Direction;
+    use st0x_execution::{Direction, ExecutorOrderId};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -621,9 +620,8 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
+    use crate::conductor::wire::test_cqrs;
     use crate::lifecycle::Lifecycle;
-    use st0x_execution::ExecutorOrderId;
-
     use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
@@ -632,7 +630,6 @@ mod tests {
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
     use crate::vault_registry::VaultRegistryCommand;
-    use alloy::primitives::{Address, U256};
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -763,7 +760,7 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = test_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
 
         cqrs.execute(

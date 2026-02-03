@@ -279,9 +279,9 @@ mod tests {
 
     use async_trait::async_trait;
     use cqrs_es::{EventEnvelope, Query, View};
-    use sqlite_es::sqlite_cqrs;
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
@@ -641,7 +641,7 @@ mod tests {
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
 
         // Phase 1: emit an event with NO query processors
-        let bare_cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+        let bare_cqrs = test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
 
         bare_cqrs
             .execute(
@@ -660,7 +660,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let query = EventCounter(counter.clone());
         let observed_cqrs =
-            sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![Box::new(query)], ());
+            test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![Box::new(query)], ());
 
         // Phase 3: emit one more event through the new framework
         let new_vault_id =

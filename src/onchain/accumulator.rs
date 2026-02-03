@@ -110,6 +110,7 @@ mod tests {
     use st0x_execution::{FractionalShares, Positive, SupportedExecutor, Symbol};
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::position::{Position, PositionCommand, PositionCqrs, PositionQuery};
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -120,7 +121,7 @@ mod tests {
             "position_view".to_string(),
         ));
         let position_query = GenericQuery::new(view_repo.clone());
-        let position_cqrs: PositionCqrs = sqlite_es::sqlite_cqrs(
+        let position_cqrs: PositionCqrs = test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),

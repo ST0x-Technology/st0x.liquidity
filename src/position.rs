@@ -681,6 +681,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::offchain_order::OffchainOrder;
     use crate::threshold::Usdc;
 
@@ -1495,7 +1496,7 @@ mod tests {
             "position_view".to_string(),
         ));
         let position_query = GenericQuery::new(view_repo.clone());
-        let position_cqrs: PositionCqrs = sqlite_es::sqlite_cqrs(
+        let position_cqrs: PositionCqrs = test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),
@@ -1537,7 +1538,7 @@ mod tests {
                 "position_view".to_string(),
             ),
         );
-        let position_cqrs: PositionCqrs = sqlite_es::sqlite_cqrs(
+        let position_cqrs: PositionCqrs = test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(view_repo))],
             (),
