@@ -82,6 +82,7 @@ pub(crate) async fn spawn_rebalancer<BP>(
     orderbook: Address,
     market_maker_wallet: Address,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
+    trigger: Arc<RebalancingTrigger>,
     frameworks: RebalancingCqrsFrameworks,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
@@ -103,9 +104,8 @@ where
         config,
         market_maker_wallet,
         operation_receiver,
-        frameworks.mint,
-        frameworks.redemption,
-        frameworks.usdc,
+        trigger,
+        frameworks,
     );
 
     let handle = tokio::spawn(async move {
@@ -202,21 +202,22 @@ where
         config: &RebalancingConfig,
         market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
-        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+        trigger: Arc<RebalancingTrigger>,
+        frameworks: RebalancingCqrsFrameworks,
     ) -> ConfiguredRebalancer<BP> {
-        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
+        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), frameworks.mint));
 
-        let redemption_manager =
-            Arc::new(RedemptionManager::new(self.tokenization, redemption_cqrs));
+        let redemption_manager = Arc::new(RedemptionManager::new(
+            self.tokenization,
+            frameworks.redemption,
+        ));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
             self.broker,
             self.wallet,
             self.cctp,
             self.vault,
-            usdc_cqrs,
+            frameworks.usdc,
             market_maker_wallet,
             VaultId(config.usdc_vault_id),
         ));
@@ -225,6 +226,7 @@ where
             mint_manager,
             redemption_manager,
             usdc_manager,
+            trigger,
             operation_receiver,
             config.redemption_wallet,
         )
@@ -265,8 +267,9 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
-    use crate::inventory::ImbalanceThreshold;
+    use crate::inventory::{ImbalanceThreshold, InventoryView};
     use crate::rebalancing::RebalancingTriggerConfig;
+    use tokio::sync::RwLock;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -474,19 +477,28 @@ mod tests {
 
         let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
 
-        let (_tx, rx) = mpsc::channel(100);
-        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let redemption_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let usdc_cqrs = Arc::new(sqlite_cqrs(pool, vec![], ()));
+        let (trigger_tx, _trigger_rx) = mpsc::channel(10);
+        let trigger = Arc::new(RebalancingTrigger::new(
+            RebalancingTriggerConfig {
+                equity_threshold: config.equity_threshold,
+                usdc_threshold: config.usdc_threshold,
+            },
+            pool.clone(),
+            TEST_ORDERBOOK,
+            Address::ZERO,
+            Arc::new(RwLock::new(InventoryView::default())),
+            trigger_tx,
+        ));
 
-        let _rebalancer = services.into_rebalancer(
-            &config,
-            market_maker_wallet,
-            rx,
-            mint_cqrs,
-            redemption_cqrs,
-            usdc_cqrs,
-        );
+        let (_tx, rx) = mpsc::channel(100);
+        let frameworks = RebalancingCqrsFrameworks {
+            mint: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            redemption: Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
+            usdc: Arc::new(sqlite_cqrs(pool, vec![], ())),
+        };
+
+        let _rebalancer =
+            services.into_rebalancer(&config, market_maker_wallet, rx, trigger, frameworks);
     }
 
     #[tokio::test]
