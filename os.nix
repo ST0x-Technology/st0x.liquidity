@@ -1,7 +1,38 @@
 { pkgs, lib, modulesPath, # dashboard,
 ... }:
 
-let inherit (import ./keys.nix) roles;
+let
+  inherit (import ./keys.nix) roles;
+
+  services = import ./services.nix;
+
+  enabledServices = lib.filterAttrs (_: v: v.enabled) services;
+
+  mkService = name: cfg: {
+    description = "st0x ${cfg.bin} (${name})";
+    wantedBy = [ "multi-user.target" ];
+    unitConfig.ConditionPathExists =
+      "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}";
+    serviceConfig = {
+      DynamicUser = true;
+      SupplementaryGroups = [ "st0x" ];
+      ExecStart = builtins.concatStringsSep " " [
+        "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}"
+        "--config-file"
+        "/run/agenix/${name}.toml"
+      ];
+      Restart = "always";
+      RestartSec = 5;
+      ReadWritePaths = [ "/mnt/data" ];
+    };
+  };
+
+  mkSecret = name: _: {
+    file = ./config/${name}.toml.age;
+    group = "st0x";
+    mode = "0640";
+  };
+
 in {
   imports = [
     (modulesPath + "/virtualisation/digital-ocean-config.nix")
@@ -138,70 +169,16 @@ in {
 
   users.groups.st0x = { };
 
-  age.secrets = let
-    secret = file: {
-      inherit file;
-      group = "st0x";
-      mode = "0640";
-    };
-  in {
-    # "server-schwab.toml" = secret ./config/server-schwab.toml.age;
-    "server-alpaca.toml" = secret ./config/server-alpaca.toml.age;
-    # "reporter-schwab.toml" = secret ./config/reporter-schwab.toml.age;
-    # "reporter-alpaca.toml" = secret ./config/reporter-alpaca.toml.age;
-  };
+  age.secrets = lib.mapAttrs mkSecret enabledServices;
 
-  systemd.services = let
-    mkServer = name: {
-      description = "st0x hedging bot (${name})";
-      wantedBy = [ "multi-user.target" ];
-      unitConfig.ConditionPathExists =
-        "/nix/var/nix/profiles/per-service/server/bin/server";
-      serviceConfig = {
-        DynamicUser = true;
-        SupplementaryGroups = [ "st0x" ];
-        ExecStart = builtins.concatStringsSep " " [
-          "/nix/var/nix/profiles/per-service/server/bin/server"
-          "--config-file"
-          "/run/agenix/${name}.toml"
-        ];
-        Restart = "always";
-        RestartSec = 5;
-        ReadWritePaths = [ "/mnt/data" ];
-      };
-    };
-
-    # mkReporter = name: {
-    #   description = "st0x position reporter (${name})";
-    #   wantedBy = [ "multi-user.target" ];
-    #   unitConfig.ConditionPathExists =
-    #     "/nix/var/nix/profiles/per-service/reporter/bin/reporter";
-    #   serviceConfig = {
-    #     DynamicUser = true;
-    #     SupplementaryGroups = [ "st0x" ];
-    #     ExecStart = builtins.concatStringsSep " " [
-    #       "/nix/var/nix/profiles/per-service/reporter/bin/reporter"
-    #       "--config-file"
-    #       "/run/agenix/${name}.toml"
-    #     ];
-    #     Restart = "always";
-    #     RestartSec = 5;
-    #     ReadWritePaths = [ "/mnt/data" ];
-    #   };
-    # };
-
-  in {
-    # server-schwab = mkServer "server-schwab";
-    server-alpaca = mkServer "server-alpaca";
-    # reporter-schwab = mkReporter "reporter-schwab";
-    # reporter-alpaca = mkReporter "reporter-alpaca";
-  };
+  systemd.services = lib.mapAttrs mkService enabledServices;
 
   environment.systemPackages = with pkgs; [
     bat
     curl
     htop
     magic-wormhole
+    sqlite
     zellij
   ];
 

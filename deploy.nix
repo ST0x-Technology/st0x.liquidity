@@ -8,9 +8,19 @@ let
 
   st0xPackage = self.packages.${system}.st0x-liquidity;
 
-  mkServiceProfile = { services }:
-    activate.custom st0xPackage (builtins.concatStringsSep " && "
-      (map (s: "systemctl restart ${s}") services));
+  mkServiceProfile = name:
+    activate.custom st0xPackage "systemctl restart ${name}";
+
+  services = import ./services.nix;
+
+  enabledServices = builtins.attrNames (builtins.removeAttrs services
+    (builtins.filter (n: !services.${n}.enabled)
+      (builtins.attrNames services)));
+
+  mkProfile = name: {
+    path = mkServiceProfile name;
+    profilePath = "${profileBase}/${name}";
+  };
 
 in {
   config = {
@@ -19,30 +29,14 @@ in {
       sshUser = "root";
       user = "root";
 
-      profilesOrder = [
-        "system"
-        "server" # "reporter"
-      ];
+      profilesOrder = [ "system" ] ++ enabledServices;
 
       profiles = {
         system.path = activate.nixos self.nixosConfigurations.st0x-liquidity;
-
-        server = {
-          path = mkServiceProfile {
-            services = [ # "server-schwab"
-              "server-alpaca"
-            ];
-          };
-          profilePath = "${profileBase}/server";
-        };
-
-        # reporter = {
-        #   path = mkServiceProfile {
-        #     services = [ "reporter-schwab" "reporter-alpaca" ];
-        #   };
-        #   profilePath = "${profileBase}/reporter";
-        # };
-      };
+      } // builtins.listToAttrs (map (name: {
+        inherit name;
+        value = mkProfile name;
+      }) enabledServices);
     };
   };
 

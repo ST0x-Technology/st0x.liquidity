@@ -12,6 +12,8 @@
     bun2nix.url = "github:nix-community/bun2nix?tag=2.0.7";
     bun2nix.inputs.nixpkgs.follows = "rainix/nixpkgs";
 
+    crane.url = "github:ipetkov/crane";
+
     disko.url = "github:nix-community/disko";
     disko.inputs.nixpkgs.follows = "rainix/nixpkgs";
 
@@ -20,7 +22,7 @@
   };
 
   outputs = { self, flake-utils, rainix, bun2nix, ragenix, deploy-rs, disko
-    , nixos-anywhere, ... }:
+    , nixos-anywhere, crane, ... }:
     {
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
@@ -45,10 +47,8 @@
             builtins.elem (pkgs.lib.getName pkg) [ "terraform" ];
         };
 
-        rustPlatform = pkgs.makeRustPlatform {
-          cargo = rainix.rust-toolchain.${system};
-          rustc = rainix.rust-toolchain.${system};
-        };
+        craneLib =
+          (crane.mkLib pkgs).overrideToolchain rainix.rust-toolchain.${system};
       in rec {
         packages = let
           rainixPkgs = rainix.packages.${system};
@@ -58,25 +58,17 @@
               inherit pkgs infraPkgs;
               localSystem = system;
             };
-        in rainixPkgs // deployPkgs // {
-          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
-
-          st0x-liquidity = pkgs.callPackage ./rust.nix {
-            inherit rustPlatform;
+          st0xRust = pkgs.callPackage ./rust.nix {
+            inherit craneLib;
             inherit (pkgs) sqlx-cli;
             sol-build-inputs = rainix.sol-build-inputs.${system};
           };
+        in rainixPkgs // deployPkgs // {
+          inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
-          st0x-clippy = packages.st0x-liquidity.overrideAttrs (_: {
-            pname = "st0x-clippy";
-            buildPhase = ''
-              runHook preBuild
-              cargo clippy --all-targets --all-features -- -D clippy::all
-              runHook postBuild
-            '';
-            installPhase = "touch $out";
-            doCheck = false;
-          });
+          st0x-liquidity = st0xRust.package;
+
+          st0x-clippy = st0xRust.clippy;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
@@ -184,6 +176,7 @@
         devShells.default = pkgs.mkShell {
           inherit (rainix.devShells.${system}.default) shellHook;
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
+          DATABASE_URL = "sqlite:liquidity.db";
           buildInputs = with pkgs;
             [
               bun
