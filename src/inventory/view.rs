@@ -507,8 +507,32 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         match event {
-            EquityRedemptionEvent::TokensSent { .. } => {
+            EquityRedemptionEvent::VaultWithdrawn { .. } => {
                 self.update_equity(symbol, |inv| inv.move_onchain_to_inflight(quantity), now)
+            }
+
+            EquityRedemptionEvent::SendFailed { .. } => {
+                // Vault withdraw succeeded but send failed - keep inflight until resolved.
+                Ok(Self {
+                    last_updated: now,
+                    ..self
+                })
+            }
+
+            EquityRedemptionEvent::TokensSent { .. } => {
+                // Tokens already in inflight from VaultWithdrawn, no balance change.
+                Ok(Self {
+                    last_updated: now,
+                    ..self
+                })
+            }
+
+            EquityRedemptionEvent::DetectionFailed { .. } => {
+                // Tokens were sent but detection failed - keep inflight until resolved.
+                Ok(Self {
+                    last_updated: now,
+                    ..self
+                })
             }
 
             EquityRedemptionEvent::Detected { .. } => Ok(Self {
@@ -516,8 +540,8 @@ impl InventoryView {
                 ..self
             }),
 
-            EquityRedemptionEvent::DetectionFailed { .. } => {
-                // Tokens were sent but detection failed - keep inflight until resolved.
+            EquityRedemptionEvent::RedemptionRejected { .. } => {
+                // Rejection after detection - keep inflight until manually resolved.
                 Ok(Self {
                     last_updated: now,
                     ..self
@@ -532,14 +556,6 @@ impl InventoryView {
                 },
                 now,
             ),
-
-            EquityRedemptionEvent::RedemptionRejected { .. } => {
-                // Rejection after detection - keep inflight until manually resolved.
-                Ok(Self {
-                    last_updated: now,
-                    ..self
-                })
-            }
         }
     }
 
@@ -1328,12 +1344,20 @@ mod tests {
         assert_eq!(equity.offchain.available(), shares(50));
     }
 
-    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokensSent {
+    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawn {
             symbol: symbol.clone(),
             quantity,
+            token: Address::random(),
+            vault_withdraw_tx: TxHash::random(),
+            withdrawn_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_sent() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
             redemption_wallet: Address::random(),
-            tx_hash: TxHash::random(),
+            redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
         }
     }
@@ -1366,10 +1390,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_tokens_sent_moves_onchain_to_inflight() {
+    fn apply_vault_withdrawn_moves_onchain_to_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
-        let event = make_tokens_sent(&symbol, dec!(30));
+        let event = make_vault_withdrawn(&symbol, dec!(30));
 
         let updated = view
             .apply_redemption_event(&symbol, &event, shares(30), Utc::now())
@@ -1456,11 +1480,11 @@ mod tests {
         // Initial state: 100 onchain, 100 offchain
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
 
-        // TokensSent: Move 30 from onchain available to inflight
+        // VaultWithdrawn: Move 30 from onchain available to inflight
         let view = view
             .apply_redemption_event(
                 &symbol,
-                &make_tokens_sent(&symbol, dec!(30)),
+                &make_vault_withdrawn(&symbol, dec!(30)),
                 quantity,
                 Utc::now(),
             )
@@ -1468,6 +1492,11 @@ mod tests {
         let inv = view.equities.get(&symbol).unwrap();
         assert_eq!(inv.onchain.total().unwrap().inner(), Decimal::from(100));
         assert!(inv.has_inflight());
+
+        // TokensSent: No balance change (already inflight)
+        let view = view
+            .apply_redemption_event(&symbol, &make_tokens_sent(), quantity, Utc::now())
+            .unwrap();
 
         // Detected: No balance change
         let view = view
@@ -1496,13 +1525,19 @@ mod tests {
 
         let view = make_view(vec![(symbol.clone(), inventory(100, 0, 100, 0))]);
 
+        // VaultWithdrawn: Move 30 from onchain available to inflight
         let view = view
             .apply_redemption_event(
                 &symbol,
-                &make_tokens_sent(&symbol, dec!(30)),
+                &make_vault_withdrawn(&symbol, dec!(30)),
                 quantity,
                 Utc::now(),
             )
+            .unwrap();
+
+        // TokensSent: No balance change
+        let view = view
+            .apply_redemption_event(&symbol, &make_tokens_sent(), quantity, Utc::now())
             .unwrap();
 
         let view = view

@@ -22,11 +22,11 @@ use crate::alpaca_tokenization::{
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::config::{BrokerCtx, Ctx};
-use crate::equity_redemption::RedemptionAggregateId;
+use crate::equity_redemption::{EquityRedemption, Redeemer, RedemptionAggregateId};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::mint::Mint;
-use crate::rebalancing::redemption::Redeem;
+use crate::rebalancing::redemption::{Redeem, RedemptionService};
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::threshold::Usdc;
@@ -108,14 +108,24 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let owner = signer.address();
             let vault = Arc::new(VaultService::new(base_provider, config.evm.orderbook));
 
-            let redemption_store = Arc::new(StoreBuilder::new(pool.clone()).build(()).await?);
-
             let vault_registry_query =
                 Arc::new(Projection::<VaultRegistry>::sqlite(pool.clone())?);
 
-            let redemption_manager = RedemptionManager::new(
-                tokenization_service,
+            let redemption_service: Arc<dyn Redeemer> = Arc::new(RedemptionService::new(
                 vault,
+                tokenization_service,
+                vault_registry_query.clone(),
+                config.evm.orderbook,
+                owner,
+            ));
+
+            let redemption_store = Arc::new(
+                StoreBuilder::new(pool.clone())
+                    .build(redemption_service)
+                    .await?,
+            );
+
+            let redemption_manager = RedemptionManager::new(
                 redemption_store,
                 vault_registry_query,
                 config.evm.orderbook,

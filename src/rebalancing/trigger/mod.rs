@@ -424,7 +424,7 @@ impl RebalancingTrigger {
     ) -> Option<(Symbol, FractionalShares)> {
         use EquityRedemptionEvent::*;
 
-        if let TokensSent {
+        if let VaultWithdrawn {
             symbol, quantity, ..
         } = event
         {
@@ -439,7 +439,10 @@ impl RebalancingTrigger {
 
         matches!(
             event,
-            Completed { .. } | DetectionFailed { .. } | RedemptionRejected { .. }
+            Completed { .. }
+                | SendFailed { .. }
+                | DetectionFailed { .. }
+                | RedemptionRejected { .. }
         )
     }
 
@@ -1130,12 +1133,20 @@ mod tests {
         ));
     }
 
-    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokensSent {
+    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawn {
             symbol: symbol.clone(),
             quantity,
+            token: Address::random(),
+            vault_withdraw_tx: TxHash::random(),
+            withdrawn_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_sent() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
             redemption_wallet: Address::random(),
-            tx_hash: TxHash::random(),
+            redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
         }
     }
@@ -1185,11 +1196,7 @@ mod tests {
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger
-            .apply_redemption_event_to_inventory(
-                &symbol,
-                &make_tokens_sent(&symbol, dec!(30)),
-                shares(30),
-            )
+            .apply_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1244,7 +1251,7 @@ mod tests {
     #[test]
     fn extract_redemption_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_tokens_sent(&symbol, dec!(42.5));
+        let event = make_vault_withdrawn(&symbol, dec!(42.5));
 
         let (extracted_symbol, extracted_quantity) =
             RebalancingTrigger::extract_redemption_info(&event).unwrap();
@@ -1263,7 +1270,7 @@ mod tests {
     fn non_terminal_redemption_events_are_not_terminal() {
         let symbol = Symbol::new("AAPL").unwrap();
         assert!(!RebalancingTrigger::is_terminal_redemption_event(
-            &make_tokens_sent(&symbol, dec!(30))
+            &make_vault_withdrawn(&symbol, dec!(30))
         ));
         assert!(!RebalancingTrigger::is_terminal_redemption_event(
             &make_redemption_detected()
