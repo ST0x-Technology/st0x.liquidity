@@ -455,188 +455,6 @@ impl Conductor {
 // to support the TradingTasks separation architecture from our branch.
 // The functions below use old types (Config, sqlite_cqrs, SqliteViewRepository,
 // GenericQuery, PositionCqrs, OffchainOrderCqrs) that no longer exist.
-=======
-    let cache = SymbolCache::default();
-    let inventory = Arc::new(RwLock::new(InventoryView::default()));
-
-    let (onchain_trade_cqrs, ()) =
-        CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(());
-    let onchain_trade_cqrs = Arc::new(onchain_trade_cqrs);
-
-    let (position_cqrs, position_query, trigger, rebalancer) =
-        if let Some(rebalancing_config) = config.rebalancing_config() {
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let market_maker_wallet = signer.address();
-
-            let infra = spawn_rebalancing_infrastructure(
-                rebalancing_config,
-                pool,
-                config,
-                &inventory,
-                event_sender,
-                &provider,
-                market_maker_wallet,
-            )
-            .await?;
-
-            (
-                infra.position_cqrs,
-                infra.position_query,
-                Some(infra.rebalancing_trigger),
-                Some(infra.handle),
-            )
-        } else {
-            let position_view_repo = Arc::new(SqliteViewRepository::new(
-                pool.clone(),
-                "position_view".to_string(),
-            ));
-            let position_view: UnwiredQuery<_, Cons<PositionAggregate, Nil>> =
-                UnwiredQuery::new(GenericQuery::new(position_view_repo.clone()));
-            let (position_cqrs, (position_view, ())) =
-                CqrsBuilder::new(pool.clone()).wire(position_view).build(());
-            let position_query = Arc::new(GenericQuery::new(position_view_repo));
-            let _position_view = position_view.into_inner();
-
-            (Arc::new(position_cqrs), position_query, None, None)
-        };
-
-    let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-        OffchainOrderAggregate,
-        OffchainOrderAggregate,
-    >::new(
-        pool.clone(), "offchain_order_view".to_string()
-    ));
-    let offchain_order_view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
-        UnwiredQuery::new(GenericQuery::new(offchain_order_view_repo));
-
-    let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor.clone()));
-    let (offchain_order_cqrs, (offchain_order_view, ())) = CqrsBuilder::new(pool.clone())
-        .wire(offchain_order_view)
-        .build(order_placer);
-    let _offchain_order_view = offchain_order_view.into_inner();
-    let offchain_order_cqrs = Arc::new(offchain_order_cqrs);
-
-    let inventory_poller = match config.order_owner() {
-        Ok(order_owner) => {
-            let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
-
-            let snapshot_query: UnwiredQuery<_, Cons<InventorySnapshotAggregate, Nil>> =
-                UnwiredQuery::new(InventorySnapshotQuery::new(inventory.clone(), trigger));
-            let (snapshot_cqrs, (snapshot_query, ())) = CqrsBuilder::new(pool.clone())
-                .wire(snapshot_query)
-                .build(());
-            let _snapshot_query = snapshot_query.into_inner();
-
-            Some(spawn_inventory_poller(
-                pool.clone(),
-                vault_service,
-                executor,
-                config.evm.orderbook,
-                order_owner,
-                snapshot_cqrs,
-            ))
-        }
-        Err(error) => {
-            warn!(%error, "Inventory poller disabled: could not resolve order owner");
-            None
-        }
-    };
-
-    let shared = SharedState {
-        cache,
-        onchain_trade_cqrs,
-        position_cqrs,
-        position_query,
-        offchain_order_cqrs,
-        execution_threshold: config.execution_threshold,
-    };
-
-    let conductor = Conductor {
-        executor_maintenance,
-        rebalancer,
-        inventory_poller,
-        trading_tasks: None,
-    };
-
-    Ok((conductor, shared))
-}
-
-async fn start_trading_tasks<E>(
-    config: &Config,
-    pool: &SqlitePool,
-    executor: E,
-    shared: &SharedState,
-) -> anyhow::Result<TradingTasks>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
-    let provider = ProviderBuilder::new().connect_ws(ws).await?;
-    let orderbook = IOrderBookV5Instance::new(config.evm.orderbook, &provider);
-
-    let mut clear_stream = orderbook.ClearV3_filter().watch().await?.into_stream();
-    let mut take_stream = orderbook.TakeOrderV3_filter().watch().await?.into_stream();
-
-    let cutoff_block =
-        get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
-
-    backfill_events(pool, &provider, &config.evm, cutoff_block - 1).await?;
-
-    let (event_sender, event_receiver) =
-        tokio::sync::mpsc::unbounded_channel::<(TradeEvent, Log)>();
-
-    let (vault_registry_cqrs, ()) =
-        CqrsBuilder::<VaultRegistryAggregate>::new(pool.clone()).build(());
-
-    let order_poller = spawn_order_poller(
-        config,
-        pool,
-        executor.clone(),
-        shared.offchain_order_cqrs.clone(),
-        shared.position_cqrs.clone(),
-    );
-
-    let dex_event_receiver = spawn_onchain_event_receiver(event_sender, clear_stream, take_stream);
-
-    let event_processor = spawn_event_processor(pool.clone(), event_receiver);
-
-    let position_checker = spawn_periodic_accumulated_position_check(
-        executor.clone(),
-        pool.clone(),
-        shared.position_cqrs.clone(),
-        shared.position_query.clone(),
-        shared.offchain_order_cqrs.clone(),
-        shared.execution_threshold,
-    );
-
-    let trade_cqrs = TradeProcessingCqrs {
-        onchain_trade_cqrs: shared.onchain_trade_cqrs.clone(),
-        position_cqrs: shared.position_cqrs.clone(),
-        position_query: shared.position_query.clone(),
-        offchain_order_cqrs: shared.offchain_order_cqrs.clone(),
-        execution_threshold: shared.execution_threshold,
-    };
-
-    let queue_processor = spawn_queue_processor(
-        executor,
-        config,
-        pool,
-        &shared.cache,
-        provider,
-        trade_cqrs,
-        vault_registry_cqrs,
-    );
-
-    Ok(TradingTasks {
-        order_poller,
-        dex_event_receiver,
-        event_processor,
-        position_checker,
-        queue_processor,
-    })
-}
->>>>>>> 10d75012 (force centralized query wiring at compile time)
 
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
@@ -4292,6 +4110,141 @@ mod tests {
         assert!(
             position.pending_offchain_order_id.is_some(),
             "Periodic checker should retry execution after broker rejection is cleared"
+        );
+    }
+
+    /// Tests that `replay_all_views` populates views from historical events.
+    ///
+    /// This test reproduces the production bug where:
+    /// 1. Events were persisted without their query processors wired
+    /// 2. After fixing the wiring, views remain empty because cqrs-es
+    ///    doesn't automatically replay historical events
+    ///
+    /// The test verifies that `replay_all_views` recovers from this state.
+    #[tokio::test]
+    async fn replay_all_views_populates_views_from_historical_events() {
+        let pool = setup_test_db().await;
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let owner = address!("0x2222222222222222222222222222222222222222");
+        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+
+        // Step 1: Create historical events WITHOUT a query processor
+        // (simulating events created before the wiring fix)
+        let bare_cqrs = wire::test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+
+        bare_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: address!("0x3333333333333333333333333333333333333333"),
+                    vault_id: fixed_bytes!(
+                        "0x0000000000000000000000000000000000000000000000000000000000000001"
+                    ),
+                    discovered_in: TxHash::ZERO,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 2: Call the production replay function
+        super::replay_all_views(&pool).await.unwrap();
+
+        // Step 3: Verify the view is populated from historical events
+        let view_repo = SqliteViewRepository::<VaultRegistryAggregate, VaultRegistryAggregate>::new(
+            pool,
+            "vault_registry_view".to_string(),
+        );
+        let view = view_repo.load(&aggregate_id).await.unwrap();
+
+        assert!(
+            view.is_some(),
+            "View should be populated after replay_all_views"
+        );
+    }
+
+    /// Tests that wired CQRS frameworks correctly pick up from where replay left off.
+    ///
+    /// This verifies the handoff between:
+    /// 1. Unwired GenericQuery instances used during replay
+    /// 2. Wired GenericQuery instances in the CQRS framework
+    ///
+    /// The wired framework must process new events without re-processing
+    /// already-replayed events or corrupting the view state.
+    #[tokio::test]
+    async fn wired_cqrs_picks_up_after_replay() {
+        let pool = setup_test_db().await;
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let owner = address!("0x2222222222222222222222222222222222222222");
+        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+
+        // Step 1: Create historical event WITHOUT a query processor
+        let bare_cqrs = wire::test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+
+        let first_token = address!("0x3333333333333333333333333333333333333333");
+        let first_vault_id =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
+
+        bare_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: first_token,
+                    vault_id: first_vault_id,
+                    discovered_in: TxHash::ZERO,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 2: Run replay to populate view from historical events
+        super::replay_all_views(&pool).await.unwrap();
+
+        // Step 3: Create a properly wired CQRS framework (simulating post-startup)
+        let wired_cqrs = super::setup_vault_registry(pool.clone());
+
+        // Step 4: Execute a NEW command through the wired framework
+        let second_token = address!("0x4444444444444444444444444444444444444444");
+        let second_vault_id =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        wired_cqrs
+            .execute(
+                &aggregate_id,
+                VaultRegistryCommand::DiscoverEquityVault {
+                    token: second_token,
+                    vault_id: second_vault_id,
+                    discovered_in: TxHash::ZERO,
+                    symbol: Symbol::new("GOOGL").unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Step 5: Verify the view contains BOTH vaults
+        let view_repo = SqliteViewRepository::<VaultRegistryAggregate, VaultRegistryAggregate>::new(
+            pool,
+            "vault_registry_view".to_string(),
+        );
+        let lifecycle = view_repo.load(&aggregate_id).await.unwrap().unwrap();
+
+        let Lifecycle::Live(view) = lifecycle else {
+            panic!("Expected Live state, got: {lifecycle:?}");
+        };
+
+        assert!(
+            view.equity_vaults.contains_key(&first_token),
+            "View should contain vault from replayed event"
+        );
+        assert!(
+            view.equity_vaults.contains_key(&second_token),
+            "View should contain vault from post-replay event"
+        );
+        assert_eq!(
+            view.equity_vaults.len(),
+            2,
+            "View should have exactly 2 vaults"
         );
     }
 }
