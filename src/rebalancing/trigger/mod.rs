@@ -4,6 +4,7 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
@@ -47,10 +48,8 @@ enum TokenAddressError {
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum RebalancingConfigError {
-    #[error("rebalancing requires alpaca-broker-api broker type")]
+    #[error("rebalancing requires Alpaca broker")]
     NotAlpacaBroker,
-    #[error("broker account_id is not a valid UUID: {0}")]
-    InvalidAccountId(#[from] uuid::Error),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -62,18 +61,12 @@ pub(crate) enum UsdcRebalancingConfig {
 }
 
 /// Configuration for rebalancing operations.
-#[derive(Clone, serde::Deserialize)]
-pub(crate) struct RebalancingTomlFields {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
-    pub(crate) redemption_wallet: Address,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
-    pub(crate) usdc_vault_id: B256,
-}
-
-/// Runtime configuration for rebalancing operations.
-/// Constructed from `RebalancingTomlFields` + broker's `AlpacaBrokerApiAuthConfig`.
+///
+/// This type validates during deserialization that:
+/// - `evm_private_key` is a valid private key
+/// - The derived market maker wallet differs from `redemption_wallet`
+///
+/// If you have a `RebalancingConfig`, it is guaranteed to be valid.
 #[derive(Clone)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity: ImbalanceThreshold,
@@ -83,32 +76,51 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Derived from broker config's account_id.
+    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
-    /// Cloned from broker config - ensures consistency.
+    /// Alpaca Broker API authentication for rebalancing operations.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
 }
 
-impl RebalancingConfig {
-    /// Construct from TOML fields and broker's Alpaca auth config.
-    ///
-    /// This is the ONLY way to construct a `RebalancingConfig`, which enforces
-    /// the invariant that rebalancing always has valid `AlpacaBrokerApiAuthConfig`.
-    pub(crate) fn from_toml_and_broker(
-        toml: RebalancingTomlFields,
-        broker_auth: AlpacaBrokerApiAuthConfig,
-    ) -> Result<Self, RebalancingConfigError> {
-        let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
+impl<'de> serde::Deserialize<'de> for RebalancingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            equity: ImbalanceThreshold,
+            usdc: UsdcRebalancingConfig,
+            redemption_wallet: Address,
+            ethereum_rpc_url: Url,
+            evm_private_key: B256,
+            usdc_vault_id: B256,
+            alpaca_account_id: AlpacaAccountId,
+            alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        let signer =
+            PrivateKeySigner::from_bytes(&raw.evm_private_key).map_err(serde::de::Error::custom)?;
+        let market_maker_wallet = signer.address();
+
+        if market_maker_wallet == raw.redemption_wallet {
+            return Err(serde::de::Error::custom(format!(
+                "market_maker_wallet (derived from evm_private_key) and redemption_wallet \
+                 must be different addresses (both are {market_maker_wallet})"
+            )));
+        }
 
         Ok(Self {
-            equity_threshold: toml.equity_threshold,
-            usdc_threshold: toml.usdc_threshold,
-            redemption_wallet: toml.redemption_wallet,
-            ethereum_rpc_url: toml.ethereum_rpc_url,
-            evm_private_key: toml.evm_private_key,
-            usdc_vault_id: toml.usdc_vault_id,
-            alpaca_account_id,
-            alpaca_broker_auth: broker_auth,
+            equity: raw.equity,
+            usdc: raw.usdc,
+            redemption_wallet: raw.redemption_wallet,
+            ethereum_rpc_url: raw.ethereum_rpc_url,
+            evm_private_key: raw.evm_private_key,
+            usdc_vault_id: raw.usdc_vault_id,
+            alpaca_account_id: raw.alpaca_account_id,
+            alpaca_broker_auth: raw.alpaca_broker_auth,
         })
     }
 }
@@ -648,7 +660,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
-    use uuid::{Uuid, uuid};
+    use uuid::Uuid;
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -1882,6 +1894,13 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
 
             [equity]
             target = "0.5"
@@ -1894,14 +1913,9 @@ mod tests {
         "#
     }
 
-    fn test_broker_auth() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Sandbox),
-        }
-    }
+    #[test]
+    fn deserialize_with_all_required_fields_succeeds() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_toml()).unwrap();
 
         assert_eq!(config.equity.target, dec!(0.5));
         assert_eq!(config.equity.deviation, dec!(0.2));
@@ -1913,37 +1927,8 @@ mod tests {
         assert_eq!(deviation, dec!(0.3));
 
         assert_eq!(
-            toml_fields.redemption_wallet,
+            config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
-        );
-    }
-
-    #[test]
-    fn from_toml_and_broker_constructs_config() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
-
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
-
-        assert_eq!(config.alpaca_broker_auth.api_key, "test_key");
-        assert_eq!(config.alpaca_broker_auth.api_secret, "test_secret");
-        assert_eq!(
-            config.alpaca_account_id,
-            AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
-        );
-    }
-
-    #[test]
-    fn from_toml_and_broker_fails_with_invalid_account_id() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
-        let mut broker_auth = test_broker_auth();
-        broker_auth.account_id = "not-a-uuid".to_string();
-
-        let result = RebalancingConfig::from_toml_and_broker(toml_fields, broker_auth);
-
-        assert!(
-            matches!(result, Err(RebalancingConfigError::InvalidAccountId(_))),
-            "Expected InvalidAccountId error, got {result:?}"
         );
     }
 
@@ -1954,6 +1939,13 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
 
             [equity]
             target = "0.6"
@@ -1965,9 +1957,7 @@ mod tests {
             deviation = "0.15"
         "#;
 
-        let toml_fields: RebalancingTomlFields = toml::from_str(toml_str).unwrap();
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config.equity.target, dec!(0.6));
         assert_eq!(config.equity.deviation, dec!(0.1));
@@ -1985,6 +1975,7 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
             [equity]
             target = "0.5"
@@ -1994,7 +1985,7 @@ mod tests {
             mode = "disabled"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
@@ -2003,6 +1994,7 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             ethereum_rpc_url = "https://eth.example.com"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
             [equity]
             target = "0.5"
@@ -2012,7 +2004,7 @@ mod tests {
             mode = "disabled"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
@@ -2022,12 +2014,13 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
             [usdc]
             mode = "disabled"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]

@@ -285,7 +285,8 @@ pub fn setup_tracing(log_level: &LogLevel) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use alloy::primitives::{Address, FixedBytes, address};
+    use alloy::primitives::{FixedBytes, address};
+    use rust_decimal::Decimal;
     use st0x_execution::schwab::{SchwabAuthConfig, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
     use tracing_test::traced_test;
@@ -566,16 +567,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn rebalancing_with_invalid_private_key_fails() {
-        let config = Config::load(&example_toml_with_private_key(
+    fn rebalancing_with_invalid_private_key_fails_at_load() {
+        let result = Config::load(&example_toml_with_private_key(
             "0x0000000000000000000000000000000000000000000000000000000000000000",
-        ))
-        .unwrap();
+        ));
 
-        let result = config.order_owner();
+        let Err(ConfigError::Toml(e)) = result else {
+            panic!("Expected Toml error for zero private key, got {result:?}");
+        };
+        let msg = e.to_string();
         assert!(
-            matches!(result, Err(ConfigError::PrivateKeyDerivation(_))),
-            "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
+            msg.contains("signature error"),
+            "Expected error about signature, got: {msg}"
         );
     }
 
@@ -716,6 +719,27 @@ pub(crate) mod tests {
         assert!(
             config.rebalancing_config().is_none(),
             "rebalancing_config() should return None when rebalancing is not configured"
+        );
+    }
+
+    #[test]
+    fn rebalancing_fails_when_market_maker_wallet_equals_redemption_wallet() {
+        // Private key 0x01 derives to 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+        let toml = example_toml().replacen(
+            "redemption_wallet = \"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"",
+            "redemption_wallet = \"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf\"",
+            1,
+        );
+
+        let result = Config::load(&toml);
+
+        let Err(ConfigError::Toml(e)) = result else {
+            panic!("Expected Toml error for matching wallets, got {result:?}");
+        };
+        let msg = e.to_string();
+        assert!(
+            msg.contains("must be different addresses"),
+            "Expected error about different addresses, got: {msg}"
         );
     }
 }
