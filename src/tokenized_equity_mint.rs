@@ -54,6 +54,172 @@ use std::str::FromStr;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
+/// Alpaca issuer request identifier returned when a tokenization request is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct IssuerRequestId(pub(crate) String);
+
+impl IssuerRequestId {
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+}
+
+/// Alpaca tokenization request identifier used to track the mint operation through their API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct TokenizationRequestId(pub(crate) String);
+
+impl std::fmt::Display for TokenizationRequestId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Onchain receipt identifier (U256) for the token transfer transaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReceiptId(pub(crate) U256);
+
+/// Errors that can occur during tokenized equity mint operations.
+///
+/// These errors enforce state machine constraints and prevent invalid transitions.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TokenizedEquityMintError {
+    /// Attempted to request mint when already in progress
+    #[error("Mint already in progress")]
+    AlreadyInProgress,
+    /// Attempted to acknowledge acceptance before requesting mint
+    #[error("Cannot accept mint: not in requested state")]
+    NotRequested,
+    /// Attempted to receive tokens before mint was accepted
+    #[error("Cannot receive tokens: mint not accepted")]
+    NotAccepted,
+    /// Attempted to deposit to vault before tokens were received
+    #[error("Cannot deposit to vault: tokens not received")]
+    TokensNotReceived,
+    /// Attempted to finalize before vault deposit
+    #[error("Cannot finalize: vault deposit not complete")]
+    VaultDepositNotComplete,
+    /// Attempted to modify a completed mint operation
+    #[error("Already completed")]
+    AlreadyCompleted,
+    /// Attempted to modify a failed mint operation
+    #[error("Already failed")]
+    AlreadyFailed,
+    /// Lifecycle state error
+    #[error(transparent)]
+    State(#[from] LifecycleError<Never>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum TokenizedEquityMintCommand {
+    RequestMint {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+    },
+    /// Alpaca rejected the mint request before acceptance.
+    RejectMint {
+        reason: String,
+    },
+
+    AcknowledgeAcceptance {
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+    },
+    /// Mint failed after acceptance but before tokens were received.
+    FailAcceptance {
+        reason: String,
+    },
+
+    ReceiveTokens {
+        tx_hash: TxHash,
+        receipt_id: ReceiptId,
+        shares_minted: U256,
+    },
+
+    /// Deposit tokens from wallet to Raindex vault.
+    DepositToVault {
+        vault_deposit_tx_hash: TxHash,
+    },
+
+    Finalize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) enum TokenizedEquityMintEvent {
+    MintRequested {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        requested_at: DateTime<Utc>,
+    },
+    /// Alpaca rejected the mint request before acceptance.
+    /// Shares remain in offchain available - no funds were moved.
+    MintRejected {
+        symbol: Symbol,
+        quantity: Decimal,
+        reason: String,
+        rejected_at: DateTime<Utc>,
+    },
+
+    MintAccepted {
+        symbol: Symbol,
+        quantity: Decimal,
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        accepted_at: DateTime<Utc>,
+    },
+    /// Mint failed after acceptance but before tokens were received.
+    /// Shares were moved to inflight, can be safely restored to offchain available.
+    MintAcceptanceFailed {
+        symbol: Symbol,
+        quantity: Decimal,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+
+    TokensReceived {
+        symbol: Symbol,
+        quantity: Decimal,
+        tx_hash: TxHash,
+        receipt_id: ReceiptId,
+        shares_minted: U256,
+        received_at: DateTime<Utc>,
+    },
+
+    /// Tokens deposited from wallet to Raindex vault.
+    VaultDeposited {
+        symbol: Symbol,
+        quantity: Decimal,
+        vault_deposit_tx_hash: TxHash,
+        deposited_at: DateTime<Utc>,
+    },
+
+    MintCompleted {
+        symbol: Symbol,
+        quantity: Decimal,
+        completed_at: DateTime<Utc>,
+    },
+}
+
+impl DomainEvent for TokenizedEquityMintEvent {
+    fn event_type(&self) -> String {
+        match self {
+            Self::MintRequested { .. } => "TokenizedEquityMintEvent::MintRequested".to_string(),
+            Self::MintRejected { .. } => "TokenizedEquityMintEvent::MintRejected".to_string(),
+            Self::MintAccepted { .. } => "TokenizedEquityMintEvent::MintAccepted".to_string(),
+            Self::MintAcceptanceFailed { .. } => {
+                "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
+            }
+            Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
+            Self::MintCompleted { .. } => "TokenizedEquityMintEvent::MintCompleted".to_string(),
+        }
+    }
+
+    fn event_version(&self) -> String {
+        "1.0".to_string()
+    }
+}
+
 /// Tokenized equity mint aggregate state machine.
 ///
 /// Uses the typestate pattern via enum variants to make invalid

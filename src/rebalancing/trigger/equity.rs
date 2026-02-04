@@ -383,6 +383,8 @@ mod tests {
             .apply_mint_event(
                 &symbol,
                 &TokenizedEquityMintEvent::MintAccepted {
+                    symbol: symbol.clone(),
+                    quantity: quantity.inner(),
                     issuer_request_id: IssuerRequestId::new("test"),
                     tokenization_request_id: TokenizationRequestId("test".to_string()),
                     accepted_at: now,
@@ -398,6 +400,8 @@ mod tests {
             .apply_mint_event(
                 &symbol,
                 &TokenizedEquityMintEvent::TokensReceived {
+                    symbol: symbol.clone(),
+                    quantity: quantity.inner(),
                     tx_hash: TxHash::random(),
                     receipt_id: ReceiptId(U256::from(1)),
                     shares_minted: U256::ZERO, // Not used by inventory update
@@ -479,6 +483,8 @@ mod tests {
                 .apply_mint_event(
                     &symbol,
                     &TokenizedEquityMintEvent::MintAccepted {
+                        symbol: symbol.clone(),
+                        quantity: qty1.inner(),
                         issuer_request_id: IssuerRequestId::new("test"),
                         tokenization_request_id: TokenizationRequestId("test1".to_string()),
                         accepted_at: now,
@@ -492,6 +498,8 @@ mod tests {
                 .apply_mint_event(
                     &symbol,
                     &TokenizedEquityMintEvent::TokensReceived {
+                        symbol: symbol.clone(),
+                        quantity: qty1.inner(),
                         tx_hash: TxHash::random(),
                         receipt_id: ReceiptId(U256::from(1)),
                         shares_minted: U256::ZERO,

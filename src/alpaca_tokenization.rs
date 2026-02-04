@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
 use crate::bindings::IERC20;
@@ -491,7 +491,7 @@ where
 
         if status.is_success() {
             let body = response.text().await?;
-            debug!(body = %body, "List requests response body");
+            trace!(body = %body, "List requests response body");
 
             let requests: Vec<TokenizationRequest> =
                 serde_json::from_str(&body).inspect_err(|error| {
@@ -501,6 +501,8 @@ where
                         "Failed to deserialize list requests response"
                     );
                 })?;
+
+            debug!(count = requests.len(), "Listed tokenization requests");
 
             return Ok(requests);
         }
