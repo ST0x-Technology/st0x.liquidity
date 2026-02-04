@@ -28,9 +28,6 @@ pub(crate) enum MintError {
     #[error("Mint request was rejected by Alpaca")]
     Rejected,
 
-    #[error("Missing issuer_request_id in Alpaca response")]
-    MissingIssuerRequestId,
-
     #[error("Missing tx_hash in completed Alpaca response")]
     MissingTxHash,
 

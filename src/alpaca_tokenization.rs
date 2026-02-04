@@ -88,6 +88,7 @@ where
         underlying_symbol: Symbol,
         quantity: FractionalShares,
         wallet: Address,
+        issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, AlpacaTokenizationError> {
         let request = MintRequest {
             underlying_symbol,
@@ -95,6 +96,7 @@ where
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet,
+            issuer_request_id,
         };
         self.client.request_mint(request).await
     }
@@ -257,6 +259,7 @@ struct MintRequest {
     network: Network,
     #[serde(rename = "wallet_address")]
     wallet: Address,
+    issuer_request_id: IssuerRequestId,
 }
 
 /// Parameters for filtering tokenization requests.
@@ -770,6 +773,7 @@ pub(crate) mod tests {
             issuer: Issuer::new("st0x"),
             network: Network::new("base"),
             wallet: address!("0x1234567890abcdef1234567890abcdef12345678"),
+            issuer_request_id: IssuerRequestId::new("test-issuer-request-id"),
         }
     }
 
@@ -789,7 +793,8 @@ pub(crate) mod tests {
                     "qty": "100.5",
                     "issuer": "st0x",
                     "network": "base",
-                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678"
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": "test-issuer-request-id"
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -1396,7 +1401,7 @@ pub(crate) mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let mint_result = service
-            .request_mint(symbol, quantity, wallet)
+            .request_mint(symbol, quantity, wallet, IssuerRequestId::new("test-id"))
             .await
             .unwrap();
 
@@ -1481,5 +1486,60 @@ pub(crate) mod tests {
 
         detection_mock.assert();
         complete_mock.assert();
+    }
+
+    #[tokio::test]
+    async fn test_request_mint_includes_issuer_request_id_in_body() {
+        let server = MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+        let service =
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await;
+
+        let issuer_request_id = IssuerRequestId::new("our-tracking-id-123");
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST)
+                .path(tokenization_mint_path())
+                .json_body(json!({
+                    "underlying_symbol": "AAPL",
+                    "qty": "100.5",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": "our-tracking-id-123"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "tokenization_request_id": "tok_req_456",
+                    "type": "mint",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "100.5",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
+                    "issuer_request_id": "our-tracking-id-123",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(100.5));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let result = service
+            .request_mint(symbol, quantity, wallet, issuer_request_id.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.issuer_request_id,
+            Some(issuer_request_id),
+            "Alpaca should return the same issuer_request_id we sent"
+        );
+
+        mint_mock.assert();
     }
 }

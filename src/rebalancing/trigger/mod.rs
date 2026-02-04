@@ -409,6 +409,26 @@ impl RebalancingTrigger {
         )
     }
 
+    /// Extracts the symbol from terminal mint events (MintCompleted, MintRejected, MintAcceptanceFailed).
+    /// Returns None if no terminal event has a symbol (backwards compat with old events).
+    fn extract_terminal_mint_symbol(
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+    ) -> Option<Symbol> {
+        for envelope in events {
+            match &envelope.payload {
+                TokenizedEquityMintEvent::MintCompleted { symbol, .. }
+                | TokenizedEquityMintEvent::MintRejected { symbol, .. }
+                | TokenizedEquityMintEvent::MintAcceptanceFailed { symbol, .. } => {
+                    if let Some(s) = symbol {
+                        return Some(s.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     async fn apply_mint_event_to_inventory(
         &self,
         symbol: &Symbol,
@@ -990,12 +1010,21 @@ mod tests {
 
     fn make_mint_completed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintCompleted {
+            symbol: None,
+            completed_at: Utc::now(),
+        }
+    }
+
+    fn make_mint_completed_with_symbol(symbol: Symbol) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::MintCompleted {
+            symbol: Some(symbol),
             completed_at: Utc::now(),
         }
     }
 
     fn make_mint_rejected() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
+            symbol: None,
             reason: "API timeout".to_string(),
             rejected_at: Utc::now(),
         }
@@ -1003,6 +1032,7 @@ mod tests {
 
     fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
+            symbol: None,
             reason: "Transaction reverted".to_string(),
             failed_at: Utc::now(),
         }
@@ -1112,6 +1142,38 @@ mod tests {
         assert!(RebalancingTrigger::is_terminal_mint_event(
             &make_mint_acceptance_failed()
         ));
+    }
+
+    #[tokio::test]
+    async fn terminal_mint_event_in_isolation_clears_in_progress_flag() {
+        // This test verifies that when MintCompleted arrives in a separate dispatch
+        // (without MintRequested in the same batch), the in_progress flag is still cleared.
+        // This simulates what happens when Finalize command is executed.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+
+        // Mark symbol as in-progress (as if a mint was triggered).
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+
+        // Dispatch ONLY MintCompleted - no MintRequested in this batch.
+        // This is what happens when Finalize command produces MintCompleted.
+        let events = vec![make_mint_envelope(make_mint_completed_with_symbol(
+            symbol.clone(),
+        ))];
+
+        trigger.dispatch("test-aggregate-id", &events).await;
+
+        // The in_progress flag should be cleared even though MintRequested wasn't in this batch.
+        assert!(
+            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            "in_progress flag should be cleared when terminal event has symbol"
+        );
     }
 
     #[test]
@@ -2334,6 +2396,131 @@ mod tests {
         assert!(
             matches!(triggered.unwrap(), TriggeredOperation::Redemption { .. }),
             "expected Redemption for 100% onchain ratio"
+        );
+    }
+
+    /// Verifies logging shows when imbalance check skips due to partial data.
+    #[tracing_test::traced_test]
+    #[sqlx::test]
+    async fn logs_show_partial_data_skips_imbalance_check(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Apply ONLY onchain data - offchain not yet polled
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 1,
+                    payload: onchain_event,
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Verify the logs show:
+        // 1. The snapshot event was applied
+        // 2. Imbalance check was skipped due to partial data
+        assert!(
+            logs_contain("Applied inventory snapshot event"),
+            "Should log when snapshot event is applied"
+        );
+        assert!(
+            logs_contain("No equity imbalance detected"),
+            "Should log that imbalance was not detected (due to partial data)"
+        );
+        assert!(
+            !logs_contain("Triggered equity rebalancing"),
+            "Should NOT trigger rebalancing with partial data"
+        );
+    }
+
+    /// Verifies logging shows trigger fires when both venues have data.
+    #[tracing_test::traced_test]
+    #[sqlx::test]
+    async fn logs_show_trigger_fires_with_complete_data(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Apply onchain data first
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 1,
+                    payload: InventorySnapshotEvent::OnchainEquity {
+                        balances,
+                        fetched_at: Utc::now(),
+                    },
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Now apply offchain data - both venues now have data
+        let mut positions = BTreeMap::new();
+        positions.insert(symbol.clone(), shares(0));
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 2,
+                    payload: InventorySnapshotEvent::OffchainEquity {
+                        positions,
+                        fetched_at: Utc::now(),
+                    },
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Verify the trigger fired after both venues have data
+        assert!(
+            logs_contain("Triggered equity rebalancing"),
+            "Should trigger rebalancing once both venues have data"
         );
     }
 }

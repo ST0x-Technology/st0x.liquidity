@@ -601,4 +601,46 @@ mod tests {
             "Expected tokenization mint endpoint to be called exactly once"
         );
     }
+
+    #[test]
+    fn wallet_collision_error_includes_address() {
+        let addr = address!("0x1234567890123456789012345678901234567890");
+        let err = SpawnRebalancerError::WalletCollision(addr);
+
+        let display = format!("{err}");
+
+        assert!(
+            display.contains(&format!("{addr}")),
+            "Expected error to contain address, got: {display}"
+        );
+        assert!(
+            display.contains("must be different"),
+            "Expected error to explain the constraint, got: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_wallet_collision_returns_error_when_wallets_match() {
+        let wallet = address!("0x1234567890123456789012345678901234567890");
+
+        let result = validate_wallet_addresses(wallet, wallet);
+
+        assert!(
+            matches!(result, Err(SpawnRebalancerError::WalletCollision(addr)) if addr == wallet),
+            "Expected WalletCollision error when wallets match, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wallet_collision_succeeds_when_wallets_differ() {
+        let market_maker = address!("0x1111111111111111111111111111111111111111");
+        let redemption = address!("0x2222222222222222222222222222222222222222");
+
+        let result = validate_wallet_addresses(market_maker, redemption);
+
+        assert!(
+            result.is_ok(),
+            "Expected success when wallets differ, got: {result:?}"
+        );
+    }
 }

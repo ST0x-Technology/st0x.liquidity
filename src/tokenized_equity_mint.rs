@@ -942,6 +942,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintCompleted {
+            symbol: None,
             completed_at: Utc::now(),
         };
 
@@ -962,6 +963,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintRejected {
+            symbol: None,
             reason: "Should not apply".to_string(),
             rejected_at: Utc::now(),
         };
@@ -980,6 +982,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
+            symbol: None,
             reason: "Should not apply".to_string(),
             failed_at: Utc::now(),
         };

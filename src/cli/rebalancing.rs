@@ -308,8 +308,14 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
+    let issuer_request_id = IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
     let request = tokenization_service
-        .request_mint(symbol.clone(), quantity, receiving_wallet)
+        .request_mint(
+            symbol.clone(),
+            quantity,
+            receiving_wallet,
+            issuer_request_id,
+        )
         .await?;
 
     writeln!(stdout, "   Request ID: {}", request.id.0)?;
