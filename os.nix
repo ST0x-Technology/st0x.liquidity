@@ -13,7 +13,7 @@ let
     in {
       description = "st0x ${cfg.bin} (${name})";
 
-      # Service is started by deploy.nix server profile, not by systemd on boot.
+      # Service is started by deploy.nix profile, not by systemd on boot.
       # This avoids coordination issues during deployments.
       wantedBy = [ ];
 
@@ -21,8 +21,11 @@ let
       stopIfChanged = false;
 
       unitConfig = {
-        ConditionPathExists = path;
         "X-OnlyManualStart" = true;
+
+        # Marker file created ONLY by service profile activation.
+        # Guarantees service is SKIPPED (not failed) during system activation.
+        ConditionPathExists = "/run/st0x/${name}.ready";
       };
 
       serviceConfig = {
@@ -183,6 +186,8 @@ in {
   programs.bash.interactiveShellInit = "set -o vi";
 
   age.secrets = lib.mapAttrs mkSecret enabledServices;
+
+  systemd.services = lib.mapAttrs mkService enabledServices;
 
   environment.systemPackages = with pkgs; [
     bat
