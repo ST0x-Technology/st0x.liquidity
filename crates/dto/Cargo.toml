@@ -20,7 +20,3 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "codegen"
-path = "src/bin/codegen.rs"

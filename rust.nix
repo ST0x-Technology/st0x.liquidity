@@ -87,11 +87,10 @@ let
   '';
 
 in {
-  # DTO crate - needs submodules for workspace resolution but not sqlx
+  # DTO crate for TypeScript codegen - no sqlx deps needed
   dto = craneLib.buildPackage (commonArgs // {
     pname = "st0x-dto";
     cargoExtraArgs = "-p st0x-dto";
-    # No sqlx setup needed, no tests
     doCheck = false;
     meta = {
       description = "st0x DTO types for TypeScript codegen";

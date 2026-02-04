@@ -32,10 +32,10 @@ jobs:
       - name: Clippy
         run: nix build --impure .#st0x-clippy
 
-    # - name: Check TypeScript bindings are up to date
-    #   run: |
-    #     TS_RS_EXPORT_DIR="$PWD" nix run --impure .#st0x-dto
-    #     git diff --exit-code dashboard/src/lib/api/
+      - name: Check TypeScript bindings are up to date
+        run: |
+          TS_RS_EXPORT_DIR="$PWD" nix run --impure .#st0x-dto
+          git diff --exit-code dashboard/src/lib/api/
 
   dashboard:
     runs-on: ubuntu-latest
