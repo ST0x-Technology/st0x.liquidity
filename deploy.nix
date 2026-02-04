@@ -6,13 +6,31 @@ let
   profileBase = "/nix/var/nix/profiles/per-service";
 
   st0xPackage = self.packages.${system}.st0x-liquidity;
-  mkServiceProfile = name:
-    activate.custom st0xPackage "systemctl restart ${name}";
+
+  rage = "/run/current-system/sw/bin/rage";
+  hostKey = "/etc/ssh/ssh_host_ed25519_key";
 
   services = import ./services.nix;
   enabledServices = builtins.attrNames (builtins.removeAttrs services
     (builtins.filter (n: !services.${n}.enabled)
       (builtins.attrNames services)));
+
+  # Decrypts config and restarts service atomically
+  mkServiceProfile = name:
+    let
+      markerFile = "/run/st0x/${name}.ready";
+      configFile = ./config/${name}.toml.age;
+      decrypted = "/run/agenix/${name}.toml";
+    in activate.custom st0xPackage (builtins.concatStringsSep " && " [
+      "systemctl stop ${name} || true"
+      "rm -f ${markerFile}"
+      "mkdir -p /run/agenix /run/st0x"
+      "${rage} -d -i ${hostKey} ${configFile} > ${decrypted}"
+      "chown root:st0x ${decrypted}"
+      "chmod 0640 ${decrypted}"
+      "touch ${markerFile}"
+      "systemctl restart ${name}"
+    ]);
 
   mkProfile = name: {
     path = mkServiceProfile name;
