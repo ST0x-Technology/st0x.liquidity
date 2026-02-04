@@ -1,4 +1,4 @@
-{ pkgs, bun2nix }:
+{ pkgs, bun2nix, st0x-dto }:
 
 let bunDeps = bun2nix.fetchBunDeps { bunNix = ./bun.nix; };
 in pkgs.stdenv.mkDerivation {
@@ -7,7 +7,7 @@ in pkgs.stdenv.mkDerivation {
 
   src = ../.;
 
-  nativeBuildInputs = [ bun2nix.hook pkgs.bun ];
+  nativeBuildInputs = [ bun2nix.hook pkgs.bun st0x-dto ];
 
   inherit bunDeps;
 
@@ -19,6 +19,7 @@ in pkgs.stdenv.mkDerivation {
   dontRunLifecycleScripts = true;
 
   buildPhase = ''
+    st0x-dto
     cd dashboard
     bun run build
   '';

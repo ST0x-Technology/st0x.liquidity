@@ -74,6 +74,7 @@
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
             bun2nix = bun2nix.packages.${system}.default;
+            st0x-dto = st0xRust.dto;
           };
 
           prepSolArtifacts = rainix.mkTask.${system} {
