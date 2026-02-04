@@ -4,9 +4,9 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
-use st0x_execution::schwab::{SchwabAuthEnv, SchwabError, SchwabTokens, extract_code_from_url};
+use st0x_execution::schwab::{SchwabAuthConfig, SchwabError, SchwabTokens, extract_code_from_url};
 
-use crate::env::BrokerConfig;
+use crate::config::BrokerConfig;
 
 pub(super) async fn auth_command<W: Write>(
     stdout: &mut W,
@@ -73,10 +73,13 @@ pub(super) async fn ensure_schwab_authentication<W: Write>(
     }
 }
 
-async fn run_oauth_flow(pool: &SqlitePool, schwab_auth: &SchwabAuthEnv) -> Result<(), SchwabError> {
+async fn run_oauth_flow(
+    pool: &SqlitePool,
+    schwab_auth: &SchwabAuthConfig,
+) -> Result<(), SchwabError> {
     println!(
         "Authenticate portfolio brokerage account (not dev account) and paste URL: {}",
-        schwab_auth.get_auth_url()
+        schwab_auth.get_auth_url()?
     );
     print!("Paste the full redirect URL you were sent to: ");
     std::io::stdout().flush()?;
@@ -101,20 +104,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::env::{Config, LogLevel};
-    use crate::onchain::EvmEnv;
+    use crate::config::{Config, LogLevel};
+    use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuthEnv) {
-        let schwab_auth = SchwabAuthEnv {
-            schwab_app_key: "test_app_key".to_string(),
-            schwab_app_secret: "test_app_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: mock_server.base_url(),
-            schwab_account_index: 0,
+    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuthConfig) {
+        let schwab_auth = SchwabAuthConfig {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
+            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+            account_index: Some(0),
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
@@ -122,7 +125,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),

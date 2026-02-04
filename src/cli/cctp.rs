@@ -12,7 +12,7 @@ use crate::cctp::{
     BridgeDirection, CctpBridge, CctpError, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
     USDC_BASE, USDC_ETHEREUM,
 };
-use crate::env::Config;
+use crate::config::Config;
 use crate::onchain::http_client_with_retry;
 use crate::rebalancing::RebalancingConfig;
 use crate::threshold::Usdc;
@@ -273,15 +273,15 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use std::str::FromStr;
     use uuid::uuid;
 
     use super::*;
     use crate::alpaca_wallet::AlpacaAccountId;
-    use crate::env::{BrokerConfig, LogLevel};
+    use crate::config::{BrokerConfig, LogLevel};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
     use crate::threshold::ExecutionThreshold;
 
@@ -290,7 +290,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -321,11 +321,11 @@ mod tests {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
             },
-            alpaca_broker_auth: AlpacaBrokerApiAuthEnv {
-                alpaca_broker_api_key: "test-key".to_string(),
-                alpaca_broker_api_secret: "test-secret".to_string(),
-                alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-                alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+                api_key: "test-key".to_string(),
+                api_secret: "test-secret".to_string(),
+                account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+                mode: Some(AlpacaBrokerApiMode::Sandbox),
             },
         });
         config

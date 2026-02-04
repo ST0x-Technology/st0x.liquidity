@@ -24,9 +24,9 @@ use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor,
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
+use crate::config::Config;
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
-use crate::env::Config;
 use crate::equity_redemption::EquityRedemption;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
@@ -43,7 +43,7 @@ use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmEnv, OnchainTrade, accumulator};
+use crate::onchain::{EvmConfig, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::{
     RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
@@ -1263,7 +1263,7 @@ async fn process_trade_within_transaction(
 }
 
 fn reconstruct_log_from_queued_event(
-    evm_env: &EvmEnv,
+    config: &EvmConfig,
     queued_event: &crate::queue::QueuedEvent,
 ) -> Log {
     use alloy::primitives::IntoLogData;
@@ -1279,7 +1279,7 @@ fn reconstruct_log_from_queued_event(
 
     Log {
         inner: alloy::primitives::Log {
-            address: evm_env.orderbook,
+            address: config.orderbook,
             data: log_data,
         },
         block_hash: None,
@@ -1531,7 +1531,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::env::tests::create_test_config;
+    use crate::config::tests::create_test_config;
     use crate::offchain::execution::{
         OffchainExecution, find_executions_by_symbol_status_and_broker,
     };

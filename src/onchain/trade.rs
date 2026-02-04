@@ -10,7 +10,7 @@ use tracing::{error, warn};
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmEnv;
+use crate::onchain::EvmConfig;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
@@ -386,7 +386,7 @@ impl OnchainTrade {
         tx_hash: B256,
         provider: P,
         cache: &SymbolCache,
-        env: &EvmEnv,
+        config: &EvmConfig,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
@@ -406,7 +406,7 @@ impl OnchainTrade {
             .filter(|log| {
                 (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == env.orderbook
+                    && log.address() == config.orderbook
             })
             .collect();
 
@@ -422,7 +422,7 @@ impl OnchainTrade {
                 log,
                 &provider,
                 cache,
-                env,
+                config,
                 feed_id_cache,
                 order_owner,
             )
@@ -448,7 +448,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     log: &Log,
     provider: P,
     cache: &SymbolCache,
-    env: &EvmEnv,
+    config: &EvmConfig,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -465,7 +465,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
     if let Ok(clear_event) = log.log_decode::<ClearV3>() {
         return OnchainTrade::try_from_clear_v3(
-            env,
+            config,
             cache,
             &provider,
             clear_event.data().clone(),
@@ -509,7 +509,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5;
-    use crate::onchain::EvmEnv;
+    use crate::onchain::EvmConfig;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
 
@@ -823,7 +823,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
-        let env = EvmEnv {
+        let config = EvmConfig {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             order_owner: Some(Address::ZERO),
@@ -838,7 +838,7 @@ mod tests {
             tx_hash,
             provider,
             &cache,
-            &env,
+            &config,
             &feed_id_cache,
             Address::ZERO,
         )

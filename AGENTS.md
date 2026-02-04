@@ -158,7 +158,7 @@ binary).
 
 ### Testing
 
-- `cargo test -q` - Run all tests (both main and execution crates)
+- `cargo test --workspace -q` - Run all tests (both main and execution crates)
 - `cargo test -q --lib` - Run library tests only
 - `cargo test -p st0x-execution -q` - Run execution crate tests only
 - `cargo test -p st0x-hedge -q` - Run main crate tests only
@@ -203,8 +203,8 @@ resolution and feature selection.
 ### Development Tools
 
 - `rainix-rs-static` - Run Rust static analysis
-- `cargo clippy --all-targets --all-features -- -D clippy::all` - Run Clippy for
-  linting
+- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all` -
+  Run Clippy for linting
 - `cargo fmt` - Format code
 
 ### Nix Development Environment
@@ -349,15 +349,8 @@ tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
-Environment variables (can be set via `.env` file):
-
-- `DATABASE_URL`: SQLite database path
-- `WS_RPC_URL`: WebSocket RPC endpoint for blockchain monitoring
-- `ORDERBOOK`: Raindex orderbook contract address
-- `ORDER_OWNER`: Owner address of orders to monitor for trades
-- `APP_KEY`, `APP_SECRET`: Charles Schwab API credentials
-- `REDIRECT_URI`: OAuth redirect URI (default: https://127.0.0.1)
-- `BASE_URL`: Schwab API base URL (default: https://api.schwabapi.com)
+All configuration is via TOML files passed with `--config-file`. See
+`example.toml` for available options.
 
 ### Code Quality & Best Practices
 
@@ -630,7 +623,7 @@ returning values within expected bounds.
   only documentation/markdown files were changed). Run them in this order to
   fail fast:
   1. `cargo check` - fastest, catches compilation errors first
-  2. `cargo test -q` - only run after check passes
+  2. `cargo test --workspace -q` - only run after check passes
   3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
   4. `cargo fmt` - always run last to ensure clean formatting
   5. **Diff review** - after all checks pass, review staged changes and revert

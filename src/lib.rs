@@ -5,7 +5,6 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
 use crate::dashboard::ServerMessage;
-use crate::migration::run_startup_check;
 
 mod alpaca_tokenization;
 mod alpaca_wallet;
@@ -14,16 +13,15 @@ mod bindings;
 mod cctp;
 pub mod cli;
 mod conductor;
+pub mod config;
 pub(crate) mod dashboard;
 mod dual_write;
-pub mod env;
 mod equity_redemption;
 mod error;
 mod error_decoding;
 mod inventory;
 mod lifecycle;
 mod lock;
-pub mod migration;
 mod offchain;
 mod offchain_order;
 mod onchain;
@@ -47,7 +45,7 @@ pub use telemetry::{TelemetryError, TelemetryGuard};
 #[cfg(test)]
 pub mod test_utils;
 
-use crate::env::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Config};
 use st0x_execution::schwab::{SchwabConfig, SchwabError};
 use st0x_execution::{ExecutionError, Executor, MockExecutorConfig, TryIntoExecutor};
 
@@ -57,11 +55,6 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
 
     let pool = config.get_sqlite_pool().await?;
     sqlx::migrate!().run(&pool).await?;
-
-    if let Err(e) = run_startup_check(&pool, &config.broker).await {
-        error!("Startup migration/consistency check failed: {e}");
-        return Err(e.into());
-    }
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
 
@@ -276,7 +269,7 @@ mod tests {
     use super::*;
     use alloy::primitives::Address;
 
-    use crate::env::tests::create_test_config;
+    use crate::config::tests::create_test_config;
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();

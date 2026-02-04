@@ -13,8 +13,8 @@ use tracing::{info, warn};
 use st0x_execution::Executor;
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::config::Config;
 use crate::dual_write::DualWriteContext;
-use crate::env::Config;
 use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;

@@ -1,10 +1,9 @@
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, Query};
-use serde::Serialize;
+use st0x_dto::EventStoreEntry;
 use tokio::sync::broadcast;
 use tracing::warn;
-use ts_rs::TS;
 
 use super::ServerMessage;
 use crate::equity_redemption::EquityRedemption;
@@ -12,29 +11,16 @@ use crate::lifecycle::{Lifecycle, Never};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
-#[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../dashboard/src/lib/api/")]
-pub(crate) struct EventStoreEntry {
-    pub(super) aggregate_type: String,
-    pub(super) aggregate_id: String,
-    #[ts(type = "number")]
-    pub(super) sequence: u64,
-    pub(super) event_type: String,
-    pub(super) timestamp: DateTime<Utc>,
-}
-
-impl EventStoreEntry {
-    fn from_envelope<A: Aggregate>(envelope: &EventEnvelope<A>) -> Self
-    where
-        A::Event: DomainEvent,
-    {
-        Self {
-            aggregate_type: A::aggregate_type(),
-            aggregate_id: envelope.aggregate_id.clone(),
-            sequence: envelope.sequence as u64,
-            event_type: envelope.payload.event_type(),
-            timestamp: Utc::now(),
-        }
+fn event_store_entry_from_envelope<A: Aggregate>(envelope: &EventEnvelope<A>) -> EventStoreEntry
+where
+    A::Event: DomainEvent,
+{
+    EventStoreEntry {
+        aggregate_type: A::aggregate_type(),
+        aggregate_id: envelope.aggregate_id.clone(),
+        sequence: envelope.sequence as u64,
+        event_type: envelope.payload.event_type(),
+        timestamp: Utc::now(),
     }
 }
 
@@ -57,7 +43,7 @@ impl EventBroadcaster {
         A::Event: DomainEvent,
     {
         for envelope in events {
-            let entry = EventStoreEntry::from_envelope(envelope);
+            let entry = event_store_entry_from_envelope(envelope);
             let msg = ServerMessage::Event(entry);
 
             if let Err(e) = self.sender.send(msg) {
@@ -141,7 +127,7 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let entry = EventStoreEntry::from_envelope(&envelope);
+        let entry = event_store_entry_from_envelope(&envelope);
 
         assert_eq!(entry.aggregate_type, "TokenizedEquityMint");
         assert_eq!(entry.aggregate_id, "test-aggregate-123");
@@ -368,7 +354,7 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let entry = EventStoreEntry::from_envelope(&envelope);
+        let entry = event_store_entry_from_envelope(&envelope);
         let json = serde_json::to_string(&entry).expect("serialization should succeed");
 
         assert!(json.contains("\"aggregate_type\":\"TokenizedEquityMint\""));

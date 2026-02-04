@@ -165,7 +165,7 @@ impl ExecutionThreshold {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum InvalidThresholdError {
+pub enum InvalidThresholdError {
     #[error("Dollar threshold cannot be negative: {0:?}")]
     NegativeDollarValue(Usdc),
     #[error("Dollar threshold cannot be zero")]

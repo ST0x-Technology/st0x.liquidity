@@ -15,8 +15,8 @@ use st0x_execution::{
 };
 use tracing::{error, info};
 
+use crate::config::{BrokerConfig, Config};
 use crate::dual_write::DualWriteContext;
-use crate::env::{BrokerConfig, Config};
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
@@ -163,19 +163,12 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     provider: &P,
     cache: &SymbolCache,
 ) -> anyhow::Result<()> {
-    let evm_env = &config.evm;
+    let evm = &config.evm;
     let feed_id_cache = FeedIdCache::new();
     let order_owner = config.order_owner()?;
 
-    match OnchainTrade::try_from_tx_hash(
-        tx_hash,
-        provider,
-        cache,
-        evm_env,
-        &feed_id_cache,
-        order_owner,
-    )
-    .await
+    match OnchainTrade::try_from_tx_hash(tx_hash, provider, cache, evm, &feed_id_cache, order_owner)
+        .await
     {
         Ok(Some(onchain_trade)) => {
             process_found_trade(onchain_trade, config, pool, stdout).await?;
@@ -406,11 +399,11 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_execution::schwab::SchwabAuthEnv;
+    use st0x_execution::schwab::SchwabAuthConfig;
 
     use super::*;
-    use crate::env::LogLevel;
-    use crate::onchain::EvmEnv;
+    use crate::config::LogLevel;
+    use crate::onchain::EvmConfig;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
@@ -421,7 +414,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -429,12 +422,12 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuthEnv {
-                schwab_app_key: "test_app_key".to_string(),
-                schwab_app_secret: "test_app_secret".to_string(),
-                schwab_redirect_uri: "https://127.0.0.1".to_string(),
-                schwab_base_url: mock_server.base_url(),
-                schwab_account_index: 0,
+            broker: BrokerConfig::Schwab(SchwabAuthConfig {
+                app_key: "test_app_key".to_string(),
+                app_secret: "test_app_secret".to_string(),
+                redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
+                base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+                account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,
@@ -443,7 +436,7 @@ mod tests {
         }
     }
 
-    fn get_schwab_auth(config: &Config) -> &SchwabAuthEnv {
+    fn get_schwab_auth(config: &Config) -> &SchwabAuthConfig {
         match &config.broker {
             BrokerConfig::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config"),

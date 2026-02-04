@@ -1,42 +1,45 @@
 use chrono::{DateTime, Utc};
-use clap::Parser;
-use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{error, info};
 
+use crate::config::{ConfigError, HasSqlite, LogLevel, configure_sqlite_pool};
 use crate::symbol::Symbol;
 use st0x_execution::Direction;
 
 mod pnl;
+use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
-pub struct ReporterEnv {
-    #[clap(long, env, default_value = "sqlite:./data/schwab.db")]
+#[derive(Debug, Deserialize)]
+pub struct ReporterConfig {
     database_url: String,
-    #[clap(long, env, default_value = "30")]
-    reporter_processing_interval_secs: u64,
-    #[clap(long, env, default_value = "info")]
-    log_level: crate::env::LogLevel,
+    processing_interval_secs: Option<u64>,
+    log_level: Option<LogLevel>,
 }
 
-impl crate::env::HasSqlite for ReporterEnv {
+impl HasSqlite for ReporterConfig {
     async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
-        crate::env::configure_sqlite_pool(&self.database_url).await
+        configure_sqlite_pool(&self.database_url).await
     }
 }
 
-impl ReporterEnv {
-    pub fn log_level(&self) -> &crate::env::LogLevel {
-        &self.log_level
+impl ReporterConfig {
+    pub fn load_file(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let contents = std::fs::read_to_string(path)?;
+        let config: Self = toml::from_str(&contents)?;
+        Ok(config)
+    }
+
+    pub fn log_level(&self) -> LogLevel {
+        self.log_level.clone().unwrap_or(LogLevel::Info)
     }
 
     fn processing_interval(&self) -> Duration {
-        Duration::from_secs(self.reporter_processing_interval_secs)
+        Duration::from_secs(self.processing_interval_secs.unwrap_or(30))
     }
 }
 
@@ -386,11 +389,11 @@ pub(crate) async fn process_iteration(pool: &SqlitePool) -> anyhow::Result<usize
     Ok(new_trades.len())
 }
 
-pub async fn run(env: ReporterEnv) -> anyhow::Result<()> {
-    use crate::env::HasSqlite;
+pub async fn run(config: ReporterConfig) -> anyhow::Result<()> {
+    use crate::config::HasSqlite;
 
-    let pool = env.get_sqlite_pool().await?;
-    let interval = env.processing_interval();
+    let pool = config.get_sqlite_pool().await?;
+    let interval = config.processing_interval();
 
     initialize_reporter(&pool, interval).await?;
     run_processing_loop(&pool, interval).await;

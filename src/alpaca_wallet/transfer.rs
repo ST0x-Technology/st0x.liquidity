@@ -37,13 +37,8 @@ impl std::fmt::Display for TokenSymbol {
 pub(crate) struct AlpacaAccountId(Uuid);
 
 impl AlpacaAccountId {
-    #[cfg(test)]
     pub(crate) const fn new(uuid: Uuid) -> Self {
         Self(uuid)
-    }
-
-    pub(crate) fn parse(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
     }
 }
 

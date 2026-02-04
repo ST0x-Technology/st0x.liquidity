@@ -9,7 +9,7 @@ use std::io::Write;
 use thiserror::Error;
 
 use crate::bindings::IERC20;
-use crate::env::Config;
+use crate::config::Config;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -165,8 +165,8 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::env::{BrokerConfig, LogLevel};
-    use crate::onchain::EvmEnv;
+    use crate::config::{BrokerConfig, LogLevel};
+    use crate::onchain::EvmConfig;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
@@ -174,7 +174,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),

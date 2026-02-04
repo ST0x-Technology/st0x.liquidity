@@ -13,7 +13,7 @@ mod tokens;
 
 // Re-export only what's needed for executor construction
 pub use auth::{
-    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthEnv, SchwabAuthError,
+    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthConfig, SchwabAuthError,
     SchwabAuthEvent,
 };
 pub use encryption::{EncryptedToken, EncryptionError, EncryptionKey, decrypt_token};
@@ -129,13 +129,13 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_env_with_mock_server(mock_server: &MockServer) -> SchwabAuthEnv {
-        SchwabAuthEnv {
-            schwab_app_key: "test_app_key".to_string(),
-            schwab_app_secret: "test_app_secret".to_string(),
-            schwab_redirect_uri: "https://127.0.0.1".to_string(),
-            schwab_base_url: mock_server.base_url(),
-            schwab_account_index: 0,
+    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
+        SchwabAuthConfig {
+            app_key: "test_app_key".to_string(),
+            app_secret: "test_app_secret".to_string(),
+            redirect_uri: None,
+            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("mock server base_url")),
+            account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
     }
@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_http_401() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -195,7 +195,7 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = env.get_tokens_from_code("invalid_code").await;
+        let result = config.get_tokens_from_code("invalid_code").await;
         assert!(matches!(
             result.unwrap_err(),
             SchwabError::RequestFailed { action, status, .. }
@@ -208,14 +208,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_http_500() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
             then.status(500);
         });
 
-        let result = env.get_tokens_from_code("test_code").await;
+        let result = config.get_tokens_from_code("test_code").await;
         assert!(matches!(
             result.unwrap_err(),
             SchwabError::RequestFailed { action, status, .. }
@@ -228,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_invalid_json_response() {
         let server = MockServer::start();
-        let env = create_test_env_with_mock_server(&server);
+        let config = create_test_config_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -238,7 +238,7 @@ mod tests {
         });
 
         assert!(matches!(
-            env.get_tokens_from_code("test_code").await.unwrap_err(),
+            config.get_tokens_from_code("test_code").await.unwrap_err(),
             SchwabError::Reqwest(_)
         ));
 

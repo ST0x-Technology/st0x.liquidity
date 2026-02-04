@@ -4,7 +4,7 @@ use rocket::serde::{Deserialize, Serialize};
 use rocket::{Route, State, get, post, routes};
 use sqlx::SqlitePool;
 
-use crate::env::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Config};
 use st0x_execution::schwab::extract_code_from_url;
 
 #[derive(Serialize, Deserialize)]
@@ -93,20 +93,20 @@ mod tests {
     use url::Url;
 
     use super::*;
-    use crate::env::{BrokerConfig, Config};
-    use crate::onchain::EvmEnv;
+    use crate::config::{BrokerConfig, Config};
+    use crate::onchain::EvmConfig;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
-    use st0x_execution::schwab::SchwabAuthEnv;
+    use st0x_execution::schwab::SchwabAuthConfig;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
     fn create_test_config_with_mock_server(mock_server: &MockServer) -> Config {
         Config {
             database_url: ":memory:".to_string(),
-            log_level: crate::env::LogLevel::Debug,
+            log_level: crate::config::LogLevel::Debug,
             server_port: 8080,
-            evm: EvmEnv {
+            evm: EvmConfig {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
                 order_owner: Some(address!("0x2222222222222222222222222222222222222222")),
@@ -114,12 +114,12 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuthEnv {
-                schwab_app_key: "test_app_key".to_string(),
-                schwab_app_secret: "test_app_secret".to_string(),
-                schwab_redirect_uri: "https://127.0.0.1".to_string(),
-                schwab_base_url: mock_server.base_url(),
-                schwab_account_index: 0,
+            broker: BrokerConfig::Schwab(SchwabAuthConfig {
+                app_key: "test_app_key".to_string(),
+                app_secret: "test_app_secret".to_string(),
+                redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
+                base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+                account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
             hyperdx: None,

@@ -1,6 +1,5 @@
 use alloy::primitives::U256;
 use async_trait::async_trait;
-use clap::ValueEnum;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -453,7 +452,7 @@ impl std::fmt::Display for InvalidDirectionError {
 
 impl std::error::Error for InvalidDirectionError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SupportedExecutor {
     Schwab,
     AlpacaTradingApi,
@@ -896,8 +895,11 @@ mod tests {
             {
                 let roundtrip = FractionalShares::from_f64(f64_value).unwrap();
                 let diff = (shares.inner() - roundtrip.inner()).abs();
+                // f64 has ~15-16 significant decimal digits. For large values like
+                // 4322285221.77, some precision loss in lower digits is expected.
+                // Use 1e-6 as tolerance which is realistic for f64 roundtrips.
                 prop_assert!(
-                    diff < Decimal::new(1, 10),
+                    diff <= Decimal::new(1, 6),
                     "Roundtrip diff too large: {} for original {}",
                     diff,
                     decimal

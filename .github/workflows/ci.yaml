@@ -1,0 +1,77 @@
+name: CI
+on: [push]
+
+concurrency:
+  group: ${{ github.ref }}-ci
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
+      - name: Build and test
+        run: nix build --impure .#st0x-liquidity
+
+      - name: Clippy
+        run: nix build --impure .#st0x-clippy
+
+  dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
+      - name: Check bun.nix is up to date
+        run: |
+          nix run .#genBunNix
+          nix fmt -- dashboard/bun.nix
+          git diff --exit-code dashboard/bun.nix
+
+      - name: Dashboard
+        run: nix build --impure .#st0x-dashboard
+
+  flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build Solidity artifacts
+        run: nix run .#prepSolArtifacts
+
+      - name: Flake checks
+        run: nix flake check --impure

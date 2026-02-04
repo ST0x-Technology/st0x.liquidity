@@ -154,8 +154,8 @@ where
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             broker_auth.base_url().to_string(),
             config.alpaca_account_id,
-            broker_auth.alpaca_broker_api_key.clone(),
-            broker_auth.alpaca_broker_api_secret.clone(),
+            broker_auth.api_key.clone(),
+            broker_auth.api_secret.clone(),
             base_provider.clone(),
             config.redemption_wallet,
         ));
@@ -165,8 +165,8 @@ where
         let wallet = Arc::new(AlpacaWalletService::new(
             broker_auth.base_url().to_string(),
             config.alpaca_account_id,
-            broker_auth.alpaca_broker_api_key.clone(),
-            broker_auth.alpaca_broker_api_secret.clone(),
+            broker_auth.api_key.clone(),
+            broker_auth.api_secret.clone(),
         ));
 
         let ethereum_evm = Evm::new(
@@ -260,7 +260,7 @@ mod tests {
     use serde_json::json;
     use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
     use uuid::Uuid;
 
     use super::*;
@@ -289,11 +289,11 @@ mod tests {
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
             alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
-            alpaca_broker_auth: AlpacaBrokerApiAuthEnv {
-                alpaca_broker_api_key: "test_key".to_string(),
-                alpaca_broker_api_secret: "test_secret".to_string(),
-                alpaca_account_id: Uuid::nil().to_string(),
-                alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+                api_key: "test_key".to_string(),
+                api_secret: "test_secret".to_string(),
+                account_id: Uuid::nil().to_string(),
+                mode: Some(AlpacaBrokerApiMode::Sandbox),
             },
         }
     }
@@ -409,11 +409,11 @@ mod tests {
                 }));
         });
 
-        let broker_auth = AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "test_key".to_string(),
-            alpaca_broker_api_secret: "test_secret".to_string(),
-            alpaca_account_id: config.alpaca_account_id.to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+        let broker_auth = AlpacaBrokerApiAuthConfig {
+            api_key: "test_key".to_string(),
+            api_secret: "test_secret".to_string(),
+            account_id: config.alpaca_account_id.to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_config(broker_auth)
@@ -502,11 +502,11 @@ mod tests {
         });
 
         let config = make_config();
-        let broker_auth = AlpacaBrokerApiAuthEnv {
-            alpaca_broker_api_key: "invalid_key".to_string(),
-            alpaca_broker_api_secret: "invalid_secret".to_string(),
-            alpaca_account_id: config.alpaca_account_id.to_string(),
-            alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+        let broker_auth = AlpacaBrokerApiAuthConfig {
+            api_key: "invalid_key".to_string(),
+            api_secret: "invalid_secret".to_string(),
+            account_id: config.alpaca_account_id.to_string(),
+            mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 
         let result = AlpacaBrokerApi::try_from_config(broker_auth).await;

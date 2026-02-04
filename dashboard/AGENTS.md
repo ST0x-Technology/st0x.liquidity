@@ -10,6 +10,16 @@ This file provides guidance to AI agents working with the dashboard.
 
 Use `bun` for all operations. Run from repo root with `--cwd dashboard`.
 
+**CRITICAL: After any change to `bun.lock`**, regenerate `bun.nix` and format
+it:
+
+```bash
+nix run .#genBunNix
+nix fmt -- dashboard/bun.nix
+```
+
+CI will fail if `bun.nix` is out of sync with `bun.lock`.
+
 ### Component Library
 
 Uses shadcn-svelte. Add components via:
