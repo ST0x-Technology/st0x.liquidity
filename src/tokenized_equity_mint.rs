@@ -150,6 +150,8 @@ pub(crate) enum TokenizedEquityMintEvent {
     /// Alpaca rejected the mint request before acceptance.
     /// Shares remain in offchain available - no funds were moved.
     MintRejected {
+        #[serde(default)]
+        symbol: Option<Symbol>,
         reason: String,
         rejected_at: DateTime<Utc>,
     },
@@ -162,6 +164,8 @@ pub(crate) enum TokenizedEquityMintEvent {
     /// Mint failed after acceptance but before tokens were received.
     /// Shares were moved to inflight, can be safely restored to offchain available.
     MintAcceptanceFailed {
+        #[serde(default)]
+        symbol: Option<Symbol>,
         reason: String,
         failed_at: DateTime<Utc>,
     },
@@ -174,6 +178,8 @@ pub(crate) enum TokenizedEquityMintEvent {
     },
 
     MintCompleted {
+        #[serde(default)]
+        symbol: Option<Symbol>,
         completed_at: DateTime<Utc>,
     },
 }
@@ -338,8 +344,9 @@ impl Lifecycle<TokenizedEquityMint, Never> {
     ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => Err(TokenizedEquityMintError::NotRequested),
-            Ok(TokenizedEquityMint::MintRequested { .. }) => {
+            Ok(TokenizedEquityMint::MintRequested { symbol, .. }) => {
                 Ok(vec![TokenizedEquityMintEvent::MintRejected {
+                    symbol: Some(symbol.clone()),
                     reason: reason.to_string(),
                     rejected_at: Utc::now(),
                 }])
@@ -378,8 +385,9 @@ impl Lifecycle<TokenizedEquityMint, Never> {
             Err(LifecycleError::Uninitialized) | Ok(TokenizedEquityMint::MintRequested { .. }) => {
                 Err(TokenizedEquityMintError::NotAccepted)
             }
-            Ok(TokenizedEquityMint::MintAccepted { .. }) => {
+            Ok(TokenizedEquityMint::MintAccepted { symbol, .. }) => {
                 Ok(vec![TokenizedEquityMintEvent::MintAcceptanceFailed {
+                    symbol: Some(symbol.clone()),
                     reason: reason.to_string(),
                     failed_at: Utc::now(),
                 }])
@@ -423,8 +431,9 @@ impl Lifecycle<TokenizedEquityMint, Never> {
                 TokenizedEquityMint::MintRequested { .. }
                 | TokenizedEquityMint::MintAccepted { .. },
             ) => Err(TokenizedEquityMintError::TokensNotReceived),
-            Ok(TokenizedEquityMint::TokensReceived { .. }) => {
+            Ok(TokenizedEquityMint::TokensReceived { symbol, .. }) => {
                 Ok(vec![TokenizedEquityMintEvent::MintCompleted {
+                    symbol: Some(symbol.clone()),
                     completed_at: Utc::now(),
                 }])
             }
@@ -451,6 +460,7 @@ impl TokenizedEquityMint {
             TokenizedEquityMintEvent::MintRejected {
                 reason,
                 rejected_at,
+                ..
             } => current.apply_rejected(reason, *rejected_at, event),
 
             TokenizedEquityMintEvent::MintAccepted {
@@ -463,9 +473,9 @@ impl TokenizedEquityMint {
                 *accepted_at,
                 event,
             ),
-            TokenizedEquityMintEvent::MintAcceptanceFailed { reason, failed_at } => {
-                current.apply_acceptance_failed(reason, *failed_at, event)
-            }
+            TokenizedEquityMintEvent::MintAcceptanceFailed {
+                reason, failed_at, ..
+            } => current.apply_acceptance_failed(reason, *failed_at, event),
 
             TokenizedEquityMintEvent::TokensReceived {
                 tx_hash,
@@ -479,7 +489,7 @@ impl TokenizedEquityMint {
                 *received_at,
                 event,
             ),
-            TokenizedEquityMintEvent::MintCompleted { completed_at } => {
+            TokenizedEquityMintEvent::MintCompleted { completed_at, .. } => {
                 current.apply_completed(*completed_at, event)
             }
         }
@@ -1045,7 +1055,7 @@ mod tests {
         let tx_hash = TxHash::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
+            symbol: symbol.clone(),
             quantity: dec!(100.5),
             wallet,
             requested_at: Utc::now(),
@@ -1068,6 +1078,7 @@ mod tests {
         aggregate.apply(received_event);
 
         let completed_event = TokenizedEquityMintEvent::MintCompleted {
+            symbol: Some(symbol),
             completed_at: Utc::now(),
         };
         aggregate.apply(completed_event);
@@ -1094,7 +1105,7 @@ mod tests {
         let wallet = Address::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
+            symbol: symbol.clone(),
             quantity: dec!(100.5),
             wallet,
             requested_at: Utc::now(),
@@ -1102,6 +1113,7 @@ mod tests {
         aggregate.apply(requested_event);
 
         let rejected_event = TokenizedEquityMintEvent::MintRejected {
+            symbol: Some(symbol),
             reason: "First rejection".to_string(),
             rejected_at: Utc::now(),
         };
@@ -1235,6 +1247,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintCompleted {
+            symbol: None,
             completed_at: Utc::now(),
         };
 
@@ -1260,6 +1273,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintRejected {
+            symbol: None,
             reason: "Should not apply".to_string(),
             rejected_at: Utc::now(),
         };
@@ -1283,6 +1297,7 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
+            symbol: None,
             reason: "Should not apply".to_string(),
             failed_at: Utc::now(),
         };

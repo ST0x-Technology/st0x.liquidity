@@ -75,7 +75,11 @@ where
             )
             .await?;
 
-        let alpaca_request = match self.service.request_mint(symbol, quantity, wallet).await {
+        let alpaca_request = match self
+            .service
+            .request_mint(symbol, quantity, wallet, issuer_request_id.clone())
+            .await
+        {
             Ok(req) => req,
             Err(e) => {
                 warn!("Alpaca mint request failed: {e}");
@@ -85,16 +89,11 @@ where
             }
         };
 
-        let alpaca_issuer_request_id = alpaca_request
-            .issuer_request_id
-            .clone()
-            .ok_or(MintError::MissingIssuerRequestId)?;
-
         self.cqrs
             .execute(
                 &issuer_request_id.0,
                 TokenizedEquityMintCommand::AcknowledgeAcceptance {
-                    issuer_request_id: alpaca_issuer_request_id,
+                    issuer_request_id: issuer_request_id.clone(),
                     tokenization_request_id: alpaca_request.id.clone(),
                 },
             )

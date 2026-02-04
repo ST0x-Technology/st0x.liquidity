@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use cqrs_es::{EventEnvelope, Query};
+use cqrs_es::{DomainEvent, EventEnvelope, Query};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{trace, warn};
 
 use super::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use super::view::InventoryView;
@@ -49,6 +49,10 @@ impl Query<Lifecycle<InventorySnapshot, Never>> for InventorySnapshotQuery {
 
             match inventory.clone().apply_snapshot_event(event, now) {
                 Ok(updated) => {
+                    trace!(
+                        event_type = event.event_type(),
+                        "Applied inventory snapshot event"
+                    );
                     *inventory = updated;
                     drop(inventory);
                     self.trigger_rebalancing_check(event).await;

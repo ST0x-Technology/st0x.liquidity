@@ -551,7 +551,7 @@ impl InventoryView {
                 now,
             ),
 
-            TokenizedEquityMintEvent::MintCompleted { completed_at } => self.update_equity(
+            TokenizedEquityMintEvent::MintCompleted { completed_at, .. } => self.update_equity(
                 symbol,
                 |inventory| Ok(inventory.with_last_rebalancing(*completed_at)),
                 now,
@@ -1199,12 +1199,14 @@ mod tests {
 
     fn make_mint_completed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintCompleted {
+            symbol: None,
             completed_at: Utc::now(),
         }
     }
 
     fn make_mint_rejected() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
+            symbol: None,
             reason: "API timeout".to_string(),
             rejected_at: Utc::now(),
         }
@@ -1212,6 +1214,7 @@ mod tests {
 
     fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
+            symbol: None,
             reason: "Transaction reverted".to_string(),
             failed_at: Utc::now(),
         }

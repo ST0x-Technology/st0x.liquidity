@@ -193,6 +193,7 @@ mod tests {
                 aggregate_id: "mint-multi".to_string(),
                 sequence: 2,
                 payload: TokenizedEquityMintEvent::MintCompleted {
+                    symbol: None,
                     completed_at: chrono::Utc::now(),
                 },
                 metadata: HashMap::new(),
