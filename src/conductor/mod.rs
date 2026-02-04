@@ -9,6 +9,7 @@ use manifest::QueryManifest;
 use std::time::Duration;
 use wire::{Cons, CqrsBuilder, Nil, UnwiredQuery};
 
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, IntoLogData};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
@@ -279,6 +280,10 @@ where
         if let Some(rebalancing_config) = config.rebalancing_config() {
             let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
             let market_maker_wallet = signer.address();
+            let ethereum_wallet = EthereumWallet::from(signer);
+            let provider_with_wallet = ProviderBuilder::new()
+                .wallet(ethereum_wallet)
+                .connect_provider(provider.clone());
 
             let infra = spawn_rebalancing_infrastructure(
                 rebalancing_config,
@@ -286,7 +291,7 @@ where
                 config,
                 &inventory,
                 event_sender,
-                &provider,
+                &provider_with_wallet,
                 market_maker_wallet,
             )
             .await?;
@@ -304,8 +309,10 @@ where
             ));
             let position_view: UnwiredQuery<_, Cons<PositionAggregate, Nil>> =
                 UnwiredQuery::new(GenericQuery::new(position_view_repo.clone()));
+
             let (position_cqrs, (position_view, ())) =
                 CqrsBuilder::new(pool.clone()).wire(position_view).build(());
+
             let position_query = Arc::new(GenericQuery::new(position_view_repo));
             let _position_view = position_view.into_inner();
 
@@ -318,6 +325,7 @@ where
     >::new(
         pool.clone(), "offchain_order_view".to_string()
     ));
+
     let offchain_order_view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
         UnwiredQuery::new(GenericQuery::new(offchain_order_view_repo));
 
@@ -325,6 +333,7 @@ where
     let (offchain_order_cqrs, (offchain_order_view, ())) = CqrsBuilder::new(pool.clone())
         .wire(offchain_order_view)
         .build(order_placer);
+
     let _offchain_order_view = offchain_order_view.into_inner();
     let offchain_order_cqrs = Arc::new(offchain_order_cqrs);
 
