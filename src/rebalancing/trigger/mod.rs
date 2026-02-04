@@ -4,6 +4,7 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -47,8 +48,6 @@ enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
-    #[error("broker account_id is not a valid UUID: {0}")]
-    InvalidAccountId(#[from] uuid::Error),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -86,7 +85,7 @@ pub(crate) struct RebalancingCtx {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Derived from broker config's account_id.
+    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Cloned from broker config - ensures consistency.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -1542,6 +1541,13 @@ mod tests {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
 
             [equity_threshold]
             target = "0.5"
@@ -1632,6 +1638,13 @@ mod tests {
             r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
 
             [equity_threshold]
             target = "0.6"
@@ -1662,6 +1675,7 @@ mod tests {
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
             [equity_threshold]
             target = "0.5"
@@ -1696,6 +1710,7 @@ mod tests {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
             [usdc]
             mode = "disabled"
