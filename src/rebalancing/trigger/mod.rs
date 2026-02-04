@@ -2176,4 +2176,164 @@ mod tests {
             "has_terminal_usdc_rebalance_event must identify ConversionConfirmed alone as terminal"
         );
     }
+
+    /// BUG REPRODUCTION: Trigger incorrectly fires with partial inventory data.
+    ///
+    /// When inventory polling starts:
+    /// 1. Onchain equity is polled first
+    /// 2. Trigger fires with onchain=X, offchain=0 (not yet polled)
+    /// 3. Ratio = X/(X+0) = 100% → detects "TooMuchOnchain" → Redemption
+    ///
+    /// This is WRONG because offchain hasn't been polled yet, not because
+    /// there's actually no offchain inventory.
+    ///
+    /// CORRECT behavior: trigger should NOT fire until both onchain AND
+    /// offchain data are available for the symbol.
+    #[tokio::test]
+    async fn bug_trigger_should_not_fire_with_partial_inventory_data() {
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        // Empty inventory - simulates startup state before polling completes
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        let (sender, mut receiver) = mpsc::channel(10);
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Seed vault registry so token lookup succeeds
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        // Create InventorySnapshotQuery that will dispatch events to the trigger
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Simulate what happens during inventory polling:
+        // OnchainEquity event arrives FIRST (offchain not yet polled)
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100)); // 100 shares onchain
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: "test".to_string(),
+            sequence: 1,
+            payload: onchain_event,
+            metadata: HashMap::new(),
+        };
+
+        // Dispatch the onchain event - this should NOT trigger rebalancing
+        // because we don't have offchain data yet
+        query.dispatch("test", &[envelope]).await;
+
+        // CORRECT BEHAVIOR: No operation should be triggered because
+        // offchain data hasn't arrived yet. The system should wait until
+        // it has a complete picture of inventory before deciding to rebalance.
+        //
+        // CURRENT BUG: A Redemption is incorrectly triggered because:
+        // - Onchain: 100 shares
+        // - Offchain: 0 shares (not polled yet, treated as "no holdings")
+        // - Ratio: 100% onchain → "TooMuchOnchain" → Redemption
+        let triggered = receiver.try_recv();
+
+        assert!(
+            triggered.is_err(),
+            "CORRECT: No operation should trigger with partial inventory data. \
+             BUG: Got {triggered:?} - system incorrectly treated missing offchain \
+             data as 'zero holdings' and triggered rebalancing."
+        );
+    }
+
+    /// Complementary test: verify that trigger DOES fire once both venues have data.
+    #[sqlx::test]
+    async fn trigger_fires_when_both_venues_have_data(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, mut receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Apply onchain snapshot (100 shares)
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 1,
+                    payload: onchain_event,
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // No trigger yet - only one venue has data
+        assert!(
+            receiver.try_recv().is_err(),
+            "should not trigger with only onchain data"
+        );
+
+        // Apply offchain snapshot (0 shares) - now both venues have data
+        let mut positions = BTreeMap::new();
+        positions.insert(symbol.clone(), shares(0));
+
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 2,
+                    payload: offchain_event,
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Now both venues have data: 100 onchain, 0 offchain = 100% ratio
+        // With target 50% and deviation 10%, ratio 100% > upper bound 60%
+        // So TooMuchOnchain -> should trigger Redemption
+        let triggered = receiver.try_recv();
+
+        assert!(
+            triggered.is_ok(),
+            "should trigger rebalancing once both venues have data"
+        );
+
+        assert!(
+            matches!(triggered.unwrap(), TriggeredOperation::Redemption { .. }),
+            "expected Redemption for 100% onchain ratio"
+        );
+    }
 }

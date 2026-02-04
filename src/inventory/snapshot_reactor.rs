@@ -151,10 +151,11 @@ mod tests {
         ));
         let query = InventorySnapshotReactor::new(Arc::clone(&inventory), None);
 
+        // Apply onchain snapshot first
         let mut balances = BTreeMap::new();
         balances.insert(aapl.clone(), test_shares(100));
 
-        let event = InventorySnapshotEvent::OnchainEquity {
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: Utc::now(),
         };
@@ -164,14 +165,35 @@ mod tests {
             owner: Address::ZERO,
         };
 
-        query.react(&id, &event).await;
+        query.react(&id, &onchain_event).await;
+
+        // With only onchain data, no imbalance should be detected (offchain is None)
+        assert!(
+            inventory
+                .read()
+                .await
+                .check_equity_imbalance(&aapl, &balanced_threshold())
+                .is_none(),
+            "should NOT detect imbalance with only onchain data"
+        );
+
+        // Apply offchain snapshot to complete the picture
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), test_shares(0));
+
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: Utc::now(),
+        };
+
+        query.react(&id, &offchain_event).await;
 
         // 100 shares onchain, 0 offchain -> ratio = 1.0, target = 0.5 -> TooMuchOnchain
         let imbalance = inventory
             .read()
             .await
             .check_equity_imbalance(&aapl, &balanced_threshold())
-            .expect("should detect imbalance after onchain equity snapshot");
+            .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
             imbalance,
@@ -186,7 +208,7 @@ mod tests {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let query = InventorySnapshotReactor::new(Arc::clone(&inventory), None);
 
-        let event = InventorySnapshotEvent::OnchainCash {
+        let onchain_event = InventorySnapshotEvent::OnchainCash {
             usdc_balance: Usdc(Decimal::from(1000)),
             fetched_at: Utc::now(),
         };
@@ -196,14 +218,32 @@ mod tests {
             owner: Address::ZERO,
         };
 
-        query.react(&id, &event).await;
+        query.react(&id, &onchain_event).await;
+
+        // With only onchain data, no imbalance should be detected (offchain is None)
+        assert!(
+            inventory
+                .read()
+                .await
+                .check_usdc_imbalance(&balanced_threshold())
+                .is_none(),
+            "should NOT detect imbalance with only onchain data"
+        );
+
+        // Apply offchain snapshot to complete the picture
+        let offchain_event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 0,
+            fetched_at: Utc::now(),
+        };
+
+        query.react(&id, &offchain_event).await;
 
         // 1000 USDC onchain, 0 offchain -> ratio = 1.0, target = 0.5 -> TooMuchOnchain
         let imbalance = inventory
             .read()
             .await
             .check_usdc_imbalance(&balanced_threshold())
-            .expect("should detect imbalance after onchain cash snapshot");
+            .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
             imbalance,
@@ -224,7 +264,7 @@ mod tests {
         let mut positions = BTreeMap::new();
         positions.insert(aapl.clone(), test_shares(50));
 
-        let event = InventorySnapshotEvent::OffchainEquity {
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
             positions,
             fetched_at: Utc::now(),
         };
@@ -234,14 +274,35 @@ mod tests {
             owner: Address::ZERO,
         };
 
-        query.react(&id, &event).await;
+        query.react(&id, &offchain_event).await;
+
+        // With only offchain data, no imbalance should be detected (onchain is None)
+        assert!(
+            inventory
+                .read()
+                .await
+                .check_equity_imbalance(&aapl, &balanced_threshold())
+                .is_none(),
+            "should NOT detect imbalance with only offchain data"
+        );
+
+        // Apply onchain snapshot to complete the picture
+        let mut balances = BTreeMap::new();
+        balances.insert(aapl.clone(), test_shares(0));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        query.react(&id, &onchain_event).await;
 
         // 0 onchain, 50 offchain -> ratio = 0.0, target = 0.5 -> TooMuchOffchain
         let imbalance = inventory
             .read()
             .await
             .check_equity_imbalance(&aapl, &balanced_threshold())
-            .expect("should detect imbalance after offchain equity snapshot");
+            .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
             imbalance,
@@ -256,7 +317,7 @@ mod tests {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let query = InventorySnapshotReactor::new(Arc::clone(&inventory), None);
 
-        let event = InventorySnapshotEvent::OffchainCash {
+        let offchain_event = InventorySnapshotEvent::OffchainCash {
             cash_balance_cents: 50_000_000, // $500,000.00
             fetched_at: Utc::now(),
         };
@@ -266,14 +327,32 @@ mod tests {
             owner: Address::ZERO,
         };
 
-        query.react(&id, &event).await;
+        query.react(&id, &offchain_event).await;
+
+        // With only offchain data, no imbalance should be detected (onchain is None)
+        assert!(
+            inventory
+                .read()
+                .await
+                .check_usdc_imbalance(&balanced_threshold())
+                .is_none(),
+            "should NOT detect imbalance with only offchain data"
+        );
+
+        // Apply onchain snapshot to complete the picture
+        let onchain_event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(Decimal::ZERO),
+            fetched_at: Utc::now(),
+        };
+
+        query.react(&id, &onchain_event).await;
 
         // 0 onchain, 500000 USDC offchain -> ratio = 0.0, target = 0.5 -> TooMuchOffchain
         let imbalance = inventory
             .read()
             .await
             .check_usdc_imbalance(&balanced_threshold())
-            .expect("should detect imbalance after offchain cash snapshot");
+            .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
             imbalance,
@@ -299,6 +378,9 @@ mod tests {
             owner: Address::ZERO,
         };
 
+        let mut positions = BTreeMap::new();
+        positions.insert(aapl.clone(), test_shares(0));
+
         query
             .react(
                 &id,
@@ -319,16 +401,36 @@ mod tests {
             )
             .await;
 
+        query
+            .react(
+                &id,
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await;
+
+        query
+            .react(
+                &id,
+                &InventorySnapshotEvent::OffchainCash {
+                    cash_balance_cents: 0,
+                    fetched_at: Utc::now(),
+                },
+            )
+            .await;
+
         let view = inventory.read().await;
 
-        // Both events applied: equity 100 onchain/0 offchain, USDC 5000 onchain/0 offchain
+        // All events applied: equity 100 onchain/0 offchain, USDC 5000 onchain/0 offchain
         let equity_imbalance = view
             .check_equity_imbalance(&aapl, &balanced_threshold())
-            .expect("should detect equity imbalance after multiple events");
+            .expect("should detect equity imbalance after all venues have data");
 
         let usdc_imbalance = view
             .check_usdc_imbalance(&balanced_threshold())
-            .expect("should detect USDC imbalance after multiple events");
+            .expect("should detect USDC imbalance after all venues have data");
 
         drop(view);
 
@@ -353,19 +455,32 @@ mod tests {
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
 
+        // First apply offchain to initialize that venue (with 0 balance)
+        let offchain_event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 0,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch("test-id", &[create_event_envelope(offchain_event)])
+            .await;
+
+        // No trigger yet - only one venue has data
+        assert!(receiver.try_recv().is_err());
+
         // Set up imbalanced inventory: lots of onchain USDC, none offchain
-        let event = InventorySnapshotEvent::OnchainCash {
+        let onchain_event = InventorySnapshotEvent::OnchainCash {
             usdc_balance: Usdc(Decimal::from(100_000)),
             fetched_at: Utc::now(),
         };
 
         query
-            .dispatch("test-id", &[create_event_envelope(event)])
+            .dispatch("test-id", &[create_event_envelope(onchain_event)])
             .await;
 
         let operation = receiver
             .try_recv()
-            .expect("should trigger USDC rebalancing after onchain cash snapshot");
+            .expect("should trigger USDC rebalancing after both venues have data");
 
         assert!(
             matches!(operation, TriggeredOperation::UsdcBaseToAlpaca { .. }),
@@ -379,19 +494,32 @@ mod tests {
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
 
+        // First apply onchain to initialize that venue (with 0 balance)
+        let onchain_event = InventorySnapshotEvent::OnchainCash {
+            usdc_balance: Usdc(Decimal::ZERO),
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch("test-id", &[create_event_envelope(onchain_event)])
+            .await;
+
+        // No trigger yet - only one venue has data
+        assert!(receiver.try_recv().is_err());
+
         // Set up imbalanced inventory: lots of offchain USDC, none onchain
-        let event = InventorySnapshotEvent::OffchainCash {
+        let offchain_event = InventorySnapshotEvent::OffchainCash {
             cash_balance_cents: 1_000_000_000, // $10,000,000
             fetched_at: Utc::now(),
         };
 
         query
-            .dispatch("test-id", &[create_event_envelope(event)])
+            .dispatch("test-id", &[create_event_envelope(offchain_event)])
             .await;
 
         let operation = receiver
             .try_recv()
-            .expect("should trigger USDC rebalancing after offchain cash snapshot");
+            .expect("should trigger USDC rebalancing after both venues have data");
 
         assert!(
             matches!(operation, TriggeredOperation::UsdcAlpacaToBase { .. }),
@@ -405,14 +533,19 @@ mod tests {
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), None);
 
-        let event = InventorySnapshotEvent::OnchainCash {
-            usdc_balance: Usdc(Decimal::from(100_000)),
-            fetched_at: Utc::now(),
-        };
+        // Apply both onchain and offchain snapshots for complete picture
+        let events = vec![
+            create_event_envelope(InventorySnapshotEvent::OnchainCash {
+                usdc_balance: Usdc(Decimal::from(100_000)),
+                fetched_at: Utc::now(),
+            }),
+            create_event_envelope(InventorySnapshotEvent::OffchainCash {
+                cash_balance_cents: 0,
+                fetched_at: Utc::now(),
+            }),
+        ];
 
-        query
-            .dispatch("test-id", &[create_event_envelope(event)])
-            .await;
+        query.dispatch("test-id", &events).await;
 
         let imbalance = inventory
             .read()
@@ -472,16 +605,30 @@ mod tests {
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
 
+        // First apply offchain to initialize that venue (with 0 balance)
+        let mut offchain_positions = BTreeMap::new();
+        offchain_positions.insert(aapl.clone(), test_shares(0));
+
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
+            positions: offchain_positions,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch("test-id", &[create_event_envelope(offchain_event)])
+            .await;
+
+        // Now apply onchain snapshot with 100 shares
         let mut balances = BTreeMap::new();
         balances.insert(aapl.clone(), test_shares(100));
 
-        let event = InventorySnapshotEvent::OnchainEquity {
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
             balances,
             fetched_at: Utc::now(),
         };
 
         query
-            .dispatch("test-id", &[create_event_envelope(event)])
+            .dispatch("test-id", &[create_event_envelope(onchain_event)])
             .await;
 
         // Equity trigger needs VaultRegistry to resolve token address.
@@ -491,7 +638,7 @@ mod tests {
             .read()
             .await
             .check_equity_imbalance(&aapl, &balanced_threshold())
-            .expect("inventory should reflect onchain equity snapshot");
+            .expect("inventory should reflect both equity snapshots");
 
         assert_eq!(
             imbalance,
@@ -516,23 +663,37 @@ mod tests {
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
 
+        // First apply onchain to initialize that venue (with 0 balance)
+        let mut onchain_balances = BTreeMap::new();
+        onchain_balances.insert(aapl.clone(), test_shares(0));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances: onchain_balances,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch("test-id", &[create_event_envelope(onchain_event)])
+            .await;
+
+        // Now apply offchain snapshot with 200 shares
         let mut positions = BTreeMap::new();
         positions.insert(aapl.clone(), test_shares(200));
 
-        let event = InventorySnapshotEvent::OffchainEquity {
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
             positions,
             fetched_at: Utc::now(),
         };
 
         query
-            .dispatch("test-id", &[create_event_envelope(event)])
+            .dispatch("test-id", &[create_event_envelope(offchain_event)])
             .await;
 
         let imbalance = inventory
             .read()
             .await
             .check_equity_imbalance(&aapl, &balanced_threshold())
-            .expect("inventory should reflect offchain equity snapshot");
+            .expect("inventory should reflect both equity snapshots");
 
         assert_eq!(
             imbalance,
@@ -554,19 +715,33 @@ mod tests {
         let (trigger, mut receiver) = make_trigger(Arc::clone(&inventory), &pool);
         let query = InventorySnapshotQuery::new(Arc::clone(&inventory), Some(trigger));
 
-        let event = InventorySnapshotEvent::OnchainCash {
+        // First apply offchain to initialize that venue (with 0 balance)
+        let offchain_event = InventorySnapshotEvent::OffchainCash {
+            cash_balance_cents: 0,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch("test-id", &[create_event_envelope(offchain_event)])
+            .await;
+
+        // No trigger yet - only one venue has data
+        assert!(receiver.try_recv().is_err());
+
+        // Now apply onchain snapshot with 200k
+        let onchain_event = InventorySnapshotEvent::OnchainCash {
             usdc_balance: Usdc(Decimal::from(200_000)),
             fetched_at: Utc::now(),
         };
 
         query
-            .dispatch("test-id", &[create_event_envelope(event)])
+            .dispatch("test-id", &[create_event_envelope(onchain_event)])
             .await;
 
         // 200k onchain, 0 offchain. Target 50/50 -> excess = 100k onchain
         let operation = receiver
             .try_recv()
-            .expect("should trigger after onchain cash snapshot");
+            .expect("should trigger after both venues have data");
 
         assert_eq!(
             operation,
