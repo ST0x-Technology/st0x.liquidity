@@ -227,20 +227,9 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
         aggregate_id: &str,
         events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
     ) {
-        // Try to extract symbol from terminal events first (for when terminal events come
-        // in isolation without MintRequested in the same batch).
-        if let Some(symbol) = Self::extract_terminal_mint_symbol(events) {
-            self.clear_equity_in_progress(&symbol);
-            debug!(symbol = %symbol, "Cleared equity in-progress flag after mint terminal event");
-
-            // After mint completes, USDC balances may have changed - check for USDC rebalancing
-            self.check_and_trigger_usdc().await;
-            return;
-        }
-
-        // For non-terminal events, we need MintRequested to know the symbol and quantity.
+        // All events now have symbol and quantity, so we can extract from any event.
         let Some((symbol, quantity)) = Self::extract_mint_info(events) else {
-            warn!(aggregate_id = %aggregate_id, "No MintRequested event found in mint dispatch");
+            warn!(aggregate_id = %aggregate_id, "No mint events found in dispatch");
             return;
         };
 
@@ -267,7 +256,7 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
         events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
     ) {
         let Some((symbol, quantity)) = Self::extract_redemption_info(events) else {
-            warn!(aggregate_id = %aggregate_id, "No TokensSent event found in redemption dispatch");
+            warn!(aggregate_id = %aggregate_id, "No VaultWithdrawn event found in redemption dispatch");
             return;
         };
 
@@ -341,7 +330,9 @@ impl RebalancingTrigger {
         let token_address = match self.load_token_address(symbol).await {
             Ok(Some(addr)) => addr,
             Ok(None) => {
-                error!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
+                // tokenized equities and won't be in the vault registry.
+                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
                 return None;
             }
             Err(e) => {
@@ -446,19 +437,33 @@ impl RebalancingTrigger {
         Ok(())
     }
 
+    /// Extracts symbol and quantity from any mint event in the batch.
+    /// All mint events now contain these fields, so this works for incremental dispatch.
     fn extract_mint_info(
         events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
     ) -> Option<(Symbol, FractionalShares)> {
-        for envelope in events {
-            if let TokenizedEquityMintEvent::MintRequested {
+        let envelope = events.first()?;
+        let (symbol, quantity) = match &envelope.payload {
+            TokenizedEquityMintEvent::MintRequested {
                 symbol, quantity, ..
-            } = &envelope.payload
-            {
-                let shares = FractionalShares::new(*quantity);
-                return Some((symbol.clone(), shares));
             }
-        }
-        None
+            | TokenizedEquityMintEvent::MintRejected {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::MintAccepted {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::MintAcceptanceFailed {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::TokensReceived {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::MintCompleted {
+                symbol, quantity, ..
+            } => (symbol, quantity),
+        };
+        Some((symbol.clone(), FractionalShares::new(*quantity)))
     }
 
     fn has_terminal_mint_event(
@@ -472,26 +477,6 @@ impl RebalancingTrigger {
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
             )
         })
-    }
-
-    /// Extracts the symbol from terminal mint events (MintCompleted, MintRejected, MintAcceptanceFailed).
-    /// Returns None if no terminal event has a symbol (backwards compat with old events).
-    fn extract_terminal_mint_symbol(
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
-    ) -> Option<Symbol> {
-        for envelope in events {
-            match &envelope.payload {
-                TokenizedEquityMintEvent::MintCompleted { symbol, .. }
-                | TokenizedEquityMintEvent::MintRejected { symbol, .. }
-                | TokenizedEquityMintEvent::MintAcceptanceFailed { symbol, .. } => {
-                    if let Some(s) = symbol {
-                        return Some(s.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
     }
 
     async fn apply_mint_event_to_inventory(
@@ -1058,46 +1043,46 @@ mod tests {
         }
     }
 
-    fn make_mint_accepted() -> TokenizedEquityMintEvent {
+    fn make_mint_accepted(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
+            symbol: symbol.clone(),
+            quantity,
             issuer_request_id: IssuerRequestId::new("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
     }
 
-    fn make_mint_completed() -> TokenizedEquityMintEvent {
+    fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintCompleted {
-            symbol: None,
+            symbol: symbol.clone(),
+            quantity,
             completed_at: Utc::now(),
         }
     }
 
-    fn make_mint_completed_with_symbol(symbol: Symbol) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
-            symbol: Some(symbol),
-            completed_at: Utc::now(),
-        }
-    }
-
-    fn make_mint_rejected() -> TokenizedEquityMintEvent {
+    fn make_mint_rejected(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
-            symbol: None,
+            symbol: symbol.clone(),
+            quantity,
             reason: "API timeout".to_string(),
             rejected_at: Utc::now(),
         }
     }
 
-    fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
+    fn make_mint_acceptance_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
-            symbol: None,
+            symbol: symbol.clone(),
+            quantity,
             reason: "Transaction reverted".to_string(),
             failed_at: Utc::now(),
         }
     }
 
-    fn make_tokens_received() -> TokenizedEquityMintEvent {
+    fn make_tokens_received(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
+            symbol: symbol.clone(),
+            quantity,
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(30_000_000_000_000_000_000_u128),
@@ -1147,7 +1132,11 @@ mod tests {
         // Apply MintAccepted - this moves shares to inflight.
         // Inflight should now block imbalance detection.
         trigger
-            .apply_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30))
+            .apply_mint_event_to_inventory(
+                &symbol,
+                &make_mint_accepted(&symbol, dec!(30)),
+                shares(30),
+            )
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1155,6 +1144,53 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "Expected no operation due to inflight"
+        );
+    }
+
+    /// Verifies that events arriving without MintRequested (incremental dispatch)
+    /// still update inventory correctly. This is the fix for the double-triggering bug
+    /// where inventory wasn't updated when events arrived in separate batches.
+    #[tokio::test]
+    async fn incremental_dispatch_updates_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.1),
+        };
+
+        // Start with imbalanced inventory: 30 onchain, 70 offchain.
+        let mut inventory = InventoryView::default().with_equity(symbol.clone());
+        inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(30), Direction::Buy))
+            .unwrap();
+        inventory = inventory
+            .apply_position_event(&symbol, &make_offchain_fill(shares(70), Direction::Buy))
+            .unwrap();
+
+        // Verify initial state has no inflight (check_equity_imbalance returns Some).
+        assert!(
+            inventory
+                .check_equity_imbalance(&symbol, &threshold)
+                .is_some()
+        );
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+
+        // Simulate incremental dispatch: MintAccepted arrives WITHOUT MintRequested.
+        // Before the fix, this would log a warning and skip inventory update.
+        // After the fix, inventory should be updated.
+        let events = vec![make_mint_envelope(make_mint_accepted(&symbol, dec!(30)))];
+        trigger.dispatch("mint-123", &events).await;
+
+        // Verify inventory was updated: offchain should have inflight now.
+        // When inflight exists, check_equity_imbalance returns None.
+        let has_imbalance = {
+            let inventory = trigger.inventory.read().await;
+            inventory.check_equity_imbalance(&symbol, &threshold)
+        };
+        assert!(
+            has_imbalance.is_none(),
+            "Expected inflight to block imbalance detection after MintAccepted dispatch"
         );
     }
 
@@ -1175,7 +1211,7 @@ mod tests {
         // Create event batch with MintRequested and MintCompleted.
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_completed()),
+            make_mint_envelope(make_mint_completed(&symbol, dec!(30))),
         ];
 
         // Check that terminal event is detected.
@@ -1201,7 +1237,7 @@ mod tests {
 
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_rejected()),
+            make_mint_envelope(make_mint_rejected(&symbol, dec!(30))),
         ];
 
         assert!(RebalancingTrigger::has_terminal_mint_event(&events));
@@ -1216,7 +1252,7 @@ mod tests {
 
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_acceptance_failed()),
+            make_mint_envelope(make_mint_acceptance_failed(&symbol, dec!(30))),
         ];
 
         assert!(RebalancingTrigger::has_terminal_mint_event(&events));
@@ -1241,9 +1277,7 @@ mod tests {
 
         // Dispatch ONLY MintCompleted - no MintRequested in this batch.
         // This is what happens when Finalize command produces MintCompleted.
-        let events = vec![make_mint_envelope(make_mint_completed_with_symbol(
-            symbol.clone(),
-        ))];
+        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
 
         trigger.dispatch("test-aggregate-id", &events).await;
 
@@ -1267,12 +1301,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_mint_info_returns_none_without_mint_requested() {
-        let events = vec![make_mint_envelope(make_mint_completed())];
+    fn extract_mint_info_returns_info_from_any_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
 
-        let result = RebalancingTrigger::extract_mint_info(&events);
+        // Can extract from MintCompleted
+        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
+        let (extracted_symbol, extracted_quantity) =
+            RebalancingTrigger::extract_mint_info(&events).unwrap();
+        assert_eq!(extracted_symbol, symbol);
+        assert_eq!(extracted_quantity.inner(), dec!(30));
 
-        assert!(result.is_none());
+        // Can extract from MintAccepted
+        let events = vec![make_mint_envelope(make_mint_accepted(&symbol, dec!(42)))];
+        let (extracted_symbol, extracted_quantity) =
+            RebalancingTrigger::extract_mint_info(&events).unwrap();
+        assert_eq!(extracted_symbol, symbol);
+        assert_eq!(extracted_quantity.inner(), dec!(42));
+
+        // Returns None for empty event list
+        let events: Vec<EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>> = vec![];
+        assert!(RebalancingTrigger::extract_mint_info(&events).is_none());
     }
 
     #[test]
@@ -1280,8 +1328,8 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_accepted()),
-            make_mint_envelope(make_tokens_received()),
+            make_mint_envelope(make_mint_accepted(&symbol, dec!(30))),
+            make_mint_envelope(make_tokens_received(&symbol, dec!(30))),
         ];
 
         assert!(!RebalancingTrigger::has_terminal_mint_event(&events));

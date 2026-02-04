@@ -88,14 +88,16 @@ impl Query<Lifecycle<UsdcRebalance, Never>> for EventBroadcaster {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::Address;
+    use cqrs_es::Query;
+    use rust_decimal_macros::dec;
+    use st0x_execution::Symbol;
+    use std::collections::HashMap;
+
     use super::*;
     use crate::equity_redemption::EquityRedemptionEvent;
     use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
     use crate::usdc_rebalance::UsdcRebalanceEvent;
-    use alloy::primitives::Address;
-    use cqrs_es::Query;
-    use st0x_execution::Symbol;
-    use std::collections::HashMap;
 
     fn make_mint_requested(symbol: &str, quantity: u64) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
@@ -193,7 +195,8 @@ mod tests {
                 aggregate_id: "mint-multi".to_string(),
                 sequence: 2,
                 payload: TokenizedEquityMintEvent::MintCompleted {
-                    symbol: None,
+                    symbol: Symbol::new("NVDA").unwrap(),
+                    quantity: dec!(25),
                     completed_at: chrono::Utc::now(),
                 },
                 metadata: HashMap::new(),

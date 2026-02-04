@@ -95,9 +95,12 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to receive tokens before mint was accepted
     #[error("Cannot receive tokens: mint not accepted")]
     NotAccepted,
-    /// Attempted to finalize before tokens were received
-    #[error("Cannot finalize: tokens not received")]
+    /// Attempted to deposit to vault before tokens were received
+    #[error("Cannot deposit to vault: tokens not received")]
     TokensNotReceived,
+    /// Attempted to finalize before vault deposit
+    #[error("Cannot finalize: vault deposit not complete")]
+    VaultDepositNotComplete,
     /// Attempted to modify a completed mint operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -136,6 +139,11 @@ pub(crate) enum TokenizedEquityMintCommand {
         shares_minted: U256,
     },
 
+    /// Deposit tokens from wallet to Raindex vault.
+    DepositToVault {
+        vault_deposit_tx_hash: TxHash,
+    },
+
     Finalize,
 }
 
@@ -150,13 +158,15 @@ pub(crate) enum TokenizedEquityMintEvent {
     /// Alpaca rejected the mint request before acceptance.
     /// Shares remain in offchain available - no funds were moved.
     MintRejected {
-        #[serde(default)]
-        symbol: Option<Symbol>,
+        symbol: Symbol,
+        quantity: Decimal,
         reason: String,
         rejected_at: DateTime<Utc>,
     },
 
     MintAccepted {
+        symbol: Symbol,
+        quantity: Decimal,
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
         accepted_at: DateTime<Utc>,
@@ -164,22 +174,32 @@ pub(crate) enum TokenizedEquityMintEvent {
     /// Mint failed after acceptance but before tokens were received.
     /// Shares were moved to inflight, can be safely restored to offchain available.
     MintAcceptanceFailed {
-        #[serde(default)]
-        symbol: Option<Symbol>,
+        symbol: Symbol,
+        quantity: Decimal,
         reason: String,
         failed_at: DateTime<Utc>,
     },
 
     TokensReceived {
+        symbol: Symbol,
+        quantity: Decimal,
         tx_hash: TxHash,
         receipt_id: ReceiptId,
         shares_minted: U256,
         received_at: DateTime<Utc>,
     },
 
+    /// Tokens deposited from wallet to Raindex vault.
+    VaultDeposited {
+        symbol: Symbol,
+        quantity: Decimal,
+        vault_deposit_tx_hash: TxHash,
+        deposited_at: DateTime<Utc>,
+    },
+
     MintCompleted {
-        #[serde(default)]
-        symbol: Option<Symbol>,
+        symbol: Symbol,
+        quantity: Decimal,
         completed_at: DateTime<Utc>,
     },
 }
