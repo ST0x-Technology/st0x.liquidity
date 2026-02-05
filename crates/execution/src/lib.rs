@@ -21,8 +21,32 @@ pub use alpaca_broker_api::AlpacaBrokerApi;
 pub use alpaca_trading_api::AlpacaTradingApi;
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorConfig};
-pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
+pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus};
 pub use schwab::SchwabExecutor;
+
+/// The order ID assigned by the executor (broker) when an order is placed.
+///
+/// Wraps the executor's string order ID for type safety in the CQRS domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorOrderId(String);
+
+impl ExecutorOrderId {
+    pub fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl AsRef<str> for ExecutorOrderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ExecutorOrderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
@@ -50,10 +74,6 @@ pub trait Executor: Send + Sync + 'static {
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
-
-    /// Poll all pending orders for status updates
-    /// More efficient than individual get_order_status calls for multiple orders
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
     /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic
@@ -926,5 +946,25 @@ mod tests {
     #[test]
     fn dry_run_supports_fractional_shares() {
         assert!(SupportedExecutor::DryRun.supports_fractional_shares());
+    }
+
+    #[test]
+    fn executor_order_id_new_stores_value() {
+        let id = ExecutorOrderId::new("ORD-123");
+        assert_eq!(id.as_ref(), "ORD-123");
+    }
+
+    #[test]
+    fn executor_order_id_display_matches_inner() {
+        let id = ExecutorOrderId::new("ORD-456");
+        assert_eq!(id.to_string(), "ORD-456");
+    }
+
+    #[test]
+    fn executor_order_id_serialization_roundtrip() {
+        let id = ExecutorOrderId::new("ORD-789");
+        let json = serde_json::to_string(&id).unwrap();
+        let deserialized: ExecutorOrderId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
     }
 }

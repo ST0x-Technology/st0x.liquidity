@@ -38,10 +38,6 @@ impl BrokerConfig {
     }
 }
 
-pub(crate) trait HasSqlite {
-    async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
-}
-
 pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let pool = SqlitePool::connect(database_url).await?;
 

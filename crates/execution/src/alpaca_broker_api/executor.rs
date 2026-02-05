@@ -10,7 +10,7 @@ use super::auth::{AccountStatus, AlpacaBrokerApiAuthConfig};
 use super::client::AlpacaBrokerApiClient;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use crate::{
-    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate, SupportedExecutor,
+    Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, SupportedExecutor,
     TryIntoExecutor,
 };
 
@@ -86,10 +86,6 @@ impl Executor for AlpacaBrokerApi {
                 error_reason: None,
             }),
         }
-    }
-
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error> {
-        super::order::poll_pending_orders(&self.client).await
     }
 
     fn to_supported_executor(&self) -> SupportedExecutor {

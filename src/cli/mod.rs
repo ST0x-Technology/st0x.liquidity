@@ -11,13 +11,12 @@ use alloy::primitives::{Address, B256};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, Symbol};
+use st0x_execution::{Direction, FractionalShares, Symbol};
 use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
 use crate::config::{Config, Env};
-use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
 
@@ -579,8 +578,17 @@ async fn run_provider_command<W: Write>(
         ProviderCommand::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
             let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache)
-                .await
+            let order_placer = trading::create_order_placer(config, pool);
+            trading::process_tx_with_provider(
+                tx_hash,
+                config,
+                pool,
+                stdout,
+                &provider,
+                &cache,
+                order_placer,
+            )
+            .await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
             rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
@@ -643,16 +651,16 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::json;
     use st0x_execution::schwab::{SchwabAuthConfig, SchwabError, SchwabTokens};
-    use st0x_execution::{Direction, FractionalShares, OrderStatus, Positive};
+    use st0x_execution::{Direction, FractionalShares, OrderStatus};
     use std::str::FromStr;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{BrokerConfig, LogLevel};
+    use crate::lifecycle::Lifecycle;
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmConfig;
-    use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
@@ -1647,6 +1655,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
 
+        let order_placer = trading::create_order_placer(&config, &pool);
         let result = trading::process_tx_with_provider(
             tx_hash,
             &config,
@@ -1654,6 +1663,7 @@ mod tests {
             &mut stdout,
             &provider,
             &cache,
+            order_placer,
         )
         .await;
 
@@ -1752,6 +1762,7 @@ mod tests {
 
         let mut stdout = Vec::new();
 
+        let order_placer = trading::create_order_placer(&config, &pool);
         let result = trading::process_tx_with_provider(
             tx_hash,
             &config,
@@ -1759,6 +1770,7 @@ mod tests {
             &mut stdout,
             &provider,
             &cache,
+            order_placer,
         )
         .await;
 
@@ -1767,12 +1779,6 @@ mod tests {
             "process_tx should succeed with proper mocking: {:?}",
             result.as_ref().err()
         );
-
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
-            .await
-            .unwrap();
-        assert_eq!(trade.symbol.to_string(), "AAPL0x");
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
 
         let executions = find_executions_by_symbol_status_and_broker(
             &pool,
@@ -1783,24 +1789,13 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(executions.len(), 1);
-        assert_eq!(
-            executions[0].shares,
-            Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
-        );
-        assert_eq!(executions[0].direction, Direction::Buy);
-
-        let execution_id = executions[0].id.unwrap();
-        let row = sqlx::query!(
-            "SELECT order_id FROM offchain_trades WHERE id = ?1",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            row.order_id.is_some(),
-            "Order ID should be stored for polling"
-        );
+        let (_order_id, aggregate) = &executions[0];
+        let order = match aggregate {
+            Lifecycle::Live(order) => order,
+            other => panic!("Expected Live offchain order, got: {other:?}"),
+        };
+        assert_eq!(order.shares(), FractionalShares::new(Decimal::from(9)));
+        assert_eq!(order.direction(), Direction::Buy);
 
         account_mock.assert();
         order_mock.assert();
@@ -1830,6 +1825,8 @@ mod tests {
 
         let mut config = config;
         config.evm.order_owner = Some(mock_data.order_owner);
+
+        let order_placer = trading::create_order_placer(&config, &pool);
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1877,6 +1874,7 @@ mod tests {
             &mut stdout1,
             &provider1,
             &cache1,
+            order_placer.clone(),
         )
         .await;
         assert!(
@@ -1884,12 +1882,6 @@ mod tests {
             "First process_tx should succeed: {:?}",
             result1.as_ref().err()
         );
-
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
-            .await
-            .unwrap();
-        assert_eq!(trade.symbol.to_string(), "TSLA0x");
-        assert!((trade.amount - 5.0).abs() < f64::EPSILON);
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();
         assert!(stdout_str1.contains("Processing trade with TradeAccumulator"));
@@ -1919,6 +1911,7 @@ mod tests {
             &mut stdout2,
             &provider2,
             &cache2,
+            order_placer.clone(),
         )
         .await;
         assert!(
@@ -1926,8 +1919,19 @@ mod tests {
             "Second process_tx should succeed with graceful duplicate handling"
         );
 
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 1, "Only one trade should exist in database");
+        let executions = find_executions_by_symbol_status_and_broker(
+            &pool,
+            Some(Symbol::new("TSLA").unwrap()),
+            OrderStatus::Submitted,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            executions.len(),
+            1,
+            "Only one offchain order should exist after processing the same tx twice"
+        );
 
         let stdout_str2 = String::from_utf8(stdout2).unwrap();
         assert!(stdout_str2.contains("Processing trade with TradeAccumulator"));

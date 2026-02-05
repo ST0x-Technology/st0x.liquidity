@@ -45,7 +45,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
@@ -671,15 +671,6 @@ impl TokenizedEquityMint {
             requested_at: *requested_at,
             failed_at,
         })
-    }
-}
-
-impl View<Self> for Lifecycle<TokenizedEquityMint, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, TokenizedEquityMint::apply_transition)
-            .or_initialize(&event.payload, TokenizedEquityMint::from_event);
     }
 }
 

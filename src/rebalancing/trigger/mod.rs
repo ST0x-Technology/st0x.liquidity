@@ -16,19 +16,19 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
+use chrono::Utc;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
+use st0x_execution::{ArithmeticError, FractionalShares, Symbol};
+
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::position::{Position, PositionEvent};
-use crate::shares::{ArithmeticError, FractionalShares};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::VaultRegistry;
-use chrono::Utc;
-use st0x_execution::Symbol;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
 
 use crate::vault_registry::VaultRegistryError;
 
@@ -610,7 +610,9 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::lifecycle::Lifecycle;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use st0x_execution::ExecutorOrderId;
+
+    use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -735,10 +737,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
+            offchain_order_id: OffchainOrder::aggregate_id(),
             shares_filled,
             direction,
-            broker_order_id: BrokerOrderId("ORD1".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD1"),
             price_cents: PriceCents(15000),
             broker_timestamp: Utc::now(),
         }

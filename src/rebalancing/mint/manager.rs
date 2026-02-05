@@ -8,7 +8,7 @@ use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use rust_decimal::Decimal;
-use st0x_execution::Symbol;
+use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
@@ -17,7 +17,6 @@ use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
 use crate::lifecycle::{Lifecycle, Never};
-use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };

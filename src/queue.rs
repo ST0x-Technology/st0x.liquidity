@@ -149,21 +149,21 @@ pub(crate) async fn get_next_unprocessed_event(
     }))
 }
 
-/// Marks an event as processed in the queue within a transaction
-#[tracing::instrument(skip(sql_tx), fields(event_id), level = tracing::Level::DEBUG)]
+/// Marks an event as processed in the queue
+#[tracing::instrument(skip(pool), fields(event_id), level = tracing::Level::DEBUG)]
 pub(crate) async fn mark_event_processed(
-    sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    pool: &SqlitePool,
     event_id: i64,
 ) -> Result<(), EventQueueError> {
     sqlx::query!(
         r#"
-        UPDATE event_queue 
+        UPDATE event_queue
         SET processed = 1, processed_at = CURRENT_TIMESTAMP
         WHERE id = ?
         "#,
         event_id
     )
-    .execute(&mut **sql_tx)
+    .execute(pool)
     .await?;
 
     Ok(())
@@ -300,11 +300,9 @@ mod tests {
         assert!(!queued_event.processed);
 
         // Mark as processed
-        let mut sql_tx = pool.begin().await.unwrap();
-        mark_event_processed(&mut sql_tx, queued_event.id.unwrap())
+        mark_event_processed(&pool, queued_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
 
         // Check unprocessed count is now 0
         let count = count_unprocessed(&pool).await.unwrap();
@@ -393,11 +391,9 @@ mod tests {
         for i in 0..3 {
             let event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
             assert_eq!(event.log_index, i);
-            let mut sql_tx = pool.begin().await.unwrap();
-            mark_event_processed(&mut sql_tx, event.id.unwrap())
+            mark_event_processed(&pool, event.id.unwrap())
                 .await
                 .unwrap();
-            sql_tx.commit().await.unwrap();
         }
 
         let count = count_unprocessed(&pool).await.unwrap();
@@ -468,11 +464,9 @@ mod tests {
         let first_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert!(matches!(first_event.event, TradeEvent::ClearV3(_)));
 
-        let mut sql_tx = pool.begin().await.unwrap();
-        mark_event_processed(&mut sql_tx, first_event.id.unwrap())
+        mark_event_processed(&pool, first_event.id.unwrap())
             .await
             .unwrap();
-        sql_tx.commit().await.unwrap();
 
         let second_event = get_next_unprocessed_event(&pool).await.unwrap().unwrap();
         assert!(matches!(second_event.event, TradeEvent::TakeOrderV3(_)));

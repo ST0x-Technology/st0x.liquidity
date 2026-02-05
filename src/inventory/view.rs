@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use st0x_execution::{ArithmeticError, Direction, FractionalShares, HasZero, Symbol};
 use std::collections::HashMap;
 use std::ops::{Add, Sub};
 
@@ -10,11 +11,9 @@ use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::EquityRedemptionEvent;
 use crate::position::PositionEvent;
-use crate::shares::{ArithmeticError, FractionalShares, HasZero};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
-use st0x_execution::{Direction, Symbol};
 
 /// Error type for inventory view operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -435,11 +434,9 @@ impl InventoryView {
                 )
             }
 
-            PositionEvent::Initialized { .. }
-            | PositionEvent::Migrated { .. }
+            PositionEvent::Migrated { .. }
             | PositionEvent::OffChainOrderPlaced { .. }
-            | PositionEvent::OffChainOrderFailed { .. }
-            | PositionEvent::ThresholdUpdated { .. } => Ok(Self {
+            | PositionEvent::OffChainOrderFailed { .. } => Ok(Self {
                 last_updated: timestamp,
                 ..self
             }),
@@ -715,9 +712,10 @@ mod tests {
 
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use st0x_execution::ExecutorOrderId;
+
+    use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
-    use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
 
     fn shares(n: i64) -> FractionalShares {
@@ -912,10 +910,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
+            offchain_order_id: OffchainOrder::aggregate_id(),
             shares_filled,
             direction,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             broker_timestamp: Utc::now(),
         }
@@ -1019,10 +1017,10 @@ mod tests {
         };
 
         let event_time = original_time + chrono::Duration::hours(1);
-        let event = PositionEvent::Initialized {
-            symbol: symbol.clone(),
-            threshold: ExecutionThreshold::whole_share(),
-            initialized_at: event_time,
+        let event = PositionEvent::OffChainOrderFailed {
+            offchain_order_id: OffchainOrder::aggregate_id(),
+            error: "test".to_string(),
+            failed_at: event_time,
         };
 
         let updated = view.apply_position_event(&symbol, &event).unwrap();

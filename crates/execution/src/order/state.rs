@@ -1,19 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
-use num_traits::ToPrimitive;
 
 use super::OrderStatus;
-use crate::{
-    Direction, ExecutionError, FractionalShares, PersistenceError, Positive, SupportedExecutor,
-    Symbol,
-};
-
-/// Database fields extracted from OrderState for storage
-#[derive(Debug)]
-pub(crate) struct OrderStateDbFields {
-    pub(crate) order_id: Option<String>,
-    pub(crate) price_cents: Option<i64>,
-    pub(crate) executed_at: Option<chrono::NaiveDateTime>,
-}
+use crate::ExecutionError;
 
 // Stateful enum with associated data for runtime use
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,117 +64,6 @@ impl OrderState {
                     error_reason: None, // We don't store error_reason in database yet
                 })
             }
-        }
-    }
-
-    pub async fn store_update(
-        &self,
-        sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        execution_id: i64,
-    ) -> Result<(), crate::PersistenceError> {
-        let status_str = self.status().as_str();
-        let db_fields = self.to_db_fields()?;
-
-        let result = sqlx::query!(
-            "
-            UPDATE offchain_trades
-            SET status = ?1, order_id = ?2, price_cents = ?3, executed_at = ?4
-            WHERE id = ?5
-            ",
-            status_str,
-            db_fields.order_id,
-            db_fields.price_cents,
-            db_fields.executed_at,
-            execution_id
-        )
-        .execute(&mut **sql_tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(crate::PersistenceError::RowNotFound { execution_id });
-        }
-
-        Ok(())
-    }
-
-    pub async fn store(
-        &self,
-        sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        symbol: &Symbol,
-        shares: Positive<FractionalShares>,
-        direction: Direction,
-        executor: SupportedExecutor,
-    ) -> Result<i64, PersistenceError> {
-        let status_str = self.status().as_str();
-        let db_fields = self.to_db_fields()?;
-
-        let symbol_str = symbol.to_string();
-        let shares_f64 = shares
-            .inner()
-            .inner()
-            .to_f64()
-            .ok_or(PersistenceError::ShareQuantityConversionFailed(shares))?;
-        let direction_str = direction.as_str();
-        let executor_str = executor.to_string();
-
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO offchain_trades (
-                symbol,
-                shares,
-                direction,
-                broker,
-                order_id,
-                price_cents,
-                status,
-                executed_at
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-            "#,
-            symbol_str,
-            shares_f64,
-            direction_str,
-            executor_str,
-            db_fields.order_id,
-            db_fields.price_cents,
-            status_str,
-            db_fields.executed_at
-        )
-        .execute(&mut **sql_tx)
-        .await?;
-
-        Ok(result.last_insert_rowid())
-    }
-
-    pub(crate) fn to_db_fields(&self) -> Result<OrderStateDbFields, ExecutionError> {
-        match self {
-            Self::Pending => Ok(OrderStateDbFields {
-                order_id: None,
-                price_cents: None,
-                executed_at: None,
-            }),
-            Self::Submitted { order_id } => Ok(OrderStateDbFields {
-                order_id: Some(order_id.clone()),
-                price_cents: None,
-                executed_at: None,
-            }),
-            Self::Filled {
-                executed_at,
-                order_id,
-                price_cents,
-            } => Ok(OrderStateDbFields {
-                order_id: Some(order_id.clone()),
-                price_cents: Some((*price_cents).try_into()?),
-                executed_at: Some(executed_at.naive_utc()),
-            }),
-            Self::Failed {
-                failed_at,
-                error_reason: _,
-            } => Ok(OrderStateDbFields {
-                order_id: None,
-                price_cents: None,
-                executed_at: Some(failed_at.naive_utc()),
-            }),
         }
     }
 }
@@ -328,53 +205,6 @@ mod tests {
                 status: OrderStatus::Failed
             }
         ));
-    }
-
-    #[test]
-    fn test_to_db_fields_pending() {
-        let state = OrderState::Pending;
-        let db_fields = state.to_db_fields().unwrap();
-        assert_eq!(db_fields.order_id, None);
-        assert_eq!(db_fields.price_cents, None);
-        assert_eq!(db_fields.executed_at, None);
-    }
-
-    #[test]
-    fn test_to_db_fields_submitted() {
-        let state = OrderState::Submitted {
-            order_id: "ORDER123".to_string(),
-        };
-        let db_fields = state.to_db_fields().unwrap();
-        assert_eq!(db_fields.order_id, Some("ORDER123".to_string()));
-        assert_eq!(db_fields.price_cents, None);
-        assert_eq!(db_fields.executed_at, None);
-    }
-
-    #[test]
-    fn test_to_db_fields_filled() {
-        let timestamp = Utc::now();
-        let state = OrderState::Filled {
-            executed_at: timestamp,
-            order_id: "ORDER123".to_string(),
-            price_cents: 15000,
-        };
-        let db_fields = state.to_db_fields().unwrap();
-        assert_eq!(db_fields.order_id, Some("ORDER123".to_string()));
-        assert_eq!(db_fields.price_cents, Some(15000));
-        assert_eq!(db_fields.executed_at, Some(timestamp.naive_utc()));
-    }
-
-    #[test]
-    fn test_to_db_fields_failed() {
-        let timestamp = Utc::now();
-        let state = OrderState::Failed {
-            failed_at: timestamp,
-            error_reason: Some("Test error".to_string()),
-        };
-        let db_fields = state.to_db_fields().unwrap();
-        assert_eq!(db_fields.order_id, None);
-        assert_eq!(db_fields.price_cents, None);
-        assert_eq!(db_fields.executed_at, Some(timestamp.naive_utc()));
     }
 
     #[test]

@@ -10,12 +10,15 @@ use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
 use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
-    EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
-    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive,
+    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
+    InvalidSharesError, PersistenceError, SharesConversionError,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 
 use crate::config::ConfigError;
+use crate::offchain_order::{NegativePriceCents, OffchainOrderError};
+use crate::onchain_trade::OnChainTradeError;
+use crate::position::PositionError;
 use crate::vault_registry::VaultRegistryError;
 
 /// Business logic validation errors for trade processing rules.
@@ -39,13 +42,6 @@ pub(crate) enum TradeValidationError {
         "Expected IO to contain USDC and one tokenized equity (t prefix, 0x or s1 suffix) but got {0} and {1}"
     )]
     InvalidSymbolConfiguration(String, String),
-    #[error(
-        "Could not fully allocate execution shares for symbol {symbol}. Remaining: {remaining_shares}"
-    )]
-    InsufficientTradeAllocation {
-        symbol: String,
-        remaining_shares: f64,
-    },
     #[error("Failed to convert U256 to f64: {0}")]
     U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]
@@ -70,8 +66,6 @@ pub(crate) enum TradeValidationError {
     },
     #[error("Negative shares amount: {0}")]
     NegativeShares(f64),
-    #[error("Share quantity {0} cannot be converted to f64")]
-    ShareConversionFailed(Positive<FractionalShares>),
     #[error("Negative USDC amount: {0}")]
     NegativeUsdc(f64),
     #[error(
@@ -118,8 +112,6 @@ pub(crate) enum EventProcessingError {
     EnqueueTakeOrderV3(#[source] EventQueueError),
     #[error("Database transaction error: {0}")]
     Transaction(#[from] sqlx::Error),
-    #[error("Execution with ID {0} not found")]
-    ExecutionNotFound(i64),
     #[error("Onchain trade processing error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Schwab execution error: {0}")]
@@ -136,6 +128,8 @@ pub(crate) enum EventProcessingError {
     Config(#[from] ConfigError),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] AggregateError<VaultRegistryError>),
+    #[error(transparent)]
+    InvalidShares(#[from] InvalidSharesError),
 }
 
 /// Order polling errors for order status monitoring.
@@ -185,12 +179,24 @@ pub(crate) enum OnChainError {
     InvalidShares(#[from] InvalidSharesError),
     #[error(transparent)]
     InvalidDirection(#[from] InvalidDirectionError),
-    #[error("Dual write error: {0}")]
-    DualWrite(#[from] crate::dual_write::DualWriteError),
+    #[error("OnChainTrade aggregate error: {0}")]
+    OnChainTradeAggregate(#[from] AggregateError<OnChainTradeError>),
+    #[error("Position aggregate error: {0}")]
+    PositionAggregate(#[from] AggregateError<PositionError>),
+    #[error("OffchainOrder aggregate error: {0}")]
+    OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
     #[error("Position error: {0}")]
-    Position(#[from] crate::position::PositionError),
+    Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
-    SharesConversion(#[from] crate::shares::SharesConversionError),
+    SharesConversion(#[from] SharesConversionError),
+    #[error("Decimal conversion error: {0}")]
+    DecimalConversion(#[from] rust_decimal::Error),
+    #[error("Negative price in cents: {0}")]
+    NegativePriceCents(#[from] NegativePriceCents),
+    #[error("JSON serde error: {0}")]
+    JsonSerde(#[from] serde_json::Error),
+    #[error("UUID parse error: {0}")]
+    Uuid(#[from] uuid::Error),
 }
 
 impl From<sqlx::Error> for OnChainError {

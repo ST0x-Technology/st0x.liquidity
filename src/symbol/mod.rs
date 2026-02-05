@@ -4,12 +4,6 @@ pub(crate) mod lock;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Symbol(String);
 
-impl Symbol {
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl AsRef<str> for Symbol {
     fn as_ref(&self) -> &str {
         &self.0

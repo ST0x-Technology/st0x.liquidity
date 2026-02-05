@@ -16,6 +16,8 @@ use st0x_execution::{FractionalShares, Symbol};
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::threshold::Usdc;
 
+pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
+
 /// State tracking the latest inventory snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InventorySnapshot {
@@ -214,8 +216,6 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
-
-    type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
     fn test_symbol(s: &str) -> Symbol {
         Symbol::new(s).unwrap()

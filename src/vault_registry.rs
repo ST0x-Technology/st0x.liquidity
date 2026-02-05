@@ -10,11 +10,13 @@ use std::collections::BTreeMap;
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+
+pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,17 +172,6 @@ impl Aggregate for Lifecycle<VaultRegistry, Never> {
     }
 }
 
-impl View<Self> for Lifecycle<VaultRegistry, Never> {
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        *self = self
-            .clone()
-            .transition(&event.payload, |event, state| {
-                Ok(VaultRegistry::apply_transition(event, state))
-            })
-            .or_initialize(&event.payload, |event| Ok(VaultRegistry::from_event(event)));
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultRegistryError {
     #[error(transparent)]
@@ -251,7 +242,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use cqrs_es::{EventEnvelope, Query};
+    use cqrs_es::{EventEnvelope, Query, View};
     use sqlite_es::sqlite_cqrs;
 
     use super::*;
@@ -264,8 +255,6 @@ mod tests {
         b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
     const TEST_TX_HASH: TxHash =
         b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-    type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
     fn make_envelope(
         aggregate_id: &str,

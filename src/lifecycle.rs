@@ -41,13 +41,22 @@
 //! - `or_initialize()` handles genesis events if the entity doesn't exist yet
 //! - Failures transition to `Failed` instead of panicking
 
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cqrs_es::{EventEnvelope, Query};
+use cqrs_es::persist::GenericQuery;
+use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteViewRepository;
 use tracing::error;
+
+/// A query that materializes a `Lifecycle<T, E>` aggregate as its own view in SQLite.
+pub(crate) type SqliteQuery<T, E> = GenericQuery<
+    SqliteViewRepository<Lifecycle<T, E>, Lifecycle<T, E>>,
+    Lifecycle<T, E>,
+    Lifecycle<T, E>,
+>;
 
 /// An uninhabited type for entities with no fallible operations.
 ///
@@ -217,6 +226,19 @@ impl<T, E: Display> Lifecycle<T, E> {
                 ..
             } => self,
         }
+    }
+}
+
+/// Blanket View impl: any `Lifecycle<T, E>` that is an `Aggregate` can serve as
+/// its own materialized view by replaying events through `apply`.
+impl<T, E> View<Self> for Lifecycle<T, E>
+where
+    Self: Aggregate,
+    T: Debug,
+    E: Debug,
+{
+    fn update(&mut self, event: &EventEnvelope<Self>) {
+        self.apply(event.payload.clone());
     }
 }
 
