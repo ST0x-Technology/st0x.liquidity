@@ -462,6 +462,9 @@ impl RebalancingTrigger {
             | TokenizedEquityMintEvent::VaultDeposited {
                 symbol, quantity, ..
             }
+            | TokenizedEquityMintEvent::VaultDepositFailed {
+                symbol, quantity, ..
+            }
             | TokenizedEquityMintEvent::MintCompleted {
                 symbol, quantity, ..
             } => (symbol, quantity),
@@ -478,6 +481,7 @@ impl RebalancingTrigger {
                 TokenizedEquityMintEvent::MintCompleted { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+                    | TokenizedEquityMintEvent::VaultDepositFailed { .. }
             )
         })
     }

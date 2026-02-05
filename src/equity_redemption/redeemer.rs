@@ -4,8 +4,8 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::onchain::vault::VaultError;
+use crate::tokenization::AlpacaTokenizationError;
 
 /// Error type for Redeemer service operations.
 #[derive(Debug, Error)]

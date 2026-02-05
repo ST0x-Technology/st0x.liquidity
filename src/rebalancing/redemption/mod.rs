@@ -14,8 +14,8 @@ use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
-use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
+use crate::tokenization::AlpacaTokenizationError;
 
 pub(crate) use service::RedemptionService;
 

@@ -13,8 +13,8 @@ use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
-use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::onchain::vault::VaultError;
+use crate::tokenization::AlpacaTokenizationError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
 
 #[derive(Debug, Error)]

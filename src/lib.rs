@@ -6,7 +6,6 @@ use tracing::{error, info, info_span, warn};
 
 use crate::dashboard::ServerMessage;
 
-mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
@@ -30,6 +29,7 @@ mod rebalancing;
 mod symbol;
 mod telemetry;
 mod threshold;
+mod tokenization;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;

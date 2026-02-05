@@ -15,9 +15,6 @@ use std::time::Duration;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
 use st0x_execution::{AlpacaBrokerApi, Executor, FractionalShares, Symbol};
 
-use crate::alpaca_tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
-};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::cctp::{
@@ -32,6 +29,9 @@ use crate::rebalancing::redemption::{Redeem, RedemptionService};
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
+use crate::tokenization::{
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
+};
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistryAggregate;

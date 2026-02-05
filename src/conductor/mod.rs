@@ -34,7 +34,6 @@ use st0x_execution::{
     Symbol,
 };
 
-use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::Config;
@@ -71,6 +70,7 @@ use crate::rebalancing::{
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
+use crate::tokenization::AlpacaTokenizationService;
 use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
 #[cfg(test)]
 pub(crate) use builder::ConductorBuilder;
