@@ -603,7 +603,7 @@ impl EquityRedemption {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use rust_decimal_macros::dec;
 
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};

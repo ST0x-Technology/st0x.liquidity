@@ -242,8 +242,11 @@ mod tests {
     use alloy::primitives::{B256, TxHash, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
+    use sqlite_es::SqliteViewRepository;
     use sqlx::Row;
+
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use st0x_event_sorcery::test_store;
@@ -251,7 +254,7 @@ mod tests {
     use super::*;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
-    use crate::vault_registry::VaultRegistryCommand;
+    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery};
 
     /// A Float (bytes32) representing zero balance, used as mock vaultBalance2 response.
     const ZERO_FLOAT_HEX: &str =
@@ -278,11 +281,32 @@ mod tests {
         FractionalShares::new(Decimal::from(n))
     }
 
+    fn create_test_vault_service(
+        pool: &sqlx::SqlitePool,
+        provider: impl Provider + Clone,
+    ) -> Arc<VaultService<impl Provider + Clone>> {
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query: Arc<VaultRegistryQuery> =
+            Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+        Arc::new(VaultService::new(
+            provider,
+            Address::ZERO,
+            vault_registry_query,
+            Address::ZERO,
+        ))
+    }
+
     #[tokio::test]
     async fn poll_and_record_emits_offchain_equity_command_with_executor_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -340,7 +364,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_cash_command_with_executor_cash_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -383,7 +407,7 @@ mod tests {
     async fn poll_and_record_emits_empty_positions_when_executor_has_no_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -420,7 +444,7 @@ mod tests {
     async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -466,7 +490,7 @@ mod tests {
     async fn poll_and_record_handles_negative_cash_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         // Margin account with negative cash (borrowed funds)
@@ -513,7 +537,7 @@ mod tests {
     async fn poll_and_record_handles_fractional_share_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let fractional_qty = FractionalShares::new(Decimal::new(12345, 3)); // 12.345 shares
@@ -558,7 +582,7 @@ mod tests {
     async fn poll_and_record_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let orderbook = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let order_owner = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
 
@@ -656,7 +680,7 @@ mod tests {
     async fn poll_and_record_skips_onchain_when_vault_registry_not_initialized() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
@@ -706,7 +730,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
@@ -756,7 +780,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
@@ -804,7 +828,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
@@ -835,7 +859,7 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let vault_service = create_test_vault_service(&pool, provider);
 
         let executor = MockExecutor::new();
 

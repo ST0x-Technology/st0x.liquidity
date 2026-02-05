@@ -26,16 +26,17 @@ use crate::equity_redemption::{EquityRedemption, Redeemer, RedemptionAggregateId
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::mint::Mint;
-use crate::rebalancing::redemption::{Redeem, RedemptionService};
+use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
+use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use crate::vault_registry::VaultRegistryAggregate;
+use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,

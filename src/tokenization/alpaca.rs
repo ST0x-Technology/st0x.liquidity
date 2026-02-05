@@ -667,25 +667,18 @@ where
         wallet: Address,
         issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(AlpacaTokenizationService::request_mint(
-            self,
-            symbol,
-            quantity,
-            wallet,
-            issuer_request_id,
-        )
-        .await?)
+        Ok(Self::request_mint(self, symbol, quantity, wallet, issuer_request_id).await?)
     }
 
     async fn poll_mint_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(AlpacaTokenizationService::poll_mint_until_complete(self, id).await?)
+        Ok(Self::poll_mint_until_complete(self, id).await?)
     }
 
     fn redemption_wallet(&self) -> Address {
-        AlpacaTokenizationService::redemption_wallet(self)
+        Self::redemption_wallet(self)
     }
 
     async fn send_for_redemption(
@@ -693,21 +686,21 @@ where
         token: Address,
         amount: U256,
     ) -> Result<TxHash, TokenizerError> {
-        Ok(AlpacaTokenizationService::send_for_redemption(self, token, amount).await?)
+        Ok(Self::send_for_redemption(self, token, amount).await?)
     }
 
     async fn poll_for_redemption(
         &self,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(AlpacaTokenizationService::poll_for_redemption(self, tx_hash).await?)
+        Ok(Self::poll_for_redemption(self, tx_hash).await?)
     }
 
     async fn poll_redemption_until_complete(
         &self,
         id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        Ok(AlpacaTokenizationService::poll_redemption_until_complete(self, id).await?)
+        Ok(Self::poll_redemption_until_complete(self, id).await?)
     }
 }
 

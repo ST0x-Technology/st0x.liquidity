@@ -905,6 +905,7 @@ mod tests {
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
+    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
@@ -1062,7 +1063,7 @@ mod tests {
         (provider, signer)
     }
 
-    fn create_test_onchain_services(
+    async fn create_test_onchain_services(
         provider: TestProvider,
         signer: &PrivateKeySigner,
     ) -> (
@@ -1080,8 +1081,20 @@ mod tests {
         })
         .unwrap();
 
+        let pool = crate::test_utils::setup_test_db().await;
+
+        let vault_registry_view_repo =
+            Arc::new(SqliteViewRepository::<
+                VaultRegistryAggregate,
+                VaultRegistryAggregate,
+            >::new(pool, "vault_registry_view".to_string()));
+
+        let vault_registry_query: Arc<VaultRegistryQuery> =
+            Arc::new(GenericQuery::new(vault_registry_view_repo));
+
         let vault_service =
-            VaultService::new(provider, ORDERBOOK_ADDRESS).with_required_confirmations(1);
+            VaultService::new(provider, ORDERBOOK_ADDRESS, vault_registry_query, owner)
+                .with_required_confirmations(1);
 
         (cctp_bridge, vault_service)
     }

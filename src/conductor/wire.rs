@@ -145,6 +145,15 @@ impl<A: Aggregate> CqrsBuilder<A, ()> {
             wired: (),
         }
     }
+
+    /// Builds the CQRS framework when no queries were wired.
+    pub(crate) fn build<S>(self, services: S) -> SqliteCqrs<A>
+    where
+        A: Aggregate<Services = S>,
+    {
+        #[allow(clippy::disallowed_methods)]
+        sqlite_es::sqlite_cqrs(self.pool, self.queries, services)
+    }
 }
 
 impl<A: Aggregate, W> CqrsBuilder<A, W> {
@@ -182,13 +191,14 @@ impl<A: Aggregate, W> CqrsBuilder<A, W> {
             ),
         }
     }
+}
 
+impl<A: Aggregate, H, T> CqrsBuilder<A, (H, T)> {
     /// Builds the CQRS framework, returning it with all wired queries.
     ///
-    /// The `Wired` tuple contains each query passed to [`wire`](Self::wire),
-    /// with their types updated to reflect the wiring. Destructure to continue
-    /// wiring to other builders or extract via [`UnwiredQuery::into_inner`].
-    pub(crate) fn build<S>(self, services: S) -> (SqliteCqrs<A>, W)
+    /// Destructure the returned tuple to continue wiring to other builders
+    /// or extract via [`UnwiredQuery::into_inner`].
+    pub(crate) fn build<S>(self, services: S) -> (SqliteCqrs<A>, (H, T))
     where
         A: Aggregate<Services = S>,
     {

@@ -511,6 +511,40 @@ struct RebalancingInfrastructure {
     handle: JoinHandle<()>,
 }
 
+struct VaultInfra {
+    market_maker_wallet: Address,
+    vault_registry_query: Arc<VaultRegistryQuery>,
+}
+
+fn create_vault_registry_query(pool: &SqlitePool) -> Arc<VaultRegistryQuery> {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(pool.clone(), "vault_registry_view".to_string()));
+    Arc::new(GenericQuery::new(view_repo))
+}
+
+fn build_offchain_order_cqrs<E: Executor + Clone + 'static>(
+    pool: &SqlitePool,
+    executor: E,
+) -> (Arc<OffchainOrderCqrs>, Arc<OffchainOrderQuery>) {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        OffchainOrderAggregate,
+        OffchainOrderAggregate,
+    >::new(pool.clone(), "offchain_order_view".to_string()));
+
+    let view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
+        UnwiredQuery::new(GenericQuery::new(view_repo));
+
+    let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor));
+    let (cqrs, (view, ())) = CqrsBuilder::new(pool.clone())
+        .wire(view)
+        .build(order_placer);
+
+    let query = view.into_inner();
+    (Arc::new(cqrs), query)
+}
+
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
     rebalancing_ctx: &RebalancingCtx,
     pool: &SqlitePool,
@@ -1387,7 +1421,11 @@ async fn place_offchain_order(
     execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
-    if let Some(error) = load_offchain_order_failure(pool, offchain_order_id).await {
+    let aggregate = offchain_order_query
+        .load(&offchain_order_id.to_string())
+        .await;
+
+    if let Some(Lifecycle::Live(OffchainOrder::Failed { error, .. })) = aggregate {
         warn!(
             %offchain_order_id,
             symbol = %execution.symbol,
@@ -1399,27 +1437,6 @@ async fn place_offchain_order(
     }
 
     Ok(Some(offchain_order_id))
-}
-
-async fn load_offchain_order_failure(
-    pool: &SqlitePool,
-    offchain_order_id: OffchainOrderId,
-) -> Option<String> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT payload FROM offchain_order_view WHERE view_id = ?1")
-            .bind(offchain_order_id.to_string())
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-    let (payload,) = row?;
-    let aggregate: OffchainOrderAggregate = serde_json::from_str(&payload).ok()?;
-
-    match aggregate {
-        crate::lifecycle::Lifecycle::Live(OffchainOrder::Failed { error, .. }) => Some(error),
-        _ => None,
-    }
 }
 
 async fn execute_fail_offchain_order_position(
@@ -1722,9 +1739,6 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
-
-
-
 
     #[tokio::test]
     async fn test_event_enqueued_when_trade_conversion_returns_none() {
@@ -4097,6 +4111,7 @@ mod tests {
             &cqrs.position_cqrs,
             &cqrs.position_query,
             &cqrs.offchain_order_cqrs,
+            &cqrs.offchain_order_query,
             &cqrs.execution_threshold,
         )
         .await
