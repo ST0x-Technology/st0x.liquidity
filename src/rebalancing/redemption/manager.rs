@@ -1,7 +1,7 @@
 //! RedemptionManager orchestrates the EquityRedemption workflow.
 //!
 //! Coordinates the `EquityRedemption` aggregate with polling for detection and completion.
-//! The aggregate handles vault withdraw and token send atomically via its Redeemer service.
+//! The aggregate handles vault withdraw and token send atomically via its Services.
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
@@ -11,11 +11,10 @@ use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
 use tracing::{error, info, instrument, warn};
 
-use super::service::RedemptionService;
 use super::{Redeem, RedemptionError};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
-use crate::tokenization::TokenizationRequestStatus;
+use crate::tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 type RedemptionQuery = SqliteQuery<EquityRedemption, Never>;
@@ -25,7 +24,7 @@ where
     P: Provider + Clone,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
-    service: Arc<RedemptionService<P>>,
+    alpaca: Arc<AlpacaTokenizationService<P>>,
     cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
     query: Arc<RedemptionQuery>,
 }
@@ -36,12 +35,12 @@ where
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     pub(crate) fn new(
-        service: Arc<RedemptionService<P>>,
+        alpaca: Arc<AlpacaTokenizationService<P>>,
         cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
         query: Arc<RedemptionQuery>,
     ) -> Self {
         Self {
-            service,
+            alpaca,
             cqrs,
             query,
         }
@@ -99,7 +98,7 @@ where
         aggregate_id: &RedemptionAggregateId,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequestId, RedemptionError> {
-        let detected = match self.service.alpaca().poll_for_redemption(tx_hash).await {
+        let detected = match self.alpaca.poll_for_redemption(tx_hash).await {
             Ok(req) => req,
             Err(e) => {
                 warn!("Polling for redemption detection failed: {e}");
@@ -133,12 +132,7 @@ where
         aggregate_id: &RedemptionAggregateId,
         request_id: &TokenizationRequestId,
     ) -> Result<(), RedemptionError> {
-        let completed = match self
-            .service
-            .alpaca()
-            .poll_redemption_until_complete(request_id)
-            .await
-        {
+        let completed = match self.alpaca.poll_redemption_until_complete(request_id).await {
             Ok(req) => req,
             Err(e) => {
                 warn!("Polling for completion failed: {e}");

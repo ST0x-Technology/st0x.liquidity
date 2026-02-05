@@ -199,6 +199,9 @@ impl DomainEvent for TokenizedEquityMintEvent {
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
             Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
+            Self::VaultDepositFailed { .. } => {
+                "TokenizedEquityMintEvent::VaultDepositFailed".to_string()
+            }
             Self::MintCompleted { .. } => "TokenizedEquityMintEvent::MintCompleted".to_string(),
         }
     }
@@ -483,9 +486,11 @@ impl Lifecycle<TokenizedEquityMint, Never> {
                 vault_deposit_tx_hash,
                 deposited_at: Utc::now(),
             }]),
+
             Ok(
                 TokenizedEquityMint::VaultDeposited { .. } | TokenizedEquityMint::Completed { .. },
             ) => Err(TokenizedEquityMintError::AlreadyCompleted),
+
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Err(e) => Err(e.into()),
         }

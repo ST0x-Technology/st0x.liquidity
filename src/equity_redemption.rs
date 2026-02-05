@@ -21,12 +21,13 @@
 //! - `Pending` indicates Alpaca detected the transfer
 //! - `Completed` and `Failed` are terminal states
 //!
-//! # Redeemer Service
+//! # Services
 //!
-//! The aggregate uses cqrs-es Services (`Arc<dyn Redeemer>`) to execute side effects atomically:
+//! The aggregate uses cqrs-es Services (`RedemptionServices`) with `Tokenizer` and `Vault`
+//! traits to execute side effects atomically:
 //!
-//! - `withdraw_from_vault()` - Withdraws tokens from Rain OrderBook vault
-//! - `send_for_redemption()` - Sends tokens to Alpaca's redemption wallet
+//! - `vault.withdraw()` - Withdraws tokens from Rain OrderBook vault
+//! - `tokenizer.send_for_redemption()` - Sends tokens to Alpaca's redemption wallet
 //!
 //! This pattern ensures that if vault withdraw succeeds but send fails, the aggregate stays
 //! in `VaultWithdrawn` state (tokens in wallet, not stranded).
@@ -40,11 +41,6 @@
 //! - Failed state preserves context depending on when failure occurred
 //! - All state transitions are captured as events for complete audit trail
 
-mod redeemer;
-
-#[cfg(test)]
-pub(crate) mod mock;
-
 use std::sync::Arc;
 
 use alloy::primitives::{Address, TxHash, U256};
@@ -57,16 +53,27 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
 
-pub(crate) use redeemer::{RedeemError, Redeemer};
-
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::onchain::vault::{Vault, VaultError, VaultId};
+use crate::tokenization::{Tokenizer, TokenizerError};
 use crate::tokenized_equity_mint::TokenizationRequestId;
+
+/// Our tokenized equity tokens use 18 decimals.
+const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// SQLite-backed event store for EquityRedemption aggregates.
 pub(crate) type RedemptionEventStore =
     PersistedEventStore<SqliteEventRepository, Lifecycle<EquityRedemption, Never>>;
 
-pub(crate) type RedemptionServices = Arc<dyn Redeemer>;
+/// Services required by the EquityRedemption aggregate.
+///
+/// Combines `Tokenizer` (for sending tokens to Alpaca) and `Vault` (for withdrawing
+/// from Rain OrderBook) traits.
+#[derive(Clone)]
+pub(crate) struct RedemptionServices {
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) vault: Arc<dyn Vault>,
+}
 
 /// Unique identifier for a redemption aggregate instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,9 +90,15 @@ impl RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
-    /// Redeemer service operation failed
-    #[error("Redeem service error: {0}")]
-    RedeemService(#[from] RedeemError),
+    /// Vault operation failed
+    #[error("Vault error: {0}")]
+    Vault(#[from] VaultError),
+    /// Tokenizer operation failed
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
+    /// Vault not found for token in vault registry
+    #[error("Vault not found for token {0}")]
+    VaultNotFound(Address),
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -108,7 +121,7 @@ pub(crate) enum EquityRedemptionError {
 
 #[derive(Debug, Clone)]
 pub(crate) enum EquityRedemptionCommand {
-    /// Atomic command: withdraws from vault and sends to Alpaca via Redeemer.
+    /// Atomic command: withdraws from vault and sends to Alpaca.
     /// Emits VaultWithdrawn, then TokensSent on success.
     /// If vault withdraw succeeds but send fails, stays in VaultWithdrawn.
     Redeem {
@@ -316,7 +329,16 @@ impl Lifecycle<EquityRedemption, Never> {
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => {
-                let vault_withdraw_tx = services.withdraw_from_vault(token, amount).await?;
+                let vault_id = services
+                    .vault
+                    .lookup_vault_id(token)
+                    .await
+                    .ok_or(EquityRedemptionError::VaultNotFound(token))?;
+
+                let vault_withdraw_tx = services
+                    .vault
+                    .withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
+                    .await?;
 
                 let now = Utc::now();
                 let vault_withdrawn = EquityRedemptionEvent::VaultWithdrawn {
@@ -327,15 +349,18 @@ impl Lifecycle<EquityRedemption, Never> {
                     withdrawn_at: now,
                 };
 
-                match services.send_for_redemption(token, amount).await {
-                    Ok((redemption_wallet, redemption_tx)) => Ok(vec![
-                        vault_withdrawn,
-                        EquityRedemptionEvent::TokensSent {
-                            redemption_wallet,
-                            redemption_tx,
-                            sent_at: now,
-                        },
-                    ]),
+                match services.tokenizer.send_for_redemption(token, amount).await {
+                    Ok(redemption_tx) => {
+                        let redemption_wallet = services.tokenizer.redemption_wallet();
+                        Ok(vec![
+                            vault_withdrawn,
+                            EquityRedemptionEvent::TokensSent {
+                                redemption_wallet,
+                                redemption_tx,
+                                sent_at: now,
+                            },
+                        ])
+                    }
                     Err(e) => {
                         // Vault withdraw succeeded but send failed - emit both events
                         Ok(vec![
@@ -682,15 +707,22 @@ impl EquityRedemption {
 mod tests {
     use rust_decimal_macros::dec;
 
-    use super::mock::MockRedeemer;
     use super::*;
+    use crate::onchain::mock::MockVault;
+    use crate::tokenization::mock::MockTokenizer;
+
+    fn mock_redemption_services() -> RedemptionServices {
+        RedemptionServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            vault: Arc::new(MockVault::new()),
+        }
+    }
 
     #[tokio::test]
     async fn test_redeem_from_uninitialized() {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let mock = MockRedeemer::new();
-        let services: RedemptionServices = Arc::new(mock);
+        let services = mock_redemption_services();
 
         let events = aggregate
             .handle(
@@ -743,7 +775,7 @@ mod tests {
     }
 
     fn mock_services() -> RedemptionServices {
-        Arc::new(MockRedeemer::new())
+        mock_redemption_services()
     }
 
     #[tokio::test]
