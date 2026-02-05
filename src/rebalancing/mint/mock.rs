@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
 
 /// Parameters captured from the last `execute_mint` call.
 #[derive(Debug, Clone)]
@@ -38,7 +38,7 @@ impl MockMint {
         }
     }
 
-    /// Creates a new mock that always returns `MintError::Rejected`.
+    /// Creates a new mock that always returns an error.
     pub(crate) fn failing() -> Self {
         Self {
             call_count: AtomicUsize::new(0),
@@ -77,7 +77,9 @@ impl Mint for MockMint {
         });
 
         if self.should_fail.load(Ordering::SeqCst) {
-            return Err(MintError::Rejected);
+            return Err(AggregateError::UserError(
+                TokenizedEquityMintError::AlreadyFailed,
+            ));
         }
 
         Ok(())
@@ -152,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failing_mock_returns_rejected_error() {
+    async fn failing_mock_returns_error() {
         let mock = MockMint::failing();
 
         let result = mock
@@ -164,7 +166,12 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(MintError::Rejected)));
+        assert!(matches!(
+            result,
+            Err(AggregateError::UserError(
+                TokenizedEquityMintError::AlreadyFailed
+            ))
+        ));
     }
 
     #[tokio::test]

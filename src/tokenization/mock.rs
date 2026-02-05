@@ -63,14 +63,16 @@ impl Tokenizer for MockTokenizer {
         _wallet: Address,
         _issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("MockTokenizer::request_mint")
+        Ok(TokenizationRequest::mock(
+            TokenizationRequestStatus::Pending,
+        ))
     }
 
     async fn poll_mint_until_complete(
         &self,
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        unimplemented!("MockTokenizer::poll_mint_until_complete")
+        Ok(TokenizationRequest::mock_completed())
     }
 
     fn redemption_wallet(&self) -> Address {

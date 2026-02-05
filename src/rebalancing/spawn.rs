@@ -67,13 +67,10 @@ pub(crate) struct RebalancingCqrsFrameworks {
 #[derive(Clone, Copy)]
 pub(crate) struct RebalancerAddresses {
     pub(crate) market_maker_wallet: Address,
-    pub(crate) orderbook: Address,
 }
 
 pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
-    pub(crate) vault_service: Arc<VaultService<BP>>,
-    pub(crate) tokenization_service: Arc<AlpacaTokenizationService<BP>>,
-    pub(crate) vault_registry_query: Arc<VaultRegistryQuery>,
+    pub(crate) raindex_service: Arc<RaindexService<BP>>,
     pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
     pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
 }
@@ -107,8 +104,7 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
-        redemption.vault_service,
-        redemption.tokenization_service,
+        redemption.raindex_service,
     )
     .await?;
 
@@ -123,7 +119,6 @@ where
         operation_receiver,
         frameworks,
         redemption_cqrs,
-        redemption.vault_registry_query,
     );
 
     let handle = tokio::spawn(async move {
@@ -136,7 +131,7 @@ where
 
 /// External service clients for rebalancing operations.
 ///
-/// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
+/// Holds connections to Alpaca APIs, CCTP bridge, and Raindex services.
 ///
 /// Generic over `BP` (Base Provider) to allow reusing the existing WebSocket
 /// connection from the main bot. The Ethereum provider uses a fixed HTTP type
@@ -145,11 +140,10 @@ struct Services<BP>
 where
     BP: Provider + Clone,
 {
-    tokenization: Arc<AlpacaTokenizationService<BP>>,
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
-    vault: Arc<VaultService<BP>>,
+    raindex: Arc<RaindexService<BP>>,
 }
 
 impl<BP> Services<BP>
@@ -158,16 +152,15 @@ where
 {
     /// Creates the services needed for rebalancing.
     ///
-    /// VaultService and AlpacaTokenizationService are passed in rather than
-    /// created here because they are needed for CQRS framework initialization in
-    /// the conductor, which must happen before spawn_rebalancer is called.
+    /// RaindexService is passed in rather than created here because it's needed
+    /// for CQRS framework initialization in the conductor, which must happen
+    /// before spawn_rebalancer is called.
     async fn new(
         ctx: &RebalancingCtx,
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
-        vault: Arc<VaultService<BP>>,
-        tokenization: Arc<AlpacaTokenizationService<BP>>,
+        raindex: Arc<RaindexService<BP>>,
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
@@ -194,11 +187,10 @@ where
 
 
         Ok(Self {
-            tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            raindex,
         })
     }
 
@@ -210,19 +202,11 @@ where
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
         redemption: RedemptionCqrs,
-        vault_registry_query: Arc<VaultRegistryQuery>,
     ) -> ConfiguredRebalancer<BP>
     where
         BP: Send + Sync + 'static,
     {
-        let mint_manager = Arc::new(MintManager::new(
-            self.tokenization as Arc<dyn Tokenizer>,
-            self.vault.clone() as Arc<dyn Vault>,
-            vault_registry_query,
-            addresses.orderbook,
-            addresses.market_maker_wallet,
-            frameworks.mint,
-        ));
+        let mint_manager = Arc::new(MintManager::new(frameworks.mint));
 
         let redemption_manager =
             Arc::new(RedemptionManager::new(redemption.cqrs, redemption.query));
@@ -231,7 +215,7 @@ where
             self.broker,
             self.wallet,
             self.cctp,
-            self.vault,
+            self.raindex,
             frameworks.usdc,
             addresses.market_maker_wallet,
             VaultId(ctx.usdc_vault_id),
@@ -453,11 +437,10 @@ mod tests {
         );
 
         let services = Services {
-            tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            raindex: raindex.clone(),
         };
 
         (services, rebalancing_ctx)
@@ -522,7 +505,8 @@ mod tests {
     #[tokio::test]
     async fn into_rebalancer_dispatches_mint_to_tokenization_service() {
         let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server).await;
+        let (services, config, tokenization, raindex) =
+            make_services_with_mock_wallet(&server).await;
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(format!(
@@ -543,7 +527,11 @@ mod tests {
         });
 
         let pool = crate::test_utils::setup_test_db().await;
-        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+        let mint_services = MintServices {
+            tokenizer: tokenization,
+            raindex,
+        };
+        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], mint_services));
         let usdc_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
 
         let redemption_view_repo = Arc::new(SqliteViewRepository::<
@@ -558,14 +546,6 @@ mod tests {
             vec![Box::new(GenericQuery::new(redemption_view_repo))],
             crate::equity_redemption::tests::mock_redeemer_services(),
         ));
-
-        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,
@@ -583,12 +563,10 @@ mod tests {
             &config,
             RebalancerAddresses {
                 market_maker_wallet: config.redemption_wallet,
-                orderbook: TEST_ORDERBOOK,
             },
             rx,
             frameworks,
             redemption,
-            vault_registry_query,
         );
 
         tx.send(TriggeredOperation::Mint {

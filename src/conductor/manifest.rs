@@ -28,6 +28,7 @@ use crate::equity_redemption::EquityRedemption;
 use crate::inventory::InventoryView;
 use crate::position::Position;
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
+use crate::tokenized_equity_mint::MintServices;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 

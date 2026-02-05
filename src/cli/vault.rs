@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::bindings::IERC20;
 use crate::config::Ctx;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, VaultId};
 use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistryAggregate;
 
@@ -123,7 +123,7 @@ pub(super) async fn vault_deposit_command<
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let vault_service = VaultService::new(
+    let raindex_service = RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
         vault_registry_query,
@@ -131,7 +131,7 @@ pub(super) async fn vault_deposit_command<
     );
 
     writeln!(stdout, "   Depositing to vault...")?;
-    let deposit_tx = vault_service
+    let deposit_tx = raindex_service
         .deposit(token, VaultId(vault_id), amount_u256, decimals)
         .await?;
     writeln!(stdout, "   Deposit tx: {deposit_tx}")?;
@@ -179,7 +179,7 @@ pub(super) async fn vault_withdraw_command<
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let vault_service = VaultService::new(
+    let raindex_service = RaindexService::new(
         base_provider_with_wallet,
         ctx.evm.orderbook,
         vault_registry_query,
@@ -191,7 +191,7 @@ pub(super) async fn vault_withdraw_command<
     writeln!(stdout, "   Amount (smallest unit): {amount_u256}")?;
 
     writeln!(stdout, "   Withdrawing from vault...")?;
-    let withdraw_tx = vault_service.withdraw_usdc(vault_id, amount_u256).await?;
+    let withdraw_tx = raindex_service.withdraw_usdc(vault_id, amount_u256).await?;
     writeln!(stdout, "   Withdraw tx: {withdraw_tx}")?;
 
     writeln!(stdout, "Vault withdrawal completed successfully!")?;

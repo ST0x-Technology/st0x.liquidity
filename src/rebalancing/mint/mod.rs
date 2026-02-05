@@ -123,6 +123,11 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(MintError::Rejected)));
+        assert!(matches!(
+            result,
+            Err(AggregateError::UserError(
+                TokenizedEquityMintError::AlreadyFailed
+            ))
+        ));
     }
 }

@@ -7,7 +7,7 @@
 //! # State Flow
 //!
 //! ```text
-//! MintRequested -> MintAccepted -> TokensReceived -> VaultDeposited -> Completed
+//! MintRequested -> MintAccepted -> TokensReceived -> DepositedIntoRaindex -> Completed
 //!       |               |               |
 //!       v               v               v
 //!     Failed          Failed          Failed
@@ -48,6 +48,16 @@ use std::str::FromStr;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 
+/// Services required by the TokenizedEquityMint aggregate.
+///
+/// Combines `Tokenizer` (for Alpaca mint operations) and `Raindex` (for depositing
+/// to Rain OrderBook) traits.
+#[derive(Clone)]
+pub(crate) struct MintServices {
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) raindex: Arc<dyn Raindex>,
+}
+
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IssuerRequestId(pub(crate) String);
@@ -86,6 +96,10 @@ impl std::fmt::Display for TokenizationRequestId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReceiptId(pub(crate) U256);
 
+/// HTTP status code from API responses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct HttpStatusCode(pub(crate) u16);
+
 /// Errors that can occur during tokenized equity mint operations.
 ///
 /// These errors enforce state machine constraints and prevent
@@ -95,18 +109,9 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to request mint when already in progress
     #[error("Mint already in progress")]
     AlreadyInProgress,
-    /// Attempted to acknowledge acceptance before requesting mint
-    #[error("Cannot accept mint: not in requested state")]
-    NotRequested,
-    /// Attempted to receive tokens before mint was accepted
-    #[error("Cannot receive tokens: mint not accepted")]
-    NotAccepted,
     /// Attempted to deposit to vault before tokens were received
     #[error("Cannot deposit to vault: tokens not received")]
     TokensNotReceived,
-    /// Attempted to finalize before vault deposit
-    #[error("Cannot finalize: vault deposit not complete")]
-    VaultDepositNotComplete,
     /// Attempted to modify a completed mint operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -115,39 +120,25 @@ pub(crate) enum TokenizedEquityMintError {
     AlreadyFailed,
 }
 
+/// Commands for the TokenizedEquityMint aggregate.
 #[derive(Debug, Clone)]
 pub(crate) enum TokenizedEquityMintCommand {
-    RequestMint {
+    /// Request tokenization from Alpaca and poll until tokens arrive or failure.
+    ///
+    /// Flow: MintRequested -> MintAccepted -> TokensReceived (success)
+    ///                     or MintRejected (immediate failure)
+    ///                     or MintAcceptanceFailed (failure after acceptance)
+    Mint {
+        issuer_request_id: IssuerRequestId,
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
     },
-    /// Alpaca rejected the mint request before acceptance.
-    RejectMint {
-        reason: String,
-    },
-
-    AcknowledgeAcceptance {
-        issuer_request_id: IssuerRequestId,
-        tokenization_request_id: TokenizationRequestId,
-    },
-    /// Mint failed after acceptance but before tokens were received.
-    FailAcceptance {
-        reason: String,
-    },
-
-    ReceiveTokens {
-        tx_hash: TxHash,
-        receipt_id: ReceiptId,
-        shares_minted: U256,
-    },
-
-    /// Deposit tokens from wallet to Raindex vault.
-    DepositToVault {
-        vault_deposit_tx_hash: TxHash,
-    },
-
-    Finalize,
+    /// Deposit received tokens into Raindex vault.
+    ///
+    /// Flow: DepositedIntoRaindex -> Completed (success)
+    ///    or RaindexDepositFailed (failure, terminal)
+    Deposit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,10 +182,10 @@ pub(crate) enum TokenizedEquityMintEvent {
     },
     /// Vault deposit failed after tokens were received.
     /// Tokens remain in wallet, can be retried or manually recovered.
-    VaultDepositFailed {
+    RaindexDepositFailed {
         symbol: Symbol,
         quantity: Decimal,
-        reason: String,
+        failed_tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
 
@@ -213,9 +204,11 @@ impl DomainEvent for TokenizedEquityMintEvent {
                 "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
-            Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
-            Self::VaultDepositFailed { .. } => {
-                "TokenizedEquityMintEvent::VaultDepositFailed".to_string()
+            Self::VaultDeposited { .. } => {
+                "TokenizedEquityMintEvent::VaultDeposited".to_string()
+            }
+            Self::RaindexDepositFailed { .. } => {
+                "TokenizedEquityMintEvent::RaindexDepositFailed".to_string()
             }
             Self::MintCompleted { .. } => "TokenizedEquityMintEvent::MintCompleted".to_string(),
         }
@@ -268,7 +261,7 @@ pub(crate) enum TokenizedEquityMint {
     },
 
     /// Tokens deposited from wallet to Raindex vault
-    VaultDeposited {
+    DepositedIntoRaindex {
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
@@ -298,11 +291,10 @@ pub(crate) enum TokenizedEquityMint {
         completed_at: DateTime<Utc>,
     },
 
-    /// Mint operation failed with error reason (terminal state)
+    /// Mint operation failed (terminal state)
     Failed {
         symbol: Symbol,
         quantity: Decimal,
-        reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -314,7 +306,7 @@ impl EventSourced for TokenizedEquityMint {
     type Event = TokenizedEquityMintEvent;
     type Command = TokenizedEquityMintCommand;
     type Error = TokenizedEquityMintError;
-    type Services = ();
+    type Services = MintServices;
 
     const AGGREGATE_TYPE: &'static str = "TokenizedEquityMint";
     const PROJECTION: Option<Table> = None;
@@ -588,7 +580,6 @@ impl TokenizedEquityMint {
 
     fn try_apply_vault_deposit_failed(
         &self,
-        reason: &str,
         failed_at: DateTime<Utc>,
     ) -> Option<Self> {
         let Self::TokensReceived {
@@ -604,7 +595,6 @@ impl TokenizedEquityMint {
         Some(Self::Failed {
             symbol: symbol.clone(),
             quantity: *quantity,
-            reason: reason.to_string(),
             requested_at: *requested_at,
             failed_at,
         })
@@ -649,7 +639,6 @@ impl TokenizedEquityMint {
         Some(Self::Failed {
             symbol: symbol.clone(),
             quantity: *quantity,
-            reason: reason.to_string(),
             requested_at: *requested_at,
             failed_at: rejected_at,
         })
@@ -669,7 +658,6 @@ impl TokenizedEquityMint {
         Some(Self::Failed {
             symbol: symbol.clone(),
             quantity: *quantity,
-            reason: reason.to_string(),
             requested_at: *requested_at,
             failed_at,
         })
@@ -679,6 +667,7 @@ impl TokenizedEquityMint {
 #[cfg(test)]
 mod tests {
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use super::*;
     use st0x_event_sorcery::{LifecycleError, TestHarness, TestStore};
@@ -1318,46 +1307,11 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::VaultDeposited {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
             vault_deposit_tx_hash: TxHash::random(),
             deposited_at: Utc::now(),
         };
 
-        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::VaultDeposited");
-    }
-
-    #[test]
-    fn test_apply_vault_deposit_failed_rejects_wrong_state() {
-        let accepted = TokenizedEquityMint::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            requested_at: Utc::now(),
-            accepted_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::VaultDepositFailed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            reason: "Should not apply".to_string(),
-            failed_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::VaultDepositFailed");
+        let result = TokenizedEquityMint::evolve(&accepted, &event).unwrap();
+        assert_eq!(result, None);
     }
 }

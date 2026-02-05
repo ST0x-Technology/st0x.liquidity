@@ -44,6 +44,7 @@ use crate::onchain::USDC_BASE;
 use crate::onchain::accumulator::{ExecutionCtx, check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::raindex::{Raindex, RaindexService};
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
@@ -743,7 +744,7 @@ where
 
 fn spawn_inventory_poller<P, E>(
     pool: SqlitePool,
-    vault_service: Arc<VaultService<P>>,
+    raindex_service: Arc<RaindexService<P>>,
     executor: E,
     orderbook: Address,
     order_owner: Address,
@@ -756,7 +757,7 @@ where
     info!("Starting inventory poller");
 
     let service = InventoryPollingService::new(
-        vault_service,
+        raindex_service,
         executor,
         pool,
         orderbook,

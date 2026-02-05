@@ -167,13 +167,13 @@ where
 
         let inventory_poller = match self.common.ctx.order_owner() {
             Ok(order_owner) => {
-                let vault_service = Arc::new(VaultService::new(
+                let raindex_service = Arc::new(RaindexService::new(
                     self.common.provider.clone(),
                     self.common.ctx.evm.orderbook,
                 ));
                 Some(spawn_inventory_poller(
                     self.common.pool.clone(),
-                    vault_service,
+                    raindex_service,
                     self.common.executor.clone(),
                     self.common.ctx.evm.orderbook,
                     order_owner,

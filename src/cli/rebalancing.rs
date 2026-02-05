@@ -34,7 +34,7 @@ use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 

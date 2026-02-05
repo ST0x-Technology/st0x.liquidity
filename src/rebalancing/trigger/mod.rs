@@ -1002,7 +1002,7 @@ mod tests {
     }
 
     fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
+        TokenizedEquityMintEvent::Completed {
             symbol: symbol.clone(),
             quantity,
             completed_at: Utc::now(),
@@ -1013,7 +1013,7 @@ mod tests {
         TokenizedEquityMintEvent::MintRejected {
             symbol: symbol.clone(),
             quantity,
-            reason: "API timeout".to_string(),
+            status_code: None,
             rejected_at: Utc::now(),
         }
     }
@@ -1022,7 +1022,7 @@ mod tests {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
             symbol: symbol.clone(),
             quantity,
-            reason: "Transaction reverted".to_string(),
+            last_status: TokenizationRequestStatus::Pending,
             failed_at: Utc::now(),
         }
     }

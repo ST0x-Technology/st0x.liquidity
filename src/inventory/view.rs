@@ -531,13 +531,13 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         match event {
-            // No venue inventory changes. VaultDeposited completes the transfer to Raindex
-            // (already counted when TokensReceived). VaultDepositFailed leaves tokens in
+            // No venue inventory changes. DepositedIntoRaindex completes the transfer to Raindex
+            // (already counted when TokensReceived). RaindexDepositFailed leaves tokens in
             // wallet awaiting retry or manual recovery.
             TokenizedEquityMintEvent::MintRequested { .. }
             | TokenizedEquityMintEvent::MintRejected { .. }
-            | TokenizedEquityMintEvent::VaultDeposited { .. }
-            | TokenizedEquityMintEvent::VaultDepositFailed { .. } => Ok(Self {
+            | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
@@ -559,7 +559,7 @@ impl InventoryView {
                 now,
             ),
 
-            TokenizedEquityMintEvent::MintCompleted { completed_at, .. } => self.update_equity(
+            TokenizedEquityMintEvent::Completed { completed_at, .. } => self.update_equity(
                 symbol,
                 |inventory| Ok(inventory.with_last_rebalancing(*completed_at)),
                 now,
@@ -1216,7 +1216,7 @@ mod tests {
     }
 
     fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
+        TokenizedEquityMintEvent::Completed {
             symbol: symbol.clone(),
             quantity,
             completed_at: Utc::now(),
@@ -1227,7 +1227,7 @@ mod tests {
         TokenizedEquityMintEvent::MintRejected {
             symbol: symbol.clone(),
             quantity,
-            reason: "API timeout".to_string(),
+            status_code: None,
             rejected_at: Utc::now(),
         }
     }
@@ -1236,13 +1236,13 @@ mod tests {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
             symbol: symbol.clone(),
             quantity,
-            reason: "Transaction reverted".to_string(),
+            last_status: TokenizationRequestStatus::Pending,
             failed_at: Utc::now(),
         }
     }
 
-    fn make_vault_deposited(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::VaultDeposited {
+    fn make_deposited_into_raindex(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::DepositedIntoRaindex {
             symbol: symbol.clone(),
             quantity,
             vault_deposit_tx_hash: TxHash::random(),
@@ -1250,11 +1250,11 @@ mod tests {
         }
     }
 
-    fn make_vault_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::VaultDepositFailed {
+    fn make_raindex_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::RaindexDepositFailed {
             symbol: symbol.clone(),
             quantity,
-            reason: "Insufficient gas".to_string(),
+            failed_tx_hash: None,
             failed_at: Utc::now(),
         }
     }
@@ -1366,18 +1366,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_vault_deposited_only_updates_last_updated() {
+    fn apply_deposited_into_raindex_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: 130 onchain (100 original + 30 minted), 70 offchain
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_vault_deposited(&symbol, dec!(30));
+        let event = make_deposited_into_raindex(&symbol, dec!(30));
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
-        // VaultDeposited doesn't change balances - tokens were already counted in onchain
+        // DepositedIntoRaindex doesn't change balances - tokens were already counted in onchain
         // when TokensReceived happened. This just confirms they're now in the Raindex vault.
         assert_eq!(
             inventory.onchain.unwrap().total().unwrap().inner(),
@@ -1391,18 +1391,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_vault_deposit_failed_only_updates_last_updated() {
+    fn apply_raindex_deposit_failed_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: tokens in wallet (counted as onchain available)
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_vault_deposit_failed(&symbol, dec!(30));
+        let event = make_raindex_deposit_failed(&symbol, dec!(30));
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
-        // VaultDepositFailed doesn't change balances - tokens remain in wallet
+        // RaindexDepositFailed doesn't change balances - tokens remain in wallet
         // (still counted as onchain) awaiting retry or manual recovery.
         assert_eq!(
             inventory.onchain.unwrap().total().unwrap().inner(),

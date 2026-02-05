@@ -32,7 +32,7 @@ pub(crate) enum UsdcRebalanceManagerError {
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] CctpError),
     #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
+    Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] SendError<crate::usdc_rebalance::UsdcRebalance>),
     #[error("Withdrawal failed with terminal status: {status}")]

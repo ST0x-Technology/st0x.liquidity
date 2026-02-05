@@ -373,7 +373,7 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let services = RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new()),
-            vault: Arc::new(MockVault::new()),
+            raindex: Arc::new(MockRaindex::new()),
         };
         let (cqrs, query) = create_redemption_cqrs(&pool, services);
 
@@ -490,7 +490,7 @@ mod tests {
         ) {
             let token = TestERC20::new(self.token_address, &self.provider);
             let owner = self.signer.address();
-            let vault_service = VaultService::new(
+            let raindex_service = RaindexService::new(
                 self.provider.clone(),
                 self.orderbook_address,
                 vault_registry_query,
@@ -508,7 +508,7 @@ mod tests {
                 .unwrap();
 
             // Deposit to vault
-            vault_service
+            raindex_service
                 .deposit(
                     self.token_address,
                     TEST_VAULT_ID,

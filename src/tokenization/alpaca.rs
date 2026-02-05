@@ -247,6 +247,26 @@ impl TokenizationRequest {
             updated_at: None,
         }
     }
+
+    /// Create a mock completed TokenizationRequest with tx_hash for testing.
+    pub(crate) fn mock_completed() -> Self {
+        Self {
+            id: TokenizationRequestId("MOCK_REQ_ID".to_string()),
+            r#type: None,
+            status: TokenizationRequestStatus::Completed,
+            underlying_symbol: Symbol::new("AAPL").unwrap(),
+            token_symbol: None,
+            quantity: FractionalShares::ZERO,
+            issuer: Issuer::new("alpaca"),
+            network: Network::new("base"),
+            wallet: None,
+            issuer_request_id: None,
+            tx_hash: Some(TxHash::ZERO),
+            fees: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
 }
 
 fn deserialize_tokenized_symbol<'de, D>(
@@ -334,6 +354,17 @@ pub(crate) enum AlpacaTokenizationError {
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
+}
+
+impl AlpacaTokenizationError {
+    /// Returns the HTTP status code if this error was caused by an API response.
+    pub(crate) fn status_code(&self) -> Option<StatusCode> {
+        match self {
+            Self::ApiError { status, .. } => Some(*status),
+            Self::Reqwest(error) => error.status(),
+            _ => None,
+        }
+    }
 }
 
 fn map_mint_error(status: StatusCode, message: String, symbol: Symbol) -> AlpacaTokenizationError {

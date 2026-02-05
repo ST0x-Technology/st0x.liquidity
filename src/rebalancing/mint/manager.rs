@@ -1,26 +1,22 @@
 //! Orchestrates Alpaca-to-Raindex equity inventory transfer.
 //!
-//! Coordinates Alpaca tokenization API and vault deposits, emitting commands to
-//! the `TokenizedEquityMint` aggregate at each step. Implements the `Mint` trait
-//! for integration with the rebalancing trigger system.
+//! Coordinates the `TokenizedEquityMint` aggregate which handles tokenization API calls
+//! and vault deposits internally via its Services. Implements the `Mint` trait for
+//! integration with the rebalancing trigger system.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use st0x_event_sorcery::Store;
 
 use super::{Mint, MintError};
-use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{Vault, VaultId};
-use crate::tokenization::{TokenizationRequest, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
-use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
 
 /// Our tokenized equity tokens use 18 decimals.
 const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
@@ -53,39 +49,6 @@ impl MintManager {
         }
     }
 
-    async fn load_vault_info(&self, symbol: &Symbol) -> Option<(Address, VaultId)> {
-        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.owner);
-        let lifecycle = self.vault_registry_query.load(&aggregate_id).await?;
-
-        match lifecycle {
-            Lifecycle::Uninitialized => {
-                warn!("Vault registry not initialized");
-                None
-            }
-            Lifecycle::Live(registry) => {
-                let token = registry.token_by_symbol(symbol)?;
-                let vault_id = registry.vault_id_by_token(token)?;
-                Some((token, VaultId(vault_id)))
-            }
-            Lifecycle::Failed { .. } => {
-                warn!("Vault registry in failed state");
-                None
-            }
-        }
-    }
-
-    /// Executes the full mint workflow.
-    ///
-    /// # Workflow
-    ///
-    /// 1. Send `RequestMint` command to aggregate
-    /// 2. Call `AlpacaTokenizationService::request_mint()`
-    /// 3. Send `AcknowledgeAcceptance` with request IDs
-    /// 4. Poll Alpaca until terminal status
-    /// 5. Send `ReceiveTokens` when Alpaca reports completion
-    /// 6. Send `Finalize` to complete
-    ///
-    /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
     #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
     async fn execute_mint_impl(
         &self,
@@ -94,7 +57,7 @@ impl MintManager {
         quantity: FractionalShares,
         wallet: Address,
     ) -> Result<(), MintError> {
-        info!(%symbol, ?quantity, %wallet, "Starting mint workflow");
+        debug!("Executing mint command");
 
         self.cqrs
             .send(
@@ -107,19 +70,7 @@ impl MintManager {
             )
             .await?;
 
-        let alpaca_request = match self
-            .tokenizer
-            .request_mint(symbol.clone(), quantity, wallet, issuer_request_id.clone())
-            .await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Alpaca mint request failed: {e}");
-                self.reject_mint(issuer_request_id, format!("Alpaca API error: {e}"))
-                    .await?;
-                return Err(MintError::Tokenizer(e));
-            }
-        };
+        debug!("Executing deposit command");
 
         self.cqrs
             .send(
@@ -274,24 +225,42 @@ impl Mint for MintManager {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, address};
-    use alloy::providers::Provider;
+    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, TxHash, U256, address, b256};
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    };
+    use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
+    use cqrs_es::persist::GenericQuery;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
-    use serde_json::json;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 
     use st0x_event_sorcery::test_store;
 
     use super::*;
+    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::conductor::wire::test_cqrs;
+    use crate::onchain::raindex::VaultId;
     use crate::onchain::vault::VaultService;
     use crate::test_utils::{create_test_vault_service, create_vault_registry_query, setup_test_db};
+    use crate::tokenization::Tokenizer;
     use crate::tokenization::alpaca::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_with_provider, setup_anvil,
-        tokenization_mint_path, tokenization_requests_path,
+        create_test_service_with_provider, tokenization_mint_path, tokenization_requests_path,
     };
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::MintServices;
+    use crate::vault_registry::{
+        VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
+    };
+    use serde_json::json;
 
-    const TEST_ORDERBOOK: Address = address!("0xdead000000000000000000000000000000000001");
+    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
+    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ));
 
     async fn create_test_store_instance() -> Arc<Store<TokenizedEquityMint>> {
         let pool = setup_test_db().await;
@@ -332,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_converts_fractional() {
+    fn fractional_shares_converts_to_u256_18_decimals() {
         let value = FractionalShares::new(dec!(100.5));
         assert_eq!(
             decimal_to_u256_18_decimals(value).unwrap(),
@@ -341,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_converts_whole_number() {
+    fn fractional_shares_converts_whole_number() {
         let value = FractionalShares::new(dec!(42));
         assert_eq!(
             decimal_to_u256_18_decimals(value).unwrap(),
@@ -350,7 +319,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_converts_zero() {
+    fn fractional_shares_converts_zero() {
         let value = FractionalShares::new(dec!(0));
         assert_eq!(decimal_to_u256_18_decimals(value).unwrap(), U256::ZERO);
     }
@@ -403,12 +372,7 @@ mod tests {
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint_impl(
-                &IssuerRequestId::new("mint-001"),
-                symbol.clone(),
-                quantity,
-                wallet,
-            )
+            .execute_mint_impl(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
             .await;
 
         // Workflow proceeds through Alpaca API but fails at vault lookup
@@ -596,31 +560,9 @@ mod tests {
             )
             .await;
 
-        // Expected to fail at vault lookup since registry is empty
-        assert!(matches!(result, Err(MintError::VaultNotFound(_))));
-
-        mint_mock.assert();
-        poll_mock.assert();
+        // MockTokenizer and MockRaindex always succeed
+        result.unwrap();
     }
-
-    use alloy::network::{Ethereum, EthereumWallet};
-    use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, TxHash, b256};
-    use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-    };
-    use alloy::providers::{Identity, ProviderBuilder, RootProvider};
-    use cqrs_es::persist::GenericQuery;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
-
-    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::conductor::wire::test_cqrs;
-    use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
-
-    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
-        "0x0000000000000000000000000000000000000000000000000000000000000001"
-    ));
 
     type LocalEvmProvider = FillProvider<
         JoinFill<
@@ -689,18 +631,6 @@ mod tests {
                 token_address,
             }
         }
-
-        async fn approve_tokens_for_orderbook(&self, amount: U256) {
-            let token = TestERC20::new(self.token_address, &self.provider);
-            token
-                .approve(self.orderbook_address, amount)
-                .send()
-                .await
-                .unwrap()
-                .get_receipt()
-                .await
-                .unwrap();
-        }
     }
 
     fn create_vault_registry_cqrs(
@@ -764,18 +694,9 @@ mod tests {
         )
         .await;
 
-        let deposit_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-        local_evm.approve_tokens_for_orderbook(deposit_amount).await;
-
-        let service = Arc::new(create_test_service_with_provider(
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(create_test_service_with_provider(
             &server,
             local_evm.provider.clone(),
-            local_evm.signer.address(),
-        ));
-        let vault = Arc::new(VaultService::new(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            vault_registry_query.clone(),
             local_evm.signer.address(),
         ));
         let cqrs = create_test_store_instance().await;

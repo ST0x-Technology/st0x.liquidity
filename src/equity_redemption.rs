@@ -90,7 +90,7 @@ impl FromStr for RedemptionAggregateId {
 pub(crate) enum EquityRedemptionError {
     /// Vault operation failed
     #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
+    Vault(#[from] RaindexError),
     /// Tokenizer operation failed
     #[error("Tokenizer error: {0}")]
     Tokenizer(#[from] TokenizerError),
@@ -366,15 +366,9 @@ impl EventSourced for EquityRedemption {
                         },
                     ]),
                     Err(e) => {
-                        // Vault withdraw succeeded but transfer failed - emit both events
-                        // Extract tx_hash if available (when tx was sent but receipt failed)
                         let tx_hash = match &e {
-                            TokenizerError::Alpaca(AlpacaTokenizationError::Transaction {
-                                tx_hash,
-                                ..
-                            }) => Some(*tx_hash),
-
-                            TokenizerError::Alpaca(_) => None,
+                            RedeemError::Transaction { tx_hash, .. } => Some(*tx_hash),
+                            _ => None,
                         };
                         Ok(vec![
                             vault_withdrawn,
@@ -386,9 +380,9 @@ impl EventSourced for EquityRedemption {
                     }
                 }
             }
-            Detect { .. } | FailDetection { .. } => Err(EquityRedemptionError::TokensNotSent),
-            Complete => Err(EquityRedemptionError::NotPending),
-            RejectRedemption { .. } => Err(EquityRedemptionError::NotPendingForRejection),
+            Detect { .. } | AwaitCompletion => {
+                Err(EquityRedemptionError::NotStarted)
+            }
         }
     }
 
