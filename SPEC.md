@@ -1218,11 +1218,16 @@ stateDiagram-v2
     MintRequested --> Failed
     MintAccepted --> TokensReceived
     MintAccepted --> Failed
-    TokensReceived --> DepositedIntoRaindex: Deposit
+    TokensReceived --> TokensWrapped: Wrap
     TokensReceived --> Failed
+    TokensWrapped --> DepositedIntoRaindex: Deposit
+    TokensWrapped --> Failed
     DepositedIntoRaindex --> Completed
     DepositedIntoRaindex --> Failed
 ```
+
+Alpaca mints unwrapped tokens. Before depositing to Raindex, we wrap them into
+ERC-4626 vault shares using the Wrapper service.
 
 ##### States
 
@@ -1233,9 +1238,10 @@ enum TokenizedEquityMint {
     MintRequested { symbol, quantity, wallet, requested_at },
     MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
     TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
+    TokensWrapped { /* + wrap_tx_hash, wrapped_shares */ },
     DepositedIntoRaindex { /* + vault_deposit_tx_hash */ },
     Completed { symbol, quantity, issuer_request_id, tokenization_request_id,
-                token_tx_hash, vault_deposit_tx_hash, completed_at },
+                token_tx_hash, wrap_tx_hash, vault_deposit_tx_hash, completed_at },
     Failed { symbol, quantity, reason, failed_at },
 }
 ```
@@ -1246,7 +1252,9 @@ enum TokenizedEquityMint {
 enum TokenizedEquityMintCommand {
     // Requests mint from Alpaca and polls until tokens arrive in wallet
     Mint { symbol, quantity, wallet },
-    // Deposits tokens from wallet to Raindex vault
+    // Wraps unwrapped tokens into ERC-4626 vault shares
+    Wrap,
+    // Deposits wrapped tokens to Raindex vault
     Deposit,
 }
 ```
@@ -1264,6 +1272,9 @@ enum TokenizedEquityMintEvent {
 
     TokensReceived { symbol, quantity, tx_hash, receipt_id, shares_minted, received_at },
 
+    TokensWrapped { wrap_tx_hash, wrapped_shares, wrapped_at },
+    WrapFailed { symbol, quantity, reason, failed_at },
+
     DepositedIntoRaindex { symbol, quantity, vault_deposit_tx_hash, deposited_at },
     RaindexDepositFailed { symbol, quantity, failed_tx_hash: Option<TxHash>, failed_at },
 
@@ -1278,7 +1289,9 @@ struct HttpStatusCode(u16);
 
 - `Mint` only from uninitialized state; polls Alpaca until tokens arrive or
   failure
-- `Deposit` only from TokensReceived state
+- `Wrap` only from TokensReceived state; wraps unwrapped tokens into ERC-4626
+  shares
+- `Deposit` only from TokensWrapped state
 - Completed and Failed are terminal states
 
 #### EquityRedemption Aggregate
@@ -1305,17 +1318,22 @@ directly (no intermediate wrapper trait).
 ```mermaid
 stateDiagram-v2
     [*] --> WithdrawnFromRaindex: Withdraw
-    WithdrawnFromRaindex --> TokensSent: Redeem
+    WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
+    TokensUnwrapped --> TokensSent: Send
+    TokensUnwrapped --> Failed
     TokensSent --> Pending
     TokensSent --> Failed
     Pending --> Completed
     Pending --> Failed
 ```
 
-- `Withdraw` command withdraws from Raindex vault to wallet
-- `WithdrawnFromRaindex` tracks tokens that left the vault but aren't yet sent
-- `Redeem` command sends tokens to Alpaca and polls until terminal
+- `Withdraw` command withdraws wrapped tokens from Raindex vault to wallet
+- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
+  yet unwrapped
+- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens
+- `TokensUnwrapped` tracks unwrapped tokens ready to send
+- `Send` command sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
 - `Completed` and `Failed` are terminal states
@@ -1328,14 +1346,25 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
+        amount: U256,
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
+    },
+    TokensUnwrapped {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        unwrap_tx: TxHash,
+        underlying_amount: U256,
+        unwrapped_at: DateTime<Utc>,
     },
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         vault_withdraw_tx: TxHash,
+        unwrap_tx: TxHash,
         redemption_wallet: Address,
         redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
@@ -1359,6 +1388,7 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         vault_withdraw_tx: Option<TxHash>,
+        unwrap_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
         failed_at: DateTime<Utc>,
@@ -1370,15 +1400,17 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    // Withdraws tokens from Raindex vault to wallet
+    // Withdraws wrapped tokens from Raindex vault to wallet
     Withdraw {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         amount: U256,
     },
-    // Sends tokens to Alpaca and polls until terminal state (completed or rejected)
-    Redeem,
+    // Unwraps ERC-4626 tokens to underlying unwrapped tokens
+    Unwrap,
+    // Sends unwrapped tokens to Alpaca and polls until terminal state
+    Send,
 }
 ```
 
@@ -1390,8 +1422,19 @@ enum EquityRedemptionEvent {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
+        amount: U256,
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
+    },
+
+    TokensUnwrapped {
+        unwrap_tx: TxHash,
+        underlying_amount: U256,
+        unwrapped_at: DateTime<Utc>,
+    },
+    UnwrapFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
 
     TokensSent {
@@ -1859,6 +1902,10 @@ know about cross-venue inventory.
   Alpaca)
 - `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex
   available
+- `TokenizedEquityMintEvent::TokensWrapped` - No balance change (conversion
+  between wrapped/unwrapped forms)
+- `TokenizedEquityMintEvent::WrapFailed` - No balance change (tokens await
+  retry)
 - `TokenizedEquityMintEvent::DepositedIntoRaindex` - No balance change
   (completes transfer to Raindex, already counted at TokensReceived)
 - `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
@@ -1870,6 +1917,9 @@ know about cross-venue inventory.
   Alpaca available
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
+- `EquityRedemptionEvent::TokensUnwrapped` - No balance change (conversion
+  between wrapped/unwrapped forms)
+- `EquityRedemptionEvent::UnwrapFailed` - No balance change (tokens await retry)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
 - `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
 - `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
