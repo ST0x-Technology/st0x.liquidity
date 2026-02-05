@@ -29,6 +29,7 @@ use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, Triggered
 use crate::tokenized_equity_mint::MintServices;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
+use crate::wrapper::Wrapper;
 
 type RebalancingTriggerDeps = Cons<
     PositionAggregate,
@@ -86,6 +87,7 @@ impl QueryManifest {
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> Self {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
@@ -94,6 +96,7 @@ impl QueryManifest {
             market_maker_wallet,
             inventory,
             operation_sender,
+            wrapper,
         );
 
         let event_broadcaster = EventBroadcaster::new(event_sender);

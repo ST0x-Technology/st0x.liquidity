@@ -15,7 +15,7 @@ use thiserror::Error;
 use crate::bindings::IERC20;
 use crate::config::Config;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
-use crate::onchain::raindex::{RaindexService, VaultId};
+use crate::onchain::vault::{RaindexService, VaultId};
 use crate::threshold::Usdc;
 use crate::vault_registry::VaultRegistryAggregate;
 

@@ -23,7 +23,7 @@ use crate::cctp::{
 use crate::config::{BrokerConfig, Config};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId, RedemptionServices};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
+use crate::onchain::vault::{Raindex, RaindexService, VaultId};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
@@ -33,9 +33,10 @@ use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
+use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
+use crate::wrapper::{Wrapper, WrapperService};
 
 use super::TransferDirection;
 
@@ -142,21 +143,24 @@ where
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let raindex = Arc::new(RaindexService::new(
+    let vault = Arc::new(RaindexService::new(
         ctx.base_provider,
         ctx.config.evm.orderbook,
-        vault_registry_query,
+        vault_registry_query.clone(),
         owner,
     ));
 
-    let mint_services = MintServices {
-        tokenizer: ctx.tokenization_service,
-        raindex,
-    };
     let mint_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
-    let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], mint_services));
-    let mint_manager = MintManager::new(mint_cqrs);
+    let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
+    let mint_manager = MintManager::new(
+        ctx.tokenization_service,
+        vault,
+        vault_registry_query,
+        ctx.config.evm.orderbook,
+        owner,
+        mint_cqrs,
+    );
 
     let issuer_request_id = IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
 
@@ -196,17 +200,20 @@ where
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let raindex: Arc<dyn Raindex> = Arc::new(RaindexService::new(
-        ctx.base_provider,
+    let raindex_service = Arc::new(RaindexService::new(
+        ctx.base_provider.clone(),
         ctx.config.evm.orderbook,
         vault_registry_query,
         owner,
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service;
+    let vault: Arc<dyn Raindex> = raindex_service;
+    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(ctx.base_provider, owner)?);
     let redemption_services = RedemptionServices {
         tokenizer: tokenizer.clone(),
-        raindex,
+        vault,
+        wrapper,
     };
 
     let redemption_view_repo = Arc::new(SqliteViewRepository::<
@@ -223,7 +230,7 @@ where
         redemption_services,
     ));
 
-    let redemption_manager = RedemptionManager::new(redemption_cqrs, redemption_query);
+    let redemption_manager = RedemptionManager::new(tokenizer, redemption_cqrs, redemption_query);
 
     let aggregate_id = RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
 
@@ -286,7 +293,7 @@ where
     let broker_auth = AlpacaBrokerApiAuthConfig {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
-        account_id: rebalancing_config.alpaca_account_id.to_string(),
+        account_id: rebalancing_config.alpaca_account_id,
         mode: Some(broker_mode),
     };
 
