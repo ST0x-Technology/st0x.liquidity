@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
 use crate::tokenization::TokenizerError;
-use crate::vault::VaultError;
+use crate::wrapper::WrapperError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -32,8 +32,8 @@ pub(crate) enum RedemptionError {
     #[error("Redemption was rejected by tokenizer")]
     Rejected,
 
-    #[error("Vault unwrapping error: {0}")]
-    Vault(#[from] VaultError),
+    #[error("Token wrapping error: {0}")]
+    Wrapper(#[from] WrapperError),
 }
 
 /// Trait for executing redemption operations.
@@ -44,7 +44,8 @@ pub(crate) trait Redeem: Send + Sync {
         aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
+        wrapped_token: Address,
+        unwrapped_token: Address,
         amount: U256,
     ) -> Result<(), RedemptionError>;
 }
@@ -73,6 +74,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             FractionalShares::new(dec!(100)),
             address!("0x1234567890123456789012345678901234567890"),
+            address!("0x2345678901234567890123456789012345678901"),
             U256::from(100_000_000_000_000_000_000_u128),
         )
         .await
@@ -86,19 +88,28 @@ mod tests {
         let mock = Arc::new(MockRedeem::new());
         let symbol = Symbol::new("TSLA").unwrap();
         let quantity = FractionalShares::new(dec!(50.5));
-        let token = address!("0xabcdef0123456789abcdef0123456789abcdef01");
+        let wrapped_token = address!("0xabcdef0123456789abcdef0123456789abcdef01");
+        let unwrapped_token = address!("0xfedcba9876543210fedcba9876543210fedcba98");
         let amount = U256::from(50_500_000_000_000_000_000_u128);
         let aggregate_id = RedemptionAggregateId::new("agg-123");
 
-        mock.execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-            .await
-            .unwrap();
+        mock.execute_redemption(
+            &aggregate_id,
+            symbol.clone(),
+            quantity,
+            wrapped_token,
+            unwrapped_token,
+            amount,
+        )
+        .await
+        .unwrap();
 
         let last = mock.last_call().unwrap();
         assert_eq!(last.aggregate_id, aggregate_id);
         assert_eq!(last.symbol, symbol);
         assert_eq!(last.quantity, quantity);
-        assert_eq!(last.token, token);
+        assert_eq!(last.wrapped_token, wrapped_token);
+        assert_eq!(last.unwrapped_token, unwrapped_token);
         assert_eq!(last.amount, amount);
     }
 
@@ -111,6 +122,7 @@ mod tests {
                 &RedemptionAggregateId::new("agg-fail"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(dec!(10)),
+                Address::ZERO,
                 Address::ZERO,
                 U256::ZERO,
             )

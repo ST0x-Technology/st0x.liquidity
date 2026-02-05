@@ -4,13 +4,14 @@ use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use st0x_execution::Symbol;
 
-use super::Wrapper;
-use crate::vault::{UnderlyingPerWrapped, WrapperError};
+use super::{RATIO_ONE, UnderlyingPerWrapped, Wrapper, WrapperError};
 
 /// Mock wrapper for testing that returns predictable values.
 pub(crate) struct MockWrapper {
     owner: Address,
     unwrap_tx: TxHash,
+    unwrapped_token: Address,
+    ratio: U256,
 }
 
 impl MockWrapper {
@@ -18,21 +19,33 @@ impl MockWrapper {
         Self {
             owner: Address::random(),
             unwrap_tx: TxHash::random(),
+            unwrapped_token: Address::random(),
+            ratio: RATIO_ONE,
         }
     }
 
-    pub(crate) fn with_owner(owner: Address) -> Self {
+    /// Creates a mock wrapper with a custom ratio.
+    pub(crate) fn with_ratio(ratio: U256) -> Self {
         Self {
-            owner,
+            owner: Address::random(),
             unwrap_tx: TxHash::random(),
+            unwrapped_token: Address::random(),
+            ratio,
         }
     }
 }
 
 #[async_trait]
 impl Wrapper for MockWrapper {
-    async fn get_ratio_for_symbol(&self, _symbol: &Symbol) -> Result<UnderlyingPerWrapped, WrapperError> {
-        Ok(UnderlyingPerWrapped::one_to_one())
+    async fn get_ratio_for_symbol(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<UnderlyingPerWrapped, WrapperError> {
+        Ok(UnderlyingPerWrapped::new(self.ratio).expect("ratio is non-zero"))
+    }
+
+    fn lookup_unwrapped(&self, _symbol: &Symbol) -> Result<Address, WrapperError> {
+        Ok(self.unwrapped_token)
     }
 
     async fn to_wrapped(

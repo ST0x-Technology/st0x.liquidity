@@ -1,32 +1,53 @@
-//! Wrapper trait and implementations for converting between wrapped and underlying tokens.
+//! Token wrapping/unwrapping abstractions for ERC-4626 vaults.
+
+mod ratio;
+mod share;
 
 #[cfg(test)]
 pub(crate) mod mock;
-mod share;
 
-pub(crate) use share::WrapperService;
-
+use alloy::contract::Error as ContractError;
 use alloy::primitives::{Address, TxHash, U256};
+use alloy::providers::PendingTransactionError;
 use async_trait::async_trait;
 use st0x_execution::Symbol;
 
-use crate::vault::{UnderlyingPerWrapped, WrapperError};
+pub(crate) use ratio::{RatioError, UnderlyingPerWrapped};
+pub(crate) use share::{EquityTokenAddresses, WrapperService};
 
-/// Trait for converting between wrapped and underlying tokens.
+#[cfg(test)]
+pub(crate) use ratio::RATIO_ONE;
+
+/// Error type for wrapper operations.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WrapperError {
+    #[error("Symbol not configured: {0}")]
+    SymbolNotConfigured(Symbol),
+    #[error("Missing Deposit event in transaction receipt")]
+    MissingDepositEvent,
+    #[error("Missing Withdraw event in transaction receipt")]
+    MissingWithdrawEvent,
+    #[error("Contract error: {0}")]
+    Contract(#[from] ContractError),
+    #[error("Pending transaction error: {0}")]
+    PendingTransaction(#[from] PendingTransactionError),
+    #[error("Ratio error: {0}")]
+    Ratio(#[from] RatioError),
+}
+
+/// Trait for wrapping and unwrapping tokens via ERC-4626 vaults.
 #[async_trait]
 pub(crate) trait Wrapper: Send + Sync {
-    /// Gets the conversion ratio for a symbol.
-    async fn get_ratio_for_symbol(&self, symbol: &Symbol) -> Result<UnderlyingPerWrapped, WrapperError>;
+    /// Gets the underlying-per-wrapped ratio for a symbol.
+    async fn get_ratio_for_symbol(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<UnderlyingPerWrapped, WrapperError>;
 
-    /// Converts underlying tokens to wrapped by depositing into the ERC-4626 vault.
-    ///
-    /// # Arguments
-    /// * `wrapped_token` - The ERC-4626 vault address
-    /// * `underlying_amount` - Amount of underlying tokens to convert
-    /// * `receiver` - Address to receive the wrapped shares
-    ///
-    /// # Returns
-    /// Transaction hash and the amount of wrapped shares received.
+    /// Gets the unwrapped (underlying) token address for a symbol.
+    fn lookup_unwrapped(&self, symbol: &Symbol) -> Result<Address, WrapperError>;
+
+    /// Deposits underlying tokens to receive wrapped tokens.
     async fn to_wrapped(
         &self,
         wrapped_token: Address,
@@ -52,6 +73,6 @@ pub(crate) trait Wrapper: Send + Sync {
         owner: Address,
     ) -> Result<(TxHash, U256), WrapperError>;
 
-    /// Returns the owner address for conversion operations.
+    /// Returns the market maker wallet address that owns the wrapped tokens.
     fn owner(&self) -> Address;
 }

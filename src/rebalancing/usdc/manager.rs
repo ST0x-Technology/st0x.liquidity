@@ -18,7 +18,7 @@ use crate::alpaca_wallet::{
 };
 use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::raindex::{RaindexService, VaultId};
+use crate::onchain::vault::{RaindexService, VaultId};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -40,7 +40,7 @@ where
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-    vault: Arc<RaindexService<BP>>,
+    raindex: Arc<RaindexService<BP>>,
     cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
     /// Market maker's (our) wallet address
     /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
@@ -77,7 +77,7 @@ where
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
-        vault: Arc<RaindexService<BP>>,
+        raindex: Arc<RaindexService<BP>>,
         cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
         market_maker_wallet: Address,
         vault_id: VaultId,
@@ -86,7 +86,7 @@ where
             alpaca_broker,
             alpaca_wallet,
             cctp_bridge,
-            vault,
+            raindex,
             cqrs,
             market_maker_wallet,
             vault_id,
@@ -521,7 +521,7 @@ where
         id: &UsdcRebalanceId,
         amount: U256,
     ) -> Result<(), UsdcRebalanceManagerError> {
-        let deposit_tx = match self.vault.deposit_usdc(self.vault_id, amount).await {
+        let deposit_tx = match self.raindex.deposit_usdc(self.vault_id, amount).await {
             Ok(tx) => tx,
             Err(e) => {
                 warn!("Vault deposit failed: {e}");
@@ -615,7 +615,7 @@ where
         amount: Usdc,
         amount_u256: U256,
     ) -> Result<(), UsdcRebalanceManagerError> {
-        let withdraw_tx = match self.vault.withdraw_usdc(self.vault_id, amount_u256).await {
+        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
             Ok(tx) => tx,
             Err(e) => {
                 warn!("Vault withdrawal failed: {e}");
@@ -907,15 +907,14 @@ mod tests {
 
     use st0x_execution::Executor;
     use st0x_execution::alpaca_broker_api::{
-        AlpacaBrokerApiAuthConfig, AlpacaBrokerApiError, AlpacaBrokerApiMode,
+        AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiError, AlpacaBrokerApiMode,
         CryptoOrderFailureReason,
     };
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaTransferId;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
+    use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
-    use crate::onchain::raindex::RaindexService;
+    use crate::onchain::vault::RaindexService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
     use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
@@ -1042,7 +1041,7 @@ mod tests {
         let auth = AlpacaBrokerApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 

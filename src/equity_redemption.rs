@@ -149,9 +149,9 @@ pub(crate) enum EquityRedemptionCommand {
     /// Unwrap ERC-4626 wrapped tokens after vault withdrawal.
     /// Calls unwrapper.unwrap() via services to redeem wrapped tokens.
     UnwrapTokens,
-    /// Send unwrapped tokens to Alpaca's redemption wallet.
+    /// Redeem unwrapped tokens by sending to Alpaca's redemption wallet.
     /// Calls tokenizer.send_for_redemption() via services.
-    SendTokens {
+    Redeem {
         token: Address,
         amount: U256,
     },
@@ -366,7 +366,7 @@ impl Aggregate for Lifecycle<EquityRedemption, Never> {
 
             EquityRedemptionCommand::UnwrapTokens => self.handle_unwrap_tokens(services).await,
 
-            EquityRedemptionCommand::SendTokens { token, amount } => {
+            EquityRedemptionCommand::Redeem { token, amount } => {
                 self.handle_send_tokens(services, *token, *amount).await
             }
 
@@ -1016,7 +1016,7 @@ pub(crate) mod tests {
 
         let send_events = aggregate
             .handle(
-                EquityRedemptionCommand::SendTokens {
+                EquityRedemptionCommand::Redeem {
                     token,
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },
@@ -1396,7 +1396,7 @@ pub(crate) mod tests {
 
         let result = aggregate
             .handle(
-                EquityRedemptionCommand::SendTokens {
+                EquityRedemptionCommand::Redeem {
                     token: Address::random(),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },
@@ -1429,7 +1429,7 @@ pub(crate) mod tests {
         let services = mock_redeemer_services();
         let result = aggregate
             .handle(
-                EquityRedemptionCommand::SendTokens {
+                EquityRedemptionCommand::Redeem {
                     token,
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },

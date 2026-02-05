@@ -111,6 +111,7 @@ mod tests {
     use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
     use crate::threshold::Usdc;
     use crate::wrapper::mock::MockWrapper;
+    use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
 
     fn test_symbol() -> Symbol {
         Symbol::new("AAPL").unwrap()
@@ -118,6 +119,10 @@ mod tests {
 
     fn test_shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
+    }
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
     fn balanced_threshold() -> ImbalanceThreshold {
@@ -192,7 +197,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&aapl, &balanced_threshold(), None)
+                .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
                 .is_none(),
             "should NOT detect imbalance with only onchain data"
         );
@@ -214,7 +219,7 @@ mod tests {
         let imbalance = inventory
             .read()
             .await
-            .check_equity_imbalance(&aapl, &balanced_threshold(), None)
+            .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
             .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
@@ -299,7 +304,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&aapl, &balanced_threshold(), None)
+                .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
                 .is_none(),
             "should NOT detect imbalance with only offchain data"
         );
@@ -321,7 +326,7 @@ mod tests {
         let imbalance = inventory
             .read()
             .await
-            .check_equity_imbalance(&aapl, &balanced_threshold(), None)
+            .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
             .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
@@ -421,7 +426,7 @@ mod tests {
 
         // All events applied: equity 100 onchain/0 offchain, USDC 5000 onchain/0 offchain
         let equity_imbalance = view
-            .check_equity_imbalance(&aapl, &balanced_threshold(), None)
+            .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
             .expect("should detect equity imbalance after all venues have data");
 
         let usdc_imbalance = view
@@ -633,7 +638,7 @@ mod tests {
         let imbalance = inventory
             .read()
             .await
-            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
             .expect("inventory should reflect both equity snapshots");
 
         assert_eq!(
@@ -688,7 +693,7 @@ mod tests {
         let imbalance = inventory
             .read()
             .await
-            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .check_equity_imbalance(&aapl, &balanced_threshold(), &one_to_one_ratio())
             .expect("inventory should reflect both equity snapshots");
 
         assert_eq!(

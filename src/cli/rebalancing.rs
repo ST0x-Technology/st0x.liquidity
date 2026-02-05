@@ -226,7 +226,7 @@ where
         ctx.rebalancing_config.equities.clone(),
     ));
 
-    let unwrapped_token = wrapper.get_unwrapped_token(symbol)?;
+    let unwrapped_token = wrapper.lookup_unwrapped(symbol)?;
 
     let redemption_services = RedemptionServices {
         tokenizer: tokenizer.clone(),

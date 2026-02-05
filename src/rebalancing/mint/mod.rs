@@ -13,10 +13,10 @@ use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
-use crate::onchain::vault::VaultError;
+use crate::onchain::vault::VaultError as RainVaultError;
 use crate::tokenization::TokenizerError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
-use crate::vault::VaultError;
+use crate::wrapper::WrapperError;
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
@@ -24,8 +24,8 @@ pub(crate) enum MintError {
     Tokenizer(#[from] TokenizerError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
-    #[error("Vault deposit error: {0}")]
-    Vault(#[from] VaultError),
+    #[error("Raindex vault error: {0}")]
+    RainVault(#[from] RainVaultError),
     #[error("Vault not found for symbol {0}")]
     VaultNotFound(Symbol),
     #[error("Mint request was rejected by Alpaca")]
@@ -36,9 +36,8 @@ pub(crate) enum MintError {
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
     #[error("Decimal overflow when scaling {0} to 18 decimals")]
     DecimalOverflow(FractionalShares),
-
-    #[error("Vault wrapping error: {0}")]
-    Vault(#[from] VaultError),
+    #[error("ERC-4626 vault wrapping error: {0}")]
+    Wrapper(#[from] WrapperError),
 }
 
 /// Trait for executing mint operations.

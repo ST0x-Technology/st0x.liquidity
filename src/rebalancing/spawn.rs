@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::{AlpacaBrokerApi, Executor};
+use st0x_execution::{AlpacaBrokerApi, EmptySymbolError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{MintManager, Rebalancer, RebalancingConfig, RedemptionManager, TriggeredOperation};
@@ -25,11 +25,12 @@ use crate::cctp::{
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
 use crate::onchain::http_client_with_retry;
-use crate::onchain::vault::{Vault, VaultId, VaultService};
+use crate::onchain::vault::{Raindex, RaindexService, VaultId};
 use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 use crate::vault_registry::VaultRegistryQuery;
+use crate::wrapper::{Wrapper, WrapperService};
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +43,8 @@ pub(crate) enum SpawnRebalancerError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] crate::cctp::CctpError),
+    #[error("failed to create wrapper service: {0}")]
+    Wrapper(#[from] EmptySymbolError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -76,7 +79,7 @@ pub(crate) struct RebalancerAddresses {
 }
 
 pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
-    pub(crate) vault_service: Arc<VaultService<BP>>,
+    pub(crate) raindex_service: Arc<RaindexService<BP>>,
     pub(crate) tokenization_service: Arc<AlpacaTokenizationService<BP>>,
     pub(crate) vault_registry_query: Arc<VaultRegistryQuery>,
     pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
@@ -115,7 +118,7 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
-        redemption.vault_service,
+        redemption.raindex_service,
         redemption.tokenization_service,
     )
     .await?;
@@ -158,7 +161,8 @@ where
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
-    vault: Arc<VaultService<BP>>,
+    raindex: Arc<RaindexService<BP>>,
+    wrapper: Arc<WrapperService<BP>>,
 }
 
 impl<BP> Services<BP>
@@ -167,7 +171,7 @@ where
 {
     /// Creates the services needed for rebalancing.
     ///
-    /// VaultService and AlpacaTokenizationService are passed in rather than
+    /// RaindexService and AlpacaTokenizationService are passed in rather than
     /// created here because they are needed for CQRS framework initialization in
     /// the conductor, which must happen before spawn_rebalancer is called.
     async fn new(
@@ -175,7 +179,7 @@ where
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
-        vault: Arc<VaultService<BP>>,
+        raindex: Arc<RaindexService<BP>>,
         tokenization: Arc<AlpacaTokenizationService<BP>>,
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
@@ -201,6 +205,12 @@ where
             MESSAGE_TRANSMITTER_V2,
         );
 
+        let wrapper = Arc::new(WrapperService::new(
+            base_provider.clone(),
+            owner,
+            config.equities.clone(),
+        ));
+
         let base_evm_for_cctp = Evm::new(
             base_provider,
             owner,
@@ -216,7 +226,8 @@ where
             broker,
             wallet,
             cctp,
-            vault,
+            raindex,
+            wrapper,
         })
     }
 
@@ -235,7 +246,8 @@ where
     {
         let mint_manager = Arc::new(MintManager::new(
             self.tokenization as Arc<dyn Tokenizer>,
-            self.vault.clone() as Arc<dyn Vault>,
+            self.raindex.clone() as Arc<dyn Raindex>,
+            self.wrapper as Arc<dyn Wrapper>,
             vault_registry_query,
             addresses.orderbook,
             addresses.market_maker_wallet,
@@ -252,7 +264,7 @@ where
             self.broker,
             self.wallet,
             self.cctp,
-            self.vault,
+            self.raindex,
             frameworks.usdc,
             addresses.market_maker_wallet,
             VaultId(config.usdc_vault_id),
@@ -279,18 +291,20 @@ mod tests {
     use rust_decimal_macros::dec;
     use serde_json::json;
     use sqlite_es::SqliteViewRepository;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{
+        AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode,
+    };
     use st0x_execution::{FractionalShares, Symbol};
     use uuid::Uuid;
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
     use crate::conductor::wire::test_cqrs;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
-    use crate::vault::WrappedTokenRegistry;
     use crate::vault_registry::VaultRegistryAggregate;
+    use std::collections::HashMap;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -316,10 +330,10 @@ mod tests {
             alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
-                account_id: Uuid::nil().to_string(),
+                account_id: AlpacaAccountId::new(Uuid::nil()),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
             },
-            wrapped_token_registry: WrappedTokenRegistry::empty(),
+            equities: HashMap::new(),
         }
     }
 
@@ -440,7 +454,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: config.alpaca_account_id.to_string(),
+            account_id: config.alpaca_account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
         let broker = Arc::new(
@@ -487,8 +501,14 @@ mod tests {
         ));
         let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-        let vault = Arc::new(
-            VaultService::new(base_provider, TEST_ORDERBOOK, vault_registry_query, owner)
+        let wrapper = Arc::new(WrapperService::new(
+            base_provider.clone(),
+            owner,
+            config.equities.clone(),
+        ));
+
+        let raindex = Arc::new(
+            RaindexService::new(base_provider, TEST_ORDERBOOK, vault_registry_query, owner)
                 .with_required_confirmations(1),
         );
 
@@ -497,7 +517,8 @@ mod tests {
             broker,
             wallet,
             cctp,
-            vault,
+            raindex,
+            wrapper,
         };
 
         (services, config)
@@ -519,7 +540,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiAuthConfig {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
-            account_id: config.alpaca_account_id.to_string(),
+            account_id: config.alpaca_account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 

@@ -89,9 +89,6 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to deposit to vault before tokens were wrapped
     #[error("Cannot deposit to vault: tokens not wrapped")]
     TokensNotWrapped,
-    /// Attempted to finalize before tokens were received
-    #[error("Cannot finalize: tokens not received")]
-    TokensNotReceived,
     /// Attempted to finalize before vault deposit
     #[error("Cannot finalize: vault deposit not complete")]
     VaultDepositNotComplete,
@@ -1122,6 +1119,13 @@ mod tests {
         };
         aggregate.apply(received_event);
 
+        let wrapped_event = TokenizedEquityMintEvent::TokensWrapped {
+            wrap_tx_hash: TxHash::random(),
+            wrapped_shares: U256::from(100_500_000_000_000_000_000_u128),
+            wrapped_at: Utc::now(),
+        };
+        aggregate.apply(wrapped_event);
+
         let deposited_event = TokenizedEquityMintEvent::VaultDeposited {
             symbol,
             quantity: dec!(100.5),
@@ -1188,6 +1192,22 @@ mod tests {
                     tx_hash,
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let wrap_tx_hash = TxHash::random();
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares: U256::from(100_500_000_000_000_000_000_u128),
                 },
                 &(),
             )
@@ -1424,6 +1444,13 @@ mod tests {
             received_at: Utc::now(),
         };
         aggregate.apply(received_event);
+
+        let wrapped_event = TokenizedEquityMintEvent::TokensWrapped {
+            wrap_tx_hash: TxHash::random(),
+            wrapped_shares: U256::from(100_500_000_000_000_000_000_u128),
+            wrapped_at: Utc::now(),
+        };
+        aggregate.apply(wrapped_event);
 
         let deposited_event = TokenizedEquityMintEvent::VaultDeposited {
             symbol: symbol.clone(),
@@ -1848,6 +1875,20 @@ mod tests {
                 TokenizedEquityMintCommand::WrapTokens {
                     wrap_tx_hash,
                     wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let vault_deposit_tx_hash = TxHash::random();
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::DepositToVault {
+                    vault_deposit_tx_hash,
                 },
                 &(),
             )

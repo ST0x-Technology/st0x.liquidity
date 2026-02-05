@@ -9,7 +9,7 @@ use alloy::primitives::U256;
 use crate::shares::{FractionalShares, SharesConversionError};
 
 /// One unit in ratio representation (10^18).
-const RATIO_ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
+pub(crate) const RATIO_ONE: U256 = U256::from_limbs([1_000_000_000_000_000_000, 0, 0, 0]);
 
 /// Ratio of underlying tokens per wrapped token.
 ///
@@ -49,11 +49,6 @@ impl UnderlyingPerWrapped {
         Ok(Self { ratio })
     }
 
-    /// Creates a 1:1 ratio (no conversion needed).
-    pub(crate) fn one_to_one() -> Self {
-        Self { ratio: RATIO_ONE }
-    }
-
     /// Converts wrapped token amount to underlying amount.
     ///
     /// Formula: underlying = wrapped * ratio / 10^18
@@ -89,7 +84,7 @@ mod tests {
 
     #[test]
     fn one_to_one_ratio_converts_identity() {
-        let ratio = UnderlyingPerWrapped::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
         let amount = U256::from(1000u64);
 
         let underlying = ratio.to_underlying(amount).unwrap();
@@ -122,7 +117,7 @@ mod tests {
 
     #[test]
     fn zero_amount_converts_to_zero() {
-        let ratio = UnderlyingPerWrapped::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         let underlying = ratio.to_underlying(U256::ZERO).unwrap();
         assert_eq!(underlying, U256::ZERO);
@@ -136,7 +131,7 @@ mod tests {
 
     #[test]
     fn large_amounts_dont_overflow() {
-        let ratio = UnderlyingPerWrapped::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         // Test with a reasonably large amount (not U256::MAX which would overflow)
         let large_amount = U256::from(10u64).pow(U256::from(30u64));
@@ -147,7 +142,7 @@ mod tests {
 
     #[test]
     fn fractional_one_to_one_converts_identity() {
-        let ratio = UnderlyingPerWrapped::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
         let wrapped = FractionalShares::new(dec!(100));
 
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
@@ -183,7 +178,7 @@ mod tests {
 
     #[test]
     fn fractional_zero_converts_to_zero() {
-        let ratio = UnderlyingPerWrapped::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         let underlying = ratio
             .to_underlying_fractional(FractionalShares::ZERO)
@@ -194,7 +189,7 @@ mod tests {
 
     #[test]
     fn fractional_conversion_handles_small_values() {
-        let ratio = UnderlyingPerWrapped::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
         let wrapped = FractionalShares::new(Decimal::new(1, 6)); // 0.000001
 
         let underlying = ratio.to_underlying_fractional(wrapped).unwrap();
