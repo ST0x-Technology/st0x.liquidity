@@ -114,6 +114,7 @@ mod tests {
     use sqlx::SqlitePool;
 
     use st0x_event_sorcery::{Projection, Store};
+    use st0x_execution::MockExecutor;
 
     use super::*;
     use crate::position::{Position, PositionCommand};

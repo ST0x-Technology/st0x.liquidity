@@ -112,6 +112,10 @@ impl Executor for AlpacaBrokerApi {
         super::market_hours::wait_until_market_open(&self.client).await
     }
 
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        super::market_hours::is_market_open(&self.client).await
+    }
+
     async fn place_market_order(
         &self,
         order: MarketOrder,
