@@ -430,6 +430,8 @@ impl InventoryView {
     /// stock splits or dividends.
     ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
+    ///
+    /// For unwrapped tokens, pass `VaultRatio::one_to_one()`.
     pub(crate) fn check_equity_imbalance(
         &self,
         symbol: &Symbol,
