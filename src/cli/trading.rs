@@ -14,7 +14,8 @@ use sqlx::SqlitePool;
 use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
     ArithmeticError, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
-    MockExecutorConfig, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    MockExecutor, MockExecutorConfig, OrderPlacement, OrderState, Positive, Symbol,
+    TryIntoExecutor,
 };
 use tracing::{error, info};
 
@@ -332,13 +333,14 @@ pub(super) async fn process_found_trade<W: Write>(
 
     update_position_aggregate(&position_cqrs, &onchain_trade, config.execution_threshold).await;
 
-    let executor_type = config.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
 
+    // CLI test command uses MockExecutor (market always open)
+    let executor = MockExecutor::new();
     let Some(params) = check_execution_readiness(
+        &executor,
         &position_query,
         base_symbol,
-        executor_type,
         &config.execution_threshold,
     )
     .await?
@@ -355,6 +357,7 @@ pub(super) async fn process_found_trade<W: Write>(
     };
 
     let offchain_order_id = OffchainOrder::aggregate_id();
+    let executor_type = config.broker.to_supported_executor();
 
     writeln!(
         stdout,
@@ -369,7 +372,7 @@ pub(super) async fn process_found_trade<W: Write>(
                 offchain_order_id,
                 shares: params.shares,
                 direction: params.direction,
-                executor: params.executor,
+                executor: executor_type,
                 threshold: config.execution_threshold,
             },
         )
