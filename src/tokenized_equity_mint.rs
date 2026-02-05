@@ -1,45 +1,21 @@
-//! Tokenized Equity Mint aggregate for converting offchain Alpaca shares to onchain tokens.
+//! Tokenized Equity Mint aggregate for Alpaca-to-Raindex inventory transfer.
 //!
-//! This module implements the CQRS-ES aggregate pattern for managing the asynchronous workflow
-//! of minting tokenized equity shares. It tracks the complete lifecycle from requesting a mint
-//! through Alpaca's tokenization API to receiving the onchain tokens.
+//! Moves equity inventory from Alpaca (brokerage) to Raindex (onchain orderbook)
+//! by tokenizing shares and depositing them to a vault for liquidity provision.
+//! This is one direction of cross-venue equity rebalancing (the reverse is
+//! `EquityRedemption`).
 //!
 //! # State Flow
 //!
-//! The aggregate progresses through the following states:
-//!
 //! ```text
-//! (start) --RequestMint--> MintRequested --AcknowledgeAcceptance--> MintAccepted
-//!                                |                                       |
-//!                                | RejectMint                            | FailAcceptance
-//!                                v                                       v
-//!                             Failed                             TokensReceived
-//!                                                                       |
-//!                                                                       | Finalize
-//!                                                                       v
-//!                                                                   Completed
+//! MintRequested -> MintAccepted -> TokensReceived -> VaultDeposited -> Completed
+//!       |               |               |
+//!       v               v               v
+//!     Failed          Failed          Failed
 //! ```
 //!
-//! - `MintRequested` can be rejected via `RejectMint`
-//! - `MintAccepted` can fail via `FailAcceptance`
-//! - `Completed` and `Failed` are terminal states
-//!
-//! # Alpaca API Integration
-//!
-//! The mint process integrates with Alpaca's tokenization API:
-//!
-//! 1. **Request**: System initiates mint request with symbol, quantity, and destination wallet
-//! 2. **Acceptance**: Alpaca responds with `issuer_request_id` and `tokenization_request_id`
-//! 3. **Transfer**: Alpaca executes onchain transfer, system detects transaction
-//! 4. **Completion**: System verifies receipt and finalizes mint
-//!
-//! # Error Handling
-//!
-//! The aggregate enforces strict state transitions:
-//!
-//! - Commands that don't match current state return appropriate errors
-//! - Terminal states (Completed, Failed) reject all state-changing commands
-//! - All state transitions are captured as events for complete audit trail
+//! Terminal states (`Completed`, `Failed`) capture audit-critical fields not
+//! available from earlier events (tx hashes, tracking IDs, timestamps).
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
@@ -214,6 +190,7 @@ impl DomainEvent for TokenizedEquityMintEvent {
                 "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
+            Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
             Self::MintCompleted { .. } => "TokenizedEquityMintEvent::MintCompleted".to_string(),
         }
     }
@@ -273,6 +250,7 @@ pub(crate) enum TokenizedEquityMint {
         tx_hash: TxHash,
         receipt_id: ReceiptId,
         shares_minted: U256,
+        vault_deposit_tx_hash: TxHash,
         requested_at: DateTime<Utc>,
         completed_at: DateTime<Utc>,
     },
@@ -332,6 +310,10 @@ impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
                 shares_minted,
             } => self.handle_receive_tokens(*tx_hash, receipt_id, *shares_minted),
 
+            TokenizedEquityMintCommand::DepositToVault {
+                vault_deposit_tx_hash,
+            } => self.handle_deposit_to_vault(*vault_deposit_tx_hash),
+
             TokenizedEquityMintCommand::Finalize => self.handle_finalize(),
         }
     }
@@ -364,13 +346,14 @@ impl Lifecycle<TokenizedEquityMint, Never> {
     ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => Err(TokenizedEquityMintError::NotRequested),
-            Ok(TokenizedEquityMint::MintRequested { symbol, .. }) => {
-                Ok(vec![TokenizedEquityMintEvent::MintRejected {
-                    symbol: Some(symbol.clone()),
-                    reason: reason.to_string(),
-                    rejected_at: Utc::now(),
-                }])
-            }
+            Ok(TokenizedEquityMint::MintRequested {
+                symbol, quantity, ..
+            }) => Ok(vec![TokenizedEquityMintEvent::MintRejected {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                reason: reason.to_string(),
+                rejected_at: Utc::now(),
+            }]),
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Ok(_) => Err(TokenizedEquityMintError::AlreadyCompleted),
             Err(e) => Err(e.into()),
@@ -384,13 +367,15 @@ impl Lifecycle<TokenizedEquityMint, Never> {
     ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => Err(TokenizedEquityMintError::NotRequested),
-            Ok(TokenizedEquityMint::MintRequested { .. }) => {
-                Ok(vec![TokenizedEquityMintEvent::MintAccepted {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: tokenization_request_id.clone(),
-                    accepted_at: Utc::now(),
-                }])
-            }
+            Ok(TokenizedEquityMint::MintRequested {
+                symbol, quantity, ..
+            }) => Ok(vec![TokenizedEquityMintEvent::MintAccepted {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                issuer_request_id: issuer_request_id.clone(),
+                tokenization_request_id: tokenization_request_id.clone(),
+                accepted_at: Utc::now(),
+            }]),
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Ok(_) => Err(TokenizedEquityMintError::AlreadyCompleted),
             Err(e) => Err(e.into()),
@@ -405,13 +390,14 @@ impl Lifecycle<TokenizedEquityMint, Never> {
             Err(LifecycleError::Uninitialized) | Ok(TokenizedEquityMint::MintRequested { .. }) => {
                 Err(TokenizedEquityMintError::NotAccepted)
             }
-            Ok(TokenizedEquityMint::MintAccepted { symbol, .. }) => {
-                Ok(vec![TokenizedEquityMintEvent::MintAcceptanceFailed {
-                    symbol: Some(symbol.clone()),
-                    reason: reason.to_string(),
-                    failed_at: Utc::now(),
-                }])
-            }
+            Ok(TokenizedEquityMint::MintAccepted {
+                symbol, quantity, ..
+            }) => Ok(vec![TokenizedEquityMintEvent::MintAcceptanceFailed {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                reason: reason.to_string(),
+                failed_at: Utc::now(),
+            }]),
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Ok(_) => Err(TokenizedEquityMintError::AlreadyCompleted),
             Err(e) => Err(e.into()),
@@ -428,16 +414,46 @@ impl Lifecycle<TokenizedEquityMint, Never> {
             Err(LifecycleError::Uninitialized) | Ok(TokenizedEquityMint::MintRequested { .. }) => {
                 Err(TokenizedEquityMintError::NotAccepted)
             }
-            Ok(TokenizedEquityMint::MintAccepted { .. }) => {
-                Ok(vec![TokenizedEquityMintEvent::TokensReceived {
-                    tx_hash,
-                    receipt_id: receipt_id.clone(),
-                    shares_minted,
-                    received_at: Utc::now(),
-                }])
-            }
+            Ok(TokenizedEquityMint::MintAccepted {
+                symbol, quantity, ..
+            }) => Ok(vec![TokenizedEquityMintEvent::TokensReceived {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                tx_hash,
+                receipt_id: receipt_id.clone(),
+                shares_minted,
+                received_at: Utc::now(),
+            }]),
             Ok(
-                TokenizedEquityMint::Completed { .. } | TokenizedEquityMint::TokensReceived { .. },
+                TokenizedEquityMint::Completed { .. }
+                | TokenizedEquityMint::TokensReceived { .. }
+                | TokenizedEquityMint::VaultDeposited { .. },
+            ) => Err(TokenizedEquityMintError::AlreadyCompleted),
+            Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn handle_deposit_to_vault(
+        &self,
+        vault_deposit_tx_hash: TxHash,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        match self.live() {
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                TokenizedEquityMint::MintRequested { .. }
+                | TokenizedEquityMint::MintAccepted { .. },
+            ) => Err(TokenizedEquityMintError::TokensNotReceived),
+            Ok(TokenizedEquityMint::TokensReceived {
+                symbol, quantity, ..
+            }) => Ok(vec![TokenizedEquityMintEvent::VaultDeposited {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                vault_deposit_tx_hash,
+                deposited_at: Utc::now(),
+            }]),
+            Ok(
+                TokenizedEquityMint::VaultDeposited { .. } | TokenizedEquityMint::Completed { .. },
             ) => Err(TokenizedEquityMintError::AlreadyCompleted),
             Ok(TokenizedEquityMint::Failed { .. }) => Err(TokenizedEquityMintError::AlreadyFailed),
             Err(e) => Err(e.into()),
@@ -449,14 +465,16 @@ impl Lifecycle<TokenizedEquityMint, Never> {
             Err(LifecycleError::Uninitialized)
             | Ok(
                 TokenizedEquityMint::MintRequested { .. }
-                | TokenizedEquityMint::MintAccepted { .. },
-            ) => Err(TokenizedEquityMintError::TokensNotReceived),
-            Ok(TokenizedEquityMint::TokensReceived { symbol, .. }) => {
-                Ok(vec![TokenizedEquityMintEvent::MintCompleted {
-                    symbol: Some(symbol.clone()),
-                    completed_at: Utc::now(),
-                }])
-            }
+                | TokenizedEquityMint::MintAccepted { .. }
+                | TokenizedEquityMint::TokensReceived { .. },
+            ) => Err(TokenizedEquityMintError::VaultDepositNotComplete),
+            Ok(TokenizedEquityMint::VaultDeposited {
+                symbol, quantity, ..
+            }) => Ok(vec![TokenizedEquityMintEvent::MintCompleted {
+                symbol: symbol.clone(),
+                quantity: *quantity,
+                completed_at: Utc::now(),
+            }]),
             Ok(TokenizedEquityMint::Completed { .. }) => {
                 Err(TokenizedEquityMintError::AlreadyCompleted)
             }
@@ -487,6 +505,7 @@ impl TokenizedEquityMint {
                 issuer_request_id,
                 tokenization_request_id,
                 accepted_at,
+                ..
             } => current.apply_accepted(
                 issuer_request_id,
                 tokenization_request_id,
@@ -502,6 +521,7 @@ impl TokenizedEquityMint {
                 receipt_id,
                 shares_minted,
                 received_at,
+                ..
             } => current.apply_tokens_received(
                 *tx_hash,
                 receipt_id,
@@ -509,6 +529,11 @@ impl TokenizedEquityMint {
                 *received_at,
                 event,
             ),
+            TokenizedEquityMintEvent::VaultDeposited {
+                vault_deposit_tx_hash,
+                deposited_at,
+                ..
+            } => current.apply_vault_deposited(*vault_deposit_tx_hash, *deposited_at, event),
             TokenizedEquityMintEvent::MintCompleted { completed_at, .. } => {
                 current.apply_completed(*completed_at, event)
             }
@@ -609,9 +634,10 @@ impl TokenizedEquityMint {
         })
     }
 
-    fn apply_completed(
+    fn apply_vault_deposited(
         &self,
-        completed_at: DateTime<Utc>,
+        vault_deposit_tx_hash: TxHash,
+        deposited_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
     ) -> Result<Self, LifecycleError<Never>> {
         let Self::TokensReceived {
@@ -623,6 +649,49 @@ impl TokenizedEquityMint {
             tx_hash,
             receipt_id,
             shares_minted,
+            requested_at,
+            accepted_at,
+            received_at,
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::VaultDeposited {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            wallet: *wallet,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            tx_hash: *tx_hash,
+            receipt_id: receipt_id.clone(),
+            shares_minted: *shares_minted,
+            vault_deposit_tx_hash,
+            requested_at: *requested_at,
+            accepted_at: *accepted_at,
+            received_at: *received_at,
+            deposited_at,
+        })
+    }
+
+    fn apply_completed(
+        &self,
+        completed_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::VaultDeposited {
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+            tokenization_request_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            vault_deposit_tx_hash,
             requested_at,
             ..
         } = self
@@ -642,6 +711,7 @@ impl TokenizedEquityMint {
             tx_hash: *tx_hash,
             receipt_id: receipt_id.clone(),
             shares_minted: *shares_minted,
+            vault_deposit_tx_hash: *vault_deposit_tx_hash,
             requested_at: *requested_at,
             completed_at,
         })
@@ -774,7 +844,7 @@ mod tests {
         let tx_hash = TxHash::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
+            symbol: symbol.clone(),
             quantity: dec!(100.5),
             wallet,
             requested_at: Utc::now(),
@@ -782,6 +852,8 @@ mod tests {
         aggregate.apply(requested_event);
 
         let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            symbol,
+            quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
@@ -808,14 +880,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finalize_after_tokens_received() {
+    async fn test_finalize_after_vault_deposit() {
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
         let tx_hash = TxHash::random();
+        let vault_deposit_tx_hash = TxHash::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
+            symbol: symbol.clone(),
             quantity: dec!(100.5),
             wallet,
             requested_at: Utc::now(),
@@ -823,6 +896,8 @@ mod tests {
         aggregate.apply(requested_event);
 
         let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            symbol: symbol.clone(),
+            quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
@@ -830,12 +905,22 @@ mod tests {
         aggregate.apply(accepted_event);
 
         let received_event = TokenizedEquityMintEvent::TokensReceived {
+            symbol: symbol.clone(),
+            quantity: dec!(100.5),
             tx_hash,
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
             received_at: Utc::now(),
         };
         aggregate.apply(received_event);
+
+        let deposited_event = TokenizedEquityMintEvent::VaultDeposited {
+            symbol,
+            quantity: dec!(100.5),
+            vault_deposit_tx_hash,
+            deposited_at: Utc::now(),
+        };
+        aggregate.apply(deposited_event);
 
         let events = aggregate
             .handle(TokenizedEquityMintCommand::Finalize, &())
@@ -854,6 +939,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
         let tx_hash = TxHash::random();
+        let vault_deposit_tx_hash = TxHash::random();
 
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
 
@@ -894,6 +980,20 @@ mod tests {
                     tx_hash,
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+                },
+                &(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::DepositToVault {
+                    vault_deposit_tx_hash,
                 },
                 &(),
             )
@@ -968,13 +1068,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_finalize_before_tokens_received() {
+    async fn test_cannot_finalize_before_vault_deposit() {
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
+        let tx_hash = TxHash::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
+            symbol: symbol.clone(),
             quantity: dec!(100.5),
             wallet,
             requested_at: Utc::now(),
@@ -982,11 +1083,23 @@ mod tests {
         aggregate.apply(requested_event);
 
         let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            symbol: symbol.clone(),
+            quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         };
         aggregate.apply(accepted_event);
+
+        let received_event = TokenizedEquityMintEvent::TokensReceived {
+            symbol,
+            quantity: dec!(100.5),
+            tx_hash,
+            receipt_id: ReceiptId(U256::from(789)),
+            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            received_at: Utc::now(),
+        };
+        aggregate.apply(received_event);
 
         let result = aggregate
             .handle(TokenizedEquityMintCommand::Finalize, &())
@@ -994,7 +1107,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(TokenizedEquityMintError::TokensNotReceived)
+            Err(TokenizedEquityMintError::VaultDepositNotComplete)
         ));
     }
 
@@ -1036,7 +1149,7 @@ mod tests {
         let wallet = Address::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol,
+            symbol: symbol.clone(),
             quantity: dec!(100.5),
             wallet,
             requested_at: Utc::now(),
@@ -1044,6 +1157,8 @@ mod tests {
         aggregate.apply(requested_event);
 
         let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            symbol,
+            quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
@@ -1073,6 +1188,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
         let tx_hash = TxHash::random();
+        let vault_deposit_tx_hash = TxHash::random();
 
         let requested_event = TokenizedEquityMintEvent::MintRequested {
             symbol: symbol.clone(),
@@ -1083,6 +1199,8 @@ mod tests {
         aggregate.apply(requested_event);
 
         let accepted_event = TokenizedEquityMintEvent::MintAccepted {
+            symbol: symbol.clone(),
+            quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS123".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
@@ -1090,6 +1208,8 @@ mod tests {
         aggregate.apply(accepted_event);
 
         let received_event = TokenizedEquityMintEvent::TokensReceived {
+            symbol: symbol.clone(),
+            quantity: dec!(100.5),
             tx_hash,
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
@@ -1097,8 +1217,17 @@ mod tests {
         };
         aggregate.apply(received_event);
 
+        let deposited_event = TokenizedEquityMintEvent::VaultDeposited {
+            symbol: symbol.clone(),
+            quantity: dec!(100.5),
+            vault_deposit_tx_hash,
+            deposited_at: Utc::now(),
+        };
+        aggregate.apply(deposited_event);
+
         let completed_event = TokenizedEquityMintEvent::MintCompleted {
-            symbol: Some(symbol),
+            symbol,
+            quantity: dec!(100.5),
             completed_at: Utc::now(),
         };
         aggregate.apply(completed_event);
@@ -1133,7 +1262,8 @@ mod tests {
         aggregate.apply(requested_event);
 
         let rejected_event = TokenizedEquityMintEvent::MintRejected {
-            symbol: Some(symbol),
+            symbol,
+            quantity: dec!(100.5),
             reason: "First rejection".to_string(),
             rejected_at: Utc::now(),
         };
@@ -1210,11 +1340,14 @@ mod tests {
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
+            vault_deposit_tx_hash: TxHash::random(),
             requested_at: Utc::now(),
             completed_at: Utc::now(),
         };
 
         let event = TokenizedEquityMintEvent::MintAccepted {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
             issuer_request_id: IssuerRequestId("ISS999".to_string()),
             tokenization_request_id: TokenizationRequestId("TOK999".to_string()),
             accepted_at: Utc::now(),
@@ -1239,6 +1372,8 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::TokensReceived {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(100_500_000_000_000_000_000_u128),
@@ -1267,7 +1402,8 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintCompleted {
-            symbol: None,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
             completed_at: Utc::now(),
         };
 
@@ -1293,7 +1429,8 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintRejected {
-            symbol: None,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
             reason: "Should not apply".to_string(),
             rejected_at: Utc::now(),
         };
@@ -1317,7 +1454,8 @@ mod tests {
         };
 
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
-            symbol: None,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: dec!(100.5),
             reason: "Should not apply".to_string(),
             failed_at: Utc::now(),
         };

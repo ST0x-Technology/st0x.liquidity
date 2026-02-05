@@ -459,6 +459,9 @@ impl RebalancingTrigger {
             | TokenizedEquityMintEvent::TokensReceived {
                 symbol, quantity, ..
             }
+            | TokenizedEquityMintEvent::VaultDeposited {
+                symbol, quantity, ..
+            }
             | TokenizedEquityMintEvent::MintCompleted {
                 symbol, quantity, ..
             } => (symbol, quantity),

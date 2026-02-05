@@ -30,13 +30,21 @@ use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::{Redeem, RedemptionService};
 use crate::rebalancing::usdc::UsdcRebalanceManager;
-use crate::rebalancing::{MintManager, RedemptionManager};
+use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistryAggregate;
 
 use super::TransferDirection;
+
+struct TransferContext<'a, BP: Provider + Clone> {
+    config: &'a Config,
+    pool: &'a SqlitePool,
+    rebalancing_config: &'a RebalancingConfig,
+    base_provider: BP,
+    tokenization_service: Arc<AlpacaTokenizationService<BP>>,
+}
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
@@ -78,95 +86,150 @@ pub(super) async fn transfer_equity_command<W: Write>(
         rebalancing_config.redemption_wallet,
     ));
 
+    let ctx = TransferContext {
+        config,
+        pool,
+        rebalancing_config,
+        base_provider,
+        tokenization_service,
+    };
+
     match direction {
         TransferDirection::ToRaindex => {
-            writeln!(stdout, "   Creating mint request...")?;
-
-            let mint_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
-            let mint_manager = MintManager::new(tokenization_service, mint_cqrs);
-
-            let issuer_request_id =
-                IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
-
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let wallet = signer.address();
-
-            writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
-            writeln!(stdout, "   Receiving Wallet: {wallet}")?;
-
-            mint_manager
-                .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
-                .await?;
-
-            writeln!(stdout, "✅ Mint completed successfully")?;
+            execute_mint(stdout, symbol, quantity, ctx).await?;
         }
 
         TransferDirection::ToAlpaca => {
             let token = token_address.ok_or_else(|| {
                 anyhow::anyhow!("--token-address is required for to-alpaca direction (redemption)")
             })?;
-
-            writeln!(stdout, "   Token Address: {token}")?;
-            writeln!(stdout, "   Sending tokens for redemption...")?;
-
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let owner = signer.address();
-            let vault = Arc::new(VaultService::new(base_provider, config.evm.orderbook));
-
-            let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-                VaultRegistryAggregate,
-                VaultRegistryAggregate,
-            >::new(
-                pool.clone(),
-                "vault_registry_view".to_string(),
-            ));
-            let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
-
-            let redemption_service = Arc::new(RedemptionService::new(
-                vault,
-                tokenization_service,
-                vault_registry_query,
-                config.evm.orderbook,
-                owner,
-            ));
-
-            let redemption_view_repo = Arc::new(SqliteViewRepository::<
-                Lifecycle<EquityRedemption, Never>,
-                Lifecycle<EquityRedemption, Never>,
-            >::new(
-                pool.clone(),
-                "equity_redemption_view".to_string(),
-            ));
-            let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
-
-            let cqrs_services: Arc<dyn Redeemer> = redemption_service.clone();
-            let redemption_cqrs = Arc::new(sqlite_cqrs(
-                pool.clone(),
-                vec![Box::new(GenericQuery::new(redemption_view_repo))],
-                cqrs_services,
-            ));
-
-            let redemption_manager =
-                RedemptionManager::new(redemption_service, redemption_cqrs, redemption_query);
-
-            let aggregate_id =
-                RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
-
-            let amount = quantity.to_u256_18_decimals()?;
-
-            writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
-            writeln!(stdout, "   Amount (wei): {amount}")?;
-
-            redemption_manager
-                .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-                .await?;
-
-            writeln!(stdout, "✅ Redemption completed successfully")?;
+            execute_redemption(stdout, symbol, quantity, token, ctx).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn execute_mint<W, BP>(
+    stdout: &mut W,
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    ctx: TransferContext<'_, BP>,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    BP: Provider + Clone + 'static,
+{
+    writeln!(stdout, "   Creating mint request...")?;
+
+    let signer = PrivateKeySigner::from_bytes(&ctx.rebalancing_config.evm_private_key)?;
+    let owner = signer.address();
+
+    let vault = Arc::new(VaultService::new(
+        ctx.base_provider,
+        ctx.config.evm.orderbook,
+    ));
+
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        ctx.pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let mint_store =
+        PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
+    let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
+    let mint_manager = MintManager::new(
+        ctx.tokenization_service,
+        vault,
+        vault_registry_query,
+        ctx.config.evm.orderbook,
+        owner,
+        mint_cqrs,
+    );
+
+    let issuer_request_id = IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
+
+    writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
+    writeln!(stdout, "   Receiving Wallet: {owner}")?;
+
+    mint_manager
+        .execute_mint(&issuer_request_id, symbol.clone(), quantity, owner)
+        .await?;
+
+    writeln!(stdout, "✅ Mint completed successfully")?;
+    Ok(())
+}
+
+async fn execute_redemption<W, BP>(
+    stdout: &mut W,
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    token: Address,
+    ctx: TransferContext<'_, BP>,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    BP: Provider + Clone + 'static,
+{
+    writeln!(stdout, "   Token Address: {token}")?;
+    writeln!(stdout, "   Sending tokens for redemption...")?;
+
+    let signer = PrivateKeySigner::from_bytes(&ctx.rebalancing_config.evm_private_key)?;
+    let owner = signer.address();
+    let vault = Arc::new(VaultService::new(
+        ctx.base_provider,
+        ctx.config.evm.orderbook,
+    ));
+
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        ctx.pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let redemption_service = Arc::new(RedemptionService::new(
+        vault,
+        ctx.tokenization_service,
+        vault_registry_query,
+        ctx.config.evm.orderbook,
+        owner,
+    ));
+
+    let redemption_view_repo = Arc::new(SqliteViewRepository::<
+        Lifecycle<EquityRedemption, Never>,
+        Lifecycle<EquityRedemption, Never>,
+    >::new(
+        ctx.pool.clone(), "equity_redemption_view".to_string()
+    ));
+    let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
+
+    let cqrs_services: Arc<dyn Redeemer> = redemption_service.clone();
+    let redemption_cqrs = Arc::new(sqlite_cqrs(
+        ctx.pool.clone(),
+        vec![Box::new(GenericQuery::new(redemption_view_repo))],
+        cqrs_services,
+    ));
+
+    let redemption_manager =
+        RedemptionManager::new(redemption_service, redemption_cqrs, redemption_query);
+
+    let aggregate_id = RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
+
+    let amount = quantity.to_u256_18_decimals()?;
+
+    writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
+    writeln!(stdout, "   Amount (wei): {amount}")?;
+
+    redemption_manager
+        .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
+        .await?;
+
+    writeln!(stdout, "✅ Redemption completed successfully")?;
     Ok(())
 }
 

@@ -65,8 +65,8 @@ use crate::position::{
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::redemption::RedemptionService;
 use crate::rebalancing::{
-    RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
-    RedemptionDependencies, spawn_rebalancer,
+    RebalancerAddresses, RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger,
+    RebalancingTriggerConfig, RedemptionDependencies, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
@@ -653,6 +653,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let redemption_deps = RedemptionDependencies {
         vault_service,
         tokenization_service,
+        vault_registry_query,
         service: redemption_service,
         cqrs: frameworks.redemption,
         query: queries.redemption_view,
@@ -661,7 +662,10 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let handle = spawn_rebalancer(
         rebalancing_config,
         provider.clone(),
-        market_maker_wallet,
+        RebalancerAddresses {
+            market_maker_wallet,
+            orderbook: config.evm.orderbook,
+        },
         operation_receiver,
         rebalancing_frameworks,
         redemption_deps,
