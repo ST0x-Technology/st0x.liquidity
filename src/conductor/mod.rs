@@ -573,6 +573,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let redemption_deps = RedemptionDependencies {
         vault_service,
         tokenization_service,
+        vault_registry_query,
         service: redemption_service,
         cqrs: Arc::new(built.redemption),
     };

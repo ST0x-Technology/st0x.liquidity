@@ -28,7 +28,7 @@ use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::{Redeem, RedemptionService};
 use crate::rebalancing::usdc::UsdcRebalanceManager;
-use crate::rebalancing::{MintManager, RedemptionManager};
+use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
@@ -72,6 +72,14 @@ pub(super) async fn transfer_equity_command<W: Write>(
         base_provider.clone(),
         rebalancing_config.redemption_wallet,
     ));
+
+    let ctx = TransferContext {
+        config,
+        pool,
+        rebalancing_config,
+        base_provider,
+        tokenization_service,
+    };
 
     match direction {
         TransferDirection::ToRaindex => {

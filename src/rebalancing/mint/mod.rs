@@ -15,25 +15,26 @@ use st0x_event_sorcery::SendError;
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
+use crate::onchain::vault::VaultError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMint};
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
     #[error("Alpaca API error: {0}")]
     Alpaca(#[from] AlpacaTokenizationError),
-
     #[error("Aggregate error: {0}")]
     Aggregate(Box<SendError<TokenizedEquityMint>>),
+    #[error("Vault deposit error: {0}")]
+    Vault(#[from] VaultError),
+    #[error("Vault not found for symbol {0}")]
+    VaultNotFound(Symbol),
 
     #[error("Mint request was rejected by Alpaca")]
     Rejected,
-
     #[error("Missing tx_hash in completed Alpaca response")]
     MissingTxHash,
-
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
-
     #[error("Decimal overflow when scaling {0} to 18 decimals")]
     DecimalOverflow(FractionalShares),
 }

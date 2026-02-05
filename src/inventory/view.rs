@@ -251,8 +251,8 @@ where
         })
     }
 
-    /// Complete a transfer from offchain to onchain, accounting for fees.
-    /// Confirms `amount_sent` left offchain, adds `amount_received` to onchain.
+    /// Complete a transfer from Alpaca to Raindex, accounting for fees.
+    /// Confirms `amount_sent` left Alpaca (offchain), adds `amount_received` to Raindex (onchain).
     /// The difference is the fee lost in transit (e.g., CCTP bridging fees).
     fn transfer_offchain_to_onchain_with_fee(
         self,
@@ -282,8 +282,8 @@ where
         })
     }
 
-    /// Complete a transfer from onchain to offchain, accounting for fees.
-    /// Confirms `amount_sent` left onchain, adds `amount_received` to offchain.
+    /// Complete a transfer from Raindex to Alpaca, accounting for fees.
+    /// Confirms `amount_sent` left Raindex (onchain), adds `amount_received` to Alpaca (offchain).
     /// The difference is the fee lost in transit (e.g., CCTP bridging fees).
     fn transfer_onchain_to_offchain_with_fee(
         self,
@@ -531,9 +531,13 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         match event {
-            // No balance changes for these events.
+            // No venue inventory changes. VaultDeposited completes the transfer to Raindex
+            // (already counted when TokensReceived). VaultDepositFailed leaves tokens in
+            // wallet awaiting retry or manual recovery.
             TokenizedEquityMintEvent::MintRequested { .. }
-            | TokenizedEquityMintEvent::MintRejected { .. } => Ok(Self {
+            | TokenizedEquityMintEvent::MintRejected { .. }
+            | TokenizedEquityMintEvent::VaultDeposited { .. }
+            | TokenizedEquityMintEvent::VaultDepositFailed { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
