@@ -96,7 +96,7 @@ Example (Offchain Batching):
   imbalance, >70% USDC imbalance), trigger automated rebalancing
 - **Equity Rebalancing**:
   - Too many tokens onchain: Redeem tokens -> receive shares at Alpaca
-  - Too many shares offchain: Mint tokens from shares -> receive tokens onchain
+  - Too many shares offchain: Mint tokens -> deposit to Raindex vault
 - **USDC Rebalancing**:
   - Too much USDC onchain: Bridge via Circle CCTP (Base -> Ethereum) -> deposit
     to Alpaca
@@ -1532,69 +1532,41 @@ enum SchwabAuthEvent {
 **Note**: Automated rebalancing is **Alpaca-only**. These aggregates are not
 used for Schwab-based operations, which rely on manual rebalancing processes.
 
-Rebalancing manages inventory positions across venues (onchain vs offchain) by
-coordinating cross-venue asset movements. Three aggregates handle the different
-rebalancing flows for Alpaca operations.
+Rebalancing manages inventory positions across trading venues (Alpaca brokerage
+vs Raindex orderbook) by coordinating cross-venue asset movements. Three
+aggregates handle the different rebalancing flows for Alpaca operations.
 
 #### TokenizedEquityMint Aggregate
 
-**Purpose**: Manages the process of converting offchain shares at Alpaca into
-onchain tokens.
+**Purpose**: Transfers equity inventory from Alpaca to Raindex by tokenizing
+shares and depositing them to a vault for liquidity provision.
 
-**Aggregate ID**: UUID for each mint request
+**Aggregate ID**: IssuerRequestId (our internal tracking ID)
+
+**Lifecycle Pattern**: Uses `Lifecycle<TokenizedEquityMint, Never>` wrapper.
+
+##### State Flow
+
+```text
+MintRequested -> MintAccepted -> TokensReceived -> VaultDeposited -> Completed
+      |               |               |
+      v               v               v
+    Failed          Failed          Failed
+```
 
 ##### States
 
+Terminal states store audit-critical fields not available from earlier events:
+
 ```rust
 enum TokenizedEquityMint {
-    NotStarted,
-    MintRequested {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        requested_at: DateTime<Utc>,
-    },
-    MintAccepted {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        requested_at: DateTime<Utc>,
-        accepted_at: DateTime<Utc>,
-    },
-    TokensReceived {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-        requested_at: DateTime<Utc>,
-        accepted_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
-    },
-    Completed {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-        requested_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-    },
-    Failed {
-        symbol: Symbol,
-        quantity: Decimal,
-        reason: String,
-        requested_at: DateTime<Utc>,
-        failed_at: DateTime<Utc>,
-    },
+    MintRequested { symbol, quantity, wallet, requested_at },
+    MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
+    TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
+    VaultDeposited { /* + vault_deposit_tx_hash */ },
+    Completed { symbol, quantity, issuer_request_id, tokenization_request_id,
+                token_tx_hash, vault_deposit_tx_hash, completed_at },
+    Failed { symbol, quantity, reason, failed_at },
 }
 ```
 
@@ -1602,69 +1574,48 @@ enum TokenizedEquityMint {
 
 ```rust
 enum TokenizedEquityMintCommand {
-    RequestMint {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-    },
-    AcknowledgeAcceptance {
-        issuer_request_id: String,
-        tokenization_request_id: String,
-    },
-    ReceiveTokens {
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-    },
+    RequestMint { symbol, quantity, wallet },
+    AcknowledgeAcceptance { issuer_request_id, tokenization_request_id },
+    ReceiveTokens { tx_hash, receipt_id, shares_minted },
+    DepositToVault { vault_deposit_tx_hash },
     Finalize,
-    Fail {
-        reason: String,
-    },
+    RejectMint { reason },
+    FailAcceptance { reason },
 }
 ```
 
 ##### Events
 
+Each event captures data relevant to that state transition:
+
 ```rust
 enum TokenizedEquityMintEvent {
-    MintRequested {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        requested_at: DateTime<Utc>,
-    },
-    MintAccepted {
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        accepted_at: DateTime<Utc>,
-    },
-    TokensReceived {
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-        received_at: DateTime<Utc>,
-    },
-    MintCompleted {
-        completed_at: DateTime<Utc>,
-    },
-    MintFailed {
-        reason: String,
-        failed_at: DateTime<Utc>,
-    },
+    MintRequested { symbol, quantity, wallet, requested_at },
+    MintAccepted { symbol, quantity, issuer_request_id, tokenization_request_id, accepted_at },
+    TokensReceived { symbol, quantity, tx_hash, receipt_id, shares_minted, received_at },
+    VaultDeposited { symbol, quantity, vault_deposit_tx_hash, deposited_at },
+    VaultDepositFailed { symbol, quantity, reason, failed_at },
+    MintCompleted { symbol, quantity, completed_at },
+    MintRejected { symbol, quantity, reason, rejected_at },
+    MintAcceptanceFailed { symbol, quantity, reason, failed_at },
 }
 ```
 
 ##### Business Rules
 
-- Can only request mint from NotStarted state
-- Mint acceptance requires valid issuer and tokenization request IDs
-- Tokens received requires transaction confirmation
-- Can mark failed from any non-terminal state
+- RequestMint only from uninitialized state
+- AcknowledgeAcceptance only from MintRequested
+- ReceiveTokens only from MintAccepted
+- DepositToVault only from TokensReceived
+- Finalize only from VaultDeposited
+- RejectMint only from MintRequested
+- FailAcceptance only from MintAccepted
+- Completed and Failed are terminal states
 
 #### EquityRedemption Aggregate
 
-**Purpose**: Manages the process of converting onchain tokens into offchain
-shares at Alpaca.
+**Purpose**: Transfers equity inventory from Raindex to Alpaca by withdrawing
+tokens from vault, sending them for redemption, and receiving shares at Alpaca.
 
 **Aggregate ID**: UUID for each redeem request
 
@@ -2238,17 +2189,24 @@ know about cross-venue inventory.
   activity)
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
   Alpaca)
-- `TokenizedEquityMintEvent::MintCompleted` - Moves from inflight to onchain
+- `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex
   available
-- `TokenizedEquityMintEvent::MintFailed` - Reconciles inflight back to offchain
+- `TokenizedEquityMintEvent::VaultDeposited` - No balance change (completes
+  transfer to Raindex, already counted at TokensReceived)
+- `TokenizedEquityMintEvent::VaultDepositFailed` - No balance change (tokens
+  await retry or manual recovery)
+- `TokenizedEquityMintEvent::MintCompleted` - No balance change (finalization)
+- `TokenizedEquityMintEvent::MintRejected` - Reconciles inflight back to Alpaca
   available
-- `EquityRedemptionEvent::VaultWithdrawn` - Moves tokens to inflight (left
-  vault)
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to
+  Alpaca available
+- `EquityRedemptionEvent::VaultWithdrawn` - Moves tokens to inflight (leaving
+  Raindex vault)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
-- `EquityRedemptionEvent::Completed` - Moves from inflight to offchain available
+- `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
 - `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
 - `EquityRedemptionEvent::RedemptionRejected` - Reconciles inflight back to
-  onchain available (tokens returned by Alpaca)
+  Raindex available (tokens returned by Alpaca)
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::RebalancingCompleted` - Moves from inflight to
