@@ -36,21 +36,6 @@ impl std::fmt::Display for TokenSymbol {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AlpacaAccountId(Uuid);
-
-impl AlpacaAccountId {
-    pub(crate) const fn new(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-}
-
-impl std::fmt::Display for AlpacaAccountId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AlpacaTransferId(Uuid);
 
 impl AlpacaTransferId {
@@ -250,6 +235,7 @@ mod tests {
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_execution::AlpacaAccountId;
     use std::str::FromStr;
     use uuid::uuid;
 

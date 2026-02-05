@@ -17,7 +17,7 @@ pub mod schwab;
 #[cfg(test)]
 pub mod test_utils;
 
-pub use alpaca_broker_api::AlpacaBrokerApi;
+pub use alpaca_broker_api::{AlpacaAccountId, AlpacaBrokerApi};
 pub use alpaca_trading_api::AlpacaTradingApi;
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorConfig};

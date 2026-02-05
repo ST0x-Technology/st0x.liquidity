@@ -8,14 +8,16 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountResponse, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+use super::auth::{
+    AccountResponse, AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode,
+};
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
     base_url: String,
-    account_id: String,
+    account_id: AlpacaAccountId,
     mode: AlpacaBrokerApiMode,
 }
 
@@ -49,7 +51,7 @@ impl AlpacaBrokerApiClient {
         Ok(Self {
             http_client,
             base_url: config.base_url().to_string(),
-            account_id: config.account_id.clone(),
+            account_id: config.account_id,
             mode: config.mode(),
         })
     }
@@ -58,8 +60,8 @@ impl AlpacaBrokerApiClient {
         &self.base_url
     }
 
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
+    pub(crate) fn account_id(&self) -> AlpacaAccountId {
+        self.account_id
     }
 
     pub(crate) fn is_sandbox(&self) -> bool {
