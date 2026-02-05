@@ -12,8 +12,8 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use st0x_execution::{
-    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutorCtx,
-    OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutor,
+    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
 
 use st0x_event_sorcery::{Projection, Store, StoreBuilder};
@@ -309,8 +309,11 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor_type = ctx.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
 
+    // CLI test command uses MockExecutor (market always open)
+    let executor = MockExecutor::new();
     let Some(params) =
-        check_execution_readiness(&position_projection, base_symbol, executor_type).await?
+        check_execution_readiness(&executor, &position_projection, base_symbol, executor_type)
+            .await?
     else {
         writeln!(
             stdout,

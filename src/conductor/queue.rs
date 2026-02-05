@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{error, info};
 
-use st0x_execution::{Executor, SupportedExecutor};
+use st0x_execution::Executor;
 
 use super::{
     TradeProcessingCqrs, convert_event_to_trade, discover_vaults_for_trade,
@@ -62,14 +62,13 @@ pub(super) async fn run_queue_processor<P, E>(
     let feed_id_cache = FeedIdCache::default();
     log_unprocessed_event_count(pool).await;
 
-    let executor_type = executor.to_supported_executor();
     let queue_context = QueueProcessingContext {
         cache,
         feed_id_cache: &feed_id_cache,
         vault_registry_cqrs,
     };
 
-    run_processing_loop(executor_type, config, pool, &provider, cqrs, &queue_context).await;
+    run_processing_loop(executor, config, pool, &provider, cqrs, &queue_context).await;
 }
 
 async fn log_unprocessed_event_count(pool: &SqlitePool) {
@@ -82,18 +81,21 @@ async fn log_unprocessed_event_count(pool: &SqlitePool) {
     }
 }
 
-async fn run_processing_loop<P: Provider + Clone>(
-    executor_type: SupportedExecutor,
+async fn run_processing_loop<P, E>(
+    executor: &E,
     config: &Config,
     pool: &SqlitePool,
     provider: &P,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingContext<'_>,
-) {
+) where
+    P: Provider + Clone,
+    E: Executor,
+    EventProcessingError: From<E::Error>,
+{
     loop {
         let result =
-            process_next_queued_event(executor_type, config, pool, provider, cqrs, queue_context)
-                .await;
+            process_next_queued_event(executor, config, pool, provider, cqrs, queue_context).await;
 
         match result {
             Ok(Some(offchain_order_id)) => {
@@ -115,14 +117,19 @@ async fn run_processing_loop<P: Provider + Clone>(
 /// Returns `Ok(Some(id))` if an offchain order was placed, `Ok(None)` if no
 /// event was available or the event was filtered out, and `Err` on failures.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(super) async fn process_next_queued_event<P: Provider + Clone>(
-    executor_type: SupportedExecutor,
+pub(super) async fn process_next_queued_event<P, E>(
+    executor: &E,
     config: &Config,
     pool: &SqlitePool,
     provider: &P,
     cqrs: &TradeProcessingCqrs,
     queue_context: &QueueProcessingContext<'_>,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError>
+where
+    P: Provider + Clone,
+    E: Executor,
+    EventProcessingError: From<E::Error>,
+{
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
         return Ok(None);
@@ -171,7 +178,7 @@ pub(super) async fn process_next_queued_event<P: Provider + Clone>(
     let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
     let _guard = symbol_lock.lock().await;
 
-    process_queued_trade(executor_type, pool, &queued_event, event_id, trade, cqrs).await
+    process_queued_trade(executor, pool, &queued_event, event_id, trade, cqrs).await
 }
 
 fn event_type_name(event: &TradeEvent) -> &'static str {
@@ -189,14 +196,18 @@ fn event_type_name(event: &TradeEvent) -> &'static str {
 /// 3. Witnesses the trade in the onchain trade aggregate
 /// 4. Checks if execution threshold is met
 /// 5. Places an offchain order if threshold is met
-pub(super) async fn process_queued_trade(
-    executor_type: SupportedExecutor,
+pub(super) async fn process_queued_trade<E>(
+    executor: &E,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
     event_id: i64,
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
+) -> Result<Option<OffchainOrderId>, EventProcessingError>
+where
+    E: Executor,
+    EventProcessingError: From<E::Error>,
+{
     // Update Position aggregate FIRST so threshold check sees current state
     execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
 
@@ -215,9 +226,9 @@ pub(super) async fn process_queued_trade(
     let base_symbol = trade.symbol.base();
 
     let Some(params) = check_execution_readiness(
+        executor,
         &cqrs.position_query,
         base_symbol,
-        executor_type,
         &cqrs.execution_threshold,
     )
     .await?
@@ -247,7 +258,7 @@ mod tests {
     use sqlite_es::SqliteViewRepository;
     use std::sync::Arc;
 
-    use st0x_execution::{SupportedExecutor, Symbol};
+    use st0x_execution::{MockExecutor, Symbol};
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
@@ -407,7 +418,7 @@ mod tests {
         let trade = test_trade(0.5, 10);
 
         let result = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,
@@ -454,7 +465,7 @@ mod tests {
         let trade = test_trade(1.5, 20);
 
         let result = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,
@@ -508,7 +519,7 @@ mod tests {
         let trade_1 = test_trade(0.5, 30);
 
         let result_1 = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_1,
             event_id_1,
@@ -527,7 +538,7 @@ mod tests {
         let trade_2 = test_trade(0.7, 31);
 
         let result_2 = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_2,
             event_id_2,
@@ -567,7 +578,7 @@ mod tests {
         assert_eq!(unprocessed_before, 1);
 
         process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,

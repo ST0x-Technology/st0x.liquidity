@@ -1510,7 +1510,8 @@ where
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions = check_all_positions(position_projection, executor_type).await?;
+    let ready_positions =
+        check_all_positions(executor, position_projection, executor_type).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1664,7 +1665,8 @@ mod tests {
     use std::sync::Arc;
 
     use st0x_execution::{
-        Direction, ExecutorOrderId, MarketOrder, MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
+        Direction, ExecutorOrderId, MarketOrder, MockExecutor, MockExecutorCtx, Positive, Symbol,
+        TryIntoExecutor,
     };
 
     use super::*;
@@ -1760,7 +1762,7 @@ mod tests {
         let cqrs = trade_processing_cqrs(&frameworks);
 
         let result = process_next_queued_event(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &config,
             &pool,
             &provider,
@@ -1817,7 +1819,7 @@ mod tests {
         let cqrs = trade_processing_cqrs(&frameworks);
 
         process_next_queued_event(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &config,
             &pool,
             &provider,
@@ -1872,7 +1874,7 @@ mod tests {
         let cqrs = trade_processing_cqrs(&frameworks);
 
         process_next_queued_event(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &config,
             &pool,
             &provider,
@@ -3005,7 +3007,7 @@ mod tests {
         let trade = test_trade_with_amount(dec!(0.5), 10);
 
         let result = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,
@@ -3056,7 +3058,7 @@ mod tests {
         let trade = test_trade_with_amount(dec!(1.5), 20);
 
         let result = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,
@@ -3107,7 +3109,7 @@ mod tests {
         let trade_1 = test_trade_with_amount(dec!(0.5), 30);
 
         let result_1 = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_1,
             event_id_1,
@@ -3126,7 +3128,7 @@ mod tests {
         let trade_2 = test_trade_with_amount(dec!(0.7), 31);
 
         let result_2 = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_2,
             event_id_2,
@@ -3163,7 +3165,7 @@ mod tests {
         let trade_1 = test_trade_with_amount(dec!(1.5), 40);
 
         let first_order_id = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_1,
             event_id_1,
@@ -3178,7 +3180,7 @@ mod tests {
         let trade_2 = test_trade_with_amount(dec!(1.5), 41);
 
         let result_2 = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_2,
             event_id_2,
@@ -3225,7 +3227,7 @@ mod tests {
         let trade_1 = test_trade_with_amount(dec!(1.5), 50);
 
         let first_order_id = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_1,
             event_id_1,
@@ -3241,7 +3243,7 @@ mod tests {
         let trade_2 = test_trade_with_amount(dec!(1.5), 51);
 
         process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event_2,
             event_id_2,
@@ -3327,7 +3329,7 @@ mod tests {
 
         // Simulate restart: process the unprocessed event
         let result = process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,
@@ -4022,7 +4024,7 @@ mod tests {
         let trade = test_trade_with_amount(1.5, 70);
 
         process_queued_trade(
-            SupportedExecutor::DryRun,
+            &MockExecutor::new(),
             &pool,
             &queued_event,
             event_id,

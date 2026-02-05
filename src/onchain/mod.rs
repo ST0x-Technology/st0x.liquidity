@@ -129,6 +129,8 @@ pub(crate) enum OnChainError {
     Uuid(#[from] uuid::Error),
     #[error("Position projection error: {0}")]
     PositionProjection(#[from] ProjectionError<Position>),
+    #[error("Market hours check failed")]
+    MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<sqlx::Error> for OnChainError {
