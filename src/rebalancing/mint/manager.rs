@@ -1,8 +1,8 @@
-//! Orchestrates offchain-to-onchain equity transfer via Alpaca tokenization.
+//! Orchestrates Alpaca-to-Raindex equity inventory transfer.
 //!
-//! Coordinates between `AlpacaTokenizationService` and the
-//! `TokenizedEquityMint` aggregate to execute the full mint
-//! lifecycle: request -> poll -> receive tokens -> finalize.
+//! Coordinates Alpaca tokenization API and vault deposits, emitting commands to
+//! the `TokenizedEquityMint` aggregate at each step. Implements the `Mint` trait
+//! for integration with the rebalancing trigger system.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -15,10 +15,11 @@ use tracing::{info, instrument, warn};
 use st0x_event_sorcery::Store;
 
 use super::{Mint, MintError};
-use crate::alpaca_tokenization::{
+use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::vault::{VaultId, VaultService};
+use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::onchain::vault::{VaultId, VaultService};
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -225,8 +226,8 @@ where
                     .await?;
 
                 self.cqrs
-                    .execute(
-                        &issuer_request_id.0,
+                    .send(
+                        issuer_request_id,
                         TokenizedEquityMintCommand::DepositToVault {
                             vault_deposit_tx_hash,
                         },
@@ -296,9 +297,9 @@ mod tests {
     use st0x_event_sorcery::test_store;
 
     use super::*;
-    use crate::alpaca_tokenization::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_from_mock, create_test_service_with_provider,
-        setup_anvil, tokenization_mint_path, tokenization_requests_path,
+    use crate::tokenization::alpaca::tests::{
+        TEST_REDEMPTION_WALLET, create_test_service_with_provider, setup_anvil,
+        tokenization_mint_path, tokenization_requests_path,
     };
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::VaultRegistryAggregate;
@@ -377,9 +378,6 @@ mod tests {
         assert_eq!(decimal_to_u256_18_decimals(value).unwrap(), U256::ZERO);
     }
 
-    // NOTE: The full happy path test requires a deployed orderbook contract for vault deposit.
-    // The vault deposit step is tested via the aggregate state transition tests.
-    // This test validates the workflow up to token receipt.
     #[tokio::test]
     async fn execute_mint_receives_tokens_then_fails_vault_lookup() {
         let server = MockServer::start();
@@ -426,10 +424,20 @@ mod tests {
         let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        manager
-            .execute_mint_impl(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
-            .await
-            .unwrap();
+        let result = manager
+            .execute_mint_impl(
+                &IssuerRequestId::new("mint-001"),
+                symbol.clone(),
+                quantity,
+                wallet,
+            )
+            .await;
+
+        // Workflow proceeds through Alpaca API but fails at vault lookup
+        assert!(
+            matches!(result, Err(MintError::VaultNotFound(ref s)) if *s == symbol),
+            "Expected VaultNotFound error, got: {result:?}"
+        );
 
         mint_mock.assert();
         poll_mock.assert();
@@ -438,12 +446,31 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_rejected_by_alpaca() {
         let server = MockServer::start();
+        let pool = crate::test_utils::setup_test_db().await;
         let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer);
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_http(endpoint.parse().unwrap());
+
+        let service = Arc::new(create_test_service_with_provider(
+            &server,
+            provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
+        let vault_registry_query = create_empty_vault_registry_query(&pool);
         let cqrs = create_test_store_instance().await;
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(
+            service,
+            cqrs,
+            vault,
+            vault_registry_query,
+            TEST_ORDERBOOK,
+            TEST_REDEMPTION_WALLET,
+        );
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
@@ -489,12 +516,31 @@ mod tests {
     #[tokio::test]
     async fn execute_mint_api_error() {
         let server = MockServer::start();
+        let pool = crate::test_utils::setup_test_db().await;
         let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer);
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_http(endpoint.parse().unwrap());
+
+        let service = Arc::new(create_test_service_with_provider(
+            &server,
+            provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
+        let vault_registry_query = create_empty_vault_registry_query(&pool);
         let cqrs = create_test_store_instance().await;
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(
+            service,
+            cqrs,
+            vault,
+            vault_registry_query,
+            TEST_ORDERBOOK,
+            TEST_REDEMPTION_WALLET,
+        );
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
@@ -518,12 +564,31 @@ mod tests {
     #[tokio::test]
     async fn trait_impl_delegates_to_execute_mint_impl() {
         let server = MockServer::start();
+        let pool = crate::test_utils::setup_test_db().await;
         let (_anvil, endpoint, key) = setup_anvil();
-        let service = Arc::new(
-            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
-        );
+
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer);
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_http(endpoint.parse().unwrap());
+
+        let service = Arc::new(create_test_service_with_provider(
+            &server,
+            provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
+        let vault_registry_query = create_empty_vault_registry_query(&pool);
         let cqrs = create_test_store_instance().await;
-        let manager = MintManager::new(service, cqrs);
+        let manager = MintManager::new(
+            service,
+            cqrs,
+            vault,
+            vault_registry_query,
+            TEST_ORDERBOOK,
+            TEST_REDEMPTION_WALLET,
+        );
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());
@@ -541,15 +606,232 @@ mod tests {
 
         let mint_trait: &dyn Mint = &manager;
 
-        mint_trait
+        // Workflow proceeds through Alpaca API but fails at vault lookup (registry empty)
+        let result = mint_trait
             .execute_mint(
                 &IssuerRequestId::new("trait-001"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(dec!(50.0)),
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
             )
-            .await
-            .unwrap();
+            .await;
+
+        // Expected to fail at vault lookup since registry is empty
+        assert!(matches!(result, Err(MintError::VaultNotFound(_))));
+
+        mint_mock.assert();
+        poll_mock.assert();
+    }
+
+    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, TxHash, b256};
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    };
+    use alloy::providers::{Identity, ProviderBuilder, RootProvider};
+    use sqlite_es::SqliteCqrs;
+
+    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::conductor::wire::test_cqrs;
+    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+
+    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
+    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ));
+
+    type LocalEvmProvider = FillProvider<
+        JoinFill<
+            JoinFill<
+                Identity,
+                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+            >,
+            WalletFiller<EthereumWallet>,
+        >,
+        RootProvider<Ethereum>,
+        Ethereum,
+    >;
+
+    struct LocalEvmWithVault {
+        _anvil: AnvilInstance,
+        provider: LocalEvmProvider,
+        signer: PrivateKeySigner,
+        orderbook_address: Address,
+        token_address: Address,
+    }
+
+    impl LocalEvmWithVault {
+        async fn new() -> Self {
+            let anvil = Anvil::new().spawn();
+            let endpoint = anvil.endpoint();
+
+            let private_key_bytes = anvil.keys()[0].to_bytes();
+            let signer =
+                PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes)).unwrap();
+
+            let wallet = EthereumWallet::from(signer.clone());
+            let provider = ProviderBuilder::new()
+                .wallet(wallet)
+                .connect_http(endpoint.parse().unwrap());
+
+            let tofu = TOFUTokenDecimals::deploy(&provider).await.unwrap();
+            let deployed_code = provider.get_code_at(*tofu.address()).await.unwrap();
+            provider
+                .raw_request::<_, ()>(
+                    "anvil_setCode".into(),
+                    (TOFU_DECIMALS_ADDRESS, deployed_code),
+                )
+                .await
+                .unwrap();
+
+            let orderbook = OrderBook::deploy(&provider).await.unwrap();
+            let orderbook_address = *orderbook.address();
+
+            let token = TestERC20::deploy(&provider).await.unwrap();
+            let token_address = *token.address();
+            let initial_supply = U256::from(1_000_000) * U256::from(10).pow(U256::from(18));
+            token
+                .mint(signer.address(), initial_supply)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+
+            Self {
+                _anvil: anvil,
+                provider,
+                signer,
+                orderbook_address,
+                token_address,
+            }
+        }
+
+        async fn approve_tokens_for_orderbook(&self, amount: U256) {
+            let token = TestERC20::new(self.token_address, &self.provider);
+            token
+                .approve(self.orderbook_address, amount)
+                .send()
+                .await
+                .unwrap()
+                .get_receipt()
+                .await
+                .unwrap();
+        }
+    }
+
+    fn create_vault_registry_cqrs(
+        pool: &sqlx::SqlitePool,
+    ) -> (SqliteCqrs<VaultRegistryAggregate>, Arc<VaultRegistryQuery>) {
+        let view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let query = Arc::new(GenericQuery::new(view_repo.clone()));
+        let cqrs = test_cqrs::<VaultRegistryAggregate>(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(view_repo))],
+            (),
+        );
+        (cqrs, query)
+    }
+
+    async fn seed_vault_registry(
+        pool: &sqlx::SqlitePool,
+        orderbook: Address,
+        owner: Address,
+        token: Address,
+        vault_id: B256,
+        symbol: Symbol,
+    ) -> Arc<VaultRegistryQuery> {
+        let (cqrs, query) = create_vault_registry_cqrs(pool);
+        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
+
+        cqrs.execute(
+            &aggregate_id,
+            VaultRegistryCommand::DiscoverEquityVault {
+                token,
+                vault_id,
+                discovered_in: TxHash::ZERO,
+                symbol,
+            },
+        )
+        .await
+        .unwrap();
+
+        query
+    }
+
+    #[tokio::test]
+    async fn execute_mint_full_workflow_with_vault_deposit() {
+        let server = MockServer::start();
+        let pool = crate::test_utils::setup_test_db().await;
+        let local_evm = LocalEvmWithVault::new().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let vault_registry_query = seed_vault_registry(
+            &pool,
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+            local_evm.token_address,
+            TEST_VAULT_ID.0,
+            symbol.clone(),
+        )
+        .await;
+
+        let deposit_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
+        local_evm.approve_tokens_for_orderbook(deposit_amount).await;
+
+        let service = Arc::new(create_test_service_with_provider(
+            &server,
+            local_evm.provider.clone(),
+            local_evm.signer.address(),
+        ));
+        let vault = Arc::new(VaultService::new(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+        ));
+        let cqrs = create_test_store_instance().await;
+        let manager = MintManager::new(
+            service,
+            cqrs,
+            vault,
+            vault_registry_query,
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        );
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(tokenization_mint_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(sample_pending_response("full_flow_test"));
+        });
+
+        let poll_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([sample_completed_response("full_flow_test")]));
+        });
+
+        let quantity = FractionalShares::new(dec!(100.0));
+        let wallet = local_evm.signer.address();
+
+        let result = manager
+            .execute_mint_impl(
+                &IssuerRequestId::new("full-flow-001"),
+                symbol,
+                quantity,
+                wallet,
+            )
+            .await;
+
+        assert!(result.is_ok(), "Expected Ok but got: {result:?}");
 
         mint_mock.assert();
         poll_mock.assert();

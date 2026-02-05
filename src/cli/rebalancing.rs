@@ -30,6 +30,9 @@ use crate::rebalancing::redemption::{Redeem, RedemptionService};
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
+use crate::tokenization::{
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
+};
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistryAggregate;

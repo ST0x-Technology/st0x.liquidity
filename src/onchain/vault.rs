@@ -13,6 +13,7 @@
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
 use alloy::providers::Provider;
+use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
@@ -260,6 +261,57 @@ fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
     let float = Float::from_raw(float);
     let formatted = float.format_with_scientific(false)?;
     Ok(formatted.parse::<Decimal>()?)
+}
+
+/// Abstraction for Rain OrderBook vault operations.
+///
+/// This trait abstracts deposit and withdraw operations for the Rain OrderBook,
+/// allowing different implementations (real service, mock) to be used interchangeably.
+#[async_trait]
+pub(crate) trait Vault: Send + Sync {
+    /// Deposits tokens to a Rain OrderBook vault.
+    async fn deposit(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, VaultError>;
+
+    /// Withdraws tokens from a Rain OrderBook vault.
+    async fn withdraw(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, VaultError>;
+}
+
+#[async_trait]
+impl<P> Vault for VaultService<P>
+where
+    P: Provider + Clone + Send + Sync,
+{
+    async fn deposit(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, VaultError> {
+        VaultService::deposit(self, token, vault_id, amount, decimals).await
+    }
+
+    async fn withdraw(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        target_amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, VaultError> {
+        VaultService::withdraw(self, token, vault_id, target_amount, decimals).await
+    }
 }
 
 #[cfg(test)]

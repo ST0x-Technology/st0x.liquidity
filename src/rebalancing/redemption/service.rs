@@ -6,10 +6,10 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::equity_redemption::{RedeemError, Redeemer};
 use crate::lifecycle::Lifecycle;
 use crate::onchain::vault::{VaultId, VaultService};
+use crate::tokenization::AlpacaTokenizationService;
 use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
 
 /// Our tokenized equity tokens use 18 decimals.

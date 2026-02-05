@@ -27,6 +27,7 @@ use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
@@ -37,6 +38,7 @@ use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, trace, warn};
 
+use super::{Tokenizer, TokenizerError};
 use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
@@ -650,6 +652,62 @@ where
                 return Ok(request);
             }
         }
+    }
+}
+
+#[async_trait]
+impl<P> Tokenizer for AlpacaTokenizationService<P>
+where
+    P: Provider + Clone + Send + Sync,
+{
+    async fn request_mint(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        wallet: Address,
+        issuer_request_id: IssuerRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(AlpacaTokenizationService::request_mint(
+            self,
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+        )
+        .await?)
+    }
+
+    async fn poll_mint_until_complete(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(AlpacaTokenizationService::poll_mint_until_complete(self, id).await?)
+    }
+
+    fn redemption_wallet(&self) -> Address {
+        AlpacaTokenizationService::redemption_wallet(self)
+    }
+
+    async fn send_for_redemption(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<TxHash, TokenizerError> {
+        Ok(AlpacaTokenizationService::send_for_redemption(self, token, amount).await?)
+    }
+
+    async fn poll_for_redemption(
+        &self,
+        tx_hash: &TxHash,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(AlpacaTokenizationService::poll_for_redemption(self, tx_hash).await?)
+    }
+
+    async fn poll_redemption_until_complete(
+        &self,
+        id: &TokenizationRequestId,
+    ) -> Result<TokenizationRequest, TokenizerError> {
+        Ok(AlpacaTokenizationService::poll_redemption_until_complete(self, id).await?)
     }
 }
 

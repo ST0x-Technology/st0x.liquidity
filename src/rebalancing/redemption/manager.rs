@@ -14,9 +14,9 @@ use st0x_event_sorcery::Store;
 
 use super::service::RedemptionService;
 use super::{Redeem, RedemptionError};
-use crate::alpaca_tokenization::TokenizationRequestStatus;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
+use crate::tokenization::TokenizationRequestStatus;
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 use crate::onchain::vault::{VaultId, VaultService};
@@ -245,9 +245,6 @@ mod tests {
     use st0x_event_sorcery::test_store;
 
     use super::*;
-    use crate::alpaca_tokenization::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_with_provider,
-    };
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
     use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::RedemptionServices;

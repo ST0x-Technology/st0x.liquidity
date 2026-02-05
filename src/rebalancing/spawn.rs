@@ -64,9 +64,16 @@ pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) usdc: Arc<Store<UsdcRebalance>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RebalancerAddresses {
+    pub(crate) market_maker_wallet: Address,
+    pub(crate) orderbook: Address,
+}
+
 pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
     pub(crate) vault_service: Arc<VaultService<BP>>,
     pub(crate) tokenization_service: Arc<AlpacaTokenizationService<BP>>,
+    pub(crate) vault_registry_query: Arc<VaultRegistryQuery>,
     pub(crate) service: Arc<RedemptionService<BP>>,
     pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
     pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
@@ -86,7 +93,7 @@ pub(crate) struct RedemptionCqrs<BP: Provider + Clone> {
 pub(crate) async fn spawn_rebalancer<BP>(
     ctx: &RebalancingCtx,
     base_provider: BP,
-    market_maker_wallet: Address,
+    addresses: RebalancerAddresses,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
     redemption: RedemptionDependencies<BP>,
@@ -115,10 +122,11 @@ where
 
     let rebalancer = services.into_rebalancer(
         ctx,
-        market_maker_wallet,
+        addresses,
         operation_receiver,
         frameworks,
         redemption_cqrs,
+        redemption.vault_registry_query,
     );
 
     let handle = tokio::spawn(async move {
@@ -204,15 +212,23 @@ where
     fn into_rebalancer(
         self,
         ctx: &RebalancingCtx,
-        market_maker_wallet: Address,
+        addresses: RebalancerAddresses,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
         redemption: RedemptionCqrs<BP>,
+        vault_registry_query: Arc<VaultRegistryQuery>,
     ) -> ConfiguredRebalancer<BP>
     where
         BP: Send + Sync + 'static,
     {
-        let mint_manager = Arc::new(MintManager::new(self.tokenization, frameworks.mint));
+        let mint_manager = Arc::new(MintManager::new(
+            self.tokenization,
+            self.vault.clone(),
+            vault_registry_query,
+            addresses.orderbook,
+            addresses.market_maker_wallet,
+            frameworks.mint,
+        ));
 
         let redemption_manager = Arc::new(RedemptionManager::new(
             redemption.service,
@@ -226,7 +242,7 @@ where
             self.cctp,
             self.vault,
             frameworks.usdc,
-            market_maker_wallet,
+            addresses.market_maker_wallet,
             VaultId(ctx.usdc_vault_id),
         ));
 
@@ -559,7 +575,7 @@ mod tests {
         let redemption_service = Arc::new(RedemptionService::new(
             services.vault.clone(),
             services.tokenization.clone(),
-            vault_registry_query,
+            vault_registry_query.clone(),
             TEST_ORDERBOOK,
             config.redemption_wallet,
         ));
@@ -579,10 +595,14 @@ mod tests {
 
         let rebalancer = services.into_rebalancer(
             &config,
-            config.redemption_wallet,
+            RebalancerAddresses {
+                market_maker_wallet: config.redemption_wallet,
+                orderbook: TEST_ORDERBOOK,
+            },
             rx,
             frameworks,
             redemption,
+            vault_registry_query,
         );
 
         tx.send(TriggeredOperation::Mint {

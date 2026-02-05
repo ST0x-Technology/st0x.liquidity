@@ -406,7 +406,10 @@ impl RebalancingTrigger {
 
         matches!(
             event,
-            MintCompleted { .. } | MintRejected { .. } | MintAcceptanceFailed { .. }
+            MintCompleted { .. }
+                | MintRejected { .. }
+                | MintAcceptanceFailed { .. }
+                | VaultDepositFailed { .. }
         )
     }
 

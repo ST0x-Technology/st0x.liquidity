@@ -31,7 +31,6 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecut
 
 use st0x_event_sorcery::{Cons, Nil, Projection, SendError, Store, StoreBuilder, Unwired};
 
-use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::config::{Ctx, CtxError};
 use crate::equity_redemption::{EquityRedemption, Redeemer};
