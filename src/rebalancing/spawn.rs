@@ -7,32 +7,25 @@ use alloy::providers::fillers::{
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::Query;
 use sqlite_es::SqliteCqrs;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::dashboard::{EventBroadcaster, ServerMessage};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{AlpacaBrokerApi, Executor};
 
 use super::usdc::UsdcRebalanceManager;
-use super::{
-    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RedemptionManager,
-    TriggeredOperation,
-};
-use crate::alpaca_tokenization::AlpacaTokenizationService;
+use super::{MintManager, Rebalancer, RebalancingConfig, RedemptionManager, TriggeredOperation};
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
 use crate::onchain::http_client_with_retry;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::raindex::{RaindexService, VaultId};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 
@@ -64,25 +57,44 @@ type HttpProvider = FillProvider<
 
 /// Type alias for a configured rebalancer with SQLite persistence.
 type ConfiguredRebalancer<BP> = Rebalancer<
-    MintManager<BP, MintEventStore>,
-    RedemptionManager<BP, RedemptionEventStore>,
+    MintManager<MintEventStore>,
+    RedemptionManager<RedemptionEventStore>,
     UsdcRebalanceManager<BP, UsdcEventStore>,
 >;
 
 pub(crate) struct RebalancingCqrsFrameworks {
     pub(crate) mint: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-    pub(crate) redemption: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
     pub(crate) usdc: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RebalancerAddresses {
+    pub(crate) market_maker_wallet: Address,
+}
+
+pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
+    pub(crate) raindex_service: Arc<RaindexService<BP>>,
+    pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
+    pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
+}
+
+/// CQRS-related dependencies for redemption manager.
+pub(crate) struct RedemptionCqrs {
+    pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
+    pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
+}
+
 /// Spawns the rebalancing infrastructure.
+///
+/// All CQRS frameworks are created in the conductor and passed here to ensure
+/// single-instance initialization with all required query processors.
 pub(crate) async fn spawn_rebalancer<BP>(
     config: &RebalancingConfig,
     base_provider: BP,
-    orderbook: Address,
-    market_maker_wallet: Address,
+    addresses: RebalancerAddresses,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
+    redemption: RedemptionDependencies<BP>,
 ) -> Result<JoinHandle<()>, SpawnRebalancerError>
 where
     BP: Provider + Clone + Send + Sync + 'static,
@@ -95,17 +107,21 @@ where
         &ethereum_wallet,
         signer.address(),
         base_provider,
-        orderbook,
+        redemption.raindex_service,
     )
     .await?;
 
+    let redemption_cqrs = RedemptionCqrs {
+        cqrs: redemption.cqrs,
+        query: redemption.query,
+    };
+
     let rebalancer = services.into_rebalancer(
         config,
-        market_maker_wallet,
+        addresses,
         operation_receiver,
-        frameworks.mint,
-        frameworks.redemption,
-        frameworks.usdc,
+        frameworks,
+        redemption_cqrs,
     );
 
     let handle = tokio::spawn(async move {
@@ -118,7 +134,7 @@ where
 
 /// External service clients for rebalancing operations.
 ///
-/// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
+/// Holds connections to Alpaca APIs, CCTP bridge, and Raindex services.
 ///
 /// Generic over `BP` (Base Provider) to allow reusing the existing WebSocket
 /// connection from the main bot. The Ethereum provider uses a fixed HTTP type
@@ -127,38 +143,33 @@ struct Services<BP>
 where
     BP: Provider + Clone,
 {
-    tokenization: Arc<AlpacaTokenizationService<BP>>,
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
-    vault: Arc<VaultService<BP>>,
+    raindex: Arc<RaindexService<BP>>,
 }
 
 impl<BP> Services<BP>
 where
     BP: Provider + Clone + 'static,
 {
+    /// Creates the services needed for rebalancing.
+    ///
+    /// RaindexService is passed in rather than created here because it's needed
+    /// for CQRS framework initialization in the conductor, which must happen
+    /// before spawn_rebalancer is called.
     async fn new(
         config: &RebalancingConfig,
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
-        orderbook: Address,
+        raindex: Arc<RaindexService<BP>>,
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
             .connect_client(http_client_with_retry(config.ethereum_rpc_url.clone()));
 
         let broker_auth = &config.alpaca_broker_auth;
-
-        let tokenization = Arc::new(AlpacaTokenizationService::new(
-            broker_auth.base_url().to_string(),
-            config.alpaca_account_id,
-            broker_auth.api_key.clone(),
-            broker_auth.api_secret.clone(),
-            base_provider.clone(),
-            config.redemption_wallet,
-        ));
 
         let broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
 
@@ -178,7 +189,7 @@ where
         );
 
         let base_evm_for_cctp = Evm::new(
-            base_provider.clone(),
+            base_provider,
             owner,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
@@ -186,38 +197,39 @@ where
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
-        let vault = Arc::new(VaultService::new(base_provider, orderbook));
 
         Ok(Self {
-            tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            raindex,
         })
     }
 
+    /// Converts Services into a configured Rebalancer.
     fn into_rebalancer(
         self,
         config: &RebalancingConfig,
-        market_maker_wallet: Address,
+        addresses: RebalancerAddresses,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
-        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
-    ) -> ConfiguredRebalancer<BP> {
-        let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
+        frameworks: RebalancingCqrsFrameworks,
+        redemption: RedemptionCqrs,
+    ) -> ConfiguredRebalancer<BP>
+    where
+        BP: Send + Sync + 'static,
+    {
+        let mint_manager = Arc::new(MintManager::new(frameworks.mint));
 
         let redemption_manager =
-            Arc::new(RedemptionManager::new(self.tokenization, redemption_cqrs));
+            Arc::new(RedemptionManager::new(redemption.cqrs, redemption.query));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
             self.broker,
             self.wallet,
             self.cctp,
-            self.vault,
-            usdc_cqrs,
-            market_maker_wallet,
+            self.raindex,
+            frameworks.usdc,
+            addresses.market_maker_wallet,
             VaultId(config.usdc_vault_id),
         ));
 
@@ -226,27 +238,9 @@ where
             redemption_manager,
             usdc_manager,
             operation_receiver,
-            config.redemption_wallet,
+            addresses.market_maker_wallet,
         )
     }
-}
-
-pub(crate) fn build_rebalancing_queries<A>(
-    trigger: Arc<RebalancingTrigger>,
-    event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<A, Never>>>>
-where
-    Lifecycle<A, Never>: cqrs_es::Aggregate,
-    RebalancingTrigger: Query<Lifecycle<A, Never>>,
-    EventBroadcaster: Query<Lifecycle<A, Never>>,
-{
-    let mut queries: Vec<Box<dyn Query<Lifecycle<A, Never>>>> = vec![Box::new(trigger)];
-
-    if let Some(sender) = event_broadcast {
-        queries.push(Box::new(EventBroadcaster::new(sender)));
-    }
-
-    queries
 }
 
 #[cfg(test)]
@@ -254,29 +248,35 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{address, b256};
     use alloy::providers::ProviderBuilder;
-    use httpmock::Method::GET;
+    use cqrs_es::persist::GenericQuery;
+    use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::sqlite_cqrs;
-    use sqlx::SqlitePool;
+    use sqlite_es::SqliteViewRepository;
     use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::{FractionalShares, Symbol};
     use uuid::Uuid;
 
     use super::*;
-    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
+    use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
+    use crate::conductor::wire::test_cqrs;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::tokenization::AlpacaTokenizationService;
+    use crate::tokenized_equity_mint::MintServices;
+    use crate::vault_registry::VaultRegistryAggregate;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
     fn make_config() -> RebalancingConfig {
         RebalancingConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancingConfig::Enabled {
                 target: dec!(0.6),
                 deviation: dec!(0.15),
             },
@@ -313,8 +313,8 @@ mod tests {
 
     #[test]
     fn spawn_rebalancer_error_display_alpaca_wallet() {
-        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::InvalidAmount {
-            amount: dec!(0),
+        let err = SpawnRebalancerError::AlpacaWallet(AlpacaWalletError::TransferNotFound {
+            transfer_id: AlpacaTransferId::from(Uuid::nil()),
         });
 
         let display = format!("{err}");
@@ -326,29 +326,32 @@ mod tests {
     }
 
     #[test]
-    fn trigger_config_uses_equity_threshold_from_config() {
+    fn trigger_config_uses_equity_from_config() {
         let config = make_config();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity: config.equity,
+            usdc: config.usdc,
         };
 
-        assert_eq!(trigger_config.equity_threshold.target, dec!(0.5));
-        assert_eq!(trigger_config.equity_threshold.deviation, dec!(0.2));
+        assert_eq!(trigger_config.equity.target, dec!(0.5));
+        assert_eq!(trigger_config.equity.deviation, dec!(0.2));
     }
 
     #[test]
-    fn trigger_config_uses_usdc_threshold_from_config() {
+    fn trigger_config_uses_usdc_from_config() {
         let config = make_config();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity: config.equity,
+            usdc: config.usdc,
         };
 
-        assert_eq!(trigger_config.usdc_threshold.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc_threshold.deviation, dec!(0.15));
+        let UsdcRebalancingConfig::Enabled { target, deviation } = trigger_config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.6));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -374,7 +377,12 @@ mod tests {
 
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
-    ) -> (Services<impl Provider + Clone + 'static>, RebalancingConfig) {
+    ) -> (
+        Services<impl Provider + Clone + 'static>,
+        RebalancingConfig,
+        Arc<AlpacaTokenizationService<impl Provider + Clone + 'static>>,
+        Arc<RaindexService<impl Provider + Clone + 'static>>,
+    ) {
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
@@ -449,44 +457,29 @@ mod tests {
         .with_required_confirmations(1);
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
-        let vault = Arc::new(
-            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
+
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            crate::test_utils::setup_test_db().await,
+            "vault_registry_view".to_string(),
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+        let raindex = Arc::new(
+            RaindexService::new(base_provider, TEST_ORDERBOOK, vault_registry_query, owner)
+                .with_required_confirmations(1),
         );
 
         let services = Services {
-            tokenization,
             broker,
             wallet,
             cctp,
-            vault,
+            raindex: raindex.clone(),
         };
 
-        (services, config)
-    }
-
-    #[tokio::test]
-    async fn into_rebalancer_constructs_without_panic() {
-        let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server).await;
-
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        sqlx::migrate!().run(&pool).await.unwrap();
-
-        let market_maker_wallet = address!("0xaabbccddaabbccddaabbccddaabbccddaabbccdd");
-
-        let (_tx, rx) = mpsc::channel(100);
-        let mint_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let redemption_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-        let usdc_cqrs = Arc::new(sqlite_cqrs(pool, vec![], ()));
-
-        let _rebalancer = services.into_rebalancer(
-            &config,
-            market_maker_wallet,
-            rx,
-            mint_cqrs,
-            redemption_cqrs,
-            usdc_cqrs,
-        );
+        (services, config, tokenization, raindex)
     }
 
     #[tokio::test]
@@ -521,6 +514,90 @@ mod tests {
         assert!(
             matches!(spawn_error, SpawnRebalancerError::AlpacaBrokerApi(_)),
             "Expected AlpacaBrokerApi error variant, got: {spawn_error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn into_rebalancer_dispatches_mint_to_tokenization_service() {
+        let server = MockServer::start();
+        let (services, config, tokenization, raindex) =
+            make_services_with_mock_wallet(&server).await;
+
+        let mint_mock = server.mock(|when, then| {
+            when.method(POST).path(format!(
+                "/v1/accounts/{}/tokenization/mint",
+                config.alpaca_account_id
+            ));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "tok_123",
+                    "type": "mint",
+                    "status": "pending",
+                    "symbol": "AAPL",
+                    "qty": "10",
+                    "issuer_request_id": "test_issuer_req",
+                    "created_at": "2024-01-15T10:30:00Z"
+                }));
+        });
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let mint_services = MintServices {
+            tokenizer: tokenization,
+            raindex,
+        };
+        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], mint_services));
+        let usdc_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+
+        let redemption_view_repo = Arc::new(SqliteViewRepository::<
+            Lifecycle<EquityRedemption, Never>,
+            Lifecycle<EquityRedemption, Never>,
+        >::new(
+            pool.clone(), "equity_redemption_view".to_string()
+        ));
+        let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
+        let redemption_cqrs = Arc::new(test_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(redemption_view_repo))],
+            crate::equity_redemption::tests::mock_redeemer_services(),
+        ));
+
+        let frameworks = RebalancingCqrsFrameworks {
+            mint: mint_cqrs,
+            usdc: usdc_cqrs,
+        };
+
+        let redemption = RedemptionCqrs {
+            cqrs: redemption_cqrs,
+            query: redemption_query,
+        };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+        let rebalancer = services.into_rebalancer(
+            &config,
+            RebalancerAddresses {
+                market_maker_wallet: config.redemption_wallet,
+            },
+            rx,
+            frameworks,
+            redemption,
+        );
+
+        tx.send(TriggeredOperation::Mint {
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(dec!(10)),
+        })
+        .await
+        .unwrap();
+
+        drop(tx);
+        rebalancer.run().await;
+
+        assert_eq!(
+            mint_mock.hits(),
+            1,
+            "Expected tokenization mint endpoint to be called exactly once"
         );
     }
 }

@@ -130,12 +130,16 @@ where
 
         log_redemption_start(&symbol, quantity, token, amount, &aggregate_id);
 
-        let result = self
+        match self
             .redemption_manager
             .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-            .await;
-
-        log_redemption_result(&symbol, result);
+            .await
+        {
+            Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
+            Err(e) => {
+                error!(%symbol, error = %e, "Redemption operation failed");
+            }
+        }
     }
 
     async fn execute_usdc_alpaca_to_base(&self, amount: crate::threshold::Usdc) {
@@ -184,13 +188,6 @@ fn log_redemption_start(
         aggregate_id = %aggregate_id.0,
         "Executing redemption operation"
     );
-}
-
-fn log_redemption_result<E: std::fmt::Display>(symbol: &Symbol, result: Result<(), E>) {
-    match result {
-        Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
-        Err(e) => error!(%symbol, error = %e, "Redemption operation failed"),
-    }
 }
 
 #[cfg(test)]

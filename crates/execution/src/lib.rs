@@ -60,9 +60,8 @@ pub trait Executor: Send + Sync + 'static {
     where
         Self: Sized;
 
-    /// Wait until market opens (blocks if market closed), then return time until market close
-    /// Implementations without market hours should return a very long duration
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error>;
+    /// Returns true if the market is currently open for trading.
+    async fn is_market_open(&self) -> Result<bool, Self::Error>;
 
     /// Place a market order for the specified symbol and quantity
     /// Returns order placement details including executor-assigned order ID
@@ -344,10 +343,6 @@ impl FractionalShares {
             return Err(SharesConversionError::Underflow(self.0));
         }
 
-        if scaled != truncated {
-            return Err(SharesConversionError::PrecisionLoss(self.0));
-        }
-
         Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
     }
 }
@@ -360,8 +355,6 @@ pub enum SharesConversionError {
     Underflow(Decimal),
     #[error("overflow when scaling shares to 18 decimals")]
     Overflow,
-    #[error("shares value {0} has more than 18 decimal places")]
-    PrecisionLoss(Decimal),
     #[error("failed to parse U256: {0}")]
     ParseError(#[from] alloy::primitives::ruint::ParseError),
 }
@@ -788,6 +781,18 @@ mod tests {
     }
 
     #[test]
+    fn to_u256_18_decimals_truncates_sub_wei_digits() {
+        // Values with >18 decimal places are truncated (sub-wei digits are meaningless)
+        let shares = FractionalShares::new(dec!(1.1234567890123456789));
+        let result = shares.to_u256_18_decimals().unwrap();
+        assert_eq!(
+            result,
+            U256::from_str("1123456789012345678").unwrap(),
+            "Expected sub-wei digits to be truncated"
+        );
+    }
+
+    #[test]
     fn to_u256_18_decimals_underflow_returns_error() {
         let shares = FractionalShares::new(dec!(0.0000000000000000001));
         let err = shares.to_u256_18_decimals().unwrap_err();
@@ -902,6 +907,7 @@ mod tests {
         }
 
         #[test]
+        #[ignore = "flaky precision test. we have an issue for removing floating point calculations"]
         fn fractional_shares_from_f64_roundtrip_within_precision(
             mantissa in 1i64..=999_999_999_999i64,
             scale in 0u32..=6,

@@ -383,6 +383,14 @@ All configuration is via TOML files passed with `--config-file`. See
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `SchwabError`) with proper propagation
+- **CRITICAL: Onchain Transaction Confirmations**: All onchain operations must
+  explicitly wait for the configured number of confirmations before proceeding.
+  Load-balanced RPC providers (like dRPC) may route subsequent requests to
+  different nodes that haven't seen recent transactions yet. Use
+  `REQUIRED_CONFIRMATIONS` from `crate::onchain` and call
+  `.with_required_confirmations(self.required_confirmations).get_receipt()` on
+  all pending transactions. Never use bare `.get_receipt().await` in production
+  code paths.
 - **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
   cqrs-es framework for event sourcing. **NEVER write directly to the `events`
   table**. This is strictly forbidden and violates the CQRS architecture:
@@ -413,6 +421,10 @@ All configuration is via TOML files passed with `--config-file`. See
   - **ALLOWED**: Direct construction in test code, CLI code, and migration code
     (different execution contexts with intentionally different query processor
     needs)
+- **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
+  `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
+  `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
+  `OffchainOrder`/`OrderPlacer`
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -863,9 +875,7 @@ impl Task<Start> { fn begin(self) -> Task<InProgress> { ... } }
 impl Task<InProgress> { fn complete(self) -> Task<Complete> { ... } }
 ```
 
-Use typestate for protocol enforcement (`Connection<Unauthenticated>` →
-`Connection<Authenticated>`) and builder patterns (`RequestBuilder<NoUrl>` →
-`RequestBuilder<HasUrl>`).
+Use typestate for protocol enforcement and builder patterns.
 
 #### Avoid deep nesting
 

@@ -11,37 +11,10 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
-use thiserror::Error;
 
-use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
 
-#[derive(Debug, Error)]
-pub(crate) enum MintError {
-    #[error("Alpaca API error: {0}")]
-    Alpaca(#[from] AlpacaTokenizationError),
-
-    #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
-
-    #[error("Mint request was rejected by Alpaca")]
-    Rejected,
-
-    #[error("Missing issuer_request_id in Alpaca response")]
-    MissingIssuerRequestId,
-
-    #[error("Missing tx_hash in completed Alpaca response")]
-    MissingTxHash,
-
-    #[error("U256 parse error: {0}")]
-    U256Parse(#[from] alloy::primitives::ruint::ParseError),
-
-    #[error("Quantity {0} has more than 18 decimal places")]
-    PrecisionLoss(FractionalShares),
-
-    #[error("Decimal overflow when scaling {0} to 18 decimals")]
-    DecimalOverflow(FractionalShares),
-}
+pub(crate) type MintError = AggregateError<TokenizedEquityMintError>;
 
 /// Trait for executing mint operations.
 #[async_trait]
@@ -121,6 +94,11 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(MintError::Rejected)));
+        assert!(matches!(
+            result,
+            Err(AggregateError::UserError(
+                TokenizedEquityMintError::AlreadyFailed
+            ))
+        ));
     }
 }

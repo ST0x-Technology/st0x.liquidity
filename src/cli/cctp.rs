@@ -283,6 +283,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
+    use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
@@ -313,14 +314,11 @@ mod tests {
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,
             alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
             },
-            usdc_threshold: ImbalanceThreshold {
-                target: Decimal::from_str("0.5").unwrap(),
-                deviation: Decimal::from_str("0.1").unwrap(),
-            },
+            usdc: UsdcRebalancingConfig::Disabled,
             alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),

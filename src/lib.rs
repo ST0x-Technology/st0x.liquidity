@@ -6,7 +6,6 @@ use tracing::{error, info, info_span, warn};
 
 use crate::dashboard::ServerMessage;
 
-mod alpaca_tokenization;
 mod alpaca_wallet;
 pub mod api;
 mod bindings;
@@ -30,6 +29,7 @@ mod rebalancing;
 mod symbol;
 mod telemetry;
 mod threshold;
+mod tokenization;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
 mod vault_registry;
@@ -255,8 +255,7 @@ where
 {
     let executor_maintenance = executor.run_executor_maintenance().await;
 
-    conductor::run_market_hours_loop(executor, config, pool, executor_maintenance, event_sender)
-        .await
+    conductor::run_conductor(executor, config, pool, executor_maintenance, event_sender).await
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@ use sqlite_es::SqliteCqrs;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
-pub(crate) type OnChainTradeCqrs = SqliteCqrs<Lifecycle<OnChainTrade, Never>>;
+pub(crate) type OnChainTradeCqrs = SqliteCqrs<Lifecycle<OnChainTrade>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OnChainTrade {

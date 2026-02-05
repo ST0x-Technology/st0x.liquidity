@@ -5,6 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 use super::client::{AlpacaWalletClient, AlpacaWalletError};
+use crate::threshold::Usdc;
+use st0x_execution::Positive;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TokenSymbol(pub(super) String);
@@ -156,33 +158,31 @@ where
     s.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
-fn validate_amount(amount: Decimal) -> Result<(), AlpacaWalletError> {
-    if amount <= Decimal::ZERO {
-        return Err(AlpacaWalletError::InvalidAmount { amount });
-    }
-
-    Ok(())
+#[derive(Serialize)]
+struct WithdrawalRequest<'a> {
+    #[serde(serialize_with = "serialize_decimal_as_string")]
+    amount: Decimal,
+    asset: &'a TokenSymbol,
+    address: &'a Address,
 }
 
-#[derive(Serialize)]
-struct WithdrawalRequest {
-    amount: String,
-    asset: String,
-    address: String,
+fn serialize_decimal_as_string<S>(value: &Decimal, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&value.to_string())
 }
 
 pub(super) async fn initiate_withdrawal(
     client: &AlpacaWalletClient,
-    amount: Decimal,
-    asset: &str,
-    address: &str,
+    amount: Positive<Usdc>,
+    asset: &TokenSymbol,
+    address: &Address,
 ) -> Result<Transfer, AlpacaWalletError> {
-    validate_amount(amount)?;
-
     let request = WithdrawalRequest {
-        amount: amount.to_string(),
-        asset: asset.to_string(),
-        address: address.to_string(),
+        amount: amount.inner().0,
+        asset,
+        address,
     };
 
     let path = format!("/v1/accounts/{}/wallets/transfers", client.account_id());
@@ -246,8 +246,9 @@ pub(super) async fn find_transfer_by_tx_hash(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{address, fixed_bytes};
     use httpmock::prelude::*;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use std::str::FromStr;
     use uuid::uuid;
@@ -261,13 +262,15 @@ mod tests {
     async fn test_initiate_withdrawal_successful() {
         let server = MockServer::start();
         let transfer_id = Uuid::new_v4();
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
         let withdrawal_mock = server.mock(|when, then| {
             when.method(POST)
                 .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"))
                 .json_body(json!({
                     "amount": "100.5",
                     "asset": "USDC",
-                    "address": "0x1234567890abcdef1234567890abcdef12345678"
+                    "address": to_address
                 }));
             then.status(200)
                 .header("content-type", "application/json")
@@ -295,15 +298,12 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let amount = Decimal::new(1005, 1);
-        let transfer = initiate_withdrawal(
-            &client,
-            amount,
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await
-        .unwrap();
+        let amount = Positive::new(Usdc(dec!(100.5))).unwrap();
+        let asset = TokenSymbol::new("USDC");
+
+        let transfer = initiate_withdrawal(&client, amount, &asset, &to_address)
+            .await
+            .unwrap();
 
         let expected_address =
             Address::from_str("0x1234567890abcdef1234567890abcdef12345678").unwrap();
@@ -317,56 +317,6 @@ mod tests {
         assert_eq!(transfer.network_fee, Decimal::new(5, 1));
 
         withdrawal_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_initiate_withdrawal_zero_amount() {
-        let server = MockServer::start();
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result = initiate_withdrawal(
-            &client,
-            Decimal::ZERO,
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await;
-
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::ZERO
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_initiate_withdrawal_negative_amount() {
-        let server = MockServer::start();
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result = initiate_withdrawal(
-            &client,
-            Decimal::new(-100, 0),
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await;
-
-        let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::new(-100, 0)
-        ));
     }
 
     #[tokio::test]
@@ -389,44 +339,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
-            &client,
-            Decimal::new(100, 0),
-            "INVALID",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await;
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let asset = TokenSymbol::new("INVALID");
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::ApiError { status, .. } if status == 400
-        ));
-
-        withdrawal_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn test_initiate_withdrawal_invalid_address() {
-        let server = MockServer::start();
-        let withdrawal_mock = server.mock(|when, then| {
-            when.method(POST)
-                .path(format!("/v1/accounts/{TEST_ACCOUNT_ID}/wallets/transfers"));
-            then.status(400)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "message": "Invalid address"
-                }));
-        });
-
-        let client = AlpacaWalletClient::new(
-            server.base_url(),
-            TEST_ACCOUNT_ID,
-            "test_key_id".to_string(),
-            "test_secret_key".to_string(),
-        );
-
-        let result =
-            initiate_withdrawal(&client, Decimal::new(100, 0), "USDC", "invalid_address").await;
+        let result = initiate_withdrawal(&client, amount, &asset, &to_address).await;
 
         assert!(matches!(
             result.unwrap_err(),
@@ -452,13 +369,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
-            &client,
-            Decimal::new(100, 0),
-            "USDC",
-            "0x1234567890abcdef1234567890abcdef12345678",
-        )
-        .await;
+        let amount = Positive::new(Usdc(dec!(100))).unwrap();
+        let asset = TokenSymbol::new("USDC");
+        let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let result = initiate_withdrawal(&client, amount, &asset, &to_address).await;
 
         assert!(matches!(
             result.unwrap_err(),

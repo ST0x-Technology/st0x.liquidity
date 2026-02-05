@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use sqlite_es::SqliteCqrs;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never, SqliteQuery};
 
 /// Abstraction for placing broker orders, injected via cqrs-es Services.
 /// Implementations handle executor-specific details (symbol mapping, API calls).
@@ -28,6 +28,7 @@ pub(crate) trait OrderPlacer: Send + Sync {
 
 pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder, Never>;
 pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
+pub(crate) type OffchainOrderQuery = SqliteQuery<OffchainOrder, Never>;
 pub(crate) type OffchainOrderServices = Arc<dyn OrderPlacer>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -562,26 +563,32 @@ async fn handle_place_order(
         direction,
     };
 
-    let executor_order_id = services
-        .place_market_order(market_order)
-        .await
-        .map_err(OffchainOrderError::BrokerPlacement)?;
-
     let now = Utc::now();
 
-    Ok(vec![
-        OffchainOrderEvent::Placed {
-            symbol: symbol.clone(),
-            shares,
-            direction,
-            executor,
-            placed_at: now,
-        },
-        OffchainOrderEvent::Submitted {
-            executor_order_id,
-            submitted_at: now,
-        },
-    ])
+    let placed = OffchainOrderEvent::Placed {
+        symbol: symbol.clone(),
+        shares,
+        direction,
+        executor,
+        placed_at: now,
+    };
+
+    match services.place_market_order(market_order).await {
+        Ok(executor_order_id) => Ok(vec![
+            placed,
+            OffchainOrderEvent::Submitted {
+                executor_order_id,
+                submitted_at: now,
+            },
+        ]),
+        Err(e) => Ok(vec![
+            placed,
+            OffchainOrderEvent::Failed {
+                error: e.to_string(),
+                failed_at: now,
+            },
+        ]),
+    }
 }
 
 fn handle_partial_fill(
@@ -657,8 +664,6 @@ pub(crate) enum OffchainOrderError {
         existing: ExecutorOrderId,
         attempted: ExecutorOrderId,
     },
-    #[error("Broker order placement failed: {0}")]
-    BrokerPlacement(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error(transparent)]
     State(#[from] LifecycleError<Never>),
 }
@@ -791,7 +796,7 @@ pub(crate) fn noop_order_placer() -> OffchainOrderServices {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
@@ -1104,7 +1109,6 @@ mod tests {
         };
 
         let result = order.handle(command, &services()).await;
-
         assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
     }
 
@@ -1127,7 +1131,6 @@ mod tests {
         };
 
         let result = order.handle(command, &services()).await;
-
         assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
     }
 
@@ -1175,14 +1178,13 @@ mod tests {
         };
 
         let events = order.handle(command, &services()).await.unwrap();
-
         assert_eq!(events.len(), 1);
 
         order.apply(events[0].clone());
-
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
+
         assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
@@ -1352,7 +1354,7 @@ mod tests {
         assert!(matches!(order, Lifecycle::Failed { .. }));
     }
 
-    fn succeeding_order_placer() -> OffchainOrderServices {
+    pub(crate) fn succeeding_order_placer() -> OffchainOrderServices {
         struct SucceedingOrderPlacer;
 
         #[async_trait]
@@ -1426,8 +1428,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_place_order_command_broker_failure() {
-        let order = Lifecycle::<OffchainOrder, Never>::default();
+    async fn test_place_order_command_broker_failure_emits_placed_and_failed() {
+        let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let command = OffchainOrderCommand::PlaceOrder {
             symbol: Symbol::new("AAPL").unwrap(),
@@ -1436,12 +1438,27 @@ mod tests {
             executor: SupportedExecutor::Schwab,
         };
 
-        let result = order.handle(command, &failing_order_placer()).await;
+        let events = order
+            .handle(command, &failing_order_placer())
+            .await
+            .unwrap();
 
-        assert!(matches!(
-            result,
-            Err(OffchainOrderError::BrokerPlacement(_))
-        ));
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], OffchainOrderEvent::Placed { .. }));
+        assert!(matches!(events[1], OffchainOrderEvent::Failed { .. }));
+
+        if let OffchainOrderEvent::Failed { error, .. } = &events[1] {
+            assert_eq!(error, "broker connection refused");
+        }
+
+        for event in events {
+            order.apply(event);
+        }
+
+        let Lifecycle::Live(OffchainOrder::Failed { error, .. }) = &order else {
+            panic!("Expected Failed state after broker rejection, got {order:?}");
+        };
+        assert_eq!(error, "broker connection refused");
     }
 
     #[tokio::test]

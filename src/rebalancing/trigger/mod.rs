@@ -4,9 +4,11 @@ mod equity;
 mod usdc;
 
 use alloy::primitives::{Address, B256};
+use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
+use rust_decimal::Decimal;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -46,62 +48,130 @@ enum TokenAddressError {
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
 pub enum RebalancingConfigError {
-    #[error("rebalancing requires alpaca-broker-api broker type")]
+    #[error("rebalancing requires Alpaca broker")]
     NotAlpacaBroker,
-    #[error("broker account_id is not a valid UUID: {0}")]
-    InvalidAccountId(#[from] uuid::Error),
+    #[error(transparent)]
+    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
+    WalletCollision(Address),
+    #[error(transparent)]
+    Uuid(#[from] uuid::Error),
 }
 
-/// TOML fields for rebalancing configuration.
-/// Alpaca auth is NOT included here - it's derived from the broker config
-/// to eliminate duplication and ensure consistency.
-#[derive(Clone, serde::Deserialize)]
+/// USDC rebalancing configuration with explicit enable/disable.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(crate) enum UsdcRebalancingConfig {
+    Enabled { target: Decimal, deviation: Decimal },
+    Disabled,
+}
+
+/// TOML fields for rebalancing configuration (without broker auth).
+///
+/// This struct is used when rebalancing config is part of a larger config
+/// where broker auth is provided separately.
+#[derive(Debug, Clone, serde::Deserialize)]
 pub(crate) struct RebalancingTomlFields {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
 }
 
-/// Runtime configuration for rebalancing operations.
-/// Constructed from `RebalancingTomlFields` + broker's `AlpacaBrokerApiAuthConfig`.
+/// Configuration for rebalancing operations.
+///
+/// This type validates during deserialization that:
+/// - `evm_private_key` is a valid private key
+/// - The derived market maker wallet differs from `redemption_wallet`
+///
+/// If you have a `RebalancingConfig`, it is guaranteed to be valid.
 #[derive(Clone)]
 pub(crate) struct RebalancingConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
     /// Issuer's wallet for tokenized equity redemptions.
     pub(crate) redemption_wallet: Address,
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Derived from broker config's account_id.
+    /// Parsed from `alpaca_broker_auth.account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
-    /// Cloned from broker config - ensures consistency.
+    /// Alpaca Broker API authentication for rebalancing operations.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
 }
 
 impl RebalancingConfig {
-    /// Construct from TOML fields and broker's Alpaca auth config.
+    /// Constructs RebalancingConfig from TOML fields and broker auth.
     ///
-    /// This is the ONLY way to construct a `RebalancingConfig`, which enforces
-    /// the invariant that rebalancing always has valid `AlpacaBrokerApiAuthConfig`.
+    /// Validates that the market maker wallet (derived from evm_private_key)
+    /// differs from the redemption_wallet.
     pub(crate) fn from_toml_and_broker(
-        toml: RebalancingTomlFields,
+        fields: RebalancingTomlFields,
         broker_auth: AlpacaBrokerApiAuthConfig,
     ) -> Result<Self, RebalancingConfigError> {
+        let signer = PrivateKeySigner::from_bytes(&fields.evm_private_key)?;
+        let market_maker_wallet = signer.address();
+
+        if market_maker_wallet == fields.redemption_wallet {
+            return Err(RebalancingConfigError::WalletCollision(market_maker_wallet));
+        }
+
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
 
         Ok(Self {
-            equity_threshold: toml.equity_threshold,
-            usdc_threshold: toml.usdc_threshold,
-            redemption_wallet: toml.redemption_wallet,
-            ethereum_rpc_url: toml.ethereum_rpc_url,
-            evm_private_key: toml.evm_private_key,
-            usdc_vault_id: toml.usdc_vault_id,
+            equity: fields.equity,
+            usdc: fields.usdc,
+            redemption_wallet: fields.redemption_wallet,
+            ethereum_rpc_url: fields.ethereum_rpc_url,
+            evm_private_key: fields.evm_private_key,
+            usdc_vault_id: fields.usdc_vault_id,
             alpaca_account_id,
             alpaca_broker_auth: broker_auth,
+        })
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RebalancingConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            equity: ImbalanceThreshold,
+            usdc: UsdcRebalancingConfig,
+            redemption_wallet: Address,
+            ethereum_rpc_url: Url,
+            evm_private_key: B256,
+            usdc_vault_id: B256,
+            alpaca_account_id: AlpacaAccountId,
+            alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        let signer =
+            PrivateKeySigner::from_bytes(&raw.evm_private_key).map_err(serde::de::Error::custom)?;
+        let market_maker_wallet = signer.address();
+
+        if market_maker_wallet == raw.redemption_wallet {
+            return Err(serde::de::Error::custom(format!(
+                "market_maker_wallet (derived from evm_private_key) and redemption_wallet \
+                 must be different addresses (both are {market_maker_wallet})"
+            )));
+        }
+
+        Ok(Self {
+            equity: raw.equity,
+            usdc: raw.usdc,
+            redemption_wallet: raw.redemption_wallet,
+            ethereum_rpc_url: raw.ethereum_rpc_url,
+            evm_private_key: raw.evm_private_key,
+            usdc_vault_id: raw.usdc_vault_id,
+            alpaca_account_id: raw.alpaca_account_id,
+            alpaca_broker_auth: raw.alpaca_broker_auth,
         })
     }
 }
@@ -109,8 +179,8 @@ impl RebalancingConfig {
 impl std::fmt::Debug for RebalancingConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RebalancingConfig")
-            .field("equity_threshold", &self.equity_threshold)
-            .field("usdc_threshold", &self.usdc_threshold)
+            .field("equity", &self.equity)
+            .field("usdc", &self.usdc)
             .field("redemption_wallet", &self.redemption_wallet)
             .field("ethereum_rpc_url", &"[REDACTED]")
             .field("evm_private_key", &"[REDACTED]")
@@ -124,8 +194,8 @@ impl std::fmt::Debug for RebalancingConfig {
 /// Configuration for the rebalancing trigger (runtime).
 #[derive(Debug, Clone)]
 pub(crate) struct RebalancingTriggerConfig {
-    pub(crate) equity_threshold: ImbalanceThreshold,
-    pub(crate) usdc_threshold: ImbalanceThreshold,
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
 }
 
 /// Operations triggered by inventory imbalances.
@@ -155,8 +225,8 @@ pub(crate) struct RebalancingTrigger {
     orderbook: Address,
     order_owner: Address,
     inventory: Arc<RwLock<InventoryView>>,
-    equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
-    usdc_in_progress: Arc<AtomicBool>,
+    pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
+    pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
 }
 
@@ -208,8 +278,9 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
         aggregate_id: &str,
         events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
     ) {
+        // All events now have symbol and quantity, so we can extract from any event.
         let Some((symbol, quantity)) = Self::extract_mint_info(events) else {
-            warn!(aggregate_id = %aggregate_id, "No MintRequested event found in mint dispatch");
+            warn!(aggregate_id = %aggregate_id, "No mint events found in dispatch");
             return;
         };
 
@@ -236,7 +307,7 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
         events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
     ) {
         let Some((symbol, quantity)) = Self::extract_redemption_info(events) else {
-            warn!(aggregate_id = %aggregate_id, "No TokensSent event found in redemption dispatch");
+            warn!(aggregate_id = %aggregate_id, "No VaultWithdrawn event found in redemption dispatch");
             return;
         };
 
@@ -284,7 +355,7 @@ impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
 
 impl RebalancingTrigger {
     /// Checks inventory for equity imbalance and triggers operation if needed.
-    async fn check_and_trigger_equity(&self, symbol: &Symbol) {
+    pub(crate) async fn check_and_trigger_equity(&self, symbol: &Symbol) {
         let Some(guard) = equity::InProgressGuard::try_claim(
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
@@ -310,7 +381,9 @@ impl RebalancingTrigger {
         let token_address = match self.load_token_address(symbol).await {
             Ok(Some(addr)) => addr,
             Ok(None) => {
-                error!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
+                // tokenized equities and won't be in the vault registry.
+                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
                 return None;
             }
             Err(e) => {
@@ -321,7 +394,7 @@ impl RebalancingTrigger {
 
         equity::check_imbalance_and_build_operation(
             symbol,
-            &self.config.equity_threshold,
+            &self.config.equity,
             &self.inventory,
             token_address,
         )
@@ -350,16 +423,20 @@ impl RebalancingTrigger {
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
-    async fn check_and_trigger_usdc(&self) {
+    pub(crate) async fn check_and_trigger_usdc(&self) {
+        let UsdcRebalancingConfig::Enabled { target, deviation } = self.config.usdc else {
+            return;
+        };
+
         let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
         else {
             debug!("Skipped USDC trigger: already in progress");
             return;
         };
 
+        let threshold = ImbalanceThreshold { target, deviation };
         let Ok(operation) =
-            usdc::check_imbalance_and_build_operation(&self.config.usdc_threshold, &self.inventory)
-                .await
+            usdc::check_imbalance_and_build_operation(&threshold, &self.inventory).await
         else {
             return;
         };
@@ -411,19 +488,39 @@ impl RebalancingTrigger {
         Ok(())
     }
 
+    /// Extracts symbol and quantity from any mint event in the batch.
+    /// All mint events now contain these fields, so this works for incremental dispatch.
     fn extract_mint_info(
         events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
     ) -> Option<(Symbol, FractionalShares)> {
-        for envelope in events {
-            if let TokenizedEquityMintEvent::MintRequested {
+        let envelope = events.first()?;
+        let (symbol, quantity) = match &envelope.payload {
+            TokenizedEquityMintEvent::MintRequested {
                 symbol, quantity, ..
-            } = &envelope.payload
-            {
-                let shares = FractionalShares::new(*quantity);
-                return Some((symbol.clone(), shares));
             }
-        }
-        None
+            | TokenizedEquityMintEvent::MintRejected {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::MintAccepted {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::MintAcceptanceFailed {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::TokensReceived {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::DepositedIntoRaindex {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::RaindexDepositFailed {
+                symbol, quantity, ..
+            }
+            | TokenizedEquityMintEvent::Completed {
+                symbol, quantity, ..
+            } => (symbol, quantity),
+        };
+        Some((symbol.clone(), FractionalShares::new(*quantity)))
     }
 
     fn has_terminal_mint_event(
@@ -432,9 +529,10 @@ impl RebalancingTrigger {
         events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
-                TokenizedEquityMintEvent::MintCompleted { .. }
+                TokenizedEquityMintEvent::Completed { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+                    | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
             )
         })
     }
@@ -466,7 +564,7 @@ impl RebalancingTrigger {
         events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
     ) -> Option<(Symbol, FractionalShares)> {
         for envelope in events {
-            if let EquityRedemptionEvent::TokensSent {
+            if let EquityRedemptionEvent::VaultWithdrawn {
                 symbol, quantity, ..
             } = &envelope.payload
             {
@@ -484,6 +582,7 @@ impl RebalancingTrigger {
             matches!(
                 envelope.payload,
                 EquityRedemptionEvent::Completed { .. }
+                    | EquityRedemptionEvent::TransferFailed { .. }
                     | EquityRedemptionEvent::DetectionFailed { .. }
                     | EquityRedemptionEvent::RedemptionRejected { .. }
             )
@@ -593,42 +692,43 @@ impl RebalancingTrigger {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
-    use alloy::primitives::{TxHash, address};
+    use alloy::primitives::{Address, TxHash, U256, address};
     use chrono::Utc;
     use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{CqrsFramework, Query};
+    use cqrs_es::{CqrsFramework, EventEnvelope, Query};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use sqlite_es::sqlite_cqrs;
-    use st0x_execution::Direction;
-    use std::collections::HashMap;
+    use st0x_execution::{Direction, ExecutorOrderId};
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use tokio::sync::mpsc;
-    use uuid::{Uuid, uuid};
+    use uuid::Uuid;
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
+    use crate::conductor::wire::test_cqrs;
+    use crate::equity_redemption::DetectionFailure;
+    use crate::inventory::InventorySnapshotQuery;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::lifecycle::Lifecycle;
-    use st0x_execution::ExecutorOrderId;
-
     use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
+    use crate::tokenization::TokenizationRequestStatus;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
     use crate::vault_registry::VaultRegistryCommand;
-    use alloy::primitives::{Address, U256};
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
-            equity_threshold: ImbalanceThreshold {
+            equity: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
-            usdc_threshold: ImbalanceThreshold {
+            usdc: UsdcRebalancingConfig::Enabled {
                 target: dec!(0.5),
                 deviation: dec!(0.2),
             },
@@ -751,7 +851,7 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = test_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
 
         cqrs.execute(
@@ -848,19 +948,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn position_event_for_unknown_symbol_logs_error_without_panic() {
-        let (trigger, mut receiver) = make_trigger_with_inventory(InventoryView::default()).await;
+    async fn position_events_auto_register_symbol_and_trigger_rebalancing() {
+        // Reproduces the production scenario: InventoryView starts empty (no
+        // with_equity call), position events arrive for a symbol that exists
+        // in the vault registry. After accumulating an imbalance, rebalancing
+        // must be triggered.
+        //
+        // In production, InventoryView::default() creates an empty equities
+        // map. Position events arrive as onchain fills are processed. If the
+        // symbol isn't pre-registered, apply_position_event_to_inventory must
+        // handle it (either by auto-registering or by decoupling the
+        // inventory update failure from the rebalancing check).
         let symbol = Symbol::new("AAPL").unwrap();
-        let event = make_onchain_fill(shares(10), Direction::Buy);
+        let (sender, mut receiver) = mpsc::channel(10);
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let pool = crate::test_utils::setup_test_db().await;
 
-        // Should handle the error gracefully without panicking.
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = RebalancingTrigger::new(
+            test_config(),
+            pool,
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory,
+            sender,
+        );
+
+        // Simulate production: onchain fills arrive on an empty inventory.
+        // 20 onchain buys, 80 offchain buys -> 20% onchain ratio.
+        // Threshold: target 50%, deviation 20%, lower bound 30%.
+        // 20% < 30% -> should trigger Mint (too much offchain).
+        for _ in 0..20 {
+            let event = make_onchain_fill(shares(1), Direction::Buy);
+            trigger
+                .apply_position_event_and_check(&symbol, &event)
+                .await;
+        }
+
+        for _ in 0..80 {
+            let event = make_offchain_fill(shares(1), Direction::Buy);
+            trigger
+                .apply_position_event_and_check(&symbol, &event)
+                .await;
+        }
+
+        // Drain any intermediate triggers and do a final check.
+        while receiver.try_recv().is_ok() {}
+        trigger.clear_equity_in_progress(&symbol);
+
+        // One more event to trigger the check after the imbalance is built up.
+        let event = make_onchain_fill(shares(1), Direction::Buy);
         trigger
             .apply_position_event_and_check(&symbol, &event)
             .await;
 
-        // Verify no operation was triggered.
-        trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        let triggered = receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
+            "Expected Mint for imbalanced inventory starting from empty, got {triggered:?}"
+        );
     }
 
     #[tokio::test]
@@ -956,36 +1103,46 @@ mod tests {
         }
     }
 
-    fn make_mint_accepted() -> TokenizedEquityMintEvent {
+    fn make_mint_accepted(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAccepted {
+            symbol: symbol.clone(),
+            quantity,
             issuer_request_id: IssuerRequestId::new("ISS123"),
             tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
             accepted_at: Utc::now(),
         }
     }
 
-    fn make_mint_completed() -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
+    fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::Completed {
+            symbol: symbol.clone(),
+            quantity,
             completed_at: Utc::now(),
         }
     }
 
-    fn make_mint_rejected() -> TokenizedEquityMintEvent {
+    fn make_mint_rejected(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRejected {
-            reason: "API timeout".to_string(),
+            symbol: symbol.clone(),
+            quantity,
+            status_code: None,
             rejected_at: Utc::now(),
         }
     }
 
-    fn make_mint_acceptance_failed() -> TokenizedEquityMintEvent {
+    fn make_mint_acceptance_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
-            reason: "Transaction reverted".to_string(),
+            symbol: symbol.clone(),
+            quantity,
+            last_status: TokenizationRequestStatus::Pending,
             failed_at: Utc::now(),
         }
     }
 
-    fn make_tokens_received() -> TokenizedEquityMintEvent {
+    fn make_tokens_received(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::TokensReceived {
+            symbol: symbol.clone(),
+            quantity,
             tx_hash: TxHash::random(),
             receipt_id: ReceiptId(U256::from(789)),
             shares_minted: U256::from(30_000_000_000_000_000_000_u128),
@@ -1035,7 +1192,11 @@ mod tests {
         // Apply MintAccepted - this moves shares to inflight.
         // Inflight should now block imbalance detection.
         trigger
-            .apply_mint_event_to_inventory(&symbol, &make_mint_accepted(), shares(30))
+            .apply_mint_event_to_inventory(
+                &symbol,
+                &make_mint_accepted(&symbol, dec!(30)),
+                shares(30),
+            )
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1043,6 +1204,53 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "Expected no operation due to inflight"
+        );
+    }
+
+    /// Verifies that events arriving without MintRequested (incremental dispatch)
+    /// still update inventory correctly. This is the fix for the double-triggering bug
+    /// where inventory wasn't updated when events arrived in separate batches.
+    #[tokio::test]
+    async fn incremental_dispatch_updates_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.1),
+        };
+
+        // Start with imbalanced inventory: 30 onchain, 70 offchain.
+        let mut inventory = InventoryView::default().with_equity(symbol.clone());
+        inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(30), Direction::Buy))
+            .unwrap();
+        inventory = inventory
+            .apply_position_event(&symbol, &make_offchain_fill(shares(70), Direction::Buy))
+            .unwrap();
+
+        // Verify initial state has no inflight (check_equity_imbalance returns Some).
+        assert!(
+            inventory
+                .check_equity_imbalance(&symbol, &threshold)
+                .is_some()
+        );
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+
+        // Simulate incremental dispatch: MintAccepted arrives WITHOUT MintRequested.
+        // Before the fix, this would log a warning and skip inventory update.
+        // After the fix, inventory should be updated.
+        let events = vec![make_mint_envelope(make_mint_accepted(&symbol, dec!(30)))];
+        trigger.dispatch("mint-123", &events).await;
+
+        // Verify inventory was updated: offchain should have inflight now.
+        // When inflight exists, check_equity_imbalance returns None.
+        let has_imbalance = {
+            let inventory = trigger.inventory.read().await;
+            inventory.check_equity_imbalance(&symbol, &threshold)
+        };
+        assert!(
+            has_imbalance.is_none(),
+            "Expected inflight to block imbalance detection after MintAccepted dispatch"
         );
     }
 
@@ -1063,7 +1271,7 @@ mod tests {
         // Create event batch with MintRequested and MintCompleted.
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_completed()),
+            make_mint_envelope(make_mint_completed(&symbol, dec!(30))),
         ];
 
         // Check that terminal event is detected.
@@ -1089,7 +1297,7 @@ mod tests {
 
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_rejected()),
+            make_mint_envelope(make_mint_rejected(&symbol, dec!(30))),
         ];
 
         assert!(RebalancingTrigger::has_terminal_mint_event(&events));
@@ -1104,10 +1312,40 @@ mod tests {
 
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_acceptance_failed()),
+            make_mint_envelope(make_mint_acceptance_failed(&symbol, dec!(30))),
         ];
 
         assert!(RebalancingTrigger::has_terminal_mint_event(&events));
+    }
+
+    #[tokio::test]
+    async fn terminal_mint_event_in_isolation_clears_in_progress_flag() {
+        // This test verifies that when MintCompleted arrives in a separate dispatch
+        // (without MintRequested in the same batch), the in_progress flag is still cleared.
+        // This simulates what happens when Finalize command is executed.
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default().with_equity(symbol.clone());
+
+        let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
+
+        // Mark symbol as in-progress (as if a mint was triggered).
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(symbol.clone());
+        }
+        assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
+
+        // Dispatch ONLY MintCompleted - no MintRequested in this batch.
+        // This is what happens when Finalize command produces MintCompleted.
+        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
+
+        trigger.dispatch("test-aggregate-id", &events).await;
+
+        // The in_progress flag should be cleared even though MintRequested wasn't in this batch.
+        assert!(
+            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
+            "in_progress flag should be cleared when terminal event has symbol"
+        );
     }
 
     #[test]
@@ -1123,12 +1361,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_mint_info_returns_none_without_mint_requested() {
-        let events = vec![make_mint_envelope(make_mint_completed())];
+    fn extract_mint_info_returns_info_from_any_event() {
+        let symbol = Symbol::new("AAPL").unwrap();
 
-        let result = RebalancingTrigger::extract_mint_info(&events);
+        // Can extract from MintCompleted
+        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
+        let (extracted_symbol, extracted_quantity) =
+            RebalancingTrigger::extract_mint_info(&events).unwrap();
+        assert_eq!(extracted_symbol, symbol);
+        assert_eq!(extracted_quantity.inner(), dec!(30));
 
-        assert!(result.is_none());
+        // Can extract from MintAccepted
+        let events = vec![make_mint_envelope(make_mint_accepted(&symbol, dec!(42)))];
+        let (extracted_symbol, extracted_quantity) =
+            RebalancingTrigger::extract_mint_info(&events).unwrap();
+        assert_eq!(extracted_symbol, symbol);
+        assert_eq!(extracted_quantity.inner(), dec!(42));
+
+        // Returns None for empty event list
+        let events: Vec<EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>> = vec![];
+        assert!(RebalancingTrigger::extract_mint_info(&events).is_none());
     }
 
     #[test]
@@ -1136,19 +1388,27 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
-            make_mint_envelope(make_mint_accepted()),
-            make_mint_envelope(make_tokens_received()),
+            make_mint_envelope(make_mint_accepted(&symbol, dec!(30))),
+            make_mint_envelope(make_tokens_received(&symbol, dec!(30))),
         ];
 
         assert!(!RebalancingTrigger::has_terminal_mint_event(&events));
     }
 
-    fn make_tokens_sent(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
-        EquityRedemptionEvent::TokensSent {
+    fn make_vault_withdrawn(symbol: &Symbol, quantity: Decimal) -> EquityRedemptionEvent {
+        EquityRedemptionEvent::VaultWithdrawn {
             symbol: symbol.clone(),
             quantity,
+            token: Address::random(),
+            vault_withdraw_tx: TxHash::random(),
+            withdrawn_at: Utc::now(),
+        }
+    }
+
+    fn make_tokens_sent() -> EquityRedemptionEvent {
+        EquityRedemptionEvent::TokensSent {
             redemption_wallet: Address::random(),
-            tx_hash: TxHash::random(),
+            redemption_tx: TxHash::random(),
             sent_at: Utc::now(),
         }
     }
@@ -1162,7 +1422,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
@@ -1175,7 +1435,6 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
-            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         }
     }
@@ -1209,11 +1468,7 @@ mod tests {
 
         // Apply TokensSent - this moves shares from onchain available to inflight.
         trigger
-            .apply_redemption_event_to_inventory(
-                &symbol,
-                &make_tokens_sent(&symbol, dec!(30)),
-                shares(30),
-            )
+            .apply_redemption_event_to_inventory(&symbol, &make_tokens_sent(), shares(30))
             .await;
 
         // With inflight, imbalance detection should not trigger anything.
@@ -1240,7 +1495,7 @@ mod tests {
 
         // Create event batch with TokensSent and Completed.
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_redemption_completed()),
         ];
 
@@ -1254,10 +1509,8 @@ mod tests {
 
     #[test]
     fn redemption_detection_failure_clears_in_progress_flag() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_detection_failed()),
         ];
 
@@ -1266,10 +1519,8 @@ mod tests {
 
     #[test]
     fn redemption_rejection_clears_in_progress_flag() {
-        let symbol = Symbol::new("AAPL").unwrap();
-
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_redemption_detected()),
             make_redemption_envelope(make_redemption_rejected()),
         ];
@@ -1280,7 +1531,7 @@ mod tests {
     #[test]
     fn extract_redemption_info_returns_symbol_and_quantity() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let events = vec![make_redemption_envelope(make_tokens_sent(
+        let events = vec![make_redemption_envelope(make_vault_withdrawn(
             &symbol,
             dec!(42.5),
         ))];
@@ -1303,9 +1554,8 @@ mod tests {
 
     #[test]
     fn has_terminal_redemption_event_returns_false_for_non_terminal() {
-        let symbol = Symbol::new("AAPL").unwrap();
         let events = vec![
-            make_redemption_envelope(make_tokens_sent(&symbol, dec!(30))),
+            make_redemption_envelope(make_tokens_sent()),
             make_redemption_envelope(make_redemption_detected()),
         ];
 
@@ -1751,66 +2001,41 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [equity_threshold]
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
+
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.5"
             deviation = "0.3"
         "#
     }
 
-    fn test_broker_auth() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
-            api_key: "test_key".to_string(),
-            api_secret: "test_secret".to_string(),
-            account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            mode: Some(st0x_execution::alpaca_broker_api::AlpacaBrokerApiMode::Sandbox),
-        }
-    }
-
     #[test]
-    fn deserialize_toml_fields_succeeds() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn deserialize_with_all_required_fields_succeeds() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_toml()).unwrap();
 
-        assert_eq!(toml_fields.equity_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.equity_threshold.deviation, dec!(0.2));
-        assert_eq!(toml_fields.usdc_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.usdc_threshold.deviation, dec!(0.3));
+        assert_eq!(config.equity.target, dec!(0.5));
+        assert_eq!(config.equity.deviation, dec!(0.2));
+
+        let UsdcRebalancingConfig::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.5));
+        assert_eq!(deviation, dec!(0.3));
+
         assert_eq!(
-            toml_fields.redemption_wallet,
+            config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
-        );
-    }
-
-    #[test]
-    fn from_toml_and_broker_constructs_config() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
-
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
-
-        assert_eq!(config.alpaca_broker_auth.api_key, "test_key");
-        assert_eq!(config.alpaca_broker_auth.api_secret, "test_secret");
-        assert_eq!(
-            config.alpaca_account_id,
-            AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
-        );
-    }
-
-    #[test]
-    fn from_toml_and_broker_fails_with_invalid_account_id() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
-        let mut broker_auth = test_broker_auth();
-        broker_auth.account_id = "not-a-uuid".to_string();
-
-        let result = RebalancingConfig::from_toml_and_broker(toml_fields, broker_auth);
-
-        assert!(
-            matches!(result, Err(RebalancingConfigError::InvalidAccountId(_))),
-            "Expected InvalidAccountId error, got {result:?}"
         );
     }
 
@@ -1821,24 +2046,34 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [equity_threshold]
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
+
+            [equity]
             target = "0.6"
             deviation = "0.1"
 
-            [usdc_threshold]
+            [usdc]
+            mode = "enabled"
             target = "0.4"
             deviation = "0.15"
         "#;
 
-        let toml_fields: RebalancingTomlFields = toml::from_str(toml_str).unwrap();
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
 
-        assert_eq!(config.equity_threshold.target, dec!(0.6));
-        assert_eq!(config.equity_threshold.deviation, dec!(0.1));
-        assert_eq!(config.usdc_threshold.target, dec!(0.4));
-        assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
+        assert_eq!(config.equity.target, dec!(0.6));
+        assert_eq!(config.equity.deviation, dec!(0.1));
+
+        let UsdcRebalancingConfig::Enabled { target, deviation } = config.usdc else {
+            panic!("expected enabled");
+        };
+        assert_eq!(target, dec!(0.4));
+        assert_eq!(deviation, dec!(0.15));
     }
 
     #[test]
@@ -1847,17 +2082,17 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
@@ -1866,33 +2101,61 @@ mod tests {
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             ethereum_rpc_url = "https://eth.example.com"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [equity_threshold]
+            [equity]
             target = "0.5"
             deviation = "0.2"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
-    fn deserialize_missing_equity_threshold_fails() {
+    fn deserialize_missing_equity_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
             ethereum_rpc_url = "https://eth.example.com"
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
 
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
+            [usdc]
+            mode = "disabled"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
+    }
+
+    #[test]
+    fn deserialize_usdc_disabled() {
+        let toml_str = r#"
+            redemption_wallet = "0x1234567890123456789012345678901234567890"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+            alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+
+            [alpaca_broker_auth]
+            api_key = "test_key"
+            api_secret = "test_secret"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            mode = "sandbox"
+
+            [equity]
+            target = "0.5"
+            deviation = "0.2"
+
+            [usdc]
+            mode = "disabled"
+        "#;
+
+        let config: RebalancingConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(matches!(config.usdc, UsdcRebalancingConfig::Disabled));
     }
 
     type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;
@@ -2394,6 +2657,291 @@ mod tests {
                 .copied()
                 .unwrap(),
             "has_terminal_usdc_rebalance_event must identify ConversionConfirmed alone as terminal"
+        );
+    }
+
+    /// BUG REPRODUCTION: Trigger incorrectly fires with partial inventory data.
+    ///
+    /// When inventory polling starts:
+    /// 1. Onchain equity is polled first
+    /// 2. Trigger fires with onchain=X, offchain=0 (not yet polled)
+    /// 3. Ratio = X/(X+0) = 100% → detects "TooMuchOnchain" → Redemption
+    ///
+    /// This is WRONG because offchain hasn't been polled yet, not because
+    /// there's actually no offchain inventory.
+    ///
+    /// CORRECT behavior: trigger should NOT fire until both onchain AND
+    /// offchain data are available for the symbol.
+    #[tokio::test]
+    async fn bug_trigger_should_not_fire_with_partial_inventory_data() {
+        let symbol = Symbol::new("RKLB").unwrap();
+
+        // Empty inventory - simulates startup state before polling completes
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        let (sender, mut receiver) = mpsc::channel(10);
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Seed vault registry so token lookup succeeds
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        // Create InventorySnapshotQuery that will dispatch events to the trigger
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Simulate what happens during inventory polling:
+        // OnchainEquity event arrives FIRST (offchain not yet polled)
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100)); // 100 shares onchain
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: "test".to_string(),
+            sequence: 1,
+            payload: onchain_event,
+            metadata: HashMap::new(),
+        };
+
+        // Dispatch the onchain event - this should NOT trigger rebalancing
+        // because we don't have offchain data yet
+        query.dispatch("test", &[envelope]).await;
+
+        // CORRECT BEHAVIOR: No operation should be triggered because
+        // offchain data hasn't arrived yet. The system should wait until
+        // it has a complete picture of inventory before deciding to rebalance.
+        //
+        // CURRENT BUG: A Redemption is incorrectly triggered because:
+        // - Onchain: 100 shares
+        // - Offchain: 0 shares (not polled yet, treated as "no holdings")
+        // - Ratio: 100% onchain → "TooMuchOnchain" → Redemption
+        let triggered = receiver.try_recv();
+
+        assert!(
+            triggered.is_err(),
+            "CORRECT: No operation should trigger with partial inventory data. \
+             BUG: Got {triggered:?} - system incorrectly treated missing offchain \
+             data as 'zero holdings' and triggered rebalancing."
+        );
+    }
+
+    /// Complementary test: verify that trigger DOES fire once both venues have data.
+    #[sqlx::test]
+    async fn trigger_fires_when_both_venues_have_data(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, mut receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Apply onchain snapshot (100 shares)
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 1,
+                    payload: onchain_event,
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // No trigger yet - only one venue has data
+        assert!(
+            receiver.try_recv().is_err(),
+            "should not trigger with only onchain data"
+        );
+
+        // Apply offchain snapshot (0 shares) - now both venues have data
+        let mut positions = BTreeMap::new();
+        positions.insert(symbol.clone(), shares(0));
+
+        let offchain_event = InventorySnapshotEvent::OffchainEquity {
+            positions,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 2,
+                    payload: offchain_event,
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Now both venues have data: 100 onchain, 0 offchain = 100% ratio
+        // With target 50% and deviation 10%, ratio 100% > upper bound 60%
+        // So TooMuchOnchain -> should trigger Redemption
+        let triggered = receiver.try_recv();
+
+        assert!(
+            triggered.is_ok(),
+            "should trigger rebalancing once both venues have data"
+        );
+
+        assert!(
+            matches!(triggered.unwrap(), TriggeredOperation::Redemption { .. }),
+            "expected Redemption for 100% onchain ratio"
+        );
+    }
+
+    /// Verifies logging shows when imbalance check skips due to partial data.
+    #[tracing_test::traced_test]
+    #[sqlx::test]
+    async fn logs_show_partial_data_skips_imbalance_check(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Apply ONLY onchain data - offchain not yet polled
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        let onchain_event = InventorySnapshotEvent::OnchainEquity {
+            balances,
+            fetched_at: Utc::now(),
+        };
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 1,
+                    payload: onchain_event,
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Verify the logs show:
+        // 1. The snapshot event was applied
+        // 2. Imbalance check was skipped due to partial data
+        assert!(
+            logs_contain("Applied inventory snapshot event"),
+            "Should log when snapshot event is applied"
+        );
+        assert!(
+            logs_contain("No equity imbalance detected"),
+            "Should log that imbalance was not detected (due to partial data)"
+        );
+        assert!(
+            !logs_contain("Triggered equity rebalancing"),
+            "Should NOT trigger rebalancing with partial data"
+        );
+    }
+
+    /// Verifies logging shows trigger fires when both venues have data.
+    #[tracing_test::traced_test]
+    #[sqlx::test]
+    async fn logs_show_trigger_fires_with_complete_data(pool: SqlitePool) {
+        let symbol = Symbol::new("RKLB").unwrap();
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+        let (sender, _receiver) = mpsc::channel(10);
+
+        seed_vault_registry(&pool, &symbol).await;
+
+        let trigger = Arc::new(RebalancingTrigger::new(
+            test_config(),
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            inventory.clone(),
+            sender,
+        ));
+
+        let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
+
+        // Apply onchain data first
+        let mut balances = BTreeMap::new();
+        balances.insert(symbol.clone(), shares(100));
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 1,
+                    payload: InventorySnapshotEvent::OnchainEquity {
+                        balances,
+                        fetched_at: Utc::now(),
+                    },
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Now apply offchain data - both venues now have data
+        let mut positions = BTreeMap::new();
+        positions.insert(symbol.clone(), shares(0));
+
+        query
+            .dispatch(
+                "test",
+                &[EventEnvelope {
+                    aggregate_id: "test".to_string(),
+                    sequence: 2,
+                    payload: InventorySnapshotEvent::OffchainEquity {
+                        positions,
+                        fetched_at: Utc::now(),
+                    },
+                    metadata: HashMap::new(),
+                }],
+            )
+            .await;
+
+        // Verify the trigger fired after both venues have data
+        assert!(
+            logs_contain("Triggered equity rebalancing"),
+            "Should trigger rebalancing once both venues have data"
         );
     }
 }

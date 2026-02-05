@@ -11,7 +11,7 @@ use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotAggregate, InventorySnapshotCommand, InventorySnapshotError,
 };
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultError, VaultId, VaultService};
+use crate::onchain::raindex::{RaindexError, RaindexService, VaultId};
 use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
@@ -27,7 +27,7 @@ use tracing::debug;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
-    Vault(#[from] VaultError),
+    Raindex(#[from] RaindexError),
     #[error(transparent)]
     Executor(ExecutorError),
     #[error(transparent)]
@@ -46,7 +46,7 @@ pub(crate) struct InventoryPollingService<P, E>
 where
     P: Provider + Clone,
 {
-    vault_service: Arc<VaultService<P>>,
+    raindex_service: Arc<RaindexService<P>>,
     executor: E,
     pool: SqlitePool,
     orderbook: Address,
@@ -60,7 +60,7 @@ where
     E: Executor,
 {
     pub(crate) fn new(
-        vault_service: Arc<VaultService<P>>,
+        raindex_service: Arc<RaindexService<P>>,
         executor: E,
         pool: SqlitePool,
         orderbook: Address,
@@ -68,7 +68,7 @@ where
         snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
     ) -> Self {
         Self {
-            vault_service,
+            raindex_service,
             executor,
             pool,
             orderbook,
@@ -150,7 +150,7 @@ where
         let expected_tokens: Vec<_> = registry.equity_vaults.keys().copied().collect();
 
         let balance_futures = registry.equity_vaults.values().map(|vault| async {
-            self.vault_service
+            self.raindex_service
                 .get_equity_balance(self.order_owner, vault.token, VaultId(vault.vault_id))
                 .await
                 .map(|balance| (vault.token, vault.symbol.clone(), balance))
@@ -194,7 +194,7 @@ where
         };
 
         let usdc_balance = self
-            .vault_service
+            .raindex_service
             .get_usdc_balance(self.order_owner, VaultId(usdc_vault.vault_id))
             .await?;
 
@@ -255,15 +255,18 @@ mod tests {
     use alloy::primitives::{B256, TxHash, address, b256};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use cqrs_es::persist::GenericQuery;
     use rust_decimal::Decimal;
-    use sqlite_es::sqlite_cqrs;
+    use sqlite_es::SqliteViewRepository;
     use sqlx::Row;
+
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
     use crate::test_utils::setup_test_db;
-    use crate::vault_registry::VaultRegistryCommand;
+    use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery};
 
     /// A Float (bytes32) representing zero balance, used as mock vaultBalance2 response.
     const ZERO_FLOAT_HEX: &str =
@@ -290,11 +293,32 @@ mod tests {
         FractionalShares::new(Decimal::from(n))
     }
 
+    fn create_test_raindex_service(
+        pool: &sqlx::SqlitePool,
+        provider: impl Provider + Clone,
+    ) -> Arc<RaindexService<impl Provider + Clone>> {
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query: Arc<VaultRegistryQuery> =
+            Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+        Arc::new(RaindexService::new(
+            provider,
+            Address::ZERO,
+            vault_registry_query,
+            Address::ZERO,
+        ))
+    }
+
     #[tokio::test]
     async fn poll_and_record_emits_offchain_equity_command_with_executor_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -315,12 +339,12 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(inventory.clone());
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -352,7 +376,7 @@ mod tests {
     async fn poll_and_record_emits_offchain_cash_command_with_executor_cash_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -362,12 +386,12 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(inventory);
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -395,7 +419,7 @@ mod tests {
     async fn poll_and_record_emits_empty_positions_when_executor_has_no_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let inventory = Inventory {
@@ -405,12 +429,12 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(inventory);
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -427,22 +451,23 @@ mod tests {
         assert!(positions.is_empty(), "Expected empty positions map");
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_offchain_commands_when_executor_returns_unimplemented() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         // Should succeed without error
@@ -465,13 +490,19 @@ mod tests {
             !has_offchain_cash,
             "Should NOT emit OffchainCash when executor returns Unimplemented"
         );
+        assert!(
+            logs_contain(
+                "Executor returned non-fetched inventory result, skipping offchain polling"
+            ),
+            "Should log debug message explaining why offchain polling was skipped"
+        );
     }
 
     #[tokio::test]
     async fn poll_and_record_handles_negative_cash_balance() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         // Margin account with negative cash (borrowed funds)
@@ -486,12 +517,12 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(inventory);
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -518,7 +549,7 @@ mod tests {
     async fn poll_and_record_handles_fractional_share_positions() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let fractional_qty = FractionalShares::new(Decimal::new(12345, 3)); // 12.345 shares
@@ -533,12 +564,12 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(inventory);
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -563,7 +594,7 @@ mod tests {
     async fn poll_and_record_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let orderbook = address!("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         let order_owner = address!("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB");
 
@@ -574,12 +605,12 @@ mod tests {
         let executor = MockExecutor::new().with_inventory(inventory);
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -608,7 +639,7 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = test_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
 
         cqrs.execute(
@@ -630,7 +661,7 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = test_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
 
         cqrs.execute(
@@ -644,22 +675,23 @@ mod tests {
         .unwrap();
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_onchain_when_vault_registry_not_initialized() {
         let pool = setup_test_db().await;
         let provider = mock_provider();
-        let vault_service = Arc::new(VaultService::new(provider.clone(), Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider.clone());
         let (orderbook, order_owner) = test_addresses();
 
         let executor = MockExecutor::new();
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -680,8 +712,13 @@ mod tests {
             !has_onchain_cash,
             "Should NOT emit OnchainCash when VaultRegistry not initialized"
         );
+        assert!(
+            logs_contain("Vault registry not initialized, skipping onchain polling"),
+            "Should log debug message explaining why onchain polling was skipped"
+        );
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_onchain_equity_when_no_equity_vaults_discovered() {
         let pool = setup_test_db().await;
@@ -693,17 +730,17 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -717,8 +754,13 @@ mod tests {
             !has_onchain_equity,
             "Should NOT emit OnchainEquity when no equity vaults discovered"
         );
+        assert!(
+            logs_contain("No equity vaults discovered, skipping onchain equity polling"),
+            "Should log debug message explaining why equity polling was skipped"
+        );
     }
 
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn poll_and_record_skips_onchain_cash_when_no_usdc_vault_discovered() {
         let pool = setup_test_db().await;
@@ -738,17 +780,17 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_success(&ZERO_FLOAT_HEX); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         service.poll_and_record().await.unwrap();
@@ -761,6 +803,10 @@ mod tests {
         assert!(
             !has_onchain_cash,
             "Should NOT emit OnchainCash when no USDC vault discovered"
+        );
+        assert!(
+            logs_contain("No USDC vault discovered, skipping onchain cash polling"),
+            "Should log debug message explaining why cash polling was skipped"
         );
     }
 
@@ -782,23 +828,23 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for equity vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
 
         assert!(
-            matches!(error, InventoryPollingError::Vault(_)),
+            matches!(error, InventoryPollingError::Raindex(_)),
             "Expected Vault error when RPC fails, got {error:?}"
         );
     }
@@ -813,23 +859,23 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure"); // vaultBalance2 for USDC vault
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let vault_service = Arc::new(VaultService::new(provider, Address::ZERO));
+        let raindex_service = create_test_raindex_service(&pool, provider);
 
         let executor = MockExecutor::new();
 
         let service = InventoryPollingService::new(
-            vault_service,
+            raindex_service,
             executor,
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            test_cqrs(pool.clone(), vec![], ()),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
 
         assert!(
-            matches!(error, InventoryPollingError::Vault(_)),
+            matches!(error, InventoryPollingError::Raindex(_)),
             "Expected Vault error when RPC fails, got {error:?}"
         );
     }

@@ -2,6 +2,7 @@ use alloy::primitives::{LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use sqlx::SqlitePool;
+
 use st0x_execution::Direction;
 use st0x_execution::schwab::{SchwabAuthConfig, SchwabTokens};
 

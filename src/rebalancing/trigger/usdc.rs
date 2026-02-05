@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rust_decimal::Decimal;
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
@@ -79,7 +79,10 @@ pub(super) async fn check_imbalance_and_build_operation(
         inventory.check_usdc_imbalance(threshold)
     };
 
-    let imbalance = imbalance.ok_or(UsdcTriggerSkip::NoImbalance)?;
+    let Some(imbalance) = imbalance else {
+        trace!("No USDC imbalance detected (balanced, partial data, or inflight)");
+        return Err(UsdcTriggerSkip::NoImbalance);
+    };
 
     match imbalance {
         Imbalance::TooMuchOffchain { excess } if excess < ALPACA_MINIMUM_WITHDRAWAL => {

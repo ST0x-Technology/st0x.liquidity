@@ -55,7 +55,6 @@ where
         self.available + self.inflight
     }
 
-    #[cfg(test)]
     pub(super) fn new(available: T, inflight: T) -> Self {
         Self {
             available,

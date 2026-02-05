@@ -15,18 +15,19 @@ use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Config;
 use crate::error::EventProcessingError;
 use crate::inventory::InventorySnapshotAggregate;
-use crate::offchain_order::OffchainOrderCqrs;
+use crate::offchain_order::{OffchainOrderCqrs, OffchainOrderQuery};
+use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
-use crate::onchain::vault::VaultService;
 use crate::onchain_trade::OnChainTradeCqrs;
 use crate::position::{PositionCqrs, PositionQuery};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
-use crate::vault_registry::VaultRegistryAggregate;
+use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
 use super::{
-    Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
-    spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
+    Conductor, TradingTasks, spawn_event_processor, spawn_inventory_poller,
+    spawn_onchain_event_receiver, spawn_order_poller, spawn_periodic_accumulated_position_check,
+    spawn_queue_processor,
 };
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
@@ -39,7 +40,9 @@ pub(crate) struct CqrsFrameworks {
     pub(crate) position_cqrs: Arc<PositionCqrs>,
     pub(crate) position_query: Arc<PositionQuery>,
     pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    pub(crate) offchain_order_query: Arc<OffchainOrderQuery>,
     pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
+    pub(crate) vault_registry_query: Arc<VaultRegistryQuery>,
     pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
 
@@ -165,13 +168,15 @@ where
 
         let inventory_poller = match self.common.config.order_owner() {
             Ok(order_owner) => {
-                let vault_service = Arc::new(VaultService::new(
+                let raindex_service = Arc::new(RaindexService::new(
                     self.common.provider.clone(),
                     self.common.config.evm.orderbook,
+                    self.common.frameworks.vault_registry_query.clone(),
+                    order_owner,
                 ));
                 Some(spawn_inventory_poller(
                     self.common.pool.clone(),
-                    vault_service,
+                    raindex_service,
                     self.common.executor.clone(),
                     self.common.config.evm.orderbook,
                     order_owner,
@@ -205,6 +210,7 @@ where
             self.common.frameworks.position_cqrs.clone(),
             self.common.frameworks.position_query.clone(),
             self.common.frameworks.offchain_order_cqrs.clone(),
+            self.common.frameworks.offchain_order_query.clone(),
             self.common.execution_threshold,
         );
         let trade_cqrs = super::TradeProcessingCqrs {
@@ -212,6 +218,7 @@ where
             position_cqrs: self.common.frameworks.position_cqrs,
             position_query: self.common.frameworks.position_query,
             offchain_order_cqrs: self.common.frameworks.offchain_order_cqrs,
+            offchain_order_query: self.common.frameworks.offchain_order_query,
             execution_threshold: self.common.execution_threshold,
         };
         let queue_processor = spawn_queue_processor(
@@ -226,13 +233,15 @@ where
 
         Conductor {
             executor_maintenance,
-            order_poller,
-            dex_event_receiver,
-            event_processor,
-            position_checker,
-            queue_processor,
             rebalancer,
             inventory_poller,
+            trading_tasks: Some(TradingTasks {
+                order_poller,
+                dex_event_receiver,
+                event_processor,
+                position_checker,
+                queue_processor,
+            }),
         }
     }
 }

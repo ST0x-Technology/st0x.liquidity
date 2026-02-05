@@ -95,7 +95,7 @@ Example (Offchain Batching):
   imbalance, >70% USDC imbalance), trigger automated rebalancing
 - **Equity Rebalancing**:
   - Too many tokens onchain: Redeem tokens -> receive shares at Alpaca
-  - Too many shares offchain: Mint tokens from shares -> receive tokens onchain
+  - Too many shares offchain: Mint tokens -> deposit to Raindex vault
 - **USDC Rebalancing**:
   - Too much USDC onchain: Bridge via Circle CCTP (Base -> Ethereum) -> deposit
     to Alpaca
@@ -1252,7 +1252,7 @@ enum PositionEvent {
     },
     OffChainOrderFailed {
         execution_id: ExecutionId,
-        error: String,
+        broker_code: Option<BrokerErrorCode>,
         failed_at: DateTime<Utc>,
     },
 }
@@ -1412,7 +1412,7 @@ enum OffchainOrderEvent {
         filled_at: DateTime<Utc>,
     },
     Failed {
-        error: String,
+        broker_code: Option<BrokerErrorCode>,
         failed_at: DateTime<Utc>,
     },
 }
@@ -1421,8 +1421,10 @@ enum MigratedOrderStatus {
     Pending,
     Submitted,
     Filled,
-    Failed { error: String },
+    Failed { broker_code: Option<BrokerErrorCode> },
 }
+
+struct BrokerErrorCode(String);
 ```
 
 #### SchwabAuth Aggregate
@@ -1483,69 +1485,47 @@ enum SchwabAuthEvent {
 **Note**: Automated rebalancing is **Alpaca-only**. These aggregates are not
 used for Schwab-based operations, which rely on manual rebalancing processes.
 
-Rebalancing manages inventory positions across venues (onchain vs offchain) by
-coordinating cross-venue asset movements. Three aggregates handle the different
-rebalancing flows for Alpaca operations.
+Rebalancing manages inventory positions across trading venues (Alpaca brokerage
+vs Raindex orderbook) by coordinating cross-venue asset movements. Three
+aggregates handle the different rebalancing flows for Alpaca operations.
 
 #### TokenizedEquityMint Aggregate
 
-**Purpose**: Manages the process of converting offchain shares at Alpaca into
-onchain tokens.
+**Purpose**: Transfers equity inventory from Alpaca to Raindex by tokenizing
+shares and depositing them to a vault for liquidity provision.
 
-**Aggregate ID**: UUID for each mint request
+**Aggregate ID**: IssuerRequestId (our internal tracking ID)
+
+**Lifecycle Pattern**: Uses `Lifecycle<TokenizedEquityMint, Never>` wrapper.
+
+##### State Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> MintRequested: Mint
+    MintRequested --> MintAccepted
+    MintRequested --> Failed
+    MintAccepted --> TokensReceived
+    MintAccepted --> Failed
+    TokensReceived --> DepositedIntoRaindex: Deposit
+    TokensReceived --> Failed
+    DepositedIntoRaindex --> Completed
+    DepositedIntoRaindex --> Failed
+```
 
 ##### States
 
+Terminal states store audit-critical fields not available from earlier events:
+
 ```rust
 enum TokenizedEquityMint {
-    NotStarted,
-    MintRequested {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        requested_at: DateTime<Utc>,
-    },
-    MintAccepted {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        requested_at: DateTime<Utc>,
-        accepted_at: DateTime<Utc>,
-    },
-    TokensReceived {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-        requested_at: DateTime<Utc>,
-        accepted_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
-    },
-    Completed {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-        requested_at: DateTime<Utc>,
-        completed_at: DateTime<Utc>,
-    },
-    Failed {
-        symbol: Symbol,
-        quantity: Decimal,
-        reason: String,
-        requested_at: DateTime<Utc>,
-        failed_at: DateTime<Utc>,
-    },
+    MintRequested { symbol, quantity, wallet, requested_at },
+    MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
+    TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
+    DepositedIntoRaindex { /* + vault_deposit_tx_hash */ },
+    Completed { symbol, quantity, issuer_request_id, tokenization_request_id,
+                token_tx_hash, vault_deposit_tx_hash, completed_at },
+    Failed { symbol, quantity, reason, failed_at },
 }
 ```
 
@@ -1553,106 +1533,116 @@ enum TokenizedEquityMint {
 
 ```rust
 enum TokenizedEquityMintCommand {
-    RequestMint {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-    },
-    AcknowledgeAcceptance {
-        issuer_request_id: String,
-        tokenization_request_id: String,
-    },
-    ReceiveTokens {
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-    },
-    Finalize,
-    Fail {
-        reason: String,
-    },
+    // Requests mint from Alpaca and polls until tokens arrive in wallet
+    Mint { symbol, quantity, wallet },
+    // Deposits tokens from wallet to Raindex vault
+    Deposit,
 }
 ```
 
 ##### Events
 
+Each event captures data relevant to that state transition:
+
 ```rust
 enum TokenizedEquityMintEvent {
-    MintRequested {
-        symbol: Symbol,
-        quantity: Decimal,
-        wallet: Address,
-        requested_at: DateTime<Utc>,
-    },
-    MintAccepted {
-        issuer_request_id: String,
-        tokenization_request_id: String,
-        accepted_at: DateTime<Utc>,
-    },
-    TokensReceived {
-        tx_hash: TxHash,
-        receipt_id: U256,
-        shares_minted: U256,
-        received_at: DateTime<Utc>,
-    },
-    MintCompleted {
-        completed_at: DateTime<Utc>,
-    },
-    MintFailed {
-        reason: String,
-        failed_at: DateTime<Utc>,
-    },
+    MintRequested { symbol, quantity, wallet, requested_at },
+
+    MintAccepted { symbol, quantity, issuer_request_id, tokenization_request_id, accepted_at },
+    MintAcceptanceFailed { symbol, quantity, last_status: TokenizationRequestStatus, failed_at },
+
+    TokensReceived { symbol, quantity, tx_hash, receipt_id, shares_minted, received_at },
+
+    DepositedIntoRaindex { symbol, quantity, vault_deposit_tx_hash, deposited_at },
+    RaindexDepositFailed { symbol, quantity, failed_tx_hash: Option<TxHash>, failed_at },
+
+    Completed { symbol, quantity, completed_at },
+    MintRejected { symbol, quantity, status_code: Option<HttpStatusCode>, rejected_at },
 }
+
+struct HttpStatusCode(u16);
 ```
 
 ##### Business Rules
 
-- Can only request mint from NotStarted state
-- Mint acceptance requires valid issuer and tokenization request IDs
-- Tokens received requires transaction confirmation
-- Can mark failed from any non-terminal state
+- `Mint` only from uninitialized state; polls Alpaca until tokens arrive or
+  failure
+- `Deposit` only from TokensReceived state
+- Completed and Failed are terminal states
 
 #### EquityRedemption Aggregate
 
-**Purpose**: Manages the process of converting onchain tokens into offchain
-shares at Alpaca.
+**Purpose**: Transfers equity inventory from Raindex to Alpaca by withdrawing
+tokens from vault, sending them for redemption, and receiving shares at Alpaca.
 
 **Aggregate ID**: UUID for each redeem request
+
+**Lifecycle Pattern**: Uses `Lifecycle<EquityRedemption, Never>` wrapper and
+cqrs-es Services for atomic side-effect execution.
+
+**Services**: `Arc<dyn Redeemer>` - handles vault withdraw and token transfer.
+
+##### State Flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> WithdrawnFromRaindex: Withdraw
+    WithdrawnFromRaindex --> TokensSent: Redeem
+    WithdrawnFromRaindex --> Failed
+    TokensSent --> Pending
+    TokensSent --> Failed
+    Pending --> Completed
+    Pending --> Failed
+```
+
+- `Withdraw` command withdraws from Raindex vault to wallet
+- `WithdrawnFromRaindex` tracks tokens that left the vault but aren't yet sent
+- `Redeem` command sends tokens to Alpaca and polls until terminal
+- `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
+- `Pending` indicates Alpaca detected the transfer
+- `Completed` and `Failed` are terminal states
 
 ##### States
 
 ```rust
 enum EquityRedemption {
-    NotStarted,
+    WithdrawnFromRaindex {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        withdrawn_at: DateTime<Utc>,
+    },
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
         redemption_wallet: Address,
-        tx_hash: TxHash,
+        redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
     },
     Pending {
         symbol: Symbol,
         quantity: Decimal,
-        tx_hash: TxHash,
-        tokenization_request_id: String,
+        redemption_tx: TxHash,
+        tokenization_request_id: TokenizationRequestId,
         sent_at: DateTime<Utc>,
         detected_at: DateTime<Utc>,
     },
     Completed {
         symbol: Symbol,
         quantity: Decimal,
-        tx_hash: TxHash,
-        tokenization_request_id: String,
+        redemption_tx: TxHash,
+        tokenization_request_id: TokenizationRequestId,
         completed_at: DateTime<Utc>,
     },
     Failed {
         symbol: Symbol,
         quantity: Decimal,
-        tx_hash: Option<TxHash>,
-        tokenization_request_id: Option<String>,
-        reason: String,
-        sent_at: Option<DateTime<Utc>>,
+        vault_withdraw_tx: Option<TxHash>,
+        redemption_tx: Option<TxHash>,
+        tokenization_request_id: Option<TokenizationRequestId>,
         failed_at: DateTime<Utc>,
     },
 }
@@ -1662,18 +1652,15 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    SendTokens {
+    // Withdraws tokens from Raindex vault to wallet
+    Withdraw {
         symbol: Symbol,
         quantity: Decimal,
-        redemption_wallet: Address,
+        token: Address,
+        amount: U256,
     },
-    Detect {
-        tokenization_request_id: String,
-    },
-    Complete,
-    Fail {
-        reason: String,
-    },
+    // Sends tokens to Alpaca and polls until terminal state (completed or rejected)
+    Redeem,
 }
 ```
 
@@ -1681,36 +1668,75 @@ enum EquityRedemptionCommand {
 
 ```rust
 enum EquityRedemptionEvent {
-    TokensSent {
+    WithdrawnFromRaindex {
         symbol: Symbol,
         quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        withdrawn_at: DateTime<Utc>,
+    },
+
+    TokensSent {
         redemption_wallet: Address,
-        tx_hash: TxHash,
+        redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
     },
+    TransferFailed {
+        tx_hash: Option<TxHash>,
+        failed_at: DateTime<Utc>,
+    },
+
     Detected {
-        tokenization_request_id: String,
+        tokenization_request_id: TokenizationRequestId,
         detected_at: DateTime<Utc>,
     },
+    DetectionFailed {
+        failure: DetectionFailure,
+        failed_at: DateTime<Utc>,
+    },
+
     Completed {
         completed_at: DateTime<Utc>,
     },
-    Failed {
-        reason: String,
-        failed_at: DateTime<Utc>,
+    RedemptionRejected {
+        rejected_at: DateTime<Utc>,
     },
+}
+
+enum DetectionFailure { Timeout, ApiError { status_code: Option<u16> } }
+```
+
+##### Redeemer Service Trait
+
+The aggregate uses cqrs-es Services to execute side effects atomically:
+
+```rust
+#[async_trait]
+trait Redeemer: Send + Sync {
+    async fn withdraw_from_vault(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<TxHash, RedeemError>;
+
+    async fn send_for_redemption(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<(Address, TxHash), RedeemError>;
 }
 ```
 
+`RedemptionService` implements `Redeemer` by composing `VaultService` and
+`AlpacaTokenizationService`.
+
 ##### Business Rules
 
-- Can only send tokens from NotStarted state
-- Redemption transitions to Pending when detected in Alpaca API (via polling GET
-  /v2/tokenization/requests)
-- API returns status values: "pending", "completed", or "rejected"
-- Completed state indicates shares have been journaled to AP's account
-- Can mark failed from any non-terminal state (captures both API rejections and
-  internal failures)
+- `Withdraw` only from uninitialized state; emits `WithdrawnFromRaindex`
+- `Redeem` only from `WithdrawnFromRaindex` state; polls Alpaca until terminal
+- If send fails after withdraw, aggregate stays in `WithdrawnFromRaindex`
+  (tokens in wallet, not stranded)
+- Completed and Failed are terminal states
 
 #### UsdcRebalance Aggregate
 
@@ -1913,7 +1939,7 @@ enum UsdcRebalanceEvent {
     // direction: Required for incremental dispatch terminal detection
     // (cqrs-es Query::dispatch only receives newly committed events)
     ConversionConfirmed { direction: RebalanceDirection, converted_at: DateTime<Utc> },
-    ConversionFailed { reason: String, failed_at: DateTime<Utc> },
+    ConversionFailed { alpaca_order_id: Option<AlpacaOrderId>, failed_at: DateTime<Utc> },
 
     // Withdrawal events
     Initiated {
@@ -1923,7 +1949,7 @@ enum UsdcRebalanceEvent {
         initiated_at: DateTime<Utc>,
     },
     WithdrawalConfirmed { confirmed_at: DateTime<Utc> },
-    WithdrawalFailed { reason: String, failed_at: DateTime<Utc> },
+    WithdrawalFailed { terminal_status: WithdrawalTerminalStatus, failed_at: DateTime<Utc> },
 
     // Bridging events (cctp_nonce comes from attestation, not burn tx)
     BridgingInitiated { burn_tx_hash: TxHash, burned_at: DateTime<Utc> },
@@ -1939,7 +1965,8 @@ enum UsdcRebalanceEvent {
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<u64>,
-        reason: String,
+        stage: BridgeStage,
+        failed_tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
     DepositInitiated {
@@ -1951,10 +1978,13 @@ enum UsdcRebalanceEvent {
     },
     DepositFailed {
         deposit_ref: Option<TransferRef>,
-        reason: String,
+        failed_tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
 }
+
+enum WithdrawalTerminalStatus { Canceled, Rejected, Returned }
+enum BridgeStage { Burn, Attestation, Mint }
 ```
 
 ##### Business Rules
@@ -2126,15 +2156,24 @@ know about cross-venue inventory.
   activity)
 - `TokenizedEquityMintEvent::MintAccepted` - Moves shares to inflight (leaving
   Alpaca)
-- `TokenizedEquityMintEvent::MintCompleted` - Moves from inflight to onchain
+- `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex
   available
-- `TokenizedEquityMintEvent::MintFailed` - Reconciles inflight back to offchain
+- `TokenizedEquityMintEvent::DepositedIntoRaindex` - No balance change
+  (completes transfer to Raindex, already counted at TokensReceived)
+- `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
+  await retry or manual recovery)
+- `TokenizedEquityMintEvent::Completed` - No balance change (finalization)
+- `TokenizedEquityMintEvent::MintRejected` - Reconciles inflight back to Alpaca
   available
-- `EquityRedemptionEvent::TokensSent` - Moves tokens to inflight (sent to
-  redemption wallet)
-- `EquityRedemptionEvent::Completed` - Moves from inflight to offchain available
-- `EquityRedemptionEvent::Failed` - Reconciles inflight back to onchain
-  available
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to
+  Alpaca available
+- `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
+  (leaving Raindex vault)
+- `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
+- `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
+- `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)
+- `EquityRedemptionEvent::RedemptionRejected` - Reconciles inflight back to
+  Raindex available (tokens returned by Alpaca)
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::RebalancingCompleted` - Moves from inflight to

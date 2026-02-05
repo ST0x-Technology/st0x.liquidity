@@ -197,6 +197,8 @@ pub(crate) enum OnChainError {
     JsonSerde(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]
     Uuid(#[from] uuid::Error),
+    #[error("Market hours check failed")]
+    MarketHoursCheck(#[source] Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<sqlx::Error> for OnChainError {

@@ -14,9 +14,11 @@ use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
 use st0x_execution::Symbol;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never, SqliteQuery};
 
 pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
+
+pub(crate) type VaultRegistryQuery = SqliteQuery<VaultRegistry, Never>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +59,10 @@ impl VaultRegistry {
             .values()
             .find(|v| v.symbol == *symbol)
             .map(|v| v.token)
+    }
+
+    pub(crate) fn vault_id_by_token(&self, token: Address) -> Option<B256> {
+        self.equity_vaults.get(&token).map(|v| v.vault_id)
     }
 
     fn empty(timestamp: DateTime<Utc>) -> Self {
@@ -150,25 +156,55 @@ impl Aggregate for Lifecycle<VaultRegistry, Never> {
                 vault_id,
                 discovered_in,
                 symbol,
-            } => VaultRegistryEvent::EquityVaultDiscovered {
-                token,
-                vault_id,
-                discovered_in,
-                discovered_at: now,
-                symbol,
-            },
+            } => {
+                // Only emit event if vault_id changed or token is new
+                let already_registered = match self {
+                    Self::Live(r) => r
+                        .equity_vaults
+                        .get(&token)
+                        .is_some_and(|v| v.vault_id == vault_id),
+                    _ => false,
+                };
+
+                if already_registered {
+                    return Ok(vec![]);
+                }
+
+                Some(VaultRegistryEvent::EquityVaultDiscovered {
+                    token,
+                    vault_id,
+                    discovered_in,
+                    discovered_at: now,
+                    symbol,
+                })
+            }
 
             VaultRegistryCommand::DiscoverUsdcVault {
                 vault_id,
                 discovered_in,
-            } => VaultRegistryEvent::UsdcVaultDiscovered {
-                vault_id,
-                discovered_in,
-                discovered_at: now,
-            },
+            } => {
+                // Only emit event if vault_id changed or USDC vault is new
+                let already_registered = match self {
+                    Self::Live(r) => r
+                        .usdc_vault
+                        .as_ref()
+                        .is_some_and(|v| v.vault_id == vault_id),
+                    _ => false,
+                };
+
+                if already_registered {
+                    return Ok(vec![]);
+                }
+
+                Some(VaultRegistryEvent::UsdcVaultDiscovered {
+                    vault_id,
+                    discovered_in,
+                    discovered_at: now,
+                })
+            }
         };
 
-        Ok(vec![event])
+        Ok(event.into_iter().collect())
     }
 }
 
@@ -243,9 +279,9 @@ mod tests {
 
     use async_trait::async_trait;
     use cqrs_es::{EventEnvelope, Query, View};
-    use sqlite_es::sqlite_cqrs;
 
     use super::*;
+    use crate::conductor::wire::test_cqrs;
     use crate::test_utils::setup_test_db;
 
     const TEST_ORDERBOOK: Address = address!("0x1234567890123456789012345678901234567890");
@@ -605,7 +641,7 @@ mod tests {
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_OWNER);
 
         // Phase 1: emit an event with NO query processors
-        let bare_cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+        let bare_cqrs = test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
 
         bare_cqrs
             .execute(
@@ -624,7 +660,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let query = EventCounter(counter.clone());
         let observed_cqrs =
-            sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![Box::new(query)], ());
+            test_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![Box::new(query)], ());
 
         // Phase 3: emit one more event through the new framework
         let new_vault_id =

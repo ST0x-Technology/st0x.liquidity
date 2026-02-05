@@ -49,8 +49,8 @@ impl Executor for AlpacaBrokerApi {
         })
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        super::market_hours::wait_until_market_open(&self.client).await
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        super::market_hours::is_market_open(&self.client).await
     }
 
     async fn place_market_order(
@@ -147,8 +147,6 @@ impl AlpacaBrokerApi {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use chrono_tz::America::New_York;
     use httpmock::prelude::*;
     use serde_json::json;
 
@@ -213,44 +211,6 @@ mod tests {
             result.unwrap_err(),
             AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401
         ));
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open() {
-        let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
-
-        let account_mock = create_account_mock(&server);
-
-        // Get today's date in ET timezone to build a response that represents
-        // market currently being open
-        let now = Utc::now();
-        let now_et = now.with_timezone(&New_York);
-        let today = now_et.date_naive();
-        let today_str = today.format("%Y-%m-%d").to_string();
-
-        // Mock calendar endpoint - returns today as a trading day with market
-        // hours that span the entire day so the test always finds market "open"
-        let calendar_mock = server.mock(|when, then| {
-            when.method(GET).path("/v1/calendar");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([
-                    {
-                        "date": today_str,
-                        "open": "00:00",
-                        "close": "23:59"
-                    }
-                ]));
-        });
-
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
-        let result = executor.wait_until_market_open().await;
-
-        account_mock.assert();
-        calendar_mock.assert();
-        assert!(result.is_ok());
-        assert!(result.unwrap().as_secs() > 0);
     }
 
     #[tokio::test]

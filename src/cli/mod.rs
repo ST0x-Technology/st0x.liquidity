@@ -1,4 +1,10 @@
 //! CLI commands for trading, asset transfers, and authentication.
+//!
+//! CLI code doesn't run in production event processing paths and doesn't share
+//! persistence with the server. The wiring bugs that `disallowed_methods` guards
+//! against aren't a concern here.
+
+#![allow(clippy::disallowed_methods)]
 
 mod alpaca_wallet;
 mod auth;
@@ -600,13 +606,16 @@ async fn run_provider_command<W: Write>(
             vault_id,
             decimals,
         } => {
-            vault::vault_deposit_command(
-                stdout, amount, token, vault_id, decimals, config, provider,
-            )
-            .await
+            let deposit = vault::Deposit {
+                amount,
+                token,
+                vault_id,
+                decimals,
+            };
+            vault::vault_deposit_command(stdout, deposit, config, pool, provider).await
         }
         ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, config, provider).await
+            vault::vault_withdraw_command(stdout, amount, config, pool, provider).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
             cctp::cctp_bridge_command(stdout, amount, all, from, config, provider).await

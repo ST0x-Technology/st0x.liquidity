@@ -5,8 +5,8 @@ use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
 use cqrs_es::CqrsFramework;
-use cqrs_es::persist::PersistedEventStore;
-use sqlite_es::SqliteEventRepository;
+use cqrs_es::persist::{GenericQuery, PersistedEventStore};
+use sqlite_es::{SqliteEventRepository, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -15,26 +15,45 @@ use std::time::Duration;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
 use st0x_execution::{AlpacaBrokerApi, Executor, FractionalShares, Symbol};
 
-use crate::alpaca_tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
-};
 use crate::alpaca_wallet::AlpacaWalletService;
 use crate::bindings::IERC20;
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
 use crate::config::{BrokerConfig, Config};
-use crate::equity_redemption::RedemptionAggregateId;
-use crate::onchain::vault::{VaultId, VaultService};
+use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId, RedemptionServices};
+use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
-use crate::rebalancing::{MintManager, RedemptionManager};
+use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenization::Tokenizer;
+use crate::tokenization::{
+    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
+};
+use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
 use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
 use super::TransferDirection;
+
+fn create_vault_registry_query(pool: &SqlitePool) -> Arc<VaultRegistryQuery> {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(pool.clone(), "vault_registry_view".to_string()));
+    Arc::new(GenericQuery::new(view_repo))
+}
+
+struct TransferContext<'a, BP: Provider + Clone> {
+    config: &'a Config,
+    pool: &'a SqlitePool,
+    rebalancing_config: &'a RebalancingConfig,
+    base_provider: BP,
+    tokenization_service: Arc<AlpacaTokenizationService<BP>>,
+}
 
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
@@ -76,60 +95,148 @@ pub(super) async fn transfer_equity_command<W: Write>(
         rebalancing_config.redemption_wallet,
     ));
 
+    let ctx = TransferContext {
+        config,
+        pool,
+        rebalancing_config,
+        base_provider,
+        tokenization_service,
+    };
+
     match direction {
         TransferDirection::ToRaindex => {
-            writeln!(stdout, "   Creating mint request...")?;
-
-            let mint_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
-            let mint_manager = MintManager::new(tokenization_service, mint_cqrs);
-
-            let issuer_request_id =
-                IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
-
-            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
-            let wallet = signer.address();
-
-            writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
-            writeln!(stdout, "   Receiving Wallet: {wallet}")?;
-
-            mint_manager
-                .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
-                .await?;
-
-            writeln!(stdout, "✅ Mint completed successfully")?;
+            execute_mint(stdout, symbol, quantity, ctx).await?;
         }
 
         TransferDirection::ToAlpaca => {
             let token = token_address.ok_or_else(|| {
                 anyhow::anyhow!("--token-address is required for to-alpaca direction (redemption)")
             })?;
-
-            writeln!(stdout, "   Token Address: {token}")?;
-            writeln!(stdout, "   Sending tokens for redemption...")?;
-
-            let redemption_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_cqrs);
-
-            let aggregate_id =
-                RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
-
-            let amount = quantity.to_u256_18_decimals()?;
-
-            writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
-            writeln!(stdout, "   Amount (wei): {amount}")?;
-
-            redemption_manager
-                .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
-                .await?;
-
-            writeln!(stdout, "✅ Redemption completed successfully")?;
+            execute_redemption(stdout, symbol, quantity, token, ctx).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn execute_mint<W, BP>(
+    stdout: &mut W,
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    ctx: TransferContext<'_, BP>,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    BP: Provider + Clone + 'static,
+{
+    writeln!(stdout, "   Creating mint request...")?;
+
+    let signer = PrivateKeySigner::from_bytes(&ctx.rebalancing_config.evm_private_key)?;
+    let owner = signer.address();
+
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        ctx.pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let raindex = Arc::new(RaindexService::new(
+        ctx.base_provider,
+        ctx.config.evm.orderbook,
+        vault_registry_query,
+        owner,
+    ));
+
+    let mint_services = MintServices {
+        tokenizer: ctx.tokenization_service,
+        raindex,
+    };
+    let mint_store =
+        PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
+    let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], mint_services));
+    let mint_manager = MintManager::new(mint_cqrs);
+
+    let issuer_request_id = IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
+
+    writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
+    writeln!(stdout, "   Receiving Wallet: {owner}")?;
+
+    mint_manager
+        .execute_mint(&issuer_request_id, symbol.clone(), quantity, owner)
+        .await?;
+
+    writeln!(stdout, "✅ Mint completed successfully")?;
+    Ok(())
+}
+
+async fn execute_redemption<W, BP>(
+    stdout: &mut W,
+    symbol: &Symbol,
+    quantity: FractionalShares,
+    token: Address,
+    ctx: TransferContext<'_, BP>,
+) -> anyhow::Result<()>
+where
+    W: Write,
+    BP: Provider + Clone + 'static,
+{
+    writeln!(stdout, "   Token Address: {token}")?;
+    writeln!(stdout, "   Sending tokens for redemption...")?;
+
+    let signer = PrivateKeySigner::from_bytes(&ctx.rebalancing_config.evm_private_key)?;
+    let owner = signer.address();
+
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        ctx.pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let raindex: Arc<dyn Raindex> = Arc::new(RaindexService::new(
+        ctx.base_provider,
+        ctx.config.evm.orderbook,
+        vault_registry_query,
+        owner,
+    ));
+
+    let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service;
+    let redemption_services = RedemptionServices {
+        tokenizer: tokenizer.clone(),
+        raindex,
+    };
+
+    let redemption_view_repo = Arc::new(SqliteViewRepository::<
+        Lifecycle<EquityRedemption, Never>,
+        Lifecycle<EquityRedemption, Never>,
+    >::new(
+        ctx.pool.clone(), "equity_redemption_view".to_string()
+    ));
+    let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
+
+    let redemption_cqrs = Arc::new(sqlite_cqrs(
+        ctx.pool.clone(),
+        vec![Box::new(GenericQuery::new(redemption_view_repo))],
+        redemption_services,
+    ));
+
+    let redemption_manager = RedemptionManager::new(redemption_cqrs, redemption_query);
+
+    let aggregate_id = RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
+
+    let amount = quantity.to_u256_18_decimals()?;
+
+    writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
+    writeln!(stdout, "   Amount (wei): {amount}")?;
+
+    redemption_manager
+        .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
+        .await?;
+
+    writeln!(stdout, "✅ Redemption completed successfully")?;
     Ok(())
 }
 
@@ -211,9 +318,14 @@ where
     );
 
     let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
-    let vault_service = Arc::new(VaultService::new(
+
+    let vault_registry_query = create_vault_registry_query(pool);
+
+    let raindex_service = Arc::new(RaindexService::new(
         base_provider_with_wallet,
         config.evm.orderbook,
+        vault_registry_query,
+        owner,
     ));
     let event_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
@@ -223,7 +335,7 @@ where
         alpaca_broker,
         alpaca_wallet,
         bridge,
-        vault_service,
+        raindex_service,
         cqrs,
         owner,
         VaultId(rebalancing_config.usdc_vault_id),
@@ -299,8 +411,14 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
 
+    let issuer_request_id = IssuerRequestId::new(uuid::Uuid::new_v4().to_string());
     let request = tokenization_service
-        .request_mint(symbol.clone(), quantity, receiving_wallet)
+        .request_mint(
+            symbol.clone(),
+            quantity,
+            receiving_wallet,
+            issuer_request_id,
+        )
         .await?;
 
     writeln!(stdout, "   Request ID: {}", request.id.0)?;

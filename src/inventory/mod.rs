@@ -1,7 +1,7 @@
 //! Inventory tracking for cross-venue asset management.
 
 mod polling;
-mod snapshot;
+pub(crate) mod snapshot;
 mod snapshot_query;
 mod venue_balance;
 mod view;
