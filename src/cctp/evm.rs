@@ -121,7 +121,10 @@ where
             Err(e) => return Err(handle_contract_error(e).await),
         };
 
-        let receipt = pending.get_receipt().await?;
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
 
         if !receipt
             .inner
@@ -158,7 +161,10 @@ where
             Err(e) => return Err(handle_contract_error(e).await),
         };
 
-        let receipt = pending.get_receipt().await?;
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
 
         let mint_event = receipt
             .inner

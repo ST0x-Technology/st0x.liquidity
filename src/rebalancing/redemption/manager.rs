@@ -470,7 +470,8 @@ mod tests {
                 self.orderbook_address,
                 vault_registry_query,
                 owner,
-            );
+            )
+            .with_required_confirmations(1);
 
             // Approve orderbook to spend tokens
             token

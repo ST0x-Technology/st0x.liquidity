@@ -373,12 +373,15 @@ mod tests {
             local_evm.provider.clone(),
             local_evm.signer.address(),
         ));
-        let raindex: Arc<dyn Raindex> = Arc::new(RaindexService::new(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-            vault_registry_query,
-            local_evm.signer.address(),
-        ));
+        let raindex: Arc<dyn Raindex> = Arc::new(
+            RaindexService::new(
+                local_evm.provider.clone(),
+                local_evm.orderbook_address,
+                vault_registry_query,
+                local_evm.signer.address(),
+            )
+            .with_required_confirmations(1),
+        );
         let cqrs = create_test_cqrs_with_services(tokenizer, raindex);
         let manager = MintManager::new(cqrs);
 
