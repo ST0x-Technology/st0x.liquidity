@@ -17,7 +17,7 @@ use crate::Symbol;
 pub(crate) struct AlpacaBrokerApiClient {
     http_client: reqwest::Client,
     base_url: String,
-    account_id: String,
+    account_id: AlpacaAccountId,
     mode: AlpacaBrokerApiMode,
 }
 
@@ -60,8 +60,8 @@ impl AlpacaBrokerApiClient {
         &self.base_url
     }
 
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
+    pub(crate) fn account_id(&self) -> AlpacaAccountId {
+        self.account_id
     }
 
     pub(crate) fn is_sandbox(&self) -> bool {

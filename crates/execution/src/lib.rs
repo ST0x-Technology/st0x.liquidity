@@ -18,8 +18,8 @@ pub mod schwab;
 pub mod test_utils;
 
 pub use alpaca_broker_api::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode,
-    ConversionDirection, TimeInForce,
+    AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError,
+    AlpacaBrokerApiMode, ConversionDirection, TimeInForce,
 };
 pub use alpaca_trading_api::{
     AlpacaTradingApi, AlpacaTradingApiCtx, AlpacaTradingApiError, AlpacaTradingApiMode,
