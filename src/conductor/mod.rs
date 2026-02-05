@@ -151,26 +151,15 @@ where
     .await?;
 
     loop {
-        let timeout = wait_for_market_open(&executor).await?;
-
-        if !try_start_trading(&mut conductor, &config, &pool, &executor, &shared).await {
-            continue;
-        }
-
-        if let Some(result) = run_trading_session(&mut conductor, timeout).await {
-            return result;
+        if try_start_trading(&mut conductor, &config, &pool, &executor, &shared).await {
+            break;
         }
     }
-}
 
-async fn wait_for_market_open<E: Executor>(executor: &E) -> anyhow::Result<Duration> {
-    let timeout = executor
-        .wait_until_market_open()
-        .await
-        .map_err(|e| anyhow::anyhow!("Market hours check failed: {e}"))?;
-
-    log_market_status(timeout);
-    Ok(timeout)
+    info!("Conductor running");
+    let result = conductor.wait_for_completion().await;
+    conductor.abort_all();
+    result
 }
 
 async fn try_start_trading<E>(
@@ -197,49 +186,6 @@ where
             conductor.executor_maintenance = executor.run_executor_maintenance().await;
             false
         }
-    }
-}
-
-enum SessionOutcome {
-    TaskCompleted(anyhow::Result<()>),
-    MarketClosed,
-}
-
-async fn await_session_outcome(conductor: &mut Conductor, timeout: Duration) -> SessionOutcome {
-    tokio::select! {
-        result = conductor.wait_for_completion() => SessionOutcome::TaskCompleted(result),
-        () = tokio::time::sleep(timeout) => SessionOutcome::MarketClosed,
-    }
-}
-
-/// Runs until market close or a task crashes. Returns `Some` if the conductor
-/// should exit, `None` if it should loop back for the next session.
-async fn run_trading_session(
-    conductor: &mut Conductor,
-    timeout: Duration,
-) -> Option<anyhow::Result<()>> {
-    info!("Market opened, conductor running");
-
-    match await_session_outcome(conductor, timeout).await {
-        SessionOutcome::TaskCompleted(result) => {
-            conductor.abort_all();
-            Some(result)
-        }
-        SessionOutcome::MarketClosed => {
-            info!("Market closed, shutting down trading tasks");
-            conductor.abort_trading_tasks();
-            info!("Trading tasks shutdown, waiting for next market open");
-            None
-        }
-    }
-}
-
-fn log_market_status(timeout: Duration) {
-    let timeout_minutes = timeout.as_secs() / 60;
-    if timeout_minutes < 60 * 24 {
-        info!("Market is open, starting conductor (will timeout in {timeout_minutes} minutes)");
-    } else {
-        info!("Starting conductor (no market hours restrictions)");
     }
 }
 
