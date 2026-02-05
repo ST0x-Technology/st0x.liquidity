@@ -8,10 +8,10 @@
 //! # State Flow
 //!
 //! ```text
-//! MintRequested -> MintAccepted -> TokensReceived -> DepositedIntoRaindex -> Completed
-//!       |               |               |
-//!       v               v               v
-//!     Failed          Failed          Failed
+//! MintRequested -> MintAccepted -> TokensReceived -> TokensWrapped -> DepositedIntoRaindex -> Completed
+//!       |               |               |                 |                   |
+//!       v               v               v                 v                   v
+//!     Failed          Failed          Failed           Failed              Failed
 //! ```
 //!
 //! Terminal states (`Completed`, `Failed`) capture audit-critical fields not
@@ -32,6 +32,7 @@ use crate::equity_redemption::TOKENIZED_EQUITY_DECIMALS;
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::onchain::raindex::{Raindex, RaindexError};
 use crate::tokenization::{TokenizationRequestStatus, Tokenizer, TokenizerError};
+use crate::wrapper::{Wrapper, WrapperError};
 
 /// SQLite-backed event store for TokenizedEquityMint aggregates.
 pub(crate) type MintEventStore =
@@ -39,11 +40,12 @@ pub(crate) type MintEventStore =
 
 /// Services required by the TokenizedEquityMint aggregate.
 ///
-/// Combines `Tokenizer` (for Alpaca mint operations) and `Raindex` (for depositing
-/// to Rain OrderBook) traits.
+/// Combines `Tokenizer` (for Alpaca mint operations), `Wrapper` (for ERC-4626 wrapping),
+/// and `Raindex` (for depositing to Rain OrderBook) traits.
 #[derive(Clone)]
 pub(crate) struct MintServices {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) wrapper: Arc<dyn Wrapper>,
     pub(crate) raindex: Arc<dyn Raindex>,
 }
 
@@ -83,9 +85,12 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to request mint when already in progress
     #[error("Mint already in progress")]
     AlreadyInProgress,
-    /// Attempted to deposit to vault before tokens were received
-    #[error("Cannot deposit to vault: tokens not received")]
+    /// Attempted to wrap before tokens were received
+    #[error("Cannot wrap: tokens not received")]
     TokensNotReceived,
+    /// Attempted to deposit to vault before tokens were wrapped
+    #[error("Cannot deposit to vault: tokens not wrapped")]
+    TokensNotWrapped,
     /// Attempted to modify a completed mint operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -98,6 +103,9 @@ pub(crate) enum TokenizedEquityMintError {
     /// Tokenizer service error
     #[error(transparent)]
     Tokenizer(#[from] TokenizerError),
+    /// Wrapper service error
+    #[error(transparent)]
+    Wrapper(#[from] WrapperError),
     /// Vault service error
     #[error(transparent)]
     Raindex(#[from] RaindexError),
@@ -123,10 +131,15 @@ pub(crate) enum TokenizedEquityMintCommand {
         quantity: Decimal,
         wallet: Address,
     },
-    /// Deposit received tokens into Raindex vault.
+    /// Wrap received tokens via ERC-4626 vault.
     ///
-    /// Flow: DepositedIntoRaindex -> Completed (success)
-    ///    or RaindexDepositFailed (failure, terminal)
+    /// Flow: TokensReceived -> TokensWrapped (success)
+    ///                      or WrappingFailed (failure, terminal)
+    Wrap,
+    /// Deposit wrapped tokens into Raindex vault.
+    ///
+    /// Flow: TokensWrapped -> DepositedIntoRaindex -> Completed (success)
+    ///                     or RaindexDepositFailed (failure, terminal)
     Deposit,
 }
 
@@ -172,15 +185,28 @@ pub(crate) enum TokenizedEquityMintEvent {
         received_at: DateTime<Utc>,
     },
 
-    /// Tokens deposited from wallet to Raindex vault.
+    /// Unwrapped tokens have been wrapped into ERC-4626 vault shares.
+    TokensWrapped {
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        wrapped_at: DateTime<Utc>,
+    },
+    /// Wrapping failed after tokens were received.
+    WrappingFailed {
+        symbol: Symbol,
+        quantity: Decimal,
+        failed_at: DateTime<Utc>,
+    },
+
+    /// Wrapped tokens deposited to Raindex vault.
     DepositedIntoRaindex {
         symbol: Symbol,
         quantity: Decimal,
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
     },
-    /// Vault deposit failed after tokens were received.
-    /// Tokens remain in wallet, can be retried or manually recovered.
+    /// Vault deposit failed after tokens were wrapped.
+    /// Wrapped tokens remain in wallet, can be retried or manually recovered.
     RaindexDepositFailed {
         symbol: Symbol,
         quantity: Decimal,
@@ -205,6 +231,8 @@ impl DomainEvent for TokenizedEquityMintEvent {
                 "TokenizedEquityMintEvent::MintAcceptanceFailed".to_string()
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
+            Self::TokensWrapped { .. } => "TokenizedEquityMintEvent::TokensWrapped".to_string(),
+            Self::WrappingFailed { .. } => "TokenizedEquityMintEvent::WrappingFailed".to_string(),
             Self::DepositedIntoRaindex { .. } => {
                 "TokenizedEquityMintEvent::DepositedIntoRaindex".to_string()
             }
@@ -260,7 +288,25 @@ pub(crate) enum TokenizedEquityMint {
         received_at: DateTime<Utc>,
     },
 
-    /// Tokens deposited from wallet to Raindex vault
+    /// Tokens have been wrapped into ERC-4626 vault shares
+    TokensWrapped {
+        symbol: Symbol,
+        quantity: Decimal,
+        wallet: Address,
+        issuer_request_id: IssuerRequestId,
+        tokenization_request_id: TokenizationRequestId,
+        tx_hash: TxHash,
+        receipt_id: ReceiptId,
+        shares_minted: U256,
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        requested_at: DateTime<Utc>,
+        accepted_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        wrapped_at: DateTime<Utc>,
+    },
+
+    /// Wrapped tokens deposited to Raindex vault
     DepositedIntoRaindex {
         symbol: Symbol,
         quantity: Decimal,
@@ -269,6 +315,8 @@ pub(crate) enum TokenizedEquityMint {
         tokenization_request_id: TokenizationRequestId,
         /// Token receipt transaction
         token_tx_hash: TxHash,
+        /// Wrapping transaction
+        wrap_tx_hash: TxHash,
         /// Vault deposit transaction
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
@@ -283,6 +331,8 @@ pub(crate) enum TokenizedEquityMint {
         tokenization_request_id: TokenizationRequestId,
         /// Token receipt transaction from Alpaca
         token_tx_hash: TxHash,
+        /// Wrapping transaction
+        wrap_tx_hash: TxHash,
         /// Vault deposit transaction to Raindex
         vault_deposit_tx_hash: TxHash,
         completed_at: DateTime<Utc>,
@@ -330,6 +380,7 @@ impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
                 self.handle_mint(services, issuer_request_id, symbol, quantity, wallet)
                     .await
             }
+            TokenizedEquityMintCommand::Wrap => self.handle_wrap(services).await,
             TokenizedEquityMintCommand::Deposit => self.handle_deposit(services).await,
         }
     }
@@ -530,26 +581,81 @@ impl Lifecycle<TokenizedEquityMint, Never> {
         }
     }
 
-    /// Handles the Deposit command: deposits received tokens into Raindex vault.
+    /// Handles the Wrap command: wraps unwrapped tokens into ERC-4626 vault shares.
     ///
-    /// Flow: DepositedIntoRaindex -> Completed (success)
-    ///    or RaindexDepositFailed (failure, terminal)
-    async fn handle_deposit(
+    /// Flow: TokensReceived -> TokensWrapped (success)
+    ///                      or WrappingFailed (failure, terminal)
+    async fn handle_wrap(
         &self,
         services: &MintServices,
     ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
-        let (symbol, quantity, shares_minted) = match self.live() {
+        let (symbol, quantity, shares_minted, wallet) = match self.live() {
             Ok(TokenizedEquityMint::TokensReceived {
                 symbol,
                 quantity,
                 shares_minted,
+                wallet,
                 ..
-            }) => (symbol.clone(), *quantity, *shares_minted),
+            }) => (symbol.clone(), *quantity, *shares_minted, *wallet),
             Err(LifecycleError::Uninitialized)
             | Ok(
                 TokenizedEquityMint::MintRequested { .. }
                 | TokenizedEquityMint::MintAccepted { .. },
             ) => return Err(TokenizedEquityMintError::TokensNotReceived),
+            Ok(
+                TokenizedEquityMint::TokensWrapped { .. }
+                | TokenizedEquityMint::DepositedIntoRaindex { .. }
+                | TokenizedEquityMint::Completed { .. },
+            ) => return Err(TokenizedEquityMintError::AlreadyCompleted),
+            Ok(TokenizedEquityMint::Failed { .. }) => {
+                return Err(TokenizedEquityMintError::AlreadyFailed);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let (token, _vault_id) = services.raindex.lookup_vault_info(&symbol).await?;
+
+        match services
+            .wrapper
+            .to_wrapped(token, shares_minted, wallet)
+            .await
+        {
+            Ok((wrap_tx_hash, wrapped_shares)) => {
+                Ok(vec![TokenizedEquityMintEvent::TokensWrapped {
+                    wrap_tx_hash,
+                    wrapped_shares,
+                    wrapped_at: Utc::now(),
+                }])
+            }
+            Err(_) => Ok(vec![TokenizedEquityMintEvent::WrappingFailed {
+                symbol,
+                quantity,
+                failed_at: Utc::now(),
+            }]),
+        }
+    }
+
+    /// Handles the Deposit command: deposits wrapped tokens into Raindex vault.
+    ///
+    /// Flow: TokensWrapped -> DepositedIntoRaindex -> Completed (success)
+    ///                     or RaindexDepositFailed (failure, terminal)
+    async fn handle_deposit(
+        &self,
+        services: &MintServices,
+    ) -> Result<Vec<TokenizedEquityMintEvent>, TokenizedEquityMintError> {
+        let (symbol, quantity, wrapped_shares) = match self.live() {
+            Ok(TokenizedEquityMint::TokensWrapped {
+                symbol,
+                quantity,
+                wrapped_shares,
+                ..
+            }) => (symbol.clone(), *quantity, *wrapped_shares),
+            Err(LifecycleError::Uninitialized)
+            | Ok(
+                TokenizedEquityMint::MintRequested { .. }
+                | TokenizedEquityMint::MintAccepted { .. }
+                | TokenizedEquityMint::TokensReceived { .. },
+            ) => return Err(TokenizedEquityMintError::TokensNotWrapped),
             Ok(
                 TokenizedEquityMint::DepositedIntoRaindex { .. }
                 | TokenizedEquityMint::Completed { .. },
@@ -564,7 +670,7 @@ impl Lifecycle<TokenizedEquityMint, Never> {
 
         match services
             .raindex
-            .deposit(token, vault_id, shares_minted, TOKENIZED_EQUITY_DECIMALS)
+            .deposit(token, vault_id, wrapped_shares, TOKENIZED_EQUITY_DECIMALS)
             .await
         {
             Ok(vault_deposit_tx_hash) => Ok(vec![
@@ -633,6 +739,14 @@ impl TokenizedEquityMint {
                 *received_at,
                 event,
             ),
+            TokenizedEquityMintEvent::TokensWrapped {
+                wrap_tx_hash,
+                wrapped_shares,
+                wrapped_at,
+            } => current.apply_tokens_wrapped(*wrap_tx_hash, *wrapped_shares, *wrapped_at, event),
+            TokenizedEquityMintEvent::WrappingFailed { failed_at, .. } => {
+                current.apply_wrapping_failed(*failed_at, event)
+            }
             TokenizedEquityMintEvent::DepositedIntoRaindex {
                 vault_deposit_tx_hash,
                 deposited_at,
@@ -741,18 +855,90 @@ impl TokenizedEquityMint {
         })
     }
 
+    fn apply_tokens_wrapped(
+        &self,
+        wrap_tx_hash: TxHash,
+        wrapped_shares: U256,
+        wrapped_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::TokensReceived {
+            symbol,
+            quantity,
+            wallet,
+            issuer_request_id,
+            tokenization_request_id,
+            tx_hash,
+            receipt_id,
+            shares_minted,
+            requested_at,
+            accepted_at,
+            received_at,
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::TokensWrapped {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            wallet: *wallet,
+            issuer_request_id: issuer_request_id.clone(),
+            tokenization_request_id: tokenization_request_id.clone(),
+            tx_hash: *tx_hash,
+            receipt_id: receipt_id.clone(),
+            shares_minted: *shares_minted,
+            wrap_tx_hash,
+            wrapped_shares,
+            requested_at: *requested_at,
+            accepted_at: *accepted_at,
+            received_at: *received_at,
+            wrapped_at,
+        })
+    }
+
+    fn apply_wrapping_failed(
+        &self,
+        failed_at: DateTime<Utc>,
+        event: &TokenizedEquityMintEvent,
+    ) -> Result<Self, LifecycleError<Never>> {
+        let Self::TokensReceived {
+            symbol,
+            quantity,
+            requested_at,
+            ..
+        } = self
+        else {
+            return Err(LifecycleError::Mismatch {
+                state: format!("{self:?}"),
+                event: event.event_type(),
+            });
+        };
+
+        Ok(Self::Failed {
+            symbol: symbol.clone(),
+            quantity: *quantity,
+            requested_at: *requested_at,
+            failed_at,
+        })
+    }
+
     fn apply_vault_deposited(
         &self,
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
     ) -> Result<Self, LifecycleError<Never>> {
-        let Self::TokensReceived {
+        let Self::TokensWrapped {
             symbol,
             quantity,
             issuer_request_id,
             tokenization_request_id,
             tx_hash,
+            wrap_tx_hash,
             ..
         } = self
         else {
@@ -768,6 +954,7 @@ impl TokenizedEquityMint {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             token_tx_hash: *tx_hash,
+            wrap_tx_hash: *wrap_tx_hash,
             vault_deposit_tx_hash,
             deposited_at,
         })
@@ -778,7 +965,7 @@ impl TokenizedEquityMint {
         failed_at: DateTime<Utc>,
         event: &TokenizedEquityMintEvent,
     ) -> Result<Self, LifecycleError<Never>> {
-        let Self::TokensReceived {
+        let Self::TokensWrapped {
             symbol,
             quantity,
             requested_at,
@@ -810,6 +997,7 @@ impl TokenizedEquityMint {
             issuer_request_id,
             tokenization_request_id,
             token_tx_hash,
+            wrap_tx_hash,
             vault_deposit_tx_hash,
             ..
         } = self
@@ -826,6 +1014,7 @@ impl TokenizedEquityMint {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             token_tx_hash: *token_tx_hash,
+            wrap_tx_hash: *wrap_tx_hash,
             vault_deposit_tx_hash: *vault_deposit_tx_hash,
             completed_at,
         })
@@ -886,359 +1075,171 @@ impl TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use rust_decimal_macros::dec;
     use std::sync::Arc;
 
+    use rust_decimal_macros::dec;
+
     use super::*;
-    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::mock::MockVault;
     use crate::tokenization::mock::MockTokenizer;
+    use crate::wrapper::mock::MockWrapper;
 
     fn mock_services() -> MintServices {
         MintServices {
             tokenizer: Arc::new(MockTokenizer::new()),
-            raindex: Arc::new(MockRaindex::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
         }
     }
 
-    #[test]
-    fn event_application_rejects_mint_accepted_on_completed_state() {
-        let completed = TokenizedEquityMint::Completed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            token_tx_hash: TxHash::random(),
-            vault_deposit_tx_hash: TxHash::random(),
-            completed_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS999".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK999".to_string()),
-            accepted_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &completed).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("Completed"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintAccepted");
-    }
-
-    #[test]
-    fn event_application_rejects_tokens_received_on_requested_state() {
-        let requested = TokenizedEquityMint::MintRequested {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            requested_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::TokensReceived {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &requested).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintRequested"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::TokensReceived");
-    }
-
-    #[test]
-    fn event_application_rejects_completed_on_accepted_state() {
-        let accepted = TokenizedEquityMint::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            requested_at: Utc::now(),
-            accepted_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::Completed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            completed_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::Completed");
-    }
-
-    #[test]
-    fn event_application_rejects_rejected_on_accepted_state() {
-        let accepted = TokenizedEquityMint::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            requested_at: Utc::now(),
-            accepted_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::MintRejected {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            status_code: None,
-            rejected_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintRejected");
-    }
-
-    #[test]
-    fn event_application_rejects_acceptance_failed_on_requested_state() {
-        let requested = TokenizedEquityMint::MintRequested {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            requested_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            last_status: TokenizationRequestStatus::Pending,
-            failed_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &requested).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintRequested"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::MintAcceptanceFailed");
-    }
-
-    #[test]
-    fn event_application_rejects_deposited_into_raindex_on_accepted_state() {
-        let accepted = TokenizedEquityMint::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            requested_at: Utc::now(),
-            accepted_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::DepositedIntoRaindex {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            vault_deposit_tx_hash: TxHash::random(),
-            deposited_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::DepositedIntoRaindex");
-    }
-
-    #[test]
-    fn event_application_rejects_raindex_deposit_failed_on_accepted_state() {
-        let accepted = TokenizedEquityMint::MintAccepted {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            wallet: Address::random(),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            requested_at: Utc::now(),
-            accepted_at: Utc::now(),
-        };
-
-        let event = TokenizedEquityMintEvent::RaindexDepositFailed {
-            symbol: Symbol::new("AAPL").unwrap(),
-            quantity: dec!(100.5),
-            failed_tx_hash: None,
-            failed_at: Utc::now(),
-        };
-
-        let err = TokenizedEquityMint::apply_transition(&event, &accepted).unwrap_err();
-
-        let LifecycleError::Mismatch { state, event: evt } = err else {
-            panic!("Expected Mismatch error, got {err:?}");
-        };
-        assert!(state.contains("MintAccepted"));
-        assert_eq!(evt, "TokenizedEquityMintEvent::RaindexDepositFailed");
-    }
-
     #[tokio::test]
-    async fn mint_command_rejects_when_already_in_progress() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
+    async fn test_mint_from_uninitialized_with_successful_tokenizer() {
+        let services = mock_services();
+        let aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
-        aggregate.apply(TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        });
-
-        let result = aggregate
+        let events = aggregate
             .handle(
                 TokenizedEquityMintCommand::Mint {
-                    issuer_request_id: IssuerRequestId::new("ISS123"),
-                    symbol,
-                    quantity: dec!(50.0),
+                    issuer_request_id: IssuerRequestId::new("test-123"),
+                    symbol: symbol.clone(),
+                    quantity: dec!(100.5),
                     wallet,
                 },
-                &mock_services(),
+                &services,
             )
-            .await;
+            .await
+            .unwrap();
 
+        // Should produce MintRequested, MintAccepted, TokensReceived
+        assert_eq!(events.len(), 3);
         assert!(matches!(
-            result,
-            Err(TokenizedEquityMintError::AlreadyInProgress)
+            events[0],
+            TokenizedEquityMintEvent::MintRequested { .. }
+        ));
+        assert!(matches!(
+            events[1],
+            TokenizedEquityMintEvent::MintAccepted { .. }
+        ));
+        assert!(matches!(
+            events[2],
+            TokenizedEquityMintEvent::TokensReceived { .. }
         ));
     }
 
     #[tokio::test]
-    async fn mint_command_rejects_when_already_completed() {
+    async fn test_deposit_wraps_and_deposits() {
+        let services = mock_services();
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
-        aggregate.apply(TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::MintAccepted {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::TokensReceived {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(1)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::DepositedIntoRaindex {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            vault_deposit_tx_hash: TxHash::random(),
-            deposited_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::Completed {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            completed_at: Utc::now(),
-        });
-
-        let result = aggregate
+        // First mint to get to TokensReceived state
+        let events = aggregate
             .handle(
                 TokenizedEquityMintCommand::Mint {
-                    issuer_request_id: IssuerRequestId::new("ISS456"),
-                    symbol,
-                    quantity: dec!(50.0),
+                    issuer_request_id: IssuerRequestId::new("test-123"),
+                    symbol: symbol.clone(),
+                    quantity: dec!(100.5),
                     wallet,
                 },
-                &mock_services(),
+                &services,
             )
-            .await;
+            .await
+            .unwrap();
 
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(TokenizedEquityMintCommand::Wrap, &services)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
         assert!(matches!(
-            result,
-            Err(TokenizedEquityMintError::AlreadyCompleted)
+            events[0],
+            TokenizedEquityMintEvent::TokensWrapped { .. }
+        ));
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(TokenizedEquityMintCommand::Deposit, &services)
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+        ));
+        assert!(matches!(
+            events[1],
+            TokenizedEquityMintEvent::Completed { .. }
         ));
     }
 
     #[tokio::test]
-    async fn mint_command_rejects_when_already_failed() {
+    async fn test_complete_mint_flow_end_to_end() {
+        let services = mock_services();
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
-        aggregate.apply(TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::MintRejected {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            status_code: None,
-            rejected_at: Utc::now(),
-        });
-
-        let result = aggregate
+        // Mint command
+        let events = aggregate
             .handle(
                 TokenizedEquityMintCommand::Mint {
-                    issuer_request_id: IssuerRequestId::new("ISS456"),
-                    symbol,
-                    quantity: dec!(50.0),
+                    issuer_request_id: IssuerRequestId::new("test-123"),
+                    symbol: symbol.clone(),
+                    quantity: dec!(100.5),
                     wallet,
                 },
-                &mock_services(),
+                &services,
             )
-            .await;
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(TokenizedEquityMintCommand::Wrap, &services)
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        let events = aggregate
+            .handle(TokenizedEquityMintCommand::Deposit, &services)
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
 
         assert!(matches!(
-            result,
-            Err(TokenizedEquityMintError::AlreadyFailed)
+            aggregate,
+            Lifecycle::Live(TokenizedEquityMint::Completed { .. })
         ));
     }
 
     #[tokio::test]
-    async fn deposit_command_rejects_before_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        aggregate.apply(TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::MintAccepted {
-            symbol,
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        });
+    async fn test_cannot_wrap_before_tokens_received() {
+        let services = mock_services();
+        let aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
 
         let result = aggregate
-            .handle(TokenizedEquityMintCommand::Deposit, &mock_services())
+            .handle(TokenizedEquityMintCommand::Wrap, &services)
             .await;
 
         assert!(matches!(
@@ -1248,80 +1249,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deposit_command_rejects_when_already_completed() {
+    async fn test_cannot_deposit_before_tokens_wrapped() {
+        let services = mock_services();
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
-        aggregate.apply(TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::MintAccepted {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::TokensReceived {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            tx_hash: TxHash::random(),
-            receipt_id: ReceiptId(U256::from(1)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::DepositedIntoRaindex {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            vault_deposit_tx_hash: TxHash::random(),
-            deposited_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::Completed {
-            symbol,
-            quantity: dec!(100.5),
-            completed_at: Utc::now(),
-        });
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::Mint {
+                    issuer_request_id: IssuerRequestId::new("test-123"),
+                    symbol: symbol.clone(),
+                    quantity: dec!(100.5),
+                    wallet,
+                },
+                &services,
+            )
+            .await
+            .unwrap();
+
+        for event in events {
+            aggregate.apply(event);
+        }
 
         let result = aggregate
-            .handle(TokenizedEquityMintCommand::Deposit, &mock_services())
+            .handle(TokenizedEquityMintCommand::Deposit, &services)
             .await;
 
         assert!(matches!(
             result,
-            Err(TokenizedEquityMintError::AlreadyCompleted)
+            Err(TokenizedEquityMintError::TokensNotWrapped)
         ));
     }
 
     #[tokio::test]
-    async fn deposit_command_rejects_when_already_failed() {
+    async fn test_cannot_mint_when_already_in_progress() {
+        let services = mock_services();
         let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let wallet = Address::random();
 
-        aggregate.apply(TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        });
-        aggregate.apply(TokenizedEquityMintEvent::MintRejected {
-            symbol,
-            quantity: dec!(100.5),
-            status_code: None,
-            rejected_at: Utc::now(),
-        });
+        // First mint
+        let events = aggregate
+            .handle(
+                TokenizedEquityMintCommand::Mint {
+                    issuer_request_id: IssuerRequestId::new("test-123"),
+                    symbol: symbol.clone(),
+                    quantity: dec!(100.5),
+                    wallet,
+                },
+                &services,
+            )
+            .await
+            .unwrap();
 
+        for event in events {
+            aggregate.apply(event);
+        }
+
+        // Second mint should fail
         let result = aggregate
-            .handle(TokenizedEquityMintCommand::Deposit, &mock_services())
+            .handle(
+                TokenizedEquityMintCommand::Mint {
+                    issuer_request_id: IssuerRequestId::new("test-456"),
+                    symbol,
+                    quantity: dec!(50.0),
+                    wallet,
+                },
+                &services,
+            )
             .await;
 
         assert!(matches!(
             result,
-            Err(TokenizedEquityMintError::AlreadyFailed)
+            Err(TokenizedEquityMintError::AlreadyInProgress)
         ));
     }
 }

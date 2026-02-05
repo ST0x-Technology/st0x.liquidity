@@ -134,13 +134,18 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{
+        AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode,
+    };
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
         AlpacaBrokerApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
         }
     }
@@ -152,7 +157,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -171,7 +176,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -204,7 +209,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -212,7 +217,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -237,7 +242,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -251,7 +256,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -281,7 +286,7 @@ mod tests {
         // 92233720368547759.00 * 100 = 9223372036854775900 > i64::MAX
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -295,7 +300,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -322,7 +327,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -337,7 +342,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -370,7 +375,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -378,7 +383,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -408,7 +413,7 @@ mod tests {
         // sub-cent precision is normal (e.g. 6.803019322 * 75.21 = 511.6476).
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -422,7 +427,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

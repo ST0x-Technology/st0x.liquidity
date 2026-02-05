@@ -11,18 +11,13 @@ use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
 use rust_decimal::Decimal;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
-use chrono::Utc;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
-use st0x_execution::{ArithmeticError, FractionalShares, Symbol};
-
-use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
@@ -31,8 +26,12 @@ use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::VaultRegistry;
-
 use crate::vault_registry::VaultRegistryError;
+use crate::wrapper::Wrapper;
+use crate::wrapper::{EquityTokenAddresses, UnderlyingPerWrapped};
+use chrono::Utc;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
+use st0x_execution::{AlpacaAccountId, ArithmeticError, FractionalShares, Symbol};
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
@@ -50,12 +49,12 @@ enum TokenAddressError {
 pub enum RebalancingConfigError {
     #[error("rebalancing requires Alpaca broker")]
     NotAlpacaBroker,
-    #[error(transparent)]
-    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("invalid EVM private key: {0}")]
+    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("invalid Alpaca account ID: {0}")]
+    InvalidAccountId(#[from] uuid::Error),
     #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
-    WalletCollision(Address),
-    #[error(transparent)]
-    Uuid(#[from] uuid::Error),
+    WalletsMatch(Address),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -66,11 +65,10 @@ pub(crate) enum UsdcRebalancingConfig {
     Disabled,
 }
 
-/// TOML fields for rebalancing configuration (without broker auth).
-///
-/// This struct is used when rebalancing config is part of a larger config
-/// where broker auth is provided separately.
-#[derive(Debug, Clone, serde::Deserialize)]
+/// TOML fields for rebalancing configuration.
+/// Alpaca auth is NOT included here - it's derived from the broker config
+/// to eliminate duplication and ensure consistency.
+#[derive(Clone, serde::Deserialize)]
 pub(crate) struct RebalancingTomlFields {
     pub(crate) equity: ImbalanceThreshold,
     pub(crate) usdc: UsdcRebalancingConfig,
@@ -78,6 +76,7 @@ pub(crate) struct RebalancingTomlFields {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
+    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Configuration for rebalancing operations.
@@ -96,41 +95,12 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Parsed from `alpaca_broker_auth.account_id` during construction.
+    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Alpaca Broker API authentication for rebalancing operations.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
-}
-
-impl RebalancingConfig {
-    /// Constructs RebalancingConfig from TOML fields and broker auth.
-    ///
-    /// Validates that the market maker wallet (derived from evm_private_key)
-    /// differs from the redemption_wallet.
-    pub(crate) fn from_toml_and_broker(
-        fields: RebalancingTomlFields,
-        broker_auth: AlpacaBrokerApiAuthConfig,
-    ) -> Result<Self, RebalancingConfigError> {
-        let signer = PrivateKeySigner::from_bytes(&fields.evm_private_key)?;
-        let market_maker_wallet = signer.address();
-
-        if market_maker_wallet == fields.redemption_wallet {
-            return Err(RebalancingConfigError::WalletCollision(market_maker_wallet));
-        }
-
-        let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
-
-        Ok(Self {
-            equity: fields.equity,
-            usdc: fields.usdc,
-            redemption_wallet: fields.redemption_wallet,
-            ethereum_rpc_url: fields.ethereum_rpc_url,
-            evm_private_key: fields.evm_private_key,
-            usdc_vault_id: fields.usdc_vault_id,
-            alpaca_account_id,
-            alpaca_broker_auth: broker_auth,
-        })
-    }
+    /// Registry of wrapped token configurations for ERC-4626 vault operations.
+    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 impl<'de> serde::Deserialize<'de> for RebalancingConfig {
@@ -148,6 +118,7 @@ impl<'de> serde::Deserialize<'de> for RebalancingConfig {
             usdc_vault_id: B256,
             alpaca_account_id: AlpacaAccountId,
             alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+            equities: HashMap<Symbol, EquityTokenAddresses>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -172,6 +143,37 @@ impl<'de> serde::Deserialize<'de> for RebalancingConfig {
             usdc_vault_id: raw.usdc_vault_id,
             alpaca_account_id: raw.alpaca_account_id,
             alpaca_broker_auth: raw.alpaca_broker_auth,
+            equities: raw.equities,
+        })
+    }
+}
+
+impl RebalancingConfig {
+    /// Constructs a RebalancingConfig from TOML fields and broker auth.
+    ///
+    /// This eliminates duplication by deriving Alpaca credentials from the broker config
+    /// rather than requiring them to be specified twice in TOML.
+    pub(crate) fn from_toml_and_broker(
+        toml: RebalancingTomlFields,
+        broker_auth: AlpacaBrokerApiAuthConfig,
+    ) -> Result<Self, RebalancingConfigError> {
+        let signer = PrivateKeySigner::from_bytes(&toml.evm_private_key)?;
+        let market_maker_wallet = signer.address();
+
+        if market_maker_wallet == toml.redemption_wallet {
+            return Err(RebalancingConfigError::WalletsMatch(market_maker_wallet));
+        }
+
+        Ok(Self {
+            equity: toml.equity,
+            usdc: toml.usdc,
+            redemption_wallet: toml.redemption_wallet,
+            ethereum_rpc_url: toml.ethereum_rpc_url,
+            evm_private_key: toml.evm_private_key,
+            usdc_vault_id: toml.usdc_vault_id,
+            alpaca_account_id: broker_auth.account_id,
+            alpaca_broker_auth: broker_auth,
+            equities: toml.equities,
         })
     }
 }
@@ -187,6 +189,7 @@ impl std::fmt::Debug for RebalancingConfig {
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
+            .field("equities", &self.equities)
             .finish()
     }
 }
@@ -210,7 +213,10 @@ pub(crate) enum TriggeredOperation {
     Redemption {
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
+        /// Wrapped (ERC-4626) token address for vault withdrawal.
+        wrapped_token: Address,
+        /// Unwrapped (underlying) token address for sending to Alpaca.
+        unwrapped_token: Address,
     },
     /// Move USDC from Alpaca to Base (too much offchain).
     UsdcAlpacaToBase { amount: Usdc },
@@ -228,6 +234,7 @@ pub(crate) struct RebalancingTrigger {
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
+    wrapper: Arc<dyn Wrapper>,
 }
 
 impl RebalancingTrigger {
@@ -238,6 +245,7 @@ impl RebalancingTrigger {
         order_owner: Address,
         inventory: Arc<RwLock<InventoryView>>,
         sender: mpsc::Sender<TriggeredOperation>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> Self {
         Self {
             config,
@@ -248,6 +256,7 @@ impl RebalancingTrigger {
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
+            wrapper,
         }
     }
 }
@@ -378,28 +387,56 @@ impl RebalancingTrigger {
     }
 
     async fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
-        let token_address = match self.load_token_address(symbol).await {
-            Ok(Some(addr)) => addr,
-            Ok(None) => {
-                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
-                // tokenized equities and won't be in the vault registry.
-                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
-                return None;
-            }
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
-                return None;
-            }
-        };
+        let wrapped_token = self.load_token_address_for_trigger(symbol).await?;
+        let unwrapped_token = self.load_unwrapped_token_for_trigger(symbol)?;
+        let vault_ratio = self.load_vault_ratio_for_trigger(symbol).await?;
 
         equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
-            token_address,
+            wrapped_token,
+            unwrapped_token,
+            &vault_ratio,
         )
         .await
         .ok()
+    }
+
+    fn load_unwrapped_token_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
+        match self.wrapper.lookup_unwrapped(symbol) {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to get unwrapped token address");
+                None
+            }
+        }
+    }
+
+    async fn load_token_address_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
+        match self.load_token_address(symbol).await {
+            Ok(Some(addr)) => Some(addr),
+            Ok(None) => {
+                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
+                // tokenized equities and won't be in the vault registry.
+                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                None
+            }
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
+                None
+            }
+        }
+    }
+
+    async fn load_vault_ratio_for_trigger(&self, symbol: &Symbol) -> Option<UnderlyingPerWrapped> {
+        match self.wrapper.get_ratio_for_symbol(symbol).await {
+            Ok(ratio) => Some(ratio),
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to fetch vault ratio");
+                None
+            }
+        }
     }
 
     async fn load_token_address(
@@ -489,38 +526,50 @@ impl RebalancingTrigger {
     }
 
     /// Extracts symbol and quantity from any mint event in the batch.
-    /// All mint events now contain these fields, so this works for incremental dispatch.
+    /// Most mint events contain these fields; TokensWrapped is an intermediate event
+    /// that doesn't carry them, so we search all events in the batch.
     fn extract_mint_info(
         events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
     ) -> Option<(Symbol, FractionalShares)> {
-        let envelope = events.first()?;
-        let (symbol, quantity) = match &envelope.payload {
-            TokenizedEquityMintEvent::MintRequested {
-                symbol, quantity, ..
+        for envelope in events {
+            let maybe_info = match &envelope.payload {
+                TokenizedEquityMintEvent::MintRequested {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::MintRejected {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::MintAccepted {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::MintAcceptanceFailed {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::TokensReceived {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::WrappingFailed {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::DepositedIntoRaindex {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::RaindexDepositFailed {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::Completed {
+                    symbol, quantity, ..
+                } => Some((symbol.clone(), FractionalShares::new(*quantity))),
+
+                // TokensWrapped is an intermediate event without symbol/quantity
+                TokenizedEquityMintEvent::TokensWrapped { .. } => None,
+            };
+
+            if maybe_info.is_some() {
+                return maybe_info;
             }
-            | TokenizedEquityMintEvent::MintRejected {
-                symbol, quantity, ..
-            }
-            | TokenizedEquityMintEvent::MintAccepted {
-                symbol, quantity, ..
-            }
-            | TokenizedEquityMintEvent::MintAcceptanceFailed {
-                symbol, quantity, ..
-            }
-            | TokenizedEquityMintEvent::TokensReceived {
-                symbol, quantity, ..
-            }
-            | TokenizedEquityMintEvent::DepositedIntoRaindex {
-                symbol, quantity, ..
-            }
-            | TokenizedEquityMintEvent::RaindexDepositFailed {
-                symbol, quantity, ..
-            }
-            | TokenizedEquityMintEvent::Completed {
-                symbol, quantity, ..
-            } => (symbol, quantity),
-        };
-        Some((symbol.clone(), FractionalShares::new(*quantity)))
+        }
+        None
     }
 
     fn has_terminal_mint_event(
@@ -532,6 +581,7 @@ impl RebalancingTrigger {
                 TokenizedEquityMintEvent::Completed { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
+                    | TokenizedEquityMintEvent::WrappingFailed { .. }
                     | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
             )
         })
@@ -582,7 +632,7 @@ impl RebalancingTrigger {
             matches!(
                 envelope.payload,
                 EquityRedemptionEvent::Completed { .. }
-                    | EquityRedemptionEvent::TransferFailed { .. }
+                    | EquityRedemptionEvent::SendFailed { .. }
                     | EquityRedemptionEvent::DetectionFailed { .. }
                     | EquityRedemptionEvent::RedemptionRejected { .. }
             )
@@ -708,19 +758,29 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::conductor::wire::test_cqrs;
-    use crate::equity_redemption::DetectionFailure;
     use crate::inventory::InventorySnapshotQuery;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::lifecycle::Lifecycle;
     use crate::offchain_order::{OffchainOrder, PriceCents};
+    use crate::onchain::mock::MockVault;
     use crate::position::TradeId;
     use crate::threshold::Usdc;
     use crate::tokenization::TokenizationRequestStatus;
-    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::HttpStatusCode;
+    use crate::tokenized_equity_mint::{
+        IssuerRequestId, MintServices, ReceiptId, TokenizationRequestId, TokenizedEquityMintCommand,
+    };
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
     use crate::vault_registry::VaultRegistryCommand;
+    use crate::wrapper::mock::MockWrapper;
+    use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -739,6 +799,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let pool = crate::test_utils::setup_test_db().await;
+        let wrapper = Arc::new(MockWrapper::new());
 
         (
             RebalancingTrigger::new(
@@ -748,6 +809,7 @@ mod tests {
                 TEST_ORDER_OWNER,
                 inventory,
                 sender,
+                wrapper,
             ),
             receiver,
         )
@@ -884,6 +946,7 @@ mod tests {
                 TEST_ORDER_OWNER,
                 inventory,
                 sender,
+                Arc::new(MockWrapper::new()),
             ),
             receiver,
         )
@@ -892,6 +955,19 @@ mod tests {
     async fn make_trigger_with_inventory_and_registry(
         inventory: InventoryView,
         symbol: &Symbol,
+    ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+        make_trigger_with_inventory_registry_and_wrapper(
+            inventory,
+            symbol,
+            Arc::new(MockWrapper::new()),
+        )
+        .await
+    }
+
+    async fn make_trigger_with_inventory_registry_and_wrapper(
+        inventory: InventoryView,
+        symbol: &Symbol,
+        wrapper: Arc<MockWrapper>,
     ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(inventory));
@@ -907,6 +983,7 @@ mod tests {
                 TEST_ORDER_OWNER,
                 inventory,
                 sender,
+                wrapper,
             ),
             receiver,
         )
@@ -973,6 +1050,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory,
             sender,
+            Arc::new(MockWrapper::new()),
         );
 
         // Simulate production: onchain fills arrive on an empty inventory.
@@ -1094,6 +1172,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn high_vault_ratio_triggers_redemption_that_would_be_balanced_at_one_to_one() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut inventory = InventoryView::default().with_equity(symbol.clone());
+
+        // 65 onchain, 35 offchain = 65% onchain ratio.
+        // At 1:1 ratio: 65% is within 30%-70% threshold -> balanced.
+        // At 1.5 ratio: 65 wrapped = 97.5 underlying-equivalent.
+        //   97.5/(97.5+35) = 73.6% -> above 70% -> triggers redemption.
+        inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(65), Direction::Buy))
+            .unwrap();
+        inventory = inventory
+            .apply_position_event(&symbol, &make_offchain_fill(shares(35), Direction::Buy))
+            .unwrap();
+
+        let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
+            1_500_000_000_000_000_000u64,
+        )));
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_registry_and_wrapper(inventory, &symbol, wrapper).await;
+
+        trigger.check_and_trigger_equity(&symbol).await;
+
+        let triggered = receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Redemption { .. })),
+            "Expected Redemption with 1.5 ratio, got {triggered:?}"
+        );
+    }
+
     fn make_mint_requested(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
         TokenizedEquityMintEvent::MintRequested {
             symbol: symbol.clone(),
@@ -1125,7 +1234,7 @@ mod tests {
         TokenizedEquityMintEvent::MintRejected {
             symbol: symbol.clone(),
             quantity,
-            status_code: None,
+            status_code: Some(HttpStatusCode(408)),
             rejected_at: Utc::now(),
         }
     }
@@ -1230,7 +1339,7 @@ mod tests {
         // Verify initial state has no inflight (check_equity_imbalance returns Some).
         assert!(
             inventory
-                .check_equity_imbalance(&symbol, &threshold)
+                .check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
                 .is_some()
         );
 
@@ -1246,7 +1355,7 @@ mod tests {
         // When inflight exists, check_equity_imbalance returns None.
         let has_imbalance = {
             let inventory = trigger.inventory.read().await;
-            inventory.check_equity_imbalance(&symbol, &threshold)
+            inventory.check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
         };
         assert!(
             has_imbalance.is_none(),
@@ -1268,7 +1377,7 @@ mod tests {
         }
         assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
 
-        // Create event batch with MintRequested and MintCompleted.
+        // Create event batch with MintRequested and Completed.
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
             make_mint_envelope(make_mint_completed(&symbol, dec!(30))),
@@ -1319,32 +1428,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_mint_event_in_isolation_clears_in_progress_flag() {
-        // This test verifies that when MintCompleted arrives in a separate dispatch
-        // (without MintRequested in the same batch), the in_progress flag is still cleared.
-        // This simulates what happens when Finalize command is executed.
+    async fn mint_commands_via_cqrs_clear_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
-
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
-        // Mark symbol as in-progress (as if a mint was triggered).
+        // Mark symbol as in-progress (as if check_and_trigger_equity detected an imbalance).
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(symbol.clone());
         }
         assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
 
-        // Dispatch ONLY MintCompleted - no MintRequested in this batch.
-        // This is what happens when Finalize command produces MintCompleted.
-        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
+        // Create CQRS framework with the trigger as a query processor.
+        let mint_services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
+        };
 
-        trigger.dispatch("test-aggregate-id", &events).await;
+        let store: MemStore<Lifecycle<TokenizedEquityMint, Never>> = MemStore::default();
+        let trigger_arc: Arc<RebalancingTrigger> = Arc::new(trigger);
+        let cqrs = CqrsFramework::new(
+            store,
+            vec![Box::new(Arc::clone(&trigger_arc))],
+            mint_services,
+        );
 
-        // The in_progress flag should be cleared even though MintRequested wasn't in this batch.
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
+
+        // Execute Mint command (produces MintRequested, MintAccepted, TokensReceived).
+        cqrs.execute(
+            &issuer_request_id.0,
+            TokenizedEquityMintCommand::Mint {
+                issuer_request_id: issuer_request_id.clone(),
+                symbol: symbol.clone(),
+                quantity: dec!(30),
+                wallet: Address::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Execute Wrap command (produces TokensWrapped).
+        cqrs.execute(&issuer_request_id.0, TokenizedEquityMintCommand::Wrap)
+            .await
+            .unwrap();
+
+        // Execute Deposit command (produces DepositedIntoRaindex, Completed).
+        cqrs.execute(&issuer_request_id.0, TokenizedEquityMintCommand::Deposit)
+            .await
+            .unwrap();
+
+        // The in_progress flag should be cleared after the terminal Completed event.
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
-            "in_progress flag should be cleared when terminal event has symbol"
+            !trigger_arc
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains(&symbol),
+            "in_progress flag should be cleared after mint completion via CQRS"
         );
     }
 
@@ -1364,7 +1507,7 @@ mod tests {
     fn extract_mint_info_returns_info_from_any_event() {
         let symbol = Symbol::new("AAPL").unwrap();
 
-        // Can extract from MintCompleted
+        // Can extract from Completed
         let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
         let (extracted_symbol, extracted_quantity) =
             RebalancingTrigger::extract_mint_info(&events).unwrap();
@@ -1400,6 +1543,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
+            amount: U256::from(50_250_000_000_000_000_000_u128),
             vault_withdraw_tx: TxHash::random(),
             withdrawn_at: Utc::now(),
         }
@@ -1422,7 +1566,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            failure: DetectionFailure::Timeout,
+            reason: "Alpaca timeout".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -1435,6 +1579,7 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
+            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         }
     }
@@ -2002,6 +2147,7 @@ mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            [equities]
 
             [alpaca_broker_auth]
             api_key = "test_key"
@@ -2047,6 +2193,7 @@ mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            [equities]
 
             [alpaca_broker_auth]
             api_key = "test_key"
@@ -2138,6 +2285,7 @@ mod tests {
             evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             alpaca_account_id = "904837e3-3b76-47ec-b432-046db621571b"
+            [equities]
 
             [alpaca_broker_auth]
             api_key = "test_key"
@@ -2506,6 +2654,7 @@ mod tests {
             Address::ZERO,
             inventory,
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         // Set in_progress flag
@@ -2692,6 +2841,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         // Create InventorySnapshotQuery that will dispatch events to the trigger
@@ -2752,6 +2902,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
@@ -2837,6 +2988,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));
@@ -2896,6 +3048,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let query = InventorySnapshotQuery::new(inventory.clone(), Some(trigger.clone()));

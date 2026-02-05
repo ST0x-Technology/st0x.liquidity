@@ -33,9 +33,11 @@ use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
+use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenized_equity_mint::MintServices;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
+use crate::wrapper::{Wrapper, WrapperService};
 
 use super::TransferDirection;
 
@@ -142,17 +144,31 @@ where
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let raindex = Arc::new(RaindexService::new(
-        ctx.base_provider,
+    let wallet_provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_provider(ctx.base_provider);
+
+    let vault = Arc::new(RaindexService::new(
+        wallet_provider.clone(),
         ctx.config.evm.orderbook,
-        vault_registry_query,
+        vault_registry_query.clone(),
         owner,
     ));
 
+    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+        wallet_provider,
+        owner,
+        ctx.rebalancing_config.equities.clone(),
+    ));
+
+    let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service.clone();
+    let raindex: Arc<dyn Raindex> = vault.clone();
     let mint_services = MintServices {
-        tokenizer: ctx.tokenization_service,
+        tokenizer,
+        wrapper: wrapper.clone(),
         raindex,
     };
+
     let mint_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
     let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], mint_services));
@@ -196,17 +212,27 @@ where
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let raindex: Arc<dyn Raindex> = Arc::new(RaindexService::new(
-        ctx.base_provider,
+    let raindex_service = Arc::new(RaindexService::new(
+        ctx.base_provider.clone(),
         ctx.config.evm.orderbook,
         vault_registry_query,
         owner,
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service;
+    let raindex: Arc<dyn Raindex> = raindex_service;
+    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+        ctx.base_provider,
+        owner,
+        ctx.rebalancing_config.equities.clone(),
+    ));
+
+    let unwrapped_token = wrapper.lookup_unwrapped(symbol)?;
+
     let redemption_services = RedemptionServices {
         tokenizer: tokenizer.clone(),
         raindex,
+        wrapper,
     };
 
     let redemption_view_repo = Arc::new(SqliteViewRepository::<
@@ -223,7 +249,7 @@ where
         redemption_services,
     ));
 
-    let redemption_manager = RedemptionManager::new(redemption_cqrs, redemption_query);
+    let redemption_manager = RedemptionManager::new(tokenizer, redemption_cqrs, redemption_query);
 
     let aggregate_id = RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
 
@@ -231,9 +257,17 @@ where
 
     writeln!(stdout, "   Aggregate ID: {}", aggregate_id.0)?;
     writeln!(stdout, "   Amount (wei): {amount}")?;
+    writeln!(stdout, "   Unwrapped Token: {unwrapped_token}")?;
 
     redemption_manager
-        .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
+        .execute_redemption(
+            &aggregate_id,
+            symbol.clone(),
+            quantity,
+            token,
+            unwrapped_token,
+            amount,
+        )
         .await?;
 
     writeln!(stdout, "✅ Redemption completed successfully")?;
@@ -286,7 +320,7 @@ where
     let broker_auth = AlpacaBrokerApiAuthConfig {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
-        account_id: rebalancing_config.alpaca_account_id.to_string(),
+        account_id: rebalancing_config.alpaca_account_id,
         mode: Some(broker_mode),
     };
 
@@ -643,8 +677,11 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{
+        AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode,
+    };
     use std::str::FromStr;
+    use uuid::uuid;
 
     use super::*;
     use crate::config::LogLevel;
@@ -677,7 +714,7 @@ mod tests {
         config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            account_id: "test-account-id".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
         });
         config
@@ -820,7 +857,7 @@ mod tests {
         let alpaca_auth = AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            account_id: "test-account-id".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
         };
 
@@ -842,7 +879,7 @@ mod tests {
         let alpaca_auth = AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            account_id: "test-account-id".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Production),
         };
 

@@ -1,5 +1,25 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Strongly typed Alpaca account identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AlpacaAccountId(Uuid);
+
+impl AlpacaAccountId {
+    pub const fn new(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AlpacaAccountId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Mode for Alpaca Broker API
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -30,7 +50,7 @@ impl AlpacaBrokerApiMode {
 pub struct AlpacaBrokerApiAuthConfig {
     pub api_key: String,
     pub api_secret: String,
-    pub account_id: String,
+    pub account_id: AlpacaAccountId,
     pub mode: Option<AlpacaBrokerApiMode>,
 }
 
@@ -89,13 +109,18 @@ pub(super) struct AccountResponse {
 
 #[cfg(test)]
 mod tests {
+    use uuid::uuid;
+
     use super::*;
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_sandbox_config() -> AlpacaBrokerApiAuthConfig {
         AlpacaBrokerApiAuthConfig {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: None,
         }
     }
@@ -104,7 +129,7 @@ mod tests {
         AlpacaBrokerApiAuthConfig {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Production),
         }
     }
@@ -141,7 +166,7 @@ mod tests {
         let config = AlpacaBrokerApiAuthConfig {
             api_key: "super_secret_key_123".to_string(),
             api_secret: "ultra_secret_secret_456".to_string(),
-            account_id: "account_789".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: None,
         };
 
@@ -150,7 +175,7 @@ mod tests {
         assert!(debug_output.contains("[REDACTED]"));
         assert!(!debug_output.contains("super_secret_key_123"));
         assert!(!debug_output.contains("ultra_secret_secret_456"));
-        assert!(debug_output.contains("account_789"));
+        assert!(debug_output.contains("904837e3-3b76-47ec-b432-046db621571b"));
         assert!(debug_output.contains("Sandbox"));
     }
 }

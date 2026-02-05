@@ -151,13 +151,16 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
+    use crate::alpaca_broker_api::auth::{AlpacaAccountId, AlpacaBrokerApiMode};
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
         AlpacaBrokerApiAuthConfig {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
         }
     }
@@ -165,7 +168,7 @@ mod tests {
     fn create_account_mock(server: &MockServer) -> httpmock::Mock<'_> {
         server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -195,7 +198,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -292,7 +295,7 @@ mod tests {
         // Mock account endpoint with all fields needed for both verify_account and fetch_inventory
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -304,7 +307,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([

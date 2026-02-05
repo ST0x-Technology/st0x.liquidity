@@ -1,15 +1,14 @@
 //! Orchestrates Alpaca-to-Raindex equity inventory transfer.
 //!
-//! Coordinates the `TokenizedEquityMint` aggregate which handles tokenization API calls
-//! and vault deposits internally via its Services. Implements the `Mint` trait for
-//! integration with the rebalancing trigger system.
+//! Executes `Mint` and `Deposit` commands on the `TokenizedEquityMint` aggregate.
+//! The aggregate handles all service interactions internally.
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{debug, info, instrument};
+use tracing::{info, instrument};
 
 use super::{Mint, MintError};
 use crate::lifecycle::{Lifecycle, Never};
@@ -32,6 +31,12 @@ where
         Self { cqrs }
     }
 
+    /// Executes the full mint workflow via Mint, Wrap, and Deposit commands.
+    ///
+    /// The aggregate handles all service interactions internally:
+    /// - Mint command: requests tokenization, polls until tokens arrive
+    /// - Wrap command: wraps unwrapped tokens into ERC-4626 vault shares
+    /// - Deposit command: deposits wrapped tokens to Raindex
     #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
     async fn execute_mint_impl(
         &self,
@@ -40,7 +45,7 @@ where
         quantity: FractionalShares,
         wallet: Address,
     ) -> Result<(), MintError> {
-        debug!("Executing mint command");
+        info!(%symbol, ?quantity, %wallet, "Starting mint workflow");
 
         self.cqrs
             .execute(
@@ -54,13 +59,19 @@ where
             )
             .await?;
 
-        debug!("Executing deposit command");
+        info!("Mint command completed, executing Wrap command");
+
+        self.cqrs
+            .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Wrap)
+            .await?;
+
+        info!("Wrap command completed, executing Deposit command");
 
         self.cqrs
             .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Deposit)
             .await?;
 
-        info!("Mint workflow completed");
+        info!("Mint workflow completed successfully");
         Ok(())
     }
 }
@@ -85,335 +96,600 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::network::{Ethereum, EthereumWallet};
-    use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, TxHash, U256, address, b256};
-    use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-    };
-    use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-    use alloy::signers::local::PrivateKeySigner;
+    use alloy::primitives::address;
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
-    use cqrs_es::persist::GenericQuery;
     use rust_decimal_macros::dec;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
+    use std::sync::Arc;
 
     use super::*;
-    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::conductor::wire::test_cqrs;
-    use crate::onchain::mock::MockRaindex;
-    use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
-    use crate::tokenization::Tokenizer;
-    use crate::tokenization::alpaca::tests::{
-        create_test_service_with_provider, tokenization_mint_path, tokenization_requests_path,
+    use crate::onchain::mock::MockVault;
+    use crate::tokenization::TokenizationRequestStatus;
+    use crate::tokenization::mock::{MockMintPollOutcome, MockMintRequestOutcome, MockTokenizer};
+    use crate::tokenized_equity_mint::{
+        HttpStatusCode, MintServices, TokenizedEquityMintError, TokenizedEquityMintEvent,
     };
-    use crate::tokenization::mock::MockTokenizer;
-    use crate::tokenized_equity_mint::MintServices;
-    use crate::vault_registry::{
-        VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
-    };
-    use httpmock::prelude::*;
-    use serde_json::json;
+    use crate::wrapper::mock::MockWrapper;
 
-    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
-        "0x0000000000000000000000000000000000000000000000000000000000000001"
-    ));
-
-    type TestCqrs = CqrsFramework<
-        Lifecycle<TokenizedEquityMint, Never>,
-        MemStore<Lifecycle<TokenizedEquityMint, Never>>,
-    >;
-
-    fn create_test_cqrs_with_mocks() -> Arc<TestCqrs> {
-        let store = MemStore::default();
-        let services = MintServices {
+    fn mock_mint_services() -> MintServices {
+        MintServices {
             tokenizer: Arc::new(MockTokenizer::new()),
-            raindex: Arc::new(MockRaindex::new()),
-        };
-        Arc::new(CqrsFramework::new(store, vec![], services))
-    }
-
-    fn create_test_cqrs_with_services(
-        tokenizer: Arc<dyn Tokenizer>,
-        raindex: Arc<dyn Raindex>,
-    ) -> Arc<TestCqrs> {
-        let store = MemStore::default();
-        let services = MintServices { tokenizer, raindex };
-        Arc::new(CqrsFramework::new(store, vec![], services))
-    }
-
-    fn sample_pending_response(id: &str) -> serde_json::Value {
-        json!({
-            "tokenization_request_id": id,
-            "type": "mint",
-            "status": "pending",
-            "underlying_symbol": "AAPL",
-            "token_symbol": "tAAPL",
-            "qty": "100.0",
-            "issuer": "st0x",
-            "network": "base",
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-            "issuer_request_id": "issuer_123",
-            "created_at": "2024-01-15T10:30:00Z"
-        })
-    }
-
-    fn sample_completed_response(id: &str) -> serde_json::Value {
-        json!({
-            "tokenization_request_id": id,
-            "type": "mint",
-            "status": "completed",
-            "underlying_symbol": "AAPL",
-            "token_symbol": "tAAPL",
-            "qty": "100.0",
-            "issuer": "st0x",
-            "network": "base",
-            "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-            "issuer_request_id": "issuer_123",
-            "tx_hash": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-            "created_at": "2024-01-15T10:30:00Z"
-        })
-    }
-
-    #[test]
-    fn fractional_shares_converts_to_u256_18_decimals() {
-        let value = FractionalShares::new(dec!(100.5));
-        let result = value.to_u256_18_decimals().unwrap();
-
-        let expected = U256::from(100_500_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn fractional_shares_converts_whole_number() {
-        let value = FractionalShares::new(dec!(42));
-        let result = value.to_u256_18_decimals().unwrap();
-
-        let expected = U256::from(42_000_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn fractional_shares_converts_zero() {
-        let value = FractionalShares::new(dec!(0));
-        let result = value.to_u256_18_decimals().unwrap();
-
-        assert_eq!(result, U256::ZERO);
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
+        }
     }
 
     #[tokio::test]
-    async fn mint_manager_executes_mint_and_deposit_commands() {
-        let cqrs = create_test_cqrs_with_mocks();
+    async fn execute_mint_reaches_completed_state() {
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(
+            store.clone(),
+            vec![],
+            mock_mint_services(),
+        ));
         let manager = MintManager::new(cqrs);
 
+        let issuer_request_id = IssuerRequestId::new("test-001");
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = manager
-            .execute_mint_impl(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
-            .await;
+        manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap();
 
-        // MockTokenizer always succeeds, MockRaindex always succeeds
-        result.unwrap();
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 6, "Expected 6 events, got: {}", events.len());
+
+        let completed = events.last().unwrap();
+        let TokenizedEquityMintEvent::Completed {
+            symbol: completed_symbol,
+            quantity: completed_quantity,
+            ..
+        } = &completed.payload
+        else {
+            panic!("Expected Completed event, got: {:?}", completed.payload);
+        };
+
+        assert_eq!(*completed_symbol, symbol);
+        assert_eq!(*completed_quantity, quantity.inner());
     }
 
     #[tokio::test]
-    async fn trait_impl_delegates_to_execute_mint_impl() {
-        let cqrs = create_test_cqrs_with_mocks();
+    async fn execute_mint_emits_events_in_correct_order() {
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(
+            store.clone(),
+            vec![],
+            mock_mint_services(),
+        ));
         let manager = MintManager::new(cqrs);
 
-        let result = manager
+        let issuer_request_id = IssuerRequestId::new("order-test");
+
+        manager
             .execute_mint(
-                &IssuerRequestId::new("trait-001"),
+                &issuer_request_id,
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(dec!(50.0)),
                 address!("0x1234567890abcdef1234567890abcdef12345678"),
             )
-            .await;
+            .await
+            .unwrap();
 
-        // MockTokenizer and MockRaindex always succeed
-        result.unwrap();
-    }
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
 
-    type LocalEvmProvider = FillProvider<
-        JoinFill<
-            JoinFill<
-                Identity,
-                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-            >,
-            WalletFiller<EthereumWallet>,
-        >,
-        RootProvider<Ethereum>,
-        Ethereum,
-    >;
-
-    struct LocalEvmWithVault {
-        _anvil: AnvilInstance,
-        provider: LocalEvmProvider,
-        signer: PrivateKeySigner,
-        orderbook_address: Address,
-        token_address: Address,
-    }
-
-    impl LocalEvmWithVault {
-        async fn new() -> Self {
-            let anvil = Anvil::new().spawn();
-            let endpoint = anvil.endpoint();
-
-            let private_key_bytes = anvil.keys()[0].to_bytes();
-            let signer =
-                PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes)).unwrap();
-
-            let wallet = EthereumWallet::from(signer.clone());
-            let provider = ProviderBuilder::new()
-                .wallet(wallet)
-                .connect_http(endpoint.parse().unwrap());
-
-            let tofu = TOFUTokenDecimals::deploy(&provider).await.unwrap();
-            let deployed_code = provider.get_code_at(*tofu.address()).await.unwrap();
-            provider
-                .raw_request::<_, ()>(
-                    "anvil_setCode".into(),
-                    (TOFU_DECIMALS_ADDRESS, deployed_code),
-                )
-                .await
-                .unwrap();
-
-            let orderbook = OrderBook::deploy(&provider).await.unwrap();
-            let orderbook_address = *orderbook.address();
-
-            let token = TestERC20::deploy(&provider).await.unwrap();
-            let token_address = *token.address();
-            let initial_supply = U256::from(1_000_000) * U256::from(10).pow(U256::from(18));
-            token
-                .mint(signer.address(), initial_supply)
-                .send()
-                .await
-                .unwrap()
-                .get_receipt()
-                .await
-                .unwrap();
-
-            Self {
-                _anvil: anvil,
-                provider,
-                signer,
-                orderbook_address,
-                token_address,
-            }
-        }
-    }
-
-    fn create_vault_registry_cqrs(
-        pool: &sqlx::SqlitePool,
-    ) -> (SqliteCqrs<VaultRegistryAggregate>, Arc<VaultRegistryQuery>) {
-        let view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let query = Arc::new(GenericQuery::new(view_repo.clone()));
-        let cqrs = test_cqrs::<VaultRegistryAggregate>(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(view_repo))],
-            (),
+        assert!(
+            matches!(
+                events[0].payload,
+                TokenizedEquityMintEvent::MintRequested { .. }
+            ),
+            "First event should be MintRequested, got: {:?}",
+            events[0].payload
         );
-        (cqrs, query)
-    }
-
-    async fn seed_vault_registry(
-        pool: &sqlx::SqlitePool,
-        orderbook: Address,
-        owner: Address,
-        token: Address,
-        vault_id: B256,
-        symbol: Symbol,
-    ) -> Arc<VaultRegistryQuery> {
-        let (cqrs, query) = create_vault_registry_cqrs(pool);
-        let aggregate_id = VaultRegistry::aggregate_id(orderbook, owner);
-
-        cqrs.execute(
-            &aggregate_id,
-            VaultRegistryCommand::DiscoverEquityVault {
-                token,
-                vault_id,
-                discovered_in: TxHash::ZERO,
-                symbol,
-            },
-        )
-        .await
-        .unwrap();
-
-        query
+        assert!(
+            matches!(
+                events[1].payload,
+                TokenizedEquityMintEvent::MintAccepted { .. }
+            ),
+            "Second event should be MintAccepted, got: {:?}",
+            events[1].payload
+        );
+        assert!(
+            matches!(
+                events[2].payload,
+                TokenizedEquityMintEvent::TokensReceived { .. }
+            ),
+            "Third event should be TokensReceived, got: {:?}",
+            events[2].payload
+        );
+        assert!(
+            matches!(
+                events[3].payload,
+                TokenizedEquityMintEvent::TokensWrapped { .. }
+            ),
+            "Fourth event should be TokensWrapped, got: {:?}",
+            events[3].payload
+        );
+        assert!(
+            matches!(
+                events[4].payload,
+                TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+            ),
+            "Fifth event should be DepositedIntoRaindex, got: {:?}",
+            events[4].payload
+        );
+        assert!(
+            matches!(
+                events[5].payload,
+                TokenizedEquityMintEvent::Completed { .. }
+            ),
+            "Sixth event should be Completed, got: {:?}",
+            events[5].payload
+        );
     }
 
     #[tokio::test]
-    async fn execute_mint_full_workflow_with_vault_deposit() {
-        let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
-        let local_evm = LocalEvmWithVault::new().await;
-        let symbol = Symbol::new("AAPL").unwrap();
+    async fn tokenizer_rejects_mint_request_emits_mint_rejected() {
+        let services = MintServices {
+            tokenizer: Arc::new(
+                MockTokenizer::new().with_mint_request_outcome(MockMintRequestOutcome::Rejected),
+            ),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
+        };
 
-        let vault_registry_query = seed_vault_registry(
-            &pool,
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-            local_evm.token_address,
-            TEST_VAULT_ID.0,
-            symbol.clone(),
-        )
-        .await;
-
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(create_test_service_with_provider(
-            &server,
-            local_evm.provider.clone(),
-            local_evm.signer.address(),
-        ));
-        let raindex: Arc<dyn Raindex> = Arc::new(
-            RaindexService::new(
-                local_evm.provider.clone(),
-                local_evm.orderbook_address,
-                vault_registry_query,
-                local_evm.signer.address(),
-            )
-            .with_required_confirmations(1),
-        );
-        let cqrs = create_test_cqrs_with_services(tokenizer, raindex);
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(store.clone(), vec![], services));
         let manager = MintManager::new(cqrs);
 
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(tokenization_mint_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(sample_pending_response("full_flow_test"));
-        });
-
-        let poll_mock = server.mock(|when, then| {
-            when.method(GET).path(tokenization_requests_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([sample_completed_response("full_flow_test")]));
-        });
-
+        let issuer_request_id = IssuerRequestId::new("rejected-test");
+        let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(dec!(100.0));
-        let wallet = local_evm.signer.address();
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = manager
-            .execute_mint_impl(
-                &IssuerRequestId::new("full-flow-001"),
-                symbol,
-                quantity,
+        let err = manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                MintError::Aggregate(cqrs_es::AggregateError::UserError(
+                    TokenizedEquityMintError::AlreadyFailed
+                ))
+            ),
+            "Expected AlreadyFailed error from Wrap command after mint rejection, got: {err:?}"
+        );
+
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 2, "Expected 2 events, got: {}", events.len());
+
+        assert!(
+            matches!(
+                events[0].payload,
+                TokenizedEquityMintEvent::MintRequested { .. }
+            ),
+            "First event should be MintRequested, got: {:?}",
+            events[0].payload
+        );
+
+        let TokenizedEquityMintEvent::MintRejected {
+            symbol: rejected_symbol,
+            quantity: rejected_quantity,
+            status_code,
+            ..
+        } = &events[1].payload
+        else {
+            panic!(
+                "Second event should be MintRejected, got: {:?}",
+                events[1].payload
+            );
+        };
+
+        assert_eq!(*rejected_symbol, symbol);
+        assert_eq!(*rejected_quantity, quantity.inner());
+        assert_eq!(*status_code, Some(HttpStatusCode(400)));
+    }
+
+    #[tokio::test]
+    async fn tokenizer_poll_returns_rejected_status_emits_acceptance_failed() {
+        let services = MintServices {
+            tokenizer: Arc::new(
+                MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Rejected),
+            ),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
+        };
+
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(store.clone(), vec![], services));
+        let manager = MintManager::new(cqrs);
+
+        let issuer_request_id = IssuerRequestId::new("poll-rejected-test");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(100.0));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let err = manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                MintError::Aggregate(cqrs_es::AggregateError::UserError(
+                    TokenizedEquityMintError::AlreadyFailed
+                ))
+            ),
+            "Expected AlreadyFailed error from Wrap command after poll rejection, got: {err:?}"
+        );
+
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 3, "Expected 3 events, got: {}", events.len());
+
+        assert!(
+            matches!(
+                events[0].payload,
+                TokenizedEquityMintEvent::MintRequested { .. }
+            ),
+            "First event should be MintRequested, got: {:?}",
+            events[0].payload
+        );
+
+        assert!(
+            matches!(
+                events[1].payload,
+                TokenizedEquityMintEvent::MintAccepted { .. }
+            ),
+            "Second event should be MintAccepted, got: {:?}",
+            events[1].payload
+        );
+
+        let TokenizedEquityMintEvent::MintAcceptanceFailed {
+            symbol: failed_symbol,
+            quantity: failed_quantity,
+            last_status,
+            ..
+        } = &events[2].payload
+        else {
+            panic!(
+                "Third event should be MintAcceptanceFailed, got: {:?}",
+                events[2].payload
+            );
+        };
+
+        assert_eq!(*failed_symbol, symbol);
+        assert_eq!(*failed_quantity, quantity.inner());
+        assert_eq!(*last_status, TokenizationRequestStatus::Rejected);
+    }
+
+    #[tokio::test]
+    async fn tokenizer_poll_error_emits_acceptance_failed() {
+        let services = MintServices {
+            tokenizer: Arc::new(
+                MockTokenizer::new().with_mint_poll_outcome(MockMintPollOutcome::Error),
+            ),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
+        };
+
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(store.clone(), vec![], services));
+        let manager = MintManager::new(cqrs);
+
+        let issuer_request_id = IssuerRequestId::new("poll-error-test");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(100.0));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let err = manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                MintError::Aggregate(cqrs_es::AggregateError::UserError(
+                    TokenizedEquityMintError::AlreadyFailed
+                ))
+            ),
+            "Expected AlreadyFailed error from Wrap command after poll error, got: {err:?}"
+        );
+
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 3, "Expected 3 events, got: {}", events.len());
+
+        let TokenizedEquityMintEvent::MintAcceptanceFailed {
+            symbol: failed_symbol,
+            quantity: failed_quantity,
+            last_status,
+            ..
+        } = &events[2].payload
+        else {
+            panic!(
+                "Third event should be MintAcceptanceFailed, got: {:?}",
+                events[2].payload
+            );
+        };
+
+        assert_eq!(*failed_symbol, symbol);
+        assert_eq!(*failed_quantity, quantity.inner());
+        assert_eq!(*last_status, TokenizationRequestStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn wrapper_failure_emits_wrapping_failed() {
+        let services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::failing()),
+            raindex: Arc::new(MockVault::new()),
+        };
+
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(store.clone(), vec![], services));
+        let manager = MintManager::new(cqrs);
+
+        let issuer_request_id = IssuerRequestId::new("wrap-fail-test");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(100.0));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let err = manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                MintError::Aggregate(cqrs_es::AggregateError::UserError(
+                    TokenizedEquityMintError::AlreadyFailed
+                ))
+            ),
+            "Expected AlreadyFailed error from Deposit command after wrapping failure, got: {err:?}"
+        );
+
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 4, "Expected 4 events, got: {}", events.len());
+
+        assert!(
+            matches!(
+                events[0].payload,
+                TokenizedEquityMintEvent::MintRequested { .. }
+            ),
+            "First event should be MintRequested, got: {:?}",
+            events[0].payload
+        );
+
+        assert!(
+            matches!(
+                events[1].payload,
+                TokenizedEquityMintEvent::MintAccepted { .. }
+            ),
+            "Second event should be MintAccepted, got: {:?}",
+            events[1].payload
+        );
+
+        assert!(
+            matches!(
+                events[2].payload,
+                TokenizedEquityMintEvent::TokensReceived { .. }
+            ),
+            "Third event should be TokensReceived, got: {:?}",
+            events[2].payload
+        );
+
+        let TokenizedEquityMintEvent::WrappingFailed {
+            symbol: failed_symbol,
+            quantity: failed_quantity,
+            ..
+        } = &events[3].payload
+        else {
+            panic!(
+                "Fourth event should be WrappingFailed, got: {:?}",
+                events[3].payload
+            );
+        };
+
+        assert_eq!(*failed_symbol, symbol);
+        assert_eq!(*failed_quantity, quantity.inner());
+    }
+
+    #[tokio::test]
+    async fn raindex_deposit_failure_emits_deposit_failed() {
+        let services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::failing_deposit()),
+        };
+
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(store.clone(), vec![], services));
+        let manager = MintManager::new(cqrs);
+
+        let issuer_request_id = IssuerRequestId::new("deposit-fail-test");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(dec!(100.0));
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap();
+
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        assert_eq!(events.len(), 5, "Expected 5 events, got: {}", events.len());
+
+        assert!(
+            matches!(
+                events[0].payload,
+                TokenizedEquityMintEvent::MintRequested { .. }
+            ),
+            "First event should be MintRequested, got: {:?}",
+            events[0].payload
+        );
+
+        assert!(
+            matches!(
+                events[1].payload,
+                TokenizedEquityMintEvent::MintAccepted { .. }
+            ),
+            "Second event should be MintAccepted, got: {:?}",
+            events[1].payload
+        );
+
+        assert!(
+            matches!(
+                events[2].payload,
+                TokenizedEquityMintEvent::TokensReceived { .. }
+            ),
+            "Third event should be TokensReceived, got: {:?}",
+            events[2].payload
+        );
+
+        assert!(
+            matches!(
+                events[3].payload,
+                TokenizedEquityMintEvent::TokensWrapped { .. }
+            ),
+            "Fourth event should be TokensWrapped, got: {:?}",
+            events[3].payload
+        );
+
+        let TokenizedEquityMintEvent::RaindexDepositFailed {
+            symbol: failed_symbol,
+            quantity: failed_quantity,
+            ..
+        } = &events[4].payload
+        else {
+            panic!(
+                "Fifth event should be RaindexDepositFailed, got: {:?}",
+                events[4].payload
+            );
+        };
+
+        assert_eq!(*failed_symbol, symbol);
+        assert_eq!(*failed_quantity, quantity.inner());
+    }
+
+    #[tokio::test]
+    async fn mint_command_preserves_parameters_in_events() {
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(
+            store.clone(),
+            vec![],
+            mock_mint_services(),
+        ));
+        let manager = MintManager::new(cqrs);
+
+        let issuer_request_id = IssuerRequestId::new("params-test");
+        let symbol = Symbol::new("TSLA").unwrap();
+        let quantity = FractionalShares::new(dec!(42.5));
+        let wallet = address!("0xabcdef0123456789abcdef0123456789abcdef01");
+
+        manager
+            .execute_mint(&issuer_request_id, symbol.clone(), quantity, wallet)
+            .await
+            .unwrap();
+
+        let events = store.load_events(&issuer_request_id.0).await.unwrap();
+
+        let TokenizedEquityMintEvent::MintRequested {
+            symbol: req_symbol,
+            quantity: req_quantity,
+            wallet: req_wallet,
+            ..
+        } = &events[0].payload
+        else {
+            panic!("Expected MintRequested event");
+        };
+
+        assert_eq!(*req_symbol, symbol);
+        assert_eq!(*req_quantity, quantity.inner());
+        assert_eq!(*req_wallet, wallet);
+
+        let TokenizedEquityMintEvent::Completed {
+            symbol: completed_symbol,
+            quantity: completed_quantity,
+            ..
+        } = &events[5].payload
+        else {
+            panic!("Expected Completed event");
+        };
+
+        assert_eq!(*completed_symbol, symbol);
+        assert_eq!(*completed_quantity, quantity.inner());
+    }
+
+    #[tokio::test]
+    async fn different_symbols_can_be_minted_independently() {
+        let store = MemStore::default();
+        let cqrs = Arc::new(CqrsFramework::new(
+            store.clone(),
+            vec![],
+            mock_mint_services(),
+        ));
+        let manager = MintManager::new(cqrs);
+        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
+
+        let aapl_id = IssuerRequestId::new("aapl-mint");
+        let aapl = Symbol::new("AAPL").unwrap();
+        manager
+            .execute_mint(
+                &aapl_id,
+                aapl.clone(),
+                FractionalShares::new(dec!(10.0)),
                 wallet,
             )
-            .await;
+            .await
+            .unwrap();
 
-        result.unwrap();
+        let tsla_id = IssuerRequestId::new("tsla-mint");
+        let tsla = Symbol::new("TSLA").unwrap();
+        manager
+            .execute_mint(
+                &tsla_id,
+                tsla.clone(),
+                FractionalShares::new(dec!(20.0)),
+                wallet,
+            )
+            .await
+            .unwrap();
 
-        mint_mock.assert();
-        poll_mock.assert();
+        let aapl_events = store.load_events(&aapl_id.0).await.unwrap();
+        let tsla_events = store.load_events(&tsla_id.0).await.unwrap();
+
+        assert_eq!(aapl_events.len(), 6);
+        assert_eq!(tsla_events.len(), 6);
+
+        let TokenizedEquityMintEvent::Completed {
+            symbol: aapl_completed,
+            ..
+        } = &aapl_events[5].payload
+        else {
+            panic!("Expected AAPL Completed event");
+        };
+
+        let TokenizedEquityMintEvent::Completed {
+            symbol: tsla_completed,
+            ..
+        } = &tsla_events[5].payload
+        else {
+            panic!("Expected TSLA Completed event");
+        };
+
+        assert_eq!(*aapl_completed, aapl);
+        assert_eq!(*tsla_completed, tsla);
     }
 }

@@ -29,6 +29,10 @@ ethereum_rpc_url = "https://mainnet.infura.io"
 evm_private_key = "0x0000000000000000000000000000000000000000000000000000000000000001"
 usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
+[rebalancing.equities.RKLB]
+wrapped = "0x1111111111111111111111111111111111111111"
+unwrapped = "0x2222222222222222222222222222222222222222"
+
 [rebalancing.equity]
 target = "0.5"
 deviation = "0.2"

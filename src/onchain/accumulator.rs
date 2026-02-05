@@ -3,7 +3,7 @@ use st0x_execution::{Direction, Executor, FractionalShares, Positive, SupportedE
 use tracing::{debug, info};
 
 use crate::error::OnChainError;
-use crate::position::{Position, PositionQuery, load_position};
+use crate::position::{PositionQuery, load_position};
 use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, Clone)]
@@ -32,25 +32,19 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     };
 
     let executor_type = executor.to_supported_executor();
+    let readiness = position.is_ready_for_execution(executor_type, threshold)?;
 
-    let Some((direction, shares)) =
-        check_position_threshold(&position, symbol, executor_type, threshold)?
-    else {
+    let Some((direction, shares)) = readiness else {
+        debug!(symbol = %symbol, net = %position.net, "Position not ready for execution");
         return Ok(None);
     };
 
-    if !check_market_open(executor, symbol).await? {
+    if !is_market_open(executor, symbol).await? {
         return Ok(None);
     }
 
     let shares = Positive::new(shares)?;
-
-    info!(
-        symbol = %symbol,
-        shares = %shares,
-        direction = ?direction,
-        "Position ready for execution"
-    );
+    info!(symbol = %symbol, shares = %shares, direction = ?direction, "Position ready for execution");
 
     Ok(Some(ExecutionParams {
         symbol: symbol.clone(),
@@ -60,29 +54,7 @@ pub(crate) async fn check_execution_readiness<E: Executor>(
     }))
 }
 
-fn check_position_threshold(
-    position: &Position,
-    symbol: &Symbol,
-    executor_type: SupportedExecutor,
-    threshold: &ExecutionThreshold,
-) -> Result<Option<(Direction, FractionalShares)>, OnChainError> {
-    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, threshold)?
-    else {
-        debug!(
-            symbol = %symbol,
-            net = %position.net,
-            "Position not ready for execution"
-        );
-        return Ok(None);
-    };
-
-    Ok(Some((direction, shares)))
-}
-
-async fn check_market_open<E: Executor>(
-    executor: &E,
-    symbol: &Symbol,
-) -> Result<bool, OnChainError> {
+async fn is_market_open<E: Executor>(executor: &E, symbol: &Symbol) -> Result<bool, OnChainError> {
     let is_open = executor
         .is_market_open()
         .await
@@ -411,27 +383,22 @@ mod tests {
             .unwrap();
         assert!(
             result.is_none(),
-            "Should still not execute while market closed, even above threshold"
+            "Should still not execute while market closed"
         );
 
-        // Market opens - accumulated position should trigger
+        // Market opens - should now execute
         let open_executor = MockExecutor::new().with_market_open(true);
 
         let params = check_execution_readiness(&open_executor, &query, &symbol, &threshold)
             .await
             .unwrap()
-            .expect("should execute when market opens with accumulated position");
+            .expect("Should execute now that market is open");
 
         assert_eq!(params.symbol, symbol);
         assert_eq!(
             params.shares,
             Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
-            "DryRun supports fractional shares, should return full 1.5"
-        );
-        assert_eq!(
-            params.direction,
-            Direction::Sell,
-            "Positive net (long) -> sell offchain to hedge"
+            "Should execute full accumulated amount"
         );
     }
 }

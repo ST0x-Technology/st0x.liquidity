@@ -11,10 +11,26 @@ use alloy::primitives::Address;
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
+use thiserror::Error;
 
+use crate::onchain::raindex::RaindexError;
+use crate::tokenization::TokenizerError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::wrapper::WrapperError;
 
-pub(crate) type MintError = AggregateError<TokenizedEquityMintError>;
+#[derive(Debug, Error)]
+pub(crate) enum MintError {
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
+    #[error("Aggregate error: {0}")]
+    Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
+    #[error("Raindex error: {0}")]
+    Raindex(#[from] RaindexError),
+    #[error("U256 parse error: {0}")]
+    U256Parse(#[from] alloy::primitives::ruint::ParseError),
+    #[error("ERC-4626 vault wrapping error: {0}")]
+    Wrapper(#[from] WrapperError),
+}
 
 /// Trait for executing mint operations.
 #[async_trait]
@@ -94,11 +110,9 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(AggregateError::UserError(
-                TokenizedEquityMintError::AlreadyFailed
-            ))
-        ));
+        assert!(
+            matches!(result, Err(MintError::Raindex(_))),
+            "Expected Raindex error, got: {result:?}"
+        );
     }
 }

@@ -26,9 +26,16 @@ use crate::inventory::InventoryView;
 use crate::lifecycle::Lifecycle;
 use crate::position::{PositionAggregate, PositionQuery};
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
-use crate::tokenized_equity_mint::MintServices;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::tokenized_equity_mint::{MintServices, TokenizedEquityMint};
 use crate::usdc_rebalance::UsdcRebalance;
+use crate::wrapper::Wrapper;
+
+/// Address configuration for query manifest initialization.
+#[derive(Clone, Copy)]
+pub(super) struct AddressConfig {
+    pub(super) orderbook: Address,
+    pub(super) market_maker_wallet: Address,
+}
 
 type RebalancingTriggerDeps = Cons<
     PositionAggregate,
@@ -81,19 +88,20 @@ impl QueryManifest {
     pub(super) fn new(
         config: RebalancingTriggerConfig,
         pool: SqlitePool,
-        orderbook: Address,
-        market_maker_wallet: Address,
+        addresses: AddressConfig,
         inventory: Arc<RwLock<InventoryView>>,
         operation_sender: mpsc::Sender<TriggeredOperation>,
         event_sender: broadcast::Sender<ServerMessage>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> Self {
         let rebalancing_trigger = RebalancingTrigger::new(
             config,
             pool.clone(),
-            orderbook,
-            market_maker_wallet,
+            addresses.orderbook,
+            addresses.market_maker_wallet,
             inventory,
             operation_sender,
+            wrapper,
         );
 
         let event_broadcaster = EventBroadcaster::new(event_sender);

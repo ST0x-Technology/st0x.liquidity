@@ -73,9 +73,11 @@ where
             TriggeredOperation::Redemption {
                 symbol,
                 quantity,
-                token,
+                wrapped_token,
+                unwrapped_token,
             } => {
-                self.execute_redemption(symbol, quantity, token).await;
+                self.execute_redemption(symbol, quantity, wrapped_token, unwrapped_token)
+                    .await;
             }
 
             TriggeredOperation::UsdcAlpacaToBase { amount } => {
@@ -112,7 +114,13 @@ where
         }
     }
 
-    async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
+    async fn execute_redemption(
+        &self,
+        symbol: Symbol,
+        quantity: FractionalShares,
+        wrapped_token: Address,
+        unwrapped_token: Address,
+    ) {
         let amount = match quantity.to_u256_18_decimals() {
             Ok(amount) => amount,
             Err(e) => {
@@ -128,11 +136,25 @@ where
 
         let aggregate_id = RedemptionAggregateId::new(Uuid::new_v4().to_string());
 
-        log_redemption_start(&symbol, quantity, token, amount, &aggregate_id);
+        log_redemption_start(
+            &symbol,
+            quantity,
+            wrapped_token,
+            unwrapped_token,
+            amount,
+            &aggregate_id,
+        );
 
         match self
             .redemption_manager
-            .execute_redemption(&aggregate_id, symbol.clone(), quantity, token, amount)
+            .execute_redemption(
+                &aggregate_id,
+                symbol.clone(),
+                quantity,
+                wrapped_token,
+                unwrapped_token,
+                amount,
+            )
             .await
         {
             Ok(()) => info!(%symbol, "Redemption operation completed successfully"),
@@ -176,14 +198,16 @@ where
 fn log_redemption_start(
     symbol: &Symbol,
     quantity: FractionalShares,
-    token: Address,
+    wrapped_token: Address,
+    unwrapped_token: Address,
     amount: U256,
     aggregate_id: &RedemptionAggregateId,
 ) {
     info!(
         %symbol,
         ?quantity,
-        %token,
+        %wrapped_token,
+        %unwrapped_token,
         %amount,
         aggregate_id = %aggregate_id.0,
         "Executing redemption operation"
@@ -252,7 +276,8 @@ mod tests {
         tx.send(TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(dec!(50)),
-            token: address!("0x1234567890123456789012345678901234567890"),
+            wrapped_token: address!("0x1234567890123456789012345678901234567890"),
+            unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
         })
         .await
         .unwrap();
@@ -358,7 +383,8 @@ mod tests {
         tx.send(TriggeredOperation::Redemption {
             symbol: Symbol::new("GOOG").unwrap(),
             quantity: FractionalShares::new(dec!(5)),
-            token: address!("0x1234567890123456789012345678901234567890"),
+            wrapped_token: address!("0x1234567890123456789012345678901234567890"),
+            unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
         })
         .await
         .unwrap();
@@ -415,7 +441,8 @@ mod tests {
         tx.send(TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: FractionalShares::new(dec!(-10)),
-            token: address!("0x1234567890123456789012345678901234567890"),
+            wrapped_token: address!("0x1234567890123456789012345678901234567890"),
+            unwrapped_token: address!("0xabcdef0123456789abcdef0123456789abcdef01"),
         })
         .await
         .unwrap();

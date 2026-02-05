@@ -15,7 +15,8 @@ pub(crate) struct RedeemCall {
     pub(crate) aggregate_id: RedemptionAggregateId,
     pub(crate) symbol: Symbol,
     pub(crate) quantity: FractionalShares,
-    pub(crate) token: Address,
+    pub(crate) wrapped_token: Address,
+    pub(crate) unwrapped_token: Address,
     pub(crate) amount: U256,
 }
 
@@ -65,7 +66,8 @@ impl Redeem for MockRedeem {
         aggregate_id: &RedemptionAggregateId,
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
+        wrapped_token: Address,
+        unwrapped_token: Address,
         amount: U256,
     ) -> Result<(), RedemptionError> {
         self.call_count.fetch_add(1, Ordering::SeqCst);
@@ -74,7 +76,8 @@ impl Redeem for MockRedeem {
             aggregate_id: aggregate_id.clone(),
             symbol,
             quantity,
-            token,
+            wrapped_token,
+            unwrapped_token,
             amount,
         });
 
@@ -114,6 +117,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             FractionalShares::new(dec!(10)),
             Address::ZERO,
+            Address::ZERO,
             U256::ZERO,
         )
         .await
@@ -126,6 +130,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             FractionalShares::new(dec!(20)),
             Address::ZERO,
+            Address::ZERO,
             U256::ZERO,
         )
         .await
@@ -137,7 +142,8 @@ mod tests {
     #[tokio::test]
     async fn execute_redemption_captures_parameters() {
         let mock = MockRedeem::new();
-        let token = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let wrapped_token = address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        let unwrapped_token = address!("0xfeedbeeffeedbeeffeedbeeffeedbeeffeedbeef");
         let amount = U256::from(999_000_000u64);
         let aggregate_id = RedemptionAggregateId::new("my-agg-id");
 
@@ -145,7 +151,8 @@ mod tests {
             &aggregate_id,
             Symbol::new("GOOG").unwrap(),
             FractionalShares::new(dec!(123.456)),
-            token,
+            wrapped_token,
+            unwrapped_token,
             amount,
         )
         .await
@@ -155,7 +162,8 @@ mod tests {
         assert_eq!(call.aggregate_id, aggregate_id);
         assert_eq!(call.symbol, Symbol::new("GOOG").unwrap());
         assert_eq!(call.quantity, FractionalShares::new(dec!(123.456)));
-        assert_eq!(call.token, token);
+        assert_eq!(call.wrapped_token, wrapped_token);
+        assert_eq!(call.unwrapped_token, unwrapped_token);
         assert_eq!(call.amount, amount);
     }
 
@@ -168,6 +176,7 @@ mod tests {
                 &RedemptionAggregateId::new("fail-test"),
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(dec!(1)),
+                Address::ZERO,
                 Address::ZERO,
                 U256::ZERO,
             )
@@ -186,6 +195,7 @@ mod tests {
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(dec!(1)),
                 Address::ZERO,
+                Address::ZERO,
                 U256::ZERO,
             )
             .await;
@@ -203,6 +213,7 @@ mod tests {
                 &aggregate_id,
                 Symbol::new("NVDA").unwrap(),
                 FractionalShares::new(dec!(50)),
+                Address::ZERO,
                 Address::ZERO,
                 U256::from(12345u64),
             )

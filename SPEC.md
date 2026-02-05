@@ -359,55 +359,55 @@ The system provides two top-level capabilities:
 ### Architecture Layers
 
 ```text
-┌───────────────────────────────────────────────────────────────────────┐
-│                          INTEGRATIONS                                 │
-│                 (external API wrappers, trait + impls)                │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  st0x-execution      st0x-tokenization  st0x-bridge    st0x-vault     │
-│  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Vault trait │
-│  │                   │                  │              │              │
-│  │ features:         │ features:        │ features:    │ features:    │
-│  │ ├─ schwab         │ └─ alpaca        │ └─ cctp      │ └─ rain      │
-│  │ ├─ alpaca-trading │                  │              │              │
-│  │ └─ mock           │                  │              │              │
-│                                                                       │
-└───────┬──────────────────┬──────────────────┬──────────────┬──────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          INTEGRATIONS                                   │
+│                 (external API wrappers, trait + impls)                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-execution      st0x-tokenization  st0x-bridge    st0x-raindex     │
+│  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Raindex trait │
+│  │                   │                  │              │                │
+│  │ features:         │ features:        │ features:    │ features:      │
+│  │ ├─ schwab         │ └─ alpaca        │ └─ cctp      │ └─ rain        │
+│  │ ├─ alpaca-trading │                  │              │                │
+│  │ └─ mock           │                  │              │                │
+│                                                                         │
+└───────┬──────────────────┬──────────────────┬──────────────┬────────────┘
         │                  │                  │              │
         ▼                  ▼                  ▼              ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│                          DOMAIN LOGIC                                 │
-│                    (business rules, uses traits)                      │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  st0x-hedge                            st0x-rebalance                 │
-│  ├─ Conductor                          ├─ Rebalancer                  │
-│  ├─ Accumulator                        ├─ Trigger logic               │
-│  ├─ Position tracking                  ├─ Mint/Redeem managers        │
-│  └─ Queue processing                   └─ CQRS aggregates             │
-│                                                                       │
-│  depends on: execution                 depends on: tokenization,      │
-│                                                    bridge, vault      │
-│                                                                       │
-└──────────────────────────────────┬────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          DOMAIN LOGIC                                   │
+│                    (business rules, uses traits)                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-hedge                            st0x-rebalance                   │
+│  ├─ Conductor                          ├─ Rebalancer                    │
+│  ├─ Accumulator                        ├─ Trigger logic                 │
+│  ├─ Position tracking                  ├─ Mint/Redeem managers          │
+│  └─ Queue processing                   └─ CQRS aggregates               │
+│                                                                         │
+│  depends on: execution                 depends on: tokenization,        │
+│                                                    bridge, vault        │
+│                                                                         │
+└──────────────────────────────────┬──────────────────────────────────────┘
                                    │
                                    ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│                           APPLICATION                                 │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  st0x-server                           st0x-dashboard                 │
-│  ├─ main.rs                            ├─ Websocket events            │
-│  ├─ API endpoints                      ├─ Admin UI backend            │
-│  ├─ Automated flows                    └─ Manual operations (future)  │
-│  │                                                                    │
-│  │ features:                                                          │
-│  │ ├─ schwab, alpaca-trading, mock                                    │
-│  │ ├─ alpaca-tokenization                                             │
-│  │ ├─ cctp                                                            │
-│  │ └─ rain                                                            │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           APPLICATION                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-server                           st0x-dashboard                   │
+│  ├─ main.rs                            ├─ Websocket events              │
+│  ├─ API endpoints                      ├─ Admin UI backend              │
+│  ├─ Automated flows                    └─ Manual operations (future)    │
+│  │                                                                      │
+│  │ features:                                                            │
+│  │ ├─ schwab, alpaca-trading, mock                                      │
+│  │ ├─ alpaca-tokenization                                               │
+│  │ ├─ cctp                                                              │
+│  │ └─ rain                                                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 
                 · · · · · · · · · · · · · · · · · · · · ·
                 ·                                       ·
@@ -428,18 +428,18 @@ The system provides two top-level capabilities:
 | `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
 | `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
 | `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
-| `st0x-vault`        | Orderbook vault deposit/withdraw operations          | `rain`                             |
+| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
-`Vault`) with one or more implementations selectable via feature flags. This
+`Raindex`) with one or more implementations selectable via feature flags. This
 allows swapping implementations without changing domain logic.
 
 **Domain Logic Layer** (business rules):
 
-| Crate            | Purpose                                                         | Dependencies                                     |
-| ---------------- | --------------------------------------------------------------- | ------------------------------------------------ |
-| `st0x-hedge`     | Hedging logic: conductor, accumulator, position tracking, queue | `st0x-execution`                                 |
-| `st0x-rebalance` | Balance maintenance: triggers, managers, CQRS aggregates        | `st0x-tokenization`, `st0x-bridge`, `st0x-vault` |
+| Crate            | Purpose                                                         | Dependencies                                       |
+| ---------------- | --------------------------------------------------------------- | -------------------------------------------------- |
+| `st0x-hedge`     | Hedging logic: conductor, accumulator, position tracking, queue | `st0x-execution`                                   |
+| `st0x-rebalance` | Balance maintenance: triggers, managers, CQRS aggregates        | `st0x-tokenization`, `st0x-bridge`, `st0x-raindex` |
 
 Domain crates depend on integration traits, not concrete implementations. This
 enables testing with mocks and future implementation swaps.
@@ -493,7 +493,7 @@ Extract external API wrappers (no CQRS/ES dependencies):
 
 - `st0x-tokenization`: Alpaca tokenization API, defines `Tokenizer` trait
 - `st0x-bridge`: CCTP cross-chain transfers, defines `Bridge` trait
-- `st0x-vault`: Rain orderbook vault operations, defines `Vault` trait
+- `st0x-raindex`: Rain orderbook vault operations, defines `Raindex` trait
 
 ### Phase 3: Rebalancing Domain Extraction
 
@@ -1507,11 +1507,16 @@ stateDiagram-v2
     MintRequested --> Failed
     MintAccepted --> TokensReceived
     MintAccepted --> Failed
-    TokensReceived --> DepositedIntoRaindex: Deposit
+    TokensReceived --> TokensWrapped: Wrap
     TokensReceived --> Failed
+    TokensWrapped --> DepositedIntoRaindex: Deposit
+    TokensWrapped --> Failed
     DepositedIntoRaindex --> Completed
     DepositedIntoRaindex --> Failed
 ```
+
+Alpaca mints unwrapped tokens. Before depositing to Raindex, we wrap them into
+ERC-4626 vault shares using the Wrapper service.
 
 ##### States
 
@@ -1522,9 +1527,10 @@ enum TokenizedEquityMint {
     MintRequested { symbol, quantity, wallet, requested_at },
     MintAccepted { /* + issuer_request_id, tokenization_request_id */ },
     TokensReceived { /* + token_tx_hash, receipt_id, shares_minted */ },
+    TokensWrapped { /* + wrap_tx_hash, wrapped_shares */ },
     DepositedIntoRaindex { /* + vault_deposit_tx_hash */ },
     Completed { symbol, quantity, issuer_request_id, tokenization_request_id,
-                token_tx_hash, vault_deposit_tx_hash, completed_at },
+                token_tx_hash, wrap_tx_hash, vault_deposit_tx_hash, completed_at },
     Failed { symbol, quantity, reason, failed_at },
 }
 ```
@@ -1535,7 +1541,9 @@ enum TokenizedEquityMint {
 enum TokenizedEquityMintCommand {
     // Requests mint from Alpaca and polls until tokens arrive in wallet
     Mint { symbol, quantity, wallet },
-    // Deposits tokens from wallet to Raindex vault
+    // Wraps unwrapped tokens into ERC-4626 vault shares
+    Wrap,
+    // Deposits wrapped tokens to Raindex vault
     Deposit,
 }
 ```
@@ -1553,6 +1561,9 @@ enum TokenizedEquityMintEvent {
 
     TokensReceived { symbol, quantity, tx_hash, receipt_id, shares_minted, received_at },
 
+    TokensWrapped { wrap_tx_hash, wrapped_shares, wrapped_at },
+    WrapFailed { symbol, quantity, reason, failed_at },
+
     DepositedIntoRaindex { symbol, quantity, vault_deposit_tx_hash, deposited_at },
     RaindexDepositFailed { symbol, quantity, failed_tx_hash: Option<TxHash>, failed_at },
 
@@ -1567,7 +1578,9 @@ struct HttpStatusCode(u16);
 
 - `Mint` only from uninitialized state; polls Alpaca until tokens arrive or
   failure
-- `Deposit` only from TokensReceived state
+- `Wrap` only from TokensReceived state; wraps unwrapped tokens into ERC-4626
+  shares
+- `Deposit` only from TokensWrapped state
 - Completed and Failed are terminal states
 
 #### EquityRedemption Aggregate
@@ -1587,17 +1600,22 @@ cqrs-es Services for atomic side-effect execution.
 ```mermaid
 stateDiagram-v2
     [*] --> WithdrawnFromRaindex: Withdraw
-    WithdrawnFromRaindex --> TokensSent: Redeem
+    WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
+    TokensUnwrapped --> TokensSent: Send
+    TokensUnwrapped --> Failed
     TokensSent --> Pending
     TokensSent --> Failed
     Pending --> Completed
     Pending --> Failed
 ```
 
-- `Withdraw` command withdraws from Raindex vault to wallet
-- `WithdrawnFromRaindex` tracks tokens that left the vault but aren't yet sent
-- `Redeem` command sends tokens to Alpaca and polls until terminal
+- `Withdraw` command withdraws wrapped tokens from Raindex vault to wallet
+- `WithdrawnFromRaindex` tracks wrapped tokens that left the vault but aren't
+  yet unwrapped
+- `Unwrap` command converts ERC-4626 wrapped tokens to unwrapped tokens
+- `TokensUnwrapped` tracks unwrapped tokens ready to send
+- `Send` command sends unwrapped tokens to Alpaca and polls until terminal
 - `TokensSent` tracks tokens that have been sent to Alpaca's redemption wallet
 - `Pending` indicates Alpaca detected the transfer
 - `Completed` and `Failed` are terminal states
@@ -1610,14 +1628,25 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
+        amount: U256,
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
+    },
+    TokensUnwrapped {
+        symbol: Symbol,
+        quantity: Decimal,
+        token: Address,
+        vault_withdraw_tx: TxHash,
+        unwrap_tx: TxHash,
+        underlying_amount: U256,
+        unwrapped_at: DateTime<Utc>,
     },
     TokensSent {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         vault_withdraw_tx: TxHash,
+        unwrap_tx: TxHash,
         redemption_wallet: Address,
         redemption_tx: TxHash,
         sent_at: DateTime<Utc>,
@@ -1641,6 +1670,7 @@ enum EquityRedemption {
         symbol: Symbol,
         quantity: Decimal,
         vault_withdraw_tx: Option<TxHash>,
+        unwrap_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
         failed_at: DateTime<Utc>,
@@ -1652,15 +1682,17 @@ enum EquityRedemption {
 
 ```rust
 enum EquityRedemptionCommand {
-    // Withdraws tokens from Raindex vault to wallet
+    // Withdraws wrapped tokens from Raindex vault to wallet
     Withdraw {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
         amount: U256,
     },
-    // Sends tokens to Alpaca and polls until terminal state (completed or rejected)
-    Redeem,
+    // Unwraps ERC-4626 tokens to underlying unwrapped tokens
+    Unwrap,
+    // Sends unwrapped tokens to Alpaca and polls until terminal state
+    Send,
 }
 ```
 
@@ -1672,8 +1704,19 @@ enum EquityRedemptionEvent {
         symbol: Symbol,
         quantity: Decimal,
         token: Address,
+        amount: U256,
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
+    },
+
+    TokensUnwrapped {
+        unwrap_tx: TxHash,
+        underlying_amount: U256,
+        unwrapped_at: DateTime<Utc>,
+    },
+    UnwrapFailed {
+        reason: String,
+        failed_at: DateTime<Utc>,
     },
 
     TokensSent {
@@ -1727,7 +1770,7 @@ trait Redeemer: Send + Sync {
 }
 ```
 
-`RedemptionService` implements `Redeemer` by composing `VaultService` and
+`RedemptionService` implements `Redeemer` by composing `RaindexService` and
 `AlpacaTokenizationService`.
 
 ##### Business Rules
@@ -2158,6 +2201,10 @@ know about cross-venue inventory.
   Alpaca)
 - `TokenizedEquityMintEvent::TokensReceived` - Moves from inflight to Raindex
   available
+- `TokenizedEquityMintEvent::TokensWrapped` - No balance change (conversion
+  between wrapped/unwrapped forms)
+- `TokenizedEquityMintEvent::WrapFailed` - No balance change (tokens await
+  retry)
 - `TokenizedEquityMintEvent::DepositedIntoRaindex` - No balance change
   (completes transfer to Raindex, already counted at TokensReceived)
 - `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
@@ -2169,6 +2216,9 @@ know about cross-venue inventory.
   Alpaca available
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
+- `EquityRedemptionEvent::TokensUnwrapped` - No balance change (conversion
+  between wrapped/unwrapped forms)
+- `EquityRedemptionEvent::UnwrapFailed` - No balance change (tokens await retry)
 - `EquityRedemptionEvent::TokensSent` - Tokens sent to Alpaca (still inflight)
 - `EquityRedemptionEvent::Completed` - Moves from inflight to Alpaca available
 - `EquityRedemptionEvent::DetectionFailed` - Tokens stranded (manual recovery)

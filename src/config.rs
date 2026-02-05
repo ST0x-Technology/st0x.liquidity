@@ -647,7 +647,7 @@ pub(crate) mod tests {
             type = "alpaca-broker-api"
             api_key = "test-key"
             api_secret = "test-secret"
-            account_id = "test-account-id"
+            account_id = "904837e3-3b76-47ec-b432-046db621571b"
             "#,
         );
 

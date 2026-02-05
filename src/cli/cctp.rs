@@ -273,18 +273,20 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{
+        AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode,
+    };
     use std::str::FromStr;
     use uuid::uuid;
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaAccountId;
     use crate::config::{BrokerConfig, LogLevel};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmConfig;
     use crate::rebalancing::RebalancingConfig;
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::threshold::ExecutionThreshold;
+    use std::collections::HashMap;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -322,9 +324,10 @@ mod tests {
             alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
-                account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+                account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
             },
+            equities: HashMap::new(),
         });
         config
     }

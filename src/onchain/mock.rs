@@ -6,26 +6,35 @@ use st0x_execution::Symbol;
 
 use super::raindex::{Raindex, RaindexError, VaultId};
 
-pub(crate) struct MockRaindex {
+pub(crate) struct MockVault {
     vault_id: VaultId,
-    token: Address,
     withdraw_tx: TxHash,
     deposit_tx: TxHash,
+    deposit_fails: bool,
 }
 
-impl MockRaindex {
+impl MockVault {
     pub(crate) fn new() -> Self {
         Self {
             vault_id: VaultId(B256::ZERO),
-            token: Address::ZERO,
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
+            deposit_fails: false,
+        }
+    }
+
+    pub(crate) fn failing_deposit() -> Self {
+        Self {
+            vault_id: VaultId(B256::ZERO),
+            withdraw_tx: TxHash::random(),
+            deposit_tx: TxHash::random(),
+            deposit_fails: true,
         }
     }
 }
 
 #[async_trait]
-impl Raindex for MockRaindex {
+impl Raindex for MockVault {
     async fn lookup_vault_id(&self, _token: Address) -> Result<VaultId, RaindexError> {
         Ok(self.vault_id)
     }
@@ -34,7 +43,7 @@ impl Raindex for MockRaindex {
         &self,
         _symbol: &Symbol,
     ) -> Result<(Address, VaultId), RaindexError> {
-        Ok((self.token, self.vault_id))
+        Ok((Address::ZERO, self.vault_id))
     }
 
     async fn deposit(
@@ -44,6 +53,9 @@ impl Raindex for MockRaindex {
         _amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
+        if self.deposit_fails {
+            return Err(RaindexError::ZeroAmount);
+        }
         Ok(self.deposit_tx)
     }
 

@@ -2,13 +2,12 @@
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{Mint, MintError};
-use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
+use crate::tokenized_equity_mint::IssuerRequestId;
 
 /// Parameters captured from the last `execute_mint` call.
 #[derive(Debug, Clone)]
@@ -77,8 +76,8 @@ impl Mint for MockMint {
         });
 
         if self.should_fail.load(Ordering::SeqCst) {
-            return Err(AggregateError::UserError(
-                TokenizedEquityMintError::AlreadyFailed,
+            return Err(MintError::Raindex(
+                crate::onchain::raindex::RaindexError::ZeroAmount,
             ));
         }
 
@@ -166,12 +165,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(AggregateError::UserError(
-                TokenizedEquityMintError::AlreadyFailed
-            ))
-        ));
+        assert!(
+            matches!(result, Err(MintError::Raindex(_))),
+            "Expected Raindex error, got: {result:?}"
+        );
     }
 
     #[tokio::test]

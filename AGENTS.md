@@ -641,22 +641,27 @@ returning values within expected bounds.
   5. **Diff review** - after all checks pass, review staged changes and revert
      any chunks without clear justification (see "Before handing over" section)
 
-#### CRITICAL: Lint Policy
+#### CRITICAL: Quality Control Policy
 
-**NEVER add `#[allow(clippy::*)]` attributes or disable any lints without
-explicit permission.** This is strictly forbidden. When clippy reports issues,
-you MUST fix the underlying code problems, not suppress the warnings.
+**NEVER bypass, disable, or suppress ANY quality control mechanism without
+explicit permission being granted.** This applies to ALL checks including but
+not limited to:
 
-**Required approach for clippy issues:**
+- Clippy lints (`#[allow(clippy::*)]`)
+- Compiler warnings (`#[allow(deprecated)]`, `#[allow(dead_code)]`, etc.)
+- Deadnix, rustfmt, or any other linting/formatting tools
+- Test assertions or validation logic
+- Any other strictness or quality enforcement
 
-1. **Refactor the code** to address the root cause of the lint violation
-2. **Break down large functions** into smaller, more focused functions
-3. **Improve code structure** to meet clippy's standards
-4. **Use proper error handling** instead of suppressing warnings
+When any check flags an issue, you MUST fix the underlying problem, not suppress
+the warning.
 
-When encountering a clippy issue: understand why it's flagged, refactor to
-address the root cause, and ask permission before suppressing if you believe
-it's incorrect.
+**Required approach:**
+
+1. **Refactor the code** to address the root cause of the violation
+2. **Find the right solution** that satisfies all quality constraints
+3. **Ask permission explicitly** if you believe suppression is the only option,
+   explaining why no alternative exists
 
 **Exception**: Lint suppression inside `sol!` macros is acceptable for issues
 from contract ABI signatures we cannot control.
