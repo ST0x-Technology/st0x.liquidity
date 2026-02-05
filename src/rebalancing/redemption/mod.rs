@@ -21,8 +21,6 @@ use crate::onchain::vault::VaultError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
-    #[error("Tokenizer error: {0}")]
-    Tokenizer(#[from] TokenizerError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] SendError<EquityRedemption>),
     #[error("Vault operation error: {0}")]

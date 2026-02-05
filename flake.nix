@@ -181,7 +181,7 @@
           inherit (rainix.devShells.${system}.default) nativeBuildInputs;
           shellHook = ''
             ${rainix.devShells.${system}.default.shellHook}
-            export TS_RS_EXPORT_DIR="$PWD"
+            export TS_RS_EXPORT_DIR="$PWD/crates/dto/bindings"
           '';
           DATABASE_URL = "sqlite:liquidity.db";
           buildInputs = with pkgs;

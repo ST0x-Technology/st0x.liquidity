@@ -2,14 +2,35 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use st0x_execution::{FractionalShares, Symbol};
 
-use super::{TokenizationRequest, Tokenizer, TokenizerError};
+use super::{
+    AlpacaTokenizationError, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
+    TokenizerError,
+};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
+
+/// Configurable outcome for detection polling.
+#[derive(Clone, Copy)]
+pub(crate) enum MockDetectionOutcome {
+    Detected,
+    Timeout,
+    ApiError,
+}
+
+/// Configurable outcome for completion polling.
+#[derive(Clone, Copy)]
+pub(crate) enum MockCompletionOutcome {
+    Completed,
+    Rejected,
+}
 
 pub(crate) struct MockTokenizer {
     redemption_wallet: Address,
     redemption_tx: TxHash,
+    detection_outcome: Option<MockDetectionOutcome>,
+    completion_outcome: Option<MockCompletionOutcome>,
 }
 
 impl MockTokenizer {
@@ -17,14 +38,19 @@ impl MockTokenizer {
         Self {
             redemption_wallet: Address::random(),
             redemption_tx: TxHash::random(),
+            detection_outcome: None,
+            completion_outcome: None,
         }
     }
 
-    pub(crate) fn with_redemption_tx(redemption_tx: TxHash) -> Self {
-        Self {
-            redemption_wallet: Address::random(),
-            redemption_tx,
-        }
+    pub(crate) fn with_detection_outcome(mut self, outcome: MockDetectionOutcome) -> Self {
+        self.detection_outcome = Some(outcome);
+        self
+    }
+
+    pub(crate) fn with_completion_outcome(mut self, outcome: MockCompletionOutcome) -> Self {
+        self.completion_outcome = Some(outcome);
+        self
     }
 }
 
@@ -37,14 +63,14 @@ impl Tokenizer for MockTokenizer {
         _wallet: Address,
         _issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        todo!("MockTokenizer::request_mint")
+        unimplemented!("MockTokenizer::request_mint")
     }
 
     async fn poll_mint_until_complete(
         &self,
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        todo!("MockTokenizer::poll_mint_until_complete")
+        unimplemented!("MockTokenizer::poll_mint_until_complete")
     }
 
     fn redemption_wallet(&self) -> Address {
@@ -63,13 +89,41 @@ impl Tokenizer for MockTokenizer {
         &self,
         _tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        todo!("MockTokenizer::poll_for_redemption")
+        match self.detection_outcome {
+            Some(MockDetectionOutcome::Detected) => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Pending,
+            )),
+            Some(MockDetectionOutcome::Timeout) => Err(TokenizerError::Alpaca(
+                AlpacaTokenizationError::PollTimeout {
+                    elapsed: std::time::Duration::from_secs(60),
+                },
+            )),
+            Some(MockDetectionOutcome::ApiError) => {
+                Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    message: "mock error".to_string(),
+                }))
+            }
+            None => unimplemented!("MockTokenizer::poll_for_redemption - no outcome configured"),
+        }
     }
 
     async fn poll_redemption_until_complete(
         &self,
         _id: &TokenizationRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        todo!("MockTokenizer::poll_redemption_until_complete")
+        match self.completion_outcome {
+            Some(MockCompletionOutcome::Completed) => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Completed,
+            )),
+            Some(MockCompletionOutcome::Rejected) => Ok(TokenizationRequest::mock(
+                TokenizationRequestStatus::Rejected,
+            )),
+            None => {
+                unimplemented!(
+                    "MockTokenizer::poll_redemption_until_complete - no outcome configured"
+                )
+            }
+        }
     }
 }

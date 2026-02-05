@@ -94,14 +94,11 @@ pub(crate) enum EquityRedemptionError {
     /// Tokenizer operation failed
     #[error("Tokenizer error: {0}")]
     Tokenizer(#[from] TokenizerError),
-    /// Vault not found for token in vault registry
-    #[error("Vault not found for token {0}")]
-    VaultNotFound(Address),
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
-    /// Attempted to complete before redemption was detected as pending
-    #[error("Cannot complete: not in pending state")]
+    /// Attempted to await completion before redemption was detected
+    #[error("Cannot await completion: not in pending state")]
     NotPending,
     /// Attempted to reject before redemption was detected as pending
     #[error("Cannot reject: not in pending state")]
@@ -131,16 +128,19 @@ pub(crate) enum EquityRedemptionCommand {
         token: Address,
         amount: U256,
     },
-    Detect {
-        tokenization_request_id: TokenizationRequestId,
-    },
-    FailDetection {
-        reason: String,
-    },
-    Complete,
-    RejectRedemption {
-        reason: String,
-    },
+    /// Polls Alpaca until they detect the token transfer.
+    /// Emits Detected on success, DetectionFailed on timeout/error.
+    Detect,
+    /// Polls Alpaca until the redemption reaches a terminal state.
+    /// Emits Completed or RedemptionRejected based on result.
+    AwaitCompletion,
+}
+
+/// Reason for detection failure when polling Alpaca for redemption detection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum DetectionFailure {
+    Timeout,
+    ApiError { status_code: Option<u16> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,9 +153,9 @@ pub(crate) enum EquityRedemptionEvent {
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
     },
-    /// Vault withdraw succeeded but send failed. Tokens are in wallet.
-    SendFailed {
-        reason: String,
+    /// Vault withdraw succeeded but transfer to redemption wallet failed.
+    TransferFailed {
+        tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
 
@@ -168,7 +168,7 @@ pub(crate) enum EquityRedemptionEvent {
     /// Alpaca failed to detect the token transfer.
     /// Tokens were sent but detection failed - keep inflight until manually resolved.
     DetectionFailed {
-        reason: String,
+        failure: DetectionFailure,
         failed_at: DateTime<Utc>,
     },
 
@@ -179,7 +179,6 @@ pub(crate) enum EquityRedemptionEvent {
     /// Alpaca rejected the redemption after detection.
     /// Tokens location unknown after rejection - keep inflight until manually resolved.
     RedemptionRejected {
-        reason: String,
         rejected_at: DateTime<Utc>,
     },
 
@@ -192,7 +191,7 @@ impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::VaultWithdrawn { .. } => "EquityRedemptionEvent::VaultWithdrawn".to_string(),
-            Self::SendFailed { .. } => "EquityRedemptionEvent::SendFailed".to_string(),
+            Self::TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
             Self::TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
             Self::DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
             Self::Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
@@ -253,7 +252,7 @@ pub(crate) enum EquityRedemption {
         completed_at: DateTime<Utc>,
     },
 
-    /// Redemption failed with error reason (terminal state)
+    /// Redemption failed (terminal state)
     ///
     /// Fields preserve context depending on when failure occurred:
     /// - `vault_withdraw_tx`: Present if vault withdraw succeeded
@@ -265,7 +264,6 @@ pub(crate) enum EquityRedemption {
         vault_withdraw_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
-        reason: String,
         failed_at: DateTime<Utc>,
     },
 }
@@ -368,7 +366,16 @@ impl EventSourced for EquityRedemption {
                         },
                     ]),
                     Err(e) => {
-                        // Vault withdraw succeeded but send failed - emit both events
+                        // Vault withdraw succeeded but transfer failed - emit both events
+                        // Extract tx_hash if available (when tx was sent but receipt failed)
+                        let tx_hash = match &e {
+                            TokenizerError::Alpaca(AlpacaTokenizationError::Transaction {
+                                tx_hash,
+                                ..
+                            }) => Some(*tx_hash),
+
+                            TokenizerError::Alpaca(_) => None,
+                        };
                         Ok(vec![
                             vault_withdrawn,
                             SendFailed {
@@ -480,7 +487,7 @@ impl EquityRedemption {
 
     fn try_apply_send_failed(
         &self,
-        reason: &str,
+        tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     ) -> Option<Self> {
         let Self::VaultWithdrawn {
@@ -497,9 +504,8 @@ impl EquityRedemption {
             symbol: symbol.clone(),
             quantity: *quantity,
             vault_withdraw_tx: Some(*vault_withdraw_tx),
-            redemption_tx: None,
+            redemption_tx: tx_hash,
             tokenization_request_id: None,
-            reason: reason.to_string(),
             failed_at,
         })
     }
@@ -569,14 +575,12 @@ impl EquityRedemption {
             vault_withdraw_tx: Some(*vault_withdraw_tx),
             redemption_tx: Some(*redemption_tx),
             tokenization_request_id: None,
-            reason: reason.to_string(),
             failed_at,
         })
     }
 
     fn try_apply_redemption_rejected(
         &self,
-        reason: &str,
         rejected_at: DateTime<Utc>,
     ) -> Option<Self> {
         let Self::Pending {
@@ -596,7 +600,6 @@ impl EquityRedemption {
             vault_withdraw_tx: None,
             redemption_tx: Some(*redemption_tx),
             tokenization_request_id: Some(tokenization_request_id.clone()),
-            reason: reason.to_string(),
             failed_at: rejected_at,
         })
     }
@@ -769,8 +772,11 @@ pub(crate) mod tests {
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::DetectionFailed { .. }
+            &events[0],
+            EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::Timeout,
+                ..
+            }
         ));
     }
 
@@ -842,7 +848,6 @@ pub(crate) mod tests {
             quantity,
             redemption_tx: failed_redemption_tx,
             tokenization_request_id,
-            reason,
             ..
         } = entity
         else {
@@ -856,7 +861,6 @@ pub(crate) mod tests {
             tokenization_request_id,
             Some(TokenizationRequestId("REQ789".to_string()))
         );
-        assert_eq!(reason, "Insufficient balance");
     }
 
     #[tokio::test]
@@ -942,7 +946,7 @@ pub(crate) mod tests {
         };
 
         let event = EquityRedemptionEvent::DetectionFailed {
-            reason: "Should not apply".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         };
 
@@ -963,7 +967,6 @@ pub(crate) mod tests {
         };
 
         let event = EquityRedemptionEvent::RedemptionRejected {
-            reason: "Should not apply".to_string(),
             rejected_at: Utc::now(),
         };
 

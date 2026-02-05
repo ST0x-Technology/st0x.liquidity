@@ -1,21 +1,19 @@
 //! RedemptionManager orchestrates the EquityRedemption workflow.
 //!
-//! Coordinates the `EquityRedemption` aggregate with polling for detection and completion.
-//! The aggregate handles vault withdraw and token send atomically via its Services.
+//! Dispatches commands to the `EquityRedemption` aggregate which handles all I/O
+//! via its Services pattern (vault withdraw, token send, polling).
 
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument};
 
 use st0x_event_sorcery::Store;
 
 use super::service::RedemptionService;
 use super::{Redeem, RedemptionError};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
-use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
-use crate::tokenization::{TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 use crate::onchain::vault::{VaultId, VaultService};
@@ -53,10 +51,6 @@ where
     }
 
     /// Executes the Redeem command and extracts the redemption tx hash.
-    ///
-    /// The aggregate atomically:
-    /// 1. Withdraws tokens from vault (emits VaultWithdrawn)
-    /// 2. Sends tokens to Alpaca (emits TokensSent or SendFailed)
     async fn execute_redeem(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -77,7 +71,6 @@ where
             )
             .await?;
 
-        // Load aggregate to get the redemption tx hash
         let state = self
             .cqrs
             .load(aggregate_id)
@@ -96,86 +89,66 @@ where
         }
     }
 
-    /// Polls for redemption detection and records it.
-    async fn poll_detection(
+    /// Executes Detect command (polls for detection internally).
+    async fn execute_detect(
         &self,
         aggregate_id: &RedemptionAggregateId,
-        tx_hash: &TxHash,
     ) -> Result<TokenizationRequestId, RedemptionError> {
-        let detected = match self.tokenizer.poll_for_redemption(tx_hash).await {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Polling for redemption detection failed: {e}");
-                self.cqrs
-                    .send(
-                        aggregate_id,
-                        EquityRedemptionCommand::FailDetection {
-                            reason: format!("Detection polling failed: {e}"),
-                        },
-                    )
-                    .await?;
-                return Err(RedemptionError::Tokenizer(e));
-            }
-        };
-
         self.cqrs
             .send(
                 aggregate_id,
-                EquityRedemptionCommand::Detect {
-                    tokenization_request_id: detected.id.clone(),
-                },
+                EquityRedemptionCommand::Detect,
             )
             .await?;
 
-        Ok(detected.id)
+        let state = self
+            .cqrs
+            .load(aggregate_id)
+            .await?
+            .ok_or(RedemptionError::AggregateNotFound)?;
+
+        match state {
+            EquityRedemption::Pending {
+                tokenization_request_id,
+                ..
+            } => Ok(tokenization_request_id),
+            EquityRedemption::Failed { reason, .. } => {
+                Err(RedemptionError::DetectionFailed)
+            }
+            other => {
+                error!(?other, "Unexpected aggregate state after Detect command");
+                Err(RedemptionError::UnexpectedState)
+            }
+        }
     }
 
-    /// Polls for completion and finalizes the redemption.
-    async fn poll_completion(
+    /// Executes AwaitCompletion command (polls for completion internally).
+    async fn execute_await_completion(
         &self,
         aggregate_id: &RedemptionAggregateId,
-        request_id: &TokenizationRequestId,
     ) -> Result<(), RedemptionError> {
-        let completed = match self
-            .tokenizer
-            .poll_redemption_until_complete(request_id)
-            .await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Polling for completion failed: {e}");
-                self.cqrs
-                    .send(
-                        aggregate_id,
-                        EquityRedemptionCommand::RejectRedemption {
-                            reason: format!("Completion polling failed: {e}"),
-                        },
-                    )
-                    .await?;
-                return Err(RedemptionError::Tokenizer(e));
-            }
-        };
+        self.cqrs
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::AwaitCompletion,
+            )
+            .await?;
 
-        match completed.status {
-            TokenizationRequestStatus::Completed => {
-                self.cqrs
-                    .send(aggregate_id, EquityRedemptionCommand::Complete)
-                    .await?;
-                Ok(())
-            }
-            TokenizationRequestStatus::Rejected => {
-                self.cqrs
-                    .send(
-                        aggregate_id,
-                        EquityRedemptionCommand::RejectRedemption {
-                            reason: "Redemption rejected by Alpaca".to_string(),
-                        },
-                    )
-                    .await?;
-                Err(RedemptionError::Rejected)
-            }
-            TokenizationRequestStatus::Pending => {
-                unreachable!("poll_redemption_until_complete should not return Pending status")
+        let state = self
+            .cqrs
+            .load(aggregate_id)
+            .await?
+            .ok_or(RedemptionError::AggregateNotFound)?;
+
+        match state {
+            EquityRedemption::Completed { .. } => Ok(()),
+            EquityRedemption::Failed { .. } => Err(RedemptionError::Rejected),
+            other => {
+                error!(
+                    ?other,
+                    "Unexpected aggregate state after AwaitCompletion command"
+                );
+                Err(RedemptionError::UnexpectedState)
             }
         }
     }
@@ -197,10 +170,10 @@ where
             .await?;
 
         info!(%redemption_tx, "Tokens sent, polling for detection");
-        let request_id = self.poll_detection(aggregate_id, &redemption_tx).await?;
+        let request_id = self.execute_detect(aggregate_id).await?;
 
-        info!(%request_id, "Redemption detected, polling for completion");
-        self.poll_completion(aggregate_id, &request_id).await?;
+        info!(%request_id, "Redemption detected, awaiting completion");
+        self.execute_await_completion(aggregate_id).await?;
 
         info!("Redemption workflow completed successfully");
         Ok(())
@@ -552,7 +525,6 @@ mod tests {
     async fn redemption_full_workflow_succeeds() {
         let pool = crate::test_utils::setup_test_db().await;
         let local_evm = LocalEvmWithVault::new().await;
-        let server = MockServer::start();
 
         // Create vault registry query first so we can use it for both deposit and redemption
         let vault_registry_query = seed_vault_registry_with_params(
@@ -656,9 +628,6 @@ mod tests {
             )
             .await;
 
-        assert!(
-            result.is_ok(),
-            "Expected redemption to succeed, got: {result:?}"
-        );
+        result.unwrap();
     }
 }

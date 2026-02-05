@@ -814,7 +814,7 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok(), "Expected Ok but got: {result:?}");
+        result.unwrap();
 
         mint_mock.assert();
         poll_mock.assert();

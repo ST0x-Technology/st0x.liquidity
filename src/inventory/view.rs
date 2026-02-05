@@ -591,8 +591,8 @@ impl InventoryView {
                 now,
             ),
 
-            EquityRedemptionEvent::SendFailed { .. } => {
-                // Vault withdraw succeeded but send failed - keep inflight until resolved.
+            EquityRedemptionEvent::TransferFailed { .. } => {
+                // Vault withdraw succeeded but transfer failed - keep inflight until resolved.
                 Ok(Self {
                     last_updated: now,
                     ..self
@@ -819,6 +819,7 @@ mod tests {
     use st0x_execution::{ExecutorOrderId, Positive};
 
     use super::*;
+    use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
@@ -1674,14 +1675,13 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
-            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         }
     }

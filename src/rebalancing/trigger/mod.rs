@@ -48,6 +48,12 @@ enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
+    #[error(transparent)]
+    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
+    WalletCollision(Address),
+    #[error(transparent)]
+    Uuid(#[from] uuid::Error),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -85,7 +91,7 @@ pub(crate) struct RebalancingCtx {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
+    /// Parsed from `alpaca_broker_auth.account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Cloned from broker config - ensures consistency.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
@@ -102,6 +108,7 @@ impl RebalancingCtx {
         broker_auth: AlpacaBrokerApiCtx,
     ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
+
 
         Ok(Self {
             equity_threshold: config.equity_threshold,
@@ -1268,7 +1275,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
@@ -1281,7 +1288,6 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
-            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         }
     }

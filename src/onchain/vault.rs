@@ -19,7 +19,6 @@ use rain_math_float::Float;
 use rust_decimal::Decimal;
 use st0x_execution::FractionalShares;
 use std::sync::Arc;
-use tracing::warn;
 
 use crate::bindings::IOrderBookV5;
 use crate::error_decoding::handle_contract_error;
@@ -49,6 +48,14 @@ pub(crate) enum VaultError {
     DecimalParse(#[from] rust_decimal::Error),
     #[error("Amount cannot be zero")]
     ZeroAmount,
+    #[error("Vault registry not found for aggregate {0}")]
+    RegistryNotFound(String),
+    #[error("Vault registry not initialized")]
+    RegistryNotInitialized,
+    #[error("Vault registry in failed state")]
+    RegistryFailed,
+    #[error("Vault not found for token {0}")]
+    VaultNotFound(Address),
 }
 
 /// Service for managing Rain OrderBook vault operations.
@@ -287,7 +294,7 @@ fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
 #[async_trait]
 pub(crate) trait Vault: Send + Sync {
     /// Looks up the vault ID for a given token from the vault registry.
-    async fn lookup_vault_id(&self, token: Address) -> Option<VaultId>;
+    async fn lookup_vault_id(&self, token: Address) -> Result<VaultId, VaultError>;
 
     /// Deposits tokens to a Rain OrderBook vault.
     async fn deposit(
@@ -313,20 +320,19 @@ impl<P> Vault for VaultService<P>
 where
     P: Provider + Clone + Send + Sync,
 {
-    async fn lookup_vault_id(&self, token: Address) -> Option<VaultId> {
+    async fn lookup_vault_id(&self, token: Address) -> Result<VaultId, VaultError> {
         let aggregate_id = VaultRegistry::aggregate_id(self.orderbook_address, self.owner);
-        let lifecycle = self.vault_registry_query.load(&aggregate_id).await?;
+        let Some(lifecycle) = self.vault_registry_query.load(&aggregate_id).await else {
+            return Err(VaultError::RegistryNotFound(aggregate_id));
+        };
 
         match lifecycle {
-            Lifecycle::Uninitialized => {
-                warn!("Vault registry not initialized");
-                None
-            }
-            Lifecycle::Live(registry) => registry.vault_id_by_token(token).map(VaultId),
-            Lifecycle::Failed { .. } => {
-                warn!("Vault registry in failed state");
-                None
-            }
+            Lifecycle::Uninitialized => Err(VaultError::RegistryNotInitialized),
+            Lifecycle::Live(registry) => registry
+                .vault_id_by_token(token)
+                .map(VaultId)
+                .ok_or(VaultError::VaultNotFound(token)),
+            Lifecycle::Failed { .. } => Err(VaultError::RegistryFailed),
         }
     }
 
