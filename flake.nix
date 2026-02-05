@@ -35,9 +35,7 @@
 
       deploy = (import ./deploy.nix { inherit deploy-rs self; }).config;
 
-      checks =
-        builtins.mapAttrs (_: deployLib: deployLib.deployChecks self.deploy)
-        deploy-rs.lib;
+      checks.x86_64-linux = deploy-rs.lib.x86_64-linux.deployChecks self.deploy;
     } // flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import rainix.inputs.nixpkgs {
