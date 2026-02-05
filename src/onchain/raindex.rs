@@ -13,12 +13,14 @@
 
 use alloy::primitives::{Address, B256, TxHash, U256, address};
 use alloy::providers::Provider;
+use alloy::rpc::types::TransactionReceipt;
 use async_trait::async_trait;
 use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 use crate::bindings::{IERC20, IOrderBookV5};
 use crate::error_decoding::handle_contract_error;
@@ -58,6 +60,8 @@ pub(crate) enum RaindexError {
     VaultNotFound(Address),
     #[error("Token not found for symbol {0}")]
     TokenNotFound(Symbol),
+    #[error("Transaction reverted on-chain: {0}")]
+    TransactionReverted(TxHash),
 }
 
 /// Service for managing Rain OrderBook vault operations.
@@ -155,30 +159,67 @@ where
             return Err(RaindexError::ZeroAmount);
         }
 
-        let erc20 = IERC20::new(token, self.provider.clone());
-        match erc20.approve(self.orderbook_address, amount).send().await {
-            Ok(pending) => {
-                pending.get_receipt().await?;
-            }
-            Err(e) => return Err(handle_contract_error(e).await),
-        }
+        self.approve_for_orderbook(token, amount).await?;
 
+        self.deposit3_to_vault(token, vault_id, amount, decimals)
+            .await
+    }
+
+    async fn approve_for_orderbook(
+        &self,
+        token: Address,
+        amount: U256,
+    ) -> Result<(), RaindexError> {
+        debug!(%token, %amount, spender = %self.orderbook_address, "Sending ERC20 approve");
+
+        let erc20 = IERC20::new(token, self.provider.clone());
+        let pending = log_and_decode_error(
+            erc20.approve(self.orderbook_address, amount).send().await,
+            "Approve",
+        )
+        .await?;
+
+        info!(tx_hash = %pending.tx_hash(), "Approve submitted");
+
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
+
+        ensure_receipt_success(&receipt)?;
+
+        info!(tx_hash = %receipt.transaction_hash, "Approve confirmed");
+        Ok(())
+    }
+
+    async fn deposit3_to_vault(
+        &self,
+        token: Address,
+        vault_id: VaultId,
+        amount: U256,
+        decimals: u8,
+    ) -> Result<TxHash, RaindexError> {
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
 
-        let tasks = Vec::new();
+        debug!(%token, ?vault_id, %amount, "Sending deposit3");
 
-        let pending = match self
-            .orderbook
-            .deposit3(token, vault_id.0, amount_float.get_inner(), tasks)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
+        let pending = log_and_decode_error(
+            self.orderbook
+                .deposit3(token, vault_id.0, amount_float.get_inner(), Vec::new())
+                .send()
+                .await,
+            "deposit3",
+        )
+        .await?;
 
-        let receipt = pending.get_receipt().await?;
+        info!(tx_hash = %pending.tx_hash(), "deposit3 submitted");
 
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
+
+        info!(tx_hash = %receipt.transaction_hash, "deposit3 confirmed");
         Ok(receipt.transaction_hash)
     }
 
@@ -388,6 +429,28 @@ where
     }
 }
 
+fn ensure_receipt_success(receipt: &TransactionReceipt) -> Result<(), RaindexError> {
+    if receipt.status() {
+        Ok(())
+    } else {
+        warn!(tx_hash = %receipt.transaction_hash, "Transaction reverted on-chain");
+        Err(RaindexError::TransactionReverted(receipt.transaction_hash))
+    }
+}
+
+async fn log_and_decode_error<T>(
+    result: Result<T, alloy::contract::Error>,
+    name: &str,
+) -> Result<T, RaindexError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            warn!(%error, "{name} failed");
+            Err(handle_contract_error(error).await)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::network::{Ethereum, EthereumWallet};
@@ -401,6 +464,7 @@ mod tests {
     use alloy::transports::{RpcError, TransportErrorKind};
     use cqrs_es::persist::GenericQuery;
     use sqlite_es::SqliteViewRepository;
+    use tracing_test::traced_test;
 
     use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
@@ -564,6 +628,7 @@ mod tests {
             Arc::new(GenericQuery::new(vault_registry_view_repo));
 
         RaindexService::new(provider, orderbook_address, vault_registry_query, owner)
+            .with_required_confirmations(1)
     }
 
     #[tokio::test]
@@ -590,6 +655,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn deposit_approves_and_transfers_without_prior_allowance() {
         let local_evm = LocalEvm::new().await.unwrap();
 
@@ -641,6 +707,13 @@ mod tests {
             .unwrap()
             .get_inner();
         assert_eq!(vault_balance_after, expected_float);
+
+        assert!(logs_contain("Sending ERC20 approve"));
+        assert!(logs_contain("Approve submitted"));
+        assert!(logs_contain("Approve confirmed"));
+        assert!(logs_contain("Sending deposit3"));
+        assert!(logs_contain("deposit3 submitted"));
+        assert!(logs_contain("deposit3 confirmed"));
     }
 
     #[tokio::test]
@@ -901,5 +974,42 @@ mod tests {
 
         let expected = FractionalShares::new(Decimal::from(700));
         assert_eq!(balance, expected, "Expected 700 shares but got {balance:?}");
+    }
+
+    #[tokio::test]
+    async fn deposit_with_production_amount_succeeds() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        // Exact amount from production failure: 1.410161147 shares with 18 decimals
+        let deposit_amount = U256::from(1_410_161_147_000_000_000_u128);
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                U256::ZERO,
+            )
+            .await
+            .unwrap();
+
+        let service = create_test_raindex_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await
+        .with_required_confirmations(1);
+
+        // This should succeed - the approve inside deposit() should cover the transferFrom amount
+        let result = service
+            .deposit(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await;
+
+        assert!(result.is_ok(), "Deposit failed: {:?}", result.unwrap_err());
     }
 }
