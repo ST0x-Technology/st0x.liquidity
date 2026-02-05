@@ -15,7 +15,7 @@ use tracing::{info, instrument, warn};
 use super::{Mint, MintError};
 use crate::equity_redemption::TOKENIZED_EQUITY_DECIMALS;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{Raindex, VaultId};
+use crate::onchain::raindex::{Raindex, VaultId};
 use crate::tokenization::{TokenizationRequest, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
@@ -311,7 +311,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::onchain::vault::RaindexService;
+    use crate::onchain::raindex::RaindexService;
     use crate::test_utils::{create_test_raindex_service, create_vault_registry_query};
     use crate::tokenization::alpaca::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_with_provider, setup_anvil,

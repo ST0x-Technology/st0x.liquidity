@@ -55,7 +55,7 @@ use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::onchain::vault::{Raindex, VaultError};
+use crate::onchain::raindex::{Raindex, RaindexError};
 use crate::tokenization::{Tokenizer, TokenizerError};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 use crate::wrapper::{Wrapper, WrapperError};
@@ -96,8 +96,8 @@ impl RedemptionAggregateId {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
     /// Rain OrderBook vault operation failed
-    #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
+    #[error("Raindex error: {0}")]
+    Raindex(#[from] RaindexError),
     /// ERC-4626 unwrap operation failed
     #[error("Wrapper error: {0}")]
     Wrapper(#[from] WrapperError),
@@ -396,11 +396,7 @@ impl Lifecycle<EquityRedemption, Never> {
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => {
-                let vault_id = services
-                    .raindex
-                    .lookup_vault_id(token)
-                    .await
-                    .ok_or(EquityRedemptionError::VaultNotFound(token))?;
+                let vault_id = services.raindex.lookup_vault_id(token).await?;
 
                 let vault_withdraw_tx = services
                     .raindex

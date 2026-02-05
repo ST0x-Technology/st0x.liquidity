@@ -38,12 +38,22 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
+use std::sync::Arc;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::onchain::raindex::Raindex;
+use crate::tokenization::Tokenizer;
 
 /// SQLite-backed event store for TokenizedEquityMint aggregates.
 pub(crate) type MintEventStore =
     PersistedEventStore<SqliteEventRepository, Lifecycle<TokenizedEquityMint, Never>>;
+
+/// Services required by the TokenizedEquityMint aggregate.
+#[derive(Clone)]
+pub(crate) struct MintServices {
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) raindex: Arc<dyn Raindex>,
+}
 
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -348,7 +358,7 @@ impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
     type Command = TokenizedEquityMintCommand;
     type Event = TokenizedEquityMintEvent;
     type Error = TokenizedEquityMintError;
-    type Services = ();
+    type Services = MintServices;
 
     fn aggregate_type() -> String {
         "TokenizedEquityMint".to_string()
@@ -981,8 +991,20 @@ impl TokenizedEquityMint {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::onchain::mock::MockVault;
+    use crate::tokenization::mock::MockTokenizer;
+
+    fn mock_services() -> MintServices {
+        MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockVault::new()),
+        }
+    }
 
     #[tokio::test]
     async fn test_request_mint_from_uninitialized() {
@@ -997,7 +1019,7 @@ mod tests {
                     quantity: dec!(100.5),
                     wallet,
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1029,7 +1051,7 @@ mod tests {
                     issuer_request_id: IssuerRequestId("ISS123".to_string()),
                     tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1072,7 +1094,7 @@ mod tests {
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1135,7 +1157,7 @@ mod tests {
         aggregate.apply(deposited_event);
 
         let events = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
+            .handle(TokenizedEquityMintCommand::Finalize, &mock_services())
             .await
             .unwrap();
 
@@ -1162,7 +1184,7 @@ mod tests {
                     quantity: dec!(100.5),
                     wallet,
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1177,7 +1199,7 @@ mod tests {
                     issuer_request_id: IssuerRequestId("ISS123".to_string()),
                     tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1193,7 +1215,7 @@ mod tests {
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1209,7 +1231,7 @@ mod tests {
                     wrap_tx_hash,
                     wrapped_shares: U256::from(100_500_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1223,7 +1245,7 @@ mod tests {
                 TokenizedEquityMintCommand::DepositToVault {
                     vault_deposit_tx_hash,
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1233,7 +1255,7 @@ mod tests {
         }
 
         let events = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
+            .handle(TokenizedEquityMintCommand::Finalize, &mock_services())
             .await
             .unwrap();
         assert_eq!(events.len(), 1);
@@ -1257,7 +1279,7 @@ mod tests {
                     issuer_request_id: IssuerRequestId("ISS123".to_string()),
                     tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1288,7 +1310,7 @@ mod tests {
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1330,7 +1352,7 @@ mod tests {
         aggregate.apply(received_event);
 
         let result = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
+            .handle(TokenizedEquityMintCommand::Finalize, &mock_services())
             .await;
 
         assert!(matches!(
@@ -1358,7 +1380,7 @@ mod tests {
                 TokenizedEquityMintCommand::RejectMint {
                     reason: "Alpaca API timeout".to_string(),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1398,7 +1420,7 @@ mod tests {
                 TokenizedEquityMintCommand::FailAcceptance {
                     reason: "Transaction reverted".to_string(),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1472,7 +1494,7 @@ mod tests {
                 TokenizedEquityMintCommand::RejectMint {
                     reason: "Cannot reject completed mint".to_string(),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1509,7 +1531,7 @@ mod tests {
                 TokenizedEquityMintCommand::RejectMint {
                     reason: "Cannot reject again".to_string(),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1528,7 +1550,7 @@ mod tests {
                 TokenizedEquityMintCommand::RejectMint {
                     reason: "Cannot reject uninitialized".to_string(),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1557,7 +1579,7 @@ mod tests {
                 TokenizedEquityMintCommand::FailAcceptance {
                     reason: "Cannot fail before acceptance".to_string(),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1766,7 +1788,7 @@ mod tests {
                     wrap_tx_hash,
                     wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1807,7 +1829,7 @@ mod tests {
                     wrap_tx_hash: TxHash::random(),
                     wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await;
 
@@ -1833,7 +1855,7 @@ mod tests {
                     quantity: dec!(100.5),
                     wallet,
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1847,7 +1869,7 @@ mod tests {
                     issuer_request_id: IssuerRequestId("ISS123".to_string()),
                     tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1862,7 +1884,7 @@ mod tests {
                     receipt_id: ReceiptId(U256::from(789)),
                     shares_minted: U256::from(100_500_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1876,7 +1898,7 @@ mod tests {
                     wrap_tx_hash,
                     wrapped_shares: U256::from(100_000_000_000_000_000_000_u128),
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1890,7 +1912,7 @@ mod tests {
                 TokenizedEquityMintCommand::DepositToVault {
                     vault_deposit_tx_hash,
                 },
-                &(),
+                &mock_services(),
             )
             .await
             .unwrap();
@@ -1899,7 +1921,7 @@ mod tests {
         }
 
         let events = aggregate
-            .handle(TokenizedEquityMintCommand::Finalize, &())
+            .handle(TokenizedEquityMintCommand::Finalize, &mock_services())
             .await
             .unwrap();
         for event in events {

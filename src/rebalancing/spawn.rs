@@ -25,7 +25,7 @@ use crate::cctp::{
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
 use crate::onchain::http_client_with_retry;
-use crate::onchain::vault::{Raindex, RaindexService, VaultId};
+use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
 use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
@@ -301,10 +301,20 @@ mod tests {
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletService};
     use crate::conductor::wire::test_cqrs;
     use crate::inventory::ImbalanceThreshold;
+    use crate::onchain::mock::MockVault;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::MintServices;
     use crate::vault_registry::VaultRegistryAggregate;
     use std::collections::HashMap;
+
+    fn mock_mint_services() -> MintServices {
+        MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockVault::new()),
+        }
+    }
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -583,7 +593,7 @@ mod tests {
         });
 
         let pool = crate::test_utils::setup_test_db().await;
-        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
+        let mint_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], mock_mint_services()));
         let usdc_cqrs = Arc::new(test_cqrs(pool.clone(), vec![], ()));
 
         let redemption_view_repo = Arc::new(SqliteViewRepository::<

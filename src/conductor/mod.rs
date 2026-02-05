@@ -52,8 +52,8 @@ use crate::offchain_order::{
 use crate::onchain::accumulator::{ExecutionParams, check_all_positions};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::raindex::{Raindex, RaindexService};
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::vault::{Raindex, RaindexService};
 use crate::onchain::{EvmConfig, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
@@ -67,6 +67,7 @@ use crate::rebalancing::{
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
+use crate::tokenized_equity_mint::MintServices;
 use crate::vault_registry::{
     VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
 };
@@ -598,6 +599,10 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         market_maker_wallet,
         rebalancing_config.equities.clone(),
     ));
+    let mint_services = MintServices {
+        tokenizer: tokenizer.clone(),
+        raindex: raindex.clone(),
+    };
     let redemption_services = RedemptionServices {
         tokenizer,
         raindex,
@@ -623,7 +628,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         wrapper,
     );
 
-    let (frameworks, queries) = manifest.wire(pool.clone(), redemption_services);
+    let (frameworks, queries) = manifest.wire(pool.clone(), mint_services, redemption_services);
 
     let rebalancing_frameworks = RebalancingCqrsFrameworks {
         mint: frameworks.mint,

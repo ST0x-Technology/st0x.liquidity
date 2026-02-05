@@ -13,7 +13,7 @@ use cqrs_es::AggregateError;
 use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
-use crate::onchain::vault::VaultError as RainVaultError;
+use crate::onchain::raindex::RaindexError;
 use crate::tokenization::TokenizerError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
 use crate::wrapper::WrapperError;
@@ -24,8 +24,8 @@ pub(crate) enum MintError {
     Tokenizer(#[from] TokenizerError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
-    #[error("Raindex vault error: {0}")]
-    RainVault(#[from] RainVaultError),
+    #[error("Raindex error: {0}")]
+    Raindex(#[from] RaindexError),
     #[error("Vault not found for symbol {0}")]
     VaultNotFound(Symbol),
     #[error("Mint request was rejected by Alpaca")]

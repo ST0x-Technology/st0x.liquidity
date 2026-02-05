@@ -291,7 +291,7 @@ mod tests {
     use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::{RedemptionServices, TOKENIZED_EQUITY_DECIMALS};
     use crate::onchain::mock::MockVault;
-    use crate::onchain::vault::{Raindex, RaindexService, VaultId};
+    use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
     use crate::tokenization::alpaca::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_with_provider,
     };

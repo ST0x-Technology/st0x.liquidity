@@ -18,7 +18,7 @@ use crate::alpaca_wallet::{
 };
 use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{RaindexService, VaultId};
+use crate::onchain::raindex::{RaindexService, VaultId};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
@@ -914,7 +914,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError};
     use crate::cctp::{CctpBridge, Evm};
-    use crate::onchain::vault::RaindexService;
+    use crate::onchain::raindex::RaindexService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
     use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 

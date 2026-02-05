@@ -52,6 +52,15 @@ impl MockTokenizer {
         self.completion_outcome = Some(outcome);
         self
     }
+
+    pub(crate) fn with_redemption_tx(tx: TxHash) -> Self {
+        Self {
+            redemption_wallet: Address::random(),
+            redemption_tx: tx,
+            detection_outcome: None,
+            completion_outcome: None,
+        }
+    }
 }
 
 #[async_trait]

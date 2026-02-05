@@ -23,7 +23,7 @@ use crate::cctp::{
 use crate::config::{BrokerConfig, Config};
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId, RedemptionServices};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{Raindex, RaindexService, VaultId};
+use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
@@ -33,7 +33,7 @@ use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 use crate::wrapper::{Wrapper, WrapperService};
@@ -160,9 +160,13 @@ where
         ctx.rebalancing_config.equities.clone(),
     ));
 
+    let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service.clone();
+    let raindex: Arc<dyn Raindex> = vault.clone();
+    let mint_services = MintServices { tokenizer, raindex };
+
     let mint_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
-    let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
+    let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], mint_services));
     let mint_manager = MintManager::new(
         ctx.tokenization_service,
         vault,
