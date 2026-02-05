@@ -359,55 +359,55 @@ The system provides two top-level capabilities:
 ### Architecture Layers
 
 ```text
-┌───────────────────────────────────────────────────────────────────────┐
-│                          INTEGRATIONS                                 │
-│                 (external API wrappers, trait + impls)                │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  st0x-execution      st0x-tokenization  st0x-bridge    st0x-vault     │
-│  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Vault trait │
-│  │                   │                  │              │              │
-│  │ features:         │ features:        │ features:    │ features:    │
-│  │ ├─ schwab         │ └─ alpaca        │ └─ cctp      │ └─ rain      │
-│  │ ├─ alpaca-trading │                  │              │              │
-│  │ └─ mock           │                  │              │              │
-│                                                                       │
-└───────┬──────────────────┬──────────────────┬──────────────┬──────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          INTEGRATIONS                                   │
+│                 (external API wrappers, trait + impls)                  │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-execution      st0x-tokenization  st0x-bridge    st0x-raindex     │
+│  ├─ Executor trait   ├─ Tokenizer trait ├─ Bridge trait├─ Raindex trait │
+│  │                   │                  │              │                │
+│  │ features:         │ features:        │ features:    │ features:      │
+│  │ ├─ schwab         │ └─ alpaca        │ └─ cctp      │ └─ rain        │
+│  │ ├─ alpaca-trading │                  │              │                │
+│  │ └─ mock           │                  │              │                │
+│                                                                         │
+└───────┬──────────────────┬──────────────────┬──────────────┬────────────┘
         │                  │                  │              │
         ▼                  ▼                  ▼              ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│                          DOMAIN LOGIC                                 │
-│                    (business rules, uses traits)                      │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  st0x-hedge                            st0x-rebalance                 │
-│  ├─ Conductor                          ├─ Rebalancer                  │
-│  ├─ Accumulator                        ├─ Trigger logic               │
-│  ├─ Position tracking                  ├─ Mint/Redeem managers        │
-│  └─ Queue processing                   └─ CQRS aggregates             │
-│                                                                       │
-│  depends on: execution                 depends on: tokenization,      │
-│                                                    bridge, vault      │
-│                                                                       │
-└──────────────────────────────────┬────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          DOMAIN LOGIC                                   │
+│                    (business rules, uses traits)                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-hedge                            st0x-rebalance                   │
+│  ├─ Conductor                          ├─ Rebalancer                    │
+│  ├─ Accumulator                        ├─ Trigger logic                 │
+│  ├─ Position tracking                  ├─ Mint/Redeem managers          │
+│  └─ Queue processing                   └─ CQRS aggregates               │
+│                                                                         │
+│  depends on: execution                 depends on: tokenization,        │
+│                                                    bridge, vault        │
+│                                                                         │
+└──────────────────────────────────┬──────────────────────────────────────┘
                                    │
                                    ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│                           APPLICATION                                 │
-├───────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  st0x-server                           st0x-dashboard                 │
-│  ├─ main.rs                            ├─ Websocket events            │
-│  ├─ API endpoints                      ├─ Admin UI backend            │
-│  ├─ Automated flows                    └─ Manual operations (future)  │
-│  │                                                                    │
-│  │ features:                                                          │
-│  │ ├─ schwab, alpaca-trading, mock                                    │
-│  │ ├─ alpaca-tokenization                                             │
-│  │ ├─ cctp                                                            │
-│  │ └─ rain                                                            │
-│                                                                       │
-└───────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           APPLICATION                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  st0x-server                           st0x-dashboard                   │
+│  ├─ main.rs                            ├─ Websocket events              │
+│  ├─ API endpoints                      ├─ Admin UI backend              │
+│  ├─ Automated flows                    └─ Manual operations (future)    │
+│  │                                                                      │
+│  │ features:                                                            │
+│  │ ├─ schwab, alpaca-trading, mock                                      │
+│  │ ├─ alpaca-tokenization                                               │
+│  │ ├─ cctp                                                              │
+│  │ └─ rain                                                              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
 
                 · · · · · · · · · · · · · · · · · · · · ·
                 ·                                       ·
@@ -428,18 +428,18 @@ The system provides two top-level capabilities:
 | `st0x-execution`    | Brokerage API integration for trade execution        | `schwab`, `alpaca-trading`, `mock` |
 | `st0x-tokenization` | Tokenization API for minting/redeeming equity tokens | `alpaca`                           |
 | `st0x-bridge`       | Cross-chain asset transfers                          | `cctp`                             |
-| `st0x-vault`        | Orderbook vault deposit/withdraw operations          | `rain`                             |
+| `st0x-raindex`      | Rain orderbook vault deposit/withdraw operations     | `rain`                             |
 
 Each integration crate defines a trait (e.g., `Executor`, `Tokenizer`, `Bridge`,
-`Vault`) with one or more implementations selectable via feature flags. This
+`Raindex`) with one or more implementations selectable via feature flags. This
 allows swapping implementations without changing domain logic.
 
 **Domain Logic Layer** (business rules):
 
-| Crate            | Purpose                                                         | Dependencies                                     |
-| ---------------- | --------------------------------------------------------------- | ------------------------------------------------ |
-| `st0x-hedge`     | Hedging logic: conductor, accumulator, position tracking, queue | `st0x-execution`                                 |
-| `st0x-rebalance` | Balance maintenance: triggers, managers, CQRS aggregates        | `st0x-tokenization`, `st0x-bridge`, `st0x-vault` |
+| Crate            | Purpose                                                         | Dependencies                                       |
+| ---------------- | --------------------------------------------------------------- | -------------------------------------------------- |
+| `st0x-hedge`     | Hedging logic: conductor, accumulator, position tracking, queue | `st0x-execution`                                   |
+| `st0x-rebalance` | Balance maintenance: triggers, managers, CQRS aggregates        | `st0x-tokenization`, `st0x-bridge`, `st0x-raindex` |
 
 Domain crates depend on integration traits, not concrete implementations. This
 enables testing with mocks and future implementation swaps.
@@ -493,7 +493,7 @@ Extract external API wrappers (no CQRS/ES dependencies):
 
 - `st0x-tokenization`: Alpaca tokenization API, defines `Tokenizer` trait
 - `st0x-bridge`: CCTP cross-chain transfers, defines `Bridge` trait
-- `st0x-vault`: Rain orderbook vault operations, defines `Vault` trait
+- `st0x-raindex`: Rain orderbook vault operations, defines `Raindex` trait
 
 ### Phase 3: Rebalancing Domain Extraction
 
