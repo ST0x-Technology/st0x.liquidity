@@ -104,9 +104,6 @@ pub(crate) enum EquityRedemptionError {
     /// Tokenizer operation failed
     #[error("Tokenizer error: {0}")]
     Tokenizer(#[from] TokenizerError),
-    /// Vault not found for token in vault registry
-    #[error("Vault not found for token {0}")]
-    VaultNotFound(Address),
     /// Attempted to unwrap tokens when redemption already started
     #[error("Cannot unwrap tokens: redemption already in progress")]
     CannotUnwrapAlreadyStarted,

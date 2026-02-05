@@ -26,8 +26,7 @@ use crate::inventory::InventoryView;
 use crate::lifecycle::Lifecycle;
 use crate::position::{PositionAggregate, PositionQuery};
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
-use crate::tokenized_equity_mint::MintServices;
-use crate::tokenized_equity_mint::TokenizedEquityMint;
+use crate::tokenized_equity_mint::{MintServices, TokenizedEquityMint};
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::wrapper::Wrapper;
 

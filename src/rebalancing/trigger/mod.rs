@@ -548,13 +548,16 @@ impl RebalancingTrigger {
                 | TokenizedEquityMintEvent::TokensReceived {
                     symbol, quantity, ..
                 }
-                | TokenizedEquityMintEvent::VaultDeposited {
+                | TokenizedEquityMintEvent::WrappingFailed {
                     symbol, quantity, ..
                 }
-                | TokenizedEquityMintEvent::VaultDepositFailed {
+                | TokenizedEquityMintEvent::DepositedIntoRaindex {
                     symbol, quantity, ..
                 }
-                | TokenizedEquityMintEvent::MintCompleted {
+                | TokenizedEquityMintEvent::RaindexDepositFailed {
+                    symbol, quantity, ..
+                }
+                | TokenizedEquityMintEvent::Completed {
                     symbol, quantity, ..
                 } => Some((symbol.clone(), FractionalShares::new(*quantity))),
 
@@ -575,10 +578,11 @@ impl RebalancingTrigger {
         events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
-                TokenizedEquityMintEvent::MintCompleted { .. }
+                TokenizedEquityMintEvent::Completed { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
-                    | TokenizedEquityMintEvent::VaultDepositFailed { .. }
+                    | TokenizedEquityMintEvent::WrappingFailed { .. }
+                    | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
             )
         })
     }
@@ -758,9 +762,15 @@ mod tests {
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::lifecycle::Lifecycle;
     use crate::offchain_order::{OffchainOrder, PriceCents};
+    use crate::onchain::mock::MockVault;
     use crate::position::TradeId;
     use crate::threshold::Usdc;
-    use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::tokenization::TokenizationRequestStatus;
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::HttpStatusCode;
+    use crate::tokenized_equity_mint::{
+        IssuerRequestId, MintServices, ReceiptId, TokenizationRequestId, TokenizedEquityMintCommand,
+    };
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
     };
@@ -1213,7 +1223,7 @@ mod tests {
     }
 
     fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
+        TokenizedEquityMintEvent::Completed {
             symbol: symbol.clone(),
             quantity,
             completed_at: Utc::now(),
@@ -1224,7 +1234,7 @@ mod tests {
         TokenizedEquityMintEvent::MintRejected {
             symbol: symbol.clone(),
             quantity,
-            reason: "API timeout".to_string(),
+            status_code: Some(HttpStatusCode(408)),
             rejected_at: Utc::now(),
         }
     }
@@ -1233,7 +1243,7 @@ mod tests {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
             symbol: symbol.clone(),
             quantity,
-            reason: "Transaction reverted".to_string(),
+            last_status: TokenizationRequestStatus::Pending,
             failed_at: Utc::now(),
         }
     }
@@ -1367,7 +1377,7 @@ mod tests {
         }
         assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
 
-        // Create event batch with MintRequested and MintCompleted.
+        // Create event batch with MintRequested and Completed.
         let events = vec![
             make_mint_envelope(make_mint_requested(&symbol, dec!(30))),
             make_mint_envelope(make_mint_completed(&symbol, dec!(30))),
@@ -1418,32 +1428,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_mint_event_in_isolation_clears_in_progress_flag() {
-        // This test verifies that when MintCompleted arrives in a separate dispatch
-        // (without MintRequested in the same batch), the in_progress flag is still cleared.
-        // This simulates what happens when Finalize command is executed.
+    async fn mint_commands_via_cqrs_clear_in_progress_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default().with_equity(symbol.clone());
-
         let (trigger, _receiver) = make_trigger_with_inventory(inventory).await;
 
-        // Mark symbol as in-progress (as if a mint was triggered).
+        // Mark symbol as in-progress (as if check_and_trigger_equity detected an imbalance).
         {
             let mut guard = trigger.equity_in_progress.write().unwrap();
             guard.insert(symbol.clone());
         }
         assert!(trigger.equity_in_progress.read().unwrap().contains(&symbol));
 
-        // Dispatch ONLY MintCompleted - no MintRequested in this batch.
-        // This is what happens when Finalize command produces MintCompleted.
-        let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
+        // Create CQRS framework with the trigger as a query processor.
+        let mint_services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            wrapper: Arc::new(MockWrapper::new()),
+            raindex: Arc::new(MockVault::new()),
+        };
 
-        trigger.dispatch("test-aggregate-id", &events).await;
+        let store: MemStore<Lifecycle<TokenizedEquityMint, Never>> = MemStore::default();
+        let trigger_arc: Arc<RebalancingTrigger> = Arc::new(trigger);
+        let cqrs = CqrsFramework::new(
+            store,
+            vec![Box::new(Arc::clone(&trigger_arc))],
+            mint_services,
+        );
 
-        // The in_progress flag should be cleared even though MintRequested wasn't in this batch.
+        let issuer_request_id = IssuerRequestId::new(Uuid::new_v4().to_string());
+
+        // Execute Mint command (produces MintRequested, MintAccepted, TokensReceived).
+        cqrs.execute(
+            &issuer_request_id.0,
+            TokenizedEquityMintCommand::Mint {
+                issuer_request_id: issuer_request_id.clone(),
+                symbol: symbol.clone(),
+                quantity: dec!(30),
+                wallet: Address::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Execute Wrap command (produces TokensWrapped).
+        cqrs.execute(&issuer_request_id.0, TokenizedEquityMintCommand::Wrap)
+            .await
+            .unwrap();
+
+        // Execute Deposit command (produces DepositedIntoRaindex, Completed).
+        cqrs.execute(&issuer_request_id.0, TokenizedEquityMintCommand::Deposit)
+            .await
+            .unwrap();
+
+        // The in_progress flag should be cleared after the terminal Completed event.
         assert!(
-            !trigger.equity_in_progress.read().unwrap().contains(&symbol),
-            "in_progress flag should be cleared when terminal event has symbol"
+            !trigger_arc
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains(&symbol),
+            "in_progress flag should be cleared after mint completion via CQRS"
         );
     }
 
@@ -1463,7 +1507,7 @@ mod tests {
     fn extract_mint_info_returns_info_from_any_event() {
         let symbol = Symbol::new("AAPL").unwrap();
 
-        // Can extract from MintCompleted
+        // Can extract from Completed
         let events = vec![make_mint_envelope(make_mint_completed(&symbol, dec!(30)))];
         let (extracted_symbol, extracted_quantity) =
             RebalancingTrigger::extract_mint_info(&events).unwrap();

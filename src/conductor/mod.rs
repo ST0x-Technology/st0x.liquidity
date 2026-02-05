@@ -61,8 +61,8 @@ use crate::position::{
 };
 use crate::queue::{QueuedEvent, enqueue};
 use crate::rebalancing::{
-    RebalancerAddresses, RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger,
-    RebalancingTriggerConfig, RedemptionDependencies, spawn_rebalancer,
+    RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
+    RedemptionDependencies, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
@@ -601,6 +601,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     ));
     let mint_services = MintServices {
         tokenizer: tokenizer.clone(),
+        wrapper: wrapper.clone(),
         raindex: raindex.clone(),
     };
     let redemption_services = RedemptionServices {
@@ -638,7 +639,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let redemption_deps = RedemptionDependencies {
         raindex_service,
         tokenization_service,
-        vault_registry_query,
         cqrs: frameworks.redemption,
         query: queries.redemption_view,
     };
@@ -646,10 +646,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     let handle = spawn_rebalancer(
         rebalancing_config,
         provider.clone(),
-        RebalancerAddresses {
-            market_maker_wallet,
-            orderbook: config.evm.orderbook,
-        },
+        market_maker_wallet,
         operation_receiver,
         rebalancing_frameworks,
         redemption_deps,

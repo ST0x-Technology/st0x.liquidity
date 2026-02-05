@@ -33,7 +33,8 @@ use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::tokenized_equity_mint::{IssuerRequestId, MintServices};
+use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::tokenized_equity_mint::MintServices;
 use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 use crate::wrapper::{Wrapper, WrapperService};
@@ -162,20 +163,16 @@ where
 
     let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service.clone();
     let raindex: Arc<dyn Raindex> = vault.clone();
-    let mint_services = MintServices { tokenizer, raindex };
+    let mint_services = MintServices {
+        tokenizer,
+        wrapper: wrapper.clone(),
+        raindex,
+    };
 
     let mint_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
     let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], mint_services));
-    let mint_manager = MintManager::new(
-        ctx.tokenization_service,
-        vault,
-        wrapper,
-        vault_registry_query,
-        ctx.config.evm.orderbook,
-        owner,
-        mint_cqrs,
-    );
+    let mint_manager = MintManager::new(mint_cqrs);
 
     let issuer_request_id = IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
 

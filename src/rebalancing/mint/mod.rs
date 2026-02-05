@@ -26,16 +26,8 @@ pub(crate) enum MintError {
     Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
     #[error("Raindex error: {0}")]
     Raindex(#[from] RaindexError),
-    #[error("Vault not found for symbol {0}")]
-    VaultNotFound(Symbol),
-    #[error("Mint request was rejected by Alpaca")]
-    Rejected,
-    #[error("Missing tx_hash in completed Alpaca response")]
-    MissingTxHash,
     #[error("U256 parse error: {0}")]
     U256Parse(#[from] alloy::primitives::ruint::ParseError),
-    #[error("Decimal overflow when scaling {0} to 18 decimals")]
-    DecimalOverflow(FractionalShares),
     #[error("ERC-4626 vault wrapping error: {0}")]
     Wrapper(#[from] WrapperError),
 }
@@ -118,6 +110,9 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(MintError::Rejected)));
+        assert!(
+            matches!(result, Err(MintError::Raindex(_))),
+            "Expected Raindex error, got: {result:?}"
+        );
     }
 }

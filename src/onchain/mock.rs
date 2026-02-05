@@ -10,6 +10,7 @@ pub(crate) struct MockVault {
     vault_id: VaultId,
     withdraw_tx: TxHash,
     deposit_tx: TxHash,
+    deposit_fails: bool,
 }
 
 impl MockVault {
@@ -18,6 +19,16 @@ impl MockVault {
             vault_id: VaultId(B256::ZERO),
             withdraw_tx: TxHash::random(),
             deposit_tx: TxHash::random(),
+            deposit_fails: false,
+        }
+    }
+
+    pub(crate) fn failing_deposit() -> Self {
+        Self {
+            vault_id: VaultId(B256::ZERO),
+            withdraw_tx: TxHash::random(),
+            deposit_tx: TxHash::random(),
+            deposit_fails: true,
         }
     }
 }
@@ -42,6 +53,9 @@ impl Raindex for MockVault {
         _amount: U256,
         _decimals: u8,
     ) -> Result<TxHash, RaindexError> {
+        if self.deposit_fails {
+            return Err(RaindexError::ZeroAmount);
+        }
         Ok(self.deposit_tx)
     }
 

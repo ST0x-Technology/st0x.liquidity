@@ -76,7 +76,9 @@ impl Mint for MockMint {
         });
 
         if self.should_fail.load(Ordering::SeqCst) {
-            return Err(MintError::Rejected);
+            return Err(MintError::Raindex(
+                crate::onchain::raindex::RaindexError::ZeroAmount,
+            ));
         }
 
         Ok(())
@@ -163,7 +165,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(MintError::Rejected)));
+        assert!(
+            matches!(result, Err(MintError::Raindex(_))),
+            "Expected Raindex error, got: {result:?}"
+        );
     }
 
     #[tokio::test]
