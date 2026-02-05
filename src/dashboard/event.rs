@@ -194,7 +194,7 @@ mod tests {
             EventEnvelope {
                 aggregate_id: "mint-multi".to_string(),
                 sequence: 2,
-                payload: TokenizedEquityMintEvent::MintCompleted {
+                payload: TokenizedEquityMintEvent::Completed {
                     symbol: Symbol::new("NVDA").unwrap(),
                     quantity: dec!(25),
                     completed_at: chrono::Utc::now(),
@@ -227,7 +227,7 @@ mod tests {
         match msg2 {
             ServerMessage::Event(entry) => {
                 assert_eq!(entry.sequence, 2);
-                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::MintCompleted");
+                assert_eq!(entry.event_type, "TokenizedEquityMintEvent::Completed");
             }
             ServerMessage::Initial(_) => panic!("expected Event message"),
         }

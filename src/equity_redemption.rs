@@ -54,7 +54,7 @@ use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::onchain::vault::{Vault, VaultError};
+use crate::onchain::raindex::{Raindex, RaindexError};
 use crate::tokenization::{
     AlpacaTokenizationError, TokenizationRequestStatus, Tokenizer, TokenizerError,
 };
@@ -74,7 +74,7 @@ pub(crate) type RedemptionEventStore =
 #[derive(Clone)]
 pub(crate) struct RedemptionServices {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) vault: Arc<dyn Vault>,
+    pub(crate) raindex: Arc<dyn Raindex>,
 }
 
 /// Unique identifier for a redemption aggregate instance.
@@ -94,7 +94,7 @@ impl RedemptionAggregateId {
 pub(crate) enum EquityRedemptionError {
     /// Vault operation failed
     #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
+    Vault(#[from] RaindexError),
     /// Tokenizer operation failed
     #[error("Tokenizer error: {0}")]
     Tokenizer(#[from] TokenizerError),
@@ -323,10 +323,10 @@ impl Lifecycle<EquityRedemption, Never> {
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => {
-                let vault_id = services.vault.lookup_vault_id(token).await?;
+                let vault_id = services.raindex.lookup_vault_id(token).await?;
 
                 let vault_withdraw_tx = services
-                    .vault
+                    .raindex
                     .withdraw(token, vault_id, amount, TOKENIZED_EQUITY_DECIMALS)
                     .await?;
 
@@ -714,27 +714,27 @@ pub(crate) mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
-    use crate::onchain::mock::MockVault;
+    use crate::onchain::mock::MockRaindex;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
 
     pub(crate) fn mock_redeemer_services() -> RedemptionServices {
         RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new()),
-            vault: Arc::new(MockVault::new()),
+            raindex: Arc::new(MockRaindex::new()),
         }
     }
 
     fn services_with_detection(outcome: MockDetectionOutcome) -> RedemptionServices {
         RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new().with_detection_outcome(outcome)),
-            vault: Arc::new(MockVault::new()),
+            raindex: Arc::new(MockRaindex::new()),
         }
     }
 
     fn services_with_completion(outcome: MockCompletionOutcome) -> RedemptionServices {
         RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new().with_completion_outcome(outcome)),
-            vault: Arc::new(MockVault::new()),
+            raindex: Arc::new(MockRaindex::new()),
         }
     }
 

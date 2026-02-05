@@ -1556,7 +1556,7 @@ enum TokenizedEquityMintEvent {
     DepositedIntoRaindex { symbol, quantity, vault_deposit_tx_hash, deposited_at },
     RaindexDepositFailed { symbol, quantity, failed_tx_hash: Option<TxHash>, failed_at },
 
-    MintCompleted { symbol, quantity, completed_at },
+    Completed { symbol, quantity, completed_at },
     MintRejected { symbol, quantity, status_code: Option<HttpStatusCode>, rejected_at },
 }
 
@@ -2162,7 +2162,7 @@ know about cross-venue inventory.
   (completes transfer to Raindex, already counted at TokensReceived)
 - `TokenizedEquityMintEvent::RaindexDepositFailed` - No balance change (tokens
   await retry or manual recovery)
-- `TokenizedEquityMintEvent::MintCompleted` - No balance change (finalization)
+- `TokenizedEquityMintEvent::Completed` - No balance change (finalization)
 - `TokenizedEquityMintEvent::MintRejected` - Reconciles inflight back to Alpaca
   available
 - `TokenizedEquityMintEvent::MintAcceptanceFailed` - Reconciles inflight back to

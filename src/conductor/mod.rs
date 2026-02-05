@@ -52,8 +52,8 @@ use crate::offchain_order::{
 use crate::onchain::accumulator::{ExecutionParams, check_all_positions};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
+use crate::onchain::raindex::{Raindex, RaindexService};
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::vault::{Vault, VaultService};
 use crate::onchain::{EvmConfig, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
@@ -67,6 +67,7 @@ use crate::rebalancing::{
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
+use crate::tokenized_equity_mint::MintServices;
 use crate::vault_registry::{
     VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
 };
@@ -268,7 +269,7 @@ where
 
     let inventory_poller = match config.order_owner() {
         Ok(order_owner) => {
-            let vault_service = Arc::new(VaultService::new(
+            let raindex_service = Arc::new(RaindexService::new(
                 provider.clone(),
                 config.evm.orderbook,
                 vault_registry_query.clone(),
@@ -284,7 +285,7 @@ where
 
             Some(spawn_inventory_poller(
                 pool.clone(),
-                vault_service,
+                raindex_service,
                 executor,
                 config.evm.orderbook,
                 order_owner,
@@ -591,7 +592,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     );
 
     let broker_auth = &rebalancing_config.alpaca_broker_auth;
-    let vault_service = Arc::new(VaultService::new(
+    let raindex_service = Arc::new(RaindexService::new(
         provider.clone(),
         config.evm.orderbook,
         vault_registry_query.clone(),
@@ -607,10 +608,14 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = tokenization_service.clone();
-    let vault: Arc<dyn Vault> = vault_service.clone();
-    let redemption_services = RedemptionServices { tokenizer, vault };
+    let raindex: Arc<dyn Raindex> = raindex_service.clone();
+    let mint_services = MintServices {
+        tokenizer: tokenizer.clone(),
+        raindex: raindex.clone(),
+    };
+    let redemption_services = RedemptionServices { tokenizer, raindex };
 
-    let (frameworks, queries) = manifest.wire(pool.clone(), redemption_services);
+    let (frameworks, queries) = manifest.wire(pool.clone(), mint_services, redemption_services);
 
     let rebalancing_frameworks = RebalancingCqrsFrameworks {
         mint: frameworks.mint,
@@ -618,9 +623,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     };
 
     let redemption_deps = RedemptionDependencies {
-        vault_service,
-        tokenization_service,
-        vault_registry_query,
+        raindex_service,
         cqrs: frameworks.redemption,
         query: queries.redemption_view,
     };
@@ -630,7 +633,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         provider.clone(),
         RebalancerAddresses {
             market_maker_wallet,
-            orderbook: config.evm.orderbook,
         },
         operation_receiver,
         rebalancing_frameworks,
@@ -836,7 +838,7 @@ where
 
 fn spawn_inventory_poller<P, E>(
     pool: SqlitePool,
-    vault_service: Arc<VaultService<P>>,
+    raindex_service: Arc<RaindexService<P>>,
     executor: E,
     orderbook: Address,
     order_owner: Address,
@@ -849,7 +851,7 @@ where
     info!("Starting inventory poller");
 
     let service = InventoryPollingService::new(
-        vault_service,
+        raindex_service,
         executor,
         pool,
         orderbook,

@@ -200,8 +200,8 @@ mod tests {
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
     use crate::conductor::wire::test_cqrs;
     use crate::equity_redemption::{RedemptionServices, TOKENIZED_EQUITY_DECIMALS};
-    use crate::onchain::mock::MockVault;
-    use crate::onchain::vault::{Vault, VaultId, VaultService};
+    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
     use crate::tokenization::Tokenizer;
     use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use crate::vault_registry::{
@@ -348,7 +348,7 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
         let services = RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new()),
-            vault: Arc::new(MockVault::new()),
+            raindex: Arc::new(MockRaindex::new()),
         };
         let (cqrs, query) = create_redemption_cqrs(&pool, services);
 
@@ -465,7 +465,7 @@ mod tests {
         ) {
             let token = TestERC20::new(self.token_address, &self.provider);
             let owner = self.signer.address();
-            let vault_service = VaultService::new(
+            let raindex_service = RaindexService::new(
                 self.provider.clone(),
                 self.orderbook_address,
                 vault_registry_query,
@@ -483,7 +483,7 @@ mod tests {
                 .unwrap();
 
             // Deposit to vault
-            vault_service
+            raindex_service
                 .deposit(
                     self.token_address,
                     TEST_VAULT_ID,
@@ -527,10 +527,10 @@ mod tests {
                 .with_detection_outcome(MockDetectionOutcome::Detected)
                 .with_completion_outcome(MockCompletionOutcome::Completed),
         );
-        let mock_vault: Arc<dyn Vault> = Arc::new(MockVault::new());
+        let mock_vault: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
         let redemption_services = RedemptionServices {
             tokenizer: mock_tokenizer,
-            vault: mock_vault,
+            raindex: mock_vault,
         };
         let (cqrs, redemption_query) = create_redemption_cqrs(&pool, redemption_services);
         let cqrs = Arc::new(cqrs);

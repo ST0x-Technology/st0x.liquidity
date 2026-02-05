@@ -1,36 +1,26 @@
 //! Orchestrates Alpaca-to-Raindex equity inventory transfer.
 //!
-//! Coordinates Alpaca tokenization API and vault deposits, emitting commands to
-//! the `TokenizedEquityMint` aggregate at each step. Implements the `Mint` trait
-//! for integration with the rebalancing trigger system.
+//! Coordinates the `TokenizedEquityMint` aggregate which handles tokenization API calls
+//! and vault deposits internally via its Services. Implements the `Mint` trait for
+//! integration with the rebalancing trigger system.
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::Address;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
-use rust_decimal::Decimal;
 use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Arc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument};
 
 use super::{Mint, MintError};
-use crate::equity_redemption::TOKENIZED_EQUITY_DECIMALS;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{Vault, VaultId};
-use crate::tokenization::{TokenizationRequest, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::{
-    IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
+    IssuerRequestId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
-use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
 
 pub(crate) struct MintManager<ES>
 where
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
-    tokenizer: Arc<dyn Tokenizer>,
-    vault: Arc<dyn Vault>,
-    vault_registry_query: Arc<VaultRegistryQuery>,
-    orderbook: Address,
-    owner: Address,
     cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
 }
 
@@ -38,57 +28,10 @@ impl<ES> MintManager<ES>
 where
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
-    pub(crate) fn new(
-        tokenizer: Arc<dyn Tokenizer>,
-        vault: Arc<dyn Vault>,
-        vault_registry_query: Arc<VaultRegistryQuery>,
-        orderbook: Address,
-        owner: Address,
-        cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
-    ) -> Self {
-        Self {
-            tokenizer,
-            vault,
-            vault_registry_query,
-            orderbook,
-            owner,
-            cqrs,
-        }
+    pub(crate) fn new(cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>) -> Self {
+        Self { cqrs }
     }
 
-    async fn load_vault_info(&self, symbol: &Symbol) -> Option<(Address, VaultId)> {
-        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.owner);
-        let lifecycle = self.vault_registry_query.load(&aggregate_id).await?;
-
-        match lifecycle {
-            Lifecycle::Uninitialized => {
-                warn!("Vault registry not initialized");
-                None
-            }
-            Lifecycle::Live(registry) => {
-                let token = registry.token_by_symbol(symbol)?;
-                let vault_id = registry.vault_id_by_token(token)?;
-                Some((token, VaultId(vault_id)))
-            }
-            Lifecycle::Failed { .. } => {
-                warn!("Vault registry in failed state");
-                None
-            }
-        }
-    }
-
-    /// Executes the full mint workflow.
-    ///
-    /// # Workflow
-    ///
-    /// 1. Send `RequestMint` command to aggregate
-    /// 2. Call `AlpacaTokenizationService::request_mint()`
-    /// 3. Send `AcknowledgeAcceptance` with request IDs
-    /// 4. Poll Alpaca until terminal status
-    /// 5. Send `ReceiveTokens` when Alpaca reports completion
-    /// 6. Send `Finalize` to complete
-    ///
-    /// On permanent errors, sends `Fail` command to transition aggregate to Failed state.
     #[instrument(skip(self), fields(%symbol, ?quantity, %wallet))]
     async fn execute_mint_impl(
         &self,
@@ -97,12 +40,13 @@ where
         quantity: FractionalShares,
         wallet: Address,
     ) -> Result<(), MintError> {
-        info!(%symbol, ?quantity, %wallet, "Starting mint workflow");
+        debug!("Executing mint command");
 
         self.cqrs
             .execute(
                 &issuer_request_id.0,
-                TokenizedEquityMintCommand::RequestMint {
+                TokenizedEquityMintCommand::Mint {
+                    issuer_request_id: issuer_request_id.clone(),
                     symbol: symbol.clone(),
                     quantity: quantity.inner(),
                     wallet,
@@ -110,155 +54,15 @@ where
             )
             .await?;
 
-        let alpaca_request = match self
-            .tokenizer
-            .request_mint(symbol.clone(), quantity, wallet, issuer_request_id.clone())
-            .await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Alpaca mint request failed: {e}");
-                self.reject_mint(issuer_request_id, format!("Alpaca API error: {e}"))
-                    .await?;
-                return Err(MintError::Tokenizer(e));
-            }
-        };
+        debug!("Executing deposit command");
 
         self.cqrs
-            .execute(
-                &issuer_request_id.0,
-                TokenizedEquityMintCommand::AcknowledgeAcceptance {
-                    issuer_request_id: issuer_request_id.clone(),
-                    tokenization_request_id: alpaca_request.id.clone(),
-                },
-            )
+            .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Deposit)
             .await?;
 
-        info!(tokenization_request_id = %alpaca_request.id, "Mint request accepted, polling for completion");
-
-        let completed_request = match self
-            .tokenizer
-            .poll_mint_until_complete(&alpaca_request.id)
-            .await
-        {
-            Ok(req) => req,
-            Err(e) => {
-                warn!("Polling failed: {e}");
-                self.fail_acceptance(issuer_request_id, format!("Polling failed: {e}"))
-                    .await?;
-                return Err(MintError::Tokenizer(e));
-            }
-        };
-
-        self.handle_completed_request(issuer_request_id, &symbol, completed_request)
-            .await
-    }
-
-    #[instrument(skip(self))]
-    async fn reject_mint(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        reason: String,
-    ) -> Result<(), MintError> {
-        self.cqrs
-            .execute(
-                &issuer_request_id.0,
-                TokenizedEquityMintCommand::RejectMint { reason },
-            )
-            .await?;
+        info!("Mint workflow completed");
         Ok(())
     }
-
-    #[instrument(skip(self))]
-    async fn fail_acceptance(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        reason: String,
-    ) -> Result<(), MintError> {
-        self.cqrs
-            .execute(
-                &issuer_request_id.0,
-                TokenizedEquityMintCommand::FailAcceptance { reason },
-            )
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self, completed_request), fields(status = ?completed_request.status))]
-    async fn handle_completed_request(
-        &self,
-        issuer_request_id: &IssuerRequestId,
-        symbol: &Symbol,
-        completed_request: TokenizationRequest,
-    ) -> Result<(), MintError> {
-        match completed_request.status {
-            TokenizationRequestStatus::Completed => {
-                let tx_hash = completed_request.tx_hash.ok_or(MintError::MissingTxHash)?;
-                let shares_minted = decimal_to_u256_18_decimals(completed_request.quantity)?;
-
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.0,
-                        TokenizedEquityMintCommand::ReceiveTokens {
-                            tx_hash,
-                            receipt_id: ReceiptId(U256::ZERO),
-                            shares_minted,
-                        },
-                    )
-                    .await?;
-
-                let (token, vault_id) = self
-                    .load_vault_info(symbol)
-                    .await
-                    .ok_or_else(|| MintError::VaultNotFound(symbol.clone()))?;
-
-                info!(?vault_id, %token, %shares_minted, "Depositing tokens to vault");
-
-                let vault_deposit_tx_hash = self
-                    .vault
-                    .deposit(token, vault_id, shares_minted, TOKENIZED_EQUITY_DECIMALS)
-                    .await?;
-
-                self.cqrs
-                    .execute(
-                        &issuer_request_id.0,
-                        TokenizedEquityMintCommand::DepositToVault {
-                            vault_deposit_tx_hash,
-                        },
-                    )
-                    .await?;
-
-                self.cqrs
-                    .execute(&issuer_request_id.0, TokenizedEquityMintCommand::Finalize)
-                    .await?;
-
-                info!(%vault_deposit_tx_hash, "Mint workflow completed successfully");
-                Ok(())
-            }
-            TokenizationRequestStatus::Rejected => {
-                self.fail_acceptance(
-                    issuer_request_id,
-                    "Mint request rejected by Alpaca".to_string(),
-                )
-                .await?;
-                Err(MintError::Rejected)
-            }
-            TokenizationRequestStatus::Pending => {
-                unreachable!("poll_mint_until_complete should not return Pending status")
-            }
-        }
-    }
-}
-
-fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintError> {
-    let decimal = value.inner();
-    let scale_factor = Decimal::from(10u64.pow(18));
-    let scaled = decimal
-        .checked_mul(scale_factor)
-        .ok_or(MintError::DecimalOverflow(value))?;
-    let truncated = scaled.trunc();
-
-    Ok(U256::from_str_radix(&truncated.to_string(), 10)?)
 }
 
 #[async_trait]
@@ -281,33 +85,63 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{U256, address};
-    use alloy::providers::Provider;
+    use alloy::network::{Ethereum, EthereumWallet};
+    use alloy::node_bindings::{Anvil, AnvilInstance};
+    use alloy::primitives::{B256, TxHash, U256, address, b256};
+    use alloy::providers::fillers::{
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    };
+    use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
-    use httpmock::prelude::*;
+    use cqrs_es::persist::GenericQuery;
     use rust_decimal_macros::dec;
-    use serde_json::json;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 
     use super::*;
-    use crate::onchain::vault::VaultService;
-    use crate::test_utils::{create_test_vault_service, create_vault_registry_query};
+    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::conductor::wire::test_cqrs;
+    use crate::onchain::mock::MockRaindex;
+    use crate::onchain::raindex::{Raindex, RaindexService, VaultId};
+    use crate::tokenization::Tokenizer;
     use crate::tokenization::alpaca::tests::{
-        TEST_REDEMPTION_WALLET, create_test_service_with_provider, setup_anvil,
-        tokenization_mint_path, tokenization_requests_path,
+        create_test_service_with_provider, tokenization_mint_path, tokenization_requests_path,
     };
+    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenized_equity_mint::MintServices;
+    use crate::vault_registry::{
+        VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
+    };
+    use httpmock::prelude::*;
+    use serde_json::json;
 
-    const TEST_ORDERBOOK: Address = address!("0xdead000000000000000000000000000000000001");
+    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
+    const TEST_VAULT_ID: VaultId = VaultId(b256!(
+        "0x0000000000000000000000000000000000000000000000000000000000000001"
+    ));
 
     type TestCqrs = CqrsFramework<
         Lifecycle<TokenizedEquityMint, Never>,
         MemStore<Lifecycle<TokenizedEquityMint, Never>>,
     >;
 
-    fn create_test_cqrs() -> Arc<TestCqrs> {
+    fn create_test_cqrs_with_mocks() -> Arc<TestCqrs> {
         let store = MemStore::default();
-        Arc::new(CqrsFramework::new(store, vec![], ()))
+        let services = MintServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            raindex: Arc::new(MockRaindex::new()),
+        };
+        Arc::new(CqrsFramework::new(store, vec![], services))
+    }
+
+    fn create_test_cqrs_with_services(
+        tokenizer: Arc<dyn Tokenizer>,
+        raindex: Arc<dyn Raindex>,
+    ) -> Arc<TestCqrs> {
+        let store = MemStore::default();
+        let services = MintServices { tokenizer, raindex };
+        Arc::new(CqrsFramework::new(store, vec![], services))
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -344,264 +178,54 @@ mod tests {
     }
 
     #[test]
-    fn decimal_to_u256_converts_fractional() {
+    fn fractional_shares_converts_to_u256_18_decimals() {
         let value = FractionalShares::new(dec!(100.5));
-        let result = decimal_to_u256_18_decimals(value).unwrap();
+        let result = value.to_u256_18_decimals().unwrap();
 
         let expected = U256::from(100_500_000_000_000_000_000_u128);
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn decimal_to_u256_converts_whole_number() {
+    fn fractional_shares_converts_whole_number() {
         let value = FractionalShares::new(dec!(42));
-        let result = decimal_to_u256_18_decimals(value).unwrap();
+        let result = value.to_u256_18_decimals().unwrap();
 
         let expected = U256::from(42_000_000_000_000_000_000_u128);
         assert_eq!(result, expected);
     }
 
     #[test]
-    fn decimal_to_u256_converts_zero() {
+    fn fractional_shares_converts_zero() {
         let value = FractionalShares::new(dec!(0));
-        let result = decimal_to_u256_18_decimals(value).unwrap();
+        let result = value.to_u256_18_decimals().unwrap();
 
         assert_eq!(result, U256::ZERO);
     }
 
     #[tokio::test]
-    async fn execute_mint_receives_tokens_then_fails_vault_lookup() {
-        let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_anvil, endpoint, key) = setup_anvil();
-
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = alloy::network::EthereumWallet::from(signer);
-        let provider = alloy::providers::ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(endpoint.parse().unwrap());
-
-        let service = Arc::new(create_test_service_with_provider(
-            &server,
-            provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-        let vault_registry_query = create_vault_registry_query(&pool);
-        let vault =
-            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
-        let cqrs = create_test_cqrs();
-        let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
-            TEST_ORDERBOOK,
-            TEST_REDEMPTION_WALLET,
-            cqrs,
-        );
-
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(tokenization_mint_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(sample_pending_response("mint_123"));
-        });
-
-        let poll_mock = server.mock(|when, then| {
-            when.method(GET).path(tokenization_requests_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([sample_completed_response("mint_123")]));
-        });
+    async fn mint_manager_executes_mint_and_deposit_commands() {
+        let cqrs = create_test_cqrs_with_mocks();
+        let manager = MintManager::new(cqrs);
 
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(dec!(100.0));
         let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
 
         let result = manager
-            .execute_mint_impl(
-                &IssuerRequestId::new("mint-001"),
-                symbol.clone(),
-                quantity,
-                wallet,
-            )
+            .execute_mint_impl(&IssuerRequestId::new("mint-001"), symbol, quantity, wallet)
             .await;
 
-        // Workflow proceeds through Alpaca API but fails at vault lookup
-        assert!(
-            matches!(result, Err(MintError::VaultNotFound(ref s)) if *s == symbol),
-            "Expected VaultNotFound error, got: {result:?}"
-        );
-
-        mint_mock.assert();
-        poll_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn execute_mint_rejected_by_alpaca() {
-        let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_anvil, endpoint, key) = setup_anvil();
-
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer);
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(endpoint.parse().unwrap());
-
-        let service = Arc::new(create_test_service_with_provider(
-            &server,
-            provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-        let vault_registry_query = create_vault_registry_query(&pool);
-        let vault =
-            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
-        let cqrs = create_test_cqrs();
-        let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
-            TEST_ORDERBOOK,
-            TEST_REDEMPTION_WALLET,
-            cqrs,
-        );
-
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(tokenization_mint_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(sample_pending_response("mint_456"));
-        });
-
-        let poll_mock = server.mock(|when, then| {
-            when.method(GET).path(tokenization_requests_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([{
-                    "tokenization_request_id": "mint_456",
-                    "type": "mint",
-                    "status": "rejected",
-                    "underlying_symbol": "AAPL",
-                    "token_symbol": "tAAPL",
-                    "qty": "100.0",
-                    "issuer": "st0x",
-                    "network": "base",
-                    "wallet_address": "0x1234567890abcdef1234567890abcdef12345678",
-                    "issuer_request_id": "issuer_123",
-                    "created_at": "2024-01-15T10:30:00Z"
-                }]));
-        });
-
-        let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(dec!(100.0));
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let result = manager
-            .execute_mint_impl(&IssuerRequestId::new("mint-002"), symbol, quantity, wallet)
-            .await;
-
-        assert!(matches!(result, Err(MintError::Rejected)));
-
-        mint_mock.assert();
-        poll_mock.assert();
-    }
-
-    #[tokio::test]
-    async fn execute_mint_api_error() {
-        let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_anvil, endpoint, key) = setup_anvil();
-
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer);
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(endpoint.parse().unwrap());
-
-        let service = Arc::new(create_test_service_with_provider(
-            &server,
-            provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-        let vault_registry_query = create_vault_registry_query(&pool);
-        let vault =
-            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
-        let cqrs = create_test_cqrs();
-        let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
-            TEST_ORDERBOOK,
-            TEST_REDEMPTION_WALLET,
-            cqrs,
-        );
-
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(tokenization_mint_path());
-            then.status(500).body("Internal Server Error");
-        });
-
-        let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares::new(dec!(100.0));
-        let wallet = address!("0x1234567890abcdef1234567890abcdef12345678");
-
-        let result = manager
-            .execute_mint_impl(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
-            .await;
-
-        assert!(matches!(result, Err(MintError::Tokenizer(_))));
-
-        mint_mock.assert();
+        // MockTokenizer always succeeds, MockRaindex always succeeds
+        result.unwrap();
     }
 
     #[tokio::test]
     async fn trait_impl_delegates_to_execute_mint_impl() {
-        let server = MockServer::start();
-        let pool = crate::test_utils::setup_test_db().await;
-        let (_anvil, endpoint, key) = setup_anvil();
+        let cqrs = create_test_cqrs_with_mocks();
+        let manager = MintManager::new(cqrs);
 
-        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
-        let wallet = EthereumWallet::from(signer);
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(endpoint.parse().unwrap());
-
-        let service = Arc::new(create_test_service_with_provider(
-            &server,
-            provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-        let vault_registry_query = create_vault_registry_query(&pool);
-        let vault =
-            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
-        let cqrs = create_test_cqrs();
-        let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
-            TEST_ORDERBOOK,
-            TEST_REDEMPTION_WALLET,
-            cqrs,
-        );
-
-        let mint_mock = server.mock(|when, then| {
-            when.method(POST).path(tokenization_mint_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(sample_pending_response("trait_test"));
-        });
-
-        let poll_mock = server.mock(|when, then| {
-            when.method(GET).path(tokenization_requests_path());
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!([sample_completed_response("trait_test")]));
-        });
-
-        let mint_trait: &dyn Mint = &manager;
-
-        // Workflow proceeds through Alpaca API but fails at vault lookup (registry empty)
-        let result = mint_trait
+        let result = manager
             .execute_mint(
                 &IssuerRequestId::new("trait-001"),
                 Symbol::new("AAPL").unwrap(),
@@ -610,31 +234,9 @@ mod tests {
             )
             .await;
 
-        // Expected to fail at vault lookup since registry is empty
-        assert!(matches!(result, Err(MintError::VaultNotFound(_))));
-
-        mint_mock.assert();
-        poll_mock.assert();
+        // MockTokenizer and MockRaindex always succeed
+        result.unwrap();
     }
-
-    use alloy::network::{Ethereum, EthereumWallet};
-    use alloy::node_bindings::{Anvil, AnvilInstance};
-    use alloy::primitives::{B256, TxHash, b256};
-    use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
-    };
-    use alloy::providers::{Identity, ProviderBuilder, RootProvider};
-    use cqrs_es::persist::GenericQuery;
-    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
-
-    use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
-    use crate::conductor::wire::test_cqrs;
-    use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
-
-    const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
-    const TEST_VAULT_ID: VaultId = VaultId(b256!(
-        "0x0000000000000000000000000000000000000000000000000000000000000001"
-    ));
 
     type LocalEvmProvider = FillProvider<
         JoinFill<
@@ -703,18 +305,6 @@ mod tests {
                 token_address,
             }
         }
-
-        async fn approve_tokens_for_orderbook(&self, amount: U256) {
-            let token = TestERC20::new(self.token_address, &self.provider);
-            token
-                .approve(self.orderbook_address, amount)
-                .send()
-                .await
-                .unwrap()
-                .get_receipt()
-                .await
-                .unwrap();
-        }
     }
 
     fn create_vault_registry_cqrs(
@@ -778,29 +368,19 @@ mod tests {
         )
         .await;
 
-        let deposit_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-        local_evm.approve_tokens_for_orderbook(deposit_amount).await;
-
-        let service = Arc::new(create_test_service_with_provider(
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(create_test_service_with_provider(
             &server,
             local_evm.provider.clone(),
             local_evm.signer.address(),
         ));
-        let vault = Arc::new(VaultService::new(
+        let raindex: Arc<dyn Raindex> = Arc::new(RaindexService::new(
             local_evm.provider.clone(),
             local_evm.orderbook_address,
-            vault_registry_query.clone(),
+            vault_registry_query,
             local_evm.signer.address(),
         ));
-        let cqrs = create_test_cqrs();
-        let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
-            vault_registry_query,
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-            cqrs,
-        );
+        let cqrs = create_test_cqrs_with_services(tokenizer, raindex);
+        let manager = MintManager::new(cqrs);
 
         let mint_mock = server.mock(|when, then| {
             when.method(POST).path(tokenization_mint_path());

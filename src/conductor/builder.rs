@@ -16,8 +16,8 @@ use crate::config::Config;
 use crate::error::EventProcessingError;
 use crate::inventory::InventorySnapshotAggregate;
 use crate::offchain_order::{OffchainOrderCqrs, OffchainOrderQuery};
+use crate::onchain::raindex::RaindexService;
 use crate::onchain::trade::TradeEvent;
-use crate::onchain::vault::VaultService;
 use crate::onchain_trade::OnChainTradeCqrs;
 use crate::position::{PositionCqrs, PositionQuery};
 use crate::symbol::cache::SymbolCache;
@@ -168,7 +168,7 @@ where
 
         let inventory_poller = match self.common.config.order_owner() {
             Ok(order_owner) => {
-                let vault_service = Arc::new(VaultService::new(
+                let raindex_service = Arc::new(RaindexService::new(
                     self.common.provider.clone(),
                     self.common.config.evm.orderbook,
                     self.common.frameworks.vault_registry_query.clone(),
@@ -176,7 +176,7 @@ where
                 ));
                 Some(spawn_inventory_poller(
                     self.common.pool.clone(),
-                    vault_service,
+                    raindex_service,
                     self.common.executor.clone(),
                     self.common.config.evm.orderbook,
                     order_owner,

@@ -510,13 +510,13 @@ impl RebalancingTrigger {
             | TokenizedEquityMintEvent::TokensReceived {
                 symbol, quantity, ..
             }
-            | TokenizedEquityMintEvent::VaultDeposited {
+            | TokenizedEquityMintEvent::DepositedIntoRaindex {
                 symbol, quantity, ..
             }
-            | TokenizedEquityMintEvent::VaultDepositFailed {
+            | TokenizedEquityMintEvent::RaindexDepositFailed {
                 symbol, quantity, ..
             }
-            | TokenizedEquityMintEvent::MintCompleted {
+            | TokenizedEquityMintEvent::Completed {
                 symbol, quantity, ..
             } => (symbol, quantity),
         };
@@ -529,10 +529,10 @@ impl RebalancingTrigger {
         events.iter().any(|envelope| {
             matches!(
                 envelope.payload,
-                TokenizedEquityMintEvent::MintCompleted { .. }
+                TokenizedEquityMintEvent::Completed { .. }
                     | TokenizedEquityMintEvent::MintRejected { .. }
                     | TokenizedEquityMintEvent::MintAcceptanceFailed { .. }
-                    | TokenizedEquityMintEvent::VaultDepositFailed { .. }
+                    | TokenizedEquityMintEvent::RaindexDepositFailed { .. }
             )
         })
     }
@@ -715,6 +715,7 @@ mod tests {
     use crate::offchain_order::{OffchainOrder, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
+    use crate::tokenization::TokenizationRequestStatus;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{
         RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceEvent,
@@ -1113,7 +1114,7 @@ mod tests {
     }
 
     fn make_mint_completed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::MintCompleted {
+        TokenizedEquityMintEvent::Completed {
             symbol: symbol.clone(),
             quantity,
             completed_at: Utc::now(),
@@ -1124,7 +1125,7 @@ mod tests {
         TokenizedEquityMintEvent::MintRejected {
             symbol: symbol.clone(),
             quantity,
-            reason: "API timeout".to_string(),
+            status_code: None,
             rejected_at: Utc::now(),
         }
     }
@@ -1133,7 +1134,7 @@ mod tests {
         TokenizedEquityMintEvent::MintAcceptanceFailed {
             symbol: symbol.clone(),
             quantity,
-            reason: "Transaction reverted".to_string(),
+            last_status: TokenizationRequestStatus::Pending,
             failed_at: Utc::now(),
         }
     }

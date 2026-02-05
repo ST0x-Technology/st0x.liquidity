@@ -26,6 +26,7 @@ use crate::inventory::InventoryView;
 use crate::lifecycle::Lifecycle;
 use crate::position::{PositionAggregate, PositionQuery};
 use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, TriggeredOperation};
+use crate::tokenized_equity_mint::MintServices;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -124,6 +125,7 @@ impl QueryManifest {
     pub(super) fn wire(
         self,
         pool: SqlitePool,
+        mint_services: MintServices,
         redemption_services: RedemptionServices,
     ) -> (BuiltFrameworks, WiredQueries) {
         let Self {
@@ -141,7 +143,7 @@ impl QueryManifest {
         let (mint, (event_broadcaster, (rebalancing_trigger, ()))) = CqrsBuilder::new(pool.clone())
             .wire(rebalancing_trigger)
             .wire(event_broadcaster)
-            .build(());
+            .build(mint_services);
 
         let (redemption, (redemption_view, (event_broadcaster, (rebalancing_trigger, ())))) =
             CqrsBuilder::new(pool.clone())

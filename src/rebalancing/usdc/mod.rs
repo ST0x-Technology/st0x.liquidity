@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 
 use crate::alpaca_wallet::AlpacaWalletError;
 use crate::cctp::CctpError;
-use crate::onchain::vault::VaultError;
+use crate::onchain::raindex::RaindexError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
 use st0x_execution::InvalidSharesError;
@@ -34,7 +34,7 @@ pub(crate) enum UsdcRebalanceManagerError {
     #[error("CCTP bridge error: {0}")]
     Cctp(#[from] CctpError),
     #[error("Vault error: {0}")]
-    Vault(#[from] VaultError),
+    Vault(#[from] RaindexError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<UsdcRebalanceError>),
     #[error("Withdrawal failed with terminal status: {status}")]
