@@ -42,10 +42,6 @@ impl Executor for AlpacaTradingApi {
         })
     }
 
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error> {
-        Ok(super::market_hours::wait_until_market_open(self.client.client()).await?)
-    }
-
     async fn is_market_open(&self) -> Result<bool, Self::Error> {
         Ok(super::market_hours::is_market_open(self.client.client()).await?)
     }
@@ -210,64 +206,6 @@ mod tests {
             error,
             AlpacaTradingApiError::AccountVerification(_)
         ));
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_when_open() {
-        let server = MockServer::start();
-        let auth = create_test_auth_env(&server.base_url());
-
-        let account_mock = create_account_mock(&server);
-
-        let clock_mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/clock");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "timestamp": "2025-01-03T14:30:00-05:00",
-                    "is_open": true,
-                    "next_open": "2030-01-06T14:30:00+00:00",
-                    "next_close": "2030-01-06T21:00:00+00:00"
-                }));
-        });
-
-        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
-
-        account_mock.assert();
-
-        let duration = executor.wait_until_market_open().await.unwrap();
-
-        clock_mock.assert();
-        assert!(duration.as_secs() > 0);
-    }
-
-    #[tokio::test]
-    async fn test_wait_until_market_open_when_open_returns_duration() {
-        let server = MockServer::start();
-        let auth = create_test_auth_env(&server.base_url());
-
-        let account_mock = create_account_mock(&server);
-
-        let mock = server.mock(|when, then| {
-            when.method(GET).path("/v2/clock");
-            then.status(200)
-                .header("content-type", "application/json")
-                .json_body(json!({
-                    "timestamp": "2026-01-03T14:30:00-05:00",
-                    "is_open": true,
-                    "next_open": "2030-01-06T14:30:00+00:00",
-                    "next_close": "2030-01-06T21:00:00+00:00"
-                }));
-        });
-
-        let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
-
-        account_mock.assert();
-
-        let duration = executor.wait_until_market_open().await.unwrap();
-
-        mock.assert();
-        assert!(duration.as_secs() > 0);
     }
 
     #[tokio::test]

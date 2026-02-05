@@ -41,12 +41,7 @@ pub trait Executor: Send + Sync + 'static {
     where
         Self: Sized;
 
-    /// Wait until market opens (blocks if market closed), then return time until market close
-    /// Implementations without market hours should return a very long duration
-    async fn wait_until_market_open(&self) -> Result<std::time::Duration, Self::Error>;
-
     /// Returns true if the market is currently open for trading.
-    /// Unlike `wait_until_market_open`, this is a non-blocking check.
     async fn is_market_open(&self) -> Result<bool, Self::Error>;
 
     /// Place a market order for the specified symbol and quantity
