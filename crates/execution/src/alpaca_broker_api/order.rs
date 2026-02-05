@@ -382,13 +382,16 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
@@ -402,7 +405,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "AAPL",
                     "qty": "100",
@@ -448,7 +451,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "TSLA",
                     "qty": "50",
@@ -495,7 +498,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/trading/accounts/test_account_123/orders/{order_id}"
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -529,7 +532,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/trading/accounts/test_account_123/orders/{order_id}"
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -563,7 +566,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(GET).path(format!(
-                "/v1/trading/accounts/test_account_123/orders/{order_id}"
+                "/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders/{order_id}"
             ));
             then.status(200)
                 .header("content-type", "application/json")
@@ -583,6 +586,100 @@ mod tests {
         mock.assert();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.status, OrderStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_multiple() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .query_param("status", "open");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "id": "904837e3-3b76-47ec-b432-046db621571b",
+                        "symbol": "AAPL",
+                        "qty": "100",
+                        "side": "buy",
+                        "status": "new",
+                        "filled_avg_price": null
+                    },
+                    {
+                        "id": "61e7b016-9c91-4a97-b912-615c9d365c9d",
+                        "symbol": "TSLA",
+                        "qty": "50",
+                        "side": "sell",
+                        "status": "partially_filled",
+                        "filled_avg_price": null
+                    }
+                ]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_updates = poll_pending_orders(&client).await.unwrap();
+
+        mock.assert();
+        assert_eq!(order_updates.len(), 2);
+
+        assert_eq!(
+            order_updates[0].order_id,
+            "904837e3-3b76-47ec-b432-046db621571b"
+        );
+        assert_eq!(order_updates[0].symbol.to_string(), "AAPL");
+        assert_eq!(order_updates[0].status, OrderStatus::Submitted);
+
+        assert_eq!(
+            order_updates[1].order_id,
+            "61e7b016-9c91-4a97-b912-615c9d365c9d"
+        );
+        assert_eq!(order_updates[1].symbol.to_string(), "TSLA");
+        assert_eq!(order_updates[1].status, OrderStatus::Submitted);
+    }
+
+    #[tokio::test]
+    async fn test_poll_pending_orders_empty() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
+                .query_param("status", "open");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([]));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let order_updates = poll_pending_orders(&client).await.unwrap();
+
+        mock.assert();
+        assert!(order_updates.is_empty());
+    }
+
+    #[test]
+    fn test_convert_price_to_cents_some() {
+        let result = convert_price_to_cents(Some(245.67)).unwrap();
+        assert_eq!(result, Some(24567));
+    }
+
+    #[test]
+    fn test_convert_price_to_cents_none() {
+        let result = convert_price_to_cents(None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_convert_price_to_cents_negative_fails() {
+        let result = convert_price_to_cents(Some(-100.0));
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaBrokerApiError::PriceConversion(_)
+        ));
     }
 
     #[test]
@@ -616,7 +713,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
                     "qty": "1000.50",
@@ -659,7 +756,7 @@ mod tests {
 
         let mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders")
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders")
                 .json_body(json!({
                     "symbol": "USDCUSD",
                     "qty": "500",

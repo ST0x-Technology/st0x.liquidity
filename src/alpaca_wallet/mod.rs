@@ -31,13 +31,13 @@ use std::sync::Arc;
 
 use st0x_execution::Positive;
 
+use st0x_execution::AlpacaAccountId;
+
 use crate::threshold::Usdc;
 
 pub(crate) use client::{AlpacaWalletClient, AlpacaWalletError};
 pub(crate) use status::PollingConfig;
-pub(crate) use transfer::{
-    AlpacaAccountId, AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus,
-};
+pub(crate) use transfer::{AlpacaTransferId, Network, TokenSymbol, Transfer, TransferStatus};
 pub(crate) use whitelist::WhitelistStatus;
 
 /// Service facade for Alpaca crypto wallet operations.
@@ -204,6 +204,7 @@ mod tests {
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use st0x_execution::AlpacaAccountId;
     use std::time::Duration;
     use uuid::uuid;
 

@@ -104,13 +104,16 @@ mod tests {
 
     use super::*;
     use crate::alpaca_broker_api::TimeInForce;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
@@ -124,7 +127,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -143,7 +146,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -176,7 +179,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -184,7 +187,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -209,7 +212,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -223,7 +226,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -241,13 +244,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_inventory_returns_error_on_market_value_overflow() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        // i64::MAX is 9_223_372_036_854_775_807, so a value whose cents
+        // representation exceeds that will fail to_i64().
+        // 92233720368547759.00 * 100 = 9223372036854775900 > i64::MAX
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": "10.0",
+                        "market_value": "92233720368547759.00"
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let error = fetch_inventory(&client).await.unwrap_err();
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        assert!(matches!(
+            error,
+            AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fetch_inventory_truncates_sub_cent_market_value() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let positions_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([
+                    {
+                        "symbol": "AAPL",
+                        "qty": "10.0",
+                        // 1575.005 * 100 = 157500.5 -> truncates to 157500
+                        "market_value": "1575.005"
+                    }
+                ]));
+        });
+
+        let account_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "cash": "50000.00"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let inventory = fetch_inventory(&client).await.unwrap();
+
+        positions_mock.assert();
+        account_mock.assert();
+
+        let aapl = inventory
+            .positions
+            .iter()
+            .find(|p| p.symbol.to_string() == "AAPL")
+            .unwrap();
+        assert_eq!(
+            aapl.market_value_cents,
+            Some(157_500),
+            "Sub-cent market value 1575.005 should truncate to 157500 cents"
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_inventory_returns_error_on_fractional_cents_in_cash() {
         let server = MockServer::start();
         let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([]));
@@ -255,7 +350,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -280,7 +375,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -294,7 +389,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

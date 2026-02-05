@@ -249,8 +249,11 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use crate::{Direction, FractionalShares, Positive};
+
+    const TEST_ACCOUNT_ID: AlpacaAccountId =
+        AlpacaAccountId::new(uuid::uuid!("904837e3-3b76-47ec-b432-046db621571b"));
 
     #[test]
     fn test_asset_status_deserialize_active() {
@@ -388,7 +391,7 @@ mod tests {
         AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(mode),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::Day,
@@ -398,7 +401,7 @@ mod tests {
     fn create_account_mock(server: &MockServer) -> httpmock::Mock<'_> {
         server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -427,7 +430,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(401)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -519,7 +522,7 @@ mod tests {
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/account");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/account");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -531,7 +534,7 @@ mod tests {
 
         let positions_mock = server.mock(|when, then| {
             when.method(GET)
-                .path("/v1/trading/accounts/test_account_123/positions");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/positions");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!([
@@ -576,7 +579,7 @@ mod tests {
     fn create_order_mock(server: &MockServer) -> httpmock::Mock<'_> {
         server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -701,7 +704,7 @@ mod tests {
         // Order mock for both orders
         let order_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
@@ -747,7 +750,7 @@ mod tests {
         let ctx = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: "test_account_123".to_string(),
+            account_id: TEST_ACCOUNT_ID,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::ZERO,
             time_in_force: TimeInForce::Day,
@@ -770,7 +773,7 @@ mod tests {
 
         let order_mock = server.mock(|when, then| {
             when.method(POST)
-                .path("/v1/trading/accounts/test_account_123/orders");
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({

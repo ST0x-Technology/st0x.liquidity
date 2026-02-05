@@ -629,7 +629,7 @@ where
     info!("Starting inventory poller");
 
     let service = InventoryPollingService::new(
-        raindex_service,
+        vault_service,
         executor,
         vault_registry,
         orderbook,

@@ -29,6 +29,7 @@ use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
 };
 use crate::tokenized_equity_mint::IssuerRequestId;
+use crate::usdc_rebalance::UsdcRebalanceId;
 use crate::vault_registry::VaultRegistry;
 
 pub(super) async fn transfer_equity_command<W: Write>(
@@ -216,7 +217,7 @@ where
     let broker_auth = AlpacaBrokerApiCtx {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
-        account_id: rebalancing_config.alpaca_account_id.to_string(),
+        account_id: rebalancing_config.alpaca_account_id,
         mode: Some(broker_mode),
         asset_cache_ttl: std::time::Duration::from_secs(3600),
         time_in_force: TimeInForce::default(),

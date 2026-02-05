@@ -84,6 +84,7 @@ impl QueryManifest {
             market_maker_wallet,
             inventory.clone(),
             operation_sender,
+            wrapper,
         );
 
         let event_broadcaster = EventBroadcaster::new(event_sender);
