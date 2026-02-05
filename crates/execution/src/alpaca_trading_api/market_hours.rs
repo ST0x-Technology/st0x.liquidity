@@ -30,6 +30,11 @@ pub enum MarketHoursError {
     },
 }
 
+pub(super) async fn is_market_open(client: &Client) -> Result<bool, MarketHoursError> {
+    let clock_data = client.issue::<clock::Get>(&()).await?;
+    Ok(clock_data.open)
+}
+
 pub(super) async fn wait_until_market_open(
     client: &Client,
 ) -> Result<std::time::Duration, MarketHoursError> {

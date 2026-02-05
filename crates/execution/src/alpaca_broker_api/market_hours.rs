@@ -93,6 +93,16 @@ async fn wait_for_next_session(
     Ok(())
 }
 
+/// Returns true if the market is currently open for trading.
+pub(super) async fn is_market_open(
+    client: &AlpacaBrokerApiClient,
+) -> Result<bool, AlpacaBrokerApiError> {
+    let now = Utc::now();
+    let now_et = now.with_timezone(&New_York);
+    let status = check_market_status(client, now_et).await?;
+    Ok(matches!(status, MarketStatus::Open { .. }))
+}
+
 /// Waits until regular market hours are open and returns the duration until
 /// the market closes.
 ///

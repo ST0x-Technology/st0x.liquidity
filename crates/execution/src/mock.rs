@@ -22,6 +22,7 @@ pub struct MockExecutor {
     should_fail: bool,
     failure_message: String,
     inventory_result: InventoryResult,
+    market_open: bool,
 }
 
 impl MockExecutor {
@@ -31,6 +32,7 @@ impl MockExecutor {
             should_fail: false,
             failure_message: String::new(),
             inventory_result: InventoryResult::Unimplemented,
+            market_open: true,
         }
     }
 
@@ -40,6 +42,7 @@ impl MockExecutor {
             should_fail: true,
             failure_message: message.into(),
             inventory_result: InventoryResult::Unimplemented,
+            market_open: true,
         }
     }
 
@@ -47,6 +50,13 @@ impl MockExecutor {
     #[must_use]
     pub fn with_inventory(mut self, inventory: Inventory) -> Self {
         self.inventory_result = InventoryResult::Fetched(inventory);
+        self
+    }
+
+    /// Configures whether the market is considered open.
+    #[must_use]
+    pub fn with_market_open(mut self, open: bool) -> Self {
+        self.market_open = open;
         self
     }
 
@@ -78,6 +88,10 @@ impl Executor for MockExecutor {
         // Test executor should never block on market hours, so return Duration::MAX
         // to signal no time limit
         Ok(std::time::Duration::MAX)
+    }
+
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        Ok(self.market_open)
     }
 
     #[tracing::instrument(skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]

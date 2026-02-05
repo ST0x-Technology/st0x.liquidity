@@ -86,6 +86,11 @@ impl Executor for SchwabExecutor {
         }
     }
 
+    async fn is_market_open(&self) -> Result<bool, Self::Error> {
+        let market_hours = fetch_market_hours(&self.auth, &self.pool, None).await?;
+        Ok(matches!(market_hours.current_status(), MarketStatus::Open))
+    }
+
     #[tracing::instrument(skip(self), fields(symbol = %order.symbol, shares = %order.shares, direction = %order.direction), level = tracing::Level::INFO)]
     async fn place_market_order(
         &self,

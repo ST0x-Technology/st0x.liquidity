@@ -107,7 +107,7 @@ mod tests {
     use rust_decimal_macros::dec;
     use sqlite_es::SqliteViewRepository;
     use sqlx::SqlitePool;
-    use st0x_execution::{FractionalShares, Positive, SupportedExecutor, Symbol};
+    use st0x_execution::{FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol};
 
     use super::*;
     use crate::conductor::wire::test_cqrs;
