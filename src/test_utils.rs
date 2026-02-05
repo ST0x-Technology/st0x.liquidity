@@ -6,7 +6,6 @@ use alloy::rpc::types::Log;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use std::sync::Arc;
 
 use st0x_execution::{Direction, FractionalShares, SchwabTokens};
 
@@ -14,8 +13,6 @@ use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
-use crate::onchain::raindex::RaindexService;
-use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
 /// unit-tests. The exact values are not important -- only that the
@@ -171,30 +168,4 @@ impl OnchainTradeBuilder {
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
     }
-}
-
-/// Creates a vault registry query for tests. Use this instead of duplicating
-/// the SqliteViewRepository/GenericQuery boilerplate in every test module.
-pub(crate) fn create_vault_registry_query(pool: &SqlitePool) -> Arc<VaultRegistryQuery> {
-    let view_repo = Arc::new(SqliteViewRepository::<
-        VaultRegistryAggregate,
-        VaultRegistryAggregate,
-    >::new(pool.clone(), "vault_registry_view".to_string()));
-    Arc::new(GenericQuery::new(view_repo))
-}
-
-/// Creates a RaindexService for tests with custom orderbook and owner addresses.
-pub(crate) fn create_test_raindex_service<P: Provider + Clone>(
-    provider: P,
-    pool: &SqlitePool,
-    orderbook: Address,
-    owner: Address,
-) -> Arc<RaindexService<P>> {
-    let vault_registry_query = create_vault_registry_query(pool);
-    Arc::new(RaindexService::new(
-        provider,
-        orderbook,
-        vault_registry_query,
-        owner,
-    ))
 }

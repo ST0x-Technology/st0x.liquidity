@@ -77,7 +77,7 @@ pub(crate) struct RebalancerAddresses {
 pub(crate) async fn spawn_rebalancer<BP>(
     ctx: &RebalancingCtx,
     base_provider: BP,
-    addresses: RebalancerAddresses,
+    market_maker_wallet: Address,
     operation_receiver: mpsc::Receiver<TriggeredOperation>,
     frameworks: RebalancingCqrsFrameworks,
     raindex_service: Arc<RaindexService<BP>>,
@@ -134,9 +134,9 @@ where
 {
     /// Creates the services needed for rebalancing.
     ///
-    /// RaindexService and AlpacaTokenizationService are passed in rather than
-    /// created here because they are needed for CQRS framework initialization in
-    /// the conductor, which must happen before spawn_rebalancer is called.
+    /// RaindexService is passed in rather than created here because it is needed
+    /// for CQRS framework initialization in the conductor, which must happen
+    /// before spawn_rebalancer is called.
     async fn new(
         ctx: &RebalancingCtx,
         ethereum_wallet: &EthereumWallet,
@@ -506,7 +506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn into_rebalancer_dispatches_mint_to_tokenization_service() {
+    async fn into_rebalancer_dispatches_mint_operation() {
         let server = MockServer::start();
         let (services, config) = make_services_with_mock_wallet(&server).await;
 

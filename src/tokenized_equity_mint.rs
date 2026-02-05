@@ -7,10 +7,10 @@
 //! # State Flow
 //!
 //! ```text
-//! MintRequested -> MintAccepted -> TokensReceived -> TokensWrapped -> VaultDeposited -> Completed
-//!       |               |               |                |                 |
-//!       v               v               v                v                 v
-//!     Failed          Failed          Failed          Failed            Failed
+//! MintRequested -> MintAccepted -> TokensReceived -> TokensWrapped -> DepositedIntoRaindex -> Completed
+//!       |               |               |                 |                   |
+//!       v               v               v                 v                   v
+//!     Failed          Failed          Failed           Failed              Failed
 //! ```
 //!
 //! - `MintRequested` can be rejected via `RejectMint`
@@ -54,9 +54,13 @@ use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::TokenizationRequestStatus;
 
 /// Services required by the TokenizedEquityMint aggregate.
+///
+/// Combines `Tokenizer` (for Alpaca mint operations), `Wrapper` (for ERC-4626 wrapping),
+/// and `Raindex` (for depositing to Rain OrderBook) traits.
 #[derive(Clone)]
 pub(crate) struct MintServices {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) wrapper: Arc<dyn Wrapper>,
     pub(crate) raindex: Arc<dyn Raindex>,
 }
 
@@ -98,6 +102,10 @@ impl std::fmt::Display for TokenizationRequestId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReceiptId(pub(crate) U256);
 
+/// HTTP status code from API responses.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct HttpStatusCode(pub(crate) u16);
+
 /// Errors that can occur during tokenized equity mint operations.
 ///
 /// These errors enforce state machine constraints and prevent
@@ -107,21 +115,12 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to request mint when already in progress
     #[error("Mint already in progress")]
     AlreadyInProgress,
-    /// Attempted to acknowledge acceptance before requesting mint
-    #[error("Cannot accept mint: not in requested state")]
-    NotRequested,
-    /// Attempted to receive tokens before mint was accepted
-    #[error("Cannot receive tokens: mint not accepted")]
-    NotAccepted,
-    /// Attempted to wrap tokens before they were received
-    #[error("Cannot wrap tokens: tokens not received")]
-    TokensNotReceivedForWrap,
+    /// Attempted to wrap before tokens were received
+    #[error("Cannot wrap: tokens not received")]
+    TokensNotReceived,
     /// Attempted to deposit to vault before tokens were wrapped
     #[error("Cannot deposit to vault: tokens not wrapped")]
     TokensNotWrapped,
-    /// Attempted to finalize before vault deposit
-    #[error("Cannot finalize: vault deposit not complete")]
-    VaultDepositNotComplete,
     /// Attempted to modify a completed mint operation
     #[error("Already completed")]
     AlreadyCompleted,
@@ -157,44 +156,41 @@ pub(crate) enum TokenizedEquityMintError {
     VaultDepositFailed,
 }
 
+/// Commands for the TokenizedEquityMint aggregate.
 #[derive(Debug, Clone)]
 pub(crate) enum TokenizedEquityMintCommand {
+    /// Request tokenization from Alpaca and poll until tokens arrive or failure.
+    ///
+    /// Flow: MintRequested -> MintAccepted -> TokensReceived (success)
+    ///                     or MintRejected (immediate failure)
+    ///                     or MintAcceptanceFailed (failure after acceptance)
     RequestMint {
         symbol: Symbol,
         quantity: Decimal,
         wallet: Address,
     },
-    /// Alpaca rejected the mint request before acceptance.
     RejectMint {
         reason: String,
     },
-
     AcknowledgeAcceptance {
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
     },
-    /// Mint failed after acceptance but before tokens were received.
     FailAcceptance {
         reason: String,
     },
-
     ReceiveTokens {
         tx_hash: TxHash,
         receipt_id: ReceiptId,
         shares_minted: U256,
     },
-
-    /// Wrap unwrapped tokens into ERC-4626 vault shares.
     WrapTokens {
         wrap_tx_hash: TxHash,
         wrapped_shares: U256,
     },
-
-    /// Deposit wrapped tokens to Raindex vault.
     DepositToVault {
         vault_deposit_tx_hash: TxHash,
     },
-
     Finalize,
 }
 
@@ -238,13 +234,18 @@ pub(crate) enum TokenizedEquityMintEvent {
         wrapped_shares: U256,
         wrapped_at: DateTime<Utc>,
     },
+    /// Wrapping failed after tokens were received.
+    WrappingFailed {
+        symbol: Symbol,
+        quantity: Decimal,
+        failed_at: DateTime<Utc>,
+    },
 
     /// Wrapped tokens deposited to Raindex vault.
     VaultDeposited {
         vault_deposit_tx_hash: TxHash,
         deposited_at: DateTime<Utc>,
     },
-
     /// Vault deposit failed after tokens were wrapped.
     /// Wrapped tokens remain in wallet, can be retried or manually recovered.
     VaultDepositFailed {
@@ -268,7 +269,10 @@ impl DomainEvent for TokenizedEquityMintEvent {
             }
             Self::TokensReceived { .. } => "TokenizedEquityMintEvent::TokensReceived".to_string(),
             Self::TokensWrapped { .. } => "TokenizedEquityMintEvent::TokensWrapped".to_string(),
-            Self::VaultDeposited { .. } => "TokenizedEquityMintEvent::VaultDeposited".to_string(),
+            Self::WrappingFailed { .. } => "TokenizedEquityMintEvent::WrappingFailed".to_string(),
+            Self::VaultDeposited { .. } => {
+                "TokenizedEquityMintEvent::VaultDeposited".to_string()
+            }
             Self::VaultDepositFailed { .. } => {
                 "TokenizedEquityMintEvent::VaultDepositFailed".to_string()
             }
@@ -344,19 +348,15 @@ pub(crate) enum TokenizedEquityMint {
     VaultDeposited {
         symbol: Symbol,
         quantity: Decimal,
-        wallet: Address,
+        /// Alpaca cross-system identifiers for auditing
         issuer_request_id: IssuerRequestId,
         tokenization_request_id: TokenizationRequestId,
+        /// Token receipt transaction
         token_tx_hash: TxHash,
-        receipt_id: ReceiptId,
-        shares_minted: U256,
+        /// Wrapping transaction
         wrap_tx_hash: TxHash,
-        wrapped_shares: U256,
+        /// Vault deposit transaction
         vault_deposit_tx_hash: TxHash,
-        requested_at: DateTime<Utc>,
-        accepted_at: DateTime<Utc>,
-        received_at: DateTime<Utc>,
-        wrapped_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
 
@@ -369,16 +369,17 @@ pub(crate) enum TokenizedEquityMint {
         tokenization_request_id: TokenizationRequestId,
         /// Token receipt transaction from Alpaca
         token_tx_hash: TxHash,
+        /// Wrapping transaction
+        wrap_tx_hash: TxHash,
         /// Vault deposit transaction to Raindex
         vault_deposit_tx_hash: TxHash,
         completed_at: DateTime<Utc>,
     },
 
-    /// Mint operation failed with error reason (terminal state)
+    /// Mint operation failed (terminal state)
     Failed {
         symbol: Symbol,
         quantity: Decimal,
-        reason: String,
         requested_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -553,6 +554,7 @@ impl EventSourced for TokenizedEquityMint {
                 wrapped_shares,
                 wrapped_at,
             } => entity.try_apply_tokens_wrapped(*wrap_tx_hash, *wrapped_shares, *wrapped_at),
+            WrappingFailed { .. } => None,
 
             VaultDeposited {
                 vault_deposit_tx_hash,
@@ -813,18 +815,11 @@ impl TokenizedEquityMint {
         let Self::TokensWrapped {
             symbol,
             quantity,
-            wallet,
             issuer_request_id,
             tokenization_request_id,
             tx_hash,
-            receipt_id,
-            shares_minted,
             wrap_tx_hash,
-            wrapped_shares,
-            requested_at,
-            accepted_at,
-            received_at,
-            wrapped_at,
+            ..
         } = self
         else {
             return None;
@@ -833,19 +828,11 @@ impl TokenizedEquityMint {
         Some(Self::VaultDeposited {
             symbol: symbol.clone(),
             quantity: *quantity,
-            wallet: *wallet,
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             token_tx_hash: *tx_hash,
-            receipt_id: receipt_id.clone(),
-            shares_minted: *shares_minted,
             wrap_tx_hash: *wrap_tx_hash,
-            wrapped_shares: *wrapped_shares,
             vault_deposit_tx_hash,
-            requested_at: *requested_at,
-            accepted_at: *accepted_at,
-            received_at: *received_at,
-            wrapped_at: *wrapped_at,
             deposited_at,
         })
     }
@@ -868,7 +855,6 @@ impl TokenizedEquityMint {
         Some(Self::Failed {
             symbol: symbol.clone(),
             quantity: *quantity,
-            reason: reason.to_string(),
             requested_at: *requested_at,
             failed_at,
         })
@@ -881,6 +867,7 @@ impl TokenizedEquityMint {
             issuer_request_id,
             tokenization_request_id,
             token_tx_hash,
+            wrap_tx_hash,
             vault_deposit_tx_hash,
             ..
         } = self
@@ -894,6 +881,7 @@ impl TokenizedEquityMint {
             issuer_request_id: issuer_request_id.clone(),
             tokenization_request_id: tokenization_request_id.clone(),
             token_tx_hash: *token_tx_hash,
+            wrap_tx_hash: *wrap_tx_hash,
             vault_deposit_tx_hash: *vault_deposit_tx_hash,
             completed_at,
         })
@@ -913,7 +901,6 @@ impl TokenizedEquityMint {
         Some(Self::Failed {
             symbol: symbol.clone(),
             quantity: *quantity,
-            reason: reason.to_string(),
             requested_at: *requested_at,
             failed_at: rejected_at,
         })
@@ -933,7 +920,6 @@ impl TokenizedEquityMint {
         Some(Self::Failed {
             symbol: symbol.clone(),
             quantity: *quantity,
-            reason: reason.to_string(),
             requested_at: *requested_at,
             failed_at,
         })

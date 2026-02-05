@@ -5,28 +5,13 @@ use async_trait::async_trait;
 use reqwest::StatusCode;
 
 use st0x_execution::{FractionalShares, Symbol};
+use std::sync::Mutex;
 
 use super::{
     AlpacaTokenizationError, TokenizationRequest, TokenizationRequestStatus, Tokenizer,
     TokenizerError,
 };
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
-
-/// Configurable outcome for detection polling.
-#[derive(Clone, Copy)]
-pub(crate) enum MockDetectionOutcome {
-    Detected,
-    Timeout,
-    ApiError,
-}
-
-/// Configurable outcome for completion polling.
-#[derive(Clone, Copy)]
-pub(crate) enum MockCompletionOutcome {
-    Completed,
-    Rejected,
-    Pending,
-}
 
 /// Configurable outcome for mint request.
 #[derive(Clone, Copy)]
@@ -45,6 +30,22 @@ pub(crate) enum MockMintPollOutcome {
     PollError,
 }
 
+/// Configurable outcome for redemption detection polling.
+#[derive(Clone, Copy)]
+pub(crate) enum MockDetectionOutcome {
+    Detected,
+    Timeout,
+    ApiError,
+}
+
+/// Configurable outcome for redemption completion polling.
+#[derive(Clone, Copy)]
+pub(crate) enum MockCompletionOutcome {
+    Completed,
+    Rejected,
+    Pending,
+}
+
 pub(crate) struct MockTokenizer {
     redemption_wallet: Address,
     redemption_tx: TxHash,
@@ -53,6 +54,7 @@ pub(crate) struct MockTokenizer {
     detection_outcome: Option<MockDetectionOutcome>,
     completion_outcome: Option<MockCompletionOutcome>,
     should_fail_send: bool,
+    last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
 }
 
 impl MockTokenizer {
@@ -65,6 +67,7 @@ impl MockTokenizer {
             detection_outcome: None,
             completion_outcome: None,
             should_fail_send: false,
+            last_issuer_request_id: Mutex::new(None),
         }
     }
 
@@ -92,6 +95,10 @@ impl MockTokenizer {
         self.should_fail_send = true;
         self
     }
+
+    pub(crate) fn last_issuer_request_id(&self) -> Option<IssuerRequestId> {
+        self.last_issuer_request_id.lock().unwrap().clone()
+    }
 }
 
 #[async_trait]
@@ -101,8 +108,10 @@ impl Tokenizer for MockTokenizer {
         _symbol: Symbol,
         _quantity: FractionalShares,
         _wallet: Address,
-        _issuer_request_id: IssuerRequestId,
+        issuer_request_id: IssuerRequestId,
     ) -> Result<TokenizationRequest, TokenizerError> {
+        *self.last_issuer_request_id.lock().unwrap() = Some(issuer_request_id);
+
         match self.mint_request_outcome {
             MockMintRequestOutcome::Pending => Ok(TokenizationRequest::mock(
                 TokenizationRequestStatus::Pending,
@@ -161,23 +170,9 @@ impl Tokenizer for MockTokenizer {
         &self,
         _tx_hash: &TxHash,
     ) -> Result<TokenizationRequest, TokenizerError> {
-        match self.detection_outcome {
-            Some(MockDetectionOutcome::Detected) => Ok(TokenizationRequest::mock(
-                TokenizationRequestStatus::Pending,
-            )),
-            Some(MockDetectionOutcome::Timeout) => Err(TokenizerError::Alpaca(
-                AlpacaTokenizationError::PollTimeout {
-                    elapsed: std::time::Duration::from_secs(60),
-                },
-            )),
-            Some(MockDetectionOutcome::ApiError) => {
-                Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
-                    status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: "mock error".to_string(),
-                }))
-            }
-            None => unimplemented!("MockTokenizer::poll_for_redemption - no outcome configured"),
-        }
+        Ok(TokenizationRequest::mock(
+            TokenizationRequestStatus::Pending,
+        ))
     }
 
     async fn poll_redemption_until_complete(

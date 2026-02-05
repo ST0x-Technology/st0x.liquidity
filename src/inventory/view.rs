@@ -583,7 +583,7 @@ impl InventoryView {
     /// - `MintAccepted`: Move quantity from `offchain.available` to `offchain.inflight`.
     /// - `MintAcceptanceFailed`: Cancel inflight back to available (safe to restore).
     /// - `TokensReceived`: Remove from `offchain.inflight`, add to `onchain.available`.
-    /// - `MintCompleted`: Update `last_rebalancing` timestamp.
+    /// - `Completed`: Update `last_rebalancing` timestamp.
     ///
     /// The `quantity` parameter is the mint quantity in `FractionalShares`, needed for
     /// events that modify balances but don't carry the quantity themselves.
@@ -596,14 +596,15 @@ impl InventoryView {
     ) -> Result<Self, InventoryViewError> {
         match event {
             // No venue inventory changes. TokensWrapped converts unwrapped to wrapped in-place.
-            // VaultDeposited completes the transfer to Raindex (already counted when
-            // TokensReceived). VaultDepositFailed leaves tokens in wallet awaiting retry
-            // or manual recovery.
+            // DepositedIntoRaindex completes the transfer to Raindex (already counted when
+            // TokensReceived). WrappingFailed/RaindexDepositFailed leaves tokens in wallet
+            // awaiting retry or manual recovery.
             TokenizedEquityMintEvent::MintRequested { .. }
             | TokenizedEquityMintEvent::MintRejected { .. }
             | TokenizedEquityMintEvent::TokensWrapped { .. }
-            | TokenizedEquityMintEvent::VaultDeposited { .. }
-            | TokenizedEquityMintEvent::VaultDepositFailed { .. } => Ok(Self {
+            | TokenizedEquityMintEvent::WrappingFailed { .. }
+            | TokenizedEquityMintEvent::DepositedIntoRaindex { .. }
+            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
@@ -625,7 +626,7 @@ impl InventoryView {
                 now,
             ),
 
-            TokenizedEquityMintEvent::MintCompleted { completed_at, .. } => self.update_equity(
+            TokenizedEquityMintEvent::Completed { completed_at, .. } => self.update_equity(
                 symbol,
                 |inventory| Ok(inventory.with_last_rebalancing(*completed_at)),
                 now,
@@ -1340,11 +1341,11 @@ mod tests {
         }
     }
 
-    fn make_vault_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::VaultDepositFailed {
+    fn make_raindex_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::RaindexDepositFailed {
             symbol: symbol.clone(),
             quantity,
-            reason: "Insufficient gas".to_string(),
+            failed_tx_hash: Some(TxHash::random()),
             failed_at: Utc::now(),
         }
     }
@@ -1452,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_vault_deposited_only_updates_last_updated() {
+    fn apply_deposited_into_raindex_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: 130 onchain (100 original + 30 minted), 70 offchain
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
@@ -1463,7 +1464,7 @@ mod tests {
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
-        // VaultDeposited doesn't change balances - tokens were already counted in onchain
+        // DepositedIntoRaindex doesn't change balances - tokens were already counted in onchain
         // when TokensReceived happened. This just confirms they're now in the Raindex vault.
         assert_eq!(
             inventory.onchain.unwrap().total().unwrap().inner(),
@@ -1477,18 +1478,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_vault_deposit_failed_only_updates_last_updated() {
+    fn apply_raindex_deposit_failed_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: tokens in wallet (counted as onchain available)
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_vault_deposit_failed(&symbol, dec!(30));
+        let event = make_raindex_deposit_failed(&symbol, dec!(30));
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
-        // VaultDepositFailed doesn't change balances - tokens remain in wallet
+        // RaindexDepositFailed doesn't change balances - tokens remain in wallet
         // (still counted as onchain) awaiting retry or manual recovery.
         assert_eq!(
             inventory.onchain.unwrap().total().unwrap().inner(),
@@ -1585,7 +1586,7 @@ mod tests {
         );
         assert!(!inventory.has_inflight());
 
-        // MintCompleted: Update last_rebalancing
+        // Completed: Update last_rebalancing
         let view = view
             .apply_mint_event(&symbol, &make_mint_completed(), shares(0), Utc::now())
             .unwrap();

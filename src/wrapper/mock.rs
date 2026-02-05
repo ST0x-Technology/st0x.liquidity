@@ -12,6 +12,7 @@ pub(crate) struct MockWrapper {
     unwrap_tx: TxHash,
     unwrapped_token: Address,
     ratio: U256,
+    wrap_fails: bool,
 }
 
 impl MockWrapper {
@@ -21,6 +22,7 @@ impl MockWrapper {
             unwrap_tx: TxHash::random(),
             unwrapped_token: Address::random(),
             ratio: RATIO_ONE,
+            wrap_fails: false,
         }
     }
 
@@ -31,6 +33,18 @@ impl MockWrapper {
             unwrap_tx: TxHash::random(),
             unwrapped_token: Address::random(),
             ratio,
+            wrap_fails: false,
+        }
+    }
+
+    /// Creates a mock wrapper that fails on wrap operations.
+    pub(crate) fn failing() -> Self {
+        Self {
+            owner: Address::random(),
+            unwrap_tx: TxHash::random(),
+            unwrapped_token: Address::random(),
+            ratio: RATIO_ONE,
+            wrap_fails: true,
         }
     }
 }
@@ -54,6 +68,9 @@ impl Wrapper for MockWrapper {
         underlying_amount: U256,
         _receiver: Address,
     ) -> Result<(TxHash, U256), WrapperError> {
+        if self.wrap_fails {
+            return Err(WrapperError::MissingDepositEvent);
+        }
         // 1:1 ratio for mock - wrapped amount equals underlying amount
         Ok((TxHash::random(), underlying_amount))
     }
