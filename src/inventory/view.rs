@@ -1240,6 +1240,24 @@ mod tests {
         }
     }
 
+    fn make_vault_deposited(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::VaultDeposited {
+            symbol: symbol.clone(),
+            quantity,
+            vault_deposit_tx_hash: TxHash::random(),
+            deposited_at: Utc::now(),
+        }
+    }
+
+    fn make_vault_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::VaultDepositFailed {
+            symbol: symbol.clone(),
+            quantity,
+            reason: "Insufficient gas".to_string(),
+            failed_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn apply_mint_requested_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
@@ -1342,6 +1360,56 @@ mod tests {
         assert_eq!(
             inventory.offchain.unwrap().total().unwrap().inner(),
             Decimal::from(100)
+        );
+        assert!(!inventory.has_inflight());
+    }
+
+    #[test]
+    fn apply_vault_deposited_only_updates_last_updated() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Post-TokensReceived state: 130 onchain (100 original + 30 minted), 70 offchain
+        let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
+        let event = make_vault_deposited(&symbol, dec!(30));
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inventory = updated.equities.get(&symbol).unwrap();
+        // VaultDeposited doesn't change balances - tokens were already counted in onchain
+        // when TokensReceived happened. This just confirms they're now in the Raindex vault.
+        assert_eq!(
+            inventory.onchain.unwrap().total().unwrap().inner(),
+            Decimal::from(130)
+        );
+        assert_eq!(
+            inventory.offchain.unwrap().total().unwrap().inner(),
+            Decimal::from(70)
+        );
+        assert!(!inventory.has_inflight());
+    }
+
+    #[test]
+    fn apply_vault_deposit_failed_only_updates_last_updated() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        // Post-TokensReceived state: tokens in wallet (counted as onchain available)
+        let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
+        let event = make_vault_deposit_failed(&symbol, dec!(30));
+
+        let updated = view
+            .apply_mint_event(&symbol, &event, shares(30), Utc::now())
+            .unwrap();
+
+        let inventory = updated.equities.get(&symbol).unwrap();
+        // VaultDepositFailed doesn't change balances - tokens remain in wallet
+        // (still counted as onchain) awaiting retry or manual recovery.
+        assert_eq!(
+            inventory.onchain.unwrap().total().unwrap().inner(),
+            Decimal::from(130)
+        );
+        assert_eq!(
+            inventory.offchain.unwrap().total().unwrap().inner(),
+            Decimal::from(70)
         );
         assert!(!inventory.has_inflight());
     }
