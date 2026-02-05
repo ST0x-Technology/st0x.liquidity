@@ -5,7 +5,6 @@
 //! for integration with the rebalancing trigger system.
 
 use alloy::primitives::{Address, U256};
-use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use rust_decimal::Decimal;
@@ -14,47 +13,41 @@ use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
 use super::{Mint, MintError};
+use crate::equity_redemption::TOKENIZED_EQUITY_DECIMALS;
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::vault::{VaultId, VaultService};
-use crate::tokenization::{
-    AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
-};
+use crate::onchain::vault::{Vault, VaultId};
+use crate::tokenization::{TokenizationRequest, TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
 
-/// Our tokenized equity tokens use 18 decimals.
-const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
-
-pub(crate) struct MintManager<P, ES>
+pub(crate) struct MintManager<ES>
 where
-    P: Provider + Clone,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
-    service: Arc<AlpacaTokenizationService<P>>,
-    vault: Arc<VaultService<P>>,
+    tokenizer: Arc<dyn Tokenizer>,
+    vault: Arc<dyn Vault>,
     vault_registry_query: Arc<VaultRegistryQuery>,
     orderbook: Address,
     owner: Address,
     cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
 }
 
-impl<P, ES> MintManager<P, ES>
+impl<ES> MintManager<ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
 {
     pub(crate) fn new(
-        service: Arc<AlpacaTokenizationService<P>>,
-        vault: Arc<VaultService<P>>,
+        tokenizer: Arc<dyn Tokenizer>,
+        vault: Arc<dyn Vault>,
         vault_registry_query: Arc<VaultRegistryQuery>,
         orderbook: Address,
         owner: Address,
         cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
     ) -> Self {
         Self {
-            service,
+            tokenizer,
             vault,
             vault_registry_query,
             orderbook,
@@ -118,7 +111,7 @@ where
             .await?;
 
         let alpaca_request = match self
-            .service
+            .tokenizer
             .request_mint(symbol.clone(), quantity, wallet, issuer_request_id.clone())
             .await
         {
@@ -127,7 +120,7 @@ where
                 warn!("Alpaca mint request failed: {e}");
                 self.reject_mint(issuer_request_id, format!("Alpaca API error: {e}"))
                     .await?;
-                return Err(MintError::Alpaca(e));
+                return Err(MintError::Tokenizer(e));
             }
         };
 
@@ -144,7 +137,7 @@ where
         info!(tokenization_request_id = %alpaca_request.id, "Mint request accepted, polling for completion");
 
         let completed_request = match self
-            .service
+            .tokenizer
             .poll_mint_until_complete(&alpaca_request.id)
             .await
         {
@@ -153,7 +146,7 @@ where
                 warn!("Polling failed: {e}");
                 self.fail_acceptance(issuer_request_id, format!("Polling failed: {e}"))
                     .await?;
-                return Err(MintError::Alpaca(e));
+                return Err(MintError::Tokenizer(e));
             }
         };
 
@@ -269,9 +262,8 @@ fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintErro
 }
 
 #[async_trait]
-impl<P, ES> Mint for MintManager<P, ES>
+impl<ES> Mint for MintManager<ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<TokenizedEquityMint, Never>> + Send + Sync,
     ES::AC: Send,
 {
@@ -290,21 +282,21 @@ where
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{U256, address};
+    use alloy::providers::Provider;
     use alloy::signers::local::PrivateKeySigner;
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
-    use cqrs_es::persist::GenericQuery;
     use httpmock::prelude::*;
     use rust_decimal_macros::dec;
     use serde_json::json;
-    use sqlite_es::SqliteViewRepository;
 
     use super::*;
+    use crate::onchain::vault::VaultService;
+    use crate::test_utils::{create_test_vault_service, create_vault_registry_query};
     use crate::tokenization::alpaca::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_with_provider, setup_anvil,
         tokenization_mint_path, tokenization_requests_path,
     };
-    use crate::vault_registry::VaultRegistryAggregate;
 
     const TEST_ORDERBOOK: Address = address!("0xdead000000000000000000000000000000000001");
 
@@ -316,16 +308,6 @@ mod tests {
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();
         Arc::new(CqrsFramework::new(store, vec![], ()))
-    }
-
-    fn create_empty_vault_registry_query(pool: &sqlx::SqlitePool) -> Arc<VaultRegistryQuery> {
-        let view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        Arc::new(GenericQuery::new(view_repo))
     }
 
     fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -404,12 +386,13 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
-        let vault_registry_query = create_empty_vault_registry_query(&pool);
+        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault =
+            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(
-            service,
-            vault,
+            service as Arc<dyn Tokenizer>,
+            vault as Arc<dyn Vault>,
             vault_registry_query,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
@@ -470,12 +453,13 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
-        let vault_registry_query = create_empty_vault_registry_query(&pool);
+        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault =
+            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(
-            service,
-            vault,
+            service as Arc<dyn Tokenizer>,
+            vault as Arc<dyn Vault>,
             vault_registry_query,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
@@ -539,12 +523,13 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
-        let vault_registry_query = create_empty_vault_registry_query(&pool);
+        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault =
+            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(
-            service,
-            vault,
+            service as Arc<dyn Tokenizer>,
+            vault as Arc<dyn Vault>,
             vault_registry_query,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
@@ -564,7 +549,7 @@ mod tests {
             .execute_mint_impl(&IssuerRequestId::new("mint-003"), symbol, quantity, wallet)
             .await;
 
-        assert!(matches!(result, Err(MintError::Alpaca(_))));
+        assert!(matches!(result, Err(MintError::Tokenizer(_))));
 
         mint_mock.assert();
     }
@@ -586,12 +571,13 @@ mod tests {
             provider.clone(),
             TEST_REDEMPTION_WALLET,
         ));
-        let vault = Arc::new(VaultService::new(provider, TEST_ORDERBOOK));
-        let vault_registry_query = create_empty_vault_registry_query(&pool);
+        let vault_registry_query = create_vault_registry_query(&pool);
+        let vault =
+            create_test_vault_service(provider, &pool, TEST_ORDERBOOK, TEST_REDEMPTION_WALLET);
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(
-            service,
-            vault,
+            service as Arc<dyn Tokenizer>,
+            vault as Arc<dyn Vault>,
             vault_registry_query,
             TEST_ORDERBOOK,
             TEST_REDEMPTION_WALLET,
@@ -638,11 +624,12 @@ mod tests {
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
-    use sqlite_es::SqliteCqrs;
+    use cqrs_es::persist::GenericQuery;
+    use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
     use crate::conductor::wire::test_cqrs;
-    use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+    use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
 
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
     const TEST_VAULT_ID: VaultId = VaultId(b256!(
@@ -802,11 +789,13 @@ mod tests {
         let vault = Arc::new(VaultService::new(
             local_evm.provider.clone(),
             local_evm.orderbook_address,
+            vault_registry_query.clone(),
+            local_evm.signer.address(),
         ));
         let cqrs = create_test_cqrs();
         let manager = MintManager::new(
-            service,
-            vault,
+            service as Arc<dyn Tokenizer>,
+            vault as Arc<dyn Vault>,
             vault_registry_query,
             local_evm.orderbook_address,
             local_evm.signer.address(),

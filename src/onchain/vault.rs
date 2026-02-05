@@ -337,7 +337,7 @@ where
         amount: U256,
         decimals: u8,
     ) -> Result<TxHash, VaultError> {
-        VaultService::deposit(self, token, vault_id, amount, decimals).await
+        Self::deposit(self, token, vault_id, amount, decimals).await
     }
 
     async fn withdraw(
@@ -347,13 +347,12 @@ where
         target_amount: U256,
         decimals: u8,
     ) -> Result<TxHash, VaultError> {
-        VaultService::withdraw(self, token, vault_id, target_amount, decimals).await
+        Self::withdraw(self, token, vault_id, target_amount, decimals).await
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::network::{Ethereum, EthereumWallet};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, b256};
@@ -363,8 +362,12 @@ mod tests {
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
     use alloy::transports::{RpcError, TransportErrorKind};
+    use cqrs_es::persist::GenericQuery;
+    use sqlite_es::SqliteViewRepository;
 
+    use super::*;
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::vault_registry::VaultRegistryAggregate;
 
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
@@ -509,11 +512,33 @@ mod tests {
         "0x0000000000000000000000000000000000000000000000000000000000000001"
     ));
 
+    async fn create_test_vault_service(
+        provider: LocalEvmProvider,
+        orderbook_address: Address,
+        owner: Address,
+    ) -> VaultService<LocalEvmProvider> {
+        let pool = crate::test_utils::setup_test_db().await;
+        let vault_registry_view_repo =
+            Arc::new(SqliteViewRepository::<
+                VaultRegistryAggregate,
+                VaultRegistryAggregate,
+            >::new(pool, "vault_registry_view".to_string()));
+        let vault_registry_query: Arc<VaultRegistryQuery> =
+            Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+        VaultService::new(provider, orderbook_address, vault_registry_query, owner)
+    }
+
     #[tokio::test]
     async fn deposit_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await;
 
         let result = service
             .deposit(
@@ -543,7 +568,12 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await;
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -579,7 +609,12 @@ mod tests {
     async fn withdraw_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await;
 
         let result = service
             .withdraw(
@@ -610,8 +645,13 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address)
-            .with_required_confirmations(1);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await
+        .with_required_confirmations(1);
 
         service
             .deposit(
@@ -647,7 +687,12 @@ mod tests {
     #[tokio::test]
     async fn get_equity_balance_returns_zero_for_empty_vault() {
         let local_evm = LocalEvm::new().await.unwrap();
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await;
 
         let balance = service
             .get_equity_balance(
@@ -676,7 +721,12 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await;
 
         service
             .deposit(
@@ -720,8 +770,13 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address)
-            .with_required_confirmations(1);
+        let service = create_test_vault_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await
+        .with_required_confirmations(1);
 
         service
             .deposit(

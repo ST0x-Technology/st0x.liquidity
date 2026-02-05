@@ -337,9 +337,6 @@ impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
             TokenizedEquityMintCommand::DepositToVault {
                 vault_deposit_tx_hash,
             } => self.handle_deposit_to_vault(*vault_deposit_tx_hash),
-            TokenizedEquityMintCommand::FailVaultDeposit { reason } => {
-                self.handle_fail_vault_deposit(reason)
-            }
 
             TokenizedEquityMintCommand::Finalize => self.handle_finalize(),
         }
@@ -1700,95 +1697,6 @@ mod tests {
         };
         assert!(state.contains("MintAccepted"));
         assert_eq!(evt, "TokenizedEquityMintEvent::VaultDeposited");
-    }
-
-    #[tokio::test]
-    async fn test_fail_vault_deposit_from_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-        let tx_hash = TxHash::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let received_event = TokenizedEquityMintEvent::TokensReceived {
-            symbol,
-            quantity: dec!(100.5),
-            tx_hash,
-            receipt_id: ReceiptId(U256::from(789)),
-            shares_minted: U256::from(100_500_000_000_000_000_000_u128),
-            received_at: Utc::now(),
-        };
-        aggregate.apply(received_event);
-
-        let events = aggregate
-            .handle(
-                TokenizedEquityMintCommand::FailVaultDeposit {
-                    reason: "Vault not found".to_string(),
-                },
-                &(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            TokenizedEquityMintEvent::VaultDepositFailed { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_fail_vault_deposit_before_tokens_received() {
-        let mut aggregate = Lifecycle::<TokenizedEquityMint, Never>::default();
-        let symbol = Symbol::new("AAPL").unwrap();
-        let wallet = Address::random();
-
-        let requested_event = TokenizedEquityMintEvent::MintRequested {
-            symbol: symbol.clone(),
-            quantity: dec!(100.5),
-            wallet,
-            requested_at: Utc::now(),
-        };
-        aggregate.apply(requested_event);
-
-        let accepted_event = TokenizedEquityMintEvent::MintAccepted {
-            symbol,
-            quantity: dec!(100.5),
-            issuer_request_id: IssuerRequestId("ISS123".to_string()),
-            tokenization_request_id: TokenizationRequestId("TOK456".to_string()),
-            accepted_at: Utc::now(),
-        };
-        aggregate.apply(accepted_event);
-
-        let result = aggregate
-            .handle(
-                TokenizedEquityMintCommand::FailVaultDeposit {
-                    reason: "Should not work".to_string(),
-                },
-                &(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(TokenizedEquityMintError::TokensNotReceived)
-        ));
     }
 
     #[test]

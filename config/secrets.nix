@@ -4,4 +4,5 @@ in {
   "server-alpaca.toml.age".publicKeys = roles.service;
   "reporter-schwab.toml.age".publicKeys = roles.service;
   "reporter-alpaca.toml.age".publicKeys = roles.service;
+  "fireblocks_secret.key.age".publicKeys = roles.service;
 }

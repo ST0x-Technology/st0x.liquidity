@@ -54,12 +54,12 @@ use sqlite_es::SqliteEventRepository;
 use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
-use crate::onchain::vault::{Vault, VaultError, VaultId};
+use crate::onchain::vault::{Vault, VaultError};
 use crate::tokenization::{Tokenizer, TokenizerError};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// Our tokenized equity tokens use 18 decimals.
-const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
+pub(crate) const TOKENIZED_EQUITY_DECIMALS: u8 = 18;
 
 /// SQLite-backed event store for EquityRedemption aggregates.
 pub(crate) type RedemptionEventStore =
@@ -704,14 +704,14 @@ impl EquityRedemption {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
     use crate::onchain::mock::MockVault;
     use crate::tokenization::mock::MockTokenizer;
 
-    fn mock_redemption_services() -> RedemptionServices {
+    pub(crate) fn mock_redeemer_services() -> RedemptionServices {
         RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new()),
             vault: Arc::new(MockVault::new()),
@@ -722,7 +722,7 @@ mod tests {
     async fn test_redeem_from_uninitialized() {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let services = mock_redemption_services();
+        let services = mock_redeemer_services();
 
         let events = aggregate
             .handle(
@@ -774,10 +774,6 @@ mod tests {
         (redemption_wallet, redemption_tx)
     }
 
-    fn mock_services() -> RedemptionServices {
-        mock_redemption_services()
-    }
-
     #[tokio::test]
     async fn test_detect_after_tokens_sent() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
@@ -789,7 +785,7 @@ mod tests {
                 EquityRedemptionCommand::Detect {
                     tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await
             .unwrap();
@@ -811,7 +807,7 @@ mod tests {
         aggregate.apply(detected_event);
 
         let events = aggregate
-            .handle(EquityRedemptionCommand::Complete, &mock_services())
+            .handle(EquityRedemptionCommand::Complete, &mock_redeemer_services())
             .await
             .unwrap();
 
@@ -823,7 +819,7 @@ mod tests {
     async fn test_complete_redemption_flow_end_to_end() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let services = mock_services();
+        let services = mock_redeemer_services();
 
         let redeem_events = aggregate
             .handle(
@@ -876,7 +872,7 @@ mod tests {
                 EquityRedemptionCommand::Detect {
                     tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await;
 
@@ -888,7 +884,7 @@ mod tests {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
 
         let result = aggregate
-            .handle(EquityRedemptionCommand::Complete, &mock_services())
+            .handle(EquityRedemptionCommand::Complete, &mock_redeemer_services())
             .await;
 
         assert!(matches!(result, Err(EquityRedemptionError::NotPending)));
@@ -905,7 +901,7 @@ mod tests {
                 EquityRedemptionCommand::FailDetection {
                     reason: "Alpaca timeout".to_string(),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await
             .unwrap();
@@ -934,7 +930,7 @@ mod tests {
                 EquityRedemptionCommand::RejectRedemption {
                     reason: "Insufficient balance".to_string(),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await
             .unwrap();
@@ -957,7 +953,7 @@ mod tests {
                 EquityRedemptionCommand::RejectRedemption {
                     reason: "Cannot reject yet".to_string(),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await;
 
@@ -1017,7 +1013,7 @@ mod tests {
                 EquityRedemptionCommand::FailDetection {
                     reason: "Cannot fail".to_string(),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await;
 
@@ -1033,7 +1029,7 @@ mod tests {
                 EquityRedemptionCommand::RejectRedemption {
                     reason: "Cannot reject".to_string(),
                 },
-                &mock_services(),
+                &mock_redeemer_services(),
             )
             .await;
 

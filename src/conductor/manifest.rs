@@ -21,7 +21,7 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 
 use super::wire::{Cons, CqrsBuilder, Nil, UnwiredQuery};
 use crate::dashboard::{EventBroadcaster, ServerMessage};
-use crate::equity_redemption::{EquityRedemption, Redeemer};
+use crate::equity_redemption::{EquityRedemption, RedemptionServices};
 use crate::inventory::InventoryView;
 use crate::lifecycle::Lifecycle;
 use crate::position::{PositionAggregate, PositionQuery};
@@ -124,7 +124,7 @@ impl QueryManifest {
     pub(super) fn wire(
         self,
         pool: SqlitePool,
-        redemption_service: Arc<dyn Redeemer>,
+        redemption_services: RedemptionServices,
     ) -> (BuiltFrameworks, WiredQueries) {
         let Self {
             rebalancing_trigger,
@@ -148,7 +148,7 @@ impl QueryManifest {
                 .wire(rebalancing_trigger)
                 .wire(event_broadcaster)
                 .wire(redemption_view)
-                .build(redemption_service);
+                .build(redemption_services);
 
         let (usdc, (event_broadcaster, (rebalancing_trigger, ()))) = CqrsBuilder::new(pool)
             .wire(rebalancing_trigger)

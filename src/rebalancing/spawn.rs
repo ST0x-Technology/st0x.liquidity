@@ -25,9 +25,8 @@ use crate::cctp::{
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
 use crate::onchain::http_client_with_retry;
-use crate::onchain::vault::{VaultId, VaultService};
-use crate::rebalancing::redemption::RedemptionService;
-use crate::tokenization::AlpacaTokenizationService;
+use crate::onchain::vault::{Vault, VaultId, VaultService};
+use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 use crate::vault_registry::VaultRegistryQuery;
@@ -60,8 +59,8 @@ type HttpProvider = FillProvider<
 
 /// Type alias for a configured rebalancer with SQLite persistence.
 type ConfiguredRebalancer<BP> = Rebalancer<
-    MintManager<BP, MintEventStore>,
-    RedemptionManager<BP, RedemptionEventStore>,
+    MintManager<MintEventStore>,
+    RedemptionManager<RedemptionEventStore>,
     UsdcRebalanceManager<BP, UsdcEventStore>,
 >;
 
@@ -80,14 +79,13 @@ pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
     pub(crate) vault_service: Arc<VaultService<BP>>,
     pub(crate) tokenization_service: Arc<AlpacaTokenizationService<BP>>,
     pub(crate) vault_registry_query: Arc<VaultRegistryQuery>,
-    pub(crate) service: Arc<RedemptionService<BP>>,
     pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
     pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
 }
 
 /// CQRS-related dependencies for redemption manager.
-pub(crate) struct RedemptionCqrs<BP: Provider + Clone> {
-    pub(crate) service: Arc<RedemptionService<BP>>,
+pub(crate) struct RedemptionCqrs {
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
     pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
 }
@@ -110,6 +108,8 @@ where
     let signer = PrivateKeySigner::from_bytes(&config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
 
+    let tokenizer: Arc<dyn Tokenizer> = redemption.tokenization_service.clone();
+
     let services = Services::new(
         config,
         &ethereum_wallet,
@@ -121,7 +121,7 @@ where
     .await?;
 
     let redemption_cqrs = RedemptionCqrs {
-        service: redemption.service,
+        tokenizer,
         cqrs: redemption.cqrs,
         query: redemption.query,
     };
@@ -221,24 +221,21 @@ where
     }
 
     /// Converts Services into a configured Rebalancer.
-    ///
-    /// RedemptionService is passed in (created in conductor) rather than created here
-    /// to ensure the same instance is used by both the CQRS framework and the manager.
     fn into_rebalancer(
         self,
         config: &RebalancingConfig,
         addresses: RebalancerAddresses,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         frameworks: RebalancingCqrsFrameworks,
-        redemption: RedemptionCqrs<BP>,
+        redemption: RedemptionCqrs,
         vault_registry_query: Arc<VaultRegistryQuery>,
     ) -> ConfiguredRebalancer<BP>
     where
         BP: Send + Sync + 'static,
     {
         let mint_manager = Arc::new(MintManager::new(
-            self.tokenization,
-            self.vault.clone(),
+            self.tokenization as Arc<dyn Tokenizer>,
+            self.vault.clone() as Arc<dyn Vault>,
             vault_registry_query,
             addresses.orderbook,
             addresses.market_maker_wallet,
@@ -246,7 +243,7 @@ where
         ));
 
         let redemption_manager = Arc::new(RedemptionManager::new(
-            redemption.service,
+            redemption.tokenizer,
             redemption.cqrs,
             redemption.query,
         ));
@@ -289,7 +286,6 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaTransferId, AlpacaWalletService};
     use crate::conductor::wire::test_cqrs;
-    use crate::equity_redemption::mock::mock_redeemer_services;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingTriggerConfig;
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
@@ -479,8 +475,19 @@ mod tests {
         .with_required_confirmations(1);
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
+
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            crate::test_utils::setup_test_db().await,
+            "vault_registry_view".to_string(),
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
         let vault = Arc::new(
-            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
+            VaultService::new(base_provider, TEST_ORDERBOOK, vault_registry_query, owner)
+                .with_required_confirmations(1),
         );
 
         let services = Services {
@@ -566,7 +573,7 @@ mod tests {
         let redemption_cqrs = Arc::new(test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(redemption_view_repo))],
-            mock_redeemer_services(),
+            crate::equity_redemption::tests::mock_redeemer_services(),
         ));
 
         let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
@@ -577,21 +584,13 @@ mod tests {
         ));
         let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-        let redemption_service = Arc::new(RedemptionService::new(
-            services.vault.clone(),
-            services.tokenization.clone(),
-            vault_registry_query.clone(),
-            TEST_ORDERBOOK,
-            config.redemption_wallet,
-        ));
-
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,
             usdc: usdc_cqrs,
         };
 
         let redemption = RedemptionCqrs {
-            service: redemption_service,
+            tokenizer: services.tokenization.clone(),
             cqrs: redemption_cqrs,
             query: redemption_query,
         };

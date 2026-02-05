@@ -4,8 +4,12 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
+use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
+use sqlite_es::SqliteViewRepository;
+use sqlx::SqlitePool;
 use std::io::Write;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::bindings::IERC20;
@@ -13,6 +17,14 @@ use crate::config::Config;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
+use crate::vault_registry::VaultRegistryAggregate;
+
+pub(super) struct Deposit {
+    pub(super) amount: Decimal,
+    pub(super) token: Address,
+    pub(super) vault_id: B256,
+    pub(super) decimals: u8,
+}
 
 #[derive(Debug, Error)]
 pub enum VaultCliError {
@@ -44,13 +56,17 @@ pub(super) async fn vault_deposit_command<
     BP: Provider + Clone + Send + Sync + 'static,
 >(
     stdout: &mut W,
-    amount: Decimal,
-    token: Address,
-    vault_id: B256,
-    decimals: u8,
+    deposit: Deposit,
     config: &Config,
+    pool: &SqlitePool,
     base_provider: BP,
 ) -> anyhow::Result<()> {
+    let Deposit {
+        amount,
+        token,
+        vault_id,
+        decimals,
+    } = deposit;
     writeln!(stdout, "Depositing tokens to Raindex vault")?;
     writeln!(stdout, "   Amount: {amount}")?;
     writeln!(stdout, "   Token: {token}")?;
@@ -100,7 +116,20 @@ pub(super) async fn vault_deposit_command<
         approve_receipt.transaction_hash
     )?;
 
-    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let vault_service = VaultService::new(
+        base_provider_with_wallet,
+        config.evm.orderbook,
+        vault_registry_query,
+        sender_address,
+    );
 
     writeln!(stdout, "   Depositing to vault...")?;
     let deposit_tx = vault_service
@@ -120,6 +149,7 @@ pub(super) async fn vault_withdraw_command<
     stdout: &mut W,
     amount: Usdc,
     config: &Config,
+    pool: &SqlitePool,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Withdrawing USDC from Raindex vault")?;
@@ -143,7 +173,20 @@ pub(super) async fn vault_withdraw_command<
         .wallet(base_wallet)
         .connect_provider(base_provider);
 
-    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
+    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(
+        pool.clone(), "vault_registry_view".to_string()
+    ));
+    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let vault_service = VaultService::new(
+        base_provider_with_wallet,
+        config.evm.orderbook,
+        vault_registry_query,
+        sender_address,
+    );
     let vault_id = VaultId(rebalancing_config.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;
@@ -167,6 +210,7 @@ mod tests {
     use super::*;
     use crate::config::{BrokerConfig, LogLevel};
     use crate::onchain::EvmConfig;
+    use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
@@ -201,20 +245,18 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_requires_rebalancing_config() {
         let config = create_config_without_rebalancing();
+        let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Decimal::from_str("100").unwrap();
 
         let mut stdout = Vec::new();
-        let result = vault_deposit_command(
-            &mut stdout,
+        let deposit = Deposit {
             amount,
-            TEST_TOKEN,
-            TEST_VAULT_ID,
-            6,
-            &config,
-            provider,
-        )
-        .await;
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            decimals: 6,
+        };
+        let result = vault_deposit_command(&mut stdout, deposit, &config, &pool, provider).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -226,11 +268,12 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_requires_rebalancing_config() {
         let config = create_config_without_rebalancing();
+        let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
-        let result = vault_withdraw_command(&mut stdout, amount, &config, provider).await;
+        let result = vault_withdraw_command(&mut stdout, amount, &config, &pool, provider).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -242,20 +285,23 @@ mod tests {
     #[tokio::test]
     async fn test_vault_deposit_writes_amount_to_stdout() {
         let config = create_config_without_rebalancing();
+        let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Decimal::from_str("500.50").unwrap();
 
         let mut stdout = Vec::new();
-        let _ = vault_deposit_command(
-            &mut stdout,
+        let deposit = Deposit {
             amount,
-            TEST_TOKEN,
-            TEST_VAULT_ID,
-            6,
-            &config,
-            provider,
-        )
-        .await;
+            token: TEST_TOKEN,
+            vault_id: TEST_VAULT_ID,
+            decimals: 6,
+        };
+        let result = vault_deposit_command(&mut stdout, deposit, &config, &pool, provider).await;
+
+        assert!(
+            result.is_err(),
+            "Expected error due to missing rebalancing config"
+        );
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -267,11 +313,17 @@ mod tests {
     #[tokio::test]
     async fn test_vault_withdraw_writes_amount_to_stdout() {
         let config = create_config_without_rebalancing();
+        let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("250.25").unwrap());
 
         let mut stdout = Vec::new();
-        let _ = vault_withdraw_command(&mut stdout, amount, &config, provider).await;
+        let result = vault_withdraw_command(&mut stdout, amount, &config, &pool, provider).await;
+
+        assert!(
+            result.is_err(),
+            "Expected error due to missing rebalancing config"
+        );
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

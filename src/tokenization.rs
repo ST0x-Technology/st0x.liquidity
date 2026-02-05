@@ -3,7 +3,7 @@
 //! This module provides the `Tokenizer` trait that abstracts tokenization operations,
 //! allowing different implementations (Alpaca, mock, etc.) to be used interchangeably.
 
-mod alpaca;
+pub(crate) mod alpaca;
 
 #[cfg(test)]
 pub(crate) mod mock;

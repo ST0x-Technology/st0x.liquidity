@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use sqlite_es::SqliteCqrs;
 
-use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+use crate::lifecycle::{Lifecycle, LifecycleError, Never, SqliteQuery};
 
 /// Abstraction for placing broker orders, injected via cqrs-es Services.
 /// Implementations handle executor-specific details (symbol mapping, API calls).
@@ -28,6 +28,7 @@ pub(crate) trait OrderPlacer: Send + Sync {
 
 pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder, Never>;
 pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
+pub(crate) type OffchainOrderQuery = SqliteQuery<OffchainOrder, Never>;
 pub(crate) type OffchainOrderServices = Arc<dyn OrderPlacer>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

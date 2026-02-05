@@ -21,22 +21,32 @@ use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
 use crate::config::{BrokerConfig, Config};
-use crate::equity_redemption::{EquityRedemption, Redeemer, RedemptionAggregateId};
+use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId, RedemptionServices};
 use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::vault::Vault;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
-use crate::rebalancing::redemption::{Redeem, RedemptionService};
+use crate::rebalancing::redemption::Redeem;
 use crate::rebalancing::usdc::UsdcRebalanceManager;
 use crate::rebalancing::{MintManager, RebalancingConfig, RedemptionManager};
 use crate::threshold::Usdc;
+use crate::tokenization::Tokenizer;
 use crate::tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use crate::vault_registry::VaultRegistryAggregate;
+use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
 use super::TransferDirection;
+
+fn create_vault_registry_query(pool: &SqlitePool) -> Arc<VaultRegistryQuery> {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(pool.clone(), "vault_registry_view".to_string()));
+    Arc::new(GenericQuery::new(view_repo))
+}
 
 struct TransferContext<'a, BP: Provider + Clone> {
     config: &'a Config,
@@ -125,11 +135,6 @@ where
     let signer = PrivateKeySigner::from_bytes(&ctx.rebalancing_config.evm_private_key)?;
     let owner = signer.address();
 
-    let vault = Arc::new(VaultService::new(
-        ctx.base_provider,
-        ctx.config.evm.orderbook,
-    ));
-
     let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
         VaultRegistryAggregate,
         VaultRegistryAggregate,
@@ -137,6 +142,13 @@ where
         ctx.pool.clone(), "vault_registry_view".to_string()
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
+
+    let vault = Arc::new(VaultService::new(
+        ctx.base_provider,
+        ctx.config.evm.orderbook,
+        vault_registry_query.clone(),
+        owner,
+    ));
 
     let mint_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(ctx.pool.clone()));
@@ -179,10 +191,6 @@ where
 
     let signer = PrivateKeySigner::from_bytes(&ctx.rebalancing_config.evm_private_key)?;
     let owner = signer.address();
-    let vault = Arc::new(VaultService::new(
-        ctx.base_provider,
-        ctx.config.evm.orderbook,
-    ));
 
     let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
         VaultRegistryAggregate,
@@ -192,13 +200,19 @@ where
     ));
     let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
 
-    let redemption_service = Arc::new(RedemptionService::new(
-        vault,
-        ctx.tokenization_service,
-        vault_registry_query,
+    let vault = Arc::new(VaultService::new(
+        ctx.base_provider,
         ctx.config.evm.orderbook,
+        vault_registry_query,
         owner,
     ));
+
+    let tokenizer: Arc<dyn Tokenizer> = ctx.tokenization_service;
+    let vault_trait: Arc<dyn Vault> = vault;
+    let redemption_services = RedemptionServices {
+        tokenizer: tokenizer.clone(),
+        vault: vault_trait,
+    };
 
     let redemption_view_repo = Arc::new(SqliteViewRepository::<
         Lifecycle<EquityRedemption, Never>,
@@ -208,15 +222,13 @@ where
     ));
     let redemption_query = Arc::new(GenericQuery::new(redemption_view_repo.clone()));
 
-    let cqrs_services: Arc<dyn Redeemer> = redemption_service.clone();
     let redemption_cqrs = Arc::new(sqlite_cqrs(
         ctx.pool.clone(),
         vec![Box::new(GenericQuery::new(redemption_view_repo))],
-        cqrs_services,
+        redemption_services,
     ));
 
-    let redemption_manager =
-        RedemptionManager::new(redemption_service, redemption_cqrs, redemption_query);
+    let redemption_manager = RedemptionManager::new(tokenizer, redemption_cqrs, redemption_query);
 
     let aggregate_id = RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
 
@@ -311,9 +323,14 @@ where
     );
 
     let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
+
+    let vault_registry_query = create_vault_registry_query(pool);
+
     let vault_service = Arc::new(VaultService::new(
         base_provider_with_wallet,
         config.evm.orderbook,
+        vault_registry_query,
+        owner,
     ));
     let event_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));

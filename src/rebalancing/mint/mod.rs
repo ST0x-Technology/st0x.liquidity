@@ -14,13 +14,13 @@ use st0x_execution::{FractionalShares, Symbol};
 use thiserror::Error;
 
 use crate::onchain::vault::VaultError;
-use crate::tokenization::AlpacaTokenizationError;
+use crate::tokenization::TokenizerError;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
 
 #[derive(Debug, Error)]
 pub(crate) enum MintError {
-    #[error("Alpaca API error: {0}")]
-    Alpaca(#[from] AlpacaTokenizationError),
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
     #[error("Aggregate error: {0}")]
     Aggregate(#[from] AggregateError<TokenizedEquityMintError>),
     #[error("Vault deposit error: {0}")]

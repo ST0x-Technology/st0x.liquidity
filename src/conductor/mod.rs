@@ -38,7 +38,7 @@ use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::Config;
 use crate::dashboard::ServerMessage;
-use crate::equity_redemption::Redeemer;
+use crate::equity_redemption::RedemptionServices;
 use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
@@ -47,7 +47,7 @@ use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
-    OffchainOrderId, OffchainOrderServices, OrderPlacer,
+    OffchainOrderId, OffchainOrderQuery, OffchainOrderServices, OrderPlacer,
 };
 use crate::onchain::accumulator::{
     ExecutionParams, check_all_positions, check_execution_readiness,
@@ -55,14 +55,13 @@ use crate::onchain::accumulator::{
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
-use crate::onchain::vault::VaultService;
+use crate::onchain::vault::{Vault, VaultService};
 use crate::onchain::{EvmConfig, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
-use crate::rebalancing::redemption::RedemptionService;
 use crate::rebalancing::{
     RebalancerAddresses, RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger,
     RebalancingTriggerConfig, RedemptionDependencies, spawn_rebalancer,
@@ -70,8 +69,10 @@ use crate::rebalancing::{
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
-use crate::tokenization::AlpacaTokenizationService;
-use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
+use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
+use crate::vault_registry::{
+    VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
+};
 #[cfg(test)]
 pub(crate) use builder::ConductorBuilder;
 
@@ -88,6 +89,7 @@ struct TradeProcessingCqrs {
     position_cqrs: Arc<PositionCqrs>,
     position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    offchain_order_query: Arc<OffchainOrderQuery>,
     execution_threshold: ExecutionThreshold,
 }
 
@@ -134,6 +136,7 @@ struct SharedState {
     position_cqrs: Arc<PositionCqrs>,
     position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    offchain_order_query: Arc<OffchainOrderQuery>,
     execution_threshold: ExecutionThreshold,
 }
 
@@ -272,9 +275,10 @@ where
     // updating their corresponding views.
     replay_all_views(pool).await?;
 
-    let (onchain_trade_cqrs, ()) =
-        CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(());
-    let onchain_trade_cqrs = Arc::new(onchain_trade_cqrs);
+    let onchain_trade_cqrs =
+        Arc::new(CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(()));
+
+    let vault_registry_query = create_vault_registry_query(pool);
 
     let (position_cqrs, position_query, trigger, rebalancer) =
         if let Some(rebalancing_config) = config.rebalancing_config() {
@@ -285,6 +289,10 @@ where
                 .wallet(ethereum_wallet)
                 .connect_provider(provider.clone());
 
+            let vault_infra = VaultInfra {
+                market_maker_wallet,
+                vault_registry_query: vault_registry_query.clone(),
+            };
             let infra = spawn_rebalancing_infrastructure(
                 rebalancing_config,
                 pool,
@@ -292,7 +300,7 @@ where
                 &inventory,
                 event_sender,
                 &provider_with_wallet,
-                market_maker_wallet,
+                vault_infra,
             )
             .await?;
 
@@ -319,27 +327,17 @@ where
             (Arc::new(position_cqrs), position_query, None, None)
         };
 
-    let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-        OffchainOrderAggregate,
-        OffchainOrderAggregate,
-    >::new(
-        pool.clone(), "offchain_order_view".to_string()
-    ));
-
-    let offchain_order_view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
-        UnwiredQuery::new(GenericQuery::new(offchain_order_view_repo));
-
-    let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor.clone()));
-    let (offchain_order_cqrs, (offchain_order_view, ())) = CqrsBuilder::new(pool.clone())
-        .wire(offchain_order_view)
-        .build(order_placer);
-
-    let _offchain_order_view = offchain_order_view.into_inner();
-    let offchain_order_cqrs = Arc::new(offchain_order_cqrs);
+    let (offchain_order_cqrs, offchain_order_query) =
+        build_offchain_order_cqrs(pool, executor.clone());
 
     let inventory_poller = match config.order_owner() {
         Ok(order_owner) => {
-            let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
+            let vault_service = Arc::new(VaultService::new(
+                provider.clone(),
+                config.evm.orderbook,
+                vault_registry_query.clone(),
+                order_owner,
+            ));
 
             let snapshot_query: UnwiredQuery<_, Cons<InventorySnapshotAggregate, Nil>> =
                 UnwiredQuery::new(InventorySnapshotQuery::new(inventory.clone(), trigger));
@@ -369,6 +367,7 @@ where
         position_cqrs,
         position_query,
         offchain_order_cqrs,
+        offchain_order_query,
         execution_threshold: config.execution_threshold,
     };
 
@@ -503,6 +502,7 @@ where
         shared.position_cqrs.clone(),
         shared.position_query.clone(),
         shared.offchain_order_cqrs.clone(),
+        shared.offchain_order_query.clone(),
         shared.execution_threshold,
     );
 
@@ -511,6 +511,7 @@ where
         position_cqrs: shared.position_cqrs.clone(),
         position_query: shared.position_query.clone(),
         offchain_order_cqrs: shared.offchain_order_cqrs.clone(),
+        offchain_order_query: shared.offchain_order_query.clone(),
         execution_threshold: shared.execution_threshold,
     };
 
@@ -588,6 +589,40 @@ struct RebalancingInfrastructure {
     handle: JoinHandle<()>,
 }
 
+struct VaultInfra {
+    market_maker_wallet: Address,
+    vault_registry_query: Arc<VaultRegistryQuery>,
+}
+
+fn create_vault_registry_query(pool: &SqlitePool) -> Arc<VaultRegistryQuery> {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        VaultRegistryAggregate,
+        VaultRegistryAggregate,
+    >::new(pool.clone(), "vault_registry_view".to_string()));
+    Arc::new(GenericQuery::new(view_repo))
+}
+
+fn build_offchain_order_cqrs<E: Executor + Clone + 'static>(
+    pool: &SqlitePool,
+    executor: E,
+) -> (Arc<OffchainOrderCqrs>, Arc<OffchainOrderQuery>) {
+    let view_repo = Arc::new(SqliteViewRepository::<
+        OffchainOrderAggregate,
+        OffchainOrderAggregate,
+    >::new(pool.clone(), "offchain_order_view".to_string()));
+
+    let view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
+        UnwiredQuery::new(GenericQuery::new(view_repo));
+
+    let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor));
+    let (cqrs, (view, ())) = CqrsBuilder::new(pool.clone())
+        .wire(view)
+        .build(order_placer);
+
+    let query = view.into_inner();
+    (Arc::new(cqrs), query)
+}
+
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
     rebalancing_config: &RebalancingConfig,
     pool: &SqlitePool,
@@ -595,8 +630,12 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     inventory: &Arc<RwLock<InventoryView>>,
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
-    market_maker_wallet: Address,
+    vault_infra: VaultInfra,
 ) -> anyhow::Result<RebalancingInfrastructure> {
+    let VaultInfra {
+        market_maker_wallet,
+        vault_registry_query,
+    } = vault_infra;
     info!("Initializing rebalancing infrastructure");
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
@@ -615,16 +654,13 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         event_sender,
     );
 
-    let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-        VaultRegistryAggregate,
-        VaultRegistryAggregate,
-    >::new(
-        pool.clone(), "vault_registry_view".to_string()
-    ));
-    let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
-
     let broker_auth = &rebalancing_config.alpaca_broker_auth;
-    let vault_service = Arc::new(VaultService::new(provider.clone(), config.evm.orderbook));
+    let vault_service = Arc::new(VaultService::new(
+        provider.clone(),
+        config.evm.orderbook,
+        vault_registry_query.clone(),
+        market_maker_wallet,
+    ));
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         broker_auth.base_url().to_string(),
         rebalancing_config.alpaca_account_id,
@@ -634,16 +670,11 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         rebalancing_config.redemption_wallet,
     ));
 
-    let redemption_service = Arc::new(RedemptionService::new(
-        vault_service.clone(),
-        tokenization_service.clone(),
-        vault_registry_query.clone(),
-        config.evm.orderbook,
-        market_maker_wallet,
-    ));
-    let redemption_service_for_cqrs: Arc<dyn Redeemer> = redemption_service.clone();
+    let tokenizer: Arc<dyn Tokenizer> = tokenization_service.clone();
+    let vault: Arc<dyn Vault> = vault_service.clone();
+    let redemption_services = RedemptionServices { tokenizer, vault };
 
-    let (frameworks, queries) = manifest.wire(pool.clone(), redemption_service_for_cqrs);
+    let (frameworks, queries) = manifest.wire(pool.clone(), redemption_services);
 
     let rebalancing_frameworks = RebalancingCqrsFrameworks {
         mint: frameworks.mint,
@@ -654,7 +685,6 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
         vault_service,
         tokenization_service,
         vault_registry_query,
-        service: redemption_service,
         cqrs: frameworks.redemption,
         query: queries.redemption_view,
     };
@@ -833,6 +863,7 @@ fn spawn_periodic_accumulated_position_check<E>(
     position_cqrs: Arc<PositionCqrs>,
     position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    offchain_order_query: Arc<OffchainOrderQuery>,
     execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
@@ -856,6 +887,7 @@ where
                 &position_cqrs,
                 &position_query,
                 &offchain_order_cqrs,
+                &offchain_order_query,
                 &execution_threshold,
             )
             .await
@@ -1417,9 +1449,9 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
 }
 
 async fn execute_new_execution_cqrs(
-    pool: &SqlitePool,
     position_cqrs: &PositionCqrs,
     offchain_order_cqrs: &OffchainOrderCqrs,
+    offchain_order_query: &OffchainOrderQuery,
     offchain_order_id: OffchainOrderId,
     params: &ExecutionParams,
     threshold: &ExecutionThreshold,
@@ -1428,7 +1460,11 @@ async fn execute_new_execution_cqrs(
         .await;
     execute_place_offchain_order(offchain_order_cqrs, offchain_order_id, params).await;
 
-    if let Some(error) = load_offchain_order_failure(pool, offchain_order_id).await {
+    let aggregate = offchain_order_query
+        .load(&offchain_order_id.to_string())
+        .await;
+
+    if let Some(Lifecycle::Live(OffchainOrder::Failed { error, .. })) = aggregate {
         warn!(
             %offchain_order_id,
             symbol = %params.symbol,
@@ -1436,27 +1472,6 @@ async fn execute_new_execution_cqrs(
             "Broker rejected order, clearing position pending state"
         );
         execute_fail_offchain_order_position(position_cqrs, offchain_order_id, params, error).await;
-    }
-}
-
-async fn load_offchain_order_failure(
-    pool: &SqlitePool,
-    offchain_order_id: OffchainOrderId,
-) -> Option<String> {
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT payload FROM offchain_order_view WHERE view_id = ?1")
-            .bind(offchain_order_id.to_string())
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-
-    let (payload,) = row?;
-    let aggregate: OffchainOrderAggregate = serde_json::from_str(&payload).ok()?;
-
-    match aggregate {
-        crate::lifecycle::Lifecycle::Live(OffchainOrder::Failed { error, .. }) => Some(error),
-        _ => None,
     }
 }
 
@@ -1583,9 +1598,9 @@ async fn process_queued_trade(
 
     let offchain_order_id = OffchainOrder::aggregate_id();
     execute_new_execution_cqrs(
-        pool,
         &cqrs.position_cqrs,
         &cqrs.offchain_order_cqrs,
+        &cqrs.offchain_order_query,
         offchain_order_id,
         &params,
         &cqrs.execution_threshold,
@@ -1630,6 +1645,7 @@ async fn check_and_execute_accumulated_positions<E>(
     position_cqrs: &PositionCqrs,
     position_query: &PositionQuery,
     offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
+    offchain_order_query: &Arc<OffchainOrderQuery>,
     threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>
 where
@@ -1662,9 +1678,9 @@ where
         );
 
         execute_new_execution_cqrs(
-            pool,
             position_cqrs,
             offchain_order_cqrs,
+            offchain_order_query,
             offchain_order_id,
             &params,
             threshold,
@@ -1820,6 +1836,7 @@ mod tests {
             position_cqrs: frameworks.position_cqrs.clone(),
             position_query: frameworks.position_query.clone(),
             offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
+            offchain_order_query: frameworks.offchain_order_query.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
@@ -1844,12 +1861,24 @@ mod tests {
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
+        let offchain_order_query = Arc::new(GenericQuery::new(offchain_order_view_repo.clone()));
         let offchain_order_cqrs = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
             crate::offchain_order::noop_order_placer(),
         ));
-        let vault_registry_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo.clone()));
+        let vault_registry_cqrs = wire::test_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(vault_registry_view_repo))],
+            (),
+        );
         let snapshot_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
@@ -1858,7 +1887,9 @@ mod tests {
             position_cqrs,
             position_query,
             offchain_order_cqrs,
+            offchain_order_query,
             vault_registry_cqrs,
+            vault_registry_query,
             snapshot_cqrs,
         }
     }
@@ -3100,12 +3131,24 @@ mod tests {
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
+        let offchain_order_query = Arc::new(GenericQuery::new(offchain_order_view_repo.clone()));
         let offchain_order_cqrs = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
             order_placer,
         ));
-        let vault_registry_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
+            VaultRegistryAggregate,
+            VaultRegistryAggregate,
+        >::new(
+            pool.clone(), "vault_registry_view".to_string()
+        ));
+        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo.clone()));
+        let vault_registry_cqrs = wire::test_cqrs(
+            pool.clone(),
+            vec![Box::new(GenericQuery::new(vault_registry_view_repo))],
+            (),
+        );
         let snapshot_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
@@ -3114,7 +3157,9 @@ mod tests {
             position_cqrs,
             position_query,
             offchain_order_cqrs,
+            offchain_order_query,
             vault_registry_cqrs,
+            vault_registry_query,
             snapshot_cqrs,
         }
     }
@@ -3128,6 +3173,7 @@ mod tests {
             position_cqrs: frameworks.position_cqrs.clone(),
             position_query: frameworks.position_query.clone(),
             offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
+            offchain_order_query: frameworks.offchain_order_query.clone(),
             execution_threshold: threshold,
         }
     }
@@ -3476,6 +3522,7 @@ mod tests {
             &cqrs.position_cqrs,
             &cqrs.position_query,
             &cqrs.offchain_order_cqrs,
+            &cqrs.offchain_order_query,
             &cqrs.execution_threshold,
         )
         .await
@@ -4270,6 +4317,7 @@ mod tests {
             &cqrs.position_cqrs,
             &cqrs.position_query,
             &cqrs.offchain_order_cqrs,
+            &cqrs.offchain_order_query,
             &cqrs.execution_threshold,
         )
         .await

@@ -4,7 +4,6 @@
 //! The aggregate handles vault withdraw and token send atomically via its Services.
 
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
 use st0x_execution::{FractionalShares, Symbol};
@@ -14,33 +13,31 @@ use tracing::{error, info, instrument, warn};
 use super::{Redeem, RedemptionError};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never, SqliteQuery};
-use crate::tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
+use crate::tokenization::{TokenizationRequestStatus, Tokenizer};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 type RedemptionQuery = SqliteQuery<EquityRedemption, Never>;
 
-pub(crate) struct RedemptionManager<P, ES>
+pub(crate) struct RedemptionManager<ES>
 where
-    P: Provider + Clone,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
-    alpaca: Arc<AlpacaTokenizationService<P>>,
+    tokenizer: Arc<dyn Tokenizer>,
     cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
     query: Arc<RedemptionQuery>,
 }
 
-impl<P, ES> RedemptionManager<P, ES>
+impl<ES> RedemptionManager<ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<EquityRedemption, Never>>,
 {
     pub(crate) fn new(
-        alpaca: Arc<AlpacaTokenizationService<P>>,
+        tokenizer: Arc<dyn Tokenizer>,
         cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
         query: Arc<RedemptionQuery>,
     ) -> Self {
         Self {
-            alpaca,
+            tokenizer,
             cqrs,
             query,
         }
@@ -98,7 +95,7 @@ where
         aggregate_id: &RedemptionAggregateId,
         tx_hash: &TxHash,
     ) -> Result<TokenizationRequestId, RedemptionError> {
-        let detected = match self.alpaca.poll_for_redemption(tx_hash).await {
+        let detected = match self.tokenizer.poll_for_redemption(tx_hash).await {
             Ok(req) => req,
             Err(e) => {
                 warn!("Polling for redemption detection failed: {e}");
@@ -110,7 +107,7 @@ where
                         },
                     )
                     .await?;
-                return Err(RedemptionError::Alpaca(e));
+                return Err(RedemptionError::Tokenizer(e));
             }
         };
 
@@ -132,7 +129,11 @@ where
         aggregate_id: &RedemptionAggregateId,
         request_id: &TokenizationRequestId,
     ) -> Result<(), RedemptionError> {
-        let completed = match self.alpaca.poll_redemption_until_complete(request_id).await {
+        let completed = match self
+            .tokenizer
+            .poll_redemption_until_complete(request_id)
+            .await
+        {
             Ok(req) => req,
             Err(e) => {
                 warn!("Polling for completion failed: {e}");
@@ -144,7 +145,7 @@ where
                         },
                     )
                     .await?;
-                return Err(RedemptionError::Alpaca(e));
+                return Err(RedemptionError::Tokenizer(e));
             }
         };
 
@@ -200,9 +201,8 @@ where
 }
 
 #[async_trait]
-impl<P, ES> Redeem for RedemptionManager<P, ES>
+impl<ES> Redeem for RedemptionManager<ES>
 where
-    P: Provider + Clone + Send + Sync + 'static,
     ES: EventStore<Lifecycle<EquityRedemption, Never>> + Send + Sync,
     ES::AC: Send,
 {
@@ -224,6 +224,7 @@ mod tests {
     use alloy::network::{Ethereum, EthereumWallet};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::{B256, TxHash, address, b256};
+    use alloy::providers::Provider;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
     };
@@ -238,13 +239,13 @@ mod tests {
     use super::*;
     use crate::bindings::{OrderBook, TOFUTokenDecimals, TestERC20};
     use crate::conductor::wire::test_cqrs;
-    use crate::equity_redemption::RedemptionServices;
-    use crate::equity_redemption::mock::MockRedeemer;
-    use crate::onchain::vault::{VaultId, VaultService};
-    use crate::rebalancing::redemption::service::TOKENIZED_EQUITY_DECIMALS;
+    use crate::equity_redemption::{RedemptionServices, TOKENIZED_EQUITY_DECIMALS};
+    use crate::onchain::mock::MockVault;
+    use crate::onchain::vault::{Vault, VaultId, VaultService};
     use crate::tokenization::alpaca::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_with_provider,
     };
+    use crate::tokenization::mock::MockTokenizer;
     use crate::vault_registry::{
         VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryQuery,
     };
@@ -387,7 +388,11 @@ mod tests {
     #[tokio::test]
     async fn redemption_cqrs_updates_view_after_command() {
         let pool = crate::test_utils::setup_test_db().await;
-        let (cqrs, query) = create_redemption_cqrs(&pool, Arc::new(MockRedeemer::new()));
+        let services = RedemptionServices {
+            tokenizer: Arc::new(MockTokenizer::new()),
+            vault: Arc::new(MockVault::new()),
+        };
+        let (cqrs, query) = create_redemption_cqrs(&pool, services);
 
         let aggregate_id = "test-redemption-1";
         let symbol = Symbol::new("TEST").unwrap();
@@ -495,9 +500,19 @@ mod tests {
             }
         }
 
-        async fn deposit_tokens_to_vault(&self, amount: U256) {
+        async fn deposit_tokens_to_vault(
+            &self,
+            amount: U256,
+            vault_registry_query: Arc<VaultRegistryQuery>,
+        ) {
             let token = TestERC20::new(self.token_address, &self.provider);
-            let vault_service = VaultService::new(self.provider.clone(), self.orderbook_address);
+            let owner = self.signer.address();
+            let vault_service = VaultService::new(
+                self.provider.clone(),
+                self.orderbook_address,
+                vault_registry_query,
+                owner,
+            );
 
             // Approve orderbook to spend tokens
             token
@@ -535,16 +550,7 @@ mod tests {
         let local_evm = LocalEvmWithVault::new().await;
         let server = MockServer::start();
 
-        let tokenization_service = Arc::new(create_test_service_with_provider(
-            &server,
-            local_evm.provider.clone(),
-            TEST_REDEMPTION_WALLET,
-        ));
-        let vault_service = Arc::new(VaultService::new(
-            local_evm.provider.clone(),
-            local_evm.orderbook_address,
-        ));
-
+        // Create vault registry query first so we can use it for both deposit and redemption
         let vault_registry_query = seed_vault_registry_with_params(
             &pool,
             local_evm.orderbook_address,
@@ -554,17 +560,33 @@ mod tests {
         )
         .await;
 
+        // Create the real tokenization service for polling
+        let tokenization_service: Arc<dyn Tokenizer> = Arc::new(create_test_service_with_provider(
+            &server,
+            local_evm.provider.clone(),
+            TEST_REDEMPTION_WALLET,
+        ));
+
         // Deposit tokens to vault
         let deposit_amount = U256::from(100) * U256::from(10).pow(U256::from(18));
-        local_evm.deposit_tokens_to_vault(deposit_amount).await;
+        local_evm
+            .deposit_tokens_to_vault(deposit_amount, vault_registry_query)
+            .await;
 
-        let redemption_service = Arc::new(RedemptionService::new(
-            vault_service,
-            tokenization_service,
-            vault_registry_query,
-            local_evm.orderbook_address,
-            local_evm.signer.address(),
-        ));
+        // Use a known tx_hash so we can match it in the mock responses
+        let redemption_tx: TxHash =
+            b256!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
+
+        // Create mock services for CQRS aggregate with the known redemption tx
+        let mock_tokenizer: Arc<dyn Tokenizer> =
+            Arc::new(MockTokenizer::with_redemption_tx(redemption_tx));
+        let mock_vault: Arc<dyn Vault> = Arc::new(MockVault::new());
+        let redemption_services = RedemptionServices {
+            tokenizer: mock_tokenizer,
+            vault: mock_vault,
+        };
+        let (cqrs, redemption_query) = create_redemption_cqrs(&pool, redemption_services);
+        let cqrs = Arc::new(cqrs);
 
         // Mock Alpaca API: token transfer triggers redemption detection
         let _transfer_mock = server.mock(|when, then| {
@@ -577,10 +599,6 @@ mod tests {
                     "status": "COMPLETE"
                 }));
         });
-
-        // Use a known tx_hash so we can match it in the mock responses
-        let redemption_tx: TxHash =
-            b256!("0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890");
 
         // Mock: poll_for_redemption returns pending request with matching tx_hash
         let _poll_detection_mock = server.mock(|when, then| {
@@ -623,11 +641,8 @@ mod tests {
                 }]));
         });
 
-        let mock_redeemer = Arc::new(MockRedeemer::with_redemption_tx(redemption_tx));
-        let (cqrs, redemption_query) = create_redemption_cqrs(&pool, mock_redeemer);
-        let cqrs = Arc::new(cqrs);
-
-        let manager = RedemptionManager::new(redemption_service, cqrs, redemption_query);
+        // Create the manager with the tokenization service for polling
+        let manager = RedemptionManager::new(tokenization_service, cqrs, redemption_query);
 
         let aggregate_id = RedemptionAggregateId::new("test-redemption-1");
         let symbol = Symbol::new("TEST").unwrap();
