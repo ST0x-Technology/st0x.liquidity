@@ -21,7 +21,6 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
@@ -37,7 +36,6 @@ use crate::equity_redemption::{EquityRedemption, Redeemer};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotReactor, InventoryView,
 };
-use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
@@ -60,7 +58,6 @@ use crate::rebalancing::{
     build_rebalancing_queries, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
-use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
 
@@ -450,12 +447,6 @@ impl Conductor {
         Ok(builder.spawn())
     }
 
-// TODO: start_infrastructure and start_trading_tasks need to be reimplemented
-// with HEAD's refactored types (Store<T>, StoreBuilder, Projection, Ctx)
-// to support the TradingTasks separation architecture from our branch.
-// The functions below use old types (Config, sqlite_cqrs, SqliteViewRepository,
-// GenericQuery, PositionCqrs, OffchainOrderCqrs) that no longer exist.
-
 impl Conductor {
     pub(crate) async fn wait_for_completion(&mut self) -> Result<(), anyhow::Error> {
         let infra = wait_for_infrastructure(
@@ -502,47 +493,6 @@ impl Conductor {
             handle.abort();
         }
     }
-}
-
-struct RebalancingInfrastructure {
-    position_cqrs: Arc<PositionCqrs>,
-    position_query: Arc<PositionQuery>,
-    rebalancing_trigger: Arc<RebalancingTrigger>,
-    handle: JoinHandle<()>,
-}
-
-struct VaultInfra {
-    market_maker_wallet: Address,
-    vault_registry_query: Arc<VaultRegistryQuery>,
-}
-
-fn create_vault_registry_query(pool: &SqlitePool) -> Arc<VaultRegistryQuery> {
-    let view_repo = Arc::new(SqliteViewRepository::<
-        VaultRegistryAggregate,
-        VaultRegistryAggregate,
-    >::new(pool.clone(), "vault_registry_view".to_string()));
-    Arc::new(GenericQuery::new(view_repo))
-}
-
-fn build_offchain_order_cqrs<E: Executor + Clone + 'static>(
-    pool: &SqlitePool,
-    executor: E,
-) -> (Arc<OffchainOrderCqrs>, Arc<OffchainOrderQuery>) {
-    let view_repo = Arc::new(SqliteViewRepository::<
-        OffchainOrderAggregate,
-        OffchainOrderAggregate,
-    >::new(pool.clone(), "offchain_order_view".to_string()));
-
-    let view: UnwiredQuery<_, Cons<OffchainOrderAggregate, Nil>> =
-        UnwiredQuery::new(GenericQuery::new(view_repo));
-
-    let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor));
-    let (cqrs, (view, ())) = CqrsBuilder::new(pool.clone())
-        .wire(view)
-        .build(order_placer);
-
-    let query = view.into_inner();
-    (Arc::new(cqrs), query)
 }
 
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 'static>(
@@ -1138,6 +1088,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     .await
 }
 
+
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
@@ -1147,7 +1098,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
 /// Vaults are classified as:
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
-async fn discover_vaults_for_trade(
+pub(super) async fn discover_vaults_for_trade(
     queued_event: &QueuedEvent,
     trade: &OnchainTrade,
     context: &VaultDiscoveryCtx<'_>,
@@ -1421,11 +1372,12 @@ async fn place_offchain_order(
     execute_place_offchain_order(execution, cqrs, offchain_order_id).await;
     execute_create_offchain_order(execution, cqrs, offchain_order_id).await;
 
-    let aggregate = offchain_order_query
-        .load(&offchain_order_id.to_string())
+    let aggregate = cqrs
+        .offchain_order
+        .load(&offchain_order_id)
         .await;
 
-    if let Some(Lifecycle::Live(OffchainOrder::Failed { error, .. })) = aggregate {
+    if let Ok(Some(OffchainOrder::Failed { error, .. })) = aggregate {
         warn!(
             %offchain_order_id,
             symbol = %execution.symbol,
