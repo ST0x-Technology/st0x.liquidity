@@ -424,37 +424,25 @@ pub(crate) struct InventoryView {
 impl InventoryView {
     /// Checks a single equity for imbalance against the threshold.
     ///
-    /// When `vault_ratio` is provided, the onchain balance is converted from wrapped
-    /// to unwrapped-equivalent before comparison with offchain balance. This ensures
-    /// correct imbalance detection when onchain tokens have accrued value through
-    /// stock splits or dividends.
+    /// The onchain balance is converted from wrapped to unwrapped-equivalent using
+    /// the vault ratio before comparison with offchain balance. This ensures correct
+    /// imbalance detection when onchain tokens have accrued value through stock
+    /// splits or dividends.
     ///
     /// Returns the imbalance if one exists, or None if balanced or symbol not tracked.
-    ///
-    /// For unwrapped tokens, pass `VaultRatio::one_to_one()`.
     pub(crate) fn check_equity_imbalance(
         &self,
         symbol: &Symbol,
         threshold: &ImbalanceThreshold,
-        vault_ratio: Option<&VaultRatio>,
+        vault_ratio: &UnderlyingPerWrapped,
     ) -> Option<Imbalance<FractionalShares>> {
         let inventory = self.equities.get(symbol)?;
 
-        match vault_ratio {
-            Some(ratio) => {
-                // Convert onchain (wrapped) to unwrapped-equivalent
-                let onchain_wrapped = inventory.onchain.total().ok()?;
-                let onchain_equivalent = ratio
-                    .wrapped_to_unwrapped_fractional(onchain_wrapped)
-                    .ok()?;
+        // Convert onchain (wrapped) to unwrapped-equivalent
+        let onchain_wrapped = inventory.onchain.as_ref()?.total().ok()?;
+        let onchain_equivalent = vault_ratio.to_underlying_fractional(onchain_wrapped).ok()?;
 
-                inventory.detect_imbalance_normalized(threshold, onchain_equivalent)
-            }
-            None => {
-                // No ratio conversion needed
-                inventory.detect_imbalance(threshold)
-            }
-        }
+        inventory.detect_imbalance_normalized(threshold, onchain_equivalent)
     }
 
     /// Checks USDC inventory for imbalance against the threshold.
@@ -607,13 +595,15 @@ impl InventoryView {
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
         match event {
-            // No venue inventory changes. DepositedIntoRaindex completes the transfer to Raindex
-            // (already counted when TokensReceived). RaindexDepositFailed leaves tokens in
-            // wallet awaiting retry or manual recovery.
+            // No venue inventory changes. TokensWrapped converts unwrapped to wrapped in-place.
+            // VaultDeposited completes the transfer to Raindex (already counted when
+            // TokensReceived). VaultDepositFailed leaves tokens in wallet awaiting retry
+            // or manual recovery.
             TokenizedEquityMintEvent::MintRequested { .. }
             | TokenizedEquityMintEvent::MintRejected { .. }
+            | TokenizedEquityMintEvent::TokensWrapped { .. }
             | TokenizedEquityMintEvent::VaultDeposited { .. }
-            | TokenizedEquityMintEvent::RaindexDepositFailed { .. } => Ok(Self {
+            | TokenizedEquityMintEvent::VaultDepositFailed { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
@@ -667,42 +657,22 @@ impl InventoryView {
                 now,
             ),
 
-            EquityRedemptionEvent::TransferFailed { .. } => {
-                // Vault withdraw succeeded but transfer failed - keep inflight until resolved.
-                Ok(Self {
-                    last_updated: now,
-                    ..self
-                })
-            }
-
-            EquityRedemptionEvent::TokensSent { .. } => {
-                // Tokens already in inflight from VaultWithdrawn, no balance change.
-                Ok(Self {
-                    last_updated: now,
-                    ..self
-                })
-            }
-
-            EquityRedemptionEvent::DetectionFailed { .. } => {
-                // Tokens were sent but detection failed - keep inflight until resolved.
-                Ok(Self {
-                    last_updated: now,
-                    ..self
-                })
-            }
-
-            EquityRedemptionEvent::Detected { .. } => Ok(Self {
+            // These events don't change venue balances, only timestamps:
+            // - TokensUnwrapped: converts wrapped to unwrapped in-place
+            // - SendFailed: vault withdraw succeeded but send failed, keep inflight
+            // - TokensSent: tokens already inflight from VaultWithdrawn
+            // - DetectionFailed: tokens sent but detection failed, keep inflight
+            // - Detected: no balance change at this stage
+            // - RedemptionRejected: rejection after detection, keep inflight
+            EquityRedemptionEvent::TokensUnwrapped { .. }
+            | EquityRedemptionEvent::SendFailed { .. }
+            | EquityRedemptionEvent::TokensSent { .. }
+            | EquityRedemptionEvent::DetectionFailed { .. }
+            | EquityRedemptionEvent::Detected { .. }
+            | EquityRedemptionEvent::RedemptionRejected { .. } => Ok(Self {
                 last_updated: now,
                 ..self
             }),
-
-            EquityRedemptionEvent::RedemptionRejected { .. } => {
-                // Rejection after detection - keep inflight until manually resolved.
-                Ok(Self {
-                    last_updated: now,
-                    ..self
-                })
-            }
 
             EquityRedemptionEvent::Completed { completed_at } => self.update_equity(
                 symbol,
@@ -895,15 +865,19 @@ mod tests {
     use st0x_execution::{ExecutorOrderId, Positive};
 
     use super::*;
-    use crate::equity_redemption::DetectionFailure;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::offchain_order::{Dollars, OffchainOrderId};
     use crate::position::TradeId;
     use crate::threshold::ExecutionThreshold;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
+    use crate::wrapper::RATIO_ONE;
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
+    }
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
     }
 
     fn venue(available: i64, inflight: i64) -> VenueBalance<FractionalShares> {
@@ -1113,7 +1087,7 @@ mod tests {
         )
     }
 
-    fn usdc_inventory(
+    fn usdc_make_inventory(
         onchain_available: i64,
         onchain_inflight: i64,
         offchain_available: i64,
@@ -1128,7 +1102,7 @@ mod tests {
 
     fn make_view(equities: Vec<(Symbol, Inventory<FractionalShares>)>) -> InventoryView {
         InventoryView {
-            usdc: usdc_inventory(1000, 0, 1000, 0),
+            usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: equities.into_iter().collect(),
             last_updated: Utc::now(),
         }
@@ -1283,7 +1257,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let original_time = Utc::now();
         let view = InventoryView {
-            usdc: usdc_inventory(1000, 0, 1000, 0),
+            usdc: usdc_make_inventory(1000, 0, 1000, 0),
             equities: vec![(symbol.clone(), make_inventory(100, 0, 100, 0))]
                 .into_iter()
                 .collect(),
@@ -1366,11 +1340,11 @@ mod tests {
         }
     }
 
-    fn make_raindex_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
-        TokenizedEquityMintEvent::RaindexDepositFailed {
+    fn make_vault_deposit_failed(symbol: &Symbol, quantity: Decimal) -> TokenizedEquityMintEvent {
+        TokenizedEquityMintEvent::VaultDepositFailed {
             symbol: symbol.clone(),
             quantity,
-            failed_tx_hash: None,
+            reason: "Insufficient gas".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -1478,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_deposited_into_raindex_only_updates_last_updated() {
+    fn apply_vault_deposited_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: 130 onchain (100 original + 30 minted), 70 offchain
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
@@ -1489,7 +1463,7 @@ mod tests {
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
-        // DepositedIntoRaindex doesn't change balances - tokens were already counted in onchain
+        // VaultDeposited doesn't change balances - tokens were already counted in onchain
         // when TokensReceived happened. This just confirms they're now in the Raindex vault.
         assert_eq!(
             inventory.onchain.unwrap().total().unwrap().inner(),
@@ -1503,18 +1477,18 @@ mod tests {
     }
 
     #[test]
-    fn apply_raindex_deposit_failed_only_updates_last_updated() {
+    fn apply_vault_deposit_failed_only_updates_last_updated() {
         let symbol = Symbol::new("AAPL").unwrap();
         // Post-TokensReceived state: tokens in wallet (counted as onchain available)
         let view = make_view(vec![(symbol.clone(), make_inventory(130, 0, 70, 0))]);
-        let event = make_raindex_deposit_failed(&symbol, dec!(30));
+        let event = make_vault_deposit_failed(&symbol, dec!(30));
 
         let updated = view
             .apply_mint_event(&symbol, &event, shares(30), Utc::now())
             .unwrap();
 
         let inventory = updated.equities.get(&symbol).unwrap();
-        // RaindexDepositFailed doesn't change balances - tokens remain in wallet
+        // VaultDepositFailed doesn't change balances - tokens remain in wallet
         // (still counted as onchain) awaiting retry or manual recovery.
         assert_eq!(
             inventory.onchain.unwrap().total().unwrap().inner(),
@@ -1731,6 +1705,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
+            amount: U256::from(50_250_000_000_000_000_000_u128),
             vault_withdraw_tx: TxHash::random(),
             withdrawn_at: Utc::now(),
         }
@@ -1759,7 +1734,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            failure: DetectionFailure::Timeout,
+            reason: "Alpaca timeout".to_string(),
             failed_at: Utc::now(),
         }
     }
@@ -2021,7 +1996,7 @@ mod tests {
         offchain_inflight: i64,
     ) -> InventoryView {
         InventoryView {
-            usdc: usdc_inventory(
+            usdc: usdc_make_inventory(
                 onchain_available,
                 onchain_inflight,
                 offchain_available,
@@ -2331,11 +2306,11 @@ mod tests {
 
     #[test]
     fn usdc_inflight_blocks_imbalance_detection() {
-        let inventory = usdc_inventory(800, 0, 200, 0);
+        let inventory = usdc_make_inventory(800, 0, 200, 0);
         let thresh = threshold("0.5", "0.2");
         assert!(inventory.detect_imbalance(&thresh).is_some());
 
-        let inventory_with_inflight = usdc_inventory(700, 100, 200, 0);
+        let inventory_with_inflight = usdc_make_inventory(700, 100, 200, 0);
         assert!(inventory_with_inflight.detect_imbalance(&thresh).is_none());
     }
 
@@ -2344,8 +2319,12 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), make_inventory(50, 0, 50, 0))]);
         let thresh = threshold("0.5", "0.2");
+        let ratio = one_to_one_ratio();
 
-        assert!(view.check_equity_imbalance(&aapl, &thresh, None).is_none());
+        assert!(
+            view.check_equity_imbalance(&aapl, &thresh, &ratio)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2353,8 +2332,9 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), make_inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
+        let ratio = one_to_one_ratio();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, None);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
 
         assert!(matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })));
     }
@@ -2364,8 +2344,9 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), make_inventory(20, 0, 80, 0))]);
         let thresh = threshold("0.5", "0.2");
+        let ratio = one_to_one_ratio();
 
-        let imbalance = view.check_equity_imbalance(&aapl, &thresh, None);
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
 
         assert!(matches!(imbalance, Some(Imbalance::TooMuchOffchain { .. })));
     }
@@ -2376,8 +2357,12 @@ mod tests {
         let msft = Symbol::new("MSFT").unwrap();
         let view = make_view(vec![(aapl, make_inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
+        let ratio = one_to_one_ratio();
 
-        assert!(view.check_equity_imbalance(&msft, &thresh, None).is_none());
+        assert!(
+            view.check_equity_imbalance(&msft, &thresh, &ratio)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2385,82 +2370,84 @@ mod tests {
         let aapl = Symbol::new("AAPL").unwrap();
         let view = make_view(vec![(aapl.clone(), make_inventory(60, 20, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
+        let ratio = one_to_one_ratio();
 
-        assert!(view.check_equity_imbalance(&aapl, &thresh, None).is_none());
+        assert!(
+            view.check_equity_imbalance(&aapl, &thresh, &ratio)
+                .is_none()
+        );
     }
 
     #[test]
-    fn check_equity_imbalance_with_one_to_one_ratio_same_as_no_ratio() {
+    fn check_equity_imbalance_with_one_to_one_ratio_detects_imbalance() {
         let aapl = Symbol::new("AAPL").unwrap();
-        let view = make_view(vec![(aapl.clone(), inventory(80, 0, 20, 0))]);
+        let view = make_view(vec![(aapl.clone(), make_inventory(80, 0, 20, 0))]);
         let thresh = threshold("0.5", "0.2");
-        let ratio = crate::vault::VaultRatio::one_to_one();
+        let ratio = one_to_one_ratio();
 
-        let imbalance_no_ratio = view.check_equity_imbalance(&aapl, &thresh, None);
-        let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, Some(&ratio));
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio);
 
-        // Both should detect too much onchain with same excess
-        assert!(matches!(
-            imbalance_no_ratio,
-            Some(Imbalance::TooMuchOnchain { .. })
-        ));
-        assert!(matches!(
-            imbalance_with_ratio,
-            Some(Imbalance::TooMuchOnchain { .. })
-        ));
+        assert!(matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })));
     }
 
     #[test]
     fn check_equity_imbalance_with_1_05_ratio_converts_onchain() {
         let aapl = Symbol::new("AAPL").unwrap();
         // 50 wrapped onchain, 50 offchain
+        // With 1:1 ratio: 50/100 = 0.5 (balanced)
         // With 1.05 ratio: 50 wrapped = 52.5 unwrapped-equivalent
         // Total = 52.5 + 50 = 102.5
-        // Ratio = 52.5 / 102.5 ≈ 0.512 (within 50% +/- 20% threshold)
-        let view = make_view(vec![(aapl.clone(), inventory(50, 0, 50, 0))]);
+        // Ratio = 52.5 / 102.5 = 0.512 (still within 50% +/- 20% threshold)
+        let view = make_view(vec![(aapl.clone(), make_inventory(50, 0, 50, 0))]);
         let thresh = threshold("0.5", "0.2");
 
-        // 1.05 ratio = 1_050_000_000_000_000_000
-        let assets_per_share = alloy::primitives::U256::from(1_050_000_000_000_000_000u64);
-        let ratio = crate::vault::VaultRatio::new(assets_per_share).unwrap();
+        // 1:1 ratio - balanced
+        let one_to_one = one_to_one_ratio();
+        assert!(
+            view.check_equity_imbalance(&aapl, &thresh, &one_to_one)
+                .is_none()
+        );
 
-        // Without ratio: 50/100 = 0.5 (balanced)
-        let imbalance_no_ratio = view.check_equity_imbalance(&aapl, &thresh, None);
-        assert!(imbalance_no_ratio.is_none());
-
-        // With 1.05 ratio: 52.5/102.5 ≈ 0.512 (still balanced)
-        let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, Some(&ratio));
-        assert!(imbalance_with_ratio.is_none());
+        // 1.05 ratio - still balanced (small appreciation doesn't change outcome)
+        let ratio_1_05 =
+            UnderlyingPerWrapped::new(U256::from(1_050_000_000_000_000_000u64)).unwrap();
+        assert!(
+            view.check_equity_imbalance(&aapl, &thresh, &ratio_1_05)
+                .is_none()
+        );
     }
 
     #[test]
     fn check_equity_imbalance_with_high_ratio_changes_detection() {
         let aapl = Symbol::new("AAPL").unwrap();
         // 65 wrapped onchain, 35 offchain
-        // Without ratio: 65% onchain (within 50% +/- 20% = 30%-70%)
-        let view = make_view(vec![(aapl.clone(), inventory(65, 0, 35, 0))]);
-        let thresh = threshold("0.5", "0.2");
-
-        // Without ratio: 65/100 = 0.65 (balanced, within threshold)
-        let imbalance_no_ratio = view.check_equity_imbalance(&aapl, &thresh, None);
-        assert!(imbalance_no_ratio.is_none());
-
+        // With 1:1 ratio: 65/100 = 0.65 (within 50% +/- 20% = 30%-70%)
         // With 1.5 ratio: 65 wrapped = 97.5 unwrapped-equivalent
         // Total = 97.5 + 35 = 132.5
-        // Ratio = 97.5 / 132.5 ≈ 0.736 (above 70% upper threshold!)
-        let assets_per_share = alloy::primitives::U256::from(1_500_000_000_000_000_000u64);
-        let ratio = crate::vault::VaultRatio::new(assets_per_share).unwrap();
+        // Ratio = 97.5 / 132.5 = 0.736 (above 70% upper threshold!)
+        let view = make_view(vec![(aapl.clone(), make_inventory(65, 0, 35, 0))]);
+        let thresh = threshold("0.5", "0.2");
 
-        let imbalance_with_ratio = view.check_equity_imbalance(&aapl, &thresh, Some(&ratio));
+        // 1:1 ratio - balanced (65% within threshold)
+        let one_to_one = one_to_one_ratio();
         assert!(
-            matches!(imbalance_with_ratio, Some(Imbalance::TooMuchOnchain { .. })),
-            "Expected TooMuchOnchain, got: {imbalance_with_ratio:?}"
+            view.check_equity_imbalance(&aapl, &thresh, &one_to_one)
+                .is_none()
+        );
+
+        // 1.5 ratio - triggers imbalance (73.6% exceeds 70% upper bound)
+        let ratio_1_5 =
+            UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let imbalance = view.check_equity_imbalance(&aapl, &thresh, &ratio_1_5);
+        assert!(
+            matches!(imbalance, Some(Imbalance::TooMuchOnchain { .. })),
+            "Expected TooMuchOnchain, got: {imbalance:?}"
         );
     }
 
     #[test]
     fn detect_imbalance_normalized_returns_none_when_balanced() {
-        let inv = inventory(50, 0, 50, 0);
+        let inv = make_inventory(50, 0, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
         // Normalized onchain = 50 (same as raw)
@@ -2472,7 +2459,7 @@ mod tests {
 
     #[test]
     fn detect_imbalance_normalized_detects_too_much_onchain() {
-        let inv = inventory(50, 0, 50, 0);
+        let inv = make_inventory(50, 0, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
         // Normalized onchain = 100 (double the raw wrapped amount)
@@ -2486,7 +2473,7 @@ mod tests {
 
     #[test]
     fn detect_imbalance_normalized_returns_none_when_inflight() {
-        let inv = inventory(50, 10, 50, 0);
+        let inv = make_inventory(50, 10, 50, 0);
         let thresh = threshold("0.5", "0.2");
 
         let normalized = shares(120);

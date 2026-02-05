@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{RwLock, mpsc};
@@ -32,6 +32,8 @@ use crate::usdc_rebalance::{
 };
 use crate::vault::WrappedTokenRegistry;
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
+use crate::wrapper::Wrapper;
+use crate::wrapper::{EquityTokenAddresses, UnderlyingPerWrapped};
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +49,12 @@ enum TokenAddressError {
 pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
+    #[error("invalid EVM private key: {0}")]
+    InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("invalid Alpaca account ID: {0}")]
+    InvalidAccountId(#[from] uuid::Error),
+    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
+    WalletsMatch(Address),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -71,7 +79,7 @@ pub(crate) struct RebalancingConfig {
     pub(crate) usdc: UsdcRebalancing,
     pub(crate) redemption_wallet: Address,
     pub(crate) usdc_vault_id: B256,
-    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
+    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 /// Runtime configuration for rebalancing operations.
@@ -92,7 +100,7 @@ pub(crate) struct RebalancingCtx {
     /// Cloned from broker config - ensures consistency.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
     /// Registry of wrapped token configurations for ERC-4626 vault operations.
-    pub(crate) wrapped_token_registry: WrappedTokenRegistry,
+    pub(crate) equities: HashMap<Symbol, EquityTokenAddresses>,
 }
 
 impl RebalancingCtx {
@@ -122,7 +130,7 @@ impl RebalancingCtx {
             usdc_vault_id: config.usdc_vault_id,
             alpaca_account_id,
             alpaca_broker_auth: broker_auth,
-            wrapped_token_registry: config.wrapped_token_registry,
+            equities: config.equities,
         })
     }
 }
@@ -139,7 +147,7 @@ impl std::fmt::Debug for RebalancingCtx {
             .field("usdc_vault_id", &self.usdc_vault_id)
             .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_auth", &"[REDACTED]")
-            .field("wrapped_token_registry", &self.wrapped_token_registry)
+            .field("equities", &self.equities)
             .finish()
     }
 }
@@ -163,7 +171,10 @@ pub(crate) enum TriggeredOperation {
     Redemption {
         symbol: Symbol,
         quantity: FractionalShares,
-        token: Address,
+        /// Wrapped (ERC-4626) token address for vault withdrawal.
+        wrapped_token: Address,
+        /// Unwrapped (underlying) token address for sending to Alpaca.
+        unwrapped_token: Address,
     },
     /// Move USDC from Alpaca to Base (too much offchain).
     UsdcAlpacaToBase { amount: Usdc },
@@ -181,6 +192,7 @@ pub(crate) struct RebalancingTrigger {
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashSet<Symbol>>>,
     pub(crate) usdc_in_progress: Arc<AtomicBool>,
     sender: mpsc::Sender<TriggeredOperation>,
+    wrapper: Arc<dyn Wrapper>,
 }
 
 impl RebalancingTrigger {
@@ -191,6 +203,7 @@ impl RebalancingTrigger {
         order_owner: Address,
         inventory: Arc<RwLock<InventoryView>>,
         sender: mpsc::Sender<TriggeredOperation>,
+        wrapper: Arc<dyn Wrapper>,
     ) -> Self {
         Self {
             config,
@@ -201,6 +214,7 @@ impl RebalancingTrigger {
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashSet::new())),
             usdc_in_progress: Arc::new(AtomicBool::new(false)),
             sender,
+            wrapper,
         }
     }
 }
@@ -323,31 +337,56 @@ impl RebalancingTrigger {
     }
 
     async fn try_build_equity_operation(&self, symbol: &Symbol) -> Option<TriggeredOperation> {
-        let token_address = match self.load_token_address(symbol).await {
-            Ok(Some(addr)) => addr,
-            Ok(None) => {
-                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
-                // tokenized equities and won't be in the vault registry.
-                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
-                return None;
-            }
-            Err(error) => {
-                error!(symbol = %symbol, error = %error, "Failed to load vault registry");
-                return None;
-            }
-        };
+        let wrapped_token = self.load_token_address_for_trigger(symbol).await?;
+        let unwrapped_token = self.load_unwrapped_token_for_trigger(symbol)?;
+        let vault_ratio = self.load_vault_ratio_for_trigger(symbol).await?;
 
-        // TODO: Fetch vault ratio from VaultService for wrapped token support.
-        // For now, pass None which treats onchain amounts as unwrapped.
         equity::check_imbalance_and_build_operation(
             symbol,
             &self.config.equity,
             &self.inventory,
-            token_address,
-            None,
+            wrapped_token,
+            unwrapped_token,
+            &vault_ratio,
         )
         .await
         .ok()
+    }
+
+    fn load_unwrapped_token_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
+        match self.wrapper.lookup_unwrapped(symbol) {
+            Ok(addr) => Some(addr),
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to get unwrapped token address");
+                None
+            }
+        }
+    }
+
+    async fn load_token_address_for_trigger(&self, symbol: &Symbol) -> Option<Address> {
+        match self.load_token_address(symbol).await {
+            Ok(Some(addr)) => Some(addr),
+            Ok(None) => {
+                // Not an error: symbols like USDCUSD (Alpaca's USDC position) aren't
+                // tokenized equities and won't be in the vault registry.
+                debug!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
+                None
+            }
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
+                None
+            }
+        }
+    }
+
+    async fn load_vault_ratio_for_trigger(&self, symbol: &Symbol) -> Option<UnderlyingPerWrapped> {
+        match self.wrapper.get_ratio_for_symbol(symbol).await {
+            Ok(ratio) => Some(ratio),
+            Err(e) => {
+                error!(symbol = %symbol, error = %e, "Failed to fetch vault ratio");
+                None
+            }
+        }
     }
 
     async fn load_token_address(
@@ -600,6 +639,12 @@ mod tests {
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
     use crate::usdc_rebalance::{TransferRef, UsdcRebalanceCommand, UsdcRebalanceId};
     use crate::vault_registry::VaultRegistryCommand;
+    use crate::wrapper::mock::MockWrapper;
+    use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
 
     fn test_config() -> RebalancingTriggerConfig {
         RebalancingTriggerConfig {
@@ -618,6 +663,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
         let pool = crate::test_utils::setup_test_db().await;
+        let wrapper = Arc::new(MockWrapper::new());
 
         (
             RebalancingTrigger::new(
@@ -627,6 +673,7 @@ mod tests {
                 TEST_ORDER_OWNER,
                 inventory,
                 sender,
+                wrapper,
             ),
             receiver,
         )
@@ -814,6 +861,7 @@ mod tests {
                 TEST_ORDER_OWNER,
                 inventory,
                 sender,
+                Arc::new(MockWrapper::new()),
             ),
             receiver,
         )
@@ -822,6 +870,19 @@ mod tests {
     async fn make_trigger_with_inventory_and_registry(
         inventory: InventoryView,
         symbol: &Symbol,
+    ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
+        make_trigger_with_inventory_registry_and_wrapper(
+            inventory,
+            symbol,
+            Arc::new(MockWrapper::new()),
+        )
+        .await
+    }
+
+    async fn make_trigger_with_inventory_registry_and_wrapper(
+        inventory: InventoryView,
+        symbol: &Symbol,
+        wrapper: Arc<MockWrapper>,
     ) -> (RebalancingTrigger, mpsc::Receiver<TriggeredOperation>) {
         let (sender, receiver) = mpsc::channel(10);
         let inventory = Arc::new(RwLock::new(inventory));
@@ -837,6 +898,7 @@ mod tests {
                 TEST_ORDER_OWNER,
                 inventory,
                 sender,
+                wrapper,
             ),
             receiver,
         )
@@ -905,6 +967,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory,
             sender,
+            Arc::new(MockWrapper::new()),
         );
 
         // Simulate production: onchain fills arrive on an empty inventory.
@@ -1021,6 +1084,37 @@ mod tests {
         assert!(
             matches!(triggered, Ok(TriggeredOperation::Mint { .. })),
             "Expected Mint operation, got {triggered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn high_vault_ratio_triggers_redemption_that_would_be_balanced_at_one_to_one() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut inventory = InventoryView::default().with_equity(symbol.clone());
+
+        // 65 onchain, 35 offchain = 65% onchain ratio.
+        // At 1:1 ratio: 65% is within 30%-70% threshold -> balanced.
+        // At 1.5 ratio: 65 wrapped = 97.5 underlying-equivalent.
+        //   97.5/(97.5+35) = 73.6% -> above 70% -> triggers redemption.
+        inventory = inventory
+            .apply_position_event(&symbol, &make_onchain_fill(shares(65), Direction::Buy))
+            .unwrap();
+        inventory = inventory
+            .apply_position_event(&symbol, &make_offchain_fill(shares(35), Direction::Buy))
+            .unwrap();
+
+        let wrapper = Arc::new(MockWrapper::with_ratio(U256::from(
+            1_500_000_000_000_000_000u64,
+        )));
+        let (trigger, mut receiver) =
+            make_trigger_with_inventory_registry_and_wrapper(inventory, &symbol, wrapper).await;
+
+        trigger.check_and_trigger_equity(&symbol).await;
+
+        let triggered = receiver.try_recv();
+        assert!(
+            matches!(triggered, Ok(TriggeredOperation::Redemption { .. })),
+            "Expected Redemption with 1.5 ratio, got {triggered:?}"
         );
     }
 
@@ -1204,6 +1298,7 @@ mod tests {
             symbol: symbol.clone(),
             quantity,
             token: Address::random(),
+            amount: U256::from(50_250_000_000_000_000_000_u128),
             vault_withdraw_tx: TxHash::random(),
             withdrawn_at: Utc::now(),
         }
@@ -2079,6 +2174,7 @@ mod tests {
             Address::ZERO,
             inventory,
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         // Set in_progress flag
@@ -2276,6 +2372,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let harness = ReactorHarness::new(InventorySnapshotReactor::new(
@@ -2338,6 +2435,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let harness = ReactorHarness::new(InventorySnapshotReactor::new(
@@ -2410,6 +2508,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let harness = ReactorHarness::new(InventorySnapshotReactor::new(
@@ -2466,6 +2565,7 @@ mod tests {
             TEST_ORDER_OWNER,
             inventory.clone(),
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let harness = ReactorHarness::new(InventorySnapshotReactor::new(

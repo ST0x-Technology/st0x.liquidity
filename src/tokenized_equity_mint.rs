@@ -112,9 +112,6 @@ pub(crate) enum TokenizedEquityMintError {
     /// Attempted to deposit to vault before tokens were wrapped
     #[error("Cannot deposit to vault: tokens not wrapped")]
     TokensNotWrapped,
-    /// Attempted to finalize before tokens were received
-    #[error("Cannot finalize: tokens not received")]
-    TokensNotReceived,
     /// Attempted to finalize before vault deposit
     #[error("Cannot finalize: vault deposit not complete")]
     VaultDepositNotComplete,

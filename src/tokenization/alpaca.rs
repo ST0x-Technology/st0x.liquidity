@@ -33,13 +33,13 @@ use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::{AlpacaAccountId, FractionalShares, Symbol};
 use thiserror::Error;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, error, trace, warn};
 
 use super::{Tokenizer, TokenizerError};
-use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
+use crate::alpaca_wallet::{Network, PollingConfig};
 use crate::bindings::IERC20;
 use crate::error_decoding::handle_contract_error;
 use crate::onchain::io::TokenizedEquitySymbol;

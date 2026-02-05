@@ -1505,6 +1505,11 @@ mod tests {
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
     use crate::wrapper::mock::MockWrapper;
+    use crate::wrapper::{RATIO_ONE, UnderlyingPerWrapped};
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
 
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
@@ -3432,7 +3437,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&symbol, &threshold, None)
+                .check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
                 .is_none(),
             "50/50 inventory should be balanced (no imbalance detected)"
         );

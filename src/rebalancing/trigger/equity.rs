@@ -11,7 +11,7 @@ use st0x_execution::{FractionalShares, Symbol};
 
 use super::TriggeredOperation;
 use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
-use crate::vault::VaultRatio;
+use crate::wrapper::UnderlyingPerWrapped;
 
 /// Maximum decimal places for Alpaca tokenization API quantities.
 const ALPACA_QUANTITY_MAX_DECIMAL_PLACES: u32 = 9;
@@ -86,14 +86,14 @@ impl Drop for InProgressGuard {
 /// or `Redemption` if there's too much onchain equity that needs to be redeemed.
 ///
 /// The onchain (wrapped) amounts are converted to unwrapped-equivalent using
-/// the vault_ratio for accurate imbalance detection. For unwrapped tokens,
-/// pass `VaultRatio::one_to_one()`.
+/// the vault_ratio for accurate imbalance detection.
 pub(super) async fn check_imbalance_and_build_operation(
     symbol: &Symbol,
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
-    token_address: Address,
-    vault_ratio: &VaultRatio,
+    wrapped_token: Address,
+    unwrapped_token: Address,
+    vault_ratio: &UnderlyingPerWrapped,
 ) -> Result<TriggeredOperation, EquityTriggerSkip> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -132,7 +132,8 @@ pub(super) async fn check_imbalance_and_build_operation(
             Ok(TriggeredOperation::Redemption {
                 symbol: symbol.clone(),
                 quantity,
-                token: token_address,
+                wrapped_token,
+                unwrapped_token,
             })
         }
     }
@@ -184,6 +185,11 @@ mod tests {
     use crate::tokenized_equity_mint::{
         IssuerRequestId, ReceiptId, TokenizationRequestId, TokenizedEquityMintEvent,
     };
+    use crate::wrapper::RATIO_ONE;
+
+    fn one_to_one_ratio() -> UnderlyingPerWrapped {
+        UnderlyingPerWrapped::new(RATIO_ONE).unwrap()
+    }
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
@@ -281,12 +287,13 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
-        let ratio = VaultRatio::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         let result = check_imbalance_and_build_operation(
             &Symbol::new("AAPL").unwrap(),
             &threshold,
             &inventory,
+            Address::ZERO,
             Address::ZERO,
             &ratio,
         )
@@ -303,12 +310,13 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
-        let ratio = VaultRatio::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         let result = check_imbalance_and_build_operation(
             &symbol,
             &threshold,
             &inventory,
+            Address::ZERO,
             Address::ZERO,
             &ratio,
         )
@@ -318,29 +326,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_too_much_onchain_returns_redemption_with_token() {
+    async fn test_too_much_onchain_returns_redemption_with_tokens() {
         let symbol = Symbol::new("AAPL").unwrap();
-        let token_address = address!("0x1234567890123456789012345678901234567890");
+        let wrapped_addr = address!("0x1234567890123456789012345678901234567890");
+        let unwrapped_addr = address!("0xabcdef0123456789abcdef0123456789abcdef01");
         let inventory = make_imbalanced_view(&symbol, 80, 20);
         let threshold = ImbalanceThreshold {
             target: dec!(0.5),
             deviation: dec!(0.2),
         };
-        let ratio = VaultRatio::one_to_one();
+        let ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         let result = check_imbalance_and_build_operation(
             &symbol,
             &threshold,
             &inventory,
-            token_address,
+            wrapped_addr,
+            unwrapped_addr,
             &ratio,
         )
         .await;
 
-        let Ok(TriggeredOperation::Redemption { token, .. }) = result else {
+        let Ok(TriggeredOperation::Redemption {
+            wrapped_token,
+            unwrapped_token,
+            ..
+        }) = result
+        else {
             panic!("Expected Redemption, got {result:?}");
         };
-        assert_eq!(token, token_address);
+        assert_eq!(wrapped_token, wrapped_addr);
+        assert_eq!(unwrapped_token, unwrapped_addr);
+    }
+
+    #[tokio::test]
+    async fn test_high_ratio_triggers_redemption_that_would_be_balanced_at_1_to_1() {
+        // With 65 onchain, 35 offchain at 1:1 ratio:
+        //   65/100 = 65% onchain, within 30%-70% threshold -> balanced
+        //
+        // With 1.5 ratio (vault appreciated 50%):
+        //   65 wrapped = 97.5 underlying-equivalent
+        //   97.5/(97.5+35) = 97.5/132.5 = 73.6% onchain, above 70% -> too much onchain
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = make_imbalanced_view(&symbol, 65, 35);
+        let threshold = ImbalanceThreshold {
+            target: dec!(0.5),
+            deviation: dec!(0.2),
+        };
+
+        // At 1:1 ratio, this is balanced
+        let ratio_1_to_1 = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+        let result_1_to_1 = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio_1_to_1,
+        )
+        .await;
+        assert_eq!(result_1_to_1, Err(EquityTriggerSkip::NoImbalance));
+
+        // At 1.5 ratio, this triggers redemption
+        let ratio_1_5 =
+            UnderlyingPerWrapped::new(U256::from(1_500_000_000_000_000_000u64)).unwrap();
+        let result_1_5 = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &ratio_1_5,
+        )
+        .await;
+        assert!(
+            matches!(result_1_5, Ok(TriggeredOperation::Redemption { .. })),
+            "Expected redemption with 1.5 ratio, got {result_1_5:?}"
+        );
     }
 
     fn precise_shares(s: &str) -> FractionalShares {
@@ -398,10 +460,17 @@ mod tests {
         };
 
         // Trigger rebalancing - should return Mint with truncated quantity
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO)
-                .await
-                .unwrap();
+        let vault_ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &vault_ratio,
+        )
+        .await
+        .unwrap();
 
         let TriggeredOperation::Mint { quantity, .. } = result else {
             panic!("Expected Mint, got {result:?}");
@@ -463,7 +532,7 @@ mod tests {
         // The leftover (0.0000000005795871467964976273) should still be there.
         let remaining_imbalance = {
             let view = inventory.read().await;
-            view.check_equity_imbalance(&symbol, &threshold)
+            view.check_equity_imbalance(&symbol, &threshold, &one_to_one_ratio())
         };
 
         // The leftover is tiny, so it won't exceed the deviation threshold alone.
@@ -501,12 +570,19 @@ mod tests {
             target: dec!(0.5),
             deviation: dec!(0.1),
         };
+        let vault_ratio = UnderlyingPerWrapped::new(RATIO_ONE).unwrap();
 
         // First trigger
-        let result1 =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO)
-                .await
-                .unwrap();
+        let result1 = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &vault_ratio,
+        )
+        .await
+        .unwrap();
 
         let TriggeredOperation::Mint { quantity: qty1, .. } = result1 else {
             panic!("Expected Mint");
@@ -568,9 +644,15 @@ mod tests {
         }
 
         // Second trigger - the leftover from first truncation plus new imbalance
-        let result2 =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO)
-                .await;
+        let result2 = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            Address::ZERO,
+            &vault_ratio,
+        )
+        .await;
 
         // Should trigger again (we added significant new imbalance)
         let TriggeredOperation::Mint { quantity: qty2, .. } = result2.unwrap() else {

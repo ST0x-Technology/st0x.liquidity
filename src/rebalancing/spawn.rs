@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
-use st0x_event_sorcery::Store;
-use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
+use st0x_event_sorcery::{Projection, Store};
+use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, EmptySymbolError, Executor};
 
 use super::equity::CrossVenueEquityTransfer;
 use super::usdc::CrossVenueCashTransfer;
@@ -28,6 +28,7 @@ use crate::tokenization::Tokenizer;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistryQuery;
+use crate::wrapper::{Wrapper, WrapperService};
 
 /// Errors that can occur when spawning the rebalancer.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +41,8 @@ pub(crate) enum SpawnRebalancerError {
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] CctpError),
+    #[error("failed to create wrapper service: {0}")]
+    Wrapper(#[from] EmptySymbolError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -117,12 +120,12 @@ struct Services<BP>
 where
     BP: Provider + Clone,
 {
-    tokenization: Arc<AlpacaTokenizationService<BP>>,
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<HttpProvider, BP>>,
     raindex: Arc<RaindexService<BP>>,
     tokenizer: Arc<dyn Tokenizer>,
+    wrapper: Arc<WrapperService<BP>>,
 }
 
 impl<BP> Services<BP>
@@ -131,7 +134,7 @@ where
 {
     /// Creates the services needed for rebalancing.
     ///
-    /// VaultService and AlpacaTokenizationService are passed in rather than
+    /// RaindexService and AlpacaTokenizationService are passed in rather than
     /// created here because they are needed for CQRS framework initialization in
     /// the conductor, which must happen before spawn_rebalancer is called.
     async fn new(
@@ -165,13 +168,19 @@ where
             usdc_base: USDC_BASE,
         })?);
 
+        let wrapper = Arc::new(WrapperService::new(
+            base_provider.clone(),
+            owner,
+            ctx.equities.clone(),
+        ));
+
         Ok(Self {
-            tokenization,
             broker,
             wallet,
             cctp,
             raindex,
             tokenizer,
+            wrapper,
         })
     }
 
@@ -198,7 +207,7 @@ where
             self.broker,
             self.wallet,
             self.cctp,
-            self.vault,
+            self.raindex,
             frameworks.usdc,
             addresses.market_maker_wallet,
             RaindexVaultId(ctx.usdc_vault_id),
@@ -223,6 +232,7 @@ mod tests {
     use httpmock::MockServer;
     use rust_decimal_macros::dec;
     use serde_json::json;
+    use std::collections::HashMap;
     use st0x_execution::{
         AlpacaBrokerApiCtx, AlpacaBrokerApiMode, FractionalShares, Symbol, TimeInForce,
     };
@@ -281,12 +291,12 @@ mod tests {
             alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
-                account_id: Uuid::nil().to_string(),
+                account_id: AlpacaAccountId::new(Uuid::nil()),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
             },
-            wrapped_token_registry: WrappedTokenRegistry::empty(),
+            equities: HashMap::new(),
         }
     }
 
@@ -400,7 +410,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: rebalancing_ctx.alpaca_account_id.to_string(),
+            account_id: rebalancing_ctx.alpaca_account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -431,10 +441,16 @@ mod tests {
             .unwrap(),
         );
 
+        let wrapper = Arc::new(WrapperService::new(
+            base_provider.clone(),
+            owner,
+            rebalancing_ctx.equities.clone(),
+        ));
+
         let vault_registry_projection = Arc::new(
             Projection::<VaultRegistry>::sqlite(crate::test_utils::setup_test_db().await).unwrap(),
         );
-        let vault = Arc::new(
+        let raindex = Arc::new(
             RaindexService::new(
                 base_provider,
                 TEST_ORDERBOOK,
@@ -445,12 +461,12 @@ mod tests {
         );
 
         let services = Services {
-            tokenization,
             broker,
             wallet,
             cctp,
-            raindex: vault,
+            raindex,
             tokenizer: tokenization,
+            wrapper,
         };
 
         (services, rebalancing_ctx)
@@ -472,7 +488,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
-            account_id: rebalancing_ctx.alpaca_account_id.to_string(),
+            account_id: rebalancing_ctx.alpaca_account_id,
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -504,14 +520,6 @@ mod tests {
 
         let redemption_cqrs = Arc::new(test_store(pool.clone(), mock_services));
 
-        let vault_registry_view_repo = Arc::new(SqliteViewRepository::<
-            VaultRegistryAggregate,
-            VaultRegistryAggregate,
-        >::new(
-            pool.clone(), "vault_registry_view".to_string()
-        ));
-        let vault_registry_query = Arc::new(GenericQuery::new(vault_registry_view_repo));
-
         let frameworks = RebalancingCqrsFrameworks {
             mint: mint_cqrs,
             redemption: redemption_cqrs,
@@ -524,6 +532,7 @@ mod tests {
             &config,
             RebalancerAddresses {
                 market_maker_wallet: Address::random(),
+                orderbook: TEST_ORDERBOOK,
             },
             rx,
             frameworks,
