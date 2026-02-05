@@ -437,11 +437,12 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::alpaca_broker_api::{
+        AlpacaAccountId, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode,
+    };
     use uuid::uuid;
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaAccountId;
     use crate::cli::ConvertDirection;
     use crate::config::LogLevel;
     use crate::inventory::ImbalanceThreshold;
@@ -449,7 +450,7 @@ mod tests {
     use crate::rebalancing::RebalancingConfig;
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::threshold::ExecutionThreshold;
-    use crate::vault::WrappedTokenRegistry;
+    use std::collections::HashMap;
 
     fn create_config_without_alpaca() -> Config {
         Config {
@@ -476,7 +477,7 @@ mod tests {
         config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            account_id: "test-account-id".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
         });
         config
@@ -499,7 +500,7 @@ mod tests {
             broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
-                account_id: alpaca_account_id.to_string(),
+                account_id: alpaca_account_id,
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
             }),
             hyperdx: None,
@@ -517,10 +518,10 @@ mod tests {
                 alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
-                    account_id: alpaca_account_id.to_string(),
+                    account_id: alpaca_account_id,
                     mode: Some(AlpacaBrokerApiMode::Sandbox),
                 },
-                wrapped_token_registry: WrappedTokenRegistry::empty(),
+                equities: HashMap::new(),
             }),
             execution_threshold: ExecutionThreshold::whole_share(),
         }

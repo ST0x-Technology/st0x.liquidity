@@ -11,7 +11,7 @@ use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotAggregate, InventorySnapshotCommand, InventorySnapshotError,
 };
 use crate::lifecycle::{Lifecycle, Never};
-use crate::onchain::raindex::{RaindexError, RaindexService, VaultId};
+use crate::onchain::vault::{RaindexService, VaultError, VaultId};
 use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 use alloy::primitives::Address;
 use alloy::providers::Provider;

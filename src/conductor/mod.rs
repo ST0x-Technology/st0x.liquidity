@@ -592,8 +592,36 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     ));
 
     let tokenizer: Arc<dyn Tokenizer> = tokenization_service.clone();
-    let vault: Arc<dyn Vault> = vault_service.clone();
-    let redemption_services = RedemptionServices { tokenizer, vault };
+    let raindex: Arc<dyn Raindex> = raindex_service.clone();
+    let wrapper: Arc<dyn Wrapper> = Arc::new(WrapperService::new(
+        provider.clone(),
+        market_maker_wallet,
+        rebalancing_config.equities.clone(),
+    ));
+    let redemption_services = RedemptionServices {
+        tokenizer,
+        raindex,
+        wrapper: wrapper.clone(),
+    };
+
+    const OPERATION_CHANNEL_CAPACITY: usize = 100;
+    let (operation_sender, operation_receiver) = mpsc::channel(OPERATION_CHANNEL_CAPACITY);
+
+    let manifest = QueryManifest::new(
+        RebalancingTriggerConfig {
+            equity: rebalancing_config.equity,
+            usdc: rebalancing_config.usdc.clone(),
+        },
+        pool.clone(),
+        manifest::AddressConfig {
+            orderbook: config.evm.orderbook,
+            market_maker_wallet,
+        },
+        inventory.clone(),
+        operation_sender,
+        event_sender,
+        wrapper,
+    );
 
     let (frameworks, queries) = manifest.wire(pool.clone(), redemption_services);
 
@@ -603,7 +631,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + Sync + 's
     };
 
     let redemption_deps = RedemptionDependencies {
-        vault_service,
+        raindex_service,
         tokenization_service,
         vault_registry_query,
         cqrs: frameworks.redemption,
@@ -821,7 +849,7 @@ where
 
 fn spawn_inventory_poller<P, E>(
     pool: SqlitePool,
-    vault_service: Arc<VaultService<P>>,
+    raindex_service: Arc<RaindexService<P>>,
     executor: E,
     orderbook: Address,
     order_owner: Address,
@@ -834,7 +862,7 @@ where
     info!("Starting inventory poller");
 
     let service = InventoryPollingService::new(
-        vault_service,
+        raindex_service,
         executor,
         pool,
         orderbook,
@@ -1516,6 +1544,7 @@ mod tests {
     use crate::rebalancing::trigger::UsdcRebalancingConfig;
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+    use crate::wrapper::mock::MockWrapper;
 
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
@@ -3411,6 +3440,7 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
@@ -3499,6 +3529,7 @@ mod tests {
             order_owner,
             Arc::clone(&inventory),
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
@@ -3540,7 +3571,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&symbol, &threshold)
+                .check_equity_imbalance(&symbol, &threshold, None)
                 .is_none(),
             "50/50 inventory should be balanced (no imbalance detected)"
         );
@@ -3605,6 +3636,7 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
@@ -3732,6 +3764,7 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
@@ -3786,14 +3819,18 @@ mod tests {
             .unwrap();
 
         let triggered = receiver.try_recv().unwrap();
-        assert_eq!(
-            triggered,
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(dec!(25)),
-                token: test_token,
-            }
-        );
+        let TriggeredOperation::Redemption {
+            symbol: s,
+            quantity,
+            wrapped_token,
+            ..
+        } = triggered
+        else {
+            panic!("Expected Redemption, got {triggered:?}");
+        };
+        assert_eq!(s, symbol);
+        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(wrapped_token, test_token);
     }
 
     #[tokio::test]
@@ -3821,14 +3858,18 @@ mod tests {
             .unwrap();
 
         let first = receiver.try_recv().unwrap();
-        assert_eq!(
-            first,
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(dec!(25)),
-                token: test_token,
-            }
-        );
+        let TriggeredOperation::Redemption {
+            symbol: s,
+            quantity,
+            wrapped_token,
+            ..
+        } = first
+        else {
+            panic!("Expected Redemption, got {first:?}");
+        };
+        assert_eq!(s, symbol);
+        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(wrapped_token, test_token);
 
         // Second fill while in-progress NOT cleared -> no second trigger.
         position_cqrs
