@@ -6,7 +6,6 @@
 pub(crate) mod manager;
 #[cfg(test)]
 pub(crate) mod mock;
-pub(crate) mod service;
 
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
@@ -19,8 +18,6 @@ use st0x_event_sorcery::SendError;
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::onchain::vault::VaultError;
-
-pub(crate) use service::RedemptionService;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {

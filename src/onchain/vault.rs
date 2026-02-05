@@ -18,11 +18,15 @@ use rain_error_decoding::AbiDecodedErrorType;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
 use st0x_execution::FractionalShares;
+use std::sync::Arc;
+use tracing::warn;
 
 use crate::bindings::IOrderBookV5;
 use crate::error_decoding::handle_contract_error;
+use crate::lifecycle::Lifecycle;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::threshold::Usdc;
+use crate::vault_registry::{VaultRegistry, VaultRegistryQuery};
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 const USDC_DECIMALS: u8 = 6;
@@ -52,10 +56,12 @@ pub(crate) enum VaultError {
 /// # Example
 ///
 /// ```ignore
-/// let service = VaultService::new(provider, orderbook_address);
+/// let service = VaultService::new(provider, orderbook_address, vault_registry_query, owner);
+///
+/// // Lookup vault ID for a token
+/// let vault_id = service.lookup_vault_id(token_address).await?;
 ///
 /// // Deposit USDC to vault
-/// let vault_id = VaultId(U256::from(1));
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
 /// service.deposit_usdc(vault_id, amount).await?;
 ///
@@ -67,6 +73,9 @@ where
     P: Provider + Clone,
 {
     orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
+    orderbook_address: Address,
+    vault_registry_query: Arc<VaultRegistryQuery>,
+    owner: Address,
     required_confirmations: u64,
 }
 
@@ -74,9 +83,17 @@ impl<P> VaultService<P>
 where
     P: Provider + Clone,
 {
-    pub(crate) fn new(provider: P, orderbook: Address) -> Self {
+    pub(crate) fn new(
+        provider: P,
+        orderbook: Address,
+        vault_registry_query: Arc<VaultRegistryQuery>,
+        owner: Address,
+    ) -> Self {
         Self {
             orderbook: IOrderBookV5::new(orderbook, provider),
+            orderbook_address: orderbook,
+            vault_registry_query,
+            owner,
             required_confirmations: REQUIRED_CONFIRMATIONS,
         }
     }
@@ -265,10 +282,13 @@ fn float_to_decimal(float: B256) -> Result<Decimal, VaultError> {
 
 /// Abstraction for Rain OrderBook vault operations.
 ///
-/// This trait abstracts deposit and withdraw operations for the Rain OrderBook,
+/// This trait abstracts deposit, withdraw, and vault lookup operations for the Rain OrderBook,
 /// allowing different implementations (real service, mock) to be used interchangeably.
 #[async_trait]
 pub(crate) trait Vault: Send + Sync {
+    /// Looks up the vault ID for a given token from the vault registry.
+    async fn lookup_vault_id(&self, token: Address) -> Option<VaultId>;
+
     /// Deposits tokens to a Rain OrderBook vault.
     async fn deposit(
         &self,
@@ -293,6 +313,23 @@ impl<P> Vault for VaultService<P>
 where
     P: Provider + Clone + Send + Sync,
 {
+    async fn lookup_vault_id(&self, token: Address) -> Option<VaultId> {
+        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook_address, self.owner);
+        let lifecycle = self.vault_registry_query.load(&aggregate_id).await?;
+
+        match lifecycle {
+            Lifecycle::Uninitialized => {
+                warn!("Vault registry not initialized");
+                None
+            }
+            Lifecycle::Live(registry) => registry.vault_id_by_token(token).map(VaultId),
+            Lifecycle::Failed { .. } => {
+                warn!("Vault registry in failed state");
+                None
+            }
+        }
+    }
+
     async fn deposit(
         &self,
         token: Address,

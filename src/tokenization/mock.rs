@@ -8,12 +8,23 @@ use super::{TokenizationRequest, Tokenizer, TokenizerError};
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
 
 pub(crate) struct MockTokenizer {
-    // TODO: Add mock configuration fields as needed
+    redemption_wallet: Address,
+    redemption_tx: TxHash,
 }
 
 impl MockTokenizer {
     pub(crate) fn new() -> Self {
-        Self {}
+        Self {
+            redemption_wallet: Address::random(),
+            redemption_tx: TxHash::random(),
+        }
+    }
+
+    pub(crate) fn with_redemption_tx(redemption_tx: TxHash) -> Self {
+        Self {
+            redemption_wallet: Address::random(),
+            redemption_tx,
+        }
     }
 }
 
@@ -37,7 +48,7 @@ impl Tokenizer for MockTokenizer {
     }
 
     fn redemption_wallet(&self) -> Address {
-        todo!("MockTokenizer::redemption_wallet")
+        self.redemption_wallet
     }
 
     async fn send_for_redemption(
@@ -45,7 +56,7 @@ impl Tokenizer for MockTokenizer {
         _token: Address,
         _amount: U256,
     ) -> Result<TxHash, TokenizerError> {
-        todo!("MockTokenizer::send_for_redemption")
+        Ok(self.redemption_tx)
     }
 
     async fn poll_for_redemption(

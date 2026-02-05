@@ -21,12 +21,13 @@
 //! - `Pending` indicates Alpaca detected the transfer
 //! - `Completed` and `Failed` are terminal states
 //!
-//! # Redeemer Service
+//! # Services
 //!
-//! The aggregate uses cqrs-es Services (`Arc<dyn Redeemer>`) to execute side effects atomically:
+//! The aggregate uses cqrs-es Services (`RedemptionServices`) with `Tokenizer` and `Vault`
+//! traits to execute side effects atomically:
 //!
-//! - `withdraw_from_vault()` - Withdraws tokens from Rain OrderBook vault
-//! - `send_for_redemption()` - Sends tokens to Alpaca's redemption wallet
+//! - `vault.withdraw()` - Withdraws tokens from Rain OrderBook vault
+//! - `tokenizer.send_for_redemption()` - Sends tokens to Alpaca's redemption wallet
 //!
 //! This pattern ensures that if vault withdraw succeeds but send fails, the aggregate stays
 //! in `VaultWithdrawn` state (tokens in wallet, not stranded).
@@ -39,11 +40,6 @@
 //! - Terminal states (Completed, Failed) reject all state-changing commands
 //! - Failed state preserves context depending on when failure occurred
 //! - All state transitions are captured as events for complete audit trail
-
-mod redeemer;
-
-#[cfg(test)]
-pub(crate) mod mock;
 
 use std::sync::Arc;
 
@@ -92,9 +88,15 @@ impl FromStr for RedemptionAggregateId {
 /// These errors enforce state machine constraints and prevent invalid transitions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum EquityRedemptionError {
-    /// Redeemer service operation failed
-    #[error("Redeem service error: {0}")]
-    RedeemService(#[from] RedeemError),
+    /// Vault operation failed
+    #[error("Vault error: {0}")]
+    Vault(#[from] VaultError),
+    /// Tokenizer operation failed
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(#[from] TokenizerError),
+    /// Vault not found for token in vault registry
+    #[error("Vault not found for token {0}")]
+    VaultNotFound(Address),
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
@@ -120,7 +122,7 @@ pub(crate) enum EquityRedemptionError {
 
 #[derive(Debug, Clone)]
 pub(crate) enum EquityRedemptionCommand {
-    /// Atomic command: withdraws from vault and sends to Alpaca via Redeemer.
+    /// Atomic command: withdraws from vault and sends to Alpaca.
     /// Emits VaultWithdrawn, then TokensSent on success.
     /// If vault withdraw succeeds but send fails, stays in VaultWithdrawn.
     Redeem {
