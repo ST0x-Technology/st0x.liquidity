@@ -699,10 +699,19 @@ mod tests {
             local_evm.provider.clone(),
             local_evm.signer.address(),
         ));
+        let vault: Arc<dyn Vault> = Arc::new(
+            VaultService::new(
+                local_evm.provider.clone(),
+                local_evm.orderbook_address,
+                vault_registry_query.clone(),
+                local_evm.signer.address(),
+            )
+            .with_required_confirmations(1),
+        );
         let cqrs = create_test_store_instance().await;
         let manager = MintManager::new(
-            service as Arc<dyn Tokenizer>,
-            vault as Arc<dyn Vault>,
+            tokenizer,
+            vault,
             vault_registry_query,
             local_evm.orderbook_address,
             local_evm.signer.address(),

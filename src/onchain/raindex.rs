@@ -158,7 +158,10 @@ where
         let erc20 = IERC20::new(token, self.provider.clone());
         match erc20.approve(self.orderbook_address, amount).send().await {
             Ok(pending) => {
-                pending.get_receipt().await?;
+                pending
+                    .with_required_confirmations(self.required_confirmations)
+                    .get_receipt()
+                    .await?;
             }
             Err(e) => return Err(handle_contract_error(e).await),
         }
@@ -177,7 +180,10 @@ where
             Err(error) => return Err(handle_contract_error(error).await),
         };
 
-        let receipt = pending.get_receipt().await?;
+        let receipt = pending
+            .with_required_confirmations(self.required_confirmations)
+            .get_receipt()
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -562,6 +568,7 @@ mod tests {
             Arc::new(GenericQuery::new(vault_registry_view_repo));
 
         RaindexService::new(provider, orderbook_address, vault_registry_query, owner)
+            .with_required_confirmations(1)
     }
 
     #[tokio::test]
@@ -965,5 +972,41 @@ mod tests {
             let roundtripped_str = roundtripped.format_with_scientific(false).unwrap();
             prop_assert_eq!(original_str, roundtripped_str);
         }
+
+    #[tokio::test]
+    async fn deposit_with_production_amount_succeeds() {
+        let local_evm = LocalEvm::new().await.unwrap();
+
+        // Exact amount from production failure: 1.410161147 shares with 18 decimals
+        let deposit_amount = U256::from(1_410_161_147_000_000_000_u128);
+
+        local_evm
+            .approve_tokens(
+                local_evm.token_address,
+                local_evm.orderbook_address,
+                U256::ZERO,
+            )
+            .await
+            .unwrap();
+
+        let service = create_test_raindex_service(
+            local_evm.provider.clone(),
+            local_evm.orderbook_address,
+            local_evm.signer.address(),
+        )
+        .await
+        .with_required_confirmations(1);
+
+        // This should succeed - the approve inside deposit() should cover the transferFrom amount
+        let result = service
+            .deposit(
+                local_evm.token_address,
+                TEST_VAULT_ID,
+                deposit_amount,
+                TEST_TOKEN_DECIMALS,
+            )
+            .await;
+
+        assert!(result.is_ok(), "Deposit failed: {:?}", result.unwrap_err());
     }
 }

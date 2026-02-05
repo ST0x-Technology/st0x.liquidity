@@ -418,6 +418,14 @@ is the source of truth for terminology and naming conventions.
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
   `SchwabError`) with proper propagation
+- **CRITICAL: Onchain Transaction Confirmations**: All onchain operations must
+  explicitly wait for the configured number of confirmations before proceeding.
+  Load-balanced RPC providers (like dRPC) may route subsequent requests to
+  different nodes that haven't seen recent transactions yet. Use
+  `REQUIRED_CONFIRMATIONS` from `crate::onchain` and call
+  `.with_required_confirmations(self.required_confirmations).get_receipt()` on
+  all pending transactions. Never use bare `.get_receipt().await` in production
+  code paths.
 - **CRITICAL: CQRS/Event Sourcing Architecture**: This application uses the
   cqrs-es framework for event sourcing. **NEVER write directly to the `events`
   table**. This is strictly forbidden and violates the CQRS architecture:
