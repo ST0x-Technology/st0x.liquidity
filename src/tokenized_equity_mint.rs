@@ -53,6 +53,13 @@ use st0x_execution::{FractionalShares, Symbol};
 use crate::rebalancing::equity::EquityTransferServices;
 use crate::tokenization::TokenizationRequestStatus;
 
+/// Services required by the TokenizedEquityMint aggregate.
+#[derive(Clone)]
+pub(crate) struct MintServices {
+    pub(crate) tokenizer: Arc<dyn Tokenizer>,
+    pub(crate) raindex: Arc<dyn Raindex>,
+}
+
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IssuerRequestId(pub(crate) String);

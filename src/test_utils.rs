@@ -14,7 +14,7 @@ use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
-use crate::onchain::vault::RaindexService;
+use crate::onchain::raindex::RaindexService;
 use crate::vault_registry::{VaultRegistryAggregate, VaultRegistryQuery};
 
 /// Returns a test `OrderV4` instance that is shared across multiple

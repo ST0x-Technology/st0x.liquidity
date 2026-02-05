@@ -2,7 +2,6 @@
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
-
 use st0x_execution::Symbol;
 
 use super::raindex::{Raindex, RaindexError, RaindexVaultId};
