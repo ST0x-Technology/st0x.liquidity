@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, B256};
+use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
@@ -10,7 +10,7 @@ use tracing::{error, warn};
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmEnv;
+use crate::onchain::EvmConfig;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
@@ -22,12 +22,114 @@ pub enum TradeEvent {
     TakeOrderV3(Box<TakeOrderV3>),
 }
 
+/// Information about a vault extracted from an order's IO specification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VaultInfo {
+    pub(crate) token: Address,
+    pub(crate) vault_id: B256,
+}
+
+/// Extracts vault information from an OrderV4 for both input and output at the
+/// specified indices.
+///
+/// Returns `(input_vault, output_vault)` if both indices are valid, or None if either is out of bounds.
+pub(crate) fn extract_vault_info(
+    order: &OrderV4,
+    input_index: usize,
+    output_index: usize,
+) -> Option<(VaultInfo, VaultInfo)> {
+    let input = order.validInputs.get(input_index)?;
+    let output = order.validOutputs.get(output_index)?;
+
+    Some((
+        VaultInfo {
+            token: input.token,
+            vault_id: input.vaultId,
+        },
+        VaultInfo {
+            token: output.token,
+            vault_id: output.vaultId,
+        },
+    ))
+}
+
+/// Vault info paired with the order owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedVaultInfo {
+    pub(crate) owner: Address,
+    pub(crate) vault: VaultInfo,
+}
+
+/// Extracts all vault information from a ClearV3 event.
+///
+/// Returns vaults from both alice and bob orders. Each order contributes two vaults
+/// (input and output) as determined by the clear config indices.
+pub(crate) fn extract_vaults_from_clear(event: &ClearV3) -> Vec<OwnedVaultInfo> {
+    let participants = [
+        (
+            &event.alice,
+            event.clearConfig.aliceInputIOIndex,
+            event.clearConfig.aliceOutputIOIndex,
+        ),
+        (
+            &event.bob,
+            event.clearConfig.bobInputIOIndex,
+            event.clearConfig.bobOutputIOIndex,
+        ),
+    ];
+
+    participants
+        .into_iter()
+        .flat_map(|(order, input_idx, output_idx)| {
+            extract_owned_vaults(order, input_idx, output_idx)
+        })
+        .collect()
+}
+
+pub(crate) fn extract_owned_vaults(
+    order: &OrderV4,
+    input_idx: U256,
+    output_idx: U256,
+) -> Vec<OwnedVaultInfo> {
+    let (Ok(in_idx), Ok(out_idx)) = (input_idx.try_into(), output_idx.try_into()) else {
+        warn!(
+            owner = %order.owner,
+            %input_idx,
+            %output_idx,
+            "extract_owned_vaults: failed to convert input_idx or output_idx from U256 to usize"
+        );
+        return vec![];
+    };
+
+    let Some((input, output)) = extract_vault_info(order, in_idx, out_idx) else {
+        warn!(
+            owner = %order.owner,
+            input_index = %in_idx,
+            output_index = %out_idx,
+            "extract_vault_info: IO indices out of bounds"
+        );
+        return vec![];
+    };
+
+    vec![
+        OwnedVaultInfo {
+            owner: order.owner,
+            vault: input,
+        },
+        OwnedVaultInfo {
+            owner: order.owner,
+            vault: output,
+        },
+    ]
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnchainTrade {
     pub(crate) id: Option<i64>,
     pub(crate) tx_hash: B256,
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedEquitySymbol,
+    pub(crate) equity_token: Address,
     pub(crate) amount: f64,
     pub(crate) direction: Direction,
     pub(crate) price: Usdc,
@@ -42,136 +144,6 @@ pub struct OnchainTrade {
 }
 
 impl OnchainTrade {
-    pub async fn save_within_transaction(
-        &self,
-        sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ) -> Result<i64, OnChainError> {
-        let tx_hash_str = self.tx_hash.to_string();
-        let log_index_i64 = i64::try_from(self.log_index)?;
-
-        let direction_str = self.direction.as_str();
-        let symbol_str = self.symbol.to_string();
-        let block_timestamp_naive = self.block_timestamp.map(|dt| dt.naive_utc());
-
-        let gas_used_i64 = self.gas_used.and_then(|g| i64::try_from(g).ok());
-        let effective_gas_price_i64 = self.effective_gas_price.and_then(|p| i64::try_from(p).ok());
-
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO onchain_trades (
-                tx_hash,
-                log_index,
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-                pyth_confidence,
-                pyth_exponent,
-                pyth_publish_time
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-            tx_hash_str,
-            log_index_i64,
-            symbol_str,
-            self.amount,
-            direction_str,
-            self.price,
-            block_timestamp_naive,
-            gas_used_i64,
-            effective_gas_price_i64,
-            self.pyth_price,
-            self.pyth_confidence,
-            self.pyth_exponent,
-            self.pyth_publish_time
-        )
-        .execute(&mut **sql_tx)
-        .await?;
-
-        Ok(result.last_insert_rowid())
-    }
-
-    #[cfg(test)]
-    pub async fn find_by_tx_hash_and_log_index(
-        pool: &sqlx::SqlitePool,
-        tx_hash: B256,
-        log_index: u64,
-    ) -> Result<Self, OnChainError> {
-        let tx_hash_str = tx_hash.to_string();
-        let log_index_i64 = i64::try_from(log_index).expect("test log_index should fit in i64");
-
-        let row = sqlx::query!(
-            "
-            SELECT
-                id,
-                tx_hash,
-                log_index,
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                created_at,
-                block_timestamp,
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-                pyth_confidence,
-                pyth_exponent,
-                pyth_publish_time
-            FROM onchain_trades
-            WHERE tx_hash = ?1 AND log_index = ?2
-            ",
-            tx_hash_str,
-            log_index_i64
-        )
-        .fetch_one(pool)
-        .await?;
-
-        let tx_hash = row
-            .tx_hash
-            .parse()
-            .expect("test db should have valid tx_hash");
-
-        let direction = row.direction.parse()?;
-
-        Ok(Self {
-            id: Some(row.id),
-            tx_hash,
-            log_index: u64::try_from(row.log_index)
-                .expect("test db log_index should be non-negative"),
-            symbol: row.symbol.parse::<TokenizedEquitySymbol>().unwrap(),
-            amount: row.amount,
-            direction,
-            price: Usdc::new(row.price_usdc).expect("db price_usdc should be non-negative"),
-            block_timestamp: row
-                .block_timestamp
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            created_at: row
-                .created_at
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            gas_used: row.gas_used.and_then(|g| u64::try_from(g).ok()),
-            effective_gas_price: row.effective_gas_price.and_then(|p| u128::try_from(p).ok()),
-            pyth_price: row.pyth_price,
-            pyth_confidence: row.pyth_confidence,
-            pyth_exponent: row.pyth_exponent.and_then(|exp| i32::try_from(exp).ok()),
-            pyth_publish_time: row
-                .pyth_publish_time
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-        })
-    }
-
-    #[cfg(test)]
-    pub async fn db_count(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
-        let row = sqlx::query!("SELECT COUNT(*) as count FROM onchain_trades")
-            .fetch_one(pool)
-            .await?;
-        Ok(row.count)
-    }
-
     /// Core parsing logic for converting blockchain events to trades
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
@@ -228,10 +200,10 @@ impl OnchainTrade {
         }
 
         // Parse the tokenized equity symbol to ensure it's valid
-        let tokenized_symbol_str = if onchain_input_symbol == "USDC" {
-            onchain_output_symbol
+        let (tokenized_symbol_str, equity_token) = if onchain_input_symbol == "USDC" {
+            (onchain_output_symbol, output.token)
         } else {
-            onchain_input_symbol
+            (onchain_input_symbol, input.token)
         };
         let tokenized_symbol = TokenizedEquitySymbol::parse(&tokenized_symbol_str)?;
 
@@ -257,6 +229,7 @@ impl OnchainTrade {
             tx_hash,
             log_index,
             symbol: tokenized_symbol,
+            equity_token,
             amount: trade_details.equity_amount().value(),
             direction: trade_details.direction(),
             price,
@@ -282,7 +255,7 @@ impl OnchainTrade {
         tx_hash: B256,
         provider: P,
         cache: &SymbolCache,
-        env: &EvmEnv,
+        config: &EvmConfig,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
@@ -302,7 +275,7 @@ impl OnchainTrade {
             .filter(|log| {
                 (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == env.orderbook
+                    && log.address() == config.orderbook
             })
             .collect();
 
@@ -318,7 +291,7 @@ impl OnchainTrade {
                 log,
                 &provider,
                 cache,
-                env,
+                config,
                 feed_id_cache,
                 order_owner,
             )
@@ -344,7 +317,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     log: &Log,
     provider: P,
     cache: &SymbolCache,
-    env: &EvmEnv,
+    config: &EvmConfig,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -361,7 +334,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
     if let Ok(clear_event) = log.log_decode::<ClearV3>() {
         return OnchainTrade::try_from_clear_v3(
-            env,
+            config,
             cache,
             &provider,
             clear_event.data().clone(),
@@ -399,61 +372,14 @@ fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, U256, fixed_bytes, uint};
+    use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
 
     use super::*;
-    use crate::onchain::EvmEnv;
+    use crate::bindings::IOrderBookV5;
+    use crate::onchain::EvmConfig;
     use crate::symbol::cache::SymbolCache;
-    use crate::test_utils::setup_test_db;
-
-    #[tokio::test]
-    async fn test_onchain_trade_save_within_transaction_and_find() {
-        let pool = setup_test_db().await;
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ),
-            log_index: 42,
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            amount: 10.0,
-            direction: Direction::Sell,
-            price: Usdc::new(150.25).unwrap(),
-            block_timestamp: DateTime::from_timestamp(1_672_531_200, 0), // Jan 1, 2023 00:00:00 UTC
-            created_at: None,
-            gas_used: Some(21000),
-            effective_gas_price: Some(2_000_000_000), // 2 gwei
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-        sql_tx.commit().await.unwrap();
-        assert!(id > 0);
-
-        let found =
-            OnchainTrade::find_by_tx_hash_and_log_index(&pool, trade.tx_hash, trade.log_index)
-                .await
-                .unwrap();
-
-        assert_eq!(found.tx_hash, trade.tx_hash);
-        assert_eq!(found.log_index, trade.log_index);
-        assert_eq!(found.symbol, trade.symbol);
-        assert!((found.amount - trade.amount).abs() < f64::EPSILON);
-        assert_eq!(found.direction, trade.direction);
-        assert_eq!(found.price, trade.price);
-        assert_eq!(found.block_timestamp, trade.block_timestamp);
-        assert_eq!(found.gas_used, trade.gas_used);
-        assert_eq!(found.effective_gas_price, trade.effective_gas_price);
-        assert!(found.id.is_some());
-        assert!(found.created_at.is_some());
-    }
 
     #[test]
     fn test_float_constants_from_v5_interface() {
@@ -554,111 +480,6 @@ mod tests {
         assert!((result - 0.5).abs() < f64::EPSILON);
     }
 
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_invalid_formats() {
-        let pool = setup_test_db().await;
-
-        // Attempt to insert invalid tx_hash format - should fail due to constraint
-        let insert_result = sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
-             VALUES ('invalid_hash', 1, 'TEST', 1.0, 'BUY', 1.0)"
-        )
-        .execute(&pool)
-        .await;
-
-        // The insert should fail due to tx_hash constraint
-        assert!(insert_result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_invalid_direction() {
-        let pool = setup_test_db().await;
-
-        // Attempt to insert invalid direction data - should fail due to constraint
-        let insert_result = sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
-             VALUES ('0x1234567890123456789012345678901234567890123456789012345678901234', 1, 'TEST', 1.0, 'INVALID', 1.0)"
-        )
-        .execute(&pool)
-        .await;
-
-        // The insert should fail due to direction constraint
-        assert!(insert_result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_save_within_transaction_constraint_violation() {
-        let pool = setup_test_db().await;
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            log_index: 100,
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            amount: 10.0,
-            direction: Direction::Buy,
-            price: Usdc::new(150.0).unwrap(),
-            block_timestamp: DateTime::from_timestamp(1_672_531_800, 0), // Jan 1, 2023 00:10:00 UTC
-            created_at: None,
-            gas_used: Some(50000), // Complex contract interaction
-            effective_gas_price: Some(1_500_000_000), // 1.5 gwei in wei
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        // Insert first trade
-        let mut sql_tx1 = pool.begin().await.unwrap();
-        trade.save_within_transaction(&mut sql_tx1).await.unwrap();
-        sql_tx1.commit().await.unwrap();
-
-        // Try to insert duplicate trade (same tx_hash and log_index)
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = trade.save_within_transaction(&mut sql_tx2).await;
-        assert!(
-            duplicate_result.is_err(),
-            "Expected duplicate constraint violation"
-        );
-        sql_tx2.rollback().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_save_within_transaction_large_log_index_wrapping() {
-        let pool = setup_test_db().await;
-
-        // Test that extremely large log_index values are handled consistently
-        // u64::MAX will wrap to -1 when cast to i64
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            ),
-            log_index: u64::MAX, // Will become -1 when cast to i64
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            amount: 10.0,
-            direction: Direction::Buy,
-            price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-
-        // This should fail due to log_index constraint (log_index >= 0)
-        let save_result = trade.save_within_transaction(&mut sql_tx).await;
-        assert!(save_result.is_err());
-        sql_tx.rollback().await.unwrap();
-    }
-
     #[test]
     fn test_float_to_f64_precision_loss() {
         // Test with very large coefficient
@@ -715,7 +536,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
-        let env = EvmEnv {
+        let config = EvmConfig {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             order_owner: Some(Address::ZERO),
@@ -730,7 +551,7 @@ mod tests {
             tx_hash,
             provider,
             &cache,
-            &env,
+            &config,
             &feed_id_cache,
             Address::ZERO,
         )
@@ -742,62 +563,177 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn test_find_by_tx_hash_database_error() {
-        let pool = setup_test_db().await;
-
-        // Close the pool to simulate database connection error
-        pool.close().await;
-
-        // Expected database connection error
-        OnchainTrade::find_by_tx_hash_and_log_index(
-            &pool,
-            fixed_bytes!("0x5555555555555555555555555555555555555555555555555555555555555555"),
-            1,
-        )
-        .await
-        .unwrap_err();
+    fn make_io(token: Address, vault_id: B256) -> IOrderBookV5::IOV2 {
+        IOrderBookV5::IOV2 {
+            token,
+            vaultId: vault_id,
+        }
     }
 
-    #[tokio::test]
-    async fn test_db_count_with_data() {
-        let pool = setup_test_db().await;
-
-        // Insert test data
-        for i in 0..5 {
-            let mut tx_hash_bytes = [0u8; 32];
-            tx_hash_bytes[0..31].copy_from_slice(&[
-                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
-                0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56,
-                0x78, 0x90, 0x12,
-            ]);
-            tx_hash_bytes[31] = i;
-
-            let trade = OnchainTrade {
-                id: None,
-                tx_hash: alloy::primitives::B256::from(tx_hash_bytes),
-                log_index: u64::from(i),
-                symbol: crate::onchain::io::TokenizedEquitySymbol::parse(&format!("TEST{i}0x"))
-                    .unwrap(),
-                amount: 10.0,
-                direction: Direction::Buy,
-                price: Usdc::new(150.0).unwrap(),
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            };
-
-            let mut sql_tx = pool.begin().await.unwrap();
-            trade.save_within_transaction(&mut sql_tx).await.unwrap();
-            sql_tx.commit().await.unwrap();
+    fn make_order(
+        owner: Address,
+        inputs: Vec<IOrderBookV5::IOV2>,
+        outputs: Vec<IOrderBookV5::IOV2>,
+    ) -> IOrderBookV5::OrderV4 {
+        IOrderBookV5::OrderV4 {
+            owner,
+            evaluable: IOrderBookV5::EvaluableV4::default(),
+            validInputs: inputs,
+            validOutputs: outputs,
+            nonce: B256::ZERO,
         }
+    }
 
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 5);
+    #[test]
+    fn extract_vault_info_returns_none_for_out_of_bounds_input() {
+        let order = make_order(
+            address!("0x1111111111111111111111111111111111111111"),
+            vec![make_io(
+                address!("0x2222222222222222222222222222222222222222"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![make_io(
+                address!("0x3333333333333333333333333333333333333333"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            )],
+        );
+
+        assert!(extract_vault_info(&order, 1, 0).is_none());
+    }
+
+    #[test]
+    fn extract_vault_info_returns_none_for_out_of_bounds_output() {
+        let order = make_order(
+            address!("0x1111111111111111111111111111111111111111"),
+            vec![make_io(
+                address!("0x2222222222222222222222222222222222222222"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![make_io(
+                address!("0x3333333333333333333333333333333333333333"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            )],
+        );
+
+        assert!(extract_vault_info(&order, 0, 1).is_none());
+    }
+
+    #[test]
+    fn extract_vault_info_extracts_valid_indices() {
+        let input_token = address!("0x2222222222222222222222222222222222222222");
+        let output_token = address!("0x3333333333333333333333333333333333333333");
+        let input_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let output_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        let order = make_order(
+            address!("0x1111111111111111111111111111111111111111"),
+            vec![make_io(input_token, input_vault)],
+            vec![make_io(output_token, output_vault)],
+        );
+
+        let (input, output) = extract_vault_info(&order, 0, 0).unwrap();
+
+        assert_eq!(input.token, input_token);
+        assert_eq!(input.vault_id, input_vault);
+        assert_eq!(output.token, output_token);
+        assert_eq!(output.vault_id, output_vault);
+    }
+
+    #[test]
+    fn extract_vaults_from_clear_extracts_both_orders() {
+        let alice_owner = address!("0xaaaa000000000000000000000000000000000001");
+        let bob_owner = address!("0xbbbb000000000000000000000000000000000002");
+
+        let alice = make_order(
+            alice_owner,
+            vec![make_io(
+                address!("0x1111111111111111111111111111111111111111"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![make_io(
+                address!("0x2222222222222222222222222222222222222222"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+            )],
+        );
+
+        let bob = make_order(
+            bob_owner,
+            vec![make_io(
+                address!("0x3333333333333333333333333333333333333333"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
+            )],
+            vec![make_io(
+                address!("0x4444444444444444444444444444444444444444"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000004"),
+            )],
+        );
+
+        let event = IOrderBookV5::ClearV3 {
+            sender: address!("0x0000000000000000000000000000000000000000"),
+            alice,
+            bob,
+            clearConfig: IOrderBookV5::ClearConfigV2 {
+                aliceInputIOIndex: uint!(0_U256),
+                aliceOutputIOIndex: uint!(0_U256),
+                bobInputIOIndex: uint!(0_U256),
+                bobOutputIOIndex: uint!(0_U256),
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
+            },
+        };
+
+        let vaults = extract_vaults_from_clear(&event);
+
+        assert_eq!(vaults.len(), 4);
+        assert_eq!(vaults[0].owner, alice_owner);
+        assert_eq!(vaults[1].owner, alice_owner);
+        assert_eq!(vaults[2].owner, bob_owner);
+        assert_eq!(vaults[3].owner, bob_owner);
+    }
+
+    #[test]
+    fn extract_owned_vaults_extracts_order_vaults() {
+        let owner = address!("0xaaaa000000000000000000000000000000000001");
+        let input_token = address!("0x1111111111111111111111111111111111111111");
+        let output_token = address!("0x2222222222222222222222222222222222222222");
+        let input_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
+        let output_vault =
+            b256!("0x0000000000000000000000000000000000000000000000000000000000000002");
+
+        let order = make_order(
+            owner,
+            vec![make_io(input_token, input_vault)],
+            vec![make_io(output_token, output_vault)],
+        );
+
+        let vaults = extract_owned_vaults(&order, uint!(0_U256), uint!(0_U256));
+
+        assert_eq!(vaults.len(), 2);
+        assert_eq!(vaults[0].owner, owner);
+        assert_eq!(vaults[0].vault.token, input_token);
+        assert_eq!(vaults[0].vault.vault_id, input_vault);
+        assert_eq!(vaults[1].owner, owner);
+        assert_eq!(vaults[1].vault.token, output_token);
+        assert_eq!(vaults[1].vault.vault_id, output_vault);
+    }
+
+    #[test]
+    fn extract_owned_vaults_returns_empty_for_invalid_indices() {
+        let owner = address!("0xaaaa000000000000000000000000000000000001");
+
+        let order = make_order(
+            owner,
+            vec![make_io(
+                address!("0x1111111111111111111111111111111111111111"),
+                b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+            )],
+            vec![],
+        );
+
+        let vaults = extract_owned_vaults(&order, uint!(0_U256), uint!(0_U256));
+        assert!(vaults.is_empty());
     }
 }

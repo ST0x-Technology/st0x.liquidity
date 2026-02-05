@@ -29,13 +29,20 @@ pub(crate) struct WrappedTokenConfig {
 /// Provides efficient lookups by:
 /// - Equity symbol (for mint/redemption flows)
 /// - Wrapped token address (for trade processing)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(from = "Vec<WrappedTokenConfig>")]
 pub(crate) struct WrappedTokenRegistry {
     /// Configs indexed by equity symbol.
     symbols: HashMap<Symbol, WrappedTokenConfig>,
 
     /// Configs indexed by wrapped token address.
     wrapped: HashMap<Address, WrappedTokenConfig>,
+}
+
+impl From<Vec<WrappedTokenConfig>> for WrappedTokenRegistry {
+    fn from(configs: Vec<WrappedTokenConfig>) -> Self {
+        Self::new(configs)
+    }
 }
 
 impl WrappedTokenRegistry {

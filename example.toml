@@ -28,6 +28,7 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 ethereum_rpc_url = "https://mainnet.infura.io"
 evm_private_key = "0x0000000000000000000000000000000000000000000000000000000000000001"
 usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+wrapped_token_registry = []
 
 [rebalancing.equity]
 target = "0.5"

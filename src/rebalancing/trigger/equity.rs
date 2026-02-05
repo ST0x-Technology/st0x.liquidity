@@ -84,14 +84,15 @@ impl Drop for InProgressGuard {
 /// Returns `Mint` if there's too much offchain equity that needs to be tokenized,
 /// or `Redemption` if there's too much onchain equity that needs to be redeemed.
 ///
-/// When `vault_ratio` is provided, the onchain (wrapped) amounts are converted to
-/// unwrapped-equivalent for accurate imbalance detection.
+/// The onchain (wrapped) amounts are converted to unwrapped-equivalent using
+/// the vault_ratio for accurate imbalance detection. For unwrapped tokens,
+/// pass `VaultRatio::one_to_one()`.
 pub(super) async fn check_imbalance_and_build_operation(
     symbol: &Symbol,
     threshold: &ImbalanceThreshold,
     inventory: &Arc<RwLock<InventoryView>>,
     token_address: Address,
-    vault_ratio: Option<&VaultRatio>,
+    vault_ratio: &VaultRatio,
 ) -> Result<TriggeredOperation, EquityTriggerSkip> {
     let imbalance = {
         let inventory = inventory.read().await;
@@ -260,7 +261,7 @@ mod tests {
             &threshold,
             &inventory,
             Address::ZERO,
-            None,
+            &ratio,
         )
         .await;
 
@@ -277,9 +278,14 @@ mod tests {
         };
         let ratio = VaultRatio::one_to_one();
 
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, Address::ZERO, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            Address::ZERO,
+            &ratio,
+        )
+        .await;
 
         assert!(matches!(result, Ok(TriggeredOperation::Mint { .. })));
     }
@@ -295,9 +301,14 @@ mod tests {
         };
         let ratio = VaultRatio::one_to_one();
 
-        let result =
-            check_imbalance_and_build_operation(&symbol, &threshold, &inventory, token_address, None)
-                .await;
+        let result = check_imbalance_and_build_operation(
+            &symbol,
+            &threshold,
+            &inventory,
+            token_address,
+            &ratio,
+        )
+        .await;
 
         let Ok(TriggeredOperation::Redemption { token, .. }) = result else {
             panic!("Expected Redemption, got {result:?}");

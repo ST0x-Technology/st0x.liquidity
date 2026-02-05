@@ -84,7 +84,6 @@ where
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn with_registry(mut self, registry: WrappedTokenRegistry) -> Self {
         self.registry = registry;
         self

@@ -26,6 +26,7 @@ mod onchain_trade;
 mod position;
 mod queue;
 mod rebalancing;
+mod shares;
 mod symbol;
 mod telemetry;
 mod threshold;
