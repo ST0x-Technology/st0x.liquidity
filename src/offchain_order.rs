@@ -796,7 +796,7 @@ pub(crate) fn noop_order_placer() -> OffchainOrderServices {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
@@ -1109,7 +1109,6 @@ mod tests {
         };
 
         let result = order.handle(command, &services()).await;
-
         assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
     }
 
@@ -1132,7 +1131,6 @@ mod tests {
         };
 
         let result = order.handle(command, &services()).await;
-
         assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
     }
 
@@ -1180,14 +1178,13 @@ mod tests {
         };
 
         let events = order.handle(command, &services()).await.unwrap();
-
         assert_eq!(events.len(), 1);
 
         order.apply(events[0].clone());
-
         let Lifecycle::Live(inner) = order else {
             panic!("Expected Live state");
         };
+
         assert!(matches!(inner, OffchainOrder::Failed { .. }));
     }
 
@@ -1357,7 +1354,7 @@ mod tests {
         assert!(matches!(order, Lifecycle::Failed { .. }));
     }
 
-    fn succeeding_order_placer() -> OffchainOrderServices {
+    pub(crate) fn succeeding_order_placer() -> OffchainOrderServices {
         struct SucceedingOrderPlacer;
 
         #[async_trait]

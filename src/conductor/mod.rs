@@ -1,11 +1,13 @@
 #[cfg(test)]
 mod builder;
 mod manifest;
+mod queue;
 pub(crate) mod wire;
 
 use std::sync::Arc;
 
 use manifest::QueryManifest;
+use queue::{VaultDiscoveryContext, run_queue_processor};
 use std::time::Duration;
 use wire::{Cons, CqrsBuilder, Nil, UnwiredQuery};
 
@@ -26,12 +28,10 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_execution::{
-    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
-    Symbol,
+    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, Symbol,
 };
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
@@ -39,7 +39,7 @@ use crate::cctp::USDC_BASE;
 use crate::config::Config;
 use crate::dashboard::ServerMessage;
 use crate::equity_redemption::RedemptionServices;
-use crate::error::{EventProcessingError, EventQueueError};
+use crate::error::EventProcessingError;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
@@ -49,9 +49,7 @@ use crate::offchain_order::{
     OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
     OffchainOrderId, OffchainOrderQuery, OffchainOrderServices, OrderPlacer,
 };
-use crate::onchain::accumulator::{
-    ExecutionParams, check_all_positions, check_execution_readiness,
-};
+use crate::onchain::accumulator::{ExecutionParams, check_all_positions};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
@@ -61,13 +59,12 @@ use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
-use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::queue::{QueuedEvent, enqueue};
 use crate::rebalancing::{
     RebalancerAddresses, RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger,
     RebalancingTriggerConfig, RedemptionDependencies, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
-use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenization::{AlpacaTokenizationService, Tokenizer};
 use crate::vault_registry::{
@@ -76,21 +73,14 @@ use crate::vault_registry::{
 #[cfg(test)]
 pub(crate) use builder::ConductorBuilder;
 
-/// Context for vault discovery operations during trade processing.
-struct VaultDiscoveryContext<'a> {
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
-    orderbook: Address,
-    order_owner: Address,
-}
-
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
-struct TradeProcessingCqrs {
-    onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
-    position_cqrs: Arc<PositionCqrs>,
-    position_query: Arc<PositionQuery>,
-    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    offchain_order_query: Arc<OffchainOrderQuery>,
-    execution_threshold: ExecutionThreshold,
+pub(super) struct TradeProcessingCqrs {
+    pub(super) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
+    pub(super) position_cqrs: Arc<PositionCqrs>,
+    pub(super) position_query: Arc<PositionQuery>,
+    pub(super) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    pub(super) offchain_order_query: Arc<OffchainOrderQuery>,
+    pub(super) execution_threshold: ExecutionThreshold,
 }
 
 /// Adapter that bridges the generic Executor trait to the OrderPlacer
@@ -1051,129 +1041,6 @@ async fn process_live_event(
     Ok(())
 }
 
-async fn run_queue_processor<P, E>(
-    executor: &E,
-    config: &Config,
-    pool: &SqlitePool,
-    cache: &SymbolCache,
-    provider: P,
-    cqrs: &TradeProcessingCqrs,
-    vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
-) where
-    P: Provider + Clone,
-    E: Executor + Clone,
-    EventProcessingError: From<E::Error>,
-{
-    info!("Starting queue processor service");
-
-    let feed_id_cache = FeedIdCache::default();
-
-    log_unprocessed_event_count(pool).await;
-
-    let executor_type = executor.to_supported_executor();
-
-    let queue_context = QueueProcessingContext {
-        cache,
-        feed_id_cache: &feed_id_cache,
-        vault_registry_cqrs,
-    };
-
-    loop {
-        let result =
-            process_next_queued_event(executor_type, config, pool, &provider, cqrs, &queue_context)
-                .await;
-
-        handle_queue_processing_result(result).await;
-    }
-}
-
-async fn log_unprocessed_event_count(pool: &SqlitePool) {
-    match crate::queue::count_unprocessed(pool).await {
-        Ok(count) if count > 0 => {
-            info!("Found {count} unprocessed events from previous sessions to process");
-        }
-        Ok(_) => info!("No unprocessed events found, starting fresh"),
-        Err(e) => error!("Failed to count unprocessed events: {e}"),
-    }
-}
-
-async fn handle_queue_processing_result(
-    result: Result<Option<OffchainOrderId>, EventProcessingError>,
-) {
-    match result {
-        Ok(Some(offchain_order_id)) => {
-            info!(%offchain_order_id, "Offchain order placed successfully");
-        }
-        Ok(None) => {
-            sleep(Duration::from_millis(100)).await;
-        }
-        Err(e) => {
-            error!("Error processing queued event: {e}");
-            sleep(Duration::from_millis(500)).await;
-        }
-    }
-}
-
-/// Context for queue event processing containing caches and CQRS components.
-struct QueueProcessingContext<'a> {
-    cache: &'a SymbolCache,
-    feed_id_cache: &'a FeedIdCache,
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
-}
-
-#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn process_next_queued_event<P: Provider + Clone>(
-    executor_type: SupportedExecutor,
-    config: &Config,
-    pool: &SqlitePool,
-    provider: &P,
-    cqrs: &TradeProcessingCqrs,
-    queue_context: &QueueProcessingContext<'_>,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    let queued_event = get_next_unprocessed_event(pool).await?;
-    let Some(queued_event) = queued_event else {
-        return Ok(None);
-    };
-
-    let event_id = extract_event_id(&queued_event)?;
-
-    let onchain_trade = convert_event_to_trade(
-        config,
-        queue_context.cache,
-        provider,
-        &queued_event,
-        queue_context.feed_id_cache,
-    )
-    .await?;
-
-    let Some(trade) = onchain_trade else {
-        return handle_filtered_event(pool, &queued_event, event_id).await;
-    };
-
-    let vault_discovery_context = VaultDiscoveryContext {
-        vault_registry_cqrs: queue_context.vault_registry_cqrs,
-        orderbook: config.evm.orderbook,
-        order_owner: config.order_owner()?,
-    };
-
-    process_valid_trade(
-        executor_type,
-        pool,
-        &queued_event,
-        event_id,
-        trade,
-        cqrs,
-        &vault_discovery_context,
-    )
-    .await
-}
-
-fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
-    queued_event
-        .id
-        .ok_or(EventProcessingError::Queue(EventQueueError::MissingEventId))
-}
-
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
 ///
 /// This function is called AFTER trade conversion succeeds, using the trade's
@@ -1183,7 +1050,7 @@ fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingEr
 /// Vaults are classified as:
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
-async fn discover_vaults_for_trade(
+pub(super) async fn discover_vaults_for_trade(
     queued_event: &QueuedEvent,
     trade: &OnchainTrade,
     context: &VaultDiscoveryContext<'_>,
@@ -1243,7 +1110,7 @@ async fn discover_vaults_for_trade(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn convert_event_to_trade<P: Provider + Clone>(
+pub(super) async fn convert_event_to_trade<P: Provider + Clone>(
     config: &Config,
     cache: &SymbolCache,
     provider: &P,
@@ -1282,66 +1149,6 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     Ok(onchain_trade)
 }
 
-#[tracing::instrument(skip(pool, queued_event), fields(event_id), level = tracing::Level::DEBUG)]
-async fn handle_filtered_event(
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    info!(
-        "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
-        match &queued_event.event {
-            TradeEvent::ClearV3(_) => "ClearV3",
-            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-        },
-        queued_event.tx_hash,
-        queued_event.log_index
-    );
-
-    mark_event_processed(pool, event_id).await?;
-
-    Ok(None)
-}
-
-#[tracing::instrument(
-    skip(pool, queued_event, trade, cqrs, vault_discovery_context),
-    fields(event_id, symbol = %trade.symbol),
-    level = tracing::Level::INFO
-)]
-async fn process_valid_trade(
-    executor_type: SupportedExecutor,
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
-    trade: OnchainTrade,
-    cqrs: &TradeProcessingCqrs,
-    vault_discovery_context: &VaultDiscoveryContext<'_>,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    info!(
-        "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
-        match &queued_event.event {
-            TradeEvent::ClearV3(_) => "ClearV3",
-            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-        },
-        trade.tx_hash,
-        trade.log_index,
-        trade.symbol,
-        trade.amount
-    );
-
-    discover_vaults_for_trade(queued_event, &trade, vault_discovery_context).await?;
-
-    let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
-    let _guard = symbol_lock.lock().await;
-
-    info!(
-        "Processing queued trade: symbol={}, amount={}, direction={:?}, tx_hash={:?}, log_index={}",
-        trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
-    );
-
-    process_queued_trade(executor_type, pool, queued_event, event_id, trade, cqrs).await
-}
-
 /// Extracts amount and price as Decimals from a trade, logging errors on failure.
 fn extract_trade_decimals(trade: &OnchainTrade) -> Option<(Decimal, Decimal)> {
     let amount = match Decimal::try_from(trade.amount) {
@@ -1369,7 +1176,7 @@ fn extract_trade_decimals(trade: &OnchainTrade) -> Option<(Decimal, Decimal)> {
     Some((amount, price_usdc))
 }
 
-async fn execute_witness_trade(
+pub(super) async fn execute_witness_trade(
     onchain_trade_cqrs: &OnChainTradeCqrs,
     trade: &OnchainTrade,
     block_number: u64,
@@ -1409,7 +1216,7 @@ async fn execute_witness_trade(
     }
 }
 
-async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainTrade) {
+pub(super) async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainTrade) {
     let base_symbol = trade.symbol.base();
     let aggregate_id = Position::aggregate_id(base_symbol);
 
@@ -1448,7 +1255,7 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
     }
 }
 
-async fn execute_new_execution_cqrs(
+pub(super) async fn execute_new_execution_cqrs(
     position_cqrs: &PositionCqrs,
     offchain_order_cqrs: &OffchainOrderCqrs,
     offchain_order_query: &OffchainOrderQuery,
@@ -1558,56 +1365,6 @@ async fn execute_place_offchain_order(
             "OffchainOrder::PlaceOrder failed: {e}"
         ),
     }
-}
-
-async fn process_queued_trade(
-    executor_type: SupportedExecutor,
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
-    trade: OnchainTrade,
-    cqrs: &TradeProcessingCqrs,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    // Update Position aggregate FIRST so threshold check sees current state
-    execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
-
-    mark_event_processed(pool, event_id).await.map_err(|e| {
-        error!("Failed to mark event {event_id} as processed: {e}");
-        EventProcessingError::Queue(e)
-    })?;
-
-    info!(
-        "Successfully marked event as processed: event_id={}, tx_hash={:?}, log_index={}",
-        event_id, queued_event.tx_hash, queued_event.log_index
-    );
-
-    execute_witness_trade(&cqrs.onchain_trade_cqrs, &trade, queued_event.block_number).await;
-
-    let base_symbol = trade.symbol.base();
-
-    let Some(params) = check_execution_readiness(
-        &cqrs.position_query,
-        base_symbol,
-        executor_type,
-        &cqrs.execution_threshold,
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    let offchain_order_id = OffchainOrder::aggregate_id();
-    execute_new_execution_cqrs(
-        &cqrs.position_cqrs,
-        &cqrs.offchain_order_cqrs,
-        &cqrs.offchain_order_query,
-        offchain_order_id,
-        &params,
-        &cqrs.execution_threshold,
-    )
-    .await;
-
-    Ok(Some(offchain_order_id))
 }
 
 fn reconstruct_log_from_queued_event(
@@ -1814,8 +1571,11 @@ mod tests {
     use futures_util::stream;
     use rust_decimal_macros::dec;
     use sqlite_es::SqliteViewRepository;
-    use st0x_execution::{Direction, MockExecutorConfig, Symbol, TryIntoExecutor};
+    use st0x_execution::{
+        Direction, MockExecutorConfig, SupportedExecutor, Symbol, TryIntoExecutor,
+    };
 
+    use super::queue::{QueueProcessingContext, process_next_queued_event, process_queued_trade};
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::conductor::builder::CqrsFrameworks;
