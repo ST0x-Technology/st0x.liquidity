@@ -50,6 +50,12 @@ enum TokenAddressError {
 pub enum RebalancingConfigError {
     #[error("rebalancing requires Alpaca broker")]
     NotAlpacaBroker,
+    #[error(transparent)]
+    Ecdsa(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("market_maker_wallet and redemption_wallet must be different addresses (both are {0})")]
+    WalletCollision(Address),
+    #[error(transparent)]
+    Uuid(#[from] uuid::Error),
 }
 
 /// USDC rebalancing configuration with explicit enable/disable.
@@ -58,6 +64,20 @@ pub enum RebalancingConfigError {
 pub(crate) enum UsdcRebalancingConfig {
     Enabled { target: Decimal, deviation: Decimal },
     Disabled,
+}
+
+/// TOML fields for rebalancing configuration (without broker auth).
+///
+/// This struct is used when rebalancing config is part of a larger config
+/// where broker auth is provided separately.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub(crate) struct RebalancingTomlFields {
+    pub(crate) equity: ImbalanceThreshold,
+    pub(crate) usdc: UsdcRebalancingConfig,
+    pub(crate) redemption_wallet: Address,
+    pub(crate) ethereum_rpc_url: Url,
+    pub(crate) evm_private_key: B256,
+    pub(crate) usdc_vault_id: B256,
 }
 
 /// Configuration for rebalancing operations.
@@ -76,10 +96,41 @@ pub(crate) struct RebalancingConfig {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
-    /// Parsed from `alpaca_broker_auth.alpaca_account_id` during construction.
+    /// Parsed from `alpaca_broker_auth.account_id` during construction.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Alpaca Broker API authentication for rebalancing operations.
     pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+}
+
+impl RebalancingConfig {
+    /// Constructs RebalancingConfig from TOML fields and broker auth.
+    ///
+    /// Validates that the market maker wallet (derived from evm_private_key)
+    /// differs from the redemption_wallet.
+    pub(crate) fn from_toml_and_broker(
+        fields: RebalancingTomlFields,
+        broker_auth: AlpacaBrokerApiAuthConfig,
+    ) -> Result<Self, RebalancingConfigError> {
+        let signer = PrivateKeySigner::from_bytes(&fields.evm_private_key)?;
+        let market_maker_wallet = signer.address();
+
+        if market_maker_wallet == fields.redemption_wallet {
+            return Err(RebalancingConfigError::WalletCollision(market_maker_wallet));
+        }
+
+        let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
+
+        Ok(Self {
+            equity: fields.equity,
+            usdc: fields.usdc,
+            redemption_wallet: fields.redemption_wallet,
+            ethereum_rpc_url: fields.ethereum_rpc_url,
+            evm_private_key: fields.evm_private_key,
+            usdc_vault_id: fields.usdc_vault_id,
+            alpaca_account_id,
+            alpaca_broker_auth: broker_auth,
+        })
+    }
 }
 
 impl<'de> serde::Deserialize<'de> for RebalancingConfig {
@@ -531,7 +582,7 @@ impl RebalancingTrigger {
             matches!(
                 envelope.payload,
                 EquityRedemptionEvent::Completed { .. }
-                    | EquityRedemptionEvent::SendFailed { .. }
+                    | EquityRedemptionEvent::TransferFailed { .. }
                     | EquityRedemptionEvent::DetectionFailed { .. }
                     | EquityRedemptionEvent::RedemptionRejected { .. }
             )
@@ -657,6 +708,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::conductor::wire::test_cqrs;
+    use crate::equity_redemption::DetectionFailure;
     use crate::inventory::InventorySnapshotQuery;
     use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::lifecycle::Lifecycle;
@@ -1369,7 +1421,7 @@ mod tests {
 
     fn make_detection_failed() -> EquityRedemptionEvent {
         EquityRedemptionEvent::DetectionFailed {
-            reason: "Alpaca timeout".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         }
     }
@@ -1382,7 +1434,6 @@ mod tests {
 
     fn make_redemption_rejected() -> EquityRedemptionEvent {
         EquityRedemptionEvent::RedemptionRejected {
-            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         }
     }

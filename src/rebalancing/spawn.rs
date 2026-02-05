@@ -85,7 +85,6 @@ pub(crate) struct RedemptionDependencies<BP: Provider + Clone> {
 
 /// CQRS-related dependencies for redemption manager.
 pub(crate) struct RedemptionCqrs {
-    pub(crate) tokenizer: Arc<dyn Tokenizer>,
     pub(crate) cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
     pub(crate) query: Arc<SqliteQuery<EquityRedemption, Never>>,
 }
@@ -108,8 +107,6 @@ where
     let signer = PrivateKeySigner::from_bytes(&config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
 
-    let tokenizer: Arc<dyn Tokenizer> = redemption.tokenization_service.clone();
-
     let services = Services::new(
         config,
         &ethereum_wallet,
@@ -121,7 +118,6 @@ where
     .await?;
 
     let redemption_cqrs = RedemptionCqrs {
-        tokenizer,
         cqrs: redemption.cqrs,
         query: redemption.query,
     };
@@ -242,11 +238,8 @@ where
             frameworks.mint,
         ));
 
-        let redemption_manager = Arc::new(RedemptionManager::new(
-            redemption.tokenizer,
-            redemption.cqrs,
-            redemption.query,
-        ));
+        let redemption_manager =
+            Arc::new(RedemptionManager::new(redemption.cqrs, redemption.query));
 
         let usdc_manager = Arc::new(UsdcRebalanceManager::new(
             self.broker,
@@ -590,7 +583,6 @@ mod tests {
         };
 
         let redemption = RedemptionCqrs {
-            tokenizer: services.tokenization.clone(),
             cqrs: redemption_cqrs,
             query: redemption_query,
         };

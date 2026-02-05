@@ -23,8 +23,8 @@ impl MockVault {
 
 #[async_trait]
 impl Vault for MockVault {
-    async fn lookup_vault_id(&self, _token: Address) -> Option<VaultId> {
-        Some(self.vault_id)
+    async fn lookup_vault_id(&self, _token: Address) -> Result<VaultId, VaultError> {
+        Ok(self.vault_id)
     }
 
     async fn deposit(

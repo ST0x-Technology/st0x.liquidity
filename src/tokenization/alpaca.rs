@@ -224,6 +224,29 @@ pub(crate) struct TokenizationRequest {
     updated_at: Option<DateTime<Utc>>,
 }
 
+#[cfg(test)]
+impl TokenizationRequest {
+    /// Create a mock TokenizationRequest for testing.
+    pub(crate) fn mock(status: TokenizationRequestStatus) -> Self {
+        Self {
+            id: TokenizationRequestId("MOCK_REQ_ID".to_string()),
+            r#type: None,
+            status,
+            underlying_symbol: Symbol::new("AAPL").unwrap(),
+            token_symbol: None,
+            quantity: FractionalShares::ZERO,
+            issuer: Issuer::new("alpaca"),
+            network: Network::new("base"),
+            wallet: None,
+            issuer_request_id: None,
+            tx_hash: None,
+            fees: None,
+            created_at: Utc::now(),
+            updated_at: None,
+        }
+    }
+}
+
 fn deserialize_tokenized_symbol<'de, D>(
     deserializer: D,
 ) -> Result<Option<TokenizedEquitySymbol>, D::Error>
@@ -300,8 +323,12 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Contract reverted: {0}")]
     Revert(#[from] AbiDecodedErrorType),
 
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("Transaction error: {source}")]
+    Transaction {
+        tx_hash: TxHash,
+        #[source]
+        source: alloy::providers::PendingTransactionError,
+    },
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
@@ -541,13 +568,16 @@ where
         let erc20 = IERC20::new(token, self.provider.clone());
 
         let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
-            Ok(pending) => pending,
+            Ok(p) => p,
             Err(e) => return Err(handle_contract_error(e).await),
         };
 
-        let receipt = pending.get_receipt().await?;
+        let tx_hash = *pending.tx_hash();
+        if let Err(source) = pending.get_receipt().await {
+            return Err(AlpacaTokenizationError::Transaction { tx_hash, source });
+        }
 
-        Ok(receipt.transaction_hash)
+        Ok(tx_hash)
     }
 
     /// Find a redemption request by its onchain transaction hash.

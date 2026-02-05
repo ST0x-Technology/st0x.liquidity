@@ -228,7 +228,7 @@ where
         redemption_services,
     ));
 
-    let redemption_manager = RedemptionManager::new(tokenizer, redemption_cqrs, redemption_query);
+    let redemption_manager = RedemptionManager::new(redemption_cqrs, redemption_query);
 
     let aggregate_id = RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
 

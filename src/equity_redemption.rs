@@ -55,7 +55,9 @@ use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 use crate::onchain::vault::{Vault, VaultError};
-use crate::tokenization::{Tokenizer, TokenizerError};
+use crate::tokenization::{
+    AlpacaTokenizationError, TokenizationRequestStatus, Tokenizer, TokenizerError,
+};
 use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// Our tokenized equity tokens use 18 decimals.
@@ -96,24 +98,21 @@ pub(crate) enum EquityRedemptionError {
     /// Tokenizer operation failed
     #[error("Tokenizer error: {0}")]
     Tokenizer(#[from] TokenizerError),
-    /// Vault not found for token in vault registry
-    #[error("Vault not found for token {0}")]
-    VaultNotFound(Address),
     /// Attempted to detect redemption before sending tokens
     #[error("Cannot detect redemption: tokens not sent")]
     TokensNotSent,
-    /// Attempted to complete before redemption was detected as pending
-    #[error("Cannot complete: not in pending state")]
+    /// Attempted to await completion before redemption was detected
+    #[error("Cannot await completion: not in pending state")]
     NotPending,
-    /// Attempted to reject before redemption was detected as pending
-    #[error("Cannot reject: not in pending state")]
-    NotPendingForRejection,
     /// Attempted to modify a completed redemption operation
     #[error("Already completed")]
     AlreadyCompleted,
     /// Attempted to modify a failed redemption operation
     #[error("Already failed")]
     AlreadyFailed,
+    /// Poll returned unexpected pending status
+    #[error("Poll for completion returned pending status unexpectedly")]
+    UnexpectedPendingStatus,
     /// Lifecycle state error
     #[error(transparent)]
     State(#[from] LifecycleError<Never>),
@@ -130,16 +129,19 @@ pub(crate) enum EquityRedemptionCommand {
         token: Address,
         amount: U256,
     },
-    Detect {
-        tokenization_request_id: TokenizationRequestId,
-    },
-    FailDetection {
-        reason: String,
-    },
-    Complete,
-    RejectRedemption {
-        reason: String,
-    },
+    /// Polls Alpaca until they detect the token transfer.
+    /// Emits Detected on success, DetectionFailed on timeout/error.
+    Detect,
+    /// Polls Alpaca until the redemption reaches a terminal state.
+    /// Emits Completed or RedemptionRejected based on result.
+    AwaitCompletion,
+}
+
+/// Reason for detection failure when polling Alpaca for redemption detection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum DetectionFailure {
+    Timeout,
+    ApiError { status_code: Option<u16> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,9 +154,9 @@ pub(crate) enum EquityRedemptionEvent {
         vault_withdraw_tx: TxHash,
         withdrawn_at: DateTime<Utc>,
     },
-    /// Vault withdraw succeeded but send failed. Tokens are in wallet.
-    SendFailed {
-        reason: String,
+    /// Vault withdraw succeeded but transfer to redemption wallet failed.
+    TransferFailed {
+        tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
 
@@ -167,7 +169,7 @@ pub(crate) enum EquityRedemptionEvent {
     /// Alpaca failed to detect the token transfer.
     /// Tokens were sent but detection failed - keep inflight until manually resolved.
     DetectionFailed {
-        reason: String,
+        failure: DetectionFailure,
         failed_at: DateTime<Utc>,
     },
 
@@ -178,7 +180,6 @@ pub(crate) enum EquityRedemptionEvent {
     /// Alpaca rejected the redemption after detection.
     /// Tokens location unknown after rejection - keep inflight until manually resolved.
     RedemptionRejected {
-        reason: String,
         rejected_at: DateTime<Utc>,
     },
 
@@ -191,7 +192,7 @@ impl DomainEvent for EquityRedemptionEvent {
     fn event_type(&self) -> String {
         match self {
             Self::VaultWithdrawn { .. } => "EquityRedemptionEvent::VaultWithdrawn".to_string(),
-            Self::SendFailed { .. } => "EquityRedemptionEvent::SendFailed".to_string(),
+            Self::TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
             Self::TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
             Self::DetectionFailed { .. } => "EquityRedemptionEvent::DetectionFailed".to_string(),
             Self::Detected { .. } => "EquityRedemptionEvent::Detected".to_string(),
@@ -252,7 +253,7 @@ pub(crate) enum EquityRedemption {
         completed_at: DateTime<Utc>,
     },
 
-    /// Redemption failed with error reason (terminal state)
+    /// Redemption failed (terminal state)
     ///
     /// Fields preserve context depending on when failure occurred:
     /// - `vault_withdraw_tx`: Present if vault withdraw succeeded
@@ -264,7 +265,6 @@ pub(crate) enum EquityRedemption {
         vault_withdraw_tx: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
-        reason: String,
         failed_at: DateTime<Utc>,
     },
 }
@@ -292,27 +292,21 @@ impl Aggregate for Lifecycle<EquityRedemption, Never> {
         command: Self::Command,
         services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        match &command {
+        match command {
             EquityRedemptionCommand::Redeem {
                 symbol,
                 quantity,
                 token,
                 amount,
             } => {
-                self.handle_redeem(services, symbol.clone(), *quantity, *token, *amount)
+                self.handle_redeem(services, symbol, quantity, token, amount)
                     .await
             }
 
-            EquityRedemptionCommand::Detect {
-                tokenization_request_id,
-            } => self.handle_detect(tokenization_request_id),
+            EquityRedemptionCommand::Detect => self.handle_detect(services).await,
 
-            EquityRedemptionCommand::FailDetection { reason } => self.handle_fail_detection(reason),
-
-            EquityRedemptionCommand::Complete => self.handle_complete(),
-
-            EquityRedemptionCommand::RejectRedemption { reason } => {
-                self.handle_reject_redemption(reason)
+            EquityRedemptionCommand::AwaitCompletion => {
+                self.handle_await_completion(services).await
             }
         }
     }
@@ -329,11 +323,7 @@ impl Lifecycle<EquityRedemption, Never> {
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         match self.live() {
             Err(LifecycleError::Uninitialized) => {
-                let vault_id = services
-                    .vault
-                    .lookup_vault_id(token)
-                    .await
-                    .ok_or(EquityRedemptionError::VaultNotFound(token))?;
+                let vault_id = services.vault.lookup_vault_id(token).await?;
 
                 let vault_withdraw_tx = services
                     .vault
@@ -362,11 +352,20 @@ impl Lifecycle<EquityRedemption, Never> {
                         ])
                     }
                     Err(e) => {
-                        // Vault withdraw succeeded but send failed - emit both events
+                        // Vault withdraw succeeded but transfer failed - emit both events
+                        // Extract tx_hash if available (when tx was sent but receipt failed)
+                        let tx_hash = match &e {
+                            TokenizerError::Alpaca(AlpacaTokenizationError::Transaction {
+                                tx_hash,
+                                ..
+                            }) => Some(*tx_hash),
+
+                            TokenizerError::Alpaca(_) => None,
+                        };
                         Ok(vec![
                             vault_withdrawn,
-                            EquityRedemptionEvent::SendFailed {
-                                reason: e.to_string(),
+                            EquityRedemptionEvent::TransferFailed {
+                                tx_hash,
                                 failed_at: now,
                             },
                         ])
@@ -379,78 +378,91 @@ impl Lifecycle<EquityRedemption, Never> {
         }
     }
 
-    fn handle_detect(
+    async fn handle_detect(
         &self,
-        tokenization_request_id: &TokenizationRequestId,
+        services: &RedemptionServices,
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized) => Err(EquityRedemptionError::TokensNotSent),
-            Ok(EquityRedemption::TokensSent { .. }) => Ok(vec![EquityRedemptionEvent::Detected {
-                tokenization_request_id: tokenization_request_id.clone(),
+        let redemption_tx = match self.live() {
+            Err(LifecycleError::Uninitialized) | Ok(EquityRedemption::VaultWithdrawn { .. }) => {
+                return Err(EquityRedemptionError::TokensNotSent);
+            }
+            Ok(EquityRedemption::TokensSent { redemption_tx, .. }) => *redemption_tx,
+            Ok(EquityRedemption::Failed { .. }) => {
+                return Err(EquityRedemptionError::AlreadyFailed);
+            }
+            Ok(_) => return Err(EquityRedemptionError::AlreadyCompleted),
+            Err(e) => return Err(e.into()),
+        };
+
+        match services.tokenizer.poll_for_redemption(&redemption_tx).await {
+            Ok(request) => Ok(vec![EquityRedemptionEvent::Detected {
+                tokenization_request_id: request.id,
                 detected_at: Utc::now(),
             }]),
-            Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Ok(_) => Err(EquityRedemptionError::AlreadyCompleted),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_complete(&self) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized)
-            | Ok(EquityRedemption::VaultWithdrawn { .. } | EquityRedemption::TokensSent { .. }) => {
-                Err(EquityRedemptionError::NotPending)
-            }
-            Ok(EquityRedemption::Pending { .. }) => Ok(vec![EquityRedemptionEvent::Completed {
-                completed_at: Utc::now(),
-            }]),
-            Ok(EquityRedemption::Completed { .. }) => Err(EquityRedemptionError::AlreadyCompleted),
-            Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    fn handle_fail_detection(
-        &self,
-        reason: &str,
-    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
-        match self.live() {
-            Err(LifecycleError::Uninitialized) | Ok(EquityRedemption::VaultWithdrawn { .. }) => {
-                Err(EquityRedemptionError::TokensNotSent)
-            }
-            Ok(EquityRedemption::TokensSent { .. }) => {
+            Err(e) => {
+                let failure = detection_failure_from_error(&e);
                 Ok(vec![EquityRedemptionEvent::DetectionFailed {
-                    reason: reason.to_string(),
+                    failure,
                     failed_at: Utc::now(),
                 }])
             }
-            Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Ok(EquityRedemption::Pending { .. } | EquityRedemption::Completed { .. }) => {
-                Err(EquityRedemptionError::AlreadyCompleted)
-            }
-            Err(e) => Err(e.into()),
         }
     }
 
-    fn handle_reject_redemption(
+    async fn handle_await_completion(
         &self,
-        reason: &str,
+        services: &RedemptionServices,
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
-        match self.live() {
+        let tokenization_request_id = match self.live() {
             Err(LifecycleError::Uninitialized)
             | Ok(EquityRedemption::VaultWithdrawn { .. } | EquityRedemption::TokensSent { .. }) => {
-                Err(EquityRedemptionError::NotPendingForRejection)
+                return Err(EquityRedemptionError::NotPending);
             }
-            Ok(EquityRedemption::Pending { .. }) => {
+            Ok(EquityRedemption::Pending {
+                tokenization_request_id,
+                ..
+            }) => tokenization_request_id.clone(),
+            Ok(EquityRedemption::Completed { .. }) => {
+                return Err(EquityRedemptionError::AlreadyCompleted);
+            }
+            Ok(EquityRedemption::Failed { .. }) => {
+                return Err(EquityRedemptionError::AlreadyFailed);
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let request = services
+            .tokenizer
+            .poll_redemption_until_complete(&tokenization_request_id)
+            .await?;
+
+        match request.status {
+            TokenizationRequestStatus::Completed => Ok(vec![EquityRedemptionEvent::Completed {
+                completed_at: Utc::now(),
+            }]),
+            TokenizationRequestStatus::Rejected => {
                 Ok(vec![EquityRedemptionEvent::RedemptionRejected {
-                    reason: reason.to_string(),
                     rejected_at: Utc::now(),
                 }])
             }
-            Ok(EquityRedemption::Completed { .. }) => Err(EquityRedemptionError::AlreadyCompleted),
-            Ok(EquityRedemption::Failed { .. }) => Err(EquityRedemptionError::AlreadyFailed),
-            Err(e) => Err(e.into()),
+            TokenizationRequestStatus::Pending => {
+                Err(EquityRedemptionError::UnexpectedPendingStatus)
+            }
         }
+    }
+}
+
+fn detection_failure_from_error(e: &TokenizerError) -> DetectionFailure {
+    match e {
+        TokenizerError::Alpaca(AlpacaTokenizationError::PollTimeout { .. }) => {
+            DetectionFailure::Timeout
+        }
+        TokenizerError::Alpaca(AlpacaTokenizationError::ApiError { status, .. }) => {
+            DetectionFailure::ApiError {
+                status_code: Some(status.as_u16()),
+            }
+        }
+        TokenizerError::Alpaca(_) => DetectionFailure::ApiError { status_code: None },
     }
 }
 
@@ -466,8 +478,8 @@ impl EquityRedemption {
                 event: event.event_type(),
             }),
 
-            EquityRedemptionEvent::SendFailed { reason, failed_at } => {
-                current.apply_send_failed(reason, *failed_at, event)
+            EquityRedemptionEvent::TransferFailed { tx_hash, failed_at } => {
+                current.apply_transfer_failed(*tx_hash, *failed_at, event)
             }
 
             EquityRedemptionEvent::TokensSent {
@@ -476,8 +488,8 @@ impl EquityRedemption {
                 sent_at,
             } => current.apply_tokens_sent(*redemption_wallet, *redemption_tx, *sent_at, event),
 
-            EquityRedemptionEvent::DetectionFailed { reason, failed_at } => {
-                current.apply_detection_failed(reason, *failed_at, event)
+            EquityRedemptionEvent::DetectionFailed { failed_at, .. } => {
+                current.apply_detection_failed(*failed_at, event)
             }
 
             EquityRedemptionEvent::Detected {
@@ -485,10 +497,9 @@ impl EquityRedemption {
                 detected_at,
             } => current.apply_detected(tokenization_request_id, *detected_at, event),
 
-            EquityRedemptionEvent::RedemptionRejected {
-                reason,
-                rejected_at,
-            } => current.apply_redemption_rejected(reason, *rejected_at, event),
+            EquityRedemptionEvent::RedemptionRejected { rejected_at } => {
+                current.apply_redemption_rejected(*rejected_at, event)
+            }
 
             EquityRedemptionEvent::Completed { completed_at } => {
                 current.apply_completed(*completed_at, event)
@@ -552,9 +563,9 @@ impl EquityRedemption {
         })
     }
 
-    fn apply_send_failed(
+    fn apply_transfer_failed(
         &self,
-        reason: &str,
+        tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
     ) -> Result<Self, LifecycleError<Never>> {
@@ -575,9 +586,8 @@ impl EquityRedemption {
             symbol: symbol.clone(),
             quantity: *quantity,
             vault_withdraw_tx: Some(*vault_withdraw_tx),
-            redemption_tx: None,
+            redemption_tx: tx_hash,
             tokenization_request_id: None,
-            reason: reason.to_string(),
             failed_at,
         })
     }
@@ -642,7 +652,6 @@ impl EquityRedemption {
 
     fn apply_detection_failed(
         &self,
-        reason: &str,
         failed_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
     ) -> Result<Self, LifecycleError<Never>> {
@@ -666,14 +675,12 @@ impl EquityRedemption {
             vault_withdraw_tx: Some(*vault_withdraw_tx),
             redemption_tx: Some(*redemption_tx),
             tokenization_request_id: None,
-            reason: reason.to_string(),
             failed_at,
         })
     }
 
     fn apply_redemption_rejected(
         &self,
-        reason: &str,
         rejected_at: DateTime<Utc>,
         event: &EquityRedemptionEvent,
     ) -> Result<Self, LifecycleError<Never>> {
@@ -697,7 +704,6 @@ impl EquityRedemption {
             vault_withdraw_tx: None,
             redemption_tx: Some(*redemption_tx),
             tokenization_request_id: Some(tokenization_request_id.clone()),
-            reason: reason.to_string(),
             failed_at: rejected_at,
         })
     }
@@ -709,11 +715,25 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::onchain::mock::MockVault;
-    use crate::tokenization::mock::MockTokenizer;
+    use crate::tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
 
     pub(crate) fn mock_redeemer_services() -> RedemptionServices {
         RedemptionServices {
             tokenizer: Arc::new(MockTokenizer::new()),
+            vault: Arc::new(MockVault::new()),
+        }
+    }
+
+    fn services_with_detection(outcome: MockDetectionOutcome) -> RedemptionServices {
+        RedemptionServices {
+            tokenizer: Arc::new(MockTokenizer::new().with_detection_outcome(outcome)),
+            vault: Arc::new(MockVault::new()),
+        }
+    }
+
+    fn services_with_completion(outcome: MockCompletionOutcome) -> RedemptionServices {
+        RedemptionServices {
+            tokenizer: Arc::new(MockTokenizer::new().with_completion_outcome(outcome)),
             vault: Arc::new(MockVault::new()),
         }
     }
@@ -782,10 +802,8 @@ pub(crate) mod tests {
 
         let events = aggregate
             .handle(
-                EquityRedemptionCommand::Detect {
-                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
-                },
-                &mock_redeemer_services(),
+                EquityRedemptionCommand::Detect,
+                &services_with_detection(MockDetectionOutcome::Detected),
             )
             .await
             .unwrap();
@@ -795,7 +813,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_from_pending() {
+    async fn test_await_completion_from_pending() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         apply_vault_withdrawn_and_tokens_sent(&mut aggregate, symbol);
@@ -807,7 +825,10 @@ pub(crate) mod tests {
         aggregate.apply(detected_event);
 
         let events = aggregate
-            .handle(EquityRedemptionCommand::Complete, &mock_redeemer_services())
+            .handle(
+                EquityRedemptionCommand::AwaitCompletion,
+                &services_with_completion(MockCompletionOutcome::Completed),
+            )
             .await
             .unwrap();
 
@@ -819,7 +840,6 @@ pub(crate) mod tests {
     async fn test_complete_redemption_flow_end_to_end() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
-        let services = mock_redeemer_services();
 
         let redeem_events = aggregate
             .handle(
@@ -829,7 +849,7 @@ pub(crate) mod tests {
                     token: Address::random(),
                     amount: U256::from(50_250_000_000_000_000_000_u128),
                 },
-                &services,
+                &mock_redeemer_services(),
             )
             .await
             .unwrap();
@@ -840,10 +860,8 @@ pub(crate) mod tests {
 
         let detect_events = aggregate
             .handle(
-                EquityRedemptionCommand::Detect {
-                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
-                },
-                &services,
+                EquityRedemptionCommand::Detect,
+                &services_with_detection(MockDetectionOutcome::Detected),
             )
             .await
             .unwrap();
@@ -851,7 +869,10 @@ pub(crate) mod tests {
         aggregate.apply(detect_events[0].clone());
 
         let complete_events = aggregate
-            .handle(EquityRedemptionCommand::Complete, &services)
+            .handle(
+                EquityRedemptionCommand::AwaitCompletion,
+                &services_with_completion(MockCompletionOutcome::Completed),
+            )
             .await
             .unwrap();
         assert_eq!(complete_events.len(), 1);
@@ -868,53 +889,52 @@ pub(crate) mod tests {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
 
         let result = aggregate
-            .handle(
-                EquityRedemptionCommand::Detect {
-                    tokenization_request_id: TokenizationRequestId("REQ789".to_string()),
-                },
-                &mock_redeemer_services(),
-            )
+            .handle(EquityRedemptionCommand::Detect, &mock_redeemer_services())
             .await;
 
         assert!(matches!(result, Err(EquityRedemptionError::TokensNotSent)));
     }
 
     #[tokio::test]
-    async fn test_cannot_complete_before_pending() {
+    async fn test_cannot_await_completion_before_pending() {
         let aggregate = Lifecycle::<EquityRedemption, Never>::default();
 
         let result = aggregate
-            .handle(EquityRedemptionCommand::Complete, &mock_redeemer_services())
+            .handle(
+                EquityRedemptionCommand::AwaitCompletion,
+                &mock_redeemer_services(),
+            )
             .await;
 
         assert!(matches!(result, Err(EquityRedemptionError::NotPending)));
     }
 
     #[tokio::test]
-    async fn test_fail_detection_from_tokens_sent_state() {
+    async fn test_detect_timeout_emits_detection_failed() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         apply_vault_withdrawn_and_tokens_sent(&mut aggregate, symbol);
 
         let events = aggregate
             .handle(
-                EquityRedemptionCommand::FailDetection {
-                    reason: "Alpaca timeout".to_string(),
-                },
-                &mock_redeemer_services(),
+                EquityRedemptionCommand::Detect,
+                &services_with_detection(MockDetectionOutcome::Timeout),
             )
             .await
             .unwrap();
 
         assert_eq!(events.len(), 1);
         assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::DetectionFailed { .. }
+            &events[0],
+            EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::Timeout,
+                ..
+            }
         ));
     }
 
     #[tokio::test]
-    async fn test_reject_redemption_from_pending_state() {
+    async fn test_await_completion_rejected_emits_redemption_rejected() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         apply_vault_withdrawn_and_tokens_sent(&mut aggregate, symbol);
@@ -927,10 +947,8 @@ pub(crate) mod tests {
 
         let events = aggregate
             .handle(
-                EquityRedemptionCommand::RejectRedemption {
-                    reason: "Insufficient balance".to_string(),
-                },
-                &mock_redeemer_services(),
+                EquityRedemptionCommand::AwaitCompletion,
+                &services_with_completion(MockCompletionOutcome::Rejected),
             )
             .await
             .unwrap();
@@ -943,24 +961,19 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_reject_redemption_before_pending() {
+    async fn test_cannot_await_completion_from_tokens_sent() {
         let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         apply_vault_withdrawn_and_tokens_sent(&mut aggregate, symbol);
 
         let result = aggregate
             .handle(
-                EquityRedemptionCommand::RejectRedemption {
-                    reason: "Cannot reject yet".to_string(),
-                },
+                EquityRedemptionCommand::AwaitCompletion,
                 &mock_redeemer_services(),
             )
             .await;
 
-        assert!(matches!(
-            result,
-            Err(EquityRedemptionError::NotPendingForRejection)
-        ));
+        assert!(matches!(result, Err(EquityRedemptionError::NotPending)));
     }
 
     #[tokio::test]
@@ -977,7 +990,6 @@ pub(crate) mod tests {
         aggregate.apply(detected_event);
 
         let rejected_event = EquityRedemptionEvent::RedemptionRejected {
-            reason: "Insufficient balance".to_string(),
             rejected_at: Utc::now(),
         };
         aggregate.apply(rejected_event);
@@ -987,7 +999,6 @@ pub(crate) mod tests {
             quantity,
             redemption_tx: failed_redemption_tx,
             tokenization_request_id,
-            reason,
             ..
         }) = aggregate
         else {
@@ -1001,42 +1012,51 @@ pub(crate) mod tests {
             tokenization_request_id,
             Some(TokenizationRequestId("REQ789".to_string()))
         );
-        assert_eq!(reason, "Insufficient balance");
     }
 
     #[tokio::test]
-    async fn test_cannot_fail_detection_before_sending() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
+    async fn test_detect_api_error_emits_detection_failed() {
+        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+        apply_vault_withdrawn_and_tokens_sent(&mut aggregate, symbol);
+
+        let events = aggregate
+            .handle(
+                EquityRedemptionCommand::Detect,
+                &services_with_detection(MockDetectionOutcome::ApiError),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            EquityRedemptionEvent::DetectionFailed {
+                failure: DetectionFailure::ApiError { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_cannot_detect_from_vault_withdrawn() {
+        let mut aggregate = Lifecycle::<EquityRedemption, Never>::default();
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let vault_event = EquityRedemptionEvent::VaultWithdrawn {
+            symbol,
+            quantity: dec!(50.25),
+            token: Address::random(),
+            vault_withdraw_tx: TxHash::random(),
+            withdrawn_at: Utc::now(),
+        };
+        aggregate.apply(vault_event);
 
         let result = aggregate
-            .handle(
-                EquityRedemptionCommand::FailDetection {
-                    reason: "Cannot fail".to_string(),
-                },
-                &mock_redeemer_services(),
-            )
+            .handle(EquityRedemptionCommand::Detect, &mock_redeemer_services())
             .await;
 
         assert!(matches!(result, Err(EquityRedemptionError::TokensNotSent)));
-    }
-
-    #[tokio::test]
-    async fn test_cannot_reject_redemption_before_sending() {
-        let aggregate = Lifecycle::<EquityRedemption, Never>::default();
-
-        let result = aggregate
-            .handle(
-                EquityRedemptionCommand::RejectRedemption {
-                    reason: "Cannot reject".to_string(),
-                },
-                &mock_redeemer_services(),
-            )
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(EquityRedemptionError::NotPendingForRejection)
-        ));
     }
 
     #[test]
@@ -1100,7 +1120,7 @@ pub(crate) mod tests {
         };
 
         let event = EquityRedemptionEvent::DetectionFailed {
-            reason: "Should not apply".to_string(),
+            failure: DetectionFailure::Timeout,
             failed_at: Utc::now(),
         };
 
@@ -1126,7 +1146,6 @@ pub(crate) mod tests {
         };
 
         let event = EquityRedemptionEvent::RedemptionRejected {
-            reason: "Should not apply".to_string(),
             rejected_at: Utc::now(),
         };
 
