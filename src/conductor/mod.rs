@@ -629,7 +629,7 @@ where
     info!("Starting inventory poller");
 
     let service = InventoryPollingService::new(
-        vault_service,
+        raindex_service,
         executor,
         vault_registry,
         orderbook,
@@ -1504,6 +1504,7 @@ mod tests {
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
     use crate::test_utils::{OnchainTradeBuilder, get_test_log, get_test_order, setup_test_db};
     use crate::threshold::ExecutionThreshold;
+    use crate::wrapper::mock::MockWrapper;
 
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
@@ -3306,6 +3307,7 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
@@ -3392,6 +3394,7 @@ mod tests {
             order_owner,
             Arc::clone(&inventory),
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
@@ -3429,7 +3432,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&symbol, &threshold)
+                .check_equity_imbalance(&symbol, &threshold, None)
                 .is_none(),
             "50/50 inventory should be balanced (no imbalance detected)"
         );
@@ -3496,6 +3499,7 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
@@ -3623,6 +3627,7 @@ mod tests {
             order_owner,
             inventory,
             operation_sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         let projection = Projection::<Position>::sqlite(pool.clone()).unwrap();
@@ -3674,14 +3679,18 @@ mod tests {
             .unwrap();
 
         let triggered = receiver.try_recv().unwrap();
-        assert_eq!(
-            triggered,
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(dec!(25)),
-                token: test_token,
-            }
-        );
+        let TriggeredOperation::Redemption {
+            symbol: s,
+            quantity,
+            wrapped_token,
+            ..
+        } = triggered
+        else {
+            panic!("Expected Redemption, got {triggered:?}");
+        };
+        assert_eq!(s, symbol);
+        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(wrapped_token, test_token);
     }
 
     #[tokio::test]
@@ -3710,14 +3719,18 @@ mod tests {
             .unwrap();
 
         let first = receiver.try_recv().unwrap();
-        assert_eq!(
-            first,
-            TriggeredOperation::Redemption {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(dec!(25)),
-                token: test_token,
-            }
-        );
+        let TriggeredOperation::Redemption {
+            symbol: s,
+            quantity,
+            wrapped_token,
+            ..
+        } = first
+        else {
+            panic!("Expected Redemption, got {first:?}");
+        };
+        assert_eq!(s, symbol);
+        assert_eq!(quantity, FractionalShares::new(dec!(25)));
+        assert_eq!(wrapped_token, test_token);
 
         // Second fill while in-progress NOT cleared -> no second trigger.
         position_store

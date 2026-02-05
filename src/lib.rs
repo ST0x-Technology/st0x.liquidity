@@ -39,8 +39,8 @@ mod threshold;
 mod tokenization;
 mod tokenized_equity_mint;
 mod usdc_rebalance;
-mod vault;
 mod vault_registry;
+mod wrapper;
 
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 

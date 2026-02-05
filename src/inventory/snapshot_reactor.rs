@@ -142,6 +142,7 @@ mod tests {
             Address::ZERO,
             inventory,
             sender,
+            Arc::new(MockWrapper::new()),
         ));
 
         (trigger, receiver)
@@ -180,7 +181,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&aapl, &balanced_threshold())
+                .check_equity_imbalance(&aapl, &balanced_threshold(), None)
                 .is_none(),
             "should NOT detect imbalance with only onchain data"
         );
@@ -203,7 +204,7 @@ mod tests {
         let imbalance = inventory
             .read()
             .await
-            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .check_equity_imbalance(&aapl, &balanced_threshold(), None)
             .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
@@ -303,7 +304,7 @@ mod tests {
             inventory
                 .read()
                 .await
-                .check_equity_imbalance(&aapl, &balanced_threshold())
+                .check_equity_imbalance(&aapl, &balanced_threshold(), None)
                 .is_none(),
             "should NOT detect imbalance with only offchain data"
         );
@@ -326,7 +327,7 @@ mod tests {
         let imbalance = inventory
             .read()
             .await
-            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .check_equity_imbalance(&aapl, &balanced_threshold(), None)
             .expect("should detect imbalance after both venues have data");
 
         assert_eq!(
@@ -462,7 +463,7 @@ mod tests {
 
         // All events applied: equity 100 onchain/0 offchain, USDC 5000 onchain/0 offchain
         let equity_imbalance = view
-            .check_equity_imbalance(&aapl, &balanced_threshold())
+            .check_equity_imbalance(&aapl, &balanced_threshold(), None)
             .expect("should detect equity imbalance after all venues have data");
 
         let usdc_imbalance = view

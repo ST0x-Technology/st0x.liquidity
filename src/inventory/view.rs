@@ -15,7 +15,7 @@ use crate::position::PositionEvent;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::TokenizedEquityMintEvent;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent};
-use crate::vault::VaultRatio;
+use crate::wrapper::UnderlyingPerWrapped;
 
 /// Error type for inventory view operations.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
@@ -156,7 +156,7 @@ where
         }
 
         let onchain_decimal: Decimal = normalized_onchain.into();
-        let offchain: Decimal = self.offchain.total().ok()?.into();
+        let offchain: Decimal = self.offchain.as_ref()?.total().ok()?.into();
         let total = onchain_decimal + offchain;
 
         if total.is_zero() {
@@ -168,14 +168,14 @@ where
         let upper = threshold.target + threshold.deviation;
 
         if ratio < lower {
-            let offchain_val = self.offchain.total().ok()?;
+            let offchain_val = self.offchain.as_ref()?.total().ok()?;
             let total_val = (normalized_onchain + offchain_val).ok()?;
             let target = (total_val * threshold.target).ok()?;
             let excess = (target - normalized_onchain).ok()?;
 
             Some(Imbalance::TooMuchOffchain { excess })
         } else if ratio > upper {
-            let offchain_val = self.offchain.total().ok()?;
+            let offchain_val = self.offchain.as_ref()?.total().ok()?;
             let total_val = (normalized_onchain + offchain_val).ok()?;
             let target = (total_val * threshold.target).ok()?;
             let excess = (normalized_onchain - target).ok()?;

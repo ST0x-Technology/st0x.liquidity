@@ -267,8 +267,8 @@ mod tests {
     use std::sync::Arc;
     use uuid::{Uuid, uuid};
 
-    use super::super::transfer::AlpacaAccountId;
     use super::*;
+    use st0x_execution::AlpacaAccountId;
 
     const TEST_ACCOUNT_ID: AlpacaAccountId =
         AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));

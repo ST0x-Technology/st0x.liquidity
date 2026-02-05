@@ -485,7 +485,6 @@ mod tests {
     use uuid::uuid;
 
     use super::*;
-    use crate::alpaca_wallet::AlpacaAccountId;
     use crate::cli::ConvertDirection;
     use crate::config::LogLevel;
     use crate::inventory::ImbalanceThreshold;
@@ -493,7 +492,7 @@ mod tests {
     use crate::rebalancing::RebalancingCtx;
     use crate::rebalancing::trigger::UsdcRebalancing;
     use crate::threshold::ExecutionThreshold;
-    use crate::vault::WrappedTokenRegistry;
+    use std::collections::HashMap;
 
     fn create_ctx_without_alpaca() -> Ctx {
         Ctx {
@@ -520,7 +519,7 @@ mod tests {
         ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
-            account_id: "test-account-id".to_string(),
+            account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
             asset_cache_ttl: std::time::Duration::from_secs(3600),
             time_in_force: TimeInForce::default(),
@@ -545,7 +544,7 @@ mod tests {
             broker: BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
-                account_id: alpaca_account_id.to_string(),
+                account_id: alpaca_account_id,
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
                 asset_cache_ttl: std::time::Duration::from_secs(3600),
                 time_in_force: TimeInForce::default(),
@@ -566,12 +565,12 @@ mod tests {
                 alpaca_broker_auth: AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
-                    account_id: alpaca_account_id.to_string(),
+                    account_id: alpaca_account_id,
                     mode: Some(AlpacaBrokerApiMode::Sandbox),
                     asset_cache_ttl: std::time::Duration::from_secs(3600),
                     time_in_force: TimeInForce::default(),
                 },
-                wrapped_token_registry: WrappedTokenRegistry::empty(),
+                equities: HashMap::new(),
             }),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
