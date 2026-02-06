@@ -49,20 +49,18 @@ where
     vault_id: VaultId,
 }
 
-use alloy::network::{Ethereum, EthereumWallet};
+use alloy::network::Ethereum;
 use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
 };
 use alloy::providers::{Identity, RootProvider};
 
-/// Provider type for Ethereum HTTP connections (used for CCTP Ethereum side).
+/// Provider type for Ethereum HTTP connections (read-only, used for CCTP Ethereum side).
+/// The wallet is inside the `ContractCallSubmitter`, not wrapping the provider.
 type EthereumHttpProvider = FillProvider<
     JoinFill<
-        JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-        >,
-        WalletFiller<EthereumWallet>,
+        Identity,
+        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
     >,
     RootProvider<Ethereum>,
     Ethereum,
@@ -899,7 +897,7 @@ mod tests {
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{B256, address, b256, fixed_bytes};
     use alloy::providers::fillers::{
-        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+        BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
     };
     use alloy::providers::{Identity, ProviderBuilder, RootProvider};
     use alloy::signers::local::PrivateKeySigner;
@@ -934,11 +932,8 @@ mod tests {
 
     type TestProvider = FillProvider<
         JoinFill<
-            JoinFill<
-                Identity,
-                JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-            >,
-            WalletFiller<EthereumWallet>,
+            Identity,
+            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
         >,
         RootProvider<Ethereum>,
         Ethereum,
@@ -1072,11 +1067,8 @@ mod tests {
         private_key: &B256,
     ) -> (TestProvider, PrivateKeySigner) {
         let signer = PrivateKeySigner::from_bytes(private_key).unwrap();
-        let wallet = EthereumWallet::from(signer.clone());
 
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(endpoint.parse().unwrap());
+        let provider = ProviderBuilder::new().connect_http(endpoint.parse().unwrap());
 
         (provider, signer)
     }
@@ -1088,7 +1080,15 @@ mod tests {
         CctpBridge<TestProvider, TestProvider>,
         VaultService<TestProvider>,
     ) {
+        use crate::fireblocks::{AlloyContractCaller, ContractCallSubmitter};
+
         let owner = signer.address();
+        let wallet = EthereumWallet::from(signer.clone());
+        let wallet_provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_provider(provider.clone());
+        let submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(wallet_provider, 1));
 
         let ethereum = Evm::new(
             provider.clone(),
@@ -1096,8 +1096,8 @@ mod tests {
             USDC_ADDRESS,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            submitter.clone(),
+        );
 
         let base = Evm::new(
             provider.clone(),
@@ -1105,13 +1105,12 @@ mod tests {
             USDC_ADDRESS,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            submitter.clone(),
+        );
 
         let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
 
-        let vault_service =
-            VaultService::new(provider, ORDERBOOK_ADDRESS).with_required_confirmations(1);
+        let vault_service = VaultService::new(provider, ORDERBOOK_ADDRESS, submitter);
 
         (cctp_bridge, vault_service)
     }

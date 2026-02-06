@@ -36,10 +36,17 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
 
     let resolved = rebalancing_config.signer.resolve().await?;
 
-    writeln!(stdout, "   Sender wallet: {}", resolved.address)?;
+    writeln!(stdout, "   Sender wallet: {}", resolved.address())?;
+
+    // CLI deposit uses a wallet-enabled provider for direct ERC20 transfers.
+    // Fireblocks CLI support for this command will be added in a future phase.
+    let wallet = resolved
+        .wallet()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-deposit currently requires a local signer"))?
+        .clone();
 
     let ethereum_provider = ProviderBuilder::new()
-        .wallet(resolved.wallet)
+        .wallet(wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
     let broker_api_base_url = if alpaca_auth.is_sandbox() {
@@ -73,7 +80,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "   USDC contract: {usdc_address}")?;
     let usdc = IERC20::IERC20Instance::new(usdc_address, &ethereum_provider);
 
-    let balance = usdc.balanceOf(resolved.address).call().await?;
+    let balance = usdc.balanceOf(resolved.address()).call().await?;
     writeln!(stdout, "   Current USDC balance: {balance}")?;
 
     if balance < amount_u256 {
@@ -138,11 +145,16 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 
     let resolved = rebalancing_config.signer.resolve().await?;
 
-    let destination = to_address.unwrap_or(resolved.address);
+    let destination = to_address.unwrap_or_else(|| resolved.address());
     writeln!(stdout, "   Destination address: {destination}")?;
 
+    let wallet = resolved
+        .wallet()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-withdraw currently requires a local signer"))?
+        .clone();
+
     let ethereum_provider = ProviderBuilder::new()
-        .wallet(resolved.wallet)
+        .wallet(wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
     let (usdc_address, network) = if alpaca_auth.is_sandbox() {

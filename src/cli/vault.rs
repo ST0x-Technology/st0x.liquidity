@@ -1,13 +1,16 @@
 //! Raindex vault deposit and withdrawal CLI commands.
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::sol_types::SolCall;
 use rust_decimal::Decimal;
 use std::io::Write;
+use std::sync::Arc;
 use thiserror::Error;
 
 use crate::bindings::IERC20;
 use crate::env::Config;
+use crate::fireblocks::AlloyContractCaller;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -62,17 +65,28 @@ pub(super) async fn vault_deposit_command<
 
     let resolved = rebalancing_config.signer.resolve().await?;
 
-    writeln!(stdout, "   Sender wallet: {}", resolved.address)?;
+    writeln!(stdout, "   Sender wallet: {}", resolved.address())?;
     writeln!(stdout, "   Orderbook: {}", config.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {vault_id}")?;
 
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(resolved.wallet)
-        .connect_provider(base_provider);
+    let submitter: Arc<dyn crate::fireblocks::ContractCallSubmitter> =
+        Arc::new(AlloyContractCaller::new(
+            ProviderBuilder::new()
+                .wallet(
+                    resolved
+                        .wallet()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("vault-deposit currently requires a local signer")
+                        })?
+                        .clone(),
+                )
+                .connect_provider(base_provider.clone()),
+            REQUIRED_CONFIRMATIONS,
+        ));
 
-    let token_contract = IERC20::IERC20Instance::new(token, &base_provider_with_wallet);
+    let token_contract = IERC20::IERC20Instance::new(token, &base_provider);
 
-    let balance = token_contract.balanceOf(resolved.address).call().await?;
+    let balance = token_contract.balanceOf(resolved.address()).call().await?;
     writeln!(stdout, "   Current token balance: {balance}")?;
 
     let amount_u256 = decimal_to_u256(amount, decimals)?;
@@ -83,12 +97,15 @@ pub(super) async fn vault_deposit_command<
     }
 
     writeln!(stdout, "   Approving orderbook to spend tokens...")?;
-    let approve_receipt = token_contract
-        .approve(config.evm.orderbook, amount_u256)
-        .send()
-        .await?
-        .with_required_confirmations(REQUIRED_CONFIRMATIONS)
-        .get_receipt()
+    let calldata = Bytes::from(
+        IERC20::approveCall {
+            spender: config.evm.orderbook,
+            amount: amount_u256,
+        }
+        .abi_encode(),
+    );
+    let approve_receipt = submitter
+        .submit_contract_call(token, &calldata, "token approval for vault deposit")
         .await?;
     writeln!(
         stdout,
@@ -96,7 +113,7 @@ pub(super) async fn vault_deposit_command<
         approve_receipt.transaction_hash
     )?;
 
-    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
+    let vault_service = VaultService::new(base_provider, config.evm.orderbook, submitter);
 
     writeln!(stdout, "   Depositing to vault...")?;
     let deposit_tx = vault_service
@@ -129,15 +146,26 @@ pub(super) async fn vault_withdraw_command<
 
     let resolved = rebalancing_config.signer.resolve().await?;
 
-    writeln!(stdout, "   Recipient wallet: {}", resolved.address)?;
+    writeln!(stdout, "   Recipient wallet: {}", resolved.address())?;
     writeln!(stdout, "   Orderbook: {}", config.evm.orderbook)?;
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(resolved.wallet)
-        .connect_provider(base_provider);
+    let submitter: Arc<dyn crate::fireblocks::ContractCallSubmitter> =
+        Arc::new(AlloyContractCaller::new(
+            ProviderBuilder::new()
+                .wallet(
+                    resolved
+                        .wallet()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("vault-withdraw currently requires a local signer")
+                        })?
+                        .clone(),
+                )
+                .connect_provider(base_provider.clone()),
+            REQUIRED_CONFIRMATIONS,
+        ));
 
-    let vault_service = VaultService::new(base_provider_with_wallet, config.evm.orderbook);
+    let vault_service = VaultService::new(base_provider, config.evm.orderbook, submitter);
     let vault_id = VaultId(rebalancing_config.usdc_vault_id);
 
     let amount_u256 = amount.to_u256_6_decimals()?;

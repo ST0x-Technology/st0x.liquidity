@@ -19,7 +19,6 @@ mod dual_write;
 pub mod env;
 mod equity_redemption;
 mod error;
-mod error_decoding;
 mod fireblocks;
 mod inventory;
 mod lifecycle;

@@ -27,8 +27,8 @@
 //!
 //! ```rust,ignore
 //! // Create bridge instance
-//! let ethereum = Evm::new(ethereum_provider, owner, usdc, token_messenger, message_transmitter);
-//! let base = Evm::new(base_provider, owner, usdc, token_messenger, message_transmitter);
+//! let ethereum = Evm::new(ethereum_provider, owner, usdc, token_messenger, message_transmitter, submitter);
+//! let base = Evm::new(base_provider, owner, usdc, token_messenger, message_transmitter, submitter);
 //! let bridge = CctpBridge::new(ethereum, base);
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
@@ -56,11 +56,12 @@ use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::sol;
 use backon::Retryable;
-use rain_error_decoding::AbiDecodedErrorType;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+
+use crate::fireblocks::ContractCallError;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
 sol!(
@@ -239,11 +240,11 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 /// ```rust,ignore
 /// let ethereum = Evm::new(
 ///     eth_provider, owner, USDC_ETHEREUM,
-///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2, eth_submitter,
 /// );
 /// let base = Evm::new(
 ///     base_provider, owner, USDC_BASE,
-///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
+///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2, base_submitter,
 /// );
 /// let bridge = CctpBridge::new(ethereum, base);
 ///
@@ -264,12 +265,10 @@ where
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CctpError {
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("Contract call error: {0}")]
+    ContractCall(#[from] ContractCallError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Attestation timeout after {attempts} attempts: {source}")]
@@ -562,8 +561,10 @@ mod tests {
     use proptest::prelude::*;
     use rand::Rng;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
 
     use super::*;
+    use crate::fireblocks::{AlloyContractCaller, ContractCallSubmitter};
 
     fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
@@ -593,14 +594,19 @@ mod tests {
             .connect(base_endpoint)
             .await?;
 
+        let ethereum_submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(ethereum_provider.clone(), 1));
+        let base_submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(base_provider.clone(), 1));
+
         let ethereum = Evm::new(
             ethereum_provider,
             owner,
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_submitter,
+        );
 
         let base = Evm::new(
             base_provider,
@@ -608,8 +614,8 @@ mod tests {
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_submitter,
+        );
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -791,7 +797,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         let initial_allowance = bridge
             .ethereum
@@ -835,7 +841,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         bridge
             .ethereum
@@ -890,7 +896,7 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         bridge
             .ethereum
@@ -949,14 +955,19 @@ mod tests {
             .connect(base_endpoint)
             .await?;
 
+        let ethereum_submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(ethereum_provider.clone(), 1));
+        let base_submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(base_provider.clone(), 1));
+
         let ethereum = Evm::new(
             ethereum_provider,
             owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_submitter,
+        );
 
         let base = Evm::new(
             base_provider,
@@ -964,8 +975,8 @@ mod tests {
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_submitter,
+        );
 
         Ok(CctpBridge::new(ethereum, base)?)
     }
@@ -988,7 +999,7 @@ mod tests {
 
         let amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         let initial_allowance = bridge
             .base
@@ -1030,7 +1041,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
         let higher_amount = U256::from(2_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         bridge
             .base
@@ -1083,7 +1094,7 @@ mod tests {
         let initial_allowance_amount = U256::from(500_000u64);
         let required_amount = U256::from(1_000_000u64);
         let owner = bridge.base.owner();
-        let spender = *bridge.base.token_messenger().address();
+        let spender = bridge.base.token_messenger_address();
 
         bridge
             .base
@@ -1480,14 +1491,19 @@ mod tests {
                 .connect(&self.base_endpoint)
                 .await?;
 
+            let ethereum_submitter: Arc<dyn ContractCallSubmitter> =
+                Arc::new(AlloyContractCaller::new(ethereum_provider.clone(), 1));
+            let base_submitter: Arc<dyn ContractCallSubmitter> =
+                Arc::new(AlloyContractCaller::new(base_provider.clone(), 1));
+
             let ethereum = Evm::new(
                 ethereum_provider,
                 owner,
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
-            )
-            .with_required_confirmations(1);
+                ethereum_submitter,
+            );
 
             let base = Evm::new(
                 base_provider,
@@ -1495,8 +1511,8 @@ mod tests {
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
-            )
-            .with_required_confirmations(1);
+                base_submitter,
+            );
 
             Ok(CctpBridge::new(ethereum, base)?
                 .with_circle_api_base(self.fee_mock_server.base_url()))
@@ -1796,11 +1812,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, CctpError::Revert(_)), "got: {err:?}");
-        assert!(
-            err.to_string().contains("ECDSA: invalid signature"),
-            "got: {err}"
-        );
+        assert!(matches!(err, CctpError::ContractCall(_)), "got: {err:?}");
     }
 
     #[tokio::test]
@@ -1832,11 +1844,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, CctpError::Revert(_)), "got: {err:?}");
-        assert!(
-            err.to_string().contains("ECDSA: invalid signature"),
-            "got: {err}"
-        );
+        assert!(matches!(err, CctpError::ContractCall(_)), "got: {err:?}");
     }
 
     fn build_nonce_message(header: &[u8], nonce: [u8; 32], trailer: &[u8]) -> Vec<u8> {
@@ -1962,7 +1970,7 @@ mod tests {
 
         let recipient = bridge.base.owner();
         let owner = bridge.ethereum.owner();
-        let spender = *bridge.ethereum.token_messenger().address();
+        let spender = bridge.ethereum.token_messenger_address();
 
         // Check initial allowance is 0
         let initial_allowance = bridge

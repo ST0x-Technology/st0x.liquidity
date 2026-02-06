@@ -11,16 +11,16 @@
 //! OrderBook V5 uses a custom float format (B256) for amounts. All conversions between
 //! standard fixed-point amounts (U256) and the float format MUST use rain-math-float.
 
-use alloy::primitives::{Address, B256, TxHash, U256, address};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256, address};
 use alloy::providers::Provider;
-use rain_error_decoding::AbiDecodedErrorType;
+use alloy::sol_types::SolCall;
 use rain_math_float::Float;
 use rust_decimal::Decimal;
 use st0x_execution::FractionalShares;
+use std::sync::Arc;
 
 use crate::bindings::IOrderBookV5;
-use crate::error_decoding::handle_contract_error;
-use crate::onchain::REQUIRED_CONFIRMATIONS;
+use crate::fireblocks::{ContractCallError, ContractCallSubmitter};
 use crate::threshold::Usdc;
 
 const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
@@ -32,12 +32,10 @@ pub(crate) struct VaultId(pub(crate) B256);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum VaultError {
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("Contract call error: {0}")]
+    ContractCall(#[from] ContractCallError),
     #[error("Contract error: {0}")]
     Contract(#[from] alloy::contract::Error),
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
     #[error("Float error: {0}")]
     Float(#[from] rain_math_float::FloatError),
     #[error("Decimal parse error: {0}")]
@@ -51,7 +49,7 @@ pub(crate) enum VaultError {
 /// # Example
 ///
 /// ```ignore
-/// let service = VaultService::new(provider, orderbook_address);
+/// let service = VaultService::new(provider, orderbook_address, submitter);
 ///
 /// // Deposit USDC to vault
 /// let vault_id = VaultId(U256::from(1));
@@ -66,26 +64,24 @@ where
     P: Provider + Clone,
 {
     orderbook: IOrderBookV5::IOrderBookV5Instance<P>,
-    required_confirmations: u64,
+    orderbook_address: Address,
+    submitter: Arc<dyn ContractCallSubmitter>,
 }
 
 impl<P> VaultService<P>
 where
     P: Provider + Clone,
 {
-    pub(crate) fn new(provider: P, orderbook: Address) -> Self {
+    pub(crate) fn new(
+        provider: P,
+        orderbook: Address,
+        submitter: Arc<dyn ContractCallSubmitter>,
+    ) -> Self {
         Self {
             orderbook: IOrderBookV5::new(orderbook, provider),
-            required_confirmations: REQUIRED_CONFIRMATIONS,
+            orderbook_address: orderbook,
+            submitter,
         }
-    }
-
-    /// Sets the number of confirmations to wait after transactions.
-    /// Use 1 for tests running against anvil (single-node, no sync delays).
-    #[cfg(test)]
-    pub(crate) fn with_required_confirmations(mut self, confirmations: u64) -> Self {
-        self.required_confirmations = confirmations;
-        self
     }
 
     /// Deposits tokens to a Rain OrderBook vault.
@@ -101,7 +97,7 @@ where
     ///
     /// Returns `VaultError::ZeroAmount` if amount is zero.
     /// Returns `VaultError::Float` if amount cannot be converted to float format.
-    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
+    /// Returns `VaultError::ContractCall` for transaction submission errors.
     pub(crate) async fn deposit(
         &self,
         token: Address,
@@ -115,19 +111,20 @@ where
 
         let amount_float = Float::from_fixed_decimal(amount, decimals)?;
 
-        let tasks = Vec::new();
+        let calldata = Bytes::from(
+            IOrderBookV5::deposit3Call {
+                token,
+                vaultId: vault_id.0,
+                depositAmount: amount_float.get_inner(),
+                tasks: Vec::new(),
+            }
+            .abi_encode(),
+        );
 
-        let pending = match self
-            .orderbook
-            .deposit3(token, vault_id.0, amount_float.get_inner(), tasks)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
+        let receipt = self
+            .submitter
+            .submit_contract_call(self.orderbook_address, &calldata, "vault deposit")
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -145,7 +142,7 @@ where
     ///
     /// Returns `VaultError::ZeroAmount` if target_amount is zero.
     /// Returns `VaultError::Float` if amount cannot be converted to float format.
-    /// Returns `VaultError::Transaction` or `VaultError::Contract` for blockchain errors.
+    /// Returns `VaultError::ContractCall` for transaction submission errors.
     pub(crate) async fn withdraw(
         &self,
         token: Address,
@@ -159,23 +156,19 @@ where
 
         let amount_float = Float::from_fixed_decimal(target_amount, decimals)?;
 
-        let tasks = Vec::new();
+        let calldata = Bytes::from(
+            IOrderBookV5::withdraw3Call {
+                token,
+                vaultId: vault_id.0,
+                targetAmount: amount_float.get_inner(),
+                tasks: Vec::new(),
+            }
+            .abi_encode(),
+        );
 
-        let pending = match self
-            .orderbook
-            .withdraw3(token, vault_id.0, amount_float.get_inner(), tasks)
-            .send()
-            .await
-        {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        // Wait for confirmations to ensure state propagates across load-balanced
-        // RPC nodes before subsequent operations that depend on the withdrawal
-        let receipt = pending
-            .with_required_confirmations(self.required_confirmations)
-            .get_receipt()
+        let receipt = self
+            .submitter
+            .submit_contract_call(self.orderbook_address, &calldata, "vault withdraw")
             .await?;
 
         Ok(receipt.transaction_hash)
@@ -276,6 +269,7 @@ mod tests {
     use alloy::transports::{RpcError, TransportErrorKind};
 
     use crate::bindings::{IOrderBookV5, OrderBook, TOFUTokenDecimals, TestERC20};
+    use crate::fireblocks::AlloyContractCaller;
 
     /// Address where LibTOFUTokenDecimals expects the singleton contract to be deployed.
     const TOFU_DECIMALS_ADDRESS: Address = address!("0x4f1C29FAAB7EDdF8D7794695d8259996734Cc665");
@@ -399,6 +393,11 @@ mod tests {
 
             Ok(balance)
         }
+
+        fn vault_service(&self) -> VaultService<LocalEvmProvider> {
+            let submitter = Arc::new(AlloyContractCaller::new(self.provider.clone(), 1));
+            VaultService::new(self.provider.clone(), self.orderbook_address, submitter)
+        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -424,7 +423,7 @@ mod tests {
     async fn deposit_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = local_evm.vault_service();
 
         let result = service
             .deposit(
@@ -454,7 +453,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = local_evm.vault_service();
 
         let vault_balance_before = local_evm
             .get_vault_balance(local_evm.token_address, vault_id.0)
@@ -490,7 +489,7 @@ mod tests {
     async fn withdraw_rejects_zero_amount() {
         let local_evm = LocalEvm::new().await.unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = local_evm.vault_service();
 
         let result = service
             .withdraw(
@@ -521,8 +520,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address)
-            .with_required_confirmations(1);
+        let service = local_evm.vault_service();
 
         service
             .deposit(
@@ -558,7 +556,7 @@ mod tests {
     #[tokio::test]
     async fn get_equity_balance_returns_zero_for_empty_vault() {
         let local_evm = LocalEvm::new().await.unwrap();
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = local_evm.vault_service();
 
         let balance = service
             .get_equity_balance(
@@ -587,7 +585,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address);
+        let service = local_evm.vault_service();
 
         service
             .deposit(
@@ -631,8 +629,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = VaultService::new(local_evm.provider.clone(), local_evm.orderbook_address)
-            .with_required_confirmations(1);
+        let service = local_evm.vault_service();
 
         service
             .deposit(

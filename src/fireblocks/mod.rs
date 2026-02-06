@@ -1,22 +1,78 @@
 mod config;
-mod signer;
+mod contract_call;
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256};
-use alloy::signers::Signer;
+use alloy::providers::Provider;
+use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
+use fireblocks_sdk::ClientBuilder;
+use std::sync::Arc;
 
 pub(crate) use config::{ChainAssetIds, FireblocksEnv};
-pub(crate) use signer::{FireblocksError, FireblocksSigner};
+pub(crate) use contract_call::{
+    AlloyContractCaller, ContractCallError, ContractCallSubmitter, FireblocksContractCallError,
+    FireblocksContractCaller,
+};
 
-/// Resolved signer: an `EthereumWallet` and the corresponding address.
+/// Resolved signer with the address and backend-specific data.
 ///
-/// Consumers don't need to know which backend produced the wallet.
+/// For local signing, holds an `EthereumWallet`. For Fireblocks, holds the
+/// environment config needed to create submitters per-chain.
 #[derive(Debug)]
-pub(crate) struct ResolvedSigner {
-    pub(crate) wallet: EthereumWallet,
-    pub(crate) address: Address,
+pub(crate) enum ResolvedSigner {
+    Local {
+        address: Address,
+        wallet: EthereumWallet,
+    },
+    Fireblocks {
+        address: Address,
+        env: FireblocksEnv,
+    },
+}
+
+impl ResolvedSigner {
+    pub(crate) fn address(&self) -> Address {
+        match self {
+            Self::Local { address, .. } | Self::Fireblocks { address, .. } => *address,
+        }
+    }
+
+    /// Returns the wallet for local signing, or `None` for Fireblocks.
+    pub(crate) fn wallet(&self) -> Option<&EthereumWallet> {
+        match self {
+            Self::Local { wallet, .. } => Some(wallet),
+            Self::Fireblocks { .. } => None,
+        }
+    }
+
+    /// Creates a `ContractCallSubmitter` for the given read provider.
+    ///
+    /// For local signing, wraps the provider with the wallet so that
+    /// alloy's filler chain handles gas, nonce, and signing. For Fireblocks,
+    /// creates a `FireblocksContractCaller` that submits CONTRACT_CALL
+    /// transactions and fetches receipts from the read provider.
+    pub(crate) fn create_submitter<P: Provider + Clone + Send + Sync + 'static>(
+        &self,
+        read_provider: P,
+        required_confirmations: u64,
+    ) -> Result<Arc<dyn ContractCallSubmitter>, FireblocksContractCallError> {
+        match self {
+            Self::Local { wallet, .. } => {
+                let wallet_provider = ProviderBuilder::new()
+                    .wallet(wallet.clone())
+                    .connect_provider(read_provider);
+                Ok(Arc::new(AlloyContractCaller::new(
+                    wallet_provider,
+                    required_confirmations,
+                )))
+            }
+            Self::Fireblocks { env, .. } => {
+                Ok(Arc::new(FireblocksContractCaller::new(env, read_provider)?))
+            }
+        }
+    }
 }
 
 /// Determines which signing backend to use at runtime.
@@ -72,10 +128,10 @@ pub(crate) enum SignerConfigError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SignerResolveError {
-    #[error(transparent)]
-    Fireblocks(#[from] FireblocksError),
     #[error("invalid EVM private key")]
     InvalidPrivateKey(#[source] alloy::signers::k256::ecdsa::Error),
+    #[error(transparent)]
+    FireblocksContractCall(#[from] FireblocksContractCallError),
 }
 
 impl SignerEnv {
@@ -105,38 +161,36 @@ impl SignerEnv {
 }
 
 impl SignerConfig {
-    /// Resolve the signer config into a wallet + address.
+    /// Resolve the signer config into a `ResolvedSigner`.
     ///
-    /// For Fireblocks, this makes an async API call to fetch the vault address.
-    /// For local keys, this is a synchronous derivation.
+    /// For Fireblocks, makes an async API call to fetch the vault address.
+    /// For local keys, synchronously derives the address.
     pub(crate) async fn resolve(&self) -> Result<ResolvedSigner, SignerResolveError> {
         match self {
             Self::Fireblocks(env) => {
-                let signer = FireblocksSigner::new(env).await?;
-                let address = signer.address();
-                let wallet = EthereumWallet::from(signer);
-                Ok(ResolvedSigner { wallet, address })
+                let address = fetch_fireblocks_address(env).await?;
+                Ok(ResolvedSigner::Fireblocks {
+                    address,
+                    env: env.clone(),
+                })
             }
             Self::Local(key) => {
                 let signer = PrivateKeySigner::from_bytes(key)
                     .map_err(SignerResolveError::InvalidPrivateKey)?;
                 let address = signer.address();
                 let wallet = EthereumWallet::from(signer);
-                Ok(ResolvedSigner { wallet, address })
+                Ok(ResolvedSigner::Local { wallet, address })
             }
         }
     }
 
-    /// Derive the address without creating a wallet.
+    /// Derive the address without creating a full `ResolvedSigner`.
     ///
     /// For local keys this is synchronous. For Fireblocks, this requires an
-    /// async API call (same as `resolve()`).
+    /// async API call to fetch the vault's deposit address.
     pub(crate) async fn address(&self) -> Result<Address, SignerResolveError> {
         match self {
-            Self::Fireblocks(env) => {
-                let signer = FireblocksSigner::new(env).await?;
-                Ok(signer.address())
-            }
+            Self::Fireblocks(env) => Ok(fetch_fireblocks_address(env).await?),
             Self::Local(key) => {
                 let signer = PrivateKeySigner::from_bytes(key)
                     .map_err(SignerResolveError::InvalidPrivateKey)?;
@@ -144,6 +198,50 @@ impl SignerConfig {
             }
         }
     }
+}
+
+/// Fetches the vault deposit address from Fireblocks using the SDK client.
+///
+/// Reads the RSA secret key from disk, builds the client, and queries the
+/// vault's deposit addresses. Reused by both `resolve()` and `address()`.
+async fn fetch_fireblocks_address(
+    env: &FireblocksEnv,
+) -> Result<Address, FireblocksContractCallError> {
+    let secret =
+        std::fs::read(&env.secret_path).map_err(|e| FireblocksContractCallError::ReadSecret {
+            path: env.secret_path.clone(),
+            source: e,
+        })?;
+
+    let mut builder = ClientBuilder::new(&env.api_key, &secret);
+    if env.sandbox {
+        builder = builder.use_sandbox();
+    }
+    let client = builder
+        .build()
+        .map_err(|e| FireblocksContractCallError::ClientBuild(Box::new(e)))?;
+
+    let default_asset_id = env.chain_asset_ids.default_asset_id();
+
+    let addresses = client
+        .addresses(&env.vault_account_id, default_asset_id)
+        .await
+        .map_err(|e| FireblocksContractCallError::FetchAddresses(Box::new(e)))?;
+
+    let address_str = addresses
+        .first()
+        .and_then(|a| a.address.as_deref())
+        .ok_or_else(|| FireblocksContractCallError::NoAddress {
+            vault_id: env.vault_account_id.clone(),
+            asset_id: default_asset_id.to_string(),
+        })?;
+
+    address_str
+        .parse::<Address>()
+        .map_err(|e| FireblocksContractCallError::InvalidAddress {
+            address: address_str.to_string(),
+            source: e,
+        })
 }
 
 #[cfg(test)]
@@ -243,7 +341,7 @@ mod tests {
         let resolved = config.resolve().await.unwrap();
 
         assert_eq!(
-            resolved.address,
+            resolved.address(),
             "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
                 .parse::<Address>()
                 .unwrap()
@@ -259,6 +357,6 @@ mod tests {
         let address = config.address().await.unwrap();
         let resolved = config.resolve().await.unwrap();
 
-        assert_eq!(address, resolved.address);
+        assert_eq!(address, resolved.address());
     }
 }

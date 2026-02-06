@@ -23,6 +23,9 @@ use crate::cctp::{
 };
 use crate::env::{BrokerConfig, Config};
 use crate::equity_redemption::RedemptionAggregateId;
+use crate::fireblocks::{AlloyContractCaller, ContractCallSubmitter};
+use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
@@ -31,7 +34,7 @@ use crate::rebalancing::{MintManager, RedemptionManager};
 use crate::shares::FractionalShares;
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
 
 use super::TransferDirection;
 
@@ -63,8 +66,24 @@ pub(super) async fn transfer_equity_command<W: Write>(
         )
     })?;
 
+    let resolved = rebalancing_config.signer.resolve().await?;
+
     let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
     let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
+
+    let submitter: Arc<dyn ContractCallSubmitter> = Arc::new(AlloyContractCaller::new(
+        ProviderBuilder::new()
+            .wallet(
+                resolved
+                    .wallet()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("transfer-equity currently requires a local signer")
+                    })?
+                    .clone(),
+            )
+            .connect_provider(base_provider.clone()),
+        REQUIRED_CONFIRMATIONS,
+    ));
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
@@ -73,6 +92,7 @@ pub(super) async fn transfer_equity_command<W: Write>(
         alpaca_auth.alpaca_broker_api_secret.clone(),
         base_provider.clone(),
         rebalancing_config.redemption_wallet,
+        submitter,
     ));
 
     match direction {
@@ -148,84 +168,8 @@ where
     };
     writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
-        anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
-    };
-
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("transfer-usdc requires rebalancing config (REBALANCING_ENABLED=true)")
-    })?;
-
-    writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
-
-    let resolved = rebalancing_config.signer.resolve().await?;
-
-    let ethereum_provider = ProviderBuilder::new()
-        .wallet(resolved.wallet.clone())
-        .connect_http(rebalancing_config.ethereum_rpc_url.clone());
-
-    let base_provider_with_wallet = ProviderBuilder::new()
-        .wallet(resolved.wallet)
-        .connect_provider(base_provider);
-
-    let broker_mode = if alpaca_auth.is_sandbox() {
-        AlpacaBrokerApiMode::Sandbox
-    } else {
-        AlpacaBrokerApiMode::Production
-    };
-
-    let broker_auth = AlpacaBrokerApiAuthEnv {
-        alpaca_broker_api_key: alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_broker_api_secret: alpaca_auth.alpaca_broker_api_secret.clone(),
-        alpaca_account_id: rebalancing_config.alpaca_account_id.to_string(),
-        alpaca_broker_api_mode: broker_mode,
-    };
-
-    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
-
-    let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-        broker_auth.base_url().to_string(),
-        rebalancing_config.alpaca_account_id,
-        alpaca_auth.alpaca_broker_api_key.clone(),
-        alpaca_auth.alpaca_broker_api_secret.clone(),
-    ));
-
-    let owner = resolved.address;
-
-    let ethereum_evm = Evm::new(
-        ethereum_provider,
-        owner,
-        USDC_ETHEREUM,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    let base_cctp = Evm::new(
-        base_provider_with_wallet.clone(),
-        owner,
-        USDC_BASE,
-        TOKEN_MESSENGER_V2,
-        MESSAGE_TRANSMITTER_V2,
-    );
-
-    let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
-    let vault_service = Arc::new(VaultService::new(
-        base_provider_with_wallet,
-        config.evm.orderbook,
-    ));
-    let event_store =
-        PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-    let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));
-
-    let rebalance_manager = UsdcRebalanceManager::new(
-        alpaca_broker,
-        alpaca_wallet,
-        bridge,
-        vault_service,
-        cqrs,
-        owner,
-        VaultId(rebalancing_config.usdc_vault_id),
-    );
+    let rebalance_manager =
+        build_usdc_rebalance_manager(config, pool, base_provider, stdout).await?;
 
     let rebalance_id = UsdcRebalanceId::new(format!("cli-usdc-{}", uuid::Uuid::new_v4()));
     writeln!(
@@ -252,8 +196,122 @@ where
     Ok(())
 }
 
+/// Constructs the USDC rebalance manager with all required services.
+async fn build_usdc_rebalance_manager<W: Write, BP>(
+    config: &Config,
+    pool: &SqlitePool,
+    base_provider: BP,
+    stdout: &mut W,
+) -> anyhow::Result<
+    UsdcRebalanceManager<
+        BP,
+        PersistedEventStore<SqliteEventRepository, Lifecycle<UsdcRebalance, Never>>,
+    >,
+>
+where
+    BP: Provider + Clone + Send + Sync + 'static,
+{
+    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+        anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
+    };
+
+    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("transfer-usdc requires rebalancing config (REBALANCING_ENABLED=true)")
+    })?;
+
+    writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
+
+    let resolved = rebalancing_config.signer.resolve().await?;
+
+    let wallet = resolved
+        .wallet()
+        .ok_or_else(|| anyhow::anyhow!("transfer-usdc currently requires a local signer"))?
+        .clone();
+
+    let ethereum_read_provider =
+        ProviderBuilder::new().connect_http(rebalancing_config.ethereum_rpc_url.clone());
+    let ethereum_submitter: Arc<dyn ContractCallSubmitter> = Arc::new(AlloyContractCaller::new(
+        ProviderBuilder::new()
+            .wallet(wallet.clone())
+            .connect_http(rebalancing_config.ethereum_rpc_url.clone()),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
+    let base_submitter: Arc<dyn ContractCallSubmitter> = Arc::new(AlloyContractCaller::new(
+        ProviderBuilder::new()
+            .wallet(wallet)
+            .connect_provider(base_provider.clone()),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
+    let broker_mode = if alpaca_auth.is_sandbox() {
+        AlpacaBrokerApiMode::Sandbox
+    } else {
+        AlpacaBrokerApiMode::Production
+    };
+
+    let broker_auth = AlpacaBrokerApiAuthEnv {
+        alpaca_broker_api_key: alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_broker_api_secret: alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_account_id: rebalancing_config.alpaca_account_id.to_string(),
+        alpaca_broker_api_mode: broker_mode,
+    };
+
+    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
+
+    let alpaca_wallet = Arc::new(AlpacaWalletService::new(
+        broker_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_auth.alpaca_broker_api_secret.clone(),
+    ));
+
+    let owner = resolved.address();
+
+    let ethereum_evm = Evm::new(
+        ethereum_read_provider,
+        owner,
+        USDC_ETHEREUM,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+        ethereum_submitter,
+    );
+
+    let base_cctp = Evm::new(
+        base_provider.clone(),
+        owner,
+        USDC_BASE,
+        TOKEN_MESSENGER_V2,
+        MESSAGE_TRANSMITTER_V2,
+        base_submitter.clone(),
+    );
+
+    let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
+    let vault_service = Arc::new(VaultService::new(
+        base_provider,
+        config.evm.orderbook,
+        base_submitter,
+    ));
+    let event_store =
+        PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
+    let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));
+
+    Ok(UsdcRebalanceManager::new(
+        alpaca_broker,
+        alpaca_wallet,
+        bridge,
+        vault_service,
+        cqrs,
+        owner,
+        VaultId(rebalancing_config.usdc_vault_id),
+    ))
+}
+
 /// Isolated tokenization command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
+pub(super) async fn alpaca_tokenize_command<
+    W: Write,
+    P: Provider + Clone + Send + Sync + 'static,
+>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
@@ -274,7 +332,8 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
-    let receiving_wallet = rebalancing_config.signer.address().await?;
+    let resolved = rebalancing_config.signer.resolve().await?;
+    let receiving_wallet = resolved.address();
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let erc20 = IERC20::new(token, provider.clone());
@@ -285,6 +344,20 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     let expected_final = initial_balance + expected_amount;
     writeln!(stdout, "   Expected final balance: {expected_final}")?;
 
+    let submitter: Arc<dyn ContractCallSubmitter> = Arc::new(AlloyContractCaller::new(
+        ProviderBuilder::new()
+            .wallet(
+                resolved
+                    .wallet()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("alpaca-tokenize currently requires a local signer")
+                    })?
+                    .clone(),
+            )
+            .connect_provider(provider.clone()),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_account_id,
@@ -292,6 +365,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         alpaca_auth.alpaca_broker_api_secret.clone(),
         provider.clone(),
         rebalancing_config.redemption_wallet,
+        submitter,
     );
 
     writeln!(stdout, "   Sending mint request to Alpaca...")?;
@@ -354,7 +428,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
 }
 
 /// Isolated redemption command - calls Alpaca tokenization API directly.
-pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
+pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone + Send + Sync + 'static>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
@@ -379,17 +453,28 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
     let resolved = rebalancing_config.signer.resolve().await?;
+
+    let wallet = resolved
+        .wallet()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-redeem currently requires a local signer"))?
+        .clone();
+
     let provider_with_wallet = ProviderBuilder::new()
-        .wallet(resolved.wallet)
-        .connect_provider(provider);
+        .wallet(wallet)
+        .connect_provider(provider.clone());
+    let submitter: Arc<dyn ContractCallSubmitter> = Arc::new(AlloyContractCaller::new(
+        provider_with_wallet,
+        REQUIRED_CONFIRMATIONS,
+    ));
 
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_broker_api_key.clone(),
         alpaca_auth.alpaca_broker_api_secret.clone(),
-        provider_with_wallet,
+        provider,
         redemption_wallet,
+        submitter,
     );
 
     let amount = quantity.to_u256_18_decimals()?;
@@ -435,7 +520,10 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
 }
 
 /// List all Alpaca tokenization requests.
-pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider + Clone>(
+pub(super) async fn alpaca_tokenization_requests_command<
+    W: Write,
+    P: Provider + Clone + Send + Sync + 'static,
+>(
     stdout: &mut W,
     config: &Config,
     provider: P,
@@ -452,6 +540,23 @@ pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider +
         )
     })?;
 
+    let resolved = rebalancing_config.signer.resolve().await?;
+    let submitter: Arc<dyn ContractCallSubmitter> = Arc::new(AlloyContractCaller::new(
+        ProviderBuilder::new()
+            .wallet(
+                resolved
+                    .wallet()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "alpaca-tokenization-requests currently requires a local signer"
+                        )
+                    })?
+                    .clone(),
+            )
+            .connect_provider(provider.clone()),
+        REQUIRED_CONFIRMATIONS,
+    ));
+
     let tokenization_service = AlpacaTokenizationService::new(
         alpaca_auth.base_url().to_string(),
         rebalancing_config.alpaca_account_id,
@@ -459,6 +564,7 @@ pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider +
         alpaca_auth.alpaca_broker_api_secret.clone(),
         provider,
         rebalancing_config.redemption_wallet,
+        submitter,
     );
 
     let requests = tokenization_service.list_requests().await?;

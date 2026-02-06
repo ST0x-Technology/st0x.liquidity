@@ -1,9 +1,9 @@
 //! Spawns the rebalancing infrastructure.
 
-use alloy::network::{Ethereum, EthereumWallet};
+use alloy::network::Ethereum;
 use alloy::primitives::Address;
 use alloy::providers::fillers::{
-    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
+    BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
 use cqrs_es::Query;
@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
-use crate::fireblocks::SignerResolveError;
+use crate::fireblocks::{FireblocksContractCallError, ResolvedSigner, SignerResolveError};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{AlpacaBrokerApi, Executor};
 
@@ -31,6 +31,7 @@ use crate::cctp::{
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::{Lifecycle, Never};
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
@@ -41,6 +42,8 @@ use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 pub(crate) enum SpawnRebalancerError {
     #[error("failed to resolve signer")]
     Signer(#[from] SignerResolveError),
+    #[error("failed to create contract call submitter")]
+    ContractCallSubmitter(#[from] FireblocksContractCallError),
     #[error("failed to create Alpaca wallet service: {0}")]
     AlpacaWallet(#[from] AlpacaWalletError),
     #[error("failed to create Alpaca broker API: {0}")]
@@ -49,14 +52,11 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] crate::cctp::CctpError),
 }
 
-/// Provider type returned by `ProviderBuilder::connect_http` with wallet.
-type HttpProvider = FillProvider<
+/// Provider type returned by `ProviderBuilder::new().connect_client(...)` (read-only, no wallet).
+type ReadOnlyHttpProvider = FillProvider<
     JoinFill<
-        JoinFill<
-            Identity,
-            JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-        >,
-        WalletFiller<EthereumWallet>,
+        Identity,
+        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
     >,
     RootProvider<Ethereum>,
     Ethereum,
@@ -89,14 +89,7 @@ where
 {
     let resolved = config.signer.resolve().await?;
 
-    let services = Services::new(
-        config,
-        &resolved.wallet,
-        resolved.address,
-        base_provider,
-        orderbook,
-    )
-    .await?;
+    let services = Services::new(config, &resolved, base_provider, orderbook).await?;
 
     let rebalancer = services.into_rebalancer(
         config,
@@ -129,7 +122,7 @@ where
     tokenization: Arc<AlpacaTokenizationService<BP>>,
     broker: Arc<AlpacaBrokerApi>,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<HttpProvider, BP>>,
+    cctp: Arc<CctpBridge<ReadOnlyHttpProvider, BP>>,
     vault: Arc<VaultService<BP>>,
 }
 
@@ -139,14 +132,19 @@ where
 {
     async fn new(
         config: &RebalancingConfig,
-        ethereum_wallet: &EthereumWallet,
-        owner: Address,
+        resolved: &ResolvedSigner,
         base_provider: BP,
         orderbook: Address,
     ) -> Result<Self, SpawnRebalancerError> {
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(ethereum_wallet.clone())
+        let owner = resolved.address();
+
+        let ethereum_read_provider = ProviderBuilder::new()
             .connect_client(http_client_with_retry(config.ethereum_rpc_url.clone()));
+
+        let base_submitter =
+            resolved.create_submitter(base_provider.clone(), REQUIRED_CONFIRMATIONS)?;
+        let ethereum_submitter =
+            resolved.create_submitter(ethereum_read_provider.clone(), REQUIRED_CONFIRMATIONS)?;
 
         let broker_auth = &config.alpaca_broker_auth;
 
@@ -157,6 +155,7 @@ where
             broker_auth.alpaca_broker_api_secret.clone(),
             base_provider.clone(),
             config.redemption_wallet,
+            base_submitter.clone(),
         ));
 
         let broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
@@ -169,11 +168,12 @@ where
         ));
 
         let ethereum_evm = Evm::new(
-            ethereum_provider,
+            ethereum_read_provider,
             owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
+            ethereum_submitter,
         );
 
         let base_evm_for_cctp = Evm::new(
@@ -182,10 +182,11 @@ where
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
+            base_submitter.clone(),
         );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
-        let vault = Arc::new(VaultService::new(base_provider, orderbook));
+        let vault = Arc::new(VaultService::new(base_provider, orderbook, base_submitter));
 
         Ok(Self {
             tokenization,
@@ -381,16 +382,27 @@ mod tests {
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
     ) -> (Services<impl Provider + Clone + 'static>, RebalancingConfig) {
+        use crate::fireblocks::AlloyContractCaller;
+
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
         let config = make_config();
         let resolved = config.signer.resolve().await.unwrap();
-        let ethereum_wallet = resolved.wallet;
 
-        let ethereum_provider = ProviderBuilder::new()
-            .wallet(ethereum_wallet)
-            .connect_http(config.ethereum_rpc_url.clone());
+        let base_submitter: Arc<dyn crate::fireblocks::ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(base_provider.clone(), 1));
+
+        // Read-only Ethereum provider (wallet lives inside the submitter)
+        let ethereum_read_provider =
+            ProviderBuilder::new().connect_http(config.ethereum_rpc_url.clone());
+        let ethereum_submitter: Arc<dyn crate::fireblocks::ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(
+                ProviderBuilder::new()
+                    .wallet(resolved.wallet().unwrap().clone())
+                    .connect_http(config.ethereum_rpc_url.clone()),
+                1,
+            ));
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url(),
@@ -399,6 +411,7 @@ mod tests {
             "test_secret".into(),
             base_provider.clone(),
             config.redemption_wallet,
+            base_submitter.clone(),
         ));
 
         // Mock the broker account verification endpoint
@@ -434,16 +447,16 @@ mod tests {
             "test_secret".into(),
         ));
 
-        let owner = resolved.address;
+        let owner = resolved.address();
 
         let ethereum_evm = Evm::new(
-            ethereum_provider,
+            ethereum_read_provider,
             owner,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            ethereum_submitter,
+        );
 
         let base_evm_for_cctp = Evm::new(
             base_provider.clone(),
@@ -451,13 +464,15 @@ mod tests {
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
+            base_submitter.clone(),
+        );
 
         let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
-        let vault = Arc::new(
-            VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
-        );
+        let vault = Arc::new(VaultService::new(
+            base_provider,
+            TEST_ORDERBOOK,
+            base_submitter,
+        ));
 
         let services = Services {
             tokenization,
