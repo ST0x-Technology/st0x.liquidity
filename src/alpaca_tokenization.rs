@@ -21,12 +21,13 @@
 //! 2. Poll `list_requests` for Alpaca's detection
 //! 3. Poll until status is `Completed` or `Rejected`
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
+use alloy::sol_types::SolCall;
 use chrono::{DateTime, Utc};
-use rain_error_decoding::AbiDecodedErrorType;
 use reqwest::{Client, StatusCode};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -37,7 +38,7 @@ use tracing::{debug, error, warn};
 
 use crate::alpaca_wallet::{AlpacaAccountId, Network, PollingConfig};
 use crate::bindings::IERC20;
-use crate::error_decoding::handle_contract_error;
+use crate::fireblocks::{ContractCallError, ContractCallSubmitter};
 use crate::onchain::io::TokenizedEquitySymbol;
 use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizationRequestId};
@@ -65,6 +66,7 @@ where
         api_secret: String,
         provider: P,
         redemption_wallet: Address,
+        submitter: Arc<dyn ContractCallSubmitter>,
     ) -> Self {
         let client = AlpacaTokenizationClient::new(
             base_url,
@@ -73,6 +75,7 @@ where
             api_secret,
             provider,
             redemption_wallet,
+            submitter,
         );
 
         Self {
@@ -290,14 +293,8 @@ pub(crate) enum AlpacaTokenizationError {
     #[error("Request not found: {id}")]
     RequestNotFound { id: TokenizationRequestId },
 
-    #[error("Redemption transfer failed: {0}")]
-    RedemptionTransferFailed(#[from] alloy::contract::Error),
-
-    #[error("Contract reverted: {0}")]
-    Revert(#[from] AbiDecodedErrorType),
-
-    #[error("Transaction error: {0}")]
-    Transaction(#[from] alloy::providers::PendingTransactionError),
+    #[error("Contract call error: {0}")]
+    ContractCall(#[from] ContractCallError),
 
     #[error("Poll timeout after {elapsed:?}")]
     PollTimeout { elapsed: Duration },
@@ -331,6 +328,7 @@ where
     api_secret: String,
     provider: P,
     redemption_wallet: Address,
+    submitter: Arc<dyn ContractCallSubmitter>,
 }
 
 impl<P> AlpacaTokenizationClient<P>
@@ -344,6 +342,7 @@ where
         api_secret: String,
         provider: P,
         redemption_wallet: Address,
+        submitter: Arc<dyn ContractCallSubmitter>,
     ) -> Self {
         Self {
             http_client: Client::new(),
@@ -353,6 +352,7 @@ where
             api_secret,
             provider,
             redemption_wallet,
+            submitter,
         }
     }
 
@@ -364,6 +364,7 @@ where
         api_secret: String,
         provider: P,
         redemption_wallet: Address,
+        submitter: Arc<dyn ContractCallSubmitter>,
     ) -> Self {
         Self {
             http_client: Client::new(),
@@ -373,6 +374,7 @@ where
             api_secret,
             provider,
             redemption_wallet,
+            submitter,
         }
     }
 
@@ -532,14 +534,18 @@ where
         token: Address,
         amount: U256,
     ) -> Result<TxHash, AlpacaTokenizationError> {
-        let erc20 = IERC20::new(token, self.provider.clone());
+        let calldata = Bytes::from(
+            IERC20::transferCall {
+                to: self.redemption_wallet,
+                amount,
+            }
+            .abi_encode(),
+        );
 
-        let pending = match erc20.transfer(self.redemption_wallet, amount).send().await {
-            Ok(pending) => pending,
-            Err(e) => return Err(handle_contract_error(e).await),
-        };
-
-        let receipt = pending.get_receipt().await?;
+        let receipt = self
+            .submitter
+            .submit_contract_call(token, &calldata, "redemption token transfer")
+            .await?;
 
         Ok(receipt.transaction_hash)
     }
@@ -655,6 +661,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::bindings::TestERC20;
+    use crate::fireblocks::AlloyContractCaller;
 
     pub(crate) const TEST_REDEMPTION_WALLET: Address =
         address!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
@@ -692,6 +699,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
+        let submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(provider.clone(), 1));
+
         AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
             TEST_ACCOUNT_ID,
@@ -699,6 +709,7 @@ pub(crate) mod tests {
             "test_api_secret".to_string(),
             provider,
             redemption_wallet,
+            submitter,
         )
     }
 
@@ -1039,6 +1050,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
+        let submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(provider.clone(), 1));
+
         let client = AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
             TEST_ACCOUNT_ID,
@@ -1046,6 +1060,7 @@ pub(crate) mod tests {
             "test_api_secret".to_string(),
             provider.clone(),
             TEST_REDEMPTION_WALLET,
+            submitter,
         );
 
         let transfer_amount = U256::from(100_000u64);
@@ -1085,6 +1100,9 @@ pub(crate) mod tests {
         let token = TestERC20::deploy(&provider).await.unwrap();
         let token_address = *token.address();
 
+        let submitter: Arc<dyn ContractCallSubmitter> =
+            Arc::new(AlloyContractCaller::new(provider.clone(), 1));
+
         let client = AlpacaTokenizationClient::new_with_base_url(
             server.base_url(),
             TEST_ACCOUNT_ID,
@@ -1092,6 +1110,7 @@ pub(crate) mod tests {
             "test_api_secret".to_string(),
             provider,
             TEST_REDEMPTION_WALLET,
+            submitter,
         );
 
         let transfer_amount = U256::from(100_000u64);
@@ -1101,13 +1120,8 @@ pub(crate) mod tests {
 
         let err = result.expect_err("expected error for insufficient balance");
         assert!(
-            matches!(err, AlpacaTokenizationError::Revert(_)),
-            "expected Revert error variant, got: {err:?}"
-        );
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("transfer amount exceeds balance"),
-            "expected 'transfer amount exceeds balance' in error message, got: {err_msg}"
+            matches!(err, AlpacaTokenizationError::ContractCall(_)),
+            "expected ContractCall error variant, got: {err:?}"
         );
     }
 

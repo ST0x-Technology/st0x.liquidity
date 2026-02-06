@@ -17,6 +17,8 @@ use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::dual_write::DualWriteContext;
 use crate::env::Config;
 use crate::error::EventProcessingError;
+use crate::fireblocks::{AlloyContractCaller, ContractCallSubmitter};
+use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
@@ -67,7 +69,7 @@ pub(crate) struct ConductorBuilder<P, E, State> {
     state: State,
 }
 
-impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
+impl<P: Provider + Clone + Send + Sync + 'static, E: Executor + Clone + Send + 'static>
     ConductorBuilder<P, E, Initial>
 {
     pub(crate) fn new(
@@ -106,7 +108,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     }
 }
 
-impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
+impl<P: Provider + Clone + Send + Sync + 'static, E: Executor + Clone + Send + 'static>
     ConductorBuilder<P, E, WithExecutorMaintenance>
 {
     pub(crate) fn with_dex_event_streams(
@@ -139,7 +141,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
 
 impl<P, E> ConductorBuilder<P, E, WithDexStreams>
 where
-    P: Provider + Clone + Send + 'static,
+    P: Provider + Clone + Send + Sync + 'static,
     E: Executor + Clone + Send + 'static,
     EventProcessingError: From<E::Error>,
 {
@@ -158,9 +160,16 @@ where
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
         let inventory_poller = if let Some(order_owner) = self.common.order_owner {
+            // The inventory poller only reads vault balances (no write operations),
+            // but VaultService requires a submitter. Create one from the read provider;
+            // it won't be used for writes in this context.
+            let read_submitter: Arc<dyn ContractCallSubmitter> = Arc::new(
+                AlloyContractCaller::new(self.common.provider.clone(), REQUIRED_CONFIRMATIONS),
+            );
             let vault_service = Arc::new(VaultService::new(
                 self.common.provider.clone(),
                 self.common.config.evm.orderbook,
+                read_submitter,
             ));
             Some(spawn_inventory_poller(
                 self.common.pool.clone(),
