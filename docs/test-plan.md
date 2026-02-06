@@ -326,9 +326,8 @@ endpoints), CCTP attestation service, MintManager and RedemptionManager
    effort.
 4. **Executor failure and recovery** (#4) -- Proves resilience of core flow.
    Medium effort.
-5. **Trigger -> Mint E2E** (#5) -- Highest-value rebalancing flow. Medium
-   effort.
-6. **Trigger -> USDC Manager E2E** (#6) -- Most complex rebalancing flow.
+5. **Trigger -> Mint** (#5) -- Highest-value rebalancing flow. Medium effort.
+6. **Trigger -> USDC Manager** (#6) -- Most complex rebalancing flow.
    Medium-High effort.
 
 ---
