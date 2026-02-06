@@ -1279,7 +1279,7 @@ async fn execute_place_offchain_order(
     }
 }
 
-async fn process_queued_trade(
+pub(crate) async fn process_queued_trade(
     executor_type: SupportedExecutor,
     pool: &SqlitePool,
     queued_event: &QueuedEvent,
@@ -1357,7 +1357,7 @@ fn reconstruct_log_from_queued_event(
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-async fn check_and_execute_accumulated_positions<E>(
+pub(crate) async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
     pool: &SqlitePool,
     position_cqrs: &PositionCqrs,

@@ -38,6 +38,8 @@ pub use dashboard::export_bindings;
 pub use telemetry::{TelemetryError, TelemetryGuard};
 
 #[cfg(test)]
+mod integration_tests;
+#[cfg(test)]
 pub mod test_utils;
 
 use crate::config::{BrokerConfig, Config};

@@ -81,7 +81,7 @@ impl<E: Executor> OrderStatusPoller<E> {
     }
 
     #[tracing::instrument(skip(self), level = tracing::Level::DEBUG)]
-    async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
+    pub(crate) async fn poll_pending_orders(&self) -> Result<(), OrderPollingError> {
         debug!("Starting polling cycle for submitted orders");
 
         let executor_type = self.executor.to_supported_executor();
