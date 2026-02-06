@@ -44,6 +44,15 @@ pub struct AlpacaBrokerApiAuthEnv {
     /// Broker API mode: sandbox or production (defaults to sandbox for safety)
     #[clap(long, env, default_value = "sandbox")]
     pub alpaca_broker_api_mode: AlpacaBrokerApiMode,
+
+    /// TTL for cached asset information (default: 1 hour)
+    #[clap(
+        long,
+        env,
+        default_value = "3600",
+        value_parser = |s: &str| s.parse::<u64>().map(std::time::Duration::from_secs)
+    )]
+    pub asset_cache_ttl: std::time::Duration,
 }
 
 impl std::fmt::Debug for AlpacaBrokerApiAuthEnv {
@@ -53,6 +62,7 @@ impl std::fmt::Debug for AlpacaBrokerApiAuthEnv {
             .field("alpaca_broker_api_secret", &"[REDACTED]")
             .field("alpaca_account_id", &self.alpaca_account_id)
             .field("alpaca_broker_api_mode", &self.alpaca_broker_api_mode)
+            .field("asset_cache_ttl", &self.asset_cache_ttl)
             .finish()
     }
 }
@@ -102,6 +112,7 @@ mod tests {
             alpaca_broker_api_secret: "test_secret_key".to_string(),
             alpaca_account_id: "test_account_123".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -111,6 +122,7 @@ mod tests {
             alpaca_broker_api_secret: "test_secret_key".to_string(),
             alpaca_account_id: "test_account_123".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -148,6 +160,7 @@ mod tests {
             alpaca_broker_api_secret: "ultra_secret_secret_456".to_string(),
             alpaca_account_id: "account_789".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         };
 
         let debug_output = format!("{config:?}");

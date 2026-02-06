@@ -454,6 +454,7 @@ mod tests {
             alpaca_broker_api_secret: "test_secret".to_string(),
             alpaca_account_id: "test_account_123".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(base_url.to_string()),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         }
     }
 

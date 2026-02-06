@@ -294,6 +294,7 @@ mod tests {
                 alpaca_broker_api_secret: "test_secret".to_string(),
                 alpaca_account_id: Uuid::nil().to_string(),
                 alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
             },
         }
     }
@@ -414,6 +415,7 @@ mod tests {
             alpaca_broker_api_secret: "test_secret".to_string(),
             alpaca_account_id: config.alpaca_account_id.to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_config(broker_auth)
@@ -507,6 +509,7 @@ mod tests {
             alpaca_broker_api_secret: "invalid_secret".to_string(),
             alpaca_account_id: config.alpaca_account_id.to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Mock(server.base_url()),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         };
 
         let result = AlpacaBrokerApi::try_from_config(broker_auth).await;

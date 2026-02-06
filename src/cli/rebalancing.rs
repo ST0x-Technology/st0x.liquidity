@@ -182,6 +182,7 @@ where
         alpaca_broker_api_secret: alpaca_auth.alpaca_broker_api_secret.clone(),
         alpaca_account_id: rebalancing_config.alpaca_account_id.to_string(),
         alpaca_broker_api_mode: broker_mode,
+        asset_cache_ttl: std::time::Duration::from_secs(3600),
     };
 
     let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
@@ -562,6 +563,7 @@ mod tests {
             alpaca_broker_api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         });
         config
     }
@@ -705,6 +707,7 @@ mod tests {
             alpaca_broker_api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {
@@ -727,6 +730,7 @@ mod tests {
             alpaca_broker_api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         };
 
         let broker_mode = if alpaca_auth.is_sandbox() {

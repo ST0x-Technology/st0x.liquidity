@@ -326,6 +326,7 @@ mod tests {
                 alpaca_broker_api_secret: "test-secret".to_string(),
                 alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
                 alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
             },
         });
         config

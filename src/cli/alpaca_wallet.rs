@@ -475,6 +475,7 @@ mod tests {
             alpaca_broker_api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         });
         config
     }
@@ -498,6 +499,7 @@ mod tests {
                 alpaca_broker_api_secret: "test-secret".to_string(),
                 alpaca_account_id: alpaca_account_id.to_string(),
                 alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
             }),
             hyperdx: None,
             rebalancing: Some(RebalancingConfig {
@@ -519,6 +521,7 @@ mod tests {
                     alpaca_broker_api_secret: "test-secret".to_string(),
                     alpaca_account_id: alpaca_account_id.to_string(),
                     alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                    asset_cache_ttl: std::time::Duration::from_secs(3600),
                 },
             }),
             execution_threshold: ExecutionThreshold::whole_share(),

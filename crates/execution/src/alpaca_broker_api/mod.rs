@@ -1,5 +1,6 @@
 use chrono::{NaiveDate, NaiveTime};
 use rust_decimal::Decimal;
+use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -11,6 +12,14 @@ mod executor;
 mod market_hours;
 mod order;
 mod positions;
+
+/// Asset status from Alpaca Broker API (public because it's exposed in error types)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetStatus {
+    Active,
+    Inactive,
+}
 
 pub use auth::{AccountStatus, AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
 pub use executor::AlpacaBrokerApi;
@@ -72,6 +81,12 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Internal error: calendar was non-empty but iteration returned None")]
     CalendarIterationInvariantViolation,
+
+    #[error("Asset {symbol} is not active (status: {status:?})")]
+    AssetNotActive { symbol: String, status: AssetStatus },
+
+    #[error("Asset {symbol} is not tradable on Alpaca")]
+    AssetNotTradable { symbol: String },
 
     #[error("Cash balance {0} cannot be converted to cents")]
     CashBalanceConversion(Decimal),
