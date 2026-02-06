@@ -2,11 +2,14 @@
 
 use alloy::primitives::U256;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::str::FromStr;
 
-use crate::shares::{ArithmeticError, FractionalShares, HasZero};
+use st0x_execution::{FractionalShares, Positive};
+
+use crate::shares::{ArithmeticError, HasZero};
 
 /// A USDC dollar amount used for threshold configuration.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -34,6 +37,24 @@ impl HasZero for Usdc {
 const USDC_DECIMAL_SCALE: Decimal = Decimal::from_parts(1_000_000, 0, 0, false, 0);
 
 impl Usdc {
+    #[cfg(test)]
+    pub(crate) fn inner(self) -> Decimal {
+        self.0
+    }
+
+    /// Creates a Usdc amount from cents (e.g., 12345 cents = $123.45).
+    pub(crate) fn from_cents(cents: i64) -> Option<Self> {
+        Decimal::from(cents).checked_div(dec!(100)).map(Self)
+    }
+
+    pub(crate) fn is_zero(self) -> bool {
+        self.0.is_zero()
+    }
+
+    pub(crate) fn is_negative(self) -> bool {
+        self.0.is_sign_negative()
+    }
+
     /// Converts to U256 with 6 decimal places (USDC standard).
     ///
     /// Returns an error for negative values or overflow during scaling.
@@ -116,25 +137,15 @@ impl std::ops::Sub for Usdc {
 /// Threshold configuration that determines when to trigger offchain execution.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) enum ExecutionThreshold {
-    Shares(FractionalShares),
+    Shares(Positive<FractionalShares>),
     DollarValue(Usdc),
 }
 
 impl ExecutionThreshold {
-    #[cfg(test)]
-    pub(crate) fn shares(value: FractionalShares) -> Result<Self, InvalidThresholdError> {
-        if value.is_negative() {
-            return Err(InvalidThresholdError::NegativeShares(value));
-        }
-
-        if value.is_zero() {
-            return Err(InvalidThresholdError::ZeroShares);
-        }
-
-        Ok(Self::Shares(value))
+    pub(crate) fn shares(value: Positive<FractionalShares>) -> Self {
+        Self::Shares(value)
     }
 
-    #[cfg(test)]
     pub(crate) fn dollar_value(value: Usdc) -> Result<Self, InvalidThresholdError> {
         if value.is_negative() {
             return Err(InvalidThresholdError::NegativeDollarValue(value));
@@ -147,20 +158,16 @@ impl ExecutionThreshold {
         Ok(Self::DollarValue(value))
     }
 
+    #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(FractionalShares::ONE)
+        Self::Shares(Positive::new(FractionalShares::new(rust_decimal::Decimal::ONE)).unwrap())
     }
 }
 
-#[cfg(test)]
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum InvalidThresholdError {
-    #[error("Shares threshold cannot be negative: {0:?}")]
-    NegativeShares(FractionalShares),
     #[error("Dollar threshold cannot be negative: {0:?}")]
     NegativeDollarValue(Usdc),
-    #[error("Shares threshold cannot be zero")]
-    ZeroShares,
     #[error("Dollar threshold cannot be zero")]
     ZeroDollarValue,
 }
@@ -168,35 +175,40 @@ pub(crate) enum InvalidThresholdError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rust_decimal::Decimal;
+
+    fn arb_decimal() -> impl Strategy<Value = Decimal> {
+        (any::<i64>(), 0u32..=10).prop_map(|(mantissa, scale)| Decimal::new(mantissa, scale))
+    }
+
+    proptest! {
+        #[test]
+        fn usdc_is_zero_matches_decimal_is_zero(decimal in arb_decimal()) {
+            let usdc = Usdc(decimal);
+
+            prop_assert_eq!(usdc.is_zero(), decimal.is_zero());
+        }
+
+        #[test]
+        fn usdc_is_negative_matches_decimal_is_sign_negative(decimal in arb_decimal()) {
+            let usdc = Usdc(decimal);
+
+            prop_assert_eq!(usdc.is_negative(), decimal.is_sign_negative());
+        }
+    }
 
     #[test]
     fn whole_share_matches_smart_constructor() {
         let from_whole_share = ExecutionThreshold::whole_share();
-        let from_constructor = ExecutionThreshold::Shares(FractionalShares::ONE);
+        let from_constructor = ExecutionThreshold::Shares(Positive::<FractionalShares>::ONE);
         assert_eq!(from_whole_share, from_constructor);
     }
 
     #[test]
-    fn shares_threshold_rejects_zero() {
-        let result = ExecutionThreshold::shares(FractionalShares::ZERO);
-        assert_eq!(result.unwrap_err(), InvalidThresholdError::ZeroShares);
-    }
-
-    #[test]
-    fn shares_threshold_rejects_negative() {
-        let negative = FractionalShares(Decimal::NEGATIVE_ONE);
-        let result = ExecutionThreshold::shares(negative);
-        assert_eq!(
-            result.unwrap_err(),
-            InvalidThresholdError::NegativeShares(negative)
-        );
-    }
-
-    #[test]
     fn shares_threshold_accepts_positive() {
-        let result = ExecutionThreshold::shares(FractionalShares::ONE);
-        assert!(result.is_ok());
+        let threshold = ExecutionThreshold::shares(Positive::<FractionalShares>::ONE);
+        assert!(matches!(threshold, ExecutionThreshold::Shares(_)));
     }
 
     #[test]
@@ -299,5 +311,29 @@ mod tests {
         assert_eq!(err.operation, "*");
         assert_eq!(err.lhs, max);
         assert_eq!(err.rhs, Usdc(two));
+    }
+
+    #[test]
+    fn from_cents_converts_positive_cents_to_dollars() {
+        let usdc = Usdc::from_cents(12345).unwrap();
+        assert_eq!(usdc.0, Decimal::new(12345, 2)); // 123.45
+    }
+
+    #[test]
+    fn from_cents_converts_negative_cents_to_dollars() {
+        let usdc = Usdc::from_cents(-500).unwrap();
+        assert_eq!(usdc.0, Decimal::new(-5, 0)); // -5.00
+    }
+
+    #[test]
+    fn from_cents_converts_zero() {
+        let usdc = Usdc::from_cents(0).unwrap();
+        assert!(usdc.is_zero());
+    }
+
+    #[test]
+    fn from_cents_handles_large_values() {
+        let usdc = Usdc::from_cents(i64::MAX).unwrap();
+        assert_eq!(usdc.0, Decimal::from(i64::MAX) / Decimal::from(100));
     }
 }

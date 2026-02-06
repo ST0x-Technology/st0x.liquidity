@@ -96,6 +96,7 @@ mod tests {
     use crate::env::{BrokerConfig, Config};
     use crate::onchain::EvmEnv;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
     use st0x_execution::schwab::SchwabAuthEnv;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
@@ -108,7 +109,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
-                order_owner: address!("0x2222222222222222222222222222222222222222"),
+                order_owner: Some(address!("0x2222222222222222222222222222222222222222")),
                 deployment_block: 0,
             },
             order_polling_interval: 15,
@@ -123,6 +124,7 @@ mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

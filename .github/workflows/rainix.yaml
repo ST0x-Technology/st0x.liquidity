@@ -107,3 +107,8 @@ jobs:
         run: nix develop -c bun run --cwd dashboard test:run
       - name: Build
         run: nix develop -c bun run --cwd dashboard build
+
+      - name: Build Docker image
+        run: docker build -t dashboard:ci dashboard/
+      - name: Validate nginx config
+        run: docker run --rm dashboard:ci nginx -t

@@ -12,8 +12,8 @@ use crate::inventory::{Imbalance, ImbalanceThreshold, InventoryView};
 use crate::threshold::Usdc;
 
 /// Minimum USDC amount for Alpaca withdrawals.
-/// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~6bps),
-/// we use $51 to ensure we always meet the minimum.
+/// Alpaca requires $50 USD minimum, but due to USDC/USD spread (~17bps observed in live tests),
+/// we use $51 to ensure we always meet the minimum after conversion slippage.
 const ALPACA_MINIMUM_WITHDRAWAL: Usdc = Usdc(Decimal::from_parts(51, 0, 0, false, 0));
 
 /// Why a USDC trigger check did not produce an operation.
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(
             ALPACA_MINIMUM_WITHDRAWAL,
             Usdc(dec!(51)),
-            "Alpaca minimum withdrawal should be $51 to account for USDC/USD spread"
+            "Alpaca minimum withdrawal should be $51 to account for ~17bps USDC/USD spread"
         );
     }
 

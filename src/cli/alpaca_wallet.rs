@@ -4,6 +4,7 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
+use rust_decimal::Decimal;
 use st0x_execution::Executor;
 use st0x_execution::alpaca_broker_api::ConversionDirection;
 use std::io::Write;
@@ -35,7 +36,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -139,7 +140,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
     let sender_address = signer.address();
 
@@ -246,7 +247,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
         )
     })?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let sender_address = signer.address();
     let target_address = address.unwrap_or(sender_address);
 
@@ -415,6 +416,17 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     if let Some(filled_qty) = order.filled_quantity {
         writeln!(stdout, "   Filled Quantity: {filled_qty}")?;
     }
+    if let (Some(price), Some(qty)) = (order.filled_average_price, order.filled_quantity) {
+        match Decimal::try_from(price) {
+            Ok(price_decimal) => {
+                let usd_amount = price_decimal * qty;
+                writeln!(stdout, "   USD Amount: ${usd_amount}")?;
+            }
+            Err(e) => {
+                writeln!(stdout, "   USD Amount: (conversion error: {e})")?;
+            }
+        }
+    }
     writeln!(stdout, "   Created: {}", order.created_at)?;
 
     Ok(())
@@ -434,6 +446,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_alpaca() -> Config {
         Config {
@@ -443,7 +456,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -451,6 +464,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -461,6 +475,7 @@ mod tests {
             alpaca_broker_api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         });
         config
     }
@@ -474,7 +489,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -484,13 +499,13 @@ mod tests {
                 alpaca_broker_api_secret: "test-secret".to_string(),
                 alpaca_account_id: alpaca_account_id.to_string(),
                 alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
             }),
             hyperdx: None,
             rebalancing: Some(RebalancingConfig {
-                ethereum_private_key: B256::ZERO,
+                evm_private_key: B256::ZERO,
                 ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
                 usdc_vault_id: B256::ZERO,
-                market_maker_wallet: Address::ZERO,
                 redemption_wallet: Address::ZERO,
                 alpaca_account_id,
                 equity_threshold: ImbalanceThreshold {
@@ -501,7 +516,15 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
+                alpaca_broker_auth: AlpacaBrokerApiAuthEnv {
+                    alpaca_broker_api_key: "test-key".to_string(),
+                    alpaca_broker_api_secret: "test-secret".to_string(),
+                    alpaca_account_id: alpaca_account_id.to_string(),
+                    alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                    asset_cache_ttl: std::time::Duration::from_secs(3600),
+                },
             }),
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 

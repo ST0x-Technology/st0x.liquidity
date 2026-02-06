@@ -1,13 +1,17 @@
 use chrono::{NaiveDate, NaiveTime};
+use rust_decimal::Decimal;
 use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
+
+use crate::Symbol;
 
 mod auth;
 mod client;
 mod executor;
 mod market_hours;
 mod order;
+mod positions;
 
 /// Asset status from Alpaca Broker API (public because it's exposed in error types)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -83,4 +87,19 @@ pub enum AlpacaBrokerApiError {
 
     #[error("Asset {symbol} is not tradable on Alpaca")]
     AssetNotTradable { symbol: String },
+
+    #[error("Cash balance {0} cannot be converted to cents")]
+    CashBalanceConversion(Decimal),
+
+    #[error("Cash balance {0} has fractional cents after conversion")]
+    FractionalCents(Decimal),
+
+    #[error("Invalid symbol in position: {0}")]
+    InvalidSymbol(#[from] crate::EmptySymbolError),
+
+    #[error("Market value conversion failed for symbol {symbol}: {market_value:?}")]
+    MarketValueConversion {
+        symbol: Symbol,
+        market_value: Option<Decimal>,
+    },
 }

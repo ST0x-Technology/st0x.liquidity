@@ -1,21 +1,20 @@
 //! Operation executor that dispatches triggered rebalancing operations to managers.
 
 use alloy::primitives::{Address, U256};
-use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use uuid::Uuid;
+
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::mint::Mint;
 use super::redemption::Redeem;
 use super::trigger::TriggeredOperation;
 use super::usdc::UsdcRebalance;
 use crate::equity_redemption::RedemptionAggregateId;
-use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
-use st0x_execution::Symbol;
 
 /// Receives triggered rebalancing operations and dispatches them to managers.
 pub(crate) struct Rebalancer<M, R, U>
@@ -114,7 +113,7 @@ where
     }
 
     async fn execute_redemption(&self, symbol: Symbol, quantity: FractionalShares, token: Address) {
-        let amount = match shares_to_u256_18_decimals(quantity) {
+        let amount = match quantity.to_u256_18_decimals() {
             Ok(amount) => amount,
             Err(e) => {
                 error!(
@@ -194,124 +193,18 @@ fn log_redemption_result<E: std::fmt::Display>(symbol: &Symbol, result: Result<(
     }
 }
 
-/// 10^18 - scale factor for converting shares to 18-decimal token amounts.
-/// Constructed via from_parts(lo, mid, hi, negative, scale) where lo/mid/hi
-/// form a 96-bit integer: 10^18 = 0x0DE0B6B3A7640000 = (mid=232830643 << 32) | lo=2808348672
-const ERC20_DECIMAL_SCALE: Decimal = Decimal::from_parts(2_808_348_672, 232_830_643, 0, false, 0);
-
-/// Converts FractionalShares (Decimal) to U256 with 18 decimal places.
-///
-/// Underflow policy: values that scale to less than 1 (i.e., < 1e-18 shares)
-/// return an error rather than silently becoming zero.
-fn shares_to_u256_18_decimals(shares: FractionalShares) -> Result<U256, SharesConversionError> {
-    let value = shares.0;
-
-    if value.is_sign_negative() {
-        return Err(SharesConversionError::NegativeValue(value));
-    }
-
-    if value.is_zero() {
-        return Ok(U256::ZERO);
-    }
-
-    let scaled = value
-        .checked_mul(ERC20_DECIMAL_SCALE)
-        .ok_or(SharesConversionError::Overflow)?;
-
-    let truncated = scaled.trunc();
-
-    if truncated.is_zero() {
-        return Err(SharesConversionError::Underflow(value));
-    }
-
-    let as_str = truncated.to_string();
-
-    U256::from_str_radix(&as_str, 10).map_err(SharesConversionError::ParseError)
-}
-
-#[derive(Debug, thiserror::Error)]
-enum SharesConversionError {
-    #[error("shares value cannot be negative: {0}")]
-    NegativeValue(Decimal),
-    #[error("shares value too small to represent with 18 decimals: {0}")]
-    Underflow(Decimal),
-    #[error("overflow when scaling shares to 18 decimals")]
-    Overflow,
-    #[error("failed to parse U256: {0}")]
-    ParseError(#[from] alloy::primitives::ruint::ParseError),
-}
-
 #[cfg(test)]
 mod tests {
     use alloy::primitives::address;
     use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     use super::*;
     use crate::rebalancing::mint::mock::MockMint;
     use crate::rebalancing::redemption::mock::MockRedeem;
     use crate::rebalancing::usdc::mock::MockUsdcRebalance;
     use crate::threshold::Usdc;
-
-    #[test]
-    fn erc20_decimal_scale_equals_1e18() {
-        let expected = dec!(1_000_000_000_000_000_000);
-        assert_eq!(ERC20_DECIMAL_SCALE, expected);
-    }
-
-    #[test]
-    fn shares_to_u256_converts_whole_number() {
-        let shares = FractionalShares(dec!(42));
-        let result = shares_to_u256_18_decimals(shares).unwrap();
-
-        let expected = U256::from(42_000_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn shares_to_u256_converts_fractional() {
-        let shares = FractionalShares(dec!(100.5));
-        let result = shares_to_u256_18_decimals(shares).unwrap();
-
-        let expected = U256::from(100_500_000_000_000_000_000_u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn shares_to_u256_converts_zero() {
-        let shares = FractionalShares(dec!(0));
-        let result = shares_to_u256_18_decimals(shares).unwrap();
-
-        assert_eq!(result, U256::ZERO);
-    }
-
-    #[test]
-    fn shares_to_u256_rejects_negative() {
-        let shares = FractionalShares(dec!(-10));
-        let result = shares_to_u256_18_decimals(shares);
-
-        assert!(matches!(
-            result,
-            Err(SharesConversionError::NegativeValue(_))
-        ));
-    }
-
-    #[test]
-    fn shares_to_u256_rejects_underflow() {
-        // Value smaller than 1e-18 should error
-        let shares = FractionalShares(Decimal::from_parts(1, 0, 0, false, 28));
-        let result = shares_to_u256_18_decimals(shares);
-
-        assert!(matches!(result, Err(SharesConversionError::Underflow(_))));
-    }
-
-    #[test]
-    fn shares_to_u256_rejects_overflow() {
-        // Decimal::MAX * 10^18 would overflow
-        let shares = FractionalShares(Decimal::MAX);
-        let result = shares_to_u256_18_decimals(shares);
-
-        assert!(matches!(result, Err(SharesConversionError::Overflow)));
-    }
 
     #[tokio::test]
     async fn dispatch_mint_calls_mint_manager() {
@@ -330,7 +223,7 @@ mod tests {
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares(dec!(100)),
+            quantity: FractionalShares::new(dec!(100)),
         })
         .await
         .unwrap();
@@ -361,7 +254,7 @@ mod tests {
 
         tx.send(TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares(dec!(50)),
+            quantity: FractionalShares::new(dec!(50)),
             token: address!("0x1234567890123456789012345678901234567890"),
         })
         .await
@@ -453,21 +346,21 @@ mod tests {
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares(dec!(10)),
+            quantity: FractionalShares::new(dec!(10)),
         })
         .await
         .unwrap();
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("TSLA").unwrap(),
-            quantity: FractionalShares(dec!(20)),
+            quantity: FractionalShares::new(dec!(20)),
         })
         .await
         .unwrap();
 
         tx.send(TriggeredOperation::Redemption {
             symbol: Symbol::new("GOOG").unwrap(),
-            quantity: FractionalShares(dec!(5)),
+            quantity: FractionalShares::new(dec!(5)),
             token: address!("0x1234567890123456789012345678901234567890"),
         })
         .await
@@ -524,7 +417,7 @@ mod tests {
 
         tx.send(TriggeredOperation::Redemption {
             symbol: Symbol::new("AAPL").unwrap(),
-            quantity: FractionalShares(dec!(-10)),
+            quantity: FractionalShares::new(dec!(-10)),
             token: address!("0x1234567890123456789012345678901234567890"),
         })
         .await
@@ -532,7 +425,7 @@ mod tests {
 
         tx.send(TriggeredOperation::Mint {
             symbol: Symbol::new("TSLA").unwrap(),
-            quantity: FractionalShares(dec!(50)),
+            quantity: FractionalShares::new(dec!(50)),
         })
         .await
         .unwrap();

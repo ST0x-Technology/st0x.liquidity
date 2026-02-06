@@ -1,12 +1,18 @@
+use alloy::primitives::Address;
+use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use tracing::Level;
+use std::process::ExitCode;
+use tracing::{Level, error, info};
+
+use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
 
 use crate::offchain::order_poller::OrderPollerConfig;
 use crate::onchain::EvmEnv;
 use crate::rebalancing::{RebalancingConfig, RebalancingConfigError};
 use crate::telemetry::HyperDxConfig;
-use st0x_execution::SupportedExecutor;
+use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthEnv;
 use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthEnv;
 use st0x_execution::schwab::SchwabAuthEnv;
@@ -102,11 +108,55 @@ impl From<&LogLevel> for Level {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
+pub(crate) enum ConfigError {
     #[error(transparent)]
     Rebalancing(#[from] RebalancingConfigError),
     #[error(transparent)]
     Clap(#[from] clap::Error),
+    #[error("ORDER_OWNER required when rebalancing is disabled")]
+    MissingOrderOwner,
+    #[error("failed to derive address from EVM_PRIVATE_KEY")]
+    PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
+    #[error("Invalid execution threshold: {0}")]
+    InvalidThreshold(#[from] InvalidThresholdError),
+    #[error("Invalid shares value: {0}")]
+    InvalidShares(#[from] st0x_execution::InvalidSharesError),
+}
+
+impl ConfigError {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::Clap(_) => "missing or invalid environment variable",
+            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
+            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
+            Self::InvalidThreshold(_) => "invalid execution threshold",
+            Self::InvalidShares(_) => "invalid shares value",
+        }
+    }
+}
+
+/// Parses environment from command line and validates configuration.
+///
+/// Returns `ExitCode::SUCCESS` if valid, `ExitCode::FAILURE` otherwise.
+/// Logs success/failure via tracing.
+///
+/// This function is intended exclusively for the `validate_config` binary.
+/// Other code should use `Env::parse()` and `into_config()` directly.
+pub fn validate_config() -> ExitCode {
+    match Env::try_parse() {
+        Ok(env) => match env.into_config() {
+            Ok(_) => {
+                info!("Config validation passed");
+                ExitCode::SUCCESS
+            }
+            Err(_) => ExitCode::FAILURE,
+        },
+        Err(e) => {
+            error!(error = %e, "Config parsing failed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +170,7 @@ pub struct Config {
     pub(crate) broker: BrokerConfig,
     pub hyperdx: Option<HyperDxConfig>,
     pub(crate) rebalancing: Option<RebalancingConfig>,
+    pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -153,7 +204,16 @@ pub struct Env {
 }
 
 impl Env {
-    pub fn into_config(self) -> Result<Config, ConfigError> {
+    /// Parses environment variables into a validated Config.
+    ///
+    /// Logs the error kind via tracing on failure.
+    pub fn into_config(self) -> anyhow::Result<Config> {
+        Ok(self.into_config_inner().inspect_err(|e| {
+            error!(kind = e.kind(), "Config parsing failed");
+        })?)
+    }
+
+    fn into_config_inner(self) -> Result<Config, ConfigError> {
         let broker = match self.executor {
             SupportedExecutor::Schwab => {
                 let schwab_auth = SchwabAuthEnv::try_parse_from(DUMMY_PROGRAM_NAME)?;
@@ -178,12 +238,30 @@ impl Env {
         });
 
         let rebalancing = if self.rebalancing_enabled {
-            if !matches!(broker, BrokerConfig::AlpacaBrokerApi(_)) {
+            let BrokerConfig::AlpacaBrokerApi(ref auth) = broker else {
                 return Err(RebalancingConfigError::NotAlpacaBroker.into());
-            }
-            Some(RebalancingConfig::from_env()?)
+            };
+            Some(RebalancingConfig::from_env(auth.clone())?)
         } else {
             None
+        };
+
+        if rebalancing.is_none() && self.evm.order_owner.is_none() {
+            return Err(ConfigError::MissingOrderOwner);
+        }
+
+        // Execution threshold is determined by broker capabilities:
+        // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
+        // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
+        //   for slippage, fees, and price discrepancies that could push fills below $1.
+        // - DryRun uses shares threshold for testing
+        let execution_threshold = match &broker {
+            BrokerConfig::Schwab(_) | BrokerConfig::DryRun => {
+                ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+            }
+            BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
+                ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))?
+            }
         };
 
         Ok(Config {
@@ -196,6 +274,7 @@ impl Env {
             broker,
             hyperdx,
             rebalancing,
+            execution_threshold,
         })
     }
 }
@@ -205,10 +284,26 @@ impl Config {
         configure_sqlite_pool(&self.database_url).await
     }
 
+    pub(crate) fn rebalancing_config(&self) -> Option<&RebalancingConfig> {
+        self.rebalancing.as_ref()
+    }
+
     pub const fn get_order_poller_config(&self) -> OrderPollerConfig {
         OrderPollerConfig {
             polling_interval: std::time::Duration::from_secs(self.order_polling_interval),
             max_jitter: std::time::Duration::from_secs(self.order_polling_max_jitter),
+        }
+    }
+
+    pub(crate) fn order_owner(&self) -> Result<Address, ConfigError> {
+        match (&self.rebalancing, self.evm.order_owner) {
+            (Some(r), _) => {
+                let signer = PrivateKeySigner::from_bytes(&r.evm_private_key)
+                    .map_err(ConfigError::PrivateKeyDerivation)?;
+                Ok(signer.address())
+            }
+            (None, Some(addr)) => Ok(addr),
+            (None, None) => Err(ConfigError::MissingOrderOwner),
         }
     }
 }
@@ -226,13 +321,17 @@ pub fn setup_tracing(log_level: &LogLevel) {
 }
 
 #[cfg(test)]
-pub mod tests {
-    use super::*;
-    use crate::onchain::EvmEnv;
+pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use rust_decimal::Decimal;
     use st0x_execution::schwab::{SchwabAuthEnv, SchwabConfig};
     use st0x_execution::{MockExecutorConfig, TryIntoExecutor};
+    use tracing_test::traced_test;
+
+    use super::*;
+    use crate::onchain::EvmEnv;
+    use crate::shares::FractionalShares;
+    use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -244,7 +343,7 @@ pub mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
-                order_owner,
+                order_owner: Some(order_owner),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -259,6 +358,7 @@ pub mod tests {
             }),
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -378,6 +478,7 @@ pub mod tests {
         });
     }
 
+    #[tracing_test::traced_test]
     #[test]
     fn rebalancing_enabled_with_schwab_fails() {
         temp_env::with_vars(
@@ -412,16 +513,16 @@ pub mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(
-                            RebalancingConfigError::NotAlpacaBroker
-                        ))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::NotAlpacaBroker)
                     ),
-                    "Expected NotAlpacaBroker error, got {result:?}"
+                    "Expected NotAlpacaBroker error, got {config_err:?}"
                 );
+                assert!(logs_contain("rebalancing configuration error"));
             },
         );
     }
@@ -438,7 +539,7 @@ pub mod tests {
                 ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -452,7 +553,6 @@ pub mod tests {
                 ),
                 // Explicitly unset to avoid env pollution
                 ("REDEMPTION_WALLET", None),
-                ("MARKET_MAKER_WALLET", None),
             ],
             || {
                 let args = vec![
@@ -474,13 +574,14 @@ pub mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-                    "Expected clap error for missing redemption_wallet, got {result:?}"
+                    "Expected clap error for missing redemption_wallet, got {config_err:?}"
                 );
             },
         );
@@ -501,11 +602,7 @@ pub mod tests {
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
                 (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
-                (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -540,20 +637,21 @@ pub mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-                    "Expected clap error for missing ethereum_rpc_url, got {result:?}"
+                    "Expected clap error for missing ethereum_rpc_url, got {config_err:?}"
                 );
             },
         );
     }
 
     #[test]
-    fn rebalancing_enabled_missing_ethereum_private_key_fails() {
+    fn rebalancing_enabled_missing_evm_private_key_fails() {
         temp_env::with_vars(
             [
                 ("ALPACA_BROKER_API_KEY", Some("test_key")),
@@ -566,10 +664,6 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
                 (
@@ -581,7 +675,7 @@ pub mod tests {
                     Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
                 ),
                 // Explicitly unset to avoid env pollution
-                ("ETHEREUM_PRIVATE_KEY", None),
+                ("EVM_PRIVATE_KEY", None),
             ],
             || {
                 let args = vec![
@@ -603,13 +697,14 @@ pub mod tests {
                 ];
 
                 let env = Env::try_parse_from(args).unwrap();
-                let result = env.into_config();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
                 assert!(
                     matches!(
-                        result,
-                        Err(ConfigError::Rebalancing(RebalancingConfigError::Clap(_)))
+                        config_err,
+                        ConfigError::Rebalancing(RebalancingConfigError::Clap(_))
                     ),
-                    "Expected clap error for missing ethereum_private_key, got {result:?}"
+                    "Expected clap error for missing evm_private_key, got {config_err:?}"
                 );
             },
         );
@@ -629,13 +724,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -697,13 +788,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -740,7 +827,7 @@ pub mod tests {
                 let rebalancing = config.rebalancing.expect("rebalancing should be Some");
 
                 assert_eq!(rebalancing.equity_threshold.target, Decimal::new(5, 1));
-                assert_eq!(rebalancing.equity_threshold.deviation, Decimal::new(2, 1));
+                assert_eq!(rebalancing.equity_threshold.deviation, Decimal::new(15, 2));
                 assert_eq!(rebalancing.usdc_threshold.target, Decimal::new(5, 1));
                 assert_eq!(rebalancing.usdc_threshold.deviation, Decimal::new(3, 1));
             },
@@ -761,13 +848,9 @@ pub mod tests {
                     "REDEMPTION_WALLET",
                     Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
                 ),
-                (
-                    "MARKET_MAKER_WALLET",
-                    Some("0xcccccccccccccccccccccccccccccccccccccccc"),
-                ),
                 ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
                 (
-                    "ETHEREUM_PRIVATE_KEY",
+                    "EVM_PRIVATE_KEY",
                     Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
                 ),
                 ("BASE_RPC_URL", Some("https://base.example.com")),
@@ -811,6 +894,609 @@ pub mod tests {
                 assert_eq!(rebalancing.equity_threshold.deviation, Decimal::new(15, 2));
                 assert_eq!(rebalancing.usdc_threshold.target, Decimal::new(4, 1));
                 assert_eq!(rebalancing.usdc_threshold.deviation, Decimal::new(25, 2));
+            },
+        );
+    }
+
+    #[test]
+    fn schwab_without_order_owner_fails_with_missing_order_owner_error() {
+        temp_env::with_vars(
+            [
+                ("SCHWAB_APP_KEY", Some("test_key")),
+                ("SCHWAB_APP_SECRET", Some("test_secret")),
+                ("SCHWAB_REDIRECT_URI", Some("https://127.0.0.1")),
+                ("SCHWAB_BASE_URL", Some("https://test.com")),
+                ("SCHWAB_ACCOUNT_INDEX", Some("0")),
+                (
+                    "ENCRYPTION_KEY",
+                    Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                ),
+                ("ORDER_OWNER", None::<&str>),
+                ("REBALANCING_ENABLED", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "schwab",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let err = env.into_config().unwrap_err();
+                let config_err = err.downcast_ref::<ConfigError>().unwrap();
+                assert!(
+                    matches!(config_err, ConfigError::MissingOrderOwner),
+                    "Expected MissingOrderOwner error, got {config_err:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn schwab_with_order_owner_succeeds() {
+        temp_env::with_vars(
+            [
+                ("SCHWAB_APP_KEY", Some("test_key")),
+                ("SCHWAB_APP_SECRET", Some("test_secret")),
+                ("SCHWAB_REDIRECT_URI", Some("https://127.0.0.1")),
+                ("SCHWAB_BASE_URL", Some("https://test.com")),
+                ("SCHWAB_ACCOUNT_INDEX", Some("0")),
+                (
+                    "ENCRYPTION_KEY",
+                    Some("0000000000000000000000000000000000000000000000000000000000000000"),
+                ),
+                ("REBALANCING_ENABLED", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "schwab",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let order_owner = config.order_owner().unwrap();
+                assert_eq!(
+                    order_owner,
+                    address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn default_execution_threshold_is_one_share() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", None::<&str>),
+                ("EXECUTION_THRESHOLD_TYPE", None::<&str>),
+                ("EXECUTION_THRESHOLD_VALUE", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "dry-run",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+
+                assert_eq!(
+                    config.execution_threshold,
+                    ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn dry_run_executor_uses_shares_threshold() {
+        temp_env::with_vars([("REBALANCING_ENABLED", None::<&str>)], || {
+            let args = vec![
+                "test",
+                "--db",
+                ":memory:",
+                "--ws-rpc-url",
+                "ws://localhost:8545",
+                "--orderbook",
+                "0x1111111111111111111111111111111111111111",
+                "--order-owner",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--deployment-block",
+                "1",
+                "--executor",
+                "dry-run",
+            ];
+
+            let env = Env::try_parse_from(args).unwrap();
+            let config = env.into_config().unwrap();
+
+            let expected = ExecutionThreshold::shares(Positive::<FractionalShares>::ONE);
+            assert_eq!(config.execution_threshold, expected);
+        });
+    }
+
+    #[test]
+    fn alpaca_trading_api_executor_uses_dollar_threshold() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", None::<&str>),
+                ("ALPACA_API_KEY", Some("test-key")),
+                ("ALPACA_API_SECRET", Some("test-secret")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-trading-api",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+
+                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+                assert_eq!(config.execution_threshold, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_broker_api_executor_uses_dollar_threshold() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", None::<&str>),
+                ("ALPACA_BROKER_API_KEY", Some("test-key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test-secret")),
+                ("ALPACA_ACCOUNT_ID", Some("test-account-id")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+
+                let expected = ExecutionThreshold::dollar_value(Usdc(Decimal::TWO)).unwrap();
+                assert_eq!(config.execution_threshold, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn config_error_kind_rebalancing() {
+        let err = ConfigError::Rebalancing(RebalancingConfigError::NotAlpacaBroker);
+        assert_eq!(err.kind(), "rebalancing configuration error");
+    }
+
+    #[test]
+    fn config_error_kind_clap() {
+        let clap_err = clap::Command::new("test")
+            .arg(clap::Arg::new("required").required(true))
+            .try_get_matches_from(vec!["test"])
+            .unwrap_err();
+        let err = ConfigError::Clap(clap_err);
+        assert_eq!(err.kind(), "missing or invalid environment variable");
+    }
+
+    #[test]
+    fn config_error_kind_invalid_threshold() {
+        let err = ConfigError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
+        assert_eq!(err.kind(), "invalid execution threshold");
+    }
+
+    #[traced_test]
+    #[test]
+    fn into_config_logs_rebalancing_error_kind() {
+        temp_env::with_vars(
+            [
+                ("REBALANCING_ENABLED", Some("true")),
+                ("ALPACA_API_KEY", Some("test-key")),
+                ("ALPACA_API_SECRET", Some("test-secret")),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--order-owner",
+                    "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-trading-api",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let result = env.into_config();
+
+                assert!(result.is_err());
+                assert!(logs_contain("rebalancing configuration error"));
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_rebalancing_without_order_owner_derives_from_private_key() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                // Private key whose address is 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                // No ORDER_OWNER - should derive from EVM_PRIVATE_KEY
+                ("ORDER_OWNER", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    // No --order-owner argument
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let order_owner = config.order_owner().unwrap();
+                // Address derived from private key 0x...0001
+                assert_eq!(
+                    order_owner,
+                    address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf")
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_rebalancing_ignores_order_owner_env_var() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    // Set ORDER_OWNER explicitly - should be ignored when rebalancing enabled
+                    "--order-owner",
+                    "0xcccccccccccccccccccccccccccccccccccccccc",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let order_owner = config.order_owner().unwrap();
+                // Should return derived address, NOT the env var value
+                assert_eq!(
+                    order_owner,
+                    address!("0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"),
+                    "Expected derived address, not env var. order_owner() should derive from EVM_PRIVATE_KEY when rebalancing is enabled."
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn alpaca_rebalancing_with_invalid_private_key_fails_with_derivation_error() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                // Zero private key is invalid for secp256k1
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000000"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+                ("ORDER_OWNER", None::<&str>),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let result = config.order_owner();
+                assert!(
+                    matches!(result, Err(ConfigError::PrivateKeyDerivation(_))),
+                    "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn rebalancing_config_returns_some_for_alpaca_broker_api() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("test_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("test_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                assert!(
+                    config.rebalancing_config().is_some(),
+                    "rebalancing_config() should return Some for AlpacaBrokerApi with rebalancing enabled"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn rebalancing_config_returns_none_when_disabled() {
+        temp_env::with_vars([("REBALANCING_ENABLED", None::<&str>)], || {
+            let args = vec![
+                "test",
+                "--db",
+                ":memory:",
+                "--ws-rpc-url",
+                "ws://localhost:8545",
+                "--orderbook",
+                "0x1111111111111111111111111111111111111111",
+                "--order-owner",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "--deployment-block",
+                "1",
+                "--executor",
+                "dry-run",
+            ];
+
+            let env = Env::try_parse_from(args).unwrap();
+            let config = env.into_config().unwrap();
+            assert!(
+                config.rebalancing_config().is_none(),
+                "rebalancing_config() should return None when rebalancing is disabled"
+            );
+        });
+    }
+
+    #[test]
+    fn rebalancing_config_contains_broker_auth() {
+        temp_env::with_vars(
+            [
+                ("ALPACA_BROKER_API_KEY", Some("my_broker_key")),
+                ("ALPACA_BROKER_API_SECRET", Some("my_broker_secret")),
+                (
+                    "ALPACA_ACCOUNT_ID",
+                    Some("904837e3-3b76-47ec-b432-046db621571b"),
+                ),
+                (
+                    "REDEMPTION_WALLET",
+                    Some("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                ),
+                ("ETHEREUM_RPC_URL", Some("https://mainnet.infura.io")),
+                (
+                    "EVM_PRIVATE_KEY",
+                    Some("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+                ),
+                ("BASE_RPC_URL", Some("https://base.example.com")),
+                (
+                    "BASE_ORDERBOOK",
+                    Some("0x2222222222222222222222222222222222222222"),
+                ),
+                (
+                    "USDC_VAULT_ID",
+                    Some("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                ),
+            ],
+            || {
+                let args = vec![
+                    "test",
+                    "--db",
+                    ":memory:",
+                    "--ws-rpc-url",
+                    "ws://localhost:8545",
+                    "--orderbook",
+                    "0x1111111111111111111111111111111111111111",
+                    "--deployment-block",
+                    "1",
+                    "--executor",
+                    "alpaca-broker-api",
+                    "--rebalancing-enabled",
+                    "true",
+                ];
+
+                let env = Env::try_parse_from(args).unwrap();
+                let config = env.into_config().unwrap();
+                let rebalancing = config.rebalancing_config().unwrap();
+
+                assert_eq!(
+                    rebalancing.alpaca_broker_auth.alpaca_broker_api_key,
+                    "my_broker_key"
+                );
+                assert_eq!(
+                    rebalancing.alpaca_broker_auth.alpaca_broker_api_secret,
+                    "my_broker_secret"
+                );
             },
         );
     }

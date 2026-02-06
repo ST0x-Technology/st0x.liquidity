@@ -110,7 +110,7 @@ mod tests {
         mock.execute_mint(
             &IssuerRequestId::new("id-1"),
             Symbol::new("AAPL").unwrap(),
-            FractionalShares(dec!(10)),
+            FractionalShares::new(dec!(10)),
             Address::ZERO,
         )
         .await
@@ -121,7 +121,7 @@ mod tests {
         mock.execute_mint(
             &IssuerRequestId::new("id-2"),
             Symbol::new("TSLA").unwrap(),
-            FractionalShares(dec!(20)),
+            FractionalShares::new(dec!(20)),
             Address::ZERO,
         )
         .await
@@ -138,7 +138,7 @@ mod tests {
         mock.execute_mint(
             &IssuerRequestId::new("req-abc"),
             Symbol::new("GOOG").unwrap(),
-            FractionalShares(dec!(123.456)),
+            FractionalShares::new(dec!(123.456)),
             wallet,
         )
         .await
@@ -147,7 +147,7 @@ mod tests {
         let call = mock.last_call().unwrap();
         assert_eq!(call.issuer_request_id, "req-abc");
         assert_eq!(call.symbol, Symbol::new("GOOG").unwrap());
-        assert_eq!(call.quantity, FractionalShares(dec!(123.456)));
+        assert_eq!(call.quantity, FractionalShares::new(dec!(123.456)));
         assert_eq!(call.wallet, wallet);
     }
 
@@ -159,7 +159,7 @@ mod tests {
             .execute_mint(
                 &IssuerRequestId::new("fail-test"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(1)),
+                FractionalShares::new(dec!(1)),
                 Address::ZERO,
             )
             .await;
@@ -175,7 +175,7 @@ mod tests {
             .execute_mint(
                 &IssuerRequestId::new("x"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(1)),
+                FractionalShares::new(dec!(1)),
                 Address::ZERO,
             )
             .await;
@@ -191,7 +191,7 @@ mod tests {
             .execute_mint(
                 &IssuerRequestId::new("captured"),
                 Symbol::new("NVDA").unwrap(),
-                FractionalShares(dec!(50)),
+                FractionalShares::new(dec!(50)),
                 Address::ZERO,
             )
             .await;

@@ -48,25 +48,22 @@ async fn enqueue_event(
 ) -> Result<(), EventQueueError> {
     let tx_hash = log
         .transaction_hash
-        .ok_or_else(|| EventQueueError::Processing("Log missing transaction hash".to_string()))?;
+        .ok_or(EventQueueError::MissingLogField("transaction_hash"))?;
 
     let log_index = log
         .log_index
-        .ok_or_else(|| EventQueueError::Processing("Log missing log index".to_string()))?;
+        .ok_or(EventQueueError::MissingLogField("log_index"))?;
 
-    let log_index_i64 = i64::try_from(log_index)
-        .map_err(|_| EventQueueError::Processing("Log index too large".to_string()))?;
+    let log_index_i64 = i64::try_from(log_index)?;
 
     let block_number = log
         .block_number
-        .ok_or_else(|| EventQueueError::Processing("Log missing block number".to_string()))?;
+        .ok_or(EventQueueError::MissingLogField("block_number"))?;
 
-    let block_number_i64 = i64::try_from(block_number)
-        .map_err(|_| EventQueueError::Processing("Block number too large".to_string()))?;
+    let block_number_i64 = i64::try_from(block_number)?;
 
     let tx_hash_str = format!("{tx_hash:#x}");
-    let event_json = serde_json::to_string(&event)
-        .map_err(|e| EventQueueError::Processing(format!("Failed to serialize event: {e}")))?;
+    let event_json = serde_json::to_string(&event)?;
 
     let block_timestamp_naive = log.block_timestamp.and_then(|ts| {
         let Ok(ts_i64) = i64::try_from(ts) else {
@@ -135,22 +132,15 @@ pub(crate) async fn get_next_unprocessed_event(
         return Ok(None);
     };
 
-    let tx_hash = B256::from_str(&row.tx_hash)
-        .map_err(|e| EventQueueError::Processing(format!("Invalid tx_hash format: {e}")))?;
+    let tx_hash = B256::from_str(&row.tx_hash)?;
 
-    let event: TradeEvent = serde_json::from_str(&row.event_data)
-        .map_err(|e| EventQueueError::Processing(format!("Failed to deserialize event: {e}")))?;
+    let event: TradeEvent = serde_json::from_str(&row.event_data)?;
 
     Ok(Some(QueuedEvent {
         id: Some(row.id),
         tx_hash,
-        log_index: row
-            .log_index
-            .try_into()
-            .map_err(|_| EventQueueError::Processing("Log index conversion failed".to_string()))?,
-        block_number: row.block_number.try_into().map_err(|_| {
-            EventQueueError::Processing("Block number conversion failed".to_string())
-        })?,
+        log_index: row.log_index.try_into()?,
+        block_number: row.block_number.try_into()?,
         event,
         processed: row.processed,
         created_at: Some(row.created_at.and_utc()),
@@ -248,9 +238,7 @@ pub(crate) async fn get_max_processed_block(
         return Ok(None);
     };
 
-    let block_u64 = u64::try_from(block).map_err(|_| {
-        EventQueueError::Processing(format!("Block number {block} conversion failed"))
-    })?;
+    let block_u64 = u64::try_from(block)?;
 
     Ok(Some(block_u64))
 }

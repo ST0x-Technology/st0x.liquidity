@@ -13,6 +13,7 @@ use crate::cctp::{
     USDC_BASE, USDC_ETHEREUM,
 };
 use crate::env::Config;
+use crate::onchain::http_client_with_retry;
 use crate::rebalancing::RebalancingConfig;
 use crate::threshold::Usdc;
 
@@ -41,14 +42,14 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-bridge requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
     let wallet = signer.address();
 
     let amount_u256 = if all {
         let balance = match from {
             CctpChain::Ethereum => {
-                let provider =
-                    ProviderBuilder::new().connect_http(rebalancing.ethereum_rpc_url.clone());
+                let provider = ProviderBuilder::new()
+                    .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
                 IERC20::IERC20Instance::new(USDC_ETHEREUM, provider)
                     .balanceOf(wallet)
                     .call()
@@ -100,10 +101,14 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     )?;
 
     writeln!(stdout, "\n3. Minting USDC on {dest:?}...")?;
-    let mint_tx = cctp_bridge
+    let mint_receipt = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
-    writeln!(stdout, "Bridge complete! Mint tx: {mint_tx}")?;
+    writeln!(
+        stdout,
+        "Bridge complete! Mint tx: {}\n  Amount received: {} (fee: {})",
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+    )?;
 
     Ok(())
 }
@@ -117,7 +122,7 @@ fn build_cctp_bridge<BP: Provider + Clone>(
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
-        .connect_http(rebalancing.ethereum_rpc_url.clone());
+        .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
     let base_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
@@ -156,7 +161,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-recover requires rebalancing configuration"))?;
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
 
     let direction = source_chain.to_bridge_direction();
     let dest_chain = match source_chain {
@@ -178,10 +183,14 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     )?;
 
     writeln!(stdout, "   Calling receiveMessage on {dest_chain:?}...")?;
-    let mint_tx = cctp_bridge
+    let mint_receipt = cctp_bridge
         .mint(direction, response.message, response.attestation)
         .await?;
-    writeln!(stdout, "CCTP transfer recovered! Mint tx: {mint_tx}")?;
+    writeln!(
+        stdout,
+        "CCTP transfer recovered! Mint tx: {}\n  Amount received: {} (fee: {})",
+        mint_receipt.tx, mint_receipt.amount, mint_receipt.fee_collected
+    )?;
 
     Ok(())
 }
@@ -197,7 +206,7 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("reset-allowance requires rebalancing configuration"))?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing.evm_private_key)?;
     let wallet = EthereumWallet::from(signer.clone());
     let owner = signer.address();
 
@@ -215,7 +224,7 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
         CctpChain::Ethereum => {
             let provider = ProviderBuilder::new()
                 .wallet(wallet)
-                .connect_http(rebalancing.ethereum_rpc_url.clone());
+                .connect_client(http_client_with_retry(rebalancing.ethereum_rpc_url.clone()));
             reset_allowance(stdout, usdc_address, owner, spender, &provider).await
         }
         CctpChain::Base => {
@@ -264,6 +273,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
+    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
     use std::str::FromStr;
     use uuid::uuid;
 
@@ -273,6 +283,7 @@ mod tests {
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmEnv;
     use crate::rebalancing::RebalancingConfig;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -282,7 +293,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -290,16 +301,16 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
     fn create_config_with_rebalancing() -> Config {
         let mut config = create_config_without_rebalancing();
         config.rebalancing = Some(RebalancingConfig {
-            ethereum_private_key: B256::ZERO,
+            evm_private_key: B256::ZERO,
             ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
-            market_maker_wallet: Address::ZERO,
             redemption_wallet: Address::ZERO,
             alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
             equity_threshold: ImbalanceThreshold {
@@ -309,6 +320,13 @@ mod tests {
             usdc_threshold: ImbalanceThreshold {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
+            },
+            alpaca_broker_auth: AlpacaBrokerApiAuthEnv {
+                alpaca_broker_api_key: "test-key".to_string(),
+                alpaca_broker_api_secret: "test-secret".to_string(),
+                alpaca_account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
+                alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
             },
         });
         config

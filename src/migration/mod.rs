@@ -97,7 +97,7 @@ pub(crate) enum MigrationError {
     #[error("Negative price in cents: {0}")]
     NegativePriceCents(#[from] NegativePriceCents),
     #[error("Negative value in field that must be non-negative: {field} = {value}")]
-    NegativeValue { field: String, value: i64 },
+    NegativeValue { field: String, value: String },
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
     #[error("IO error: {0}")]

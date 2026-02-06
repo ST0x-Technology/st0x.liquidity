@@ -1,6 +1,8 @@
 use reqwest::header::InvalidHeaderValue;
 use thiserror::Error;
 
+use crate::InvalidSharesError;
+
 mod auth;
 mod encryption;
 mod executor;
@@ -102,6 +104,10 @@ pub enum SchwabError {
     /// Token encryption or decryption failed, wraps [`encryption::EncryptionError`].
     #[error("Encryption error: {0}")]
     Encryption(#[from] encryption::EncryptionError),
+
+    /// Invalid share quantity for Schwab API (requires whole shares).
+    #[error("Invalid shares for Schwab API: {0}")]
+    InvalidShares(#[from] InvalidSharesError),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {

@@ -12,7 +12,8 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use st0x_execution::Symbol;
+use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthEnv, AlpacaBrokerApiMode};
+use st0x_execution::{AlpacaBrokerApi, Executor, Symbol};
 
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
@@ -88,7 +89,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
 
-            let wallet = rebalancing_config.market_maker_wallet;
+            let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+            let wallet = signer.address();
 
             writeln!(stdout, "   Issuer Request ID: {}", issuer_request_id.0)?;
             writeln!(stdout, "   Receiving Wallet: {wallet}")?;
@@ -159,7 +161,7 @@ where
 
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
 
     let ethereum_provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer.clone()))
@@ -169,14 +171,24 @@ where
         .wallet(EthereumWallet::from(signer.clone()))
         .connect_provider(base_provider);
 
-    let broker_url = if alpaca_auth.is_sandbox() {
-        "https://broker-api.sandbox.alpaca.markets"
+    let broker_mode = if alpaca_auth.is_sandbox() {
+        AlpacaBrokerApiMode::Sandbox
     } else {
-        "https://broker-api.alpaca.markets"
+        AlpacaBrokerApiMode::Production
     };
 
+    let broker_auth = AlpacaBrokerApiAuthEnv {
+        alpaca_broker_api_key: alpaca_auth.alpaca_broker_api_key.clone(),
+        alpaca_broker_api_secret: alpaca_auth.alpaca_broker_api_secret.clone(),
+        alpaca_account_id: rebalancing_config.alpaca_account_id.to_string(),
+        alpaca_broker_api_mode: broker_mode,
+        asset_cache_ttl: std::time::Duration::from_secs(3600),
+    };
+
+    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
+
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
-        broker_url.into(),
+        broker_auth.base_url().to_string(),
         rebalancing_config.alpaca_account_id,
         alpaca_auth.alpaca_broker_api_key.clone(),
         alpaca_auth.alpaca_broker_api_secret.clone(),
@@ -210,11 +222,12 @@ where
     let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));
 
     let rebalance_manager = UsdcRebalanceManager::new(
+        alpaca_broker,
         alpaca_wallet,
         bridge,
         vault_service,
         cqrs,
-        rebalancing_config.market_maker_wallet,
+        owner,
         VaultId(rebalancing_config.usdc_vault_id),
     );
 
@@ -248,7 +261,6 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     stdout: &mut W,
     symbol: Symbol,
     quantity: FractionalShares,
-    wallet: Option<Address>,
     token: Address,
     config: &Config,
     provider: P,
@@ -266,7 +278,8 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
-    let receiving_wallet = wallet.unwrap_or(rebalancing_config.market_maker_wallet);
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let receiving_wallet = signer.address();
     writeln!(stdout, "   Receiving wallet: {receiving_wallet}")?;
 
     let erc20 = IERC20::new(token, provider.clone());
@@ -370,7 +383,7 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     let redemption_wallet = rebalancing_config.redemption_wallet;
     writeln!(stdout, "   Redemption wallet: {redemption_wallet}")?;
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.ethereum_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let provider_with_wallet = ProviderBuilder::new()
         .wallet(EthereumWallet::from(signer))
         .connect_provider(provider);
@@ -521,6 +534,7 @@ mod tests {
     use crate::env::LogLevel;
     use crate::onchain::EvmEnv;
     use crate::test_utils::setup_test_db;
+    use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
         Config {
@@ -530,7 +544,7 @@ mod tests {
             evm: EvmEnv {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
-                order_owner: Address::ZERO,
+                order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
@@ -538,6 +552,7 @@ mod tests {
             broker: BrokerConfig::DryRun,
             hyperdx: None,
             rebalancing: None,
+            execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
@@ -548,6 +563,7 @@ mod tests {
             alpaca_broker_api_secret: "test-secret".to_string(),
             alpaca_account_id: "test-account-id".to_string(),
             alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
         });
         config
     }
@@ -562,7 +578,7 @@ mod tests {
         let config = create_config_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -588,7 +604,7 @@ mod tests {
         let config = create_alpaca_config_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
-        let quantity = FractionalShares(Decimal::from_str("10.5").unwrap());
+        let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
 
         let mut stdout = Vec::new();
         let result = transfer_equity_command(
@@ -681,6 +697,52 @@ mod tests {
         assert!(
             output.contains("Alpaca -> Raindex"),
             "Expected direction in output, got: {output}"
+        );
+    }
+
+    #[test]
+    fn cli_broker_mode_sandbox_when_sandbox_auth() {
+        let alpaca_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Sandbox,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+        };
+
+        let broker_mode = if alpaca_auth.is_sandbox() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_mode,
+            AlpacaBrokerApiMode::Sandbox,
+            "Sandbox auth should yield Sandbox broker mode"
+        );
+    }
+
+    #[test]
+    fn cli_broker_mode_production_when_production_auth() {
+        let alpaca_auth = AlpacaBrokerApiAuthEnv {
+            alpaca_broker_api_key: "test-key".to_string(),
+            alpaca_broker_api_secret: "test-secret".to_string(),
+            alpaca_account_id: "test-account-id".to_string(),
+            alpaca_broker_api_mode: AlpacaBrokerApiMode::Production,
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+        };
+
+        let broker_mode = if alpaca_auth.is_sandbox() {
+            AlpacaBrokerApiMode::Sandbox
+        } else {
+            AlpacaBrokerApiMode::Production
+        };
+
+        assert_eq!(
+            broker_mode,
+            AlpacaBrokerApiMode::Production,
+            "Production auth should yield Production broker mode"
         );
     }
 }

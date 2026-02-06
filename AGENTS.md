@@ -4,39 +4,52 @@ This file provides guidance to AI agents working with code in this repository.
 
 **CRITICAL: File Size Limit** - AGENTS.md must not exceed 40,000 characters.
 When editing this file, check the character count (`wc -c AGENTS.md`). If over
-the limit, condense explanations without removing any rules.
+the limit:
+
+- **NEVER remove guidelines** - only condense verbose explanations
+- **Condense code examples first** - examples are illustrative, rules are not
+- **Remove redundancy** - if a guideline duplicates another, keep one reference
+- **Shorten explanations** - preserve the rule, reduce the elaboration
+
+## Ownership Principles
+
+**CRITICAL: Take full ownership. Never deflect responsibility.**
+
+- **Fix all problems immediately** - regardless of who introduced them. Never
+  say "this is a pre-existing issue" as justification for not fixing it.
+- **Meet ALL constraints** - when editing a file with size limits, ensure the
+  ENTIRE file meets the limit, not just your additions.
+- **No warnings or errors pass through** - CI and review catch everything. If
+  you see a warning/error, it's your responsibility to fix it now.
 
 ## Communication
 
-- **Do not run commands to "show" output to the user.** The CLI interface
-  truncates output and the user cannot see full command results. If you need the
-  user to review something, stop and explicitly ask them to look at it (e.g.,
-  "please review the changes in src/foo.rs"). Do not run `git diff` or similar
-  commands expecting the user to see the output - they won't.
+- **Do not run commands to "show" output to the user.** The CLI truncates
+  output. If you need the user to review something, explicitly ask them to look
+  at it. Do not run `git diff` expecting the user to see output.
+
+## Planning Hierarchy
+
+The project uses a strict document hierarchy:
+
+1. **SPEC.md** - Source of truth for system behavior. Features documented here
+   before implementation.
+2. **ROADMAP.md / GitHub Issues** - Downstream from spec. Describe problems, not
+   solutions.
+3. **Planning** - Downstream from issues. Implementation plans before coding.
+4. **Tests** - Downstream from plan. Written before implementation (TDD).
+5. **Implementation** - Makes the tests pass.
+
+**Before implementing:** Ensure feature is in SPEC.md → has GitHub issue → plan
+the implementation.
 
 ## Plan & Review
-
-### Before starting work
-
-- Write a comprehensive step-by-step plan to PLAN.md with each task having a
-  corresponding section and a list of subtasks as checkboxes inside of it
-- The task sections should follow the format `## Task N. <TASK NAME>`
-- The plan should be a detailed implementation plan and the reasoning behind the
-  design decisions
-- Do not include timelines in the plan as they tend to be inaccurate
-- Remain focused on the task at hand, do not include unrelated improvements or
-  premature optimizations
-- Once you write the plan, ask me to review it. Do not continue until I approve
-  the plan.
 
 ### While implementing
 
 - **CRITICAL: All new or modified logic MUST have corresponding test coverage.**
   Do not move on from a piece of code until tests are written. This is
   non-negotiable.
-- You should update PLAN.md every time you complete a section
-- Upon completing a planned task, add detailed descriptions of the changes you
-  made to ease the review process
 
 ### Handling questions and approach changes
 
@@ -65,8 +78,9 @@ messages just for the sake of it; when they point out issues, they expect action
 (usually a fix, sometimes reproducing, opening a GitHub issue, etc. based on
 context).
 
-This prevents wasted time on undirected exploration and ensures alignment on the
-implementation strategy.
+**CRITICAL: Re-evaluate all work when a pattern is identified.** When the user
+points out a mistake, immediately: (1) fix it, (2) re-evaluate ALL session work
+for similar issues, (3) proactively fix all instances without being asked.
 
 ### When user action is required
 
@@ -82,14 +96,28 @@ check output, provide input), you must ensure they see the request:
 The user checks your output when they see you've stopped. If you give them a
 command mid-response and keep working, they will miss it.
 
-### Before creating a PR
+### Before handing over
 
-- **CRITICAL**: Delete PLAN.md before submitting changes for review
-- PLAN.md is a transient development file that should ONLY exist on development
-  branches
-- PLAN.md should NEVER appear in pull requests or be merged to main/master
-- The plan is for development tracking only - final documentation goes in commit
-  messages, docstrings, and permanent markdown documents
+After implementation is complete and verification passes (tests, lints, fmt),
+perform a self-review:
+
+1. **Review the diff** - examine all changes and ask: can I justify each chunk?
+2. **Revert unjustified changes** - if you can't articulate why a change is
+   necessary, revert it
+3. **Check for scope creep** - did you change things unrelated to the task?
+
+**Justified changes:** explicitly requested by user, required to make the
+requested change work, fixes a bug/warning encountered during the task, improves
+readability of code being modified, enforces stricter domain boundaries.
+
+**Unjustified changes:** renaming unrelated things, reformatting outside the
+change area, LLM-initiated "while I'm here" improvements, changing terminology
+without request, adding comments to unchanged code.
+
+This step exists because LLMs are not naturally aware of diff size while
+generating, but can effectively review diffs after the fact. When context is
+ambiguous (after compaction), if you cannot point to an explicit user request in
+visible conversation, treat the change as unjustified and revert it.
 
 ## Project Overview
 
@@ -145,10 +173,20 @@ binary).
 - `sqlx migrate add <migration_name>` - Create a new migration file
 - Database URL configured via `DATABASE_URL` environment variable
 
+**CRITICAL: If Rust build fails with sqlx macro errors like "unable to open
+database file" or "(code: 14)", run `sqlx db reset -y` to fix the database.**
+This is the proper solution - NEVER try workarounds like
+`DATABASE_URL=sqlite://:memory:` or other hacks.
+
 **CRITICAL: NEVER manually create migration files.** Always use
 `sqlx migrate add
 <migration_name>` to create migrations. This ensures proper
 timestamping and sequencing.
+
+**CRITICAL: New worktrees require database setup.** When working in a new git
+worktree, you will encounter sqlx compile errors like "unable to open database
+file". Fix this by running `sqlx db reset -y` to create and migrate the local
+database before running any cargo commands.
 
 ### Dependency Management
 
@@ -184,18 +222,46 @@ resolution and feature selection.
   If you want to test functionality, write proper tests. There is never a reason
   to run the application speculatively.
 
-### Updating GitHub Issues
+### Updating ROADMAP.md
 
-When updating GitHub issue bodies (especially the roadmap issue #2):
+After completing work or creating new issues, update ROADMAP.md:
 
-1. Save the current body to a local `.md` file:
-   `gh issue view <number> --repo ST0x-Technology/st0x.liquidity --json body -q '.body' > roadmap-issue-2.md`
-2. Edit the file using the `Edit` tool (so changes are visible for review)
-3. Apply the update:
-   `gh issue edit <number> --repo ST0x-Technology/st0x.liquidity --body-file roadmap-issue-2.md`
-4. Delete the temp file
+**Section ordering (newest first):**
 
-This pattern ensures changes are reviewable before being applied.
+The roadmap is ordered with highest priority / most recent work at the top:
+
+1. **Current Development Focus** - Active work and immediate priorities
+2. **Backlog sections** - Planned future work by category
+3. **Completed sections** - Finished work, ordered newest to oldest
+
+This ordering ensures readers see current priorities immediately without
+scrolling past historical work. When adding new "Completed" sections, add them
+above older completed sections.
+
+**After completing a plan:**
+
+1. Mark completed issues as `[x]` with PR link
+2. Use this format:
+   ```markdown
+   - [x] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
+     - PR: [#M PR title](https://github.com/ST0x-Technology/st0x.liquidity/pull/M)
+   ```
+3. Move completed items from "Current Development Focus" to the appropriate
+   "Completed" section (or create a new one if it represents a milestone)
+
+**When creating new issues:**
+
+1. Add the issue to the appropriate roadmap section
+2. Use this format:
+   ```markdown
+   - [ ] [#N Issue title](https://github.com/ST0x-Technology/st0x.liquidity/issues/N)
+   ```
+
+**Verification:**
+
+- Use `gh issue list --state all` and `gh pr list --state all` to cross-check
+- Ensure no issues are marked `[x]` in ROADMAP.md but still open on GitHub
+- Ensure all recent closed issues/PRs are reflected in the roadmap
 
 ## Architecture Overview
 
@@ -340,6 +406,20 @@ Environment variables (can be set via `.env` file):
     event sourcing pattern
   - If you see existing code writing directly to `events` table, that code is
     incorrect and should be refactored to use CqrsFramework
+- **CRITICAL: Single CQRS Framework Instance Per Aggregate**: In the main bot
+  flow, each aggregate type must have exactly ONE `SqliteCqrs<A>` instance,
+  constructed once during startup in `Conductor::start`, then passed to all
+  consumers. This prevents silent production bugs where missing query processors
+  cause events to persist without triggering required side effects.
+  - **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` anywhere in
+    the server binary's code path outside `Conductor::start`
+  - **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
+    aggregate type in the bot flow
+  - **REQUIRED**: When adding a new query processor, add it to the framework
+    construction in `Conductor::start`
+  - **ALLOWED**: Direct construction in test code, CLI code, and migration code
+    (different execution contexts with intentionally different query processor
+    needs)
 - **Type Modeling**: Make invalid states unrepresentable through the type
   system. Use algebraic data types (ADTs) and enums to encode business rules and
   state transitions directly in types rather than relying on runtime validation.
@@ -387,28 +467,8 @@ Environment variables (can be set via `.env` file):
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
-  - Example of correct import organization:
-    ```rust
-    use std::sync::Arc;
-    use alloy::primitives::{Address, B256};
-    use cqrs_es::{CqrsFramework, EventStore};
-    use serde::{Deserialize, Serialize};
-
-    use crate::account::ClientId;
-    use crate::mint::TokenizationRequestId;
-    use super::{Mint, MintCommand};
-    ```
-  - Example of **INCORRECT** import organization:
-    ```rust
-    // ❌ WRONG - Three groups, internal imports mixed with external
-    use std::sync::Arc;
-
-    use alloy::primitives::{Address, B256};
-    use crate::account::ClientId;  // Internal import in wrong place
-    use cqrs_es::CqrsFramework;
-
-    use super::Mint;
-    ```
+  - Example: `use std::sync::Arc; use alloy::primitives::Address;` [blank line]
+    `use crate::foo::Bar; use super::Baz;`
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
   module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
@@ -433,41 +493,6 @@ Environment variables (can be set via `.env` file):
     preemptively
   - **Principle**: Error types must enable debugging and preserve all context -
     opaque strings make debugging impossible
-  - Example of **FORBIDDEN** pattern:
-    ```rust
-    // ❌ CATASTROPHICALLY BAD - Destroys all type information
-    #[derive(Debug, thiserror::Error)]
-    pub enum MyError {
-        #[error("Aggregate error: {0}")]
-        AggregateError(String),  // WRONG: No way to know what failed
-        #[error("Processing failed: {0}")]
-        ProcessingError(String), // WRONG: Loses error chain
-    }
-
-    // Code that creates these errors (FORBIDDEN):
-    some_operation().map_err(|e| MyError::AggregateError(e.to_string()))?;
-    ```
-  - Example of **CORRECT** pattern:
-    ```rust
-    // ✅ CORRECT - Preserves all type information
-    #[derive(Debug, thiserror::Error)]
-    pub enum MyError {
-        #[error("CQRS aggregate error: {0}")]
-        Aggregate(#[from] cqrs_es::AggregateError<OtherError>),
-        #[error("Database error: {0}")]
-        Database(#[from] sqlx::Error),
-        #[error("Specific business rule violation")]
-        BusinessRuleViolation {
-            field: String,
-            value: Decimal,
-            #[source]
-            cause: ValidationError,
-        },
-    }
-
-    // With #[from], this works automatically:
-    some_operation()?;  // Auto-converts via From trait
-    ```
   - When adding new error variants:
     1. Only add variants when you encounter actual errors during implementation
     2. Use `#[from]` for error types from external crates
@@ -495,90 +520,10 @@ Environment variables (can be set via `.env` file):
 **This is a mission-critical financial application. The following patterns are
 STRICTLY FORBIDDEN and can result in catastrophic financial losses:**
 
-**NEVER** write code that silently provides wrong values, hides conversion
-errors, or masks failures in any way. This includes but is not limited to:
-
-- Defensive value capping that hides overflow/underflow
-- Fallback to default values on conversion failure
-- Silent truncation of precision
-- Using `unwrap_or(default_value)` on financial calculations
-- Using `unwrap_or_default()` on monetary values
-- Conversion functions that "gracefully degrade" instead of failing
-
-**ALL financial operations must use explicit error handling with proper error
-propagation. Here are examples of forbidden patterns and their correct
-alternatives:**
-
-#### Numeric Conversions
-
-```rust
-// ❌ CATASTROPHICALLY DANGEROUS - Silent data corruption
-const fn shares_to_db_i64(value: u64) -> i64 {
-    if value > i64::MAX as u64 {
-        i64::MAX  // WRONG: Silently caps at wrong value
-    } else {
-        value as i64
-    }
-}
-
-// ✅ CORRECT - Explicit conversion with proper error handling
-fn shares_to_db_i64(value: u64) -> Result<i64, ConversionError> {
-    value.try_into()
-        .map_err(|_| ConversionError::ValueTooLarge {
-            value,
-            max_allowed: i64::MAX as u64
-        })
-}
-```
-
-#### String Parsing
-
-```rust
-// ❌ DANGEROUS - Hides conversion errors
-fn parse_price(input: &str) -> f64 {
-    input.parse().unwrap_or(0.0)  // WRONG
-}
-
-// ✅ CORRECT - Parse with explicit error
-fn parse_price(input: &str) -> Result<Decimal, ParseError> {
-    Decimal::from_str(input).map_err(|e| ParseError::InvalidPrice { input: input.to_string(), source: e })
-}
-```
-
-#### Precision-Critical Arithmetic
-
-```rust
-// ❌ DANGEROUS - Silent precision loss
-fn convert_to_cents(dollars: f64) -> i64 {
-    (dollars * 100.0) as i64  // WRONG: Truncates
-}
-
-// ✅ CORRECT - Checked arithmetic
-fn convert_to_cents(dollars: Decimal) -> Result<i64, ArithmeticError> {
-    let cents = dollars.checked_mul(Decimal::from(100)).ok_or(ArithmeticError::Overflow)?;
-    if cents.fract() != Decimal::ZERO {
-        return Err(ArithmeticError::FractionalCents { value: cents });
-    }
-    cents.to_i64().ok_or(ArithmeticError::ConversionFailed { value: cents })
-}
-```
-
-#### Database Constraints
-
-```rust
-// ❌ DANGEROUS - Masks constraint violations
-async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
-    let safe = amount.min(Decimal::MAX).max(Decimal::ZERO);  // WRONG
-    sqlx::query!("INSERT INTO trades (amount) VALUES (?)", safe).execute(pool).await?;
-    Ok(())
-}
-
-// ✅ CORRECT - Let constraints fail naturally
-async fn save_amount(amount: Decimal, pool: &Pool) -> Result<(), Error> {
-    sqlx::query!("INSERT INTO trades (amount) VALUES (?)", amount).execute(pool).await?;
-    Ok(())
-}
-```
+**NEVER** silently mask failures: no defensive capping, fallback defaults,
+precision truncation, `unwrap_or()`, `unwrap_or_default()`, or graceful
+degradation on financial values. ALL financial operations must use explicit
+error handling with proper error propagation.
 
 #### Error Categories That Must Fail Fast
 
@@ -631,15 +576,6 @@ The following files MUST NOT be read without explicit user permission:
 2. **Explain why** you need to read it
 3. **Wait for confirmation** before proceeding
 
-**Example of correct behavior:**
-
-```
-User: "Why isn't the bot connecting to Schwab?"
-Assistant: "I can help debug this. To check the configuration, I would need to
-read your .env file which contains sensitive credentials. May I have permission
-to read it?"
-```
-
 **Alternatives**: Ask user to verify env vars are set, request sanitized output,
 check `.env.example` instead of `.env`, or review code that uses configuration.
 
@@ -653,6 +589,13 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
   conversion logic
 - **Testing Principle**: Only cover happy paths with all components working and
   connected in integration tests and cover everything in unit tests
+- **CRITICAL: Tests must assert CORRECT behavior, never "document gaps"**: Tests
+  exist to verify the system works correctly. If code is broken or incomplete,
+  tests MUST assert the correct expected behavior and FAIL until the code is
+  fixed. NEVER write tests that assert incorrect behavior with comments like
+  "documenting the gap" or "will fix later". A failing test is the correct way
+  to flag broken code - it forces the issue to be addressed. Tests that pass
+  while asserting wrong behavior are worse than no tests at all.
 - **Debugging failing tests**: When debugging tests with failing assert! macros,
   add additional context to the assert! macro instead of adding temporary
   println! statements
@@ -690,6 +633,8 @@ returning values within expected bounds.
   2. `cargo test -q` - only run after check passes
   3. `cargo clippy` - only run after tests pass (fixing lints can break tests)
   4. `cargo fmt` - always run last to ensure clean formatting
+  5. **Diff review** - after all checks pass, review staged changes and revert
+     any chunks without clear justification (see "Before handing over" section)
 
 #### CRITICAL: Lint Policy
 
@@ -704,65 +649,12 @@ you MUST fix the underlying code problems, not suppress the warnings.
 3. **Improve code structure** to meet clippy's standards
 4. **Use proper error handling** instead of suppressing warnings
 
-**Examples of FORBIDDEN practices:**
+When encountering a clippy issue: understand why it's flagged, refactor to
+address the root cause, and ask permission before suppressing if you believe
+it's incorrect.
 
-```rust
-// ❌ NEVER DO THIS - Suppressing lints is forbidden
-#[allow(clippy::too_many_lines)]
-fn large_function() { /* ... */ }
-
-#[allow(clippy::needless_continue)]
-// ❌ NEVER DO THIS - Fix the code structure instead
-```
-
-**Required approach:**
-
-```rust
-// ✅ CORRECT - Refactor to address the issue
-fn process_data() -> Result<(), Error> {
-    let data = get_data()?;
-    validate_data(&data)?;
-    save_data(&data)?;
-    Ok(())
-}
-
-fn validate_data(data: &Data) -> Result<(), Error> {
-    // Extracted validation logic
-}
-
-fn save_data(data: &Data) -> Result<(), Error> {
-    // Extracted saving logic
-}
-```
-
-**If you encounter a clippy issue:**
-
-1. Understand WHY clippy is flagging the code
-2. Refactor the code to address the underlying problem
-3. If you believe a lint is incorrect, ask for permission before suppressing it
-4. Document your reasoning if given permission to suppress a specific lint
-
-**Exception for third-party macro-generated code:**
-
-When using third-party macros, such as `sol!` to generate Rust code , lint
-suppression is acceptable for issues that originate from the contract's function
-signatures, which we cannot control.
-
-For example, to deal with a function generated from a smart contract's ABI, we
-can add `allow` inside the `sol!` macro invocation.
-
-```rust
-// ✅ CORRECT - Suppressing lint for third-party ABI generated code
-sol!(
-    #![sol(all_derives = true, rpc)]
-    #[allow(clippy::too_many_arguments)]
-    #[derive(serde::Serialize, serde::Deserialize)]
-    IPyth, "node_modules/@pythnetwork/pyth-sdk-solidity/abis/IPyth.json"
-);
-```
-
-This policy ensures code quality remains high and prevents technical debt
-accumulation through lint suppression.
+**Exception**: Lint suppression inside `sol!` macros is acceptable for issues
+from contract ABI signatures we cannot control.
 
 ### Commenting Guidelines
 
@@ -792,6 +684,13 @@ that cannot be expressed through code structure alone.
 - Describing function signatures (use doc comments instead)
 - Adding obvious test setup descriptions
 - Marking code sections that are clear from structure
+- **Referencing internal task tracking or ephemeral context**: NEVER leave
+  comments like `// Task 7: ...`, `// TODO from ticket XYZ`,
+  `// Part of sprint 5 work`, or any reference to task numbers, issue trackers,
+  todo lists, or session context that won't exist for future readers. These
+  comments are meaningless to PR reviewers, future maintainers, and anyone
+  without access to your internal state. If the code needs explanation, explain
+  WHAT it does and WHY - not which task number led to writing it.
 
 #### Good Comment Examples
 
@@ -826,9 +725,7 @@ fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
 ```rust
 // ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
 // ❌ Obvious from context: // Store test tokens
-// ❌ Just restating code: // Mock account hash endpoint
 // ❌ Test section markers: // 1. Test token refresh integration
-// ❌ Obvious operations: // Execute the order, // Create a trade, // Verify mocks
 ```
 
 #### Comment Maintenance
@@ -838,6 +735,11 @@ If a comment is needed to explain what code does, consider refactoring instead.
 Keep comments focused on "why" rather than "what".
 
 ### Code style
+
+#### ASCII only in code
+
+Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
+Unicode breaks vim navigation and grep workflows.
 
 #### Module Organization
 
@@ -853,53 +755,8 @@ Organize code within modules by importance and visibility:
 This organization pattern makes the module's public interface clear at a glance
 and keeps implementation details appropriately subordinate.
 
-**Example of good module organization (note that comments are just for
-illustration, in real code we wouldn't leave those):**
-
-```rust
-// Public struct definition
-pub(crate) struct TradeExecution {
-    pub(crate) id: Option<i64>,
-    pub(crate) symbol: Symbol,
-    pub(crate) shares: Shares,
-}
-
-// Implementation block right after type definition
-impl TradeExecution {
-    pub(crate) async fn save(&self, pool: &SqlitePool) -> Result<i64, Error> {
-        // Implementation
-    }
-}
-
-// Public function that uses helper functions
-pub(crate) async fn find_executions_by_status(
-    pool: &SqlitePool,
-    status: OrderStatus,
-) -> Result<Vec<TradeExecution>, Error> {
-    let rows = query_by_status(pool, status.as_str()).await?;
-    rows.into_iter().map(row_to_execution).collect()
-}
-
-// Another public function (standalone)
-pub(crate) async fn find_execution_by_id(
-    pool: &SqlitePool,
-    id: i64,
-) -> Result<Option<TradeExecution>, Error> {
-    // Implementation
-}
-
-// Private helper functions used by find_executions_by_status
-async fn query_by_status(
-    pool: &SqlitePool,
-    status: &str,
-) -> Result<Vec<ExecutionRow>, sqlx::Error> {
-    // SQL query implementation
-}
-
-fn row_to_execution(row: ExecutionRow) -> Result<TradeExecution, Error> {
-    // Conversion logic
-}
-```
+**Example:** Public types first -> impl blocks -> public functions -> private
+helpers.
 
 This pattern applies across the entire workspace, including both the main crate
 and sub-crates like `st0x-execution`.
@@ -1048,22 +905,11 @@ let Some(symbol) = trade_data.extract_symbol() else {
 };
 ```
 
-##### Extract functions for complex logic:
-
-Break deeply nested event processing into helper functions with clear names.
-
 ##### Use pattern matching with guards:
 
 ```rust
 // ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
 // ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
-```
-
-##### Prefer iterator chains over nested loops:
-
-```rust
-// ❌ Imperative: let mut results = Vec::new(); for t in &trades { if t.is_valid() { results.push(...) } }
-// ✅ Functional: trades.iter().filter(|t| t.is_valid()).map(process_trade).collect::<Result<Vec<_>, _>>()
 ```
 
 #### Struct field access

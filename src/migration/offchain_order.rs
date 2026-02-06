@@ -15,7 +15,7 @@ use crate::shares::FractionalShares;
 struct OffchainOrderRow {
     id: i64,
     symbol: String,
-    shares: i64,
+    shares: f64,
     direction: String,
     order_id: Option<String>,
     price_cents: Option<i64>,
@@ -112,13 +112,13 @@ fn build_offchain_order_command(
 ) -> Result<OffchainOrderCommand, MigrationError> {
     let symbol = Symbol::new(&row.symbol)?;
 
-    if row.shares < 0 {
+    if row.shares < 0.0 {
         return Err(MigrationError::NegativeValue {
             field: "shares".to_string(),
-            value: row.shares,
+            value: row.shares.to_string(),
         });
     }
-    let shares = Decimal::from(row.shares);
+    let shares = Decimal::try_from(row.shares)?;
 
     let direction = row.direction.parse()?;
     let migrated_status = row.status.parse()?;
@@ -127,7 +127,7 @@ fn build_offchain_order_command(
 
     Ok(OffchainOrderCommand::Migrate {
         symbol,
-        shares: FractionalShares(shares),
+        shares: FractionalShares::new(shares),
         direction,
         executor: SupportedExecutor::Schwab,
         status: migrated_status,
@@ -155,7 +155,7 @@ mod tests {
     async fn insert_test_order(
         pool: &SqlitePool,
         symbol: &str,
-        shares: i64,
+        shares: f64,
         direction: &str,
         order_id: Option<&str>,
         price_cents: Option<i64>,
@@ -212,7 +212,7 @@ mod tests {
         insert_test_order(
             &pool,
             "AAPL",
-            10,
+            10.0,
             "BUY",
             Some("ORDER123"),
             Some(15050),
@@ -242,12 +242,12 @@ mod tests {
         let pool = create_test_pool().await;
         let cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
-        insert_test_order(&pool, "AAPL", 10, "BUY", None, None, "PENDING").await;
-        insert_test_order(&pool, "TSLA", 5, "SELL", None, None, "PENDING").await;
+        insert_test_order(&pool, "AAPL", 10.0, "BUY", None, None, "PENDING").await;
+        insert_test_order(&pool, "TSLA", 5.0, "SELL", None, None, "PENDING").await;
         insert_test_order(
             &pool,
             "MSFT",
-            20,
+            20.0,
             "BUY",
             Some("ORDER123"),
             None,
@@ -257,7 +257,7 @@ mod tests {
         insert_test_order(
             &pool,
             "GOOGL",
-            15,
+            15.0,
             "SELL",
             Some("ORDER456"),
             None,
@@ -267,7 +267,7 @@ mod tests {
         insert_test_order(
             &pool,
             "NVDA",
-            8,
+            8.0,
             "BUY",
             Some("ORDER789"),
             Some(50025),
@@ -277,14 +277,14 @@ mod tests {
         insert_test_order(
             &pool,
             "AMD",
-            12,
+            12.0,
             "SELL",
             Some("ORDER999"),
             Some(14050),
             "FILLED",
         )
         .await;
-        insert_test_order(&pool, "META", 3, "BUY", None, None, "FAILED").await;
+        insert_test_order(&pool, "META", 3.0, "BUY", None, None, "FAILED").await;
 
         let count = migrate_offchain_orders(&pool, &cqrs, ExecutionMode::Commit)
             .await
@@ -310,7 +310,7 @@ mod tests {
         insert_test_order(
             &pool,
             "AAPL",
-            10,
+            10.0,
             "BUY",
             Some("ORDER123"),
             Some(15050),

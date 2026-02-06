@@ -64,7 +64,7 @@ mod tests {
         mock.execute_redemption(
             &RedemptionAggregateId::new("agg-1"),
             Symbol::new("AAPL").unwrap(),
-            FractionalShares(dec!(100)),
+            FractionalShares::new(dec!(100)),
             address!("0x1234567890123456789012345678901234567890"),
             U256::from(100_000_000_000_000_000_000_u128),
         )
@@ -78,7 +78,7 @@ mod tests {
     async fn mock_redeem_captures_last_call_parameters() {
         let mock = Arc::new(MockRedeem::new());
         let symbol = Symbol::new("TSLA").unwrap();
-        let quantity = FractionalShares(dec!(50.5));
+        let quantity = FractionalShares::new(dec!(50.5));
         let token = address!("0xabcdef0123456789abcdef0123456789abcdef01");
         let amount = U256::from(50_500_000_000_000_000_000_u128);
         let aggregate_id = RedemptionAggregateId::new("agg-123");
@@ -103,7 +103,7 @@ mod tests {
             .execute_redemption(
                 &RedemptionAggregateId::new("agg-fail"),
                 Symbol::new("AAPL").unwrap(),
-                FractionalShares(dec!(10)),
+                FractionalShares::new(dec!(10)),
                 Address::ZERO,
                 U256::ZERO,
             )

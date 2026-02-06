@@ -1,11 +1,15 @@
+use cqrs_es::persist::PersistedEventStore;
+use cqrs_es::{AggregateContext, EventStore};
 use rust_decimal::Decimal;
-use st0x_execution::{OrderState, Symbol};
+use sqlite_es::SqliteEventRepository;
+use st0x_execution::{FractionalShares, OrderState, Symbol};
 
+use crate::lifecycle::Lifecycle;
 use crate::offchain::execution::OffchainExecution;
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::onchain::OnchainTrade;
 use crate::position::{Position, PositionCommand, TradeId};
-use crate::shares::FractionalShares;
+use crate::shares::ArithmeticError;
 use crate::threshold::ExecutionThreshold;
 
 use super::{DualWriteContext, DualWriteError};
@@ -40,7 +44,7 @@ pub(crate) async fn acknowledge_onchain_fill(
         tx_hash: trade.tx_hash,
         log_index: trade.log_index,
     };
-    let amount = FractionalShares(Decimal::try_from(trade.amount)?);
+    let amount = FractionalShares::new(Decimal::try_from(trade.amount)?);
     let price_usdc = Decimal::try_from(trade.price.value())?;
 
     let block_timestamp =
@@ -79,7 +83,7 @@ pub(crate) async fn place_offchain_order(
             .id
             .ok_or_else(|| DualWriteError::MissingExecutionId)?,
     );
-    let shares = FractionalShares(Decimal::from(execution.shares.value()));
+    let shares = FractionalShares::new(execution.shares.inner().inner());
     let direction = execution.direction;
     let executor = execution.executor;
 
@@ -110,7 +114,7 @@ pub(crate) async fn complete_offchain_order(
             .id
             .ok_or_else(|| DualWriteError::MissingExecutionId)?,
     );
-    let shares_filled = FractionalShares(Decimal::from(execution.shares.value()));
+    let shares_filled = FractionalShares::new(execution.shares.inner().inner());
     let direction = execution.direction;
 
     let (broker_order_id, price_cents, broker_timestamp) = match &execution.state {
@@ -169,14 +173,48 @@ pub(crate) async fn fail_offchain_order(
     Ok(())
 }
 
+/// Loads the current state of a Position aggregate from the event store.
+///
+/// Returns `Ok(Some(position))` if the position exists and is in Live state.
+/// Returns `Ok(None)` if no position exists for this symbol (no events).
+/// Returns `Err` if the aggregate is in a failed state or there's a database error.
+pub(crate) async fn load_position(
+    context: &DualWriteContext,
+    symbol: &Symbol,
+) -> Result<Option<Position>, DualWriteError> {
+    let aggregate_id = Position::aggregate_id(symbol);
+
+    let repo = SqliteEventRepository::new(context.pool().clone());
+    let store = PersistedEventStore::<
+        SqliteEventRepository,
+        Lifecycle<Position, ArithmeticError<FractionalShares>>,
+    >::new_event_store(repo);
+
+    let aggregate_context = store.load_aggregate(&aggregate_id).await?;
+    let aggregate = aggregate_context.aggregate();
+
+    match aggregate {
+        Lifecycle::Live(position) => Ok(Some(position.clone())),
+        Lifecycle::Uninitialized => Ok(None),
+        Lifecycle::Failed { error, .. } => Err(DualWriteError::PositionAggregateFailed {
+            aggregate_id,
+            error: error.clone(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::fixed_bytes;
+    use alloy::primitives::{Address, fixed_bytes};
     use chrono::Utc;
-    use st0x_execution::{Direction, SupportedExecutor};
+    use rust_decimal::Decimal;
+    use st0x_execution::{
+        Direction, FractionalShares as ExecutionShares, Positive, SupportedExecutor,
+    };
 
     use super::*;
     use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
+    use crate::shares::FractionalShares;
     use crate::test_utils::setup_test_db;
 
     #[tokio::test]
@@ -196,6 +234,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -245,6 +284,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -280,7 +320,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: Positive::new(ExecutionShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -293,6 +333,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -334,7 +375,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: Positive::new(ExecutionShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Filled {
@@ -351,6 +392,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -398,7 +440,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: Positive::new(ExecutionShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -411,6 +453,7 @@ mod tests {
             ),
             log_index: 0,
             symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
             amount: 10.5,
             direction: Direction::Buy,
             price: Usdc::new(150.25).unwrap(),
@@ -455,7 +498,7 @@ mod tests {
         let execution = OffchainExecution {
             id: Some(1),
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: Positive::new(ExecutionShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -479,7 +522,7 @@ mod tests {
         let execution = OffchainExecution {
             id: None,
             symbol: symbol.clone(),
-            shares: st0x_execution::Shares::new(10).unwrap(),
+            shares: Positive::new(ExecutionShares::new(Decimal::from(10))).unwrap(),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             state: OrderState::Pending,
@@ -492,5 +535,98 @@ mod tests {
             result.unwrap_err(),
             DualWriteError::MissingExecutionId
         ));
+    }
+
+    #[tokio::test]
+    async fn test_load_position_returns_none_for_uninitialized() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let result = load_position(&context, &symbol).await.unwrap();
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_load_position_returns_some_for_initialized() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        initialize_position(&context, &symbol, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
+        let result = load_position(&context, &symbol).await.unwrap();
+
+        assert!(result.is_some());
+        let position = result.unwrap();
+        assert_eq!(position.symbol, symbol);
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(position.threshold, ExecutionThreshold::whole_share());
+    }
+
+    #[tokio::test]
+    async fn test_load_position_reflects_accumulated_fills() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool);
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        initialize_position(&context, &symbol, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
+        let trade = OnchainTrade {
+            id: None,
+            tx_hash: fixed_bytes!(
+                "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            ),
+            log_index: 0,
+            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
+            equity_token: Address::ZERO,
+            amount: 2.5,
+            direction: Direction::Buy,
+            price: Usdc::new(150.0).unwrap(),
+            block_timestamp: Some(Utc::now()),
+            created_at: None,
+            gas_used: None,
+            effective_gas_price: None,
+            pyth_price: None,
+            pyth_confidence: None,
+            pyth_exponent: None,
+            pyth_publish_time: None,
+        };
+
+        acknowledge_onchain_fill(&context, &trade).await.unwrap();
+
+        let position = load_position(&context, &symbol).await.unwrap().unwrap();
+
+        assert_eq!(position.net, FractionalShares::new(Decimal::new(25, 1)));
+        assert_eq!(
+            position.accumulated_long,
+            FractionalShares::new(Decimal::new(25, 1))
+        );
+        assert_eq!(position.accumulated_short, FractionalShares::ZERO);
+        assert_eq!(position.last_price_usdc, Some(Decimal::from(150)));
+    }
+
+    #[tokio::test]
+    async fn test_load_position_different_symbols_isolated() {
+        let pool = setup_test_db().await;
+        let context = DualWriteContext::new(pool);
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        let msft = Symbol::new("MSFT").unwrap();
+
+        initialize_position(&context, &aapl, ExecutionThreshold::whole_share())
+            .await
+            .unwrap();
+
+        let aapl_position = load_position(&context, &aapl).await.unwrap();
+        let msft_position = load_position(&context, &msft).await.unwrap();
+
+        assert!(aapl_position.is_some());
+        assert!(msft_position.is_none());
     }
 }
