@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
 use alloy::primitives::{Address, B256, fixed_bytes};
 use chrono::Utc;
+use cqrs_es::persist::GenericQuery;
 use rust_decimal_macros::dec;
 use serde_json::Value;
+use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use st0x_execution::{
     Direction, FractionalShares, MockExecutor, OrderState, SupportedExecutor, Symbol,
@@ -9,17 +13,18 @@ use st0x_execution::{
 
 use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
 use crate::conductor::{
-    check_and_execute_accumulated_positions, execute_pending_offchain_execution,
-    process_trade_within_transaction,
+    ExecutorOrderPlacer, TradeProcessingCqrs, check_and_execute_accumulated_positions,
+    process_queued_trade,
 };
-use crate::dual_write::{DualWriteContext, load_position};
 use crate::offchain::order_poller::{OrderPollerConfig, OrderStatusPoller};
-use crate::offchain_order::ExecutionId;
+use crate::offchain_order::{OffchainOrderAggregate, OffchainOrderCqrs};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 use crate::onchain::trade::TradeEvent;
+use crate::position::{PositionAggregate, PositionCqrs, PositionQuery, load_position};
 use crate::queue::QueuedEvent;
 use crate::test_utils::setup_test_db;
+use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, sqlx::FromRow)]
 struct Event {
@@ -83,15 +88,68 @@ fn make_trade(tx_hash: B256, log_index: u64, amount: f64) -> OnchainTrade {
     }
 }
 
+/// Constructs the CQRS frameworks needed by the integration tests.
+///
+/// Uses `ExecutorOrderPlacer(MockExecutor::new())` so that the `PlaceOrder`
+/// command atomically calls the mock executor and emits `Placed` + `Submitted`.
+fn create_test_cqrs(
+    pool: &SqlitePool,
+) -> (
+    TradeProcessingCqrs,
+    Arc<PositionCqrs>,
+    Arc<PositionQuery>,
+    Arc<OffchainOrderCqrs>,
+) {
+    let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
+
+    let position_view_repo = Arc::new(
+        SqliteViewRepository::<PositionAggregate, PositionAggregate>::new(
+            pool.clone(),
+            "position_view".to_string(),
+        ),
+    );
+    let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
+    let position_cqrs: Arc<PositionCqrs> = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(GenericQuery::new(position_view_repo))],
+        (),
+    ));
+
+    let order_placer: crate::offchain_order::OffchainOrderServices =
+        Arc::new(ExecutorOrderPlacer(MockExecutor::new()));
+
+    let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
+        OffchainOrderAggregate,
+        OffchainOrderAggregate,
+    >::new(
+        pool.clone(), "offchain_order_view".to_string()
+    ));
+    let offchain_order_cqrs: Arc<OffchainOrderCqrs> = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
+        order_placer,
+    ));
+
+    let cqrs = TradeProcessingCqrs {
+        onchain_trade_cqrs,
+        position_cqrs: position_cqrs.clone(),
+        position_query: position_query.clone(),
+        offchain_order_cqrs: offchain_order_cqrs.clone(),
+        execution_threshold: ExecutionThreshold::whole_share(),
+    };
+
+    (cqrs, position_cqrs, position_query, offchain_order_cqrs)
+}
+
 #[tokio::test]
 async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
     let pool = setup_test_db().await;
-    let dual_write_context = DualWriteContext::new(pool.clone());
+    let (cqrs, position_cqrs, position_query, offchain_order_cqrs) = create_test_cqrs(&pool);
 
     let symbol = Symbol::new("AAPL").unwrap();
 
-    // Checkpoint 1: before any trades — no Position aggregate exists
-    let before = load_position(&dual_write_context, &symbol).await?;
+    // Checkpoint 1: before any trades -- no Position aggregate exists
+    let before = load_position(&position_query, &symbol).await?;
     assert!(
         before.is_none(),
         "No position should exist before any trades"
@@ -99,23 +157,23 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
 
     // Trade 1: 0.5 shares Buy, below whole-share threshold
     let tx1 = fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    let result1 = process_trade_within_transaction(
+    let result1 = process_queued_trade(
         SupportedExecutor::DryRun,
         &pool,
         &make_queued_event(tx1, 1),
         1,
         make_trade(tx1, 1, 0.5),
-        &dual_write_context,
+        &cqrs,
     )
     .await?;
 
-    // Checkpoint 2: after first trade — below threshold, no execution
+    // Checkpoint 2: after first trade -- below threshold, no execution
     assert!(
         result1.is_none(),
         "No execution should be created below threshold"
     );
 
-    let position1 = load_position(&dual_write_context, &symbol)
+    let position1 = load_position(&position_query, &symbol)
         .await?
         .expect("Position should exist after first trade");
     assert_eq!(position1.accumulated_long, FractionalShares::ZERO);
@@ -124,10 +182,9 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
         FractionalShares::new(dec!(0.5))
     );
     assert_eq!(position1.net, FractionalShares::new(dec!(-0.5)));
-    assert_eq!(position1.pending_execution_id, None);
+    assert_eq!(position1.pending_offchain_order_id, None);
 
     let mut expected_events: Vec<&str> = vec![
-        "PositionEvent::Initialized",
         "PositionEvent::OnChainOrderFilled", // trade 1
         "OnChainTradeEvent::Filled",         // trade 1
     ];
@@ -140,26 +197,21 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
 
     // Trade 2: 0.7 shares Sell, total net = -1.2, crosses threshold
     let tx2 = fixed_bytes!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let result2 = process_trade_within_transaction(
+    let result2 = process_queued_trade(
         SupportedExecutor::DryRun,
         &pool,
         &make_queued_event(tx2, 2),
         2,
         make_trade(tx2, 2, 0.7),
-        &dual_write_context,
+        &cqrs,
     )
     .await?;
 
-    // Checkpoint 3: above threshold — execution created
-    let execution = result2.expect("Execution should be created when threshold is crossed");
-    assert_eq!(
-        execution.direction,
-        Direction::Buy,
-        "Onchain Sell -> offchain Buy to hedge"
-    );
-    assert_eq!(execution.executor, SupportedExecutor::DryRun);
+    // Checkpoint 3: above threshold -- execution created, broker submission is atomic
+    let offchain_order_id =
+        result2.expect("OffchainOrderId should be returned when threshold is crossed");
 
-    let position2 = load_position(&dual_write_context, &symbol)
+    let position2 = load_position(&position_query, &symbol)
         .await?
         .expect("Position should exist after second trade");
     assert_eq!(position2.accumulated_long, FractionalShares::ZERO);
@@ -169,16 +221,18 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert_eq!(position2.net, FractionalShares::new(dec!(-1.2)));
     assert_eq!(
-        position2.pending_execution_id,
-        Some(ExecutionId(execution.id.unwrap())),
-        "Position should reference the pending execution"
+        position2.pending_offchain_order_id,
+        Some(offchain_order_id),
+        "Position should reference the pending offchain order"
     );
 
+    // PlaceOrder command now emits both Placed and Submitted atomically
     expected_events.extend([
         "PositionEvent::OnChainOrderFilled",  // trade 2
         "OnChainTradeEvent::Filled",          // trade 2
         "PositionEvent::OffChainOrderPlaced", // threshold crossed
         "OffchainOrderEvent::Placed",         // offchain order created
+        "OffchainOrderEvent::Submitted",      // broker accepted (atomic with Placed)
     ]);
     let actual_events = fetch_events(&pool).await;
     let actual_types: Vec<&str> = actual_events
@@ -187,30 +241,24 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     assert_eq!(actual_types, expected_events);
 
-    // Fulfillment: exercise the real conductor and poller orchestration
-    let execution_id = execution.id.unwrap();
+    // Fulfillment: order poller detects the filled order and completes the lifecycle
     let mock_executor = MockExecutor::new();
-
-    // Conductor places the order with the broker and confirms submission
-    execute_pending_offchain_execution(&mock_executor, &pool, &dual_write_context, execution_id)
-        .await?;
-
-    // Order poller detects the filled order and completes the lifecycle
     let poller = OrderStatusPoller::new(
         OrderPollerConfig::default(),
         pool.clone(),
         mock_executor,
-        dual_write_context.clone(),
+        offchain_order_cqrs.clone(),
+        position_cqrs.clone(),
     );
     poller.poll_pending_orders().await?;
 
-    // Checkpoint 4: after fulfillment — pending_execution_id should be cleared
-    let position3 = load_position(&dual_write_context, &symbol)
+    // Checkpoint 4: after fulfillment -- pending_offchain_order_id should be cleared
+    let position3 = load_position(&position_query, &symbol)
         .await?
         .expect("Position should exist after fulfillment");
     assert_eq!(
-        position3.pending_execution_id, None,
-        "pending_execution_id should be cleared after fulfillment",
+        position3.pending_offchain_order_id, None,
+        "pending_offchain_order_id should be cleared after fulfillment",
     );
     assert_eq!(
         position3.net,
@@ -219,7 +267,6 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     expected_events.extend([
-        "OffchainOrderEvent::Submitted",      // broker accepted
         "OffchainOrderEvent::Filled",         // broker filled
         "PositionEvent::OffChainOrderFilled", // position updated, pending cleared
     ]);
@@ -238,45 +285,36 @@ async fn happy_path_flow() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std::error::Error>> {
     let pool = setup_test_db().await;
-    let dual_write_context = DualWriteContext::new(pool.clone());
+    let (cqrs, position_cqrs, position_query, offchain_order_cqrs) = create_test_cqrs(&pool);
 
     let symbol = Symbol::new("AAPL").unwrap();
 
     // Trade 1: 0.5 shares Sell, below whole-share threshold
     let tx1 = fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-    process_trade_within_transaction(
+    process_queued_trade(
         SupportedExecutor::DryRun,
         &pool,
         &make_queued_event(tx1, 1),
         1,
         make_trade(tx1, 1, 0.5),
-        &dual_write_context,
+        &cqrs,
     )
     .await?;
 
     // Trade 2: 0.7 shares Sell, total net = -1.2, crosses threshold
     let tx2 = fixed_bytes!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-    let result2 = process_trade_within_transaction(
+    let result2 = process_queued_trade(
         SupportedExecutor::DryRun,
         &pool,
         &make_queued_event(tx2, 2),
         2,
         make_trade(tx2, 2, 0.7),
-        &dual_write_context,
+        &cqrs,
     )
     .await?;
 
-    let execution = result2.expect("Execution should be created when threshold is crossed");
-    let execution_id = execution.id.unwrap();
-
-    // Conductor places the order with the broker and confirms submission
-    execute_pending_offchain_execution(
-        &MockExecutor::new(),
-        &pool,
-        &dual_write_context,
-        execution_id,
-    )
-    .await?;
+    let _offchain_order_id =
+        result2.expect("OffchainOrderId should be returned when threshold is crossed");
 
     // Poller discovers the broker FAILED the order and handles the failure
     let failed_executor = MockExecutor::new().with_order_status(OrderState::Failed {
@@ -287,17 +325,18 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         OrderPollerConfig::default(),
         pool.clone(),
         failed_executor,
-        dual_write_context.clone(),
+        offchain_order_cqrs.clone(),
+        position_cqrs.clone(),
     );
     poller.poll_pending_orders().await?;
 
-    // Checkpoint: after failure — pending_execution_id cleared, position still has net exposure
-    let position_after_failure = load_position(&dual_write_context, &symbol)
+    // Checkpoint: after failure -- pending cleared, position still has net exposure
+    let position_after_failure = load_position(&position_query, &symbol)
         .await?
         .expect("Position should exist after failure");
     assert_eq!(
-        position_after_failure.pending_execution_id, None,
-        "pending_execution_id should be cleared after failure",
+        position_after_failure.pending_offchain_order_id, None,
+        "pending_offchain_order_id should be cleared after failure",
     );
     assert_eq!(
         position_after_failure.net,
@@ -306,14 +345,13 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     );
 
     let mut expected_events: Vec<&str> = vec![
-        "PositionEvent::Initialized",
         "PositionEvent::OnChainOrderFilled",  // trade 1
         "OnChainTradeEvent::Filled",          // trade 1
         "PositionEvent::OnChainOrderFilled",  // trade 2
         "OnChainTradeEvent::Filled",          // trade 2
         "PositionEvent::OffChainOrderPlaced", // threshold crossed
         "OffchainOrderEvent::Placed",         // offchain order created
-        "OffchainOrderEvent::Submitted",      // broker accepted
+        "OffchainOrderEvent::Submitted",      // broker accepted (atomic with Placed)
         "OffchainOrderEvent::Failed",         // broker reported failure
         "PositionEvent::OffChainOrderFailed", // position cleared
     ];
@@ -324,30 +362,35 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         .collect();
     assert_eq!(actual_types, expected_events);
 
-    // Position checker finds the unexecuted position and retries.
-    // This spawns execute_pending_offchain_execution via tokio::spawn internally.
-    check_and_execute_accumulated_positions(&MockExecutor::new(), &pool, &dual_write_context)
-        .await?;
-
-    // Let the spawned execution task complete
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Position checker finds the unexecuted position and retries
+    let threshold = ExecutionThreshold::whole_share();
+    check_and_execute_accumulated_positions(
+        &MockExecutor::new(),
+        &pool,
+        &position_cqrs,
+        &position_query,
+        &offchain_order_cqrs,
+        &threshold,
+    )
+    .await?;
 
     // New poller with default MockExecutor (returns Filled) completes the retry lifecycle
     let retry_poller = OrderStatusPoller::new(
         OrderPollerConfig::default(),
         pool.clone(),
         MockExecutor::new(),
-        dual_write_context.clone(),
+        offchain_order_cqrs.clone(),
+        position_cqrs.clone(),
     );
     retry_poller.poll_pending_orders().await?;
 
     // Final checkpoint: position fully hedged
-    let final_position = load_position(&dual_write_context, &symbol)
+    let final_position = load_position(&position_query, &symbol)
         .await?
         .expect("Position should exist after recovery");
     assert_eq!(
-        final_position.pending_execution_id, None,
-        "pending_execution_id should be cleared after successful retry",
+        final_position.pending_offchain_order_id, None,
+        "pending_offchain_order_id should be cleared after successful retry",
     );
     assert_eq!(
         final_position.net,
@@ -358,7 +401,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     expected_events.extend([
         "PositionEvent::OffChainOrderPlaced", // position checker retry
         "OffchainOrderEvent::Placed",         // new offchain order
-        "OffchainOrderEvent::Submitted",      // broker accepted retry
+        "OffchainOrderEvent::Submitted",      // broker accepted retry (atomic)
         "OffchainOrderEvent::Filled",         // broker filled
         "PositionEvent::OffChainOrderFilled", // position hedged, net=0
     ]);

@@ -74,12 +74,12 @@ struct VaultDiscoveryContext<'a> {
 }
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
-struct TradeProcessingCqrs {
-    onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
-    position_cqrs: Arc<PositionCqrs>,
-    position_query: Arc<PositionQuery>,
-    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    execution_threshold: ExecutionThreshold,
+pub(crate) struct TradeProcessingCqrs {
+    pub(crate) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
+    pub(crate) position_cqrs: Arc<PositionCqrs>,
+    pub(crate) position_query: Arc<PositionQuery>,
+    pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 /// Adapter that bridges the generic Executor trait to the OrderPlacer
