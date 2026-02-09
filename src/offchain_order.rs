@@ -1599,12 +1599,10 @@ mod tests {
         assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
     }
 
-    /// Bug: ConfirmSubmission is not idempotent, blocking recovery after partial
-    /// dual-write failures.
-    ///
-    /// If ES write succeeds but legacy write fails, retrying with the same
-    /// executor_order_id fails with AlreadySubmitted. System stuck in inconsistent
-    /// state with no programmatic recovery path.
+    /// ConfirmSubmission is idempotent: retrying with the same executor_order_id
+    /// on an already-submitted order is a no-op (returns empty events). This
+    /// ensures resilience against duplicate command delivery or retries after
+    /// transient failures.
     #[tokio::test]
     async fn test_confirm_submission_not_idempotent_blocks_retry_recovery() {
         let mut order = Lifecycle::Live(OffchainOrder::Pending {
