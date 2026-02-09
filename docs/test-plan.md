@@ -141,13 +141,6 @@ listener, event queue enqueue/dequeue.
 reports failure), the order poller handles the failure, and the periodic
 position checker detects the still-unhedged position and retries successfully.
 
-**Why not test a crash**: After `process_queued_trade()` crosses the threshold,
-it atomically sets `pending_offchain_order_id` on the Position aggregate. The
-position checker queries for positions where `pending_offchain_order_id` is None
--- so it won't find a position with an existing pending order. The realistic way
-to reach the "unexecuted position" state is: submit -> broker reports failure ->
-poller clears pending order -> position checker picks it up.
-
 **What's real**: Same as Test 1 plus
 `check_and_execute_accumulated_positions()`,
 `MockExecutor::with_order_status(Failed)`.
