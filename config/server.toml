@@ -1,0 +1,30 @@
+database_url = "sqlite:///mnt/data/alpaca.db"
+log_level = "debug"
+server_port = 8001
+
+[hyperdx]
+service_name = "st0x-hedge"
+
+[evm]
+orderbook = "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
+deployment_block = 40850446
+
+[broker]
+type = "alpaca-broker-api"
+# NOTE: if you're reviewing the infra PR, let me know if we should move this to
+# secrets or if setting the value here is fine
+account_id = "00000000-0000-0000-0000-000000000000"
+mode = "production"
+
+[rebalancing]
+# TODO: update to the fireblocks one
+redemption_wallet = "0xe75F9042728C3aD626B1aa283fD9A7fcaF63Bf1d"
+usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffaabb"
+
+[rebalancing.equity_threshold]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc_threshold]
+target = "0.5"
+deviation = "0.3"

@@ -1,0 +1,2 @@
+database_url = "/mnt/data/server-alpaca.db"
+log_level = "info"
