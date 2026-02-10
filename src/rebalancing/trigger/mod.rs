@@ -284,7 +284,7 @@ impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
 
 impl RebalancingTrigger {
     /// Checks inventory for equity imbalance and triggers operation if needed.
-    async fn check_and_trigger_equity(&self, symbol: &Symbol) {
+    pub(crate) async fn check_and_trigger_equity(&self, symbol: &Symbol) {
         let Some(guard) = equity::InProgressGuard::try_claim(
             symbol.clone(),
             Arc::clone(&self.equity_in_progress),
@@ -350,7 +350,7 @@ impl RebalancingTrigger {
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
-    async fn check_and_trigger_usdc(&self) {
+    pub(crate) async fn check_and_trigger_usdc(&self) {
         let Some(guard) = usdc::InProgressGuard::try_claim(Arc::clone(&self.usdc_in_progress))
         else {
             debug!("Skipped USDC trigger: already in progress");
