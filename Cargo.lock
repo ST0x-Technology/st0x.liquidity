@@ -1328,6 +1328,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "assert-struct"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c1d15176e70a5c6f5f2b226928371188d7da903bd0f132ea09a85df1d8a4ad"
+dependencies = [
+ "assert-struct-macros",
+ "quote",
+ "regex",
+ "syn 2.0.108",
+]
+
+[[package]]
+name = "assert-struct-macros"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8130b5a7bd5f06ab6a03f116cbe6fc9798f12121b670e832409ffa8306a1715d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "regex",
+ "syn 2.0.108",
+]
+
+[[package]]
+name = "assert_matches"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
+
+[[package]]
 name = "async-attributes"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6649,6 +6679,8 @@ dependencies = [
  "aes-gcm",
  "alloy",
  "anyhow",
+ "assert-struct",
+ "assert_matches",
  "async-trait",
  "backon",
  "base64 0.22.1",
