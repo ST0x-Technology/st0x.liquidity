@@ -204,12 +204,11 @@ async fn build_imbalanced_equity_inventory(position_cqrs: &PositionCqrs, aggrega
         .unwrap();
 }
 
-/// Test 4: Position CQRS events -> RebalancingTrigger -> Rebalancer -> MintManager -> Aggregate
-///
-/// Drives InventoryView state through real Position CQRS commands (not direct
-/// `apply_position_event` calls), verifying the production wiring where
-/// RebalancingTrigger receives events as a Query processor, updates inventory,
-/// detects imbalance, and sends a TriggeredOperation to the Rebalancer.
+/// Verifies the full equity mint rebalancing pipeline: position CQRS commands
+/// flow through the RebalancingTrigger (registered as a Query processor),
+/// update the InventoryView, detect an equity imbalance, and dispatch a Mint
+/// operation through the Rebalancer to the MintManager which drives the
+/// TokenizedEquityMint aggregate to completion via the Alpaca tokenization API.
 #[tokio::test]
 async fn position_events_trigger_equity_mint_through_rebalancer() {
     let pool = setup_test_db().await;
@@ -335,11 +334,10 @@ async fn position_events_trigger_equity_mint_through_rebalancer() {
     );
 }
 
-/// Test 5: Trigger -> Rebalancer -> MockUsdcRebalance (USDC transfer flow)
-///
-/// Uses MockUsdcRebalance since the real UsdcRebalanceManager requires CCTP bridge
-/// and vault services that perform actual Ethereum transactions. This still tests the
-/// trigger -> channel -> rebalancer -> manager dispatch chain.
+/// Verifies USDC rebalancing dispatch: a USDC imbalance triggers the
+/// RebalancingTrigger to send a UsdcAlpacaToBase operation through the channel
+/// to the Rebalancer, which dispatches to the USDC manager. Uses mocked managers
+/// since the real USDC flow requires CCTP bridge and vault transactions.
 #[tokio::test]
 async fn trigger_rebalancer_usdc_dispatch() {
     let pool = setup_test_db().await;

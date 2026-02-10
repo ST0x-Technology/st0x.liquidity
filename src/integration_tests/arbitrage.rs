@@ -3,6 +3,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, B256, fixed_bytes};
 use chrono::Utc;
 use cqrs_es::persist::GenericQuery;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
@@ -29,8 +30,7 @@ use crate::threshold::ExecutionThreshold;
 
 /// Loads a position and asserts it matches the expected field values.
 ///
-/// All test trades use the same price (`150.25`). The `last_updated` timestamp is
-/// non-deterministic and is asserted against the loaded value.
+/// The `last_updated` timestamp is non-deterministic and is asserted against the loaded value.
 async fn assert_position(
     query: &Arc<PositionQuery>,
     symbol: &Symbol,
@@ -38,6 +38,7 @@ async fn assert_position(
     accumulated_long: FractionalShares,
     accumulated_short: FractionalShares,
     pending: Option<OffchainOrderId>,
+    last_price_usdc: Decimal,
 ) {
     let pos = load_position(query, symbol)
         .await
@@ -50,7 +51,7 @@ async fn assert_position(
             accumulated_long,
             accumulated_short,
             pending_offchain_order_id: pending,
-            last_price_usdc: Some(dec!(150.25)),
+            last_price_usdc: Some(last_price_usdc),
             last_updated: pos.last_updated,
         }
     );
@@ -63,7 +64,22 @@ async fn submit_trade(
     trade: OnchainTrade,
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    let queued_event = make_queued_event(trade.tx_hash, trade.log_index);
+    let queued_event = QueuedEvent {
+        id: Some(1),
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+        block_number: 12345,
+        event: TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
+            sender: Address::ZERO,
+            config: TakeOrderConfigV4::default(),
+            input: B256::ZERO,
+            output: B256::ZERO,
+        })),
+        processed: false,
+        created_at: None,
+        processed_at: None,
+        block_timestamp: Some(Utc::now()),
+    };
     process_queued_trade(
         SupportedExecutor::DryRun,
         pool,
@@ -92,31 +108,13 @@ async fn poll_and_fill(
     Ok(())
 }
 
-fn make_queued_event(tx_hash: B256, log_index: u64) -> QueuedEvent {
-    QueuedEvent {
-        id: Some(1),
-        tx_hash,
-        log_index,
-        block_number: 12345,
-        event: TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
-            sender: Address::ZERO,
-            config: TakeOrderConfigV4::default(),
-            input: B256::ZERO,
-            output: B256::ZERO,
-        })),
-        processed: false,
-        created_at: None,
-        processed_at: None,
-        block_timestamp: Some(Utc::now()),
-    }
-}
-
-fn make_trade(
+fn onchain_trade(
     tx_hash: B256,
     log_index: u64,
     amount: f64,
     symbol: &str,
     direction: Direction,
+    price: f64,
 ) -> OnchainTrade {
     OnchainTrade {
         id: None,
@@ -126,7 +124,7 @@ fn make_trade(
         equity_token: Address::ZERO,
         amount,
         direction,
-        price: Usdc::new(150.25).unwrap(),
+        price: Usdc::new(price).unwrap(),
         block_timestamp: Some(Utc::now()),
         created_at: None,
         gas_used: Some(21000),
@@ -206,7 +204,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let result1 = submit_trade(
         &pool,
         1,
-        make_trade(tx1, 1, 0.5, "tAAPL", Direction::Sell),
+        onchain_trade(tx1, 1, 0.5, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?;
@@ -222,6 +220,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         FractionalShares::ZERO,
         FractionalShares::new(dec!(0.5)),
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -237,7 +236,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
     let order_id = submit_trade(
         &pool,
         2,
-        make_trade(tx2, 2, 0.7, "tAAPL", Direction::Sell),
+        onchain_trade(tx2, 2, 0.7, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
@@ -251,6 +250,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         Some(order_id),
+        dec!(150.25),
     )
     .await;
 
@@ -290,6 +290,7 @@ async fn onchain_trades_accumulate_and_trigger_offchain_fill()
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -322,14 +323,14 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
     submit_trade(
         &pool,
         1,
-        make_trade(tx1, 1, 0.5, "tAAPL", Direction::Sell),
+        onchain_trade(tx1, 1, 0.5, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?;
     let order_id = submit_trade(
         &pool,
         2,
-        make_trade(tx2, 2, 0.7, "tAAPL", Direction::Sell),
+        onchain_trade(tx2, 2, 0.7, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
@@ -359,6 +360,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -405,6 +407,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -430,6 +433,7 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 
 /// Tests that two symbols processed through the pipeline don't contaminate each other's
 /// Position state or event streams.
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let pool = setup_test_db().await;
@@ -446,7 +450,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         submit_trade(
             &pool,
             1,
-            make_trade(tx1, 1, 0.6, "tAAPL", Direction::Sell),
+            onchain_trade(tx1, 1, 0.6, "tAAPL", Direction::Sell, 150.25),
             &cqrs
         )
         .await?
@@ -456,7 +460,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         submit_trade(
             &pool,
             2,
-            make_trade(tx2, 2, 0.4, "tMSFT", Direction::Sell),
+            onchain_trade(tx2, 2, 0.4, "tMSFT", Direction::Sell, 420.50),
             &cqrs
         )
         .await?
@@ -465,14 +469,13 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let aapl_order_id = submit_trade(
         &pool,
         3,
-        make_trade(tx3, 3, 0.6, "tAAPL", Direction::Sell),
+        onchain_trade(tx3, 3, 0.6, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
     .expect("AAPL 1.2 crosses threshold");
     let aapl_order_str = aapl_order_id.to_string();
 
-    // Phase 1: position state
     assert_position(
         &position_query,
         &aapl,
@@ -480,6 +483,7 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         Some(aapl_order_id),
+        dec!(150.25),
     )
     .await;
     assert_position(
@@ -489,10 +493,10 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
         FractionalShares::ZERO,
         FractionalShares::new(dec!(0.4)),
         None,
+        dec!(420.50),
     )
     .await;
 
-    // Phase 1: event sequence
     let tx1_agg = format!("{tx1}:1");
     let tx2_agg = format!("{tx2}:2");
     let tx3_agg = format!("{tx3}:3");
@@ -517,57 +521,31 @@ async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let events = assert_events(&pool, &expected).await;
 
-    // AAPL offchain order payload spot checks
     let aapl_placed = &events[7].payload["Placed"];
     assert_eq!(aapl_placed["symbol"].as_str().unwrap(), "AAPL");
     assert_eq!(aapl_placed["direction"].as_str().unwrap(), "Buy");
 
-    // Phases 2-4: fill AAPL, MSFT crosses threshold, fill MSFT
-    fill_aapl_cross_msft_threshold_and_fill(
-        &pool,
-        &cqrs,
-        &position_query,
-        &offchain_order_cqrs,
-        &position_cqrs,
-        aapl_order_id,
-        &mut expected,
-    )
-    .await
-}
-
-/// Phases 2-4 of `multi_symbol_isolation`: fills AAPL, crosses MSFT threshold, fills MSFT.
-async fn fill_aapl_cross_msft_threshold_and_fill(
-    pool: &SqlitePool,
-    cqrs: &TradeProcessingCqrs,
-    position_query: &Arc<PositionQuery>,
-    offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
-    position_cqrs: &Arc<PositionCqrs>,
-    aapl_order_id: OffchainOrderId,
-    expected: &mut Vec<ExpectedEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let aapl = Symbol::new("AAPL").unwrap();
-    let msft = Symbol::new("MSFT").unwrap();
-    let aapl_order_str = aapl_order_id.to_string();
-
-    // Phase 2: poll and fill AAPL, verify MSFT unchanged
-    poll_and_fill(pool, offchain_order_cqrs, position_cqrs).await?;
+    // Poll and fill AAPL, verify MSFT unchanged
+    poll_and_fill(&pool, &offchain_order_cqrs, &position_cqrs).await?;
 
     assert_position(
-        position_query,
+        &position_query,
         &aapl,
         FractionalShares::ZERO,
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         None,
+        dec!(150.25),
     )
     .await;
     assert_position(
-        position_query,
+        &position_query,
         &msft,
         FractionalShares::new(dec!(-0.4)),
         FractionalShares::ZERO,
         FractionalShares::new(dec!(0.4)),
         None,
+        dec!(420.50),
     )
     .await;
 
@@ -579,53 +557,28 @@ async fn fill_aapl_cross_msft_threshold_and_fill(
         ),
         ExpectedEvent::new("Position", "AAPL", "PositionEvent::OffChainOrderFilled"),
     ]);
-    assert_events(pool, expected).await;
+    assert_events(&pool, &expected).await;
 
-    // Phases 3-4: MSFT crosses threshold and fills
-    cross_msft_threshold_and_fill(
-        pool,
-        cqrs,
-        position_query,
-        offchain_order_cqrs,
-        position_cqrs,
-        aapl_order_id,
-        expected,
-    )
-    .await
-}
-
-/// Phases 3-4: MSFT crosses threshold, gets filled, both positions end hedged.
-async fn cross_msft_threshold_and_fill(
-    pool: &SqlitePool,
-    cqrs: &TradeProcessingCqrs,
-    position_query: &Arc<PositionQuery>,
-    offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
-    position_cqrs: &Arc<PositionCqrs>,
-    aapl_order_id: OffchainOrderId,
-    expected: &mut Vec<ExpectedEvent>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let aapl = Symbol::new("AAPL").unwrap();
-    let msft = Symbol::new("MSFT").unwrap();
-
-    // Phase 3: MSFT crosses threshold (0.4 + 0.6 = 1.0, exactly at threshold)
+    // MSFT crosses threshold (0.4 + 0.6 = 1.0, exactly at threshold)
     let tx4 = fixed_bytes!("0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
     let msft_order_id = submit_trade(
-        pool,
+        &pool,
         4,
-        make_trade(tx4, 4, 0.6, "tMSFT", Direction::Sell),
-        cqrs,
+        onchain_trade(tx4, 4, 0.6, "tMSFT", Direction::Sell, 420.50),
+        &cqrs,
     )
     .await?
     .expect("MSFT 1.0 hits threshold");
     let msft_order_str = msft_order_id.to_string();
 
     assert_position(
-        position_query,
+        &position_query,
         &msft,
         FractionalShares::new(dec!(-1.0)),
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.0)),
         Some(msft_order_id),
+        dec!(420.50),
     )
     .await;
     assert_ne!(
@@ -649,31 +602,33 @@ async fn cross_msft_threshold_and_fill(
             "OffchainOrderEvent::Submitted",
         ),
     ]);
-    let events = assert_events(pool, expected).await;
+    let events = assert_events(&pool, &expected).await;
 
     let msft_placed = &events[14].payload["Placed"];
     assert_eq!(msft_placed["symbol"].as_str().unwrap(), "MSFT");
     assert_eq!(msft_placed["direction"].as_str().unwrap(), "Buy");
 
-    // Phase 4: poll and fill MSFT
-    poll_and_fill(pool, offchain_order_cqrs, position_cqrs).await?;
+    // Poll and fill MSFT, both positions end fully hedged
+    poll_and_fill(&pool, &offchain_order_cqrs, &position_cqrs).await?;
 
     assert_position(
-        position_query,
+        &position_query,
         &aapl,
         FractionalShares::ZERO,
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.2)),
         None,
+        dec!(150.25),
     )
     .await;
     assert_position(
-        position_query,
+        &position_query,
         &msft,
         FractionalShares::ZERO,
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.0)),
         None,
+        dec!(420.50),
     )
     .await;
 
@@ -685,7 +640,7 @@ async fn cross_msft_threshold_and_fill(
         ),
         ExpectedEvent::new("Position", "MSFT", "PositionEvent::OffChainOrderFilled"),
     ]);
-    assert_events(pool, expected).await;
+    assert_events(&pool, &expected).await;
 
     Ok(())
 }
@@ -705,7 +660,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let result1 = submit_trade(
         &pool,
         1,
-        make_trade(tx1, 1, 0.5, "tAAPL", Direction::Buy),
+        onchain_trade(tx1, 1, 0.5, "tAAPL", Direction::Buy, 150.25),
         &cqrs,
     )
     .await?;
@@ -718,6 +673,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         FractionalShares::new(dec!(0.5)),
         FractionalShares::ZERO,
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -725,7 +681,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
     let order_id = submit_trade(
         &pool,
         2,
-        make_trade(tx2, 2, 0.7, "tAAPL", Direction::Buy),
+        onchain_trade(tx2, 2, 0.7, "tAAPL", Direction::Buy, 150.25),
         &cqrs,
     )
     .await?
@@ -739,6 +695,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         FractionalShares::new(dec!(1.2)),
         FractionalShares::ZERO,
         Some(order_id),
+        dec!(150.25),
     )
     .await;
 
@@ -776,6 +733,7 @@ async fn buy_direction_accumulates_long() -> Result<(), Box<dyn std::error::Erro
         FractionalShares::new(dec!(1.2)),
         FractionalShares::ZERO,
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -799,7 +757,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
     let order_id = submit_trade(
         &pool,
         1,
-        make_trade(tx1, 1, 1.0, "tAAPL", Direction::Sell),
+        onchain_trade(tx1, 1, 1.0, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
@@ -812,6 +770,7 @@ async fn exact_threshold_triggers_execution() -> Result<(), Box<dyn std::error::
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.0)),
         Some(order_id),
+        dec!(150.25),
     )
     .await;
 
@@ -844,7 +803,7 @@ async fn position_checker_noop_when_hedged() -> Result<(), Box<dyn std::error::E
     submit_trade(
         &pool,
         1,
-        make_trade(tx1, 1, 1.0, "tAAPL", Direction::Sell),
+        onchain_trade(tx1, 1, 1.0, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
@@ -887,7 +846,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let order1 = submit_trade(
         &pool,
         1,
-        make_trade(tx1, 1, 1.0, "tAAPL", Direction::Sell),
+        onchain_trade(tx1, 1, 1.0, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
@@ -901,6 +860,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         FractionalShares::ZERO,
         FractionalShares::new(dec!(1.0)),
         None,
+        dec!(150.25),
     )
     .await;
 
@@ -909,7 +869,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     let order2 = submit_trade(
         &pool,
         2,
-        make_trade(tx2, 2, 1.5, "tAAPL", Direction::Sell),
+        onchain_trade(tx2, 2, 1.5, "tAAPL", Direction::Sell, 150.25),
         &cqrs,
     )
     .await?
@@ -923,6 +883,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         FractionalShares::ZERO,
         FractionalShares::new(dec!(2.5)),
         Some(order2),
+        dec!(150.25),
     )
     .await;
 
@@ -935,6 +896,7 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
         FractionalShares::ZERO,
         FractionalShares::new(dec!(2.5)),
         None,
+        dec!(150.25),
     )
     .await;
 
