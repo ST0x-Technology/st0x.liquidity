@@ -1,8 +1,9 @@
 name: Deploy
 
 on:
-  push:
-    branches: [master]
+  # Temporarily disabled during live testing - manual deploys only
+  # push:
+  #   branches: [master]
   workflow_dispatch:
 
 concurrency:
