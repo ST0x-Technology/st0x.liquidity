@@ -1,18 +1,10 @@
 # Single source of truth for all st0x services
 {
-  server-schwab = {
-    enabled = false;
-    bin = "server";
-  };
-  server-alpaca = {
+  server = {
     enabled = true;
     bin = "server";
   };
-  reporter-schwab = {
-    enabled = false;
-    bin = "reporter";
-  };
-  reporter-alpaca = {
+  reporter = {
     enabled = false;
     bin = "reporter";
   };

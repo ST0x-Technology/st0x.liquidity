@@ -19,7 +19,9 @@ let
       SupplementaryGroups = [ "st0x" ];
       ExecStart = builtins.concatStringsSep " " [
         "/nix/var/nix/profiles/per-service/${name}/bin/${cfg.bin}"
-        "--config-file"
+        "--config"
+        "${./config/${name}.toml}"
+        "--secrets"
         "/run/agenix/${name}.toml"
       ];
       Restart = "always";
@@ -29,7 +31,7 @@ let
   };
 
   mkSecret = name: _: {
-    file = ./config/${name}.toml.age;
+    file = ./secret/${name}.toml.age;
     group = "st0x";
     mode = "0640";
   };

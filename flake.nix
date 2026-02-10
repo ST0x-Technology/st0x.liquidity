@@ -133,7 +133,7 @@
                 keys.nix
 
               echo "Updated host key in keys.nix, rekeying secrets..."
-              ragenix --rules ./config/secrets.nix -i "$identity" -r
+              ragenix --rules ./secret/secrets.nix -i "$identity" -r
             '';
           };
 
@@ -142,8 +142,7 @@
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
               ${infraPkgs.parseIdentity}
-              ragenix --rules ./config/secrets.nix -i "$identity" -e "$@"
-              exec ragenix --rules ./config/secrets.nix -i "$identity" -r
+              exec ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
             '';
           };
 
