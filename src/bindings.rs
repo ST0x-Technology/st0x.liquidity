@@ -33,6 +33,39 @@ sol!(
     TOFUTokenDecimals, "lib/rain.orderbook/out/TOFUTokenDecimals.sol/TOFUTokenDecimals.json"
 );
 
+// ERC20 with configurable name, symbol, and decimals via constructor args.
+// Distinct from `TestERC20` (ArbTest Token) which has a no-arg constructor.
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    #[derive(serde::Serialize, serde::Deserialize)]
+    DeployableERC20, "lib/rain.orderbook/out/TestERC20.sol/TestERC20.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    Interpreter, "lib/rain.orderbook/out/Rainterpreter.sol/Rainterpreter.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    Store, "lib/rain.orderbook/out/RainterpreterStore.sol/RainterpreterStore.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    Parser, "lib/rain.orderbook/out/RainterpreterParser.sol/RainterpreterParser.json"
+);
+
+#[cfg(test)]
+sol!(
+    #![sol(all_derives = true, rpc)]
+    Deployer, "lib/rain.orderbook/out/RainterpreterExpressionDeployer.sol/RainterpreterExpressionDeployer.json"
+);
+
 sol!(
     #![sol(all_derives = true, rpc)]
     #[allow(clippy::too_many_arguments)]
