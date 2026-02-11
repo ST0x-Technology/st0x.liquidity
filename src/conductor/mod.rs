@@ -67,10 +67,10 @@ use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistry
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 
 /// Context for vault discovery operations during trade processing.
-struct VaultDiscoveryContext<'a> {
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
-    orderbook: Address,
-    order_owner: Address,
+pub(crate) struct VaultDiscoveryContext<'a> {
+    pub(crate) vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Address,
 }
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
@@ -944,7 +944,7 @@ fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingEr
 /// Vaults are classified as:
 /// - USDC vault: token == USDC_BASE
 /// - Equity vault: token matches the trade's symbol (via cache lookup)
-async fn discover_vaults_for_trade(
+pub(crate) async fn discover_vaults_for_trade(
     queued_event: &QueuedEvent,
     trade: &OnchainTrade,
     context: &VaultDiscoveryContext<'_>,

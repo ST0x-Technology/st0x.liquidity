@@ -26,9 +26,10 @@ use crate::bindings::IOrderBookV5::{self, TakeOrderV3};
 use crate::bindings::{
     DeployableERC20, Deployer, Interpreter, OrderBook, Parser, Store, TOFUTokenDecimals,
 };
+use crate::cctp::USDC_BASE;
 use crate::conductor::{
-    ExecutorOrderPlacer, TradeProcessingCqrs, check_and_execute_accumulated_positions,
-    process_queued_trade,
+    ExecutorOrderPlacer, TradeProcessingCqrs, VaultDiscoveryContext,
+    check_and_execute_accumulated_positions, discover_vaults_for_trade, process_queued_trade,
 };
 use crate::error::EventProcessingError;
 use crate::offchain::order_poller::{OrderPollerConfig, OrderStatusPoller};
@@ -41,6 +42,7 @@ use crate::queue::QueuedEvent;
 use crate::symbol::cache::SymbolCache;
 use crate::test_utils::setup_test_db;
 use crate::threshold::ExecutionThreshold;
+use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate};
 
 /// Loads a position and asserts it matches the expected field values.
 ///
@@ -87,7 +89,7 @@ impl AnvilTrade {
     }
 
     async fn submit(
-        self,
+        &self,
         pool: &SqlitePool,
         event_id: i64,
         cqrs: &TradeProcessingCqrs,
@@ -97,7 +99,7 @@ impl AnvilTrade {
             pool,
             &self.queued_event,
             event_id,
-            self.trade,
+            self.trade.clone(),
             cqrs,
         )
         .await
@@ -136,6 +138,57 @@ struct AnvilOrderBook<P> {
     feed_id_cache: FeedIdCache,
 }
 
+/// Places USDC contract code and storage directly at `USDC_BASE` via Anvil cheatcodes,
+/// avoiding a temporary deploy + clone. Initializes the OpenZeppelin ERC20 storage layout:
+/// totalSupply, name ("USD Coin"), symbol ("USDC"), decimals (6), and balance for `owner`.
+async fn deploy_usdc_at_base<P: alloy::providers::Provider>(provider: &P, owner: Address) {
+    let total_supply = U256::from(1_000_000_000_000u64);
+
+    provider
+        .anvil_set_code(USDC_BASE, DeployableERC20::DEPLOYED_BYTECODE.clone())
+        .await
+        .unwrap();
+
+    // Slot 2: _totalSupply
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(2), total_supply.into())
+        .await
+        .unwrap();
+
+    // Slot 3: _name = "USD Coin" (Solidity short-string: data left-aligned, len*2 in last byte)
+    let mut name_bytes = [0u8; 32];
+    name_bytes[..8].copy_from_slice(b"USD Coin");
+    name_bytes[31] = 16;
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(3), B256::from(name_bytes))
+        .await
+        .unwrap();
+
+    // Slot 4: _symbol = "USDC" (Solidity short-string encoding)
+    let mut symbol_bytes = [0u8; 32];
+    symbol_bytes[..4].copy_from_slice(b"USDC");
+    symbol_bytes[31] = 8;
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(4), B256::from(symbol_bytes))
+        .await
+        .unwrap();
+
+    // Slot 5: _decimals = 6
+    provider
+        .anvil_set_storage_at(USDC_BASE, U256::from(5), U256::from(6).into())
+        .await
+        .unwrap();
+
+    // _balances[owner]: keccak256(abi.encode(owner, 0)) where 0 is the balances mapping slot
+    let mut slot_key = [0u8; 64];
+    slot_key[12..32].copy_from_slice(owner.as_slice());
+    let balance_slot = U256::from_be_bytes(keccak256(slot_key).0);
+    provider
+        .anvil_set_storage_at(USDC_BASE, balance_slot, total_supply.into())
+        .await
+        .unwrap();
+}
+
 async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provider + Clone> {
     let (anvil, endpoint, key) = setup_anvil();
     let signer = PrivateKeySigner::from_bytes(&key).unwrap();
@@ -171,23 +224,14 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
 
     let orderbook = OrderBook::deploy(&provider).await.unwrap();
 
-    let usdc = DeployableERC20::deploy(
-        &provider,
-        "USD Coin".to_string(),
-        "USDC".to_string(),
-        6,
-        owner,
-        U256::from(1_000_000_000_000u64),
-    )
-    .await
-    .unwrap();
+    // Place USDC contract directly at USDC_BASE so vault discovery recognizes it.
+    deploy_usdc_at_base(&provider, owner).await;
 
     // Extract addresses before moving provider into the struct
     let orderbook_addr = *orderbook.address();
     let deployer_addr = *deployer.address();
     let interpreter_addr = *interpreter.address();
     let store_addr = *store.address();
-    let usdc_addr = *usdc.address();
 
     AnvilOrderBook {
         _anvil: anvil,
@@ -197,7 +241,7 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
         interpreter_addr,
         store_addr,
         owner,
-        usdc_addr,
+        usdc_addr: USDC_BASE,
         equity_tokens: HashMap::new(),
         symbol_cache: SymbolCache::default(),
         feed_id_cache: FeedIdCache::default(),
@@ -1176,89 +1220,69 @@ async fn second_hedge_after_full_lifecycle() -> Result<(), Box<dyn std::error::E
     Ok(())
 }
 
-/// Full end-to-end test: real OrderBook on Anvil -> parse TakeOrderV3 -> CQRS pipeline -> hedge.
 #[tokio::test]
-async fn real_orderbook_take_order_event() -> Result<(), Box<dyn std::error::Error>> {
+async fn take_order_discovers_equity_vault() -> Result<(), Box<dyn std::error::Error>> {
     let mut ob = setup_anvil_orderbook().await;
     let pool = setup_test_db().await;
-    let (cqrs, position_cqrs, position_query, offchain_order_cqrs) = create_test_cqrs(&pool);
-    let symbol = Symbol::new("AAPL").unwrap();
+    let (cqrs, _, _, _) = create_test_cqrs(&pool);
 
-    // Sell 2.0 shares at $100 on the real OrderBook
-    let t1 = ob.take_order("AAPL", 2.0, Direction::Sell, 100).await;
-    let t1_agg = t1.aggregate_id();
+    let t1 = ob.take_order("AAPL", 1.0, Direction::Sell, 100).await;
+    t1.submit(&pool, 1, &cqrs).await?;
 
-    // Verify key parsed trade fields before submitting
-    assert_eq!(t1.trade.direction, Direction::Sell);
-    assert!(
-        (t1.trade.amount - 2.0).abs() < f64::EPSILON,
-        "Expected 2.0 shares, got {}",
-        t1.trade.amount
-    );
-    assert!(
-        (t1.trade.price.value() - 100.0).abs() < 0.01,
-        "Expected ~100 USDC/share, got {}",
-        t1.trade.price.value()
-    );
-    assert!(t1.trade.tx_hash != B256::ZERO, "tx_hash should be set");
-    assert!(t1.trade.gas_used.is_some(), "gas_used should be populated");
+    // Run vault discovery using the same trade data
+    let vault_registry_cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
+    let context = VaultDiscoveryContext {
+        vault_registry_cqrs: &vault_registry_cqrs,
+        orderbook: ob.orderbook_addr,
+        order_owner: ob.owner,
+    };
 
-    let order_id = t1
-        .submit(&pool, 1, &cqrs)
-        .await?
-        .expect("2.0 shares should cross whole-share threshold");
-    let order_id_str = order_id.to_string();
+    discover_vaults_for_trade(&t1.queued_event, &t1.trade, &context).await?;
 
-    // Position: 2 shares sold onchain -> net=-2.0, accumulated_short=2.0
-    assert_position()
-        .query(&position_query)
-        .symbol(&symbol)
-        .net(FractionalShares::new(dec!(-2.0)))
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(2.0)))
-        .pending(order_id)
-        .last_price_usdc(dec!(100))
-        .call()
-        .await;
+    let vault_agg_id = VaultRegistry::aggregate_id(ob.orderbook_addr, ob.owner);
+    let events = fetch_events(&pool).await;
 
-    let mut expected = vec![
-        ExpectedEvent::new("Position", "AAPL", "PositionEvent::OnChainOrderFilled"),
-        ExpectedEvent::new("OnChainTrade", &t1_agg, "OnChainTradeEvent::Filled"),
-        ExpectedEvent::new("Position", "AAPL", "PositionEvent::OffChainOrderPlaced"),
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Placed"),
-        ExpectedEvent::new(
-            "OffchainOrder",
-            &order_id_str,
-            "OffchainOrderEvent::Submitted",
-        ),
-    ];
-    let events = assert_events(&pool, &expected).await;
+    // The trade produces Position + OnChainTrade + offchain order events,
+    // followed by VaultRegistry discovery for both the USDC and equity vaults.
+    let vault_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.aggregate_type == "VaultRegistry")
+        .collect();
 
-    // Hedge direction should be Buy (opposite of onchain Sell)
+    assert_eq!(vault_events.len(), 2, "Expected USDC + equity vault events");
+
+    // Both events belong to the same VaultRegistry aggregate
+    for ve in &vault_events {
+        assert_eq!(ve.aggregate_id, vault_agg_id);
+    }
+
+    // Sell order: input=USDC, output=equity. Vault discovery processes input first.
     assert_eq!(
-        events[3].payload["Placed"]["direction"].as_str().unwrap(),
-        "Buy"
+        vault_events[0].event_type,
+        "VaultRegistryEvent::UsdcVaultDiscovered"
+    );
+    assert_eq!(
+        vault_events[0].payload["UsdcVaultDiscovered"]["vault_id"]
+            .as_str()
+            .unwrap(),
+        format!("{:#x}", keccak256(b"AAPL"))
     );
 
-    // Complete the lifecycle: poll and fill the offchain order
-    poll_and_fill(&pool, &offchain_order_cqrs, &position_cqrs).await?;
+    assert_eq!(
+        vault_events[1].event_type,
+        "VaultRegistryEvent::EquityVaultDiscovered"
+    );
 
-    // Final: position fully hedged
-    assert_position()
-        .query(&position_query)
-        .symbol(&symbol)
-        .net(FractionalShares::ZERO)
-        .accumulated_long(FractionalShares::ZERO)
-        .accumulated_short(FractionalShares::new(dec!(2.0)))
-        .last_price_usdc(dec!(100))
-        .call()
-        .await;
-
-    expected.extend([
-        ExpectedEvent::new("OffchainOrder", &order_id_str, "OffchainOrderEvent::Filled"),
-        ExpectedEvent::new("Position", "AAPL", "PositionEvent::OffChainOrderFilled"),
-    ]);
-    assert_events(&pool, &expected).await;
+    let equity_payload = &vault_events[1].payload["EquityVaultDiscovered"];
+    assert_eq!(equity_payload["symbol"].as_str().unwrap(), "AAPL");
+    assert_eq!(
+        equity_payload["vault_id"].as_str().unwrap(),
+        format!("{:#x}", keccak256(b"AAPL"))
+    );
+    assert_eq!(
+        equity_payload["token"].as_str().unwrap(),
+        format!("{:#x}", ob.equity_tokens["AAPL"])
+    );
 
     Ok(())
 }

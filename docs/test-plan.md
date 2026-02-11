@@ -1,4 +1,4 @@
-# Integration Testing Plan
+# Integration Test Plan
 
 ## Pre-Existing Tests (What Already Crosses Boundaries)
 
@@ -23,233 +23,139 @@ Several unit-ish tests that wire a few components:
   real rebalancer.
 - **UsdcManager tests** -- same pattern: real CQRS, mocked HTTP, but standalone.
 
-## The Gap
-
-Each test covers a 2-3 step segment. No single test chains a full flow:
-
-**Arbitrage pipeline**: No test runs the chain from "onchain trade arrives"
-through to "position fully hedged, net exposure = 0". The segments (accumulate,
-threshold, place, poll, fill) are all tested individually but never wired
-together.
-
-**Rebalancing pipeline**: No test chains trigger -> rebalancer dispatch -> real
-manager -> real aggregate progression. Each boundary is mocked: trigger mocks
-the receiver, rebalancer mocks the managers, managers mock external APIs but are
-never invoked by a real trigger.
-
-**Multi-symbol concurrency**: Per-symbol position isolation exists but two
-symbols processed simultaneously are never tested for interference.
-
 ---
 
-## Testing Approach
-
-### Integration tests
+## Integration Tests
 
 Integration tests call conductor-level functions that internally orchestrate
 CQRS commands and event emission. They exercise the real orchestration with real
 in-memory SQLite and only mock external dependencies (broker API).
 
-**Key functions** (all `pub(crate)` in `src/conductor/mod.rs`):
-
-- **`process_queued_trade()`** -- the main entry point. Takes a `QueuedEvent`
-  and `OnchainTrade`, handles position fill acknowledgement, accumulation,
-  threshold checking, and offchain order placement. The `PlaceOrder` CQRS
-  command atomically calls the executor and emits both `Placed` and `Submitted`
-  events. Returns `Option<OffchainOrderId>` when threshold is crossed.
-- **`check_and_execute_accumulated_positions()`** -- the periodic safety net.
-  Scans all symbols for positions past threshold without a pending offchain
-  order, creates new offchain orders, and places them via the executor.
-
-**Key types used from outside the conductor:**
-
-- **`TradeProcessingCqrs`** -- bundles `OnChainTradeCqrs`, `PositionCqrs`,
-  `PositionQuery`, `OffchainOrderCqrs`, and `ExecutionThreshold`.
-- **`ExecutorOrderPlacer<E>`** -- adapter that bridges the generic `Executor`
-  trait to the `OrderPlacer` trait used by the OffchainOrder aggregate.
-- **`OrderStatusPoller::poll_pending_orders()`** -- queries SUBMITTED orders
-  from the offchain_order_view, polls broker for status, and runs fill/failure
-  handling via CQRS commands on both the OffchainOrder and Position aggregates.
-
 **What's real**: TradeProcessingCqrs, CQRS frameworks (SqliteCqrs), all
 aggregates (OnChainTrade, Position, OffchainOrder), threshold checking, order
-placement, order polling.
+placement, order poller.
 
 **What's mocked**: MockExecutor (broker API).
 
-**What's constructed directly**: `OnchainTrade` structs (bypasses
-`try_from_clear_v3` which needs RPC to fetch the companion `AfterClearV2` event
-and resolve token symbols -- that function has its own unit tests).
+**Onchain events**: Tests use a real Anvil OrderBook (`AnvilOrderBook` helper)
+that deploys the full Rain OrderBook contract stack + ERC20 tokens on a local
+Anvil node. Each trade deploys a real order, takes it, and parses the resulting
+`TakeOrderV3` event through `OnchainTrade::try_from_take_order_if_target_owner`
+-- the same pipeline used in production. USDC is cloned to the real `USDC_BASE`
+address so vault discovery works identically to production.
 
 **Database**: In-memory SQLite (`:memory:`) with real migrations.
 
 **Assertions**: Query the `events` table to verify the exact sequence of domain
 events emitted, plus Position view state via `load_position()`.
 
-## Recommended Integration Tests
+### Shared Test Infrastructure (`src/integration_tests/mod.rs`)
 
-### 1. Full Arbitrage Pipeline (Happy Path)
+- **`StoredEvent`** -- struct for querying CQRS events from the database
+- **`ExpectedEvent`** -- helper struct for asserting event sequences
+- **`fetch_events()`** -- fetches all events from the database ordered by rowid
+- **`assert_events()`** -- asserts that fetched events match expected
+  `(aggregate_type, aggregate_id, event_type)` triples exactly
 
-**What it proves**: The core money-making flow works end-to-end -- onchain trade
--> accumulate -> threshold -> hedge on broker -> poll -> fill -> position
-reconciled.
+### Arbitrage Tests (`src/integration_tests/arbitrage.rs`)
 
-**What's real**: TradeProcessingCqrs, all CQRS aggregates (OnChainTrade,
-Position, OffchainOrder), threshold check, order placement, order poller.
+**Key helpers:**
 
-**What's mocked**: MockExecutor (returns order ID, then `Filled` status).
+- **`AnvilOrderBook`** -- deploys Rain OrderBook + Interpreter + Store +
+  Parser + ERC20 tokens on Anvil; `deploy_usdc_at_base()` places USDC contract
+  at `USDC_BASE` via cheatcodes
+- **`AnvilTrade`** -- wraps a parsed `OnchainTrade` + `QueuedEvent`; `.submit()`
+  calls `process_queued_trade()`
+- **`assert_position()`** -- uses `#[bon::builder]` pattern for readable
+  position assertions
+- **`poll_and_fill()`** -- creates `OrderStatusPoller` with default
+  `MockExecutor` (returns Filled) and polls
+- **`create_test_cqrs()`** -- constructs all CQRS frameworks for tests
 
-**What's skipped**: Blockchain event parsing (`try_from_clear_v3`), WebSocket
-listener, event queue enqueue/dequeue.
+**Tests (8 total):**
 
-**Flow** (calls conductor-level functions directly):
+1. **`onchain_trades_accumulate_and_trigger_offchain_fill`** -- Full happy path:
+   two sell trades accumulate (0.5 + 0.7 = 1.2 shares), cross whole-share
+   threshold, trigger offchain hedge order, poller fills it, position net = 0.
+   Verifies complete 9-event sequence with payload spot-checks.
 
-1. Construct `OnchainTrade` directly (symbol=tAAPL, amount=0.5, direction=Sell)
-   and a `QueuedEvent` wrapping it
-2. Call `process_queued_trade()` -- internally handles position fill
-   acknowledgement, accumulation, threshold checking, and offchain order
-   placement. Returns `None` (below threshold)
-3. **Checkpoint**: Assert position state (accumulated_short=0.5, net=-0.5, no
-   pending_offchain_order_id). Assert events: `OnChainOrderFilled`, `Filled`
-4. Construct second trade (amount=0.7) and call `process_queued_trade()` again
-   -- this time threshold is crossed, returns `Some(OffchainOrderId)`
-5. **Checkpoint**: Assert position state (accumulated_short=1.2, net=-1.2,
-   pending_offchain_order_id set). Assert new events: `OnChainOrderFilled`,
-   `Filled`, `OffChainOrderPlaced`, `Placed`, `Submitted` (Placed and Submitted
-   are emitted atomically by the PlaceOrder command)
-6. Call `OrderStatusPoller::poll_pending_orders()` -- MockExecutor returns
-   Filled, poller handles fill lifecycle
-7. **Final checkpoint**: Assert position (net=0,
-   pending_offchain_order_id=None). Assert final events: `Filled`,
-   `OffChainOrderFilled`
+2. **`position_checker_recovers_failed_execution`** -- Recovery path: trades
+   cross threshold, broker fails the order, poller handles failure (clears
+   pending), position checker detects unhedged position, retries with new
+   offchain order, poller fills retry. Verifies 14-event sequence across
+   failure + recovery.
 
-**Final event sequence** (queried from `events` table):
+3. **`multi_symbol_isolation`** -- Interleaved AAPL and MSFT trades verify no
+   cross-contamination. AAPL crosses threshold first (0.6 + 0.6 = 1.2), gets
+   filled, then MSFT crosses (0.4 + 0.6 = 1.0), gets filled independently. Both
+   positions end at net = 0.
 
-- `PositionEvent::OnChainOrderFilled` (trade 1)
-- `OnChainTradeEvent::Filled` (trade 1)
-- `PositionEvent::OnChainOrderFilled` (trade 2)
-- `OnChainTradeEvent::Filled` (trade 2)
-- `PositionEvent::OffChainOrderPlaced` (threshold crossed)
-- `OffchainOrderEvent::Placed`
-- `OffchainOrderEvent::Submitted` (broker accepted, atomic with Placed)
-- `OffchainOrderEvent::Filled` (broker filled)
-- `PositionEvent::OffChainOrderFilled` (position hedged, net=0)
+4. **`buy_direction_accumulates_long`** -- Buy trades (0.5 + 0.7 = 1.2)
+   accumulate `accumulated_long`, cross threshold, trigger a Sell hedge
+   (opposite direction). Verifies hedge direction is Sell in event payloads.
 
-### 2. Position Checker Recovers After Failed Broker Execution
+5. **`exact_threshold_triggers_execution`** -- A single 1.0-share sell
+   immediately crosses the whole-share threshold, producing all 5 events
+   (OnChainOrderFilled, Filled, OffChainOrderPlaced, Placed, Submitted) in one
+   `process_queued_trade()` call.
 
-**What it proves**: When a broker order fails (e.g. Alpaca/Schwab API rejects or
-reports failure), the order poller handles the failure, and the periodic
-position checker detects the still-unhedged position and retries successfully.
+6. **`position_checker_noop_when_hedged`** -- After a complete hedge cycle
+   (position net = 0), `check_and_execute_accumulated_positions()` emits no new
+   events.
 
-**What's real**: Same as Test 1 plus
-`check_and_execute_accumulated_positions()`,
-`MockExecutor::with_order_status(Failed)`.
+7. **`second_hedge_after_full_lifecycle`** -- Two full cycles: first sell (1.0
+   shares) -> hedge -> fill, then second sell (1.5 shares) -> hedge -> fill.
+   Verifies the position accumulates across cycles (accumulated_short = 2.5) and
+   both hedge orders are independent. Verifies the full 14-event sequence.
 
-**Flow**:
+8. **`take_order_discovers_equity_vault`** -- A take-order event triggers vault
+   discovery via `discover_vaults_for_trade()`, producing `UsdcVaultDiscovered`
+   and `EquityVaultDiscovered` events on the VaultRegistry aggregate with
+   correct vault IDs, token addresses, and symbols.
 
-1. Call `process_queued_trade()` x2 -- crosses threshold, returns
-   `Some(OffchainOrderId)`. PlaceOrder command atomically emits Placed +
-   Submitted.
-2. Create `OrderStatusPoller` with
-   `MockExecutor::new().with_order_status(Failed)` -- `poll_pending_orders()`
-   discovers the failure, emits `OffchainOrderEvent::Failed` and
-   `PositionEvent::OffChainOrderFailed` (clears pending_offchain_order_id)
-3. **Checkpoint**: Assert `pending_offchain_order_id` is None on Position, net
-   still -1.2 (unhedged). Assert failure events emitted.
-4. Call `check_and_execute_accumulated_positions()` -- finds the position (net
-   past threshold, no pending offchain order), creates new offchain order,
-   places via executor
-5. Create new `OrderStatusPoller` with default MockExecutor (returns Filled) --
-   `poll_pending_orders()` completes the retry lifecycle
-6. **Final checkpoint**: Position net=0, pending_offchain_order_id=None. Events
-   table shows the complete failure-recovery sequence.
+### Rebalancing Tests (`src/integration_tests/rebalancing.rs`)
 
-### 3. Multi-Symbol Isolation
+**Key helpers:**
 
-**What it proves**: Two symbols processed concurrently don't contaminate each
-other's state.
+- **`seed_vault_registry()`** -- seeds VaultRegistry with token address and
+  deterministic vault ID
+- **`discover_deterministic_tx_hash()`** -- uses Anvil snapshot/revert to
+  determine the tx_hash produced by an ERC20 transfer before setting up httpmock
+  responses
+- **`test_trigger_config()`** -- returns standard `RebalancingTriggerConfig`
+- **`build_position_cqrs_with_trigger()`** -- constructs Position CQRS with
+  `RebalancingTrigger` as a query processor
+- **`build_imbalanced_inventory()`** -- creates Equity or USDC imbalances in the
+  InventoryView
 
-**What's real**: Same as Test 1, but for two symbols (AAPL, MSFT).
+**Tests (4 total):**
 
-**Flow**:
+1. **`equity_offchain_imbalance_triggers_mint`** -- Full equity mint pipeline:
+   position CQRS commands flow through `RebalancingTrigger` (registered as a
+   query processor), update the `InventoryView`, detect an equity imbalance (20%
+   onchain / 80% offchain), dispatch a Mint operation through the Rebalancer to
+   the real `MintManager`, which drives the `TokenizedEquityMint` aggregate to
+   completion via mocked Alpaca tokenization API. Verifies HTTP mock calls and
+   CQRS event sequence.
 
-1. Call `process_queued_trade()` with interleaved trades: tAAPL sell 0.6 shares,
-   tMSFT sell 0.4 shares, tAAPL sell 0.6 shares
-2. Assert: AAPL's second call returns `Some(OffchainOrderId)` (1.2 shares
-   crosses threshold), MSFT returns `None` (0.4 below threshold)
-3. Assert: Only AAPL has `OffChainOrderPlaced` / `Placed` / `Submitted` events
-4. Call `OrderStatusPoller::poll_pending_orders()` for AAPL
-5. Call `process_queued_trade()` with more tMSFT trades to cross threshold
-6. Assert: MSFT gets its own independent `OffChainOrderPlaced` / `Placed` /
-   `Submitted` events
-7. Call `OrderStatusPoller::poll_pending_orders()` for MSFT
-8. Assert: Both Position aggregates independently hedged (net=0), no
-   cross-contamination in events. Verify via `load_position()` for each symbol
+2. **`equity_onchain_imbalance_triggers_redemption`** -- Full equity redemption
+   pipeline: detects too much onchain equity (79.8% onchain / 20% offchain),
+   dispatches Redemption through the Rebalancer to the real `RedemptionManager`.
+   The manager sends real ERC20 tokens on Anvil, then drives the
+   `EquityRedemption` aggregate through TokensSent -> Detected -> Completed via
+   mocked Alpaca API. Uses Anvil snapshot/revert to discover deterministic
+   tx_hash for httpmock setup. Verifies onchain ERC20 balances after redemption.
 
-### 4. Trigger -> Rebalancer -> Mint Manager -> Aggregate
+3. **`usdc_offchain_imbalance_triggers_alpaca_to_base`** -- USDC imbalance
+   dispatch: 100 onchain / 900 offchain USDC (10% ratio, below 30% threshold)
+   triggers `UsdcAlpacaToBase` operation. Uses mocked managers since the real
+   USDC flow requires CCTP bridge. Asserts the USDC manager is called once with
+   correct excess amount ($400) and other managers are not called.
 
-**What it proves**: The full rebalancing chain for equity mint works when wired
-together -- trigger detects imbalance, rebalancer dispatches, manager calls API,
-CQRS aggregate progresses.
-
-**What's real**: RebalancingTrigger, Rebalancer dispatch, MintManager,
-TokenizedEquityMint aggregate (CQRS), VaultRegistry.
-
-**What's mocked**: Alpaca tokenization HTTP API (httpmock), RedemptionManager
-and UsdcManager (use MockRedeem/MockUsdcRebalance since we're only testing
-mint).
-
-**Flow**:
-
-1. Set up InventoryView with equity imbalance (too many shares offchain relative
-   to onchain for AAPL)
-2. Register AAPL vault in VaultRegistry via CQRS command
-3. Create a real MintManager with mocked HTTP + real CQRS aggregate
-4. Create Rebalancer with the real MintManager + MockRedeem + MockUsdcRebalance
-5. Create RebalancingTrigger connected to Rebalancer via mpsc channel
-6. Call `trigger.check_and_trigger_equity()`
-7. Run `rebalancer.run()` (will process one operation then exit when channel
-   closes)
-8. Assert: Alpaca mock received the mint HTTP request
-9. Assert: TokenizedEquityMint aggregate progressed through its lifecycle events
-10. Assert: MintManager's CQRS commands were executed (check events table)
-
-### 5. Trigger -> Rebalancer -> USDC Manager -> Aggregate
-
-**What it proves**: Same as Test 4 but for USDC rebalancing (AlpacaToBase
-direction).
-
-**What's real**: RebalancingTrigger, Rebalancer dispatch, UsdcManager,
-UsdcRebalance aggregate (CQRS).
-
-**What's mocked**: Alpaca wallet HTTP API (httpmock for withdrawal/transfer
-endpoints), CCTP attestation service, MintManager and RedemptionManager
-(MockMint/MockRedeem).
-
-**Flow**:
-
-1. Set up InventoryView with USDC imbalance (too much USD offchain)
-2. Create real UsdcManager with mocked HTTP + real CQRS aggregate
-3. Create Rebalancer with MockMint + MockRedeem + real UsdcManager
-4. Create RebalancingTrigger connected to Rebalancer via mpsc channel
-5. Call `trigger.check_and_trigger_usdc()`
-6. Run `rebalancer.run()`
-7. Assert: Alpaca wallet mocks received the expected HTTP requests
-8. Assert: UsdcRebalance aggregate progressed through its lifecycle events
-
----
-
-## Priority
-
-1. **Full arbitrage pipeline** (#1) -- Proves the core money-making flow. Medium
-   effort. Start here.
-2. **Position checker recovery** (#2) -- Proves the safety net works. Low-Medium
-   effort (reuses Test 1 setup).
-3. **Multi-symbol isolation** (#3) -- Validates no cross-contamination. Medium
-   effort.
-4. **Trigger -> Mint** (#4) -- Highest-value rebalancing flow. Medium effort.
-5. **Trigger -> USDC Manager** (#5) -- Most complex rebalancing flow.
-   Medium-High effort.
+4. **`usdc_onchain_imbalance_triggers_base_to_alpaca`** -- Inverse USDC
+   dispatch: 900 onchain / 100 offchain USDC (90% ratio, above 70% upper bound)
+   triggers `UsdcBaseToAlpaca`. Asserts base_to_alpaca is called once with
+   correct excess ($400) and other managers are not called.
 
 ---
 
