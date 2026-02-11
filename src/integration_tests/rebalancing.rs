@@ -423,6 +423,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
 /// setting up httpmock responses, so the mock detection endpoint can match
 /// the exact hash produced by the real onchain transfer.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn equity_onchain_imbalance_triggers_redemption() {
     let pool = setup_test_db().await;
     let symbol = Symbol::new("AAPL").unwrap();
@@ -577,6 +578,24 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     drop(position_cqrs);
 
     rebalancer.run().await;
+
+    // Verify onchain balances after the ERC20 transfer
+    let erc20 = IERC20::new(token_address, &provider);
+    let sender_balance = erc20.balanceOf(signer.address()).call().await.unwrap();
+    assert_eq!(
+        sender_balance,
+        U256::ZERO,
+        "Sender should have 0 tokens after redemption transfer"
+    );
+    let recipient_balance = erc20
+        .balanceOf(TEST_REDEMPTION_WALLET)
+        .call()
+        .await
+        .unwrap();
+    assert_eq!(
+        recipient_balance, transfer_amount,
+        "Redemption wallet should have received the tokens"
+    );
 
     detection_mock.assert();
     completion_mock.assert();

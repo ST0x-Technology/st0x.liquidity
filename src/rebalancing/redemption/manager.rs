@@ -383,6 +383,21 @@ mod tests {
             .await
             .unwrap();
 
+        // Verify onchain balances after the ERC20 transfer
+        let erc20_check = IERC20::new(token_address, &provider);
+        let sender_balance = erc20_check
+            .balanceOf(signer.address())
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(sender_balance, U256::ZERO);
+        let recipient_balance = erc20_check
+            .balanceOf(TEST_REDEMPTION_WALLET)
+            .call()
+            .await
+            .unwrap();
+        assert_eq!(recipient_balance, transfer_amount);
+
         detection_mock.assert();
         completion_mock.assert();
     }
