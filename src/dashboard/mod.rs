@@ -1,3 +1,5 @@
+//! WebSocket-based dashboard for real-time server state streaming.
+
 use futures_util::SinkExt;
 use rocket::{Route, State, get, routes};
 use rocket_ws::{Channel, Message, WebSocket};

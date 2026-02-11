@@ -1,3 +1,8 @@
+//! Thread-safe cache for ERC20 token symbol lookups.
+//!
+//! Prevents repeated RPC calls by caching the mapping from token addresses
+//! to their symbol strings.
+
 use alloy::{primitives::Address, providers::Provider};
 use backon::{ExponentialBuilder, Retryable};
 use std::{

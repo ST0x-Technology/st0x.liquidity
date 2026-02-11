@@ -1,3 +1,10 @@
+//! Transfer status polling with exponential backoff for
+//! Alpaca Broker API wallet operations.
+//!
+//! Provides `poll_transfer_status` and `poll_deposit_status`
+//! which poll until a transfer reaches a terminal state
+//! (Complete/Failed) or times out.
+
 use alloy::primitives::TxHash;
 use backon::{ExponentialBuilder, Retryable};
 use std::time::Duration;

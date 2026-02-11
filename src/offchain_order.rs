@@ -1,4 +1,5 @@
-//! OffchainOrder aggregate for tracking broker order lifecycle.
+//! OffchainOrder CQRS/ES aggregate for tracking broker
+//! order lifecycle: Pending -> Submitted -> Filled/Failed.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

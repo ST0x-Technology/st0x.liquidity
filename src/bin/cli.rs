@@ -1,3 +1,5 @@
+//! Command-line interface for manual trading and authentication operations.
+
 use st0x_hedge::cli;
 use st0x_hedge::setup_tracing;
 

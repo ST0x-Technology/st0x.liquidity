@@ -32,40 +32,6 @@ the limit:
   output. If you need the user to review something, explicitly ask them to look
   at it. Do not run `git diff` expecting the user to see output.
 
-## Launching Subagents
-
-**CRITICAL: Subagents are restricted to file reads and edits only.**
-
-When spawning background subagents for parallel work, the following rules apply:
-
-**Allowed tools:** Read, Edit, Write, Glob, Grep, WebFetch, WebSearch.
-
-**FORBIDDEN in subagents:**
-
-- `Bash` for ANY purpose - no `sed`, `awk`, `grep`, `find`, `cat`, shell loops,
-  `curl`, or ad-hoc scripts. Use the dedicated Read/Edit/Glob/Grep tools instead
-- `cargo` commands - the Cargo.lock will compete across parallel agents and
-  nothing will actually parallelize. Only the orchestrating agent runs cargo
-- `git` commands - subagents must NEVER run `git checkout`, `git restore`,
-  `git stash`, or any git command that modifies working tree state. A subagent
-  running `git checkout` on a file DESTROYS unstaged work with no recovery
-
-**Prompt template for subagents:**
-
-Every subagent prompt MUST include these constraints verbatim:
-
-```
-RULES:
-- Use ONLY Read, Edit, Write, Glob, Grep tools. NEVER use Bash.
-- Do NOT run cargo, git, sed, awk, curl, or any shell commands.
-- Do NOT create scripts or temporary files.
-- Make your edits and report what you changed.
-```
-
-**Scope:** Each subagent should have a narrow, well-defined task (e.g., "rename
-X to Y in these 3 files"). Do not give subagents broad exploratory mandates that
-could lead to unintended changes.
-
 ## Planning Hierarchy
 
 The project uses a strict document hierarchy:
@@ -780,23 +746,37 @@ Unicode breaks vim navigation and grep workflows.
 
 #### Module Organization
 
-Organize code within modules by importance and visibility:
+Organize code within modules by importance to the reader, not by when it was
+added. Public API first, then private implementation, then tests. A reader
+should understand what a module provides and how to use it before encountering
+implementation details.
 
-- **Public API first**: Place public functions, types, and traits at the top of
-  the module where they are immediately visible to consumers
-- **Private helpers below public code**: Place private helper functions, types,
-  and traits immediately after the public code that uses them
-- **Implementation blocks next to type definitions**: Place `impl` blocks after
-  the type definition
+**Module docstrings**: Every module should have a `//!` docstring explaining
+what it provides. This makes it obvious what parts of the module are most
+important (and should be placed higher up) while also helping identify when
+something doesn't belong in the module and should be moved elsewhere.
 
-This organization pattern makes the module's public interface clear at a glance
-and keeps implementation details appropriately subordinate.
+**Determining importance**: What a module _does_ (types consumers use, functions
+they call) matters more than what _supports_ it (error types, internal helpers,
+private traits). If code A uses code B, then A is more important than B -
+because B exists to serve A, not the other way around. For example, a function
+that can fail is more important than the error type it returns, since the error
+type is a byproduct of the function's implementation.
 
-**Example:** Public types first -> impl blocks -> public functions -> private
-helpers.
+#### Line width in docstrings and macros
 
-This pattern applies across the entire workspace, including both the main crate
-and sub-crates like `st0x-execution`.
+Module docstrings (`//!`) and long strings inside attribute macros (e.g.,
+`#[error(...)]`) must not exceed 80 characters per line. `cargo fmt` does not
+enforce this (without nightly rustfmt), so it must be checked manually.
+
+For multi-line `#[error]` strings, use `\` continuation:
+
+```rust
+#[error(
+    "Expected IO to contain USDC and one tokenized equity \
+     (t prefix, 0x or s1 suffix) but got {0} and {1}"
+)]
+```
 
 #### Never use `is_err()`/`is_ok()` assertions in tests
 

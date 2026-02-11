@@ -1,4 +1,5 @@
-//! Operation executor that dispatches triggered rebalancing operations to managers.
+//! Operation executor that dispatches triggered rebalancing operations to
+//! managers.
 
 use alloy::primitives::{Address, U256};
 use std::sync::Arc;

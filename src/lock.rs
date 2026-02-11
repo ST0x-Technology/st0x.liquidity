@@ -1,3 +1,10 @@
+//! Per-symbol execution locks backed by SQLite with automatic
+//! cleanup for stale leases.
+//!
+//! Provides [`try_acquire_execution_lease`] and
+//! [`release_execution_lease`] to ensure only one worker
+//! processes a given symbol at a time.
+
 use crate::onchain::OnChainError;
 use st0x_execution::Symbol;
 use tracing::{debug, info, warn};

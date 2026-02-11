@@ -1,3 +1,5 @@
+//! Processes TakeOrderV3 events from the Raindex orderbook.
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;

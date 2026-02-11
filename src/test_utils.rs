@@ -1,3 +1,6 @@
+//! Shared test fixtures: database setup, stub orders/logs,
+//! and builders for onchain trades and offchain executions.
+
 use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
@@ -13,7 +16,7 @@ use crate::config::SchwabAuth;
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
-/// unit-tests. The exact values are not important – only that the
+/// unit-tests. The exact values are not important -- only that the
 /// structure is valid and deterministic.
 pub(crate) fn get_test_order() -> OrderV4 {
     OrderV4 {

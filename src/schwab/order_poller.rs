@@ -1,3 +1,6 @@
+//! Polls Schwab order status with jittered intervals and handles order
+//! state transitions.
+
 use chrono::Utc;
 use rand::Rng;
 use sqlx::SqlitePool;

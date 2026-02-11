@@ -1,3 +1,9 @@
+//! Alpaca Broker API trusted address whitelist management
+//! for crypto withdrawals.
+//!
+//! Addresses must be whitelisted and approved (24h waiting
+//! period) before withdrawals can target them.
+
 use alloy::primitives::Address;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

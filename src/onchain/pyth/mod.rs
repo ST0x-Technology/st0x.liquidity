@@ -1,3 +1,6 @@
+//! Pyth oracle price feed integration for onchain price lookups via
+//! transaction traces.
+
 use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy::providers::Provider;
 use alloy::providers::ext::DebugApi;
@@ -275,7 +278,10 @@ fn find_call_by_cached_feed_id<'a>(
         .chain(rest.iter())
         .find(|call| call.price_feed_id == feed_id)
         .ok_or_else(|| {
-            warn!("No Pyth call found matching cached feed ID {feed_id} for {symbol} in transaction {tx_hash}");
+            warn!(
+                "No Pyth call found matching cached feed ID {feed_id} \
+                 for {symbol} in transaction {tx_hash}"
+            );
             PythError::NoMatchingFeedId(feed_id)
         })
 }

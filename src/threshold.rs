@@ -1,4 +1,8 @@
 //! Execution threshold configuration for position management.
+//!
+//! Determines the minimum position imbalance (whole-share or
+//! dollar-value based) required before placing an offsetting
+//! broker order.
 
 use alloy::primitives::U256;
 use rust_decimal::Decimal;

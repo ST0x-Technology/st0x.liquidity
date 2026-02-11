@@ -1,3 +1,5 @@
+//! AES-256-GCM encryption and decryption for Schwab OAuth refresh tokens
+
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use alloy::primitives::FixedBytes;

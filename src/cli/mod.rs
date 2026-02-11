@@ -94,7 +94,7 @@ pub enum Commands {
     /// Perform Charles Schwab OAuth authentication flow
     Auth,
 
-    /// Transfer tokenized equity between trading venues (Raindex ↔ Alpaca)
+    /// Transfer tokenized equity between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
     /// Uses existing MintManager (to-raindex) or RedemptionManager (to-alpaca).
@@ -199,7 +199,7 @@ pub enum Commands {
         amount: Usdc,
     },
 
-    /// Bridge USDC via CCTP (full flow: burn → attestation → mint)
+    /// Bridge USDC via CCTP (full flow: burn -> attestation -> mint)
     ///
     /// Bridges USDC between Ethereum mainnet and Base using Circle's CCTP V2.
     CctpBridge {

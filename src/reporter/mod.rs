@@ -1,3 +1,5 @@
+//! Standalone reporting binary for trade history and PnL analysis.
+
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use rust_decimal::Decimal;
@@ -11,7 +13,7 @@ use tracing::{error, info};
 
 use st0x_execution::Direction;
 
-use crate::config::{ConfigError, LogLevel, configure_sqlite_pool};
+use crate::config::{CtxError, LogLevel, configure_sqlite_pool};
 use crate::symbol::Symbol;
 
 mod pnl;
@@ -42,7 +44,7 @@ impl HasSqlite for ReporterConfig {
 }
 
 impl ReporterConfig {
-    pub fn load_file(path: &std::path::Path) -> Result<Self, ConfigError> {
+    pub fn load_file(path: &std::path::Path) -> Result<Self, CtxError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Self = toml::from_str(&contents)?;
         Ok(config)
@@ -500,8 +502,8 @@ mod tests {
         let err = ReporterConfig::load_file(path).unwrap_err();
 
         assert!(
-            matches!(err, ConfigError::Io(_)),
-            "expected ConfigError::Io, got: {err:?}"
+            matches!(err, CtxError::Io(_)),
+            "expected CtxError::Io, got: {err:?}"
         );
     }
 
@@ -513,8 +515,8 @@ mod tests {
         let err = ReporterConfig::load_file(file.path()).unwrap_err();
 
         assert!(
-            matches!(err, ConfigError::Toml(_)),
-            "expected ConfigError::Toml, got: {err:?}"
+            matches!(err, CtxError::Toml(_)),
+            "expected CtxError::Toml, got: {err:?}"
         );
     }
 
@@ -526,8 +528,8 @@ mod tests {
         let err = ReporterConfig::load_file(file.path()).unwrap_err();
 
         assert!(
-            matches!(err, ConfigError::Toml(_)),
-            "expected ConfigError::Toml for missing database_url, got: {err:?}"
+            matches!(err, CtxError::Toml(_)),
+            "expected CtxError::Toml for missing database_url, got: {err:?}"
         );
     }
 

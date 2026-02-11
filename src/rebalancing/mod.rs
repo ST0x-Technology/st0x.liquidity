@@ -1,7 +1,8 @@
 //! Rebalancing orchestration managers.
 //!
-//! This module provides managers that coordinate rebalancing operations between
-//! external services (Alpaca tokenization, CCTP bridge, vault) and CQRS-ES aggregates.
+//! This module provides managers that coordinate rebalancing
+//! operations between external services (Alpaca tokenization, CCTP
+//! bridge, vault) and CQRS-ES aggregates.
 //!
 //! # Manager Pattern
 //!

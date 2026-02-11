@@ -1,4 +1,5 @@
-//! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist, transfers, convert).
+//! Alpaca crypto wallet CLI commands (deposit, withdraw, whitelist,
+//! transfers, convert).
 
 use alloy::network::EthereumWallet;
 use alloy::primitives::Address;

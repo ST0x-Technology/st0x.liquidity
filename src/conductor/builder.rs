@@ -1,4 +1,4 @@
-use std::sync::Arc;
+//! Typestate builder for constructing a fully-wired Conductor instance.
 
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -6,25 +6,26 @@ use alloy::sol_types;
 use futures_util::Stream;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
+use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use st0x_execution::Executor;
 
+use super::EventProcessingError;
+use super::{
+    Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
+    spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
+};
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
 use crate::dual_write::DualWriteContext;
+use crate::inventory::InventorySnapshotAggregate;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
-
-use super::EventProcessingError;
-use super::{
-    Conductor, InventorySnapshotAggregate, VaultRegistryAggregate, spawn_event_processor,
-    spawn_inventory_poller, spawn_onchain_event_receiver, spawn_order_poller,
-    spawn_periodic_accumulated_position_check, spawn_queue_processor,
-};
+use crate::vault_registry::VaultRegistryAggregate;
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
 type TakeStream =

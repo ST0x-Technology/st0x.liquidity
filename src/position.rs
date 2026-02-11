@@ -1,4 +1,9 @@
-//! Position aggregate for tracking onchain/offchain exposure.
+//! Position CQRS/ES aggregate for tracking per-symbol
+//! onchain/offchain exposure.
+//!
+//! Accumulates long and short fills, tracks the net
+//! position, and decides when the imbalance exceeds the
+//! threshold to trigger an offsetting broker order.
 
 use alloy::primitives::TxHash;
 use async_trait::async_trait;

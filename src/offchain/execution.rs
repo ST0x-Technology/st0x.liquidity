@@ -1,3 +1,8 @@
+//! Offchain execution persistence and retrieval.
+//!
+//! Provides `OffchainExecution` and query functions for reading and writing
+//! broker order records in SQLite.
+
 use sqlx::SqlitePool;
 
 use crate::onchain::OnChainError;

@@ -1,8 +1,8 @@
-//! Equity Redemption aggregate for converting onchain tokens back to offchain Alpaca shares.
+//! Aggregate modeling the lifecycle of redeeming tokenized
+//! equities for underlying shares.
 //!
-//! This module implements the CQRS-ES aggregate pattern for managing the asynchronous workflow
-//! of redeeming tokenized equity shares. It tracks the complete lifecycle from sending tokens
-//! to Alpaca's redemption wallet through detecting the redemption to final completion.
+//! Tracks the workflow from transferring tokens to Alpaca's
+//! redemption wallet through to share delivery.
 //!
 //! # State Flow
 //!
@@ -23,8 +23,10 @@
 //!
 //! The redemption process integrates with Alpaca's redemption API:
 //!
-//! 1. **Send**: System initiates onchain transfer to Alpaca's redemption wallet
-//! 2. **Detection**: Alpaca detects the transfer and returns `tokenization_request_id`
+//! 1. **Send**: System initiates onchain transfer to
+//!    Alpaca's redemption wallet
+//! 2. **Detection**: Alpaca detects the transfer and
+//!    returns `tokenization_request_id`
 //! 3. **Processing**: Alpaca processes the redemption and credits the account
 //! 4. **Completion**: System confirms redemption is complete
 //!
@@ -34,7 +36,8 @@
 //!
 //! - Commands that don't match current state return appropriate errors
 //! - Terminal states (Completed, Failed) reject all state-changing commands
-//! - Failed state preserves context (tx_hash, tokenization_request_id) depending on when failure occurred
+//! - Failed state preserves context (tx_hash,
+//!   tokenization_request_id) depending on when failure occurred
 //! - All state transitions are captured as events for complete audit trail
 
 use alloy::primitives::{Address, TxHash};

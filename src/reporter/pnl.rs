@@ -1,3 +1,6 @@
+//! PnL calculation engine for matched trade pairs using
+//! FIFO inventory matching.
+
 use rust_decimal::Decimal;
 use st0x_execution::Direction;
 use std::cmp::Ordering;

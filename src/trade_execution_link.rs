@@ -1,3 +1,5 @@
+//! Audit trail linking onchain trades to offchain broker executions.
+
 use chrono::{DateTime, Utc};
 
 #[cfg(test)]

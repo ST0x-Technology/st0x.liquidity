@@ -1,4 +1,8 @@
-//! OnChainTrade aggregate for tracking blockchain trades.
+//! OnChainTrade CQRS/ES aggregate for recording DEX fills
+//! from the Raindex orderbook.
+//!
+//! Keyed by `(tx_hash, log_index)`. Can be enriched after
+//! the fact with gas costs and Pyth oracle price data.
 
 use alloy::primitives::TxHash;
 use async_trait::async_trait;

@@ -1,14 +1,16 @@
 //! Circle CCTP bridge service for cross-chain USDC transfers.
 //!
-//! This module provides a service layer for bridging USDC between Ethereum mainnet
-//! and Base using Circle's Cross-Chain Transfer Protocol (CCTP) V2 with fast transfers.
+//! This module provides a service layer for bridging USDC between
+//! Ethereum mainnet and Base using Circle's Cross-Chain Transfer
+//! Protocol (CCTP) V2 with fast transfers.
 //!
 //! ## Overview
 //!
-//! Circle CCTP enables native USDC transfers between blockchains by burning on the
-//! source chain and minting on the destination chain. This implementation uses
-//! **CCTP V2 Fast Transfer** which reduces transfer time from 13-19 minutes per chain
-//! to ~40-70 seconds for a cost of 1 basis point (0.01%) per transfer.
+//! Circle CCTP enables native USDC transfers between blockchains by
+//! burning on the source chain and minting on the destination chain.
+//! This implementation uses **CCTP V2 Fast Transfer** which reduces
+//! transfer time from 13-19 minutes per chain to ~40-70 seconds for a
+//! cost of 1 basis point (0.01%) per transfer.
 //!
 //! ## Supported Chains
 //!
@@ -19,28 +21,35 @@
 //!
 //! The CCTP bridge flow consists of three steps:
 //!
-//! 1. **Burn**: Lock and burn USDC on source chain via `TokenMessengerV2.depositForBurn()`
-//! 2. **Attest**: Poll Circle's attestation API for signed message (fast transfer: ~20-30s)
-//! 3. **Mint**: Mint native USDC on destination chain via `MessageTransmitterV2.receiveMessage()`
+//! 1. **Burn**: Lock and burn USDC on source chain via
+//!    `TokenMessengerV2.depositForBurn()`
+//! 2. **Attest**: Poll Circle's attestation API for signed message
+//!    (fast transfer: ~20-30s)
+//! 3. **Mint**: Mint native USDC on destination chain via
+//!    `MessageTransmitterV2.receiveMessage()`
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
 //! // Create bridge instance
-//! let ethereum = Evm::new(ethereum_provider, owner, usdc, token_messenger, message_transmitter);
-//! let base = Evm::new(base_provider, owner, usdc, token_messenger, message_transmitter);
+//! let ethereum = Evm::new(ethereum_provider, owner, usdc,
+//!     token_messenger, message_transmitter);
+//! let base = Evm::new(base_provider, owner, usdc,
+//!     token_messenger, message_transmitter);
 //! let bridge = CctpBridge::new(ethereum, base);
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
 //! let amount = U256::from(1_000_000); // 1 USDC
-//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
+//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount,
+//!     recipient).await?;
 //! ```
 //!
 //! ## CCTP V2 Fast Transfer
 //!
-//! Fast transfers are enabled by setting `minFinalityThreshold` to 1000 in the
-//! `depositForBurn()` call. The fee is dynamically queried from Circle's API
-//! (`/v2/burn/USDC/fees`) before each burn operation.
+//! Fast transfers are enabled by setting `minFinalityThreshold` to
+//! 1000 in the `depositForBurn()` call. The fee is dynamically
+//! queried from Circle's API (`/v2/burn/USDC/fees`) before each burn
+//! operation.
 //!
 //! **Timing**: ~40s Base->Ethereum, ~70s Ethereum->Base (measured)
 //! **Cost**: 1 basis point (0.01%) of transfer amount

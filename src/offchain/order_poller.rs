@@ -1,3 +1,5 @@
+//! Polls broker APIs for order status updates and reconciles fills.
+
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
@@ -257,7 +259,10 @@ impl<E: Executor> OrderStatusPoller<E> {
     ) -> Result<(), OrderPollingError> {
         let execution = self.finalize_order(execution_id, order_state).await?;
         let symbol = &execution.symbol;
-        info!("Updated execution {execution_id} to FAILED and cleared locks for symbol: {symbol}");
+        info!(
+            "Updated execution {execution_id} to FAILED \
+             and cleared locks for symbol: {symbol}"
+        );
 
         let error_message = extract_error_message(order_state);
         self.execute_failed_order_dual_write(execution_id, symbol, error_message)

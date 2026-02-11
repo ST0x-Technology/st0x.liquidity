@@ -1,3 +1,6 @@
+//! Dual-writes onchain trade aggregate commands to both
+//! CQRS/ES and legacy SQLite tables.
+
 use rust_decimal::Decimal;
 
 use crate::onchain::OnchainTrade;

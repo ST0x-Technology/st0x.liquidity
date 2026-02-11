@@ -164,6 +164,28 @@ impl TelemetryCtx {
     }
 }
 
+pub struct TelemetryGuard {
+    tracer_provider: SdkTracerProvider,
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        // Flush any pending spans to HyperDX before shutdown.
+        // This blocks until all pending exports complete or timeout.
+        // The BatchSpanProcessor uses scheduled_delay (3s) as its export interval,
+        // and force_flush waits for pending exports with its own internal timeout.
+        if let Err(e) = self.tracer_provider.force_flush() {
+            eprintln!("Failed to flush telemetry spans: {e:?}");
+        }
+
+        // Shutdown the tracer provider to clean up background threads and resources.
+        // This ensures the BatchSpanProcessor's background thread terminates cleanly.
+        if let Err(e) = self.tracer_provider.shutdown() {
+            eprintln!("Failed to shutdown telemetry provider: {e:?}");
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TelemetryAssemblyError {
     #[error("telemetry config present but telemetry secrets missing")]
@@ -187,28 +209,6 @@ pub enum TelemetryError {
 impl From<Box<dyn std::any::Any + Send>> for TelemetryError {
     fn from(_: Box<dyn std::any::Any + Send>) -> Self {
         Self::ThreadJoin
-    }
-}
-
-pub struct TelemetryGuard {
-    tracer_provider: SdkTracerProvider,
-}
-
-impl Drop for TelemetryGuard {
-    fn drop(&mut self) {
-        // Flush any pending spans to HyperDX before shutdown.
-        // This blocks until all pending exports complete or timeout.
-        // The BatchSpanProcessor uses scheduled_delay (3s) as its export interval,
-        // and force_flush waits for pending exports with its own internal timeout.
-        if let Err(e) = self.tracer_provider.force_flush() {
-            eprintln!("Failed to flush telemetry spans: {e:?}");
-        }
-
-        // Shutdown the tracer provider to clean up background threads and resources.
-        // This ensures the BatchSpanProcessor's background thread terminates cleanly.
-        if let Err(e) = self.tracer_provider.shutdown() {
-            eprintln!("Failed to shutdown telemetry provider: {e:?}");
-        }
     }
 }
 

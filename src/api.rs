@@ -1,3 +1,5 @@
+//! HTTP API endpoints for health checks and broker authentication.
+
 use chrono::{DateTime, Utc};
 use rocket::serde::json::Json;
 use rocket::serde::{Deserialize, Serialize};

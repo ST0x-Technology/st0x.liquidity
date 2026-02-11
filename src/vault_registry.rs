@@ -16,6 +16,8 @@ use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
+pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
+
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DiscoveredEquityVault {
@@ -264,8 +266,6 @@ mod tests {
         b256!("0x0000000000000000000000000000000000000000000000000000000000000001");
     const TEST_TX_HASH: TxHash =
         b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
-
-    type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
     fn make_envelope(
         aggregate_id: &str,

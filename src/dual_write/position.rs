@@ -1,3 +1,6 @@
+//! Dual-writes position aggregate commands to both CQRS/ES
+//! and legacy SQLite tables.
+
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventStore};
 use rust_decimal::Decimal;

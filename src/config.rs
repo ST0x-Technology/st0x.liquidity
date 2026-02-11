@@ -1,3 +1,9 @@
+//! Application configuration loading and validation.
+//!
+//! Reads plaintext config and encrypted secrets from separate TOML files,
+//! validates compatibility, and assembles the runtime [`Ctx`] that the rest
+//! of the application consumes.
+
 use alloy::primitives::{Address, FixedBytes};
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
@@ -119,7 +125,7 @@ impl BrokerCtx {
         }
     }
 
-    fn execution_threshold(&self) -> Result<ExecutionThreshold, ConfigError> {
+    fn execution_threshold(&self) -> Result<ExecutionThreshold, CtxError> {
         match self {
             Self::Schwab(_) | Self::DryRun => Ok(ExecutionThreshold::shares(
                 Positive::<FractionalShares>::ONE,
@@ -237,85 +243,14 @@ impl From<&LogLevel> for Level {
     }
 }
 
-pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let pool = SqlitePool::connect(database_url).await?;
-
-    // SQLite Concurrency Configuration:
-    //
-    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
-    // all processes. When both main bot and reporter try to write simultaneously,
-    // one will block until the other completes. This is a fundamental SQLite
-    // limitation.
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(&pool)
-        .await?;
-
-    // Busy Timeout: 10 seconds - when a write is blocked by another process,
-    // SQLite will wait up to 10 seconds before failing with "database is locked".
-    // This prevents immediate failures when main bot and reporter write concurrently.
-    //
-    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
-    // to avoid blocking mission-critical main bot operations.
-    //
-    // Future: This limitation will be eliminated when migrating to Kafka +
-    // Elasticsearch with CQRS pattern for separate read/write paths.
-    sqlx::query("PRAGMA busy_timeout = 10000")
-        .execute(&pool)
-        .await?;
-
-    Ok(pool)
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ConfigError {
-    #[error(transparent)]
-    Rebalancing(#[from] RebalancingCtxError),
-    #[error("ORDER_OWNER required when rebalancing is disabled")]
-    MissingOrderOwner,
-    #[error("failed to derive address from EVM_PRIVATE_KEY")]
-    PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
-    #[error("failed to read config file")]
-    Io(#[from] std::io::Error),
-    #[error("failed to parse TOML")]
-    Toml(#[from] toml::de::Error),
-    #[error(transparent)]
-    InvalidThreshold(#[from] InvalidThresholdError),
-    #[error(transparent)]
-    InvalidShares(#[from] st0x_execution::InvalidSharesError),
-    #[error(transparent)]
-    Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
-    #[error("rebalancing config present in config but rebalancing secrets missing")]
-    RebalancingSecretsMissing,
-    #[error("rebalancing secrets present but rebalancing config missing in config")]
-    RebalancingConfigMissing,
-}
-
-#[cfg(test)]
-impl ConfigError {
-    fn kind(&self) -> &'static str {
-        match self {
-            Self::Rebalancing(_) => "rebalancing configuration error",
-            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
-            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
-            Self::Io(_) => "failed to read config file",
-            Self::Toml(_) => "failed to parse TOML",
-            Self::InvalidThreshold(_) => "invalid execution threshold",
-            Self::InvalidShares(_) => "invalid shares value",
-            Self::Telemetry(_) => "telemetry assembly error",
-            Self::RebalancingSecretsMissing => "rebalancing secrets missing",
-            Self::RebalancingConfigMissing => "rebalancing config missing",
-        }
-    }
-}
-
 impl Ctx {
-    pub fn load_files(config: &Path, secrets: &Path) -> Result<Self, ConfigError> {
+    pub fn load_files(config: &Path, secrets: &Path) -> Result<Self, CtxError> {
         let config_str = std::fs::read_to_string(config)?;
         let secrets_str = std::fs::read_to_string(secrets)?;
         Self::from_toml(&config_str, &secrets_str)
     }
 
-    pub fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, ConfigError> {
+    fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, CtxError> {
         let config: Config = toml::from_str(config_toml)?;
         let secrets: Secrets = toml::from_str(secrets_toml)?;
 
@@ -343,14 +278,14 @@ impl Ctx {
                 )?)
             }
             (None, None) => None,
-            (Some(_), None) => return Err(ConfigError::RebalancingSecretsMissing),
-            (None, Some(_)) => return Err(ConfigError::RebalancingConfigMissing),
+            (Some(_), None) => return Err(CtxError::RebalancingSecretsMissing),
+            (None, Some(_)) => return Err(CtxError::RebalancingConfigMissing),
         };
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
         if rebalancing.is_none() && evm.order_owner.is_none() {
-            return Err(ConfigError::MissingOrderOwner);
+            return Err(CtxError::MissingOrderOwner);
         }
 
         Ok(Self {
@@ -382,17 +317,87 @@ impl Ctx {
         }
     }
 
-    pub(crate) fn order_owner(&self) -> Result<Address, ConfigError> {
+    pub(crate) fn order_owner(&self) -> Result<Address, CtxError> {
         match (&self.rebalancing, self.evm.order_owner) {
             (Some(r), _) => {
-                let signer = PrivateKeySigner::from_bytes(&r.evm_private_key)
-                    .map_err(ConfigError::PrivateKeyDerivation)?;
+                let signer = PrivateKeySigner::from_bytes(&r.evm_private_key)?;
                 Ok(signer.address())
             }
             (None, Some(addr)) => Ok(addr),
-            (None, None) => Err(ConfigError::MissingOrderOwner),
+            (None, None) => Err(CtxError::MissingOrderOwner),
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CtxError {
+    #[error(transparent)]
+    Rebalancing(#[from] RebalancingCtxError),
+    #[error("ORDER_OWNER required when rebalancing is disabled")]
+    MissingOrderOwner,
+    #[error("failed to derive address from EVM_PRIVATE_KEY")]
+    PrivateKeyDerivation(#[from] alloy::signers::k256::ecdsa::Error),
+    #[error("failed to read config file")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse TOML")]
+    Toml(#[from] toml::de::Error),
+    #[error(transparent)]
+    InvalidThreshold(#[from] InvalidThresholdError),
+    #[error(transparent)]
+    InvalidShares(#[from] st0x_execution::InvalidSharesError),
+    #[error(transparent)]
+    Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
+    #[error("rebalancing config present in config but rebalancing secrets missing")]
+    RebalancingSecretsMissing,
+    #[error("rebalancing secrets present but rebalancing config missing in config")]
+    RebalancingConfigMissing,
+}
+
+#[cfg(test)]
+impl CtxError {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Rebalancing(_) => "rebalancing configuration error",
+            Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
+            Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
+            Self::Io(_) => "failed to read config file",
+            Self::Toml(_) => "failed to parse TOML",
+            Self::InvalidThreshold(_) => "invalid execution threshold",
+            Self::InvalidShares(_) => "invalid shares value",
+            Self::Telemetry(_) => "telemetry assembly error",
+            Self::RebalancingSecretsMissing => "rebalancing secrets missing",
+            Self::RebalancingConfigMissing => "rebalancing config missing",
+        }
+    }
+}
+
+pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let pool = SqlitePool::connect(database_url).await?;
+
+    // SQLite Concurrency Configuration:
+    //
+    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
+    // all processes. When both main bot and reporter try to write simultaneously,
+    // one will block until the other completes. This is a fundamental SQLite
+    // limitation.
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
+
+    // Busy Timeout: 10 seconds - when a write is blocked by another process,
+    // SQLite will wait up to 10 seconds before failing with "database is locked".
+    // This prevents immediate failures when main bot and reporter write concurrently.
+    //
+    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
+    // to avoid blocking mission-critical main bot operations.
+    //
+    // Future: This limitation will be eliminated when migrating to Kafka +
+    // Elasticsearch with CQRS pattern for separate read/write paths.
+    sqlx::query("PRAGMA busy_timeout = 10000")
+        .execute(&pool)
+        .await?;
+
+    Ok(pool)
 }
 
 #[cfg(test)]
@@ -620,9 +625,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 result,
-                Err(ConfigError::Rebalancing(
-                    RebalancingCtxError::NotAlpacaBroker
-                ))
+                Err(CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker))
             ),
             "Expected NotAlpacaBroker error for rebalancing with Schwab broker, got {result:?}"
         );
@@ -635,7 +638,7 @@ pub(crate) mod tests {
             schwab_secrets_toml(),
         );
         assert!(
-            matches!(result, Err(ConfigError::MissingOrderOwner)),
+            matches!(result, Err(CtxError::MissingOrderOwner)),
             "Expected MissingOrderOwner error, got {result:?}"
         );
     }
@@ -687,7 +690,7 @@ pub(crate) mod tests {
 
         let result = ctx.order_owner();
         assert!(
-            matches!(result, Err(ConfigError::PrivateKeyDerivation(_))),
+            matches!(result, Err(CtxError::PrivateKeyDerivation(_))),
             "Expected PrivateKeyDerivation error for zero private key, got {result:?}"
         );
     }
@@ -735,7 +738,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 result,
-                Err(ConfigError::Telemetry(
+                Err(CtxError::Telemetry(
                     crate::telemetry::TelemetryAssemblyError::SecretsMissing
                 ))
             ),
@@ -758,7 +761,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 result,
-                Err(ConfigError::Telemetry(
+                Err(CtxError::Telemetry(
                     crate::telemetry::TelemetryAssemblyError::ConfigMissing
                 ))
             ),
@@ -796,7 +799,7 @@ pub(crate) mod tests {
 
         let result = Ctx::from_toml(config, secrets);
         assert!(
-            matches!(result, Err(ConfigError::RebalancingSecretsMissing)),
+            matches!(result, Err(CtxError::RebalancingSecretsMissing)),
             "Expected RebalancingSecretsMissing error, got {result:?}"
         );
     }
@@ -854,13 +857,13 @@ pub(crate) mod tests {
 
     #[test]
     fn config_error_kind_rebalancing() {
-        let err = ConfigError::Rebalancing(RebalancingCtxError::NotAlpacaBroker);
+        let err = CtxError::Rebalancing(RebalancingCtxError::NotAlpacaBroker);
         assert_eq!(err.kind(), "rebalancing configuration error");
     }
 
     #[test]
     fn config_error_kind_invalid_threshold() {
-        let err = ConfigError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
+        let err = CtxError::InvalidThreshold(InvalidThresholdError::ZeroDollarValue);
         assert_eq!(err.kind(), "invalid execution threshold");
     }
 

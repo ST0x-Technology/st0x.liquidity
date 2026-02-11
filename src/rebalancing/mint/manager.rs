@@ -1,7 +1,8 @@
 //! MintManager orchestrates the TokenizedEquityMint workflow.
 //!
-//! Coordinates between `AlpacaTokenizationService` and the `TokenizedEquityMint` aggregate
-//! to execute the full mint lifecycle: request -> poll -> receive tokens -> finalize.
+//! Coordinates between `AlpacaTokenizationService` and the
+//! `TokenizedEquityMint` aggregate to execute the full mint
+//! lifecycle: request -> poll -> receive tokens -> finalize.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;

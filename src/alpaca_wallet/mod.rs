@@ -1,22 +1,25 @@
-//! Alpaca crypto wallet API client for deposits and withdrawals.
+//! Alpaca Broker API crypto wallet client for USDC deposits and withdrawals.
 //!
-//! This module provides a client for interacting with Alpaca's crypto wallet API,
+//! This module integrates with the wallet endpoints of the Alpaca Broker API,
 //! supporting USDC deposits and withdrawals.
 //!
 //! # Authentication
 //!
-//! Authentication uses Alpaca API credentials (API key and secret).
+//! Authentication uses Alpaca Broker API credentials (API key and secret).
 //! The client automatically fetches and caches the account ID.
 //!
 //! # Whitelisting
 //!
-//! Alpaca requires addresses to be whitelisted before withdrawals. After whitelisting,
-//! there is a 24-hour approval period before the address can be used.
+//! Alpaca requires addresses to be whitelisted before
+//! withdrawals. After whitelisting, there is a 24-hour
+//! approval period before the address can be used.
 //!
 //! # Transfer Lifecycle
 //!
-//! Transfers progress through states: Pending → Processing → Complete/Failed.
-//! Use `poll_transfer_until_complete()` to wait for a transfer to reach a terminal state.
+//! Transfers progress through states:
+//! Pending -> Processing -> Complete/Failed.
+//! Use `poll_transfer_until_complete()` to wait for a
+//! transfer to reach a terminal state.
 
 mod client;
 mod status;

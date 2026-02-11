@@ -550,8 +550,8 @@ impl InventoryView {
     /// Applies a USDC rebalance event to update USDC inventory.
     ///
     /// - `Initiated`: Move amount from source venue's available to inflight.
-    ///   - `AlpacaToBase`: offchain → onchain (move offchain to inflight)
-    ///   - `BaseToAlpaca`: onchain → offchain (move onchain to inflight)
+    ///   - `AlpacaToBase`: offchain -> onchain (move offchain to inflight)
+    ///   - `BaseToAlpaca`: onchain -> offchain (move onchain to inflight)
     /// - `WithdrawalConfirmed`: No balance change (awaiting bridge).
     /// - `WithdrawalFailed`: Keep inflight until manually resolved.
     /// - `BridgingInitiated`, `BridgeAttestationReceived`: No balance change.

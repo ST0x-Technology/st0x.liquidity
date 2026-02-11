@@ -1,3 +1,9 @@
+//! Alpaca Broker API crypto transfer types and operations.
+//!
+//! Provides `request_withdrawal` and `get_transfer_status`
+//! for initiating and tracking crypto transfers. Transfers
+//! progress through Queued -> Pending -> Complete/Failed.
+
 use alloy::primitives::{Address, TxHash};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;

@@ -1,3 +1,6 @@
+//! Processes ClearV3 events from the Raindex orderbook with
+//! fallback to transaction receipts.
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, Log};

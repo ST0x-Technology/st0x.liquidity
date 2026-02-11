@@ -1,3 +1,5 @@
+//! Reporting service for P&L and trade statistics generation.
+
 use clap::Parser;
 use st0x_hedge::reporter::{self, ReporterConfig, ReporterEnv};
 use st0x_hedge::setup_tracing;

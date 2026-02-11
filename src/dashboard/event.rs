@@ -1,3 +1,6 @@
+//! CQRS query processor that broadcasts aggregate events to WebSocket
+//! dashboard clients.
+
 use async_trait::async_trait;
 use chrono::Utc;
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, Query};

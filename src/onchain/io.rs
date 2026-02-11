@@ -1,5 +1,9 @@
-//! Order I/O handling logic for processing symbol pairs, amounts, and trade details.
-//! This module centralizes all logic related to parsing and validating onchain order data.
+//! Order I/O parsing: extracts symbol pairs, amounts, prices,
+//! and trade direction from raw Raindex order inputs/outputs.
+//!
+//! Determines which side of a Raindex fill is USDC vs tokenized
+//! equity, computes the trade direction (buy/sell), and
+//! validates amounts before further processing.
 
 use std::fmt;
 use std::str::FromStr;

@@ -1,3 +1,9 @@
+//! Market making system for tokenized equities.
+//!
+//! Provides onchain liquidity via Raindex orders and hedges
+//! directional exposure by executing offsetting trades on
+//! traditional brokerages.
+
 use rocket::{Ignite, Rocket};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;

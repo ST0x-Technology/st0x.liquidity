@@ -1,3 +1,11 @@
+//! HTTP client for Alpaca Broker API crypto deposit and withdrawal endpoints.
+//!
+//! Provides [`AlpacaWalletClient`] which can:
+//!
+//! - Fetch whitelisted withdrawal addresses
+//! - Whitelist new withdrawal addresses
+//! - Fetch deposit addresses
+
 use alloy::primitives::{Address, TxHash, hex::FromHexError};
 use reqwest::{Client, Response, StatusCode};
 use rust_decimal::Decimal;
@@ -26,7 +34,10 @@ pub enum AlpacaWalletError {
         transfer_id: AlpacaTransferId,
         elapsed: std::time::Duration,
     },
-    #[error("Invalid status transition for transfer {transfer_id}: {previous:?} -> {next:?}")]
+    #[error(
+        "Invalid status transition for transfer {transfer_id}: \
+         {previous:?} -> {next:?}"
+    )]
     InvalidStatusTransition {
         transfer_id: AlpacaTransferId,
         previous: TransferStatus,
@@ -215,7 +226,8 @@ impl AlpacaWalletClient {
             created_at: String,
         }
 
-        // Broker API endpoint: GET /v1/accounts/{account_id}/wallets?asset=USDC&network=ethereum
+        // Broker API endpoint:
+        // GET /v1/accounts/{account_id}/wallets?asset=USDC&network=ethereum
         let path = format!(
             "/v1/accounts/{}/wallets?asset={}&network={}",
             self.account_id,

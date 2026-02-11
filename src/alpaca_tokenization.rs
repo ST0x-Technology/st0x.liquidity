@@ -1,8 +1,10 @@
-//! Alpaca tokenization API client for mint and redemption operations.
+//! Alpaca tokenization API client for mint and redemption
+//! operations.
 //!
-//! This module provides a client for interacting with Alpaca's tokenization API,
-//! which enables converting offchain shares to onchain tokens (minting) and
-//! converting onchain tokens back to offchain shares (redemption).
+//! This module provides a client for interacting with Alpaca's
+//! tokenization API, which enables converting offchain shares to
+//! onchain tokens (minting) and converting onchain tokens back to
+//! offchain shares (redemption).
 //!
 //! # API Endpoints
 //!
@@ -415,11 +417,15 @@ where
 
         if status.is_success() {
             let body = response.text().await?;
-            let tokenization_request: TokenizationRequest =
-                serde_json::from_str(&body).map_err(|e| {
-                    error!(body = %body, error = %e, "Failed to deserialize tokenization response");
-                    e
+            let tokenization_request: TokenizationRequest = serde_json::from_str(&body)
+                .inspect_err(|error| {
+                    error!(
+                        body = %body,
+                        error = %error,
+                        "Failed to deserialize tokenization response"
+                    );
                 })?;
+
             debug!(request_id = %tokenization_request.id.0, "Mint request created");
             return Ok(tokenization_request);
         }
@@ -485,10 +491,14 @@ where
             let body = response.text().await?;
             debug!(body = %body, "List requests response body");
 
-            let requests: Vec<TokenizationRequest> = serde_json::from_str(&body).map_err(|e| {
-                error!(body = %body, error = %e, "Failed to deserialize list requests response");
-                e
-            })?;
+            let requests: Vec<TokenizationRequest> =
+                serde_json::from_str(&body).inspect_err(|error| {
+                    error!(
+                        body = %body,
+                        error = %error,
+                        "Failed to deserialize list requests response"
+                    );
+                })?;
 
             return Ok(requests);
         }

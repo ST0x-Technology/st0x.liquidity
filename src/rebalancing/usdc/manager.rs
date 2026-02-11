@@ -1,7 +1,8 @@
 //! UsdcRebalanceManager orchestrates the USDC rebalancing workflow.
 //!
-//! Coordinates between `AlpacaBrokerApi`, `AlpacaWalletService`, `CctpBridge`, `VaultService`,
-//! and the `UsdcRebalance` aggregate to execute USDC transfers between Alpaca and Base.
+//! Coordinates between `AlpacaBrokerApi`, `AlpacaWalletService`,
+//! `CctpBridge`, `VaultService`, and the `UsdcRebalance` aggregate to
+//! execute USDC transfers between Alpaca and Base.
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;

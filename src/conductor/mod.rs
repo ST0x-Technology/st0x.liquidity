@@ -1,3 +1,8 @@
+//! Orchestrates the main bot loop: subscribes to DEX events, queues them,
+//! processes trades, places offsetting broker orders, and manages background
+//! tasks (order polling, rebalancing, inventory tracking). [`Conductor`] owns
+//! the task handles; [`run_market_hours_loop`] drives the lifecycle.
+
 mod builder;
 
 use std::sync::Arc;
@@ -27,14 +32,13 @@ use st0x_execution::{
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
-use crate::config::{ConfigError, Ctx};
+use crate::config::{Ctx, CtxError};
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
+    InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
-use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain::execution::{OffchainExecution, find_execution_by_id};
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::BrokerOrderId;
@@ -57,8 +61,21 @@ use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryError};
+use crate::vault_registry::{
+    VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError,
+};
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+
+pub(crate) struct Conductor {
+    pub(crate) executor_maintenance: Option<JoinHandle<()>>,
+    pub(crate) order_poller: JoinHandle<()>,
+    pub(crate) dex_event_receiver: JoinHandle<()>,
+    pub(crate) event_processor: JoinHandle<()>,
+    pub(crate) position_checker: JoinHandle<()>,
+    pub(crate) queue_processor: JoinHandle<()>,
+    pub(crate) rebalancer: Option<JoinHandle<()>>,
+    pub(crate) inventory_poller: Option<JoinHandle<()>>,
+}
 
 /// Event processing errors for live event handling.
 #[derive(Debug, thiserror::Error)]
@@ -86,30 +103,9 @@ pub(crate) enum EventProcessingError {
     #[error(transparent)]
     EmptySymbol(#[from] EmptySymbolError),
     #[error("Config error: {0}")]
-    Config(#[from] ConfigError),
+    Config(#[from] CtxError),
     #[error("Vault registry command failed: {0}")]
     VaultRegistry(#[from] AggregateError<VaultRegistryError>),
-}
-
-type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
-type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
-
-/// Context for vault discovery operations during trade processing.
-struct VaultDiscoveryCtx<'a> {
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
-    orderbook: Address,
-    order_owner: Address,
-}
-
-pub(crate) struct Conductor {
-    pub(crate) executor_maintenance: Option<JoinHandle<()>>,
-    pub(crate) order_poller: JoinHandle<()>,
-    pub(crate) dex_event_receiver: JoinHandle<()>,
-    pub(crate) event_processor: JoinHandle<()>,
-    pub(crate) position_checker: JoinHandle<()>,
-    pub(crate) queue_processor: JoinHandle<()>,
-    pub(crate) rebalancer: Option<JoinHandle<()>>,
-    pub(crate) inventory_poller: Option<JoinHandle<()>>,
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -157,7 +153,10 @@ where
 fn log_market_status(timeout: Duration) {
     let timeout_minutes = timeout.as_secs() / 60;
     if timeout_minutes < 60 * 24 {
-        info!("Market is open, starting conductor (will timeout in {timeout_minutes} minutes)");
+        info!(
+            "Market is open, starting conductor \
+             (will timeout in {timeout_minutes} minutes)"
+        );
     } else {
         info!("Starting conductor (no market hours restrictions)");
     }
@@ -258,6 +257,13 @@ where
         event_sender,
     ))
     .await
+}
+
+/// Context for vault discovery operations during trade processing.
+struct VaultDiscoveryCtx<'a> {
+    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    orderbook: Address,
+    order_owner: Address,
 }
 
 impl Conductor {
@@ -374,7 +380,10 @@ impl Conductor {
     }
 
     pub(crate) fn abort_trading_tasks(&self) {
-        info!("Aborting trading tasks (keeping broker maintenance and DEX event receiver alive)");
+        info!(
+            "Aborting trading tasks \
+             (keeping broker maintenance and DEX event receiver alive)"
+        );
 
         self.order_poller.abort();
         self.event_processor.abort();
@@ -459,8 +468,10 @@ async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: 
 
     match handle.await {
         Ok(()) => info!("{task_name} completed successfully"),
-        Err(e) if e.is_cancelled() => info!("{task_name} cancelled (expected during shutdown)"),
-        Err(e) => error!("{task_name} task panicked: {e}"),
+        Err(error) if error.is_cancelled() => {
+            info!("{task_name} cancelled (expected during shutdown)");
+        }
+        Err(error) => error!("{task_name} task panicked: {error}"),
     }
 }
 
@@ -663,7 +674,8 @@ fn handle_event_result(
     match result {
         Ok((event, log)) => {
             trace!(
-                "Received blockchain event: tx_hash={:?}, log_index={:?}, block_number={:?}",
+                "Received blockchain event: tx_hash={:?}, \
+                 log_index={:?}, block_number={:?}",
                 log.transaction_hash, log.log_index, log.block_number
             );
             if sender.send((event, log)).is_err() {
@@ -699,7 +711,8 @@ where
     let Some((mut event_buffer, block_number)) = first_event_result else {
         let current_block = provider.get_block_number().await?;
         info!(
-            "No subscription events within timeout, using current block {current_block} as cutoff"
+            "No subscription events within timeout, \
+             using current block {current_block} as cutoff"
         );
         return Ok(current_block);
     };
@@ -997,7 +1010,8 @@ async fn handle_filtered_event(
     event_id: i64,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
-        "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
+        "Event filtered out (no matching owner): \
+         event_type={:?}, tx_hash={:?}, log_index={}",
         match &queued_event.event {
             TradeEvent::ClearV3(_) => "ClearV3",
             TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
@@ -1034,7 +1048,8 @@ async fn process_valid_trade(
     vault_discovery_context: &VaultDiscoveryCtx<'_>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
-        "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
+        "Event successfully converted to trade: event_type={:?}, \
+         tx_hash={:?}, log_index={}, symbol={}, amount={}",
         match &queued_event.event {
             TradeEvent::ClearV3(_) => "ClearV3",
             TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
@@ -1051,7 +1066,8 @@ async fn process_valid_trade(
     let _guard = symbol_lock.lock().await;
 
     info!(
-        "Processing queued trade: symbol={}, amount={}, direction={:?}, tx_hash={:?}, log_index={}",
+        "Processing queued trade: symbol={}, amount={}, \
+         direction={:?}, tx_hash={:?}, log_index={}",
         trade.symbol, trade.amount, trade.direction, trade.tx_hash, trade.log_index
     );
 
@@ -1073,11 +1089,13 @@ async fn execute_witness_trade(
 ) {
     match crate::dual_write::witness_trade(dual_write_context, trade, block_number).await {
         Ok(()) => info!(
-            "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
+            "Successfully executed OnChainTrade::Witness \
+             command: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
         ),
         Err(e) => error!(
-            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            "Failed to execute OnChainTrade::Witness \
+             command: {e}, tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
     }
@@ -1107,11 +1125,13 @@ async fn execute_initialize_position(dual_write_context: &DualWriteContext, trad
 async fn execute_acknowledge_fill(dual_write_context: &DualWriteContext, trade: &OnchainTrade) {
     match crate::dual_write::acknowledge_onchain_fill(dual_write_context, trade).await {
         Ok(()) => info!(
-            "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
+            "Successfully executed Position::AcknowledgeOnChainFill \
+             command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
         Err(e) => error!(
-            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+            "Failed to execute Position::AcknowledgeOnChainFill \
+             command: {e}, tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
     }
@@ -1134,11 +1154,13 @@ async fn execute_place_offchain_order(
     match crate::dual_write::place_offchain_order(dual_write_context, execution, base_symbol).await
     {
         Ok(()) => info!(
-            "Successfully executed Position::PlaceOffChainOrder command: execution_id={:?}, symbol={}",
+            "Successfully executed Position::PlaceOffChainOrder \
+             command: execution_id={:?}, symbol={}",
             execution.id, base_symbol
         ),
         Err(e) => error!(
-            "Failed to execute Position::PlaceOffChainOrder command: {e}, execution_id={:?}, symbol={}",
+            "Failed to execute Position::PlaceOffChainOrder \
+             command: {e}, execution_id={:?}, symbol={}",
             execution.id, base_symbol
         ),
     }
@@ -1147,11 +1169,13 @@ async fn execute_place_offchain_order(
 async fn execute_place_order(dual_write_context: &DualWriteContext, execution: &OffchainExecution) {
     match crate::dual_write::place_order(dual_write_context, execution).await {
         Ok(()) => info!(
-            "Successfully executed OffchainOrder::Place command: execution_id={:?}, symbol={}",
+            "Successfully executed OffchainOrder::Place \
+             command: execution_id={:?}, symbol={}",
             execution.id, execution.symbol
         ),
         Err(e) => error!(
-            "Failed to execute OffchainOrder::Place command: {e}, execution_id={:?}, symbol={}",
+            "Failed to execute OffchainOrder::Place \
+             command: {e}, execution_id={:?}, symbol={}",
             execution.id, execution.symbol
         ),
     }
@@ -1188,10 +1212,12 @@ async fn execute_mark_stale_failed(
     .await
     {
         Ok(()) => info!(
-            "Successfully executed OffchainOrder::MarkFailed command for stale execution {execution_id}"
+            "Successfully executed OffchainOrder::MarkFailed \
+             command for stale execution {execution_id}"
         ),
         Err(e) => error!(
-            "Failed to execute OffchainOrder::MarkFailed command for stale execution {execution_id}: {e}"
+            "Failed to execute OffchainOrder::MarkFailed \
+             command for stale execution {execution_id}: {e}"
         ),
     }
 }
@@ -1212,10 +1238,12 @@ async fn execute_fail_stale_offchain(
     .await
     {
         Ok(()) => info!(
-            "Successfully executed Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}"
+            "Successfully executed Position::FailOffChainOrder \
+             command for stale execution {execution_id}, symbol {symbol}"
         ),
         Err(e) => error!(
-            "Failed to execute Position::FailOffChainOrder command for stale execution {execution_id}, symbol {symbol}: {e}"
+            "Failed to execute Position::FailOffChainOrder \
+             command for stale execution {execution_id}, symbol {symbol}: {e}"
         ),
     }
 }
@@ -1232,13 +1260,16 @@ async fn process_trade_within_transaction(
     execute_initialize_position(dual_write_context, &trade).await;
     execute_acknowledge_fill(dual_write_context, &trade).await;
 
-    let mut sql_tx = pool
-        .begin()
-        .await
-        .inspect_err(|e| error!("Failed to begin transaction for event processing: {e}"))?;
+    let mut sql_tx = pool.begin().await.inspect_err(|e| {
+        error!(
+            "Failed to begin transaction \
+             for event processing: {e}"
+        );
+    })?;
 
     info!(
-        "Started transaction for atomic event processing: event_id={}, tx_hash={:?}, log_index={}",
+        "Started transaction for atomic event processing: \
+         event_id={}, tx_hash={:?}, log_index={}",
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
@@ -1389,7 +1420,7 @@ where
 }
 
 /// Maps database symbols to current executor-recognized tickers.
-/// Handles corporate actions like SPLG → SPYM rename (Oct 31, 2025).
+/// Handles corporate actions like SPLG -> SPYM rename (Oct 31, 2025).
 /// Remove once proper tSPYM tokens are issued onchain.
 fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
     match symbol.to_string().as_str() {

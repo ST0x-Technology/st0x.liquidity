@@ -1,3 +1,6 @@
+//! Dual-writes offchain order aggregate commands to both
+//! CQRS/ES and legacy SQLite tables.
+
 use st0x_execution::{FractionalShares, OrderState, PersistenceError};
 use tracing::info;
 

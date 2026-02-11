@@ -1,8 +1,10 @@
-//! Inventory polling service for fetching actual balances and emitting snapshot events.
+//! Inventory polling service for fetching actual balances and emitting
+//! snapshot events.
 //!
-//! This service polls onchain vaults and offchain broker accounts to fetch actual
-//! inventory balances, then emits InventorySnapshotCommands to record the fetched
-//! values. The InventoryView reacts to these events to reconcile tracked inventory.
+//! This service polls onchain vaults and offchain broker accounts to fetch
+//! actual inventory balances, then emits InventorySnapshotCommands to record
+//! the fetched values. The InventoryView reacts to these events to reconcile
+//! tracked inventory.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
 
-type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
+pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]

@@ -1,3 +1,8 @@
+//! Historical onchain event backfill with retry logic.
+//!
+//! Scans past blocks for `ClearV3` and `TakeOrderV3` events and enqueues them
+//! for processing, ensuring no trades are missed after downtime.
+
 use alloy::providers::Provider;
 use alloy::rpc::types::Filter;
 use alloy::sol_types::SolEvent;

@@ -1,3 +1,9 @@
+//! Onchain trade accumulation and offchain order placement.
+//!
+//! Processes onchain trades through the position accumulator
+//! with duplicate detection, then triggers offsetting offchain
+//! orders when thresholds are met.
+
 use num_traits::ToPrimitive;
 use sqlx::SqlitePool;
 use st0x_execution::{

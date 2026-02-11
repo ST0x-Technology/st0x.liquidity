@@ -1,3 +1,7 @@
+//! Onchain event processing: EVM configuration, trade
+//! parsing, event backfilling, position accumulation, and
+//! vault management.
+
 use alloy::primitives::Address;
 use alloy::primitives::ruint::FromUintError;
 use alloy::rpc::client::RpcClient;
