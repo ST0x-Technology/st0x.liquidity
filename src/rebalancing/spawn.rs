@@ -76,7 +76,7 @@ pub(crate) struct RebalancingCqrsFrameworks {
 
 /// Spawns the rebalancing infrastructure.
 pub(crate) async fn spawn_rebalancer<BP>(
-    config: &RebalancingCtx,
+    ctx: &RebalancingCtx,
     base_provider: BP,
     orderbook: Address,
     market_maker_wallet: Address,
@@ -86,11 +86,11 @@ pub(crate) async fn spawn_rebalancer<BP>(
 where
     BP: Provider + Clone + Send + Sync + 'static,
 {
-    let signer = PrivateKeySigner::from_bytes(&config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&ctx.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
 
     let services = Services::new(
-        config,
+        ctx,
         &ethereum_wallet,
         signer.address(),
         base_provider,
@@ -99,7 +99,7 @@ where
     .await?;
 
     let rebalancer = services.into_rebalancer(
-        config,
+        ctx,
         market_maker_wallet,
         operation_receiver,
         frameworks.mint,
@@ -138,7 +138,7 @@ where
     BP: Provider + Clone + 'static,
 {
     async fn new(
-        config: &RebalancingConfig,
+        ctx: &RebalancingCtx,
         ethereum_wallet: &EthereumWallet,
         owner: Address,
         base_provider: BP,
@@ -146,24 +146,24 @@ where
     ) -> Result<Self, SpawnRebalancerError> {
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet.clone())
-            .connect_client(http_client_with_retry(config.ethereum_rpc_url.clone()));
+            .connect_client(http_client_with_retry(ctx.ethereum_rpc_url.clone()));
 
-        let broker_auth = &config.alpaca_broker_auth;
+        let broker_auth = &ctx.alpaca_broker_auth;
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             broker_auth.base_url().to_string(),
-            config.alpaca_account_id,
+            ctx.alpaca_account_id,
             broker_auth.api_key.clone(),
             broker_auth.api_secret.clone(),
             base_provider.clone(),
-            config.redemption_wallet,
+            ctx.redemption_wallet,
         ));
 
         let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
 
         let wallet = Arc::new(AlpacaWalletService::new(
             broker_auth.base_url().to_string(),
-            config.alpaca_account_id,
+            ctx.alpaca_account_id,
             broker_auth.api_key.clone(),
             broker_auth.api_secret.clone(),
         ));
@@ -198,7 +198,7 @@ where
 
     fn into_rebalancer(
         self,
-        config: &RebalancingConfig,
+        ctx: &RebalancingCtx,
         market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
         mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
@@ -217,7 +217,7 @@ where
             self.vault,
             usdc_cqrs,
             market_maker_wallet,
-            VaultId(config.usdc_vault_id),
+            VaultId(ctx.usdc_vault_id),
         ));
 
         Rebalancer::new(
@@ -225,7 +225,7 @@ where
             redemption_manager,
             usdc_manager,
             operation_receiver,
-            config.redemption_wallet,
+            ctx.redemption_wallet,
         )
     }
 }
@@ -269,8 +269,8 @@ mod tests {
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
-    fn make_config() -> RebalancingConfig {
-        RebalancingConfig {
+    fn make_ctx() -> RebalancingCtx {
+        RebalancingCtx {
             equity_threshold: ImbalanceThreshold {
                 target: dec!(0.5),
                 deviation: dec!(0.2),

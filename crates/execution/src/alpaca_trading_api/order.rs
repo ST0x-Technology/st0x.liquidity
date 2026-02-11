@@ -288,10 +288,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
         mock.assert();
-        let placement = result.unwrap();
+        let placement = place_market_order(&client, market_order).await.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
@@ -357,10 +355,8 @@ mod tests {
             direction: Direction::Sell,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
         mock.assert();
-        let placement = result.unwrap();
+        let placement = place_market_order(&client, market_order).await.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
@@ -388,11 +384,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
         mock.assert();
-        let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
+        assert!(matches!(place_market_order(&client, market_order).await.unwrap_err(), AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]
@@ -416,11 +409,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
-
         mock.assert();
-        let error = result.unwrap_err();
-        assert!(matches!(error, AlpacaTradingApiError::OrderCreate(_)));
+        assert!(matches!(place_market_order(&client, market_order).await.unwrap_err(), AlpacaTradingApiError::OrderCreate(_)));
     }
 
     #[tokio::test]

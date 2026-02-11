@@ -394,7 +394,6 @@ mod tests {
         let ctx = create_test_ctx(auth, pool);
         let result = Schwab::try_from_ctx(ctx).await;
 
-        assert!(result.is_ok());
         let broker = result.unwrap();
         assert_eq!(broker.auth.app_key, "test_key");
     }
@@ -469,7 +468,6 @@ mod tests {
         let ctx = create_test_ctx(auth, pool);
         let result = Schwab::try_from_ctx(ctx).await;
 
-        assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
@@ -541,7 +539,6 @@ mod tests {
         let broker = Schwab { auth, pool };
         let result = broker.wait_until_market_open().await;
 
-        assert!(result.is_ok());
         let duration = result.unwrap();
         // Market is open, returns time until close (should be ~2 hours)
         assert!(duration.as_secs() > 0);
@@ -639,7 +636,6 @@ mod tests {
         let broker = Schwab { auth, pool };
         let result = broker.wait_until_market_open().await;
 
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
         market_hours_mock.assert();
     }

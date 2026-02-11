@@ -664,9 +664,7 @@ mod tests {
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
 
-        let result = fetch_attestation.retry(backoff).await;
-
-        assert!(result.is_ok(), "Expected attestation to succeed");
+        fetch_attestation.retry(backoff).await.unwrap();
         assert_eq!(mock.hits(), 1, "Expected exactly 1 API call");
     }
 

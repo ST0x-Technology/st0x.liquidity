@@ -188,10 +188,9 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let result = AlpacaBrokerApi::try_from_ctx(ctx).await;
+        AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
 
         account_mock.assert();
-        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -253,7 +252,6 @@ mod tests {
 
         account_mock.assert();
         calendar_mock.assert();
-        assert!(result.is_ok());
         assert!(result.unwrap().as_secs() > 0);
     }
 

@@ -114,22 +114,22 @@ mod tests {
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuth) {
+    fn create_schwab_ctx(mock_server: &MockServer) -> (Ctx, SchwabAuth) {
         let schwab_auth = SchwabAuth {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
-            redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
-            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+            redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
+            base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
             account_index: Some(0),
             encryption_key: TEST_ENCRYPTION_KEY,
         };
 
-        let config = Config {
+        let ctx = Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
@@ -142,13 +142,13 @@ mod tests {
             execution_threshold: ExecutionThreshold::whole_share(),
         };
 
-        (config, schwab_auth)
+        (ctx, schwab_auth)
     }
 
     #[tokio::test]
     async fn test_ensure_auth_with_valid_tokens() {
         let server = MockServer::start();
-        let (config, schwab_auth) = create_schwab_config(&server);
+        let (ctx, schwab_auth) = create_schwab_ctx(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, &schwab_auth).await;
 

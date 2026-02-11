@@ -7,6 +7,7 @@ use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
 use std::io::Write;
 
+use super::CctpChain;
 use crate::bindings::IERC20;
 use crate::cctp::{
     BridgeDirection, CctpBridge, CctpError, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
@@ -16,7 +17,6 @@ use crate::config::Ctx;
 use crate::onchain::http_client_with_retry;
 use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
-use super::CctpChain;
 
 impl CctpChain {
     /// Converts to the bridge direction (from this chain to its destination).
@@ -33,10 +33,10 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     amount: Option<Usdc>,
     all: bool,
     from: CctpChain,
-    config: &Ctx,
+    ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
-    let rebalancing = config
+    let rebalancing = ctx
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-bridge requires rebalancing configuration"))?;
@@ -149,14 +149,14 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     stdout: &mut W,
     burn_tx: B256,
     source_chain: CctpChain,
-    config: &Ctx,
+    ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Recovering CCTP transfer")?;
     writeln!(stdout, "   Burn tx: {burn_tx}")?;
     writeln!(stdout, "   Source chain: {source_chain:?}")?;
 
-    let rebalancing = config
+    let rebalancing = ctx
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("cctp-recover requires rebalancing configuration"))?;
@@ -197,10 +197,10 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
 pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
     stdout: &mut W,
     chain: CctpChain,
-    config: &Config,
+    ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
-    let rebalancing = config
+    let rebalancing = ctx
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("reset-allowance requires rebalancing configuration"))?;
@@ -210,8 +210,8 @@ pub(super) async fn reset_allowance_command<W: Write, BP: Provider + Clone>(
     let owner = signer.address();
 
     let (usdc_address, spender, chain_name) = match chain {
-        CctpChain::Ethereum => (USDC_ETHEREUM, config.evm.orderbook, "Ethereum"),
-        CctpChain::Base => (USDC_BASE, config.evm.orderbook, "Base"),
+        CctpChain::Ethereum => (USDC_ETHEREUM, ctx.evm.orderbook, "Ethereum"),
+        CctpChain::Base => (USDC_BASE, ctx.evm.orderbook, "Base"),
     };
 
     writeln!(stdout, "Resetting USDC allowance on {chain_name}")?;
@@ -274,6 +274,7 @@ mod tests {
     use rust_decimal::Decimal;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use std::str::FromStr;
+    use url::Url;
     use uuid::uuid;
 
     use super::*;
@@ -284,13 +285,13 @@ mod tests {
     use crate::rebalancing::RebalancingCtx;
     use crate::threshold::ExecutionThreshold;
 
-    fn create_config_without_rebalancing() -> Config {
-        Config {
+    fn create_ctx_without_rebalancing() -> Ctx {
+        Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
@@ -304,11 +305,11 @@ mod tests {
         }
     }
 
-    fn create_config_with_rebalancing() -> Config {
-        let mut config = create_config_without_rebalancing();
-        config.rebalancing = Some(RebalancingCtx {
+    fn create_ctx_with_rebalancing() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.rebalancing = Some(RebalancingCtx {
             evm_private_key: B256::ZERO,
-            ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
+            ethereum_rpc_url: Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
             redemption_wallet: Address::ZERO,
             alpaca_account_id: AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b")),
@@ -327,7 +328,7 @@ mod tests {
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
             },
         });
-        config
+        ctx
     }
 
     fn create_mock_provider() -> impl Provider + Clone + 'static {
@@ -337,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cctp_bridge_requires_rebalancing_config() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let amount = Some(Usdc(Decimal::from_str("100").unwrap()));
 
@@ -347,7 +348,7 @@ mod tests {
             amount,
             false,
             CctpChain::Ethereum,
-            &config,
+            &ctx,
             provider,
         )
         .await;
@@ -361,14 +362,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cctp_recover_requires_rebalancing_config() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
         let burn_tx = B256::ZERO;
 
         let mut stdout = Vec::new();
         let result =
-            cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &config, provider)
-                .await;
+            cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &ctx, provider).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -379,13 +379,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_cctp_recover_writes_burn_tx_to_stdout() {
-        let config = create_config_with_rebalancing();
+        let ctx = create_ctx_with_rebalancing();
         let provider = create_mock_provider();
         let burn_tx = B256::ZERO;
 
         let mut stdout = Vec::new();
-        let _ = cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &config, provider)
-            .await;
+        let _ =
+            cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &ctx, provider).await;
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

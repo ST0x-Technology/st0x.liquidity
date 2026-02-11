@@ -349,10 +349,8 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&config, &pool, None).await;
-
         mock.assert();
-        let market_hours = result.unwrap();
+        let market_hours = fetch_market_hours(&config, &pool, None).await.unwrap();
         assert_eq!(
             market_hours.date,
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap()
@@ -395,10 +393,8 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = fetch_market_hours(&config, &pool, Some("2025-01-04")).await;
-
         mock.assert();
-        let market_hours = result.unwrap();
+        let market_hours = fetch_market_hours(&config, &pool, Some("2025-01-04")).await.unwrap();
         assert_eq!(
             market_hours.date,
             NaiveDate::from_ymd_opt(2025, 1, 4).unwrap()

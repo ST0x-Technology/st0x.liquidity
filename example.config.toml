@@ -6,10 +6,6 @@ server_port = 8080
 orderbook = "0x1111111111111111111111111111111111111111"
 deployment_block = 1
 
-[broker]
-type = "alpaca-broker-api"
-mode = "sandbox"
-
 [hyperdx]
 service_name = "st0x-hedge"
 

@@ -241,7 +241,12 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     writeln!(stdout, "   Asset: USDC")?;
     writeln!(stdout, "   Network: Ethereum")?;
 
-    let alpaca_wallet = build_wallet_service(alpaca_auth, rebalancing_config);
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
     let existing = alpaca_wallet.get_whitelisted_addresses().await?;
@@ -291,12 +296,17 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
         anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config
+    let rebalancing_config = ctx
         .rebalancing
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("alpaca-transfers requires rebalancing configuration"))?;
 
-    let alpaca_wallet = build_wallet_service(alpaca_auth, rebalancing_config);
+    let alpaca_wallet = AlpacaWalletService::new(
+        alpaca_auth.base_url().to_string(),
+        rebalancing_config.alpaca_account_id,
+        alpaca_auth.api_key.clone(),
+        alpaca_auth.api_secret.clone(),
+    );
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
     writeln!(
@@ -336,7 +346,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     stdout: &mut W,
     direction: ConvertDirection,
     amount: Usdc,
-    config: &Ctx,
+    ctx: &Ctx,
 ) -> anyhow::Result<()> {
     let direction_str = match direction {
         ConvertDirection::ToUsd => "USDC → USD",
@@ -409,13 +419,13 @@ mod tests {
     use crate::rebalancing::RebalancingCtx;
     use crate::threshold::ExecutionThreshold;
 
-    fn create_config_without_alpaca() -> Config {
-        Config {
+    fn create_ctx_without_alpaca() -> Ctx {
+        Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
@@ -429,9 +439,9 @@ mod tests {
         }
     }
 
-    fn create_alpaca_config_without_rebalancing() -> Config {
-        let mut config = create_config_without_alpaca();
-        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+    fn create_alpaca_ctx_without_rebalancing() -> Ctx {
+        let mut ctx = create_ctx_without_alpaca();
+        ctx.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
@@ -440,7 +450,7 @@ mod tests {
         ctx
     }
 
-    fn create_full_alpaca_config() -> Config {
+    fn create_full_alpaca_ctx() -> Ctx {
         let alpaca_account_id = AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"));
         Ctx {
             database_url: ":memory:".to_string(),
@@ -488,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_deposit_requires_alpaca_broker() {
-        let config = create_config_without_alpaca();
+        let ctx = create_ctx_without_alpaca();
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();

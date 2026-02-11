@@ -6,7 +6,7 @@ use st0x_hedge::setup_tracing;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let Env { config, secrets } = Env::parse();
-    let ctx = Ctx::load_file(&config, &secrets)?;
+    let ctx = Ctx::load_files(&config, &secrets)?;
 
     let log_level: tracing::Level = (&ctx.log_level).into();
 

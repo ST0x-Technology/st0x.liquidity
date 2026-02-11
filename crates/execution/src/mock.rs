@@ -182,10 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_from_ctx_success() {
-        let result = MockExecutor::try_from_ctx(MockExecutorCtx).await;
-        assert!(result.is_ok());
-
-        let executor = result.unwrap();
+        let executor = MockExecutor::try_from_ctx(MockExecutorCtx).await.unwrap();
         assert!(!executor.should_fail);
         assert_eq!(executor.failure_message, "");
     }

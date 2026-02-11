@@ -178,10 +178,9 @@ mod tests {
 
         let account_mock = create_account_mock(&server);
 
-        let result = AlpacaTradingApi::try_from_ctx(auth).await;
+        AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
 
         account_mock.assert();
-        assert!(result.is_ok());
     }
 
     #[tokio::test]
