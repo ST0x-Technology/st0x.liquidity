@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
+use st0x_dto::ServerMessage;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaTradingApiError, EmptySymbolError, ExecutionError, Executor,
     MarketOrder, SchwabError, SupportedExecutor, Symbol,
@@ -33,7 +34,6 @@ use st0x_execution::{
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::{Ctx, CtxError};
-use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{

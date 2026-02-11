@@ -10,7 +10,7 @@ use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
-use crate::dashboard::ServerMessage;
+use st0x_dto::ServerMessage;
 
 mod alpaca_tokenization;
 mod alpaca_wallet;
@@ -44,7 +44,6 @@ mod trade_execution_link;
 mod usdc_rebalance;
 mod vault_registry;
 
-pub use dashboard::export_bindings;
 pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(test)]

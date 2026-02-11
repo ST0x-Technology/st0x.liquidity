@@ -6,8 +6,7 @@ use rocket_ws::{Channel, Message, WebSocket};
 use tokio::sync::broadcast;
 use tracing::warn;
 
-pub use st0x_dto::export_bindings;
-pub(crate) use st0x_dto::{InitialState, ServerMessage};
+use st0x_dto::{InitialState, ServerMessage};
 
 mod event;
 
