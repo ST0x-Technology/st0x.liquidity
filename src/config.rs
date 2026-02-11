@@ -4,8 +4,9 @@ use clap::Parser;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::Level;
+use url::Url;
 
 use st0x_execution::{
     AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx, AlpacaTradingApiMode,
@@ -20,46 +21,91 @@ use crate::rebalancing::{
 use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
 
+#[derive(Parser, Debug)]
+pub struct Env {
+    /// Path to plaintext TOML configuration file
+    #[clap(long)]
+    pub config: PathBuf,
+    /// Path to encrypted TOML secrets file
+    #[clap(long)]
+    pub secrets: PathBuf,
+}
+
+/// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
-pub struct Config {
+struct Config {
     database_url: String,
     log_level: Option<LogLevel>,
     server_port: Option<u16>,
     evm: EvmConfig,
     order_polling_interval: Option<u64>,
     order_polling_max_jitter: Option<u64>,
-    broker: BrokerTag,
     #[serde(rename = "hyperdx")]
-    hyperdx: Option<TelemetryConfig>,
+    telemetry: Option<TelemetryConfig>,
     rebalancing: Option<RebalancingConfig>,
 }
 
-/// Broker type and non-secret configuration fields.
-/// Deserialized from the plaintext `[broker]` TOML section.
+/// Secret credentials deserialized from the encrypted secrets TOML.
+#[derive(Deserialize)]
+struct Secrets {
+    evm: EvmSecrets,
+    broker: BrokerSecrets,
+    #[serde(rename = "hyperdx")]
+    telemetry: Option<TelemetrySecrets>,
+    rebalancing: Option<RebalancingSecrets>,
+}
+
+/// Broker type tag and all broker credentials.
+/// Deserialized from the `[broker]` section of the secrets TOML.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
-pub enum BrokerTag {
+enum BrokerSecrets {
     Schwab {
+        app_key: String,
+        app_secret: String,
         redirect_uri: Option<Url>,
         base_url: Option<Url>,
         account_index: Option<usize>,
+        encryption_key: FixedBytes<32>,
     },
     AlpacaTradingApi {
+        api_key: String,
+        api_secret: String,
         trading_mode: Option<AlpacaTradingApiMode>,
     },
     AlpacaBrokerApi {
+        api_key: String,
+        api_secret: String,
         account_id: String,
         mode: Option<AlpacaBrokerApiMode>,
     },
     DryRun,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+// ===== Runtime types (assembled from Config + Secrets) =====
+
+/// Combined runtime context for the server. Assembled from plaintext config,
+/// encrypted secrets, and derived runtime state.
+#[derive(Debug, Clone)]
+pub struct Ctx {
+    pub(crate) database_url: String,
+    pub log_level: LogLevel,
+    pub(crate) server_port: u16,
+    pub(crate) evm: EvmCtx,
+    pub(crate) order_polling_interval: u64,
+    pub(crate) order_polling_max_jitter: u64,
+    pub(crate) broker: BrokerConfig,
+    pub(crate) telemetry: Option<TelemetryCtx>,
+    pub(crate) rebalancing: Option<RebalancingCtx>,
+    pub(crate) execution_threshold: ExecutionThreshold,
+}
+
+/// Runtime broker configuration assembled from `BrokerSecrets`.
+#[derive(Debug, Clone)]
 pub enum BrokerConfig {
-    Schwab(SchwabAuthConfig),
-    AlpacaTradingApi(AlpacaTradingApiAuthConfig),
-    AlpacaBrokerApi(AlpacaBrokerApiAuthConfig),
+    Schwab(SchwabAuth),
+    AlpacaTradingApi(AlpacaTradingApiCtx),
+    AlpacaBrokerApi(AlpacaBrokerApiCtx),
     DryRun,
 }
 
@@ -74,37 +120,30 @@ impl BrokerConfig {
     }
 }
 
-pub(crate) trait HasSqlite {
-    async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
+/// Schwab auth credentials used by the main crate for token management
+/// and executor construction.
+#[derive(Debug, Clone)]
+pub struct SchwabAuth {
+    pub(crate) app_key: String,
+    pub(crate) app_secret: String,
+    pub(crate) redirect_uri: Option<Url>,
+    pub(crate) base_url: Option<Url>,
+    pub(crate) account_index: Option<usize>,
+    pub(crate) encryption_key: FixedBytes<32>,
 }
 
-pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let pool = SqlitePool::connect(database_url).await?;
-
-    // SQLite Concurrency Configuration:
-    //
-    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
-    // all processes. When both main bot and reporter try to write simultaneously,
-    // one will block until the other completes. This is a fundamental SQLite
-    // limitation.
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(&pool)
-        .await?;
-
-    // Busy Timeout: 10 seconds - when a write is blocked by another process,
-    // SQLite will wait up to 10 seconds before failing with "database is locked".
-    // This prevents immediate failures when main bot and reporter write concurrently.
-    //
-    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
-    // to avoid blocking mission-critical main bot operations.
-    //
-    // Future: This limitation will be eliminated when migrating to Kafka +
-    // Elasticsearch with CQRS pattern for separate read/write paths.
-    sqlx::query("PRAGMA busy_timeout = 10000")
-        .execute(&pool)
-        .await?;
-
-    Ok(pool)
+impl SchwabAuth {
+    pub(crate) fn to_schwab_ctx(&self, pool: SqlitePool) -> SchwabCtx {
+        SchwabCtx {
+            app_key: self.app_key.clone(),
+            app_secret: self.app_secret.clone(),
+            redirect_uri: self.redirect_uri.clone(),
+            base_url: self.base_url.clone(),
+            account_index: self.account_index,
+            encryption_key: self.encryption_key,
+            pool,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
