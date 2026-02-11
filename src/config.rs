@@ -119,7 +119,7 @@ pub enum BrokerCtx {
 }
 
 impl BrokerCtx {
-    pub fn to_supported_executor(&self) -> SupportedExecutor {
+    pub(crate) fn to_supported_executor(&self) -> SupportedExecutor {
         match self {
             Self::Schwab(_) => SupportedExecutor::Schwab,
             Self::AlpacaTradingApi(_) => SupportedExecutor::AlpacaTradingApi,
