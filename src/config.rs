@@ -10,6 +10,7 @@ use clap::Parser;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use std::path::{Path, PathBuf};
 use tracing::Level;
 use url::Url;
@@ -94,7 +95,7 @@ enum BrokerSecrets {
 
 /// Combined runtime context for the server. Assembled from plaintext config,
 /// encrypted secrets, and derived runtime state.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Ctx {
     pub(crate) database_url: String,
     pub log_level: LogLevel,
@@ -109,7 +110,7 @@ pub struct Ctx {
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum BrokerCtx {
     Schwab(SchwabAuth),
     AlpacaTradingApi(AlpacaTradingApiCtx),
@@ -187,7 +188,7 @@ impl From<BrokerSecrets> for BrokerCtx {
 
 /// Schwab auth credentials used by the main crate for token management
 /// and executor construction.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SchwabAuth {
     pub(crate) app_key: String,
     pub(crate) app_secret: String,
@@ -208,6 +209,45 @@ impl SchwabAuth {
             encryption_key: self.encryption_key,
             pool,
         }
+    }
+}
+
+impl std::fmt::Debug for SchwabAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SchwabAuth")
+            .field("app_key", &"[REDACTED]")
+            .field("app_secret", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("base_url", &self.base_url)
+            .field("account_index", &self.account_index)
+            .field("encryption_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for BrokerCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Schwab(auth) => f.debug_tuple("Schwab").field(auth).finish(),
+            Self::AlpacaTradingApi(ctx) => f.debug_tuple("AlpacaTradingApi").field(ctx).finish(),
+            Self::AlpacaBrokerApi(ctx) => f.debug_tuple("AlpacaBrokerApi").field(ctx).finish(),
+            Self::DryRun => write!(f, "DryRun"),
+        }
+    }
+}
+
+impl std::fmt::Debug for Ctx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ctx")
+            .field("database_url", &self.database_url)
+            .field("log_level", &self.log_level)
+            .field("server_port", &self.server_port)
+            .field("evm", &self.evm)
+            .field("broker", &self.broker)
+            .field("telemetry", &self.telemetry)
+            .field("rebalancing", &self.rebalancing.is_some())
+            .field("execution_threshold", &self.execution_threshold)
+            .finish()
     }
 }
 
@@ -374,32 +414,23 @@ impl CtxError {
 }
 
 pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let pool = SqlitePool::connect(database_url).await?;
-
-    // SQLite Concurrency Configuration:
+    // PRAGMAs are set via SqliteConnectOptions so they apply to every
+    // connection the pool opens, not just the first one.
     //
-    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
-    // all processes. When both main bot and reporter try to write simultaneously,
-    // one will block until the other completes. This is a fundamental SQLite
-    // limitation.
-    sqlx::query("PRAGMA journal_mode = WAL")
-        .execute(&pool)
-        .await?;
-
-    // Busy Timeout: 10 seconds - when a write is blocked by another process,
-    // SQLite will wait up to 10 seconds before failing with "database is locked".
-    // This prevents immediate failures when main bot and reporter write concurrently.
+    // WAL Mode: Allows concurrent readers but only ONE writer at a time
+    // across all processes. When both main bot and reporter try to write
+    // simultaneously, one will block until the other completes.
     //
-    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
-    // to avoid blocking mission-critical main bot operations.
-    //
-    // Future: This limitation will be eliminated when migrating to Kafka +
-    // Elasticsearch with CQRS pattern for separate read/write paths.
-    sqlx::query("PRAGMA busy_timeout = 10000")
-        .execute(&pool)
-        .await?;
+    // Busy Timeout: 10 seconds - when a write is blocked by another
+    // process, SQLite will wait up to 10 seconds before failing with
+    // "database is locked". Reporter must keep transactions SHORT
+    // (single INSERT per trade) to avoid blocking the main bot.
+    let options: SqliteConnectOptions = database_url
+        .parse::<SqliteConnectOptions>()?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(std::time::Duration::from_secs(10));
 
-    Ok(pool)
+    SqlitePool::connect_with(options).await
 }
 
 #[cfg(test)]

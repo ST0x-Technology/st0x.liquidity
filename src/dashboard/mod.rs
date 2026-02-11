@@ -6,11 +6,12 @@ use rocket_ws::{Channel, Message, WebSocket};
 use tokio::sync::broadcast;
 use tracing::warn;
 
+pub use st0x_dto::export_bindings;
+pub(crate) use st0x_dto::{InitialState, ServerMessage};
+
 mod event;
 
 pub(crate) use event::EventBroadcaster;
-pub use st0x_dto::export_bindings;
-pub(crate) use st0x_dto::{InitialState, ServerMessage};
 
 pub(crate) struct Broadcast {
     pub(crate) sender: broadcast::Sender<ServerMessage>,

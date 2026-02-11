@@ -84,10 +84,19 @@ pub(crate) struct TelemetrySecrets {
     pub(crate) api_key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TelemetryCtx {
     pub(crate) api_key: String,
     pub(crate) service_name: String,
+}
+
+impl std::fmt::Debug for TelemetryCtx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelemetryCtx")
+            .field("api_key", &"[REDACTED]")
+            .field("service_name", &self.service_name)
+            .finish()
+    }
 }
 
 impl TelemetryCtx {
