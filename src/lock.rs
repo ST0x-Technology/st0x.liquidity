@@ -1,4 +1,4 @@
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 use st0x_execution::Symbol;
 use tracing::{debug, info, warn};
 

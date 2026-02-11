@@ -148,13 +148,14 @@ where
     };
     writeln!(stdout, "Transferring USDC: {dir}, Amount: {amount} USDC")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("transfer-usdc requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("transfer-usdc requires rebalancing config (REBALANCING_ENABLED=true)")
-    })?;
+    let rebalancing_config = ctx
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("transfer-usdc requires rebalancing configuration"))?;
 
     writeln!(stdout, "   Vault ID: {}", rebalancing_config.usdc_vault_id)?;
 
@@ -211,7 +212,7 @@ where
     let bridge = Arc::new(CctpBridge::new(ethereum_evm, base_cctp)?);
     let vault_service = Arc::new(VaultService::new(
         base_provider_with_wallet,
-        config.evm.orderbook,
+        ctx.evm.orderbook,
     ));
     let event_store =
         PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
@@ -258,7 +259,7 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
-    config: &Config,
+    ctx: &Ctx,
     provider: P,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting tokenization via Alpaca API")?;
@@ -266,11 +267,11 @@ pub(super) async fn alpaca_tokenize_command<W: Write, P: Provider + Clone>(
     writeln!(stdout, "   Quantity: {quantity}")?;
     writeln!(stdout, "   Token: {token}")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-tokenize requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
         anyhow::anyhow!("alpaca-tokenize requires rebalancing configuration for wallet addresses")
     })?;
 
@@ -360,7 +361,7 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     symbol: Symbol,
     quantity: FractionalShares,
     token: Address,
-    config: &Config,
+    ctx: &Ctx,
     provider: P,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔄 Requesting redemption via Alpaca API")?;
@@ -368,11 +369,11 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
     writeln!(stdout, "   Quantity: {quantity}")?;
     writeln!(stdout, "   Token: {token}")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-redeem requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
         anyhow::anyhow!("alpaca-redeem requires rebalancing configuration for wallet addresses")
     })?;
 
@@ -438,16 +439,16 @@ pub(super) async fn alpaca_redeem_command<W: Write, P: Provider + Clone>(
 /// List all Alpaca tokenization requests.
 pub(super) async fn alpaca_tokenization_requests_command<W: Write, P: Provider + Clone>(
     stdout: &mut W,
-    config: &Config,
+    ctx: &Ctx,
     provider: P,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "📋 Listing Alpaca tokenization requests")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-tokenization-requests requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
+    let rebalancing_config = ctx.rebalancing.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "alpaca-tokenization-requests requires rebalancing configuration for account ID"
         )
@@ -525,6 +526,7 @@ mod tests {
     use rust_decimal::Decimal;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use std::str::FromStr;
+    use url::Url;
 
     use super::*;
     use crate::config::LogLevel;
@@ -532,35 +534,35 @@ mod tests {
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
 
-    fn create_config_without_rebalancing() -> Config {
-        Config {
+    fn create_ctx_without_rebalancing() -> Ctx {
+        Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::DryRun,
+            broker: BrokerCtx::DryRun,
             telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
-    fn create_alpaca_config_without_rebalancing() -> Config {
-        let mut config = create_config_without_rebalancing();
-        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+    fn create_alpaca_ctx_without_rebalancing() -> Ctx {
+        let mut ctx = create_ctx_without_rebalancing();
+        ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
         });
-        config
+        ctx
     }
 
     fn create_mock_provider() -> impl Provider + Clone + 'static {
@@ -570,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_equity_requires_alpaca_broker() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
@@ -582,7 +584,7 @@ mod tests {
             &symbol,
             quantity,
             None,
-            &config,
+            &ctx,
             &pool,
         )
         .await;
@@ -596,7 +598,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_equity_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
         let quantity = FractionalShares::new(Decimal::from_str("10.5").unwrap());
@@ -608,7 +610,7 @@ mod tests {
             &symbol,
             quantity,
             None,
-            &config,
+            &ctx,
             &pool,
         )
         .await;
@@ -622,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_alpaca_broker() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
@@ -632,7 +634,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
-            &config,
+            &ctx,
             &pool,
             provider,
         )
@@ -647,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
@@ -657,7 +659,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
-            &config,
+            &ctx,
             &pool,
             provider,
         )
@@ -672,21 +674,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_usdc_writes_direction_to_stdout() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let pool = setup_test_db().await;
         let provider = create_mock_provider();
         let amount = Usdc(Decimal::from_str("100").unwrap());
 
         let mut stdout = Vec::new();
-        let _ = transfer_usdc_command(
+        transfer_usdc_command(
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
-            &config,
+            &ctx,
             &pool,
             provider,
         )
-        .await;
+        .await
+        .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

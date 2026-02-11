@@ -9,8 +9,8 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 use super::EvmCtx;
+use super::OnChainError;
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::error::OnChainError;
 use crate::queue::enqueue;
 
 fn get_backfill_retry_strat() -> ExponentialBuilder {

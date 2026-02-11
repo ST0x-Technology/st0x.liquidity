@@ -444,7 +444,8 @@ mod tests {
             "OFFCHAIN".parse::<TradeType>().unwrap(),
             TradeType::Offchain
         );
-        assert!("invalid".parse::<TradeType>().is_err());
+        let error = "invalid".parse::<TradeType>().unwrap_err();
+        assert_eq!(error, "Invalid trade type: 'invalid'");
     }
 
     #[test]

@@ -89,6 +89,21 @@ pub struct TelemetryCtx {
 }
 
 impl TelemetryCtx {
+    pub(crate) fn from_config_and_secrets(
+        config: Option<TelemetryConfig>,
+        secrets: Option<TelemetrySecrets>,
+    ) -> Result<Option<Self>, TelemetryAssemblyError> {
+        match (config, secrets) {
+            (Some(config), Some(secrets)) => Ok(Some(Self {
+                api_key: secrets.api_key,
+                service_name: config.service_name,
+            })),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(TelemetryAssemblyError::SecretsMissing),
+            (None, Some(_)) => Err(TelemetryAssemblyError::ConfigMissing),
+        }
+    }
+
     pub fn setup(&self, log_level: tracing::Level) -> Result<TelemetryGuard, TelemetryError> {
         let headers = HashMap::from([("authorization".to_string(), self.api_key.clone())]);
 
@@ -147,6 +162,14 @@ impl TelemetryCtx {
 
         Ok(TelemetryGuard { tracer_provider })
     }
+}
+
+#[derive(Debug, Error)]
+pub enum TelemetryAssemblyError {
+    #[error("telemetry config present but telemetry secrets missing")]
+    SecretsMissing,
+    #[error("telemetry secrets present but telemetry config missing")]
+    ConfigMissing,
 }
 
 #[derive(Debug, Error)]

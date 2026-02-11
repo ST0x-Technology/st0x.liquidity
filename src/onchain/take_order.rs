@@ -2,8 +2,8 @@ use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 
+use super::OnChainError;
 use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
-use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;

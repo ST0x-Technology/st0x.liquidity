@@ -83,6 +83,7 @@ fn check_timeout(
 }
 
 /// Represents a validated status transition.
+#[derive(Debug)]
 struct ValidatedTransition {
     new_status: TransferStatus,
     changed: bool,
@@ -410,13 +411,11 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result =
-            poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config).await;
+        let error = poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaWalletError::TransferTimeout { .. }
-        ));
+        assert!(matches!(error, AlpacaWalletError::TransferTimeout { .. }));
 
         assert!(status_mock.hits() >= 2);
     }
@@ -447,14 +446,14 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result =
-            poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config).await;
+        let error = poll_transfer_status(&client, &AlpacaTransferId::from(transfer_id), &config)
+            .await
+            .unwrap_err();
 
         assert!(
             error_mock.hits() >= 1,
             "Expected at least one retry attempt"
         );
-        let error = result.unwrap_err();
         assert!(
             matches!(error, AlpacaWalletError::ApiError { status, .. } if status.as_u16() == 503)
         );
@@ -536,10 +535,10 @@ mod tests {
                 }]));
         });
 
-        let result = poll_handle.await.unwrap();
+        let error = poll_handle.await.unwrap().unwrap_err();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaWalletError::InvalidStatusTransition {
                 previous: TransferStatus::Processing,
                 next: TransferStatus::Pending,
@@ -552,28 +551,42 @@ mod tests {
 
     #[test]
     fn test_parse_status_transition_processing_to_pending_is_regression() {
-        let result = parse_status_transition(TransferStatus::Processing, TransferStatus::Pending);
-        assert!(result.is_err());
+        let error = parse_status_transition(TransferStatus::Processing, TransferStatus::Pending)
+            .unwrap_err();
+        assert_eq!(error, (TransferStatus::Processing, TransferStatus::Pending));
     }
 
     #[test]
     fn test_parse_status_transition_complete_to_any_is_regression() {
-        assert!(
-            parse_status_transition(TransferStatus::Complete, TransferStatus::Pending).is_err()
+        let error =
+            parse_status_transition(TransferStatus::Complete, TransferStatus::Pending).unwrap_err();
+        assert_eq!(error, (TransferStatus::Complete, TransferStatus::Pending));
+
+        let error = parse_status_transition(TransferStatus::Complete, TransferStatus::Processing)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            (TransferStatus::Complete, TransferStatus::Processing)
         );
-        assert!(
-            parse_status_transition(TransferStatus::Complete, TransferStatus::Processing).is_err()
-        );
-        assert!(parse_status_transition(TransferStatus::Complete, TransferStatus::Failed).is_err());
+
+        let error =
+            parse_status_transition(TransferStatus::Complete, TransferStatus::Failed).unwrap_err();
+        assert_eq!(error, (TransferStatus::Complete, TransferStatus::Failed));
     }
 
     #[test]
     fn test_parse_status_transition_failed_to_any_is_regression() {
-        assert!(parse_status_transition(TransferStatus::Failed, TransferStatus::Pending).is_err());
-        assert!(
-            parse_status_transition(TransferStatus::Failed, TransferStatus::Processing).is_err()
-        );
-        assert!(parse_status_transition(TransferStatus::Failed, TransferStatus::Complete).is_err());
+        let error =
+            parse_status_transition(TransferStatus::Failed, TransferStatus::Pending).unwrap_err();
+        assert_eq!(error, (TransferStatus::Failed, TransferStatus::Pending));
+
+        let error = parse_status_transition(TransferStatus::Failed, TransferStatus::Processing)
+            .unwrap_err();
+        assert_eq!(error, (TransferStatus::Failed, TransferStatus::Processing));
+
+        let error =
+            parse_status_transition(TransferStatus::Failed, TransferStatus::Complete).unwrap_err();
+        assert_eq!(error, (TransferStatus::Failed, TransferStatus::Complete));
     }
 
     #[test]
@@ -764,14 +777,13 @@ mod tests {
             max_retry_delay: Duration::from_millis(100),
         };
 
-        let result = poll_deposit_by_tx_hash(&client, &tx_hash, &config).await;
+        let error = poll_deposit_by_tx_hash(&client, &tx_hash, &config)
+            .await
+            .unwrap_err();
 
         assert!(
-            matches!(
-                result.unwrap_err(),
-                AlpacaWalletError::DepositTimeout { tx_hash: _, .. }
-            ),
-            "Expected DepositTimeout error"
+            matches!(error, AlpacaWalletError::DepositTimeout { tx_hash: _, .. }),
+            "Expected DepositTimeout error, got: {error:?}"
         );
 
         assert!(empty_mock.hits() >= 1, "Expected at least one poll attempt");

@@ -1,8 +1,22 @@
 use alloy::primitives::Address;
+use alloy::primitives::ruint::FromUintError;
 use alloy::rpc::client::RpcClient;
 use alloy::transports::layers::RetryBackoffLayer;
+use alloy::transports::{RpcError, TransportErrorKind};
+use rain_math_float::FloatError;
 use serde::Deserialize;
+use st0x_execution::order::status::ParseOrderStatusError;
+use st0x_execution::{
+    EmptySymbolError, ExecutionError, InvalidDirectionError, InvalidExecutorError,
+    InvalidSharesError, PersistenceError,
+};
+use std::num::{ParseFloatError, TryFromIntError};
 use url::Url;
+
+use crate::dual_write::DualWriteError;
+use crate::position::PositionError;
+use crate::queue::EventQueueError;
+use crate::shares::SharesConversionError;
 
 pub(crate) mod accumulator;
 pub(crate) mod backfill;
@@ -15,6 +29,7 @@ pub(crate) mod trade;
 pub(crate) mod vault;
 
 pub(crate) use trade::OnchainTrade;
+pub(crate) use trade::TradeValidationError;
 
 #[derive(Deserialize)]
 pub(crate) struct EvmConfig {
@@ -34,6 +49,99 @@ pub(crate) struct EvmCtx {
     pub(crate) orderbook: Address,
     pub(crate) order_owner: Option<Address>,
     pub(crate) deployment_block: u64,
+}
+
+impl EvmCtx {
+    pub(crate) fn new(config: &EvmConfig, secrets: EvmSecrets) -> Self {
+        Self {
+            ws_rpc_url: secrets.ws_rpc_url,
+            orderbook: config.orderbook,
+            order_owner: config.order_owner,
+            deployment_block: config.deployment_block,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AlloyError {
+    #[error("Failed to get symbol: {0}")]
+    GetSymbol(#[from] alloy::contract::Error),
+    #[error("Sol type error: {0}")]
+    SolType(#[from] alloy::sol_types::Error),
+    #[error("RPC transport error: {0}")]
+    RpcTransport(#[from] RpcError<TransportErrorKind>),
+}
+
+/// Unified error type for onchain trade processing with clear domain boundaries.
+/// Provides error mapping between layers while maintaining separation of concerns.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OnChainError {
+    #[error("Trade validation error: {0}")]
+    Validation(#[from] TradeValidationError),
+    #[error("Database persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("Alloy error: {0}")]
+    Alloy(#[from] AlloyError),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
+    #[error("Event queue error: {0}")]
+    EventQueue(#[from] EventQueueError),
+    #[error("Order status parse error: {0}")]
+    OrderStatusParse(#[from] ParseOrderStatusError),
+    #[error("Invalid executor: {0}")]
+    InvalidExecutor(#[from] InvalidExecutorError),
+    #[error("Float conversion error: {0}")]
+    FloatConversion(#[from] FloatError),
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] TryFromIntError),
+    #[error(transparent)]
+    EmptySymbol(#[from] EmptySymbolError),
+    #[error(transparent)]
+    InvalidShares(#[from] InvalidSharesError),
+    #[error(transparent)]
+    InvalidDirection(#[from] InvalidDirectionError),
+    #[error("Dual write error: {0}")]
+    DualWrite(#[from] DualWriteError),
+    #[error("Position error: {0}")]
+    Position(#[from] PositionError),
+    #[error("Shares conversion error: {0}")]
+    SharesConversion(#[from] SharesConversionError),
+}
+
+impl From<sqlx::Error> for OnChainError {
+    fn from(err: sqlx::Error) -> Self {
+        Self::Persistence(PersistenceError::Database(err))
+    }
+}
+
+impl From<alloy::contract::Error> for OnChainError {
+    fn from(err: alloy::contract::Error) -> Self {
+        Self::Alloy(AlloyError::GetSymbol(err))
+    }
+}
+
+impl From<ParseFloatError> for OnChainError {
+    fn from(err: ParseFloatError) -> Self {
+        Self::Validation(TradeValidationError::U256ToF64(err))
+    }
+}
+
+impl From<FromUintError<usize>> for OnChainError {
+    fn from(err: FromUintError<usize>) -> Self {
+        Self::Validation(TradeValidationError::InvalidIndex(err))
+    }
+}
+
+impl From<alloy::sol_types::Error> for OnChainError {
+    fn from(err: alloy::sol_types::Error) -> Self {
+        Self::Alloy(AlloyError::SolType(err))
+    }
+}
+
+impl From<RpcError<TransportErrorKind>> for OnChainError {
+    fn from(err: RpcError<TransportErrorKind>) -> Self {
+        Self::Alloy(AlloyError::RpcTransport(err))
+    }
 }
 
 /// Number of block confirmations to wait after transactions before subsequent

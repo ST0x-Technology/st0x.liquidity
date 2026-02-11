@@ -6,7 +6,7 @@ use std::{
 };
 
 use crate::bindings::{IERC20::IERC20Instance, IOrderBookV5::IOV2};
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct SymbolCache {
@@ -89,7 +89,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         assert!(matches!(
             cache.get_io_symbol(provider, &io).await.unwrap_err(),
-            OnChainError::Alloy(crate::error::AlloyError::GetSymbol(_))
+            OnChainError::Alloy(crate::onchain::AlloyError::GetSymbol(_))
         ));
     }
 }

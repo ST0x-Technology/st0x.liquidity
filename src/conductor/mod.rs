@@ -8,7 +8,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::Query;
+use cqrs_es::{AggregateError, Query};
 use futures_util::{Stream, StreamExt};
 use sqlite_es::{SqliteCqrs, sqlite_cqrs};
 use sqlx::SqlitePool;
@@ -20,15 +20,17 @@ use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
-use st0x_execution::{EmptySymbolError, Executor, MarketOrder, SupportedExecutor, Symbol};
+use st0x_execution::{
+    AlpacaBrokerApiError, AlpacaTradingApiError, EmptySymbolError, ExecutionError, Executor,
+    MarketOrder, SchwabError, SupportedExecutor, Symbol,
+};
 
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
-use crate::config::Ctx;
+use crate::config::{ConfigError, Ctx};
 use crate::dashboard::ServerMessage;
 use crate::dual_write::DualWriteContext;
 use crate::equity_redemption::EquityRedemption;
-use crate::error::{EventProcessingError, EventQueueError};
 use crate::inventory::{
     InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
 };
@@ -43,8 +45,10 @@ use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmCtx, OnchainTrade, accumulator};
-use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::onchain::{EvmCtx, OnChainError, OnchainTrade, accumulator};
+use crate::queue::{
+    EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
+};
 use crate::rebalancing::{
     RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
     build_rebalancing_queries, spawn_rebalancer,
@@ -53,8 +57,39 @@ use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryError};
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
+
+/// Event processing errors for live event handling.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EventProcessingError {
+    #[error("Event queue error: {0}")]
+    Queue(#[from] EventQueueError),
+    #[error("Failed to enqueue ClearV3 event: {0}")]
+    EnqueueClearV3(#[source] EventQueueError),
+    #[error("Failed to enqueue TakeOrderV3 event: {0}")]
+    EnqueueTakeOrderV3(#[source] EventQueueError),
+    #[error("Database transaction error: {0}")]
+    Transaction(#[from] sqlx::Error),
+    #[error("Execution with ID {0} not found")]
+    ExecutionNotFound(i64),
+    #[error("Onchain trade processing error: {0}")]
+    OnChain(#[from] OnChainError),
+    #[error("Schwab execution error: {0}")]
+    Schwab(#[from] SchwabError),
+    #[error("Alpaca Broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
+    #[error("Alpaca Trading API error: {0}")]
+    AlpacaTradingApi(#[from] AlpacaTradingApiError),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
+    #[error(transparent)]
+    EmptySymbol(#[from] EmptySymbolError),
+    #[error("Config error: {0}")]
+    Config(#[from] ConfigError),
+    #[error("Vault registry command failed: {0}")]
+    VaultRegistry(#[from] AggregateError<VaultRegistryError>),
+}
 
 type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
@@ -1525,13 +1560,13 @@ mod tests {
     use sqlite_es::sqlite_cqrs;
 
     use st0x_execution::{
-        Direction, FractionalShares, MockExecutorCtx, OrderState, OrderStatus, Positive,
-        SupportedExecutor, Symbol, TryIntoExecutor,
+        Direction, FractionalShares, MockExecutorCtx, OrderState, OrderStatus, PersistenceError,
+        Positive, SupportedExecutor, Symbol, TryIntoExecutor,
     };
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::config::tests::create_test_ctx;
+    use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::offchain::execution::{
         OffchainExecution, find_executions_by_symbol_status_and_broker,
     };
@@ -1613,8 +1648,18 @@ mod tests {
 
         let duplicate_trade = existing_trade.clone();
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
-        assert!(duplicate_result.is_err());
+        let err = duplicate_trade
+            .save_within_transaction(&mut sql_tx2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OnChainError::Persistence(PersistenceError::Database(ref db_err))
+                if matches!(db_err, sqlx::Error::Database(_))
+            ),
+            "Expected database constraint violation, got: {err:?}"
+        );
         sql_tx2.rollback().await.unwrap();
 
         let count = OnchainTrade::db_count(&pool).await.unwrap();
@@ -1654,8 +1699,18 @@ mod tests {
 
         let duplicate_trade = existing_trade.clone();
         let mut sql_tx2 = pool.begin().await.unwrap();
-        let duplicate_result = duplicate_trade.save_within_transaction(&mut sql_tx2).await;
-        assert!(duplicate_result.is_err());
+        let err = duplicate_trade
+            .save_within_transaction(&mut sql_tx2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OnChainError::Persistence(PersistenceError::Database(ref db_err))
+                if matches!(db_err, sqlx::Error::Database(_))
+            ),
+            "Expected database constraint violation, got: {err:?}"
+        );
         sql_tx2.rollback().await.unwrap();
 
         let count = OnchainTrade::db_count(&pool).await.unwrap();
@@ -1665,7 +1720,9 @@ mod tests {
     #[tokio::test]
     async fn test_complete_event_processing_flow() {
         let pool = setup_test_db().await;
-        let ctx = create_test_ctx();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
 
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -1916,7 +1973,9 @@ mod tests {
     #[tokio::test]
     async fn test_process_queued_event_deserialization() {
         let pool = setup_test_db().await;
-        let ctx = create_test_ctx();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
 
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -2025,15 +2084,13 @@ mod tests {
         let mut clear_stream = stream::iter(vec![Ok((clear_event, log.clone()))]);
         let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
-        let result = wait_for_first_event_with_timeout(
+        let (events, block_number) = wait_for_first_event_with_timeout(
             &mut clear_stream,
             &mut take_stream,
             std::time::Duration::from_secs(1),
         )
-        .await;
-
-        assert!(result.is_some());
-        let (events, block_number) = result.unwrap();
+        .await
+        .unwrap();
         assert_eq!(block_number, 1000);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].0, TradeEvent::ClearV3(_)));
@@ -2061,14 +2118,15 @@ mod tests {
         let mut clear_stream = stream::iter(vec![Ok((clear_event, log))]);
         let mut take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
 
-        let result = wait_for_first_event_with_timeout(
-            &mut clear_stream,
-            &mut take_stream,
-            std::time::Duration::from_millis(100),
-        )
-        .await;
-
-        assert!(result.is_none());
+        assert!(
+            wait_for_first_event_with_timeout(
+                &mut clear_stream,
+                &mut take_stream,
+                std::time::Duration::from_millis(100),
+            )
+            .await
+            .is_none()
+        );
     }
 
     #[tokio::test]
@@ -2127,10 +2185,9 @@ mod tests {
         };
 
         let log = get_test_log();
-        let result =
-            process_live_event(&pool, TradeEvent::ClearV3(Box::new(clear_event)), log).await;
-
-        assert!(result.is_ok());
+        process_live_event(&pool, TradeEvent::ClearV3(Box::new(clear_event)), log)
+            .await
+            .unwrap();
 
         let count = crate::queue::count_unprocessed(&pool).await.unwrap();
         assert_eq!(count, 1);
@@ -2139,7 +2196,9 @@ mod tests {
     #[tokio::test]
     async fn test_clear_v2_event_filtering_without_errors() {
         let pool = setup_test_db().await;
-        let ctx = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
         let asserter = Asserter::new();
@@ -2193,7 +2252,6 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
         assert!(result.unwrap().is_none());
 
         let remaining_count = crate::queue::count_unprocessed(&pool).await.unwrap();
@@ -2206,10 +2264,13 @@ mod tests {
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
-        let result =
-            execute_pending_offchain_execution(&executor, &pool, &dual_write_context, 99999).await;
+        let error =
+            execute_pending_offchain_execution(&executor, &pool, &dual_write_context, 99999)
+                .await
+                .unwrap_err();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             EventProcessingError::ExecutionNotFound(99999)
         ));
     }
@@ -2376,10 +2437,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-                .await;
-        assert!(result.is_ok());
+        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+            .await
+            .unwrap();
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -2460,10 +2520,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
-                .await;
-        assert!(result.is_ok());
+        execute_pending_offchain_execution(&broker, &pool, &dual_write_context, execution_id)
+            .await
+            .unwrap();
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -2727,7 +2786,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_abort_all() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2742,7 +2803,7 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .spawn();
@@ -2760,7 +2821,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_individual_abort() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2775,7 +2838,7 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .spawn();
@@ -2806,7 +2869,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_builder_returns_immediately() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2823,7 +2888,7 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .spawn();
@@ -2841,7 +2906,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_without_rebalancer() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2856,7 +2923,7 @@ mod tests {
             snapshot_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
         };
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .spawn();
@@ -2868,7 +2935,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_with_rebalancer() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2889,7 +2958,7 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .with_rebalancer(rebalancer_handle)
@@ -2904,7 +2973,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_rebalancer_aborted_on_abort_all() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2925,7 +2996,7 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .with_rebalancer(rebalancer_handle)
@@ -2942,7 +3013,9 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2963,7 +3036,7 @@ mod tests {
             }
         });
 
-        let conductor = ConductorBuilder::new(config, pool, cache, provider, executor, frameworks)
+        let conductor = ConductorBuilder::new(ctx, pool, cache, provider, executor, frameworks)
             .with_executor_maintenance(None)
             .with_dex_event_streams(clear_stream, take_stream)
             .with_rebalancer(rebalancer_handle)
@@ -2998,7 +3071,9 @@ mod tests {
     #[tokio::test]
     async fn test_logs_info_when_event_is_filtered_out() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
         let asserter = Asserter::new();
@@ -3034,7 +3109,7 @@ mod tests {
 
         let result = process_next_queued_event(
             SupportedExecutor::DryRun,
-            &config,
+            &ctx,
             &pool,
             &provider,
             &dual_write_context,
@@ -3042,7 +3117,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        result.unwrap();
         assert!(
             logs_contain("Event filtered out"),
             "Expected info log when event is filtered"
@@ -3053,7 +3128,9 @@ mod tests {
     #[tokio::test]
     async fn test_logs_event_type_when_processing() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
         let asserter = Asserter::new();
@@ -3087,17 +3164,17 @@ mod tests {
             vault_registry_cqrs: &vault_registry_cqrs,
         };
 
-        let result = process_next_queued_event(
+        process_next_queued_event(
             SupportedExecutor::DryRun,
-            &config,
+            &ctx,
             &pool,
             &provider,
             &dual_write_context,
             &queue_context,
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert!(result.is_ok());
         assert!(
             logs_contain("ClearV3"),
             "Expected log to mention event type"

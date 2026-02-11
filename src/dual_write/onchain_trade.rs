@@ -181,11 +181,10 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = witness_trade(&context, &trade, 12345).await;
+        let error = witness_trade(&context, &trade, 12345).await.unwrap_err();
 
-        assert!(result.is_err());
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             DualWriteError::MissingBlockTimestamp { .. }
         ));
     }

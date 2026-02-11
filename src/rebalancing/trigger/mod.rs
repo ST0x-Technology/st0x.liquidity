@@ -52,13 +52,13 @@ pub enum RebalancingCtxError {
     InvalidAccountId(#[from] uuid::Error),
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub(crate) struct RebalancingSecrets {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
 }
 
-#[derive(Clone, Copy, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
@@ -664,7 +664,13 @@ mod tests {
         }
 
         trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -674,7 +680,13 @@ mod tests {
         trigger.usdc_in_progress.store(true, Ordering::SeqCst);
 
         trigger.check_and_trigger_usdc().await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -714,7 +726,13 @@ mod tests {
         trigger.check_and_trigger_equity(&symbol).await;
         trigger.check_and_trigger_usdc().await;
 
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     fn shares(n: i64) -> FractionalShares {
@@ -860,7 +878,13 @@ mod tests {
 
         // Verify no operation was triggered.
         trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -887,7 +911,13 @@ mod tests {
         while receiver.try_recv().is_ok() {}
 
         trigger.check_and_trigger_equity(&symbol).await;
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -913,7 +943,13 @@ mod tests {
             .await;
 
         // No operation should be triggered.
-        assert!(receiver.try_recv().is_err());
+        assert!(
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
+            "Expected channel to be empty (no message sent)"
+        );
     }
 
     #[tokio::test]
@@ -1041,7 +1077,10 @@ mod tests {
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
             "Expected no operation due to inflight"
         );
     }
@@ -1219,7 +1258,10 @@ mod tests {
         // With inflight, imbalance detection should not trigger anything.
         trigger.check_and_trigger_equity(&symbol).await;
         assert!(
-            receiver.try_recv().is_err(),
+            matches!(
+                receiver.try_recv().unwrap_err(),
+                mpsc::error::TryRecvError::Empty
+            ),
             "Expected no operation due to inflight"
         );
     }
@@ -1869,7 +1911,11 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("redemption_wallet"),
+            "Expected missing redemption_wallet error, got: {error}"
+        );
     }
 
     #[test]
@@ -1878,7 +1924,11 @@ mod tests {
             ethereum_rpc_url = "https://eth.example.com"
         "#;
 
-        assert!(toml::from_str::<RebalancingSecrets>(toml_str).is_err());
+        let error = toml::from_str::<RebalancingSecrets>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("evm_private_key"),
+            "Expected missing evm_private_key error, got: {error}"
+        );
     }
 
     #[test]
@@ -1892,7 +1942,11 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
+        let error = toml::from_str::<RebalancingConfig>(toml_str).unwrap_err();
+        assert!(
+            error.message().contains("equity_threshold"),
+            "Expected missing equity_threshold error, got: {error}"
+        );
     }
 
     type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;

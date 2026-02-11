@@ -231,8 +231,7 @@ mod tests {
 
     #[test]
     fn dollar_threshold_accepts_positive() {
-        let result = ExecutionThreshold::dollar_value(Usdc(Decimal::ONE));
-        assert!(result.is_ok());
+        ExecutionThreshold::dollar_value(Usdc(Decimal::ONE)).unwrap();
     }
 
     #[test]

@@ -17,7 +17,7 @@ use st0x_execution::{
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::dual_write::DualWriteContext;
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
@@ -178,9 +178,9 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
                 "   This transaction may not contain orderbook events matching the configured order hash."
             )?;
         }
-        Err(OnChainError::Validation(crate::error::TradeValidationError::TransactionNotFound(
-            hash,
-        ))) => {
+        Err(OnChainError::Validation(
+            crate::onchain::TradeValidationError::TransactionNotFound(hash),
+        )) => {
             writeln!(stdout, "❌ Transaction not found: {hash}")?;
             writeln!(
                 stdout,

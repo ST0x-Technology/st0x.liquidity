@@ -718,17 +718,10 @@ mod tests {
             Ok::<Bytes, AttestationError>(Bytes::from(attestation_bytes))
         };
 
-        let result = fetch_attestation.retry(backoff).await;
+        let error = fetch_attestation.retry(backoff).await.unwrap_err();
 
         assert!(
-            result.is_err(),
-            "Expected attestation to fail after max retries"
-        );
-        assert!(
-            matches!(
-                result.unwrap_err(),
-                AttestationError::NotYetAvailable { status: 404 }
-            ),
+            matches!(error, AttestationError::NotYetAvailable { status: 404 }),
             "Expected AttestationError::NotYetAvailable with status 404"
         );
         assert!(

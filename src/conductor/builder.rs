@@ -15,11 +15,11 @@ use st0x_execution::Executor;
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
 use crate::dual_write::DualWriteContext;
-use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
 use crate::symbol::cache::SymbolCache;
 
+use super::EventProcessingError;
 use super::{
     Conductor, InventorySnapshotAggregate, VaultRegistryAggregate, spawn_event_processor,
     spawn_inventory_poller, spawn_onchain_event_receiver, spawn_order_poller,

@@ -17,7 +17,6 @@ pub mod config;
 pub(crate) mod dashboard;
 mod dual_write;
 mod equity_redemption;
-mod error;
 mod error_decoding;
 mod inventory;
 mod lifecycle;
@@ -253,7 +252,7 @@ async fn run_with_executor<E>(
 ) -> anyhow::Result<()>
 where
     E: Executor + Clone + Send + 'static,
-    error::EventProcessingError: From<E::Error>,
+    conductor::EventProcessingError: From<E::Error>,
 {
     let executor_maintenance = executor.run_executor_maintenance().await;
 
@@ -262,10 +261,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::Address;
+    use alloy::primitives::{Address, address};
 
     use super::*;
-    use crate::config::tests::create_test_ctx;
+    use crate::config::tests::create_test_ctx_with_order_owner;
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
@@ -280,7 +279,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_function_websocket_connection_error() {
-        let mut ctx = create_test_ctx();
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let pool = create_test_pool().await;
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
         Box::pin(run(ctx, pool, create_test_event_sender()))
@@ -290,7 +291,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_function_invalid_orderbook_address() {
-        let mut ctx = create_test_ctx();
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         let pool = create_test_pool().await;
         ctx.evm.orderbook = Address::ZERO;
         ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
@@ -301,7 +304,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_function_error_propagation() {
-        let mut ctx = create_test_ctx();
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
         ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
         Box::pin(run(ctx, pool, create_test_event_sender()))

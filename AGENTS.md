@@ -21,6 +21,10 @@ the limit:
   ENTIRE file meets the limit, not just your additions.
 - **No warnings or errors pass through** - CI and review catch everything. If
   you see a warning/error, it's your responsibility to fix it now.
+- **Work until all tasks are complete** - do not stop until every assigned task
+  is done, unless you need input from the user to proceed. If blocked on one
+  task, move to the next. Only stop working when the task list is clear or you
+  genuinely cannot proceed without user input.
 
 ## Communication
 
@@ -37,6 +41,7 @@ When spawning background subagents for parallel work, the following rules apply:
 **Allowed tools:** Read, Edit, Write, Glob, Grep, WebFetch, WebSearch.
 
 **FORBIDDEN in subagents:**
+
 - `Bash` for ANY purpose - no `sed`, `awk`, `grep`, `find`, `cat`, shell loops,
   `curl`, or ad-hoc scripts. Use the dedicated Read/Edit/Glob/Grep tools instead
 - `cargo` commands - the Cargo.lock will compete across parallel agents and
@@ -48,6 +53,7 @@ When spawning background subagents for parallel work, the following rules apply:
 **Prompt template for subagents:**
 
 Every subagent prompt MUST include these constraints verbatim:
+
 ```
 RULES:
 - Use ONLY Read, Edit, Write, Glob, Grep tools. NEVER use Bash.
@@ -57,8 +63,8 @@ RULES:
 ```
 
 **Scope:** Each subagent should have a narrow, well-defined task (e.g., "rename
-X to Y in these 3 files"). Do not give subagents broad exploratory mandates
-that could lead to unintended changes.
+X to Y in these 3 files"). Do not give subagents broad exploratory mandates that
+could lead to unintended changes.
 
 ## Planning Hierarchy
 
@@ -792,12 +798,23 @@ helpers.
 This pattern applies across the entire workspace, including both the main crate
 and sub-crates like `st0x-execution`.
 
-#### Use `.unwrap` over boolean result assertions in tests
+#### Never use `is_err()`/`is_ok()` assertions in tests
 
-Instead of `assert!(result.is_err()); assert!(matches!(...))`, write
-`assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));` directly.
-Similarly, instead of `assert!(result.is_ok()); assert_eq!(...)`, write
-`assert_eq!(result.unwrap(), "expected_value");` so unexpected values are shown.
+`assert!(result.is_err())` is never acceptable - every error test must verify
+the exact error variant:
+
+```rust
+// FORBIDDEN: doesn't check which error
+assert!(result.is_err());
+
+// REQUIRED: unwrap first, then assert the exact variant
+let error = result.unwrap_err();
+assert!(matches!(error, SomeError::SpecificVariant { .. }));
+```
+
+`assert!(result.is_ok())` is equally bad - just call `.unwrap()`.
+
+**FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`
 
 #### Assertions must be specific
 
@@ -849,8 +866,8 @@ Wrap primitives in newtypes to prevent mixing incompatible values at call sites
 ##### The Typestate Pattern:
 
 Encode runtime state in compile-time types to eliminate runtime checks. Use for
-protocol enforcement and builder patterns (e.g.,
-`Connection<Unauthenticated>` -> `Connection<Authenticated>`).
+protocol enforcement and builder patterns (e.g., `Connection<Unauthenticated>`
+-> `Connection<Authenticated>`).
 
 #### Avoid deep nesting
 
@@ -861,7 +878,8 @@ maintainability. This includes test modules - do NOT nest submodules inside
 ##### Techniques for flat code:
 
 - **Early returns** with `?` and `return Err(...)` instead of nested `if let`
-- **let-else** for guard clauses: `let Some(x) = expr else { return Err(...); };`
+- **let-else** for guard clauses:
+  `let Some(x) = expr else { return Err(...); };`
 - **Pattern matching with guards** instead of nested `if let` chains
 
 #### Struct field access

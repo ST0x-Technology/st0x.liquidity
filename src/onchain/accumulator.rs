@@ -5,12 +5,13 @@ use st0x_execution::{
 };
 use tracing::{debug, info, warn};
 
+use super::OnChainError;
 use super::OnchainTrade;
 use crate::dual_write::{DualWriteContext, load_position};
-use crate::error::{OnChainError, TradeValidationError};
 use crate::lock::{clear_execution_lease, set_pending_execution_id, try_acquire_execution_lease};
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::position_calculator::{AccumulationBucket, PositionCalculator};
+use crate::onchain::trade::TradeValidationError;
 use crate::trade_execution_link::TradeExecutionLink;
 
 #[derive(Debug, Clone)]

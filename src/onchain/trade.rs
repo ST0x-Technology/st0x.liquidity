@@ -1,3 +1,4 @@
+use alloy::primitives::ruint::FromUintError;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -5,17 +6,79 @@ use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
+use st0x_execution::{Direction, FractionalShares, Positive};
+use std::num::ParseFloatError;
 use tracing::{error, warn};
 
-use st0x_execution::Direction;
-
+use super::OnChainError;
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
-use crate::error::{OnChainError, TradeValidationError};
 use crate::onchain::EvmCtx;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
+
+/// Business logic validation errors for trade processing rules.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TradeValidationError {
+    #[error("No transaction hash found in log")]
+    NoTxHash,
+    #[error("No log index found in log")]
+    NoLogIndex,
+    #[error("No block number found in log")]
+    NoBlockNumber,
+    #[error("Integer conversion error: {0}")]
+    IntConversion(#[from] std::num::TryFromIntError),
+    #[error("Invalid IO index: {0}")]
+    InvalidIndex(#[from] FromUintError<usize>),
+    #[error("No input found at index: {0}")]
+    NoInputAtIndex(usize),
+    #[error("No output found at index: {0}")]
+    NoOutputAtIndex(usize),
+    #[error(
+        "Expected IO to contain USDC and one tokenized equity (t prefix, 0x or s1 suffix) but got {0} and {1}"
+    )]
+    InvalidSymbolConfiguration(String, String),
+    #[error(
+        "Could not fully allocate execution shares for symbol {symbol}. Remaining: {remaining_shares}"
+    )]
+    InsufficientTradeAllocation {
+        symbol: String,
+        remaining_shares: f64,
+    },
+    #[error("Failed to convert U256 to f64: {0}")]
+    U256ToF64(#[from] ParseFloatError),
+    #[error("Transaction not found: {0}")]
+    TransactionNotFound(B256),
+    #[error(
+        "Node provider issue: tx receipt missing or has no logs. \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    NodeReceiptMissing {
+        block_number: u64,
+        tx_hash: B256,
+        clear_log_index: u64,
+    },
+    #[error(
+        "Unexpected: tx receipt has ClearV3 but no AfterClearV2 (should be impossible). \
+        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
+    )]
+    AfterClearMissingFromReceipt {
+        block_number: u64,
+        tx_hash: B256,
+        clear_log_index: u64,
+    },
+    #[error("Negative shares amount: {0}")]
+    NegativeShares(f64),
+    #[error("Share quantity {0} cannot be converted to f64")]
+    ShareConversionFailed(Positive<FractionalShares>),
+    #[error("Negative USDC amount: {0}")]
+    NegativeUsdc(f64),
+    #[error(
+        "Symbol '{0}' is not a tokenized equity (must start with 't' or end with '0x' or 's1')"
+    )]
+    NotTokenizedEquity(String),
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
@@ -395,9 +458,7 @@ impl OnchainTrade {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
-                OnChainError::Validation(crate::error::TradeValidationError::TransactionNotFound(
-                    tx_hash,
-                ))
+                OnChainError::Validation(TradeValidationError::TransactionNotFound(tx_hash))
             })?;
 
         let trades: Vec<_> = receipt
@@ -507,6 +568,7 @@ mod tests {
     use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
+    use st0x_execution::PersistenceError;
 
     use super::*;
     use crate::bindings::IOrderBookV5;
@@ -673,15 +735,17 @@ mod tests {
         .execute(&pool)
         .await;
 
-        // The insert should fail due to tx_hash constraint
-        assert!(insert_result.is_err());
+        let err = insert_result.unwrap_err();
+        assert!(
+            matches!(err, sqlx::Error::Database(_)),
+            "Expected database constraint error, got: {err:?}"
+        );
     }
 
     #[tokio::test]
     async fn test_find_by_tx_hash_and_log_index_invalid_direction() {
         let pool = setup_test_db().await;
 
-        // Attempt to insert invalid direction data - should fail due to constraint
         let insert_result = sqlx::query!(
             "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
              VALUES ('0x1234567890123456789012345678901234567890123456789012345678901234', 1, 'TEST', 1.0, 'INVALID', 1.0)"
@@ -689,8 +753,11 @@ mod tests {
         .execute(&pool)
         .await;
 
-        // The insert should fail due to direction constraint
-        assert!(insert_result.is_err());
+        let err = insert_result.unwrap_err();
+        assert!(
+            matches!(err, sqlx::Error::Database(_)),
+            "Expected database constraint error for invalid direction, got: {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -762,9 +829,14 @@ mod tests {
 
         let mut sql_tx = pool.begin().await.unwrap();
 
-        // This should fail due to log_index constraint (log_index >= 0)
-        let save_result = trade.save_within_transaction(&mut sql_tx).await;
-        assert!(save_result.is_err());
+        let err = trade
+            .save_within_transaction(&mut sql_tx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OnChainError::IntConversion(_)),
+            "Expected integer conversion error for u64::MAX log_index, got: {err:?}"
+        );
         sql_tx.rollback().await.unwrap();
     }
 

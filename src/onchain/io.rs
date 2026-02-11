@@ -4,7 +4,8 @@
 use std::fmt;
 use std::str::FromStr;
 
-use crate::error::{OnChainError, TradeValidationError};
+use super::OnChainError;
+use crate::onchain::trade::TradeValidationError;
 use st0x_execution::{Direction, Symbol};
 
 /// Test-only macro to create a TokenizedEquitySymbol.
@@ -263,15 +264,38 @@ mod tests {
 
     #[test]
     fn test_tokenized_equity_symbol_parse() {
-        // Test that TokenizedEquitySymbol::parse correctly identifies tokenized symbols
-        assert!(TokenizedEquitySymbol::parse("AAPL0x").is_ok());
-        assert!(TokenizedEquitySymbol::parse("NVDAs1").is_ok());
-        assert!(TokenizedEquitySymbol::parse("GME0x").is_ok());
-        assert!(TokenizedEquitySymbol::parse("tGME").is_ok());
-        assert!(TokenizedEquitySymbol::parse("tAAPL").is_ok());
-        assert!(TokenizedEquitySymbol::parse("USDC").is_err());
-        assert!(TokenizedEquitySymbol::parse("AAPL").is_err());
-        assert!(TokenizedEquitySymbol::parse("").is_err());
+        TokenizedEquitySymbol::parse("AAPL0x").unwrap();
+        TokenizedEquitySymbol::parse("NVDAs1").unwrap();
+        TokenizedEquitySymbol::parse("GME0x").unwrap();
+        TokenizedEquitySymbol::parse("tGME").unwrap();
+        TokenizedEquitySymbol::parse("tAAPL").unwrap();
+
+        let err = TokenizedEquitySymbol::parse("USDC").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OnChainError::Validation(TradeValidationError::NotTokenizedEquity(ref s)) if s == "USDC"
+            ),
+            "Expected NotTokenizedEquity for USDC, got: {err:?}"
+        );
+
+        let err = TokenizedEquitySymbol::parse("AAPL").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OnChainError::Validation(TradeValidationError::NotTokenizedEquity(ref s)) if s == "AAPL"
+            ),
+            "Expected NotTokenizedEquity for AAPL, got: {err:?}"
+        );
+
+        let err = TokenizedEquitySymbol::parse("").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OnChainError::Validation(TradeValidationError::NotTokenizedEquity(ref s)) if s.is_empty()
+            ),
+            "Expected NotTokenizedEquity for empty string, got: {err:?}"
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use sqlx::SqlitePool;
 
-use crate::error::OnChainError;
+use crate::onchain::OnChainError;
 use st0x_execution::{
     Direction, FractionalShares, OrderState, OrderStatus, PersistenceError, Positive,
     SupportedExecutor, Symbol,

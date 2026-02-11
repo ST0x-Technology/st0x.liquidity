@@ -1,7 +1,7 @@
 use num_traits::ToPrimitive;
 use rand::Rng;
 use sqlx::SqlitePool;
-use st0x_execution::{Executor, OrderState, OrderStatus, PersistenceError, Symbol};
+use st0x_execution::{ExecutionError, Executor, OrderState, OrderStatus, PersistenceError, Symbol};
 use std::time::Duration;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
@@ -10,8 +10,27 @@ use super::execution::{
     OffchainExecution, find_execution_by_id, find_executions_by_symbol_status_and_broker,
 };
 use crate::dual_write::DualWriteContext;
-use crate::error::{OnChainError, OrderPollingError};
 use crate::lock::{clear_execution_lease, clear_pending_execution_id, renew_execution_lease};
+use crate::onchain::OnChainError;
+
+/// Order polling errors for order status monitoring.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OrderPollingError {
+    #[error("Executor error: {0}")]
+    Executor(Box<dyn std::error::Error + Send + Sync>),
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+    #[error("Persistence error: {0}")]
+    Persistence(#[from] PersistenceError),
+    #[error("Onchain error: {0}")]
+    OnChain(#[from] OnChainError),
+}
+
+impl From<ExecutionError> for OrderPollingError {
+    fn from(err: ExecutionError) -> Self {
+        Self::Executor(Box::new(err))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OrderPollerConfig {

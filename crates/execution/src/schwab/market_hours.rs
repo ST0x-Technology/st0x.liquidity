@@ -485,19 +485,25 @@ mod tests {
 
     #[test]
     fn test_parse_date_invalid() {
-        assert!(parse_date("invalid-date").is_err());
+        let error = parse_date("invalid-date").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid"),
+            "Expected parse error for invalid date, got: {error}"
+        );
     }
 
     #[test]
     fn test_parse_datetime_rfc3339() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        assert!(parse_datetime("2025-01-03T09:30:00-05:00", date).is_ok());
+        let parsed = parse_datetime("2025-01-03T09:30:00-05:00", date).unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2025, 1, 3, 14, 30, 0).unwrap());
     }
 
     #[test]
     fn test_parse_datetime_time_only() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        assert!(parse_datetime("09:30:00", date).is_ok());
+        let parsed = parse_datetime("09:30:00", date).unwrap();
+        assert_eq!(parsed, Utc.with_ymd_and_hms(2025, 1, 3, 14, 30, 0).unwrap());
     }
 
     #[test]
