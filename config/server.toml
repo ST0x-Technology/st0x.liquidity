@@ -9,16 +9,8 @@ service_name = "st0x-hedge"
 orderbook = "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
 deployment_block = 40850446
 
-[broker]
-type = "alpaca-broker-api"
-# NOTE: if you're reviewing the infra PR, let me know if we should move this to
-# secrets or if setting the value here is fine
-account_id = "00000000-0000-0000-0000-000000000000"
-mode = "production"
-
 [rebalancing]
-# TODO: update to the fireblocks one
-redemption_wallet = "0xe75F9042728C3aD626B1aa283fD9A7fcaF63Bf1d"
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
 usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffaabb"
 
 [rebalancing.equity_threshold]

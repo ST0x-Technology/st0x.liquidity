@@ -1277,12 +1277,9 @@ mod tests {
     fn test_cli_command_structure_validation() {
         let cmd = Cli::command();
 
-        assert!(
-            cmd.clone()
-                .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL"])
-                .is_err(),
-            "buy without quantity should fail"
-        );
+        cmd.clone()
+            .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL"])
+            .unwrap_err();
 
         let _err = cmd
             .clone()

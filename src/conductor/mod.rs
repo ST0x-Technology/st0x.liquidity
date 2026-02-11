@@ -289,7 +289,9 @@ impl Conductor {
         let cutoff_block =
             get_cutoff_block(&mut clear_stream, &mut take_stream, &provider, pool).await?;
 
-        backfill_events(pool, &provider, &ctx.evm, cutoff_block - 1).await?;
+        if let Some(end_block) = cutoff_block.checked_sub(1) {
+            backfill_events(pool, &provider, &ctx.evm, end_block).await?;
+        }
 
         let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
         let position_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));

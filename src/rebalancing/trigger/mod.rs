@@ -53,12 +53,14 @@ pub enum RebalancingCtxError {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingSecrets {
     pub(crate) ethereum_rpc_url: Url,
     pub(crate) evm_private_key: B256,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,

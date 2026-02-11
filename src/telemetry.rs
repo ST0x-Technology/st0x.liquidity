@@ -73,11 +73,13 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TelemetryConfig {
     pub(crate) service_name: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TelemetrySecrets {
     pub(crate) api_key: String,
 }

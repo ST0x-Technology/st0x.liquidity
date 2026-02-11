@@ -127,7 +127,7 @@ struct TimeRange {
 ///
 /// Uses the `/marketdata/v1/markets/{marketId}` endpoint with "equity" as the market ID.
 /// Returns market hours in Eastern timezone per the API specification.
-pub async fn fetch_market_hours(
+pub(crate) async fn fetch_market_hours(
     config: &SchwabAuthConfig,
     pool: &SqlitePool,
     date: Option<&str>,

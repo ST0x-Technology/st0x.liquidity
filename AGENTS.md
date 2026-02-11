@@ -765,9 +765,9 @@ type is a byproduct of the function's implementation.
 
 #### Line width in docstrings and macros
 
-Module docstrings (`//!`) and long strings inside attribute macros (e.g.,
-`#[error(...)]`) must not exceed 80 characters per line. `cargo fmt` does not
-enforce this (without nightly rustfmt), so it must be checked manually.
+All doc comments (`//!` and `///`) and long strings inside attribute macros
+(e.g., `#[error(...)]`) must not exceed 80 characters per line. `cargo fmt` does
+not enforce this (without nightly rustfmt), so be careful and check manually.
 
 For multi-line `#[error]` strings, use `\` continuation:
 

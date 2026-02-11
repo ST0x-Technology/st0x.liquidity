@@ -40,6 +40,7 @@ pub(crate) enum Imbalance<T> {
 
 /// Threshold configuration for imbalance detection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
     pub(crate) target: Decimal,

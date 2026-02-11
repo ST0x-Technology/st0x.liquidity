@@ -36,6 +36,7 @@ pub(crate) use trade::OnchainTrade;
 pub(crate) use trade::TradeValidationError;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EvmConfig {
     pub(crate) orderbook: Address,
     pub(crate) order_owner: Option<Address>,
@@ -43,6 +44,7 @@ pub(crate) struct EvmConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct EvmSecrets {
     pub(crate) ws_rpc_url: Url,
 }

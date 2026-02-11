@@ -39,6 +39,7 @@ pub struct Env {
 
 /// Non-secret settings deserialized from the plaintext config TOML.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Config {
     database_url: String,
     log_level: Option<LogLevel>,
@@ -53,6 +54,7 @@ struct Config {
 
 /// Secret credentials deserialized from the encrypted secrets TOML.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Secrets {
     evm: EvmSecrets,
     broker: BrokerSecrets,
@@ -64,7 +66,7 @@ struct Secrets {
 /// Broker type tag and all broker credentials.
 /// Deserialized from the `[broker]` section of the secrets TOML.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum BrokerSecrets {
     Schwab {
         app_key: String,
@@ -405,8 +407,8 @@ pub(crate) mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use tracing_test::traced_test;
 
-    use st0x_execution::MockExecutorCtx;
     use st0x_execution::TryIntoExecutor;
+    use st0x_execution::{MockExecutor, MockExecutorCtx};
 
     use super::*;
     use crate::onchain::EvmCtx;
@@ -538,14 +540,13 @@ pub(crate) mod tests {
             panic!("Expected Schwab broker config");
         };
         let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
-        let schwab_result = schwab_ctx.try_into_executor().await;
-        assert!(
-            schwab_result.is_err(),
-            "Schwab executor should fail without tokens"
-        );
+        schwab_ctx.try_into_executor().await.unwrap_err();
 
-        let test_executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        assert!(format!("{test_executor:?}").contains("MockExecutor"));
+        // MockExecutorCtx implements TryIntoExecutor, which produces a
+        // MockExecutor via the Executor trait's associated Ctx type.
+        // The type annotation verifies the correct executor type is
+        // produced; .unwrap() verifies construction succeeds.
+        let _: MockExecutor = MockExecutorCtx.try_into_executor().await.unwrap();
     }
 
     #[test]
@@ -927,5 +928,66 @@ pub(crate) mod tests {
         assert!(matches!(ctx.broker, BrokerCtx::AlpacaBrokerApi(_)));
         assert!(ctx.rebalancing.is_some());
         assert!(ctx.telemetry.is_some());
+    }
+
+    #[test]
+    fn server_config_toml_is_valid() {
+        let config_str = include_str!("../config/server.toml");
+        toml::from_str::<Config>(config_str).unwrap();
+    }
+
+    #[test]
+    fn unknown_config_fields_rejected() {
+        let config = r#"
+            database_url = ":memory:"
+            bogus_field = "should fail"
+            [evm]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            order_owner = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            deployment_block = 1
+        "#;
+
+        let err = Ctx::from_toml(config, dry_run_secrets_toml()).unwrap_err();
+        assert!(
+            matches!(err, CtxError::Toml(_)),
+            "Expected TOML parse error for unknown field, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_secrets_fields_rejected() {
+        let secrets = r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            extra_secret = "should fail"
+            [broker]
+            type = "dry-run"
+        "#;
+
+        let err = Ctx::from_toml(minimal_config_toml(), secrets).unwrap_err();
+        assert!(
+            matches!(err, CtxError::Toml(_)),
+            "Expected TOML parse error for unknown field, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_broker_secrets_fields_rejected() {
+        let secrets = r#"
+            [evm]
+            ws_rpc_url = "ws://localhost:8545"
+            [broker]
+            type = "alpaca-broker-api"
+            api_key = "key"
+            api_secret = "secret"
+            account_id = "id"
+            unknown_field = "should fail"
+        "#;
+
+        let err = Ctx::from_toml(minimal_config_toml(), secrets).unwrap_err();
+        assert!(
+            matches!(err, CtxError::Toml(_)),
+            "Expected TOML parse error for unknown broker field, got {err:?}"
+        );
     }
 }
