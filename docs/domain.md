@@ -9,12 +9,12 @@ the st0x liquidity codebase. Code names must be consistent with this document.
 
 Types follow a strict naming convention based on their role:
 
-| Suffix     | Meaning                  | Source                               | Example                         |
-| ---------- | ------------------------ | ------------------------------------ | ------------------------------- |
-| `*Env`     | CLI args / env vars      | clap-powered struct                  | `ServerEnv`, `ReporterEnv`      |
-| `*Config`  | Non-secret settings      | Plaintext TOML (`config/*.toml`)     | `SchwabConfig`, `EvmConfig`     |
-| `*Secrets` | Secret credentials       | Encrypted TOML (`secret/*.toml.age`) | `SchwabSecrets`, `EvmSecrets`   |
-| `*Ctx`     | Combined runtime context | Assembled from runtime state         | `SchwabCtx`, `EvmCtx`           |
+| Suffix     | Meaning                  | Source                               | Example                       |
+| ---------- | ------------------------ | ------------------------------------ | ----------------------------- |
+| `*Env`     | CLI args / env vars      | clap-powered struct                  | `ServerEnv`, `ReporterEnv`    |
+| `*Config`  | Non-secret settings      | Plaintext TOML (`config/*.toml`)     | `SchwabConfig`, `EvmConfig`   |
+| `*Secrets` | Secret credentials       | Encrypted TOML (`secret/*.toml.age`) | `SchwabSecrets`, `EvmSecrets` |
+| `*Ctx`     | Combined runtime context | Assembled from runtime state         | `SchwabCtx`, `EvmCtx`         |
 
 **Rules:**
 
@@ -31,7 +31,6 @@ Types follow a strict naming convention based on their role:
   files. Library crates (e.g., `st0x-execution`) may use `*Ctx` as their public
   construction interface without splitting Config from Secrets - that split
   belongs in the caller.
-
 
 ## Domain Glossary
 
@@ -51,8 +50,8 @@ venue:
 
 An abstraction over an offchain trading venue. The `Executor` trait provides a
 uniform interface for placing market orders, polling order status, and querying
-inventory regardless of which brokerage is used. Implementations:
-`Schwab`, `AlpacaTradingApi`, `AlpacaBrokerApi`, `MockExecutor`.
+inventory regardless of which brokerage is used. Implementations: `Schwab`,
+`AlpacaTradingApi`, `AlpacaBrokerApi`, `MockExecutor`.
 
 ### Conductor
 

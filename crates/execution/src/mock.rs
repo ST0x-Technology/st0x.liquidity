@@ -11,7 +11,7 @@ use crate::{
     OrderUpdate, SupportedExecutor, TryIntoExecutor,
 };
 
-/// Context for MockExecutor (unit struct — no context needed)
+/// Context for MockExecutor (unit struct - no context needed)
 #[derive(Debug, Clone, Default)]
 pub struct MockExecutorCtx;
 

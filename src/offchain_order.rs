@@ -870,10 +870,11 @@ impl DomainEvent for OffchainOrderEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use cqrs_es::EventEnvelope;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
+
+    use super::*;
 
     #[tokio::test]
     async fn test_place_order() {

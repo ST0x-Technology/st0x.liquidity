@@ -4,6 +4,38 @@ use alloy::transports::layers::RetryBackoffLayer;
 use serde::Deserialize;
 use url::Url;
 
+pub(crate) mod accumulator;
+pub(crate) mod backfill;
+mod clear;
+pub(crate) mod io;
+pub(crate) mod position_calculator;
+pub(crate) mod pyth;
+mod take_order;
+pub(crate) mod trade;
+pub(crate) mod vault;
+
+pub(crate) use trade::OnchainTrade;
+
+#[derive(Deserialize)]
+pub(crate) struct EvmConfig {
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Option<Address>,
+    pub(crate) deployment_block: u64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct EvmSecrets {
+    pub(crate) ws_rpc_url: Url,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct EvmCtx {
+    pub(crate) ws_rpc_url: Url,
+    pub(crate) orderbook: Address,
+    pub(crate) order_owner: Option<Address>,
+    pub(crate) deployment_block: u64,
+}
+
 /// Number of block confirmations to wait after transactions before subsequent
 /// operations that depend on the state change. This ensures state propagates
 /// across load-balanced RPC providers (like dRPC) that may route requests to
@@ -30,24 +62,4 @@ pub(crate) fn http_client_with_retry(url: Url) -> RpcClient {
         RPC_COMPUTE_UNITS_PER_SECOND,
     );
     RpcClient::builder().layer(retry_layer).http(url)
-}
-
-pub(crate) mod accumulator;
-pub(crate) mod backfill;
-mod clear;
-pub(crate) mod io;
-pub(crate) mod position_calculator;
-pub(crate) mod pyth;
-mod take_order;
-pub(crate) mod trade;
-pub(crate) mod vault;
-
-pub use trade::OnchainTrade;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct EvmConfig {
-    pub ws_rpc_url: url::Url,
-    pub orderbook: Address,
-    pub order_owner: Option<Address>,
-    pub deployment_block: u64,
 }

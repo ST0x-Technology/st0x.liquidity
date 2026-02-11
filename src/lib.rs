@@ -40,26 +40,26 @@ mod usdc_rebalance;
 mod vault_registry;
 
 pub use dashboard::export_bindings;
-pub use telemetry::{TelemetryError, TelemetryGuard};
+pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(test)]
 pub mod test_utils;
 
-use crate::config::{BrokerConfig, Config};
-use st0x_execution::schwab::{SchwabConfig, SchwabError};
-use st0x_execution::{ExecutionError, Executor, MockExecutorConfig, TryIntoExecutor};
+use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
 
-pub async fn launch(config: Config) -> anyhow::Result<()> {
+use crate::config::{BrokerConfig, Ctx};
+
+pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     let launch_span = info_span!("launch");
     let _enter = launch_span.enter();
 
-    let pool = config.get_sqlite_pool().await?;
+    let pool = ctx.get_sqlite_pool().await?;
     sqlx::migrate!().run(&pool).await?;
 
     let (event_sender, _) = broadcast::channel::<ServerMessage>(256);
 
-    let server_task = spawn_server_task(&config, &pool, event_sender.clone());
-    let bot_task = spawn_bot_task(config, pool, event_sender);
+    let server_task = spawn_server_task(&ctx, &pool, event_sender.clone());
+    let bot_task = spawn_bot_task(ctx, pool, event_sender);
 
     await_shutdown(server_task, bot_task).await;
 
@@ -68,19 +68,19 @@ pub async fn launch(config: Config) -> anyhow::Result<()> {
 }
 
 fn spawn_server_task(
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> JoinHandle<Result<Rocket<Ignite>, rocket::Error>> {
     let rocket_config = rocket::Config::figment()
-        .merge(("port", config.server_port))
+        .merge(("port", ctx.server_port))
         .merge(("address", "0.0.0.0"));
 
     let rocket = rocket::custom(rocket_config)
         .mount("/", api::routes())
         .mount("/api", dashboard::routes())
         .manage(pool.clone())
-        .manage(config.clone())
+        .manage(ctx.clone())
         .manage(dashboard::Broadcast {
             sender: event_sender,
         });
@@ -89,7 +89,7 @@ fn spawn_server_task(
 }
 
 fn spawn_bot_task(
-    config: Config,
+    ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> JoinHandle<()> {
@@ -97,7 +97,7 @@ fn spawn_bot_task(
         let bot_span = info_span!("bot_task");
         let _enter = bot_span.enter();
 
-        if let Err(e) = Box::pin(run(config, pool, event_sender)).await {
+        if let Err(e) = Box::pin(run(ctx, pool, event_sender)).await {
             error!("Bot failed: {e}");
         }
     })
@@ -153,14 +153,14 @@ fn log_bot_result(result: Result<(), JoinError>) {
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 async fn run(
-    config: Config,
+    ctx: Ctx,
     pool: SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
     const RERUN_DELAY_SECS: u64 = 10;
 
     loop {
-        let result = Box::pin(run_bot_session(&config, &pool, event_sender.clone())).await;
+        let result = Box::pin(run_bot_session(&ctx, &pool, event_sender.clone())).await;
 
         match result {
             Ok(()) => {
@@ -188,17 +188,17 @@ async fn run(
 
 #[tracing::instrument(skip_all, level = tracing::Level::INFO)]
 async fn run_bot_session(
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     event_sender: broadcast::Sender<ServerMessage>,
 ) -> anyhow::Result<()> {
-    match &config.broker {
+    match &ctx.broker {
         BrokerConfig::DryRun => {
             info!("Initializing test executor for dry-run mode");
-            let executor = MockExecutorConfig.try_into_executor().await?;
+            let executor = MockExecutorCtx.try_into_executor().await?;
 
             Box::pin(run_with_executor(
-                config.clone(),
+                ctx.clone(),
                 pool.clone(),
                 executor,
                 event_sender,
@@ -207,14 +207,11 @@ async fn run_bot_session(
         }
         BrokerConfig::Schwab(schwab_auth) => {
             info!("Initializing Schwab executor");
-            let schwab_config = SchwabConfig {
-                auth: schwab_auth.clone(),
-                pool: pool.clone(),
-            };
-            let executor = schwab_config.try_into_executor().await?;
+            let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+            let executor = schwab_ctx.try_into_executor().await?;
 
             Box::pin(run_with_executor(
-                config.clone(),
+                ctx.clone(),
                 pool.clone(),
                 executor,
                 event_sender,
@@ -226,7 +223,7 @@ async fn run_bot_session(
             let executor = alpaca_auth.clone().try_into_executor().await?;
 
             Box::pin(run_with_executor(
-                config.clone(),
+                ctx.clone(),
                 pool.clone(),
                 executor,
                 event_sender,
@@ -238,7 +235,7 @@ async fn run_bot_session(
             let executor = alpaca_auth.clone().try_into_executor().await?;
 
             Box::pin(run_with_executor(
-                config.clone(),
+                ctx.clone(),
                 pool.clone(),
                 executor,
                 event_sender,
@@ -249,7 +246,7 @@ async fn run_bot_session(
 }
 
 async fn run_with_executor<E>(
-    config: Config,
+    ctx: Ctx,
     pool: SqlitePool,
     executor: E,
     event_sender: broadcast::Sender<ServerMessage>,
@@ -260,15 +257,15 @@ where
 {
     let executor_maintenance = executor.run_executor_maintenance().await;
 
-    conductor::run_market_hours_loop(executor, config, pool, executor_maintenance, event_sender)
+    conductor::run_market_hours_loop(executor, ctx, pool, executor_maintenance, event_sender)
         .await
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy::primitives::Address;
 
+    use super::*;
     use crate::config::tests::create_test_config;
 
     async fn create_test_pool() -> SqlitePool {
@@ -284,31 +281,31 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_function_websocket_connection_error() {
-        let mut config = create_test_config();
+        let mut ctx = create_test_config();
         let pool = create_test_pool().await;
-        config.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
-        Box::pin(run(config, pool, create_test_event_sender()))
+        ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.url:8545".parse().unwrap();
+        Box::pin(run(ctx, pool, create_test_event_sender()))
             .await
             .unwrap_err();
     }
 
     #[tokio::test]
     async fn test_run_function_invalid_orderbook_address() {
-        let mut config = create_test_config();
+        let mut ctx = create_test_config();
         let pool = create_test_pool().await;
-        config.evm.orderbook = Address::ZERO;
-        config.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
-        Box::pin(run(config, pool, create_test_event_sender()))
+        ctx.evm.orderbook = Address::ZERO;
+        ctx.evm.ws_rpc_url = "ws://localhost:8545".parse().unwrap();
+        Box::pin(run(ctx, pool, create_test_event_sender()))
             .await
             .unwrap_err();
     }
 
     #[tokio::test]
     async fn test_run_function_error_propagation() {
-        let mut config = create_test_config();
-        config.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
+        let mut ctx = create_test_config();
+        ctx.evm.ws_rpc_url = "ws://invalid.nonexistent.localhost:9999".parse().unwrap();
         let pool = create_test_pool().await;
-        Box::pin(run(config, pool, create_test_event_sender()))
+        Box::pin(run(ctx, pool, create_test_event_sender()))
             .await
             .unwrap_err();
     }

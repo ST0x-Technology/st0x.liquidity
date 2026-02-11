@@ -7,14 +7,15 @@ use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
+use st0x_execution::Direction;
+
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
 use crate::error::{OnChainError, TradeValidationError};
-use crate::onchain::EvmConfig;
+use crate::onchain::EvmCtx;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
-use st0x_execution::Direction;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {

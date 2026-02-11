@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-use super::EvmConfig;
+use super::EvmCtx;
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::error::OnChainError;
 use crate::queue::enqueue;
@@ -34,7 +34,7 @@ enum EventData {
 pub(crate) async fn backfill_events<P: Provider + Clone>(
     pool: &SqlitePool,
     provider: &P,
-    config: &EvmConfig,
+    config: &EvmCtx,
     end_block: u64,
 ) -> Result<(), OnChainError> {
     let retry_strat = get_backfill_retry_strat();

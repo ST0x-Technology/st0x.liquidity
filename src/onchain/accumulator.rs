@@ -763,6 +763,7 @@ mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+
     use st0x_execution::{FractionalShares, OrderStatus, Positive, Symbol};
 
     use super::*;

@@ -159,7 +159,7 @@ where
             config.redemption_wallet,
         ));
 
-        let broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
+        let broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
 
         let wallet = Arc::new(AlpacaWalletService::new(
             broker_auth.base_url().to_string(),
@@ -259,7 +259,7 @@ mod tests {
     use serde_json::json;
     use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use uuid::Uuid;
 
     use super::*;
@@ -288,7 +288,7 @@ mod tests {
                 "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
             ),
             alpaca_account_id: AlpacaAccountId::new(Uuid::nil()),
-            alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+            alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test_key".to_string(),
                 api_secret: "test_secret".to_string(),
                 account_id: Uuid::nil().to_string(),
@@ -408,14 +408,14 @@ mod tests {
                 }));
         });
 
-        let broker_auth = AlpacaBrokerApiAuthConfig {
+        let broker_auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: config.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
         let broker = Arc::new(
-            AlpacaBrokerApi::try_from_config(broker_auth)
+            AlpacaBrokerApi::try_from_ctx(broker_auth)
                 .await
                 .expect("Failed to create test broker API"),
         );
@@ -501,14 +501,14 @@ mod tests {
         });
 
         let config = make_config();
-        let broker_auth = AlpacaBrokerApiAuthConfig {
+        let broker_auth = AlpacaBrokerApiCtx {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
             account_id: config.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 
-        let result = AlpacaBrokerApi::try_from_config(broker_auth).await;
+        let result = AlpacaBrokerApi::try_from_ctx(broker_auth).await;
 
         assert!(
             result.is_err(),

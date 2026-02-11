@@ -9,7 +9,7 @@ use std::io::Write;
 use thiserror::Error;
 
 use crate::bindings::IERC20;
-use crate::config::Config;
+use crate::config::Ctx;
 use crate::onchain::REQUIRED_CONFIRMATIONS;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
@@ -48,7 +48,7 @@ pub(super) async fn vault_deposit_command<
     token: Address,
     vault_id: B256,
     decimals: u8,
-    config: &Config,
+    ctx: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Depositing tokens to Raindex vault")?;

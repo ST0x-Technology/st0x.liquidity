@@ -13,7 +13,7 @@ use tracing::{info, warn};
 use st0x_execution::Executor;
 
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::config::Config;
+use crate::config::Ctx;
 use crate::dual_write::DualWriteContext;
 use crate::error::EventProcessingError;
 use crate::onchain::trade::TradeEvent;
@@ -37,7 +37,7 @@ pub(crate) struct CqrsFrameworks {
 }
 
 struct CommonFields<P, E> {
-    config: Config,
+    ctx: Ctx,
     pool: SqlitePool,
     cache: SymbolCache,
     provider: P,
@@ -69,7 +69,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     ConductorBuilder<P, E, Initial>
 {
     pub(crate) fn new(
-        config: Config,
+        ctx: Ctx,
         pool: SqlitePool,
         cache: SymbolCache,
         provider: P,
@@ -78,7 +78,7 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     ) -> Self {
         Self {
             common: CommonFields {
-                config,
+                ctx,
                 pool,
                 cache,
                 provider,
@@ -153,17 +153,17 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
-        let inventory_poller = match self.common.config.order_owner() {
+        let inventory_poller = match self.common.ctx.order_owner() {
             Ok(order_owner) => {
                 let vault_service = Arc::new(VaultService::new(
                     self.common.provider.clone(),
-                    self.common.config.evm.orderbook,
+                    self.common.ctx.evm.orderbook,
                 ));
                 Some(spawn_inventory_poller(
                     self.common.pool.clone(),
                     vault_service,
                     self.common.executor.clone(),
-                    self.common.config.evm.orderbook,
+                    self.common.ctx.evm.orderbook,
                     order_owner,
                     self.common.frameworks.snapshot_cqrs,
                 ))
@@ -176,7 +176,7 @@ where
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
         let order_poller = spawn_order_poller(
-            &self.common.config,
+            &self.common.ctx,
             &self.common.pool,
             self.common.executor.clone(),
             self.common.frameworks.dual_write_context.clone(),
@@ -195,7 +195,7 @@ where
         );
         let queue_processor = spawn_queue_processor(
             self.common.executor,
-            &self.common.config,
+            &self.common.ctx,
             &self.common.pool,
             &self.common.cache,
             self.common.provider,

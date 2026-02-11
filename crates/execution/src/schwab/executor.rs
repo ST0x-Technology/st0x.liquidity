@@ -370,7 +370,6 @@ mod tests {
 
         let result = Schwab::try_from_ctx(ctx).await;
 
-        assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
     }
 

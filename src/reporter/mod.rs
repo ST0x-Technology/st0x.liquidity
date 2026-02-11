@@ -456,8 +456,8 @@ fn log_processing_result(result: anyhow::Result<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
     use rust_decimal_macros::dec;
+    use std::io::Write;
 
     use super::*;
 

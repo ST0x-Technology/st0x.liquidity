@@ -141,6 +141,7 @@ pub(crate) async fn clear_pending_execution_id(
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
+
     use st0x_execution::OrderState;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
 

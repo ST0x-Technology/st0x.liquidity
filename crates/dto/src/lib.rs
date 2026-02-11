@@ -18,6 +18,7 @@ pub enum ServerMessage {
     Event(EventStoreEntry),
 }
 
+/// Full dashboard snapshot sent to the frontend on connection.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +48,7 @@ impl InitialState {
     }
 }
 
+/// Single event from the event store for live updates.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 pub struct EventStoreEntry {
@@ -58,7 +60,7 @@ pub struct EventStoreEntry {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Placeholder for trade information.
+/// Completed trade record.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +68,7 @@ pub struct Trade {
     pub id: String,
 }
 
-/// Position information for a symbol.
+/// Per-symbol net position.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +78,7 @@ pub struct Position {
     pub net: Decimal,
 }
 
+/// Per-symbol onchain/offchain/net balances.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +92,7 @@ pub struct SymbolInventory {
     pub net: Decimal,
 }
 
+/// Onchain and offchain USDC balances.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +103,7 @@ pub struct UsdcInventory {
     pub offchain: Decimal,
 }
 
+/// Full inventory snapshot across all symbols and USDC.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +124,7 @@ impl Inventory {
     }
 }
 
+/// Absolute and percentage profit/loss.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 pub struct PnL {
@@ -128,6 +134,7 @@ pub struct PnL {
     pub percent: Decimal,
 }
 
+/// Performance metrics for a single time window.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +178,7 @@ impl TimeframeMetrics {
     }
 }
 
+/// Metrics across all tracked timeframes.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 pub struct PerformanceMetrics {
@@ -198,6 +206,7 @@ impl PerformanceMetrics {
     }
 }
 
+/// Current bid/ask spread for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -214,6 +223,7 @@ pub struct SpreadSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Incremental spread change for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -230,7 +240,7 @@ pub struct SpreadUpdate {
     pub pyth_price: Decimal,
 }
 
-/// Placeholder for rebalance operation tracking.
+/// Active or completed rebalance operation.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -238,7 +248,7 @@ pub struct RebalanceOperation {
     pub id: String,
 }
 
-/// Circuit breaker status for the trading system.
+/// Whether the trading circuit breaker is active.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -246,7 +256,7 @@ pub enum CircuitBreakerStatus {
     Active,
 }
 
-/// Authentication status for broker connections.
+/// Broker authentication status.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -301,8 +311,7 @@ mod tests {
 
     #[test]
     fn export_bindings_generates_files_in_dashboard_directory() {
-        let export_dir =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api");
+        let export_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api");
 
         export_bindings().unwrap();
 

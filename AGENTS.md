@@ -28,6 +28,38 @@ the limit:
   output. If you need the user to review something, explicitly ask them to look
   at it. Do not run `git diff` expecting the user to see output.
 
+## Launching Subagents
+
+**CRITICAL: Subagents are restricted to file reads and edits only.**
+
+When spawning background subagents for parallel work, the following rules apply:
+
+**Allowed tools:** Read, Edit, Write, Glob, Grep, WebFetch, WebSearch.
+
+**FORBIDDEN in subagents:**
+- `Bash` for ANY purpose - no `sed`, `awk`, `grep`, `find`, `cat`, shell loops,
+  `curl`, or ad-hoc scripts. Use the dedicated Read/Edit/Glob/Grep tools instead
+- `cargo` commands - the Cargo.lock will compete across parallel agents and
+  nothing will actually parallelize. Only the orchestrating agent runs cargo
+- `git` commands - subagents must NEVER run `git checkout`, `git restore`,
+  `git stash`, or any git command that modifies working tree state. A subagent
+  running `git checkout` on a file DESTROYS unstaged work with no recovery
+
+**Prompt template for subagents:**
+
+Every subagent prompt MUST include these constraints verbatim:
+```
+RULES:
+- Use ONLY Read, Edit, Write, Glob, Grep tools. NEVER use Bash.
+- Do NOT run cargo, git, sed, awk, curl, or any shell commands.
+- Do NOT create scripts or temporary files.
+- Make your edits and report what you changed.
+```
+
+**Scope:** Each subagent should have a narrow, well-defined task (e.g., "rename
+X to Y in these 3 files"). Do not give subagents broad exploratory mandates
+that could lead to unintended changes.
+
 ## Planning Hierarchy
 
 The project uses a strict document hierarchy:
@@ -460,8 +492,8 @@ is the source of truth for terminology and naming conventions.
   - **Group 2 - Workspace imports**: Imports from other workspace crates
     (`st0x_execution`). No empty lines within.
   - **Empty line**
-  - **Group 3 - Crate-internal imports**: Imports using `crate::` and
-    `super::`. No empty lines within.
+  - **Group 3 - Crate-internal imports**: Imports using `crate::` and `super::`.
+    No empty lines within.
   - Groups 2 or 3 may be absent if unused; never add an empty group
   - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
@@ -805,73 +837,20 @@ enums, newtypes, or other constructs best represent the concept at hand.
 
 ##### Make invalid states unrepresentable:
 
-Instead of using multiple fields that can contradict each other:
-
-```rust
-// ❌ Bad: Multiple fields can be in invalid combinations
-pub struct Order {
-    pub status: String,  // "pending", "completed", "failed"
-    pub order_id: Option<String>,  // Some when completed, None when pending
-    pub executed_at: Option<DateTime<Utc>>,  // Some when completed
-    pub price_cents: Option<i64>,  // Some when completed
-    pub error_reason: Option<String>,  // Some when failed
-}
-```
-
-Use enum variants to encode valid states:
-
-```rust
-// ✅ Good: Each state has exactly the data it needs
-pub enum OrderStatus {
-    Pending,
-    Completed {
-        order_id: String,
-        executed_at: DateTime<Utc>,
-        price_cents: i64,
-    },
-    Failed {
-        failed_at: DateTime<Utc>,
-        error_reason: String,
-    },
-}
-```
+Instead of multiple optional fields that can contradict each other (e.g.,
+`status: String` + `order_id: Option<String>` + `error_reason: Option<String>`),
+use enum variants where each state carries exactly the data it needs.
 
 ##### Use newtypes for domain concepts:
 
-```rust
-// ❌ Bad: Easy to mix up parameters of the same type
-fn place_order(symbol: String, account: String, amount: i64, price: i64) { }
-
-// ✅ Good: Type system prevents mixing incompatible values
-#[derive(Debug, Clone)]
-struct Symbol(String);
-
-#[derive(Debug, Clone)]
-struct AccountId(String);
-
-#[derive(Debug)]
-struct Shares(i64);
-
-#[derive(Debug)]
-struct PriceCents(i64);
-
-fn place_order(symbol: Symbol, account: AccountId, amount: Shares, price: PriceCents) { }
-```
+Wrap primitives in newtypes to prevent mixing incompatible values at call sites
+(e.g., `Symbol(String)`, `AccountId(String)`, `Shares(i64)`, `PriceCents(i64)`).
 
 ##### The Typestate Pattern:
 
-Encodes runtime state in compile-time types, eliminating runtime checks.
-
-```rust
-// ✅ Good: State transitions enforced at compile time
-struct Task<State> { data: TaskData, state: State }
-impl Task<Start> { fn begin(self) -> Task<InProgress> { ... } }
-impl Task<InProgress> { fn complete(self) -> Task<Complete> { ... } }
-```
-
-Use typestate for protocol enforcement (`Connection<Unauthenticated>` →
-`Connection<Authenticated>`) and builder patterns (`RequestBuilder<NoUrl>` →
-`RequestBuilder<HasUrl>`).
+Encode runtime state in compile-time types to eliminate runtime checks. Use for
+protocol enforcement and builder patterns (e.g.,
+`Connection<Unauthenticated>` -> `Connection<Authenticated>`).
 
 #### Avoid deep nesting
 
@@ -881,35 +860,9 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 ##### Techniques for flat code:
 
-```rust
-// ❌ Nested: if let Some(data) = data { if !data.is_empty() { if data.len() > 5 { ... } } }
-// ✅ Flat with early returns:
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    let data = data.ok_or(Error::None)?;
-    if data.is_empty() { return Err(Error::Empty); }
-    if data.len() <= 5 { return Err(Error::TooShort); }
-    Ok(data.to_uppercase())
-}
-```
-
-##### Use let-else pattern for guard clauses:
-
-```rust
-// Use let-else to flatten nested if-let chains
-let Some(trade_data) = convert_event_to_trade(event) else {
-    return Err(Error::ConversionFailed);
-};
-let Some(symbol) = trade_data.extract_symbol() else {
-    return Err(Error::NoSymbol);
-};
-```
-
-##### Use pattern matching with guards:
-
-```rust
-// ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
-// ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
-```
+- **Early returns** with `?` and `return Err(...)` instead of nested `if let`
+- **let-else** for guard clauses: `let Some(x) = expr else { return Err(...); };`
+- **Pattern matching with guards** instead of nested `if let` chains
 
 #### Struct field access
 

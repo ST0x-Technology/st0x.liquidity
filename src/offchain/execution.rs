@@ -254,12 +254,13 @@ impl OffchainExecution {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use rust_decimal::Decimal;
+
+    use st0x_execution::OrderState;
 
     use super::*;
     use crate::test_utils::{OffchainExecutionBuilder, setup_test_db};
-    use chrono::Utc;
-    use st0x_execution::OrderState;
 
     #[tokio::test]
     async fn test_offchain_execution_save_and_find() {

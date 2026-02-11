@@ -8,7 +8,6 @@ deployment_block = 1
 
 [broker]
 type = "alpaca-broker-api"
-account_id = "904837e3-3b76-47ec-b432-046db621571b"
 mode = "sandbox"
 
 [hyperdx]
