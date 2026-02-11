@@ -199,11 +199,11 @@ mod tests {
                 }));
         });
 
-        let result = AlpacaTradingApi::try_from_ctx(auth).await;
+        let error = AlpacaTradingApi::try_from_ctx(auth).await.unwrap_err();
 
         account_mock.assert();
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaTradingApiError::AccountVerification(_)
         ));
     }
@@ -228,12 +228,12 @@ mod tests {
         });
 
         let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
-        let result = executor.wait_until_market_open().await;
 
         account_mock.assert();
+
+        let duration = executor.wait_until_market_open().await.unwrap();
+
         clock_mock.assert();
-        assert!(result.is_ok());
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 
@@ -257,11 +257,12 @@ mod tests {
         });
 
         let executor = AlpacaTradingApi::try_from_ctx(auth).await.unwrap();
-        let result = executor.wait_until_market_open().await;
 
         account_mock.assert();
+
+        let duration = executor.wait_until_market_open().await.unwrap();
+
         mock.assert();
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 
@@ -277,10 +278,9 @@ mod tests {
         account_mock.assert();
 
         let valid_uuid = "904837e3-3b76-47ec-b432-046db621571b";
-        let result = executor.parse_order_id(valid_uuid);
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), valid_uuid);
+        let order_id = executor.parse_order_id(valid_uuid).unwrap();
+        assert_eq!(order_id, valid_uuid);
     }
 
     #[tokio::test]
@@ -295,10 +295,9 @@ mod tests {
         account_mock.assert();
 
         let invalid_uuid = "not-a-valid-uuid";
-        let result = executor.parse_order_id(invalid_uuid);
 
         assert!(matches!(
-            result.unwrap_err(),
+            executor.parse_order_id(invalid_uuid).unwrap_err(),
             AlpacaTradingApiError::InvalidOrderId(_)
         ));
     }
@@ -331,8 +330,6 @@ mod tests {
 
         account_mock.assert();
 
-        let result = executor.run_executor_maintenance().await;
-
-        assert!(result.is_none());
+        assert!(executor.run_executor_maintenance().await.is_none());
     }
 }

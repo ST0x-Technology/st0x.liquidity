@@ -10,13 +10,15 @@ mod vault;
 use alloy::primitives::{Address, B256};
 use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
+use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, Symbol};
 use std::io::Write;
 use thiserror::Error;
 use tracing::info;
 
-use crate::config::{Config, ServerEnv};
+use st0x_execution::{Direction, Symbol};
+
+use crate::config::{Ctx, Env};
 use crate::shares::FractionalShares;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::Usdc;
@@ -173,7 +175,7 @@ pub enum Commands {
     VaultDeposit {
         /// Amount of tokens to deposit (human-readable, e.g., 100 for 100 tokens)
         #[arg(short = 'a', long = "amount")]
-        amount: rust_decimal::Decimal,
+        amount: Decimal,
 
         /// Token contract address
         #[arg(short = 't', long = "token")]
@@ -303,36 +305,36 @@ pub enum Commands {
 #[command(version)]
 pub struct CliEnv {
     #[clap(flatten)]
-    env: ServerEnv,
+    env: Env,
     #[command(subcommand)]
     pub command: Commands,
 }
 
 impl CliEnv {
     /// Parse CLI arguments, load config from file, and return with subcommand.
-    pub fn parse_and_convert() -> anyhow::Result<(Config, Commands)> {
+    pub fn parse_and_convert() -> anyhow::Result<(Ctx, Commands)> {
         let cli_env = Self::parse();
-        let config = Config::load_file(&cli_env.env.config, &cli_env.env.secrets)?;
-        Ok((config, cli_env.command))
+        let ctx = Ctx::load_files(&cli_env.env.config, &cli_env.env.secrets)?;
+        Ok((ctx, cli_env.command))
     }
 }
 
-pub async fn run(config: Config) -> anyhow::Result<()> {
+pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let pool = config.get_sqlite_pool().await?;
-    run_command_with_writers(config, cli.command, &pool, &mut std::io::stdout()).await
+    let pool = ctx.get_sqlite_pool().await?;
+    run_command_with_writers(ctx, cli.command, &pool, &mut std::io::stdout()).await
 }
 
-pub async fn run_command(config: Config, command: Commands) -> anyhow::Result<()> {
-    let pool = config.get_sqlite_pool().await?;
-    run_command_with_writers(config, command, &pool, &mut std::io::stdout()).await
+pub async fn run_command(ctx: Ctx, command: Commands) -> anyhow::Result<()> {
+    let pool = ctx.get_sqlite_pool().await?;
+    run_command_with_writers(ctx, command, &pool, &mut std::io::stdout()).await
 }
 
 async fn execute_order<W: Write>(
     symbol: Symbol,
     quantity: u64,
     direction: Direction,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
@@ -340,7 +342,7 @@ async fn execute_order<W: Write>(
         return Err(CliError::InvalidQuantity { value: quantity }.into());
     }
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(symbol, quantity, direction, config, pool, stdout).await
+    trading::execute_order_with_writers(symbol, quantity, direction, ctx, pool, stdout).await
 }
 
 /// Commands that don't require a WebSocket provider.
@@ -390,7 +392,7 @@ enum ProviderCommand {
         amount: Usdc,
     },
     VaultDeposit {
-        amount: rust_decimal::Decimal,
+        amount: Decimal,
         token: Address,
         vault_id: B256,
         decimals: u8,
@@ -424,14 +426,14 @@ enum ProviderCommand {
 }
 
 async fn run_command_with_writers<W: Write>(
-    config: Config,
+    ctx: Ctx,
     command: Commands,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     match classify_command(command) {
-        Ok(simple) => run_simple_command(simple, &config, pool, stdout).await?,
-        Err(provider_cmd) => run_provider_command(provider_cmd, &config, pool, stdout).await?,
+        Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
+        Err(provider_cmd) => run_provider_command(provider_cmd, &ctx, pool, stdout).await?,
     }
 
     info!("CLI operation completed successfully");
@@ -515,18 +517,18 @@ fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand>
 
 async fn run_simple_command<W: Write>(
     command: SimpleCommand,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     match command {
         SimpleCommand::Buy { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Buy, config, pool, stdout).await
+            execute_order(symbol, quantity, Direction::Buy, ctx, pool, stdout).await
         }
         SimpleCommand::Sell { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Sell, config, pool, stdout).await
+            execute_order(symbol, quantity, Direction::Sell, ctx, pool, stdout).await
         }
-        SimpleCommand::Auth => auth::auth_command(stdout, &config.broker, pool).await,
+        SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
             direction,
             symbol,
@@ -539,52 +541,50 @@ async fn run_simple_command<W: Write>(
                 &symbol,
                 quantity,
                 token_address,
-                config,
+                ctx,
                 pool,
             )
             .await
         }
         SimpleCommand::AlpacaDeposit { amount } => {
-            alpaca_wallet::alpaca_deposit_command(stdout, amount, config).await
+            alpaca_wallet::alpaca_deposit_command(stdout, amount, ctx).await
         }
         SimpleCommand::AlpacaWhitelist { address } => {
-            alpaca_wallet::alpaca_whitelist_command(stdout, address, config).await
+            alpaca_wallet::alpaca_whitelist_command(stdout, address, ctx).await
         }
         SimpleCommand::AlpacaWithdraw { amount, to_address } => {
-            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, config).await
+            alpaca_wallet::alpaca_withdraw_command(stdout, amount, to_address, ctx).await
         }
         SimpleCommand::AlpacaTransfers => {
-            alpaca_wallet::alpaca_transfers_command(stdout, config).await
+            alpaca_wallet::alpaca_transfers_command(stdout, ctx).await
         }
         SimpleCommand::AlpacaConvert { direction, amount } => {
-            alpaca_wallet::alpaca_convert_command(stdout, direction, amount, config).await
+            alpaca_wallet::alpaca_convert_command(stdout, direction, amount, ctx).await
         }
         SimpleCommand::OrderStatus { order_id } => {
-            trading::order_status_command(stdout, &order_id, config, pool).await
+            trading::order_status_command(stdout, &order_id, ctx, pool).await
         }
     }
 }
 
 async fn run_provider_command<W: Write>(
     command: ProviderCommand,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     let provider = ProviderBuilder::new()
-        .connect_ws(WsConnect::new(config.evm.ws_rpc_url.as_str()))
+        .connect_ws(WsConnect::new(ctx.evm.ws_rpc_url.as_str()))
         .await?;
 
     match command {
         ProviderCommand::ProcessTx { tx_hash } => {
             info!("Processing transaction: tx_hash={tx_hash}");
             let cache = SymbolCache::default();
-            trading::process_tx_with_provider(tx_hash, config, pool, stdout, &provider, &cache)
-                .await
+            trading::process_tx_with_provider(tx_hash, ctx, pool, stdout, &provider, &cache).await
         }
         ProviderCommand::TransferUsdc { direction, amount } => {
-            rebalancing::transfer_usdc_command(stdout, direction, amount, config, pool, provider)
-                .await
+            rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool, provider).await
         }
         ProviderCommand::VaultDeposit {
             amount,
@@ -592,30 +592,28 @@ async fn run_provider_command<W: Write>(
             vault_id,
             decimals,
         } => {
-            vault::vault_deposit_command(
-                stdout, amount, token, vault_id, decimals, config, provider,
-            )
-            .await
+            vault::vault_deposit_command(stdout, amount, token, vault_id, decimals, ctx, provider)
+                .await
         }
         ProviderCommand::VaultWithdraw { amount } => {
-            vault::vault_withdraw_command(stdout, amount, config, provider).await
+            vault::vault_withdraw_command(stdout, amount, ctx, provider).await
         }
         ProviderCommand::CctpBridge { amount, all, from } => {
-            cctp::cctp_bridge_command(stdout, amount, all, from, config, provider).await
+            cctp::cctp_bridge_command(stdout, amount, all, from, ctx, provider).await
         }
         ProviderCommand::CctpRecover {
             burn_tx,
             source_chain,
-        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, config, provider).await,
+        } => cctp::cctp_recover_command(stdout, burn_tx, source_chain, ctx, provider).await,
         ProviderCommand::ResetAllowance { chain } => {
-            cctp::reset_allowance_command(stdout, chain, config, provider).await
+            cctp::reset_allowance_command(stdout, chain, ctx, provider).await
         }
         ProviderCommand::AlpacaTokenize {
             symbol,
             quantity,
             token,
         } => {
-            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, token, config, provider)
+            rebalancing::alpaca_tokenize_command(stdout, symbol, quantity, token, ctx, provider)
                 .await
         }
         ProviderCommand::AlpacaRedeem {
@@ -623,11 +621,10 @@ async fn run_provider_command<W: Write>(
             quantity,
             token,
         } => {
-            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, config, provider)
-                .await
+            rebalancing::alpaca_redeem_command(stdout, symbol, quantity, token, ctx, provider).await
         }
         ProviderCommand::AlpacaTokenizationRequests => {
-            rebalancing::alpaca_tokenization_requests_command(stdout, config, provider).await
+            rebalancing::alpaca_tokenization_requests_command(stdout, ctx, provider).await
         }
     }
 }
@@ -646,6 +643,7 @@ mod tests {
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
     };
     use std::str::FromStr;
+    use url::Url;
 
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
@@ -659,8 +657,8 @@ mod tests {
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn get_schwab_auth_from_config(config: &Config) -> &SchwabAuth {
-        match &config.broker {
+    fn get_schwab_auth_from_ctx(ctx: &Ctx) -> &SchwabAuth {
+        match &ctx.broker {
             BrokerConfig::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config in tests"),
         }
@@ -669,9 +667,9 @@ mod tests {
     #[tokio::test]
     async fn test_run_buy_order() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -698,7 +696,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -712,9 +710,9 @@ mod tests {
     #[tokio::test]
     async fn test_run_sell_order() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -741,7 +739,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -755,9 +753,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_failure() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -785,7 +783,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -799,7 +797,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_expired_refresh_token() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -809,7 +807,7 @@ mod tests {
             refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(8),
         };
         expired_tokens
-            .store(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
             .await
             .unwrap();
 
@@ -817,7 +815,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -832,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_successful_token_refresh() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_access_tokens = SchwabTokens {
@@ -842,7 +840,7 @@ mod tests {
             refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
         };
         expired_access_tokens
-            .store(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
             .await
             .unwrap();
 
@@ -886,7 +884,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -901,7 +899,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_valid_tokens_no_refresh_needed() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
 
         let valid_tokens = SchwabTokens {
@@ -911,7 +909,7 @@ mod tests {
             refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
         };
         valid_tokens
-            .store(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
             .await
             .unwrap();
 
@@ -935,17 +933,16 @@ mod tests {
                 .header("location", "/trader/v1/accounts/ABC123DEF456/orders/12345");
         });
 
-        let result = trading::execute_order_with_writers(
+        trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
-        .await;
-
-        assert!(result.is_ok());
+        .await
+        .unwrap();
         account_mock.assert();
         order_mock.assert();
     }
@@ -953,9 +950,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_success_stdout_output() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -976,17 +973,16 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        let result = trading::execute_order_with_writers(
+        trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout_buffer,
         )
-        .await;
-
-        assert!(result.is_ok());
+        .await
+        .unwrap();
 
         let stdout_output = String::from_utf8(stdout_buffer).unwrap();
         assert!(stdout_output.contains("Order placed successfully"));
@@ -997,9 +993,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_failure_stderr_output() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1028,13 +1024,12 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout_buffer,
         )
-        .await;
-
-        assert!(result.is_err());
+        .await
+        .unwrap_err();
 
         let stdout_output = String::from_utf8(stdout_buffer).unwrap();
         assert!(stdout_output.contains("Failed to place order"));
@@ -1043,7 +1038,7 @@ mod tests {
     #[tokio::test]
     async fn test_authentication_with_oauth_flow_on_expired_refresh_token() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -1053,14 +1048,14 @@ mod tests {
             refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(8),
         };
         expired_tokens
-            .store(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
             .await
             .unwrap();
 
         let mut stdout_buffer = Vec::new();
 
         let result =
-            auth::ensure_schwab_authentication(&pool, &config.broker, &mut stdout_buffer).await;
+            auth::ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout_buffer).await;
 
         assert!(matches!(
             result.unwrap_err().downcast_ref::<SchwabError>(),
@@ -1103,7 +1098,7 @@ mod tests {
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(address!("0x0000000000000000000000000000000000000000")),
                 deployment_block: 1,
@@ -1113,8 +1108,8 @@ mod tests {
             broker: BrokerConfig::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
-                redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
-                base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+                redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
+                base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
                 account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
@@ -1148,8 +1143,8 @@ mod tests {
                 aliceOutputIOIndex: U256::from(1),
                 bobInputIOIndex: U256::from(1),
                 bobOutputIOIndex: U256::from(0),
-                aliceBountyVaultId: alloy::primitives::B256::ZERO,
-                bobBountyVaultId: alloy::primitives::B256::ZERO,
+                aliceBountyVaultId: B256::ZERO,
+                bobBountyVaultId: B256::ZERO,
             },
         };
 
@@ -1288,29 +1283,28 @@ mod tests {
             .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL"]);
         assert!(result.is_err(), "buy without quantity should fail");
 
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "sell", "-q", "100"]);
-        assert!(result.is_err(), "sell without symbol should fail");
+        cmd.clone()
+            .try_get_matches_from(vec!["schwab", "sell", "-q", "100"])
+            .unwrap_err();
 
-        let result = cmd.clone().try_get_matches_from(vec!["schwab", "buy"]);
-        assert!(result.is_err());
+        cmd.clone()
+            .try_get_matches_from(vec!["schwab", "buy"])
+            .unwrap_err();
 
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL", "-q", "100"]);
-        assert!(result.is_ok());
+        cmd.clone()
+            .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL", "-q", "100"])
+            .unwrap();
 
-        let result = cmd.try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"]);
-        assert!(result.is_ok());
+        cmd.try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"])
+            .unwrap();
     }
 
     #[tokio::test]
     async fn test_integration_buy_command_end_to_end() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1340,7 +1334,7 @@ mod tests {
             quantity: 100,
         };
 
-        let result = run_command_with_writers(config, buy_command, &pool, &mut stdout).await;
+        let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
 
         assert!(
             result.is_ok(),
@@ -1356,9 +1350,9 @@ mod tests {
     #[tokio::test]
     async fn test_integration_sell_command_end_to_end() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_config_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)

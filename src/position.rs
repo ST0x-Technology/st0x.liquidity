@@ -1767,10 +1767,8 @@ mod tests {
             last_price_usdc: None,
         };
 
-        let result = position.handle(command, &()).await;
-
         assert!(matches!(
-            result,
+            position.handle(command, &()).await,
             Err(PositionError::State(LifecycleError::AlreadyInitialized))
         ));
     }
@@ -1788,11 +1786,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::Schwab)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
             shares.inner(),
@@ -1815,11 +1813,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::Schwab)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Buy);
         assert_eq!(
             shares.inner(),
@@ -1842,11 +1840,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Sell);
         assert_eq!(
             shares.inner(),
@@ -1869,11 +1867,11 @@ mod tests {
             last_updated: Some(Utc::now()),
         };
 
-        let result = position
+        let (direction, shares) = position
             .is_ready_for_execution(SupportedExecutor::AlpacaTradingApi)
-            .unwrap();
+            .unwrap()
+            .expect("should be ready for execution");
 
-        let (direction, shares) = result.expect("should be ready for execution");
         assert_eq!(direction, Direction::Buy);
         assert_eq!(
             shares.inner(),

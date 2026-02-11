@@ -249,9 +249,9 @@ mod tests {
     async fn failing_mock_still_increments_count() {
         let mock = MockUsdcRebalance::failing_alpaca_to_base();
 
-        let _ = mock
-            .execute_alpaca_to_base(&UsdcRebalanceId::new("x"), Usdc(dec!(1)))
-            .await;
+        mock.execute_alpaca_to_base(&UsdcRebalanceId::new("x"), Usdc(dec!(1)))
+            .await
+            .unwrap_err();
 
         assert_eq!(mock.alpaca_to_base_calls(), 1);
     }
@@ -260,9 +260,9 @@ mod tests {
     async fn failing_mock_still_captures_last_call() {
         let mock = MockUsdcRebalance::failing_alpaca_to_base();
 
-        let _ = mock
-            .execute_alpaca_to_base(&UsdcRebalanceId::new("captured"), Usdc(dec!(42)))
-            .await;
+        mock.execute_alpaca_to_base(&UsdcRebalanceId::new("captured"), Usdc(dec!(42)))
+            .await
+            .unwrap_err();
 
         let call = mock.last_alpaca_to_base_call().unwrap();
         assert_eq!(call.id, "captured");

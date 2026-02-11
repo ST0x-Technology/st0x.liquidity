@@ -326,11 +326,11 @@ mod tests {
 
     #[test]
     fn trigger_config_uses_equity_threshold_from_config() {
-        let config = make_config();
+        let rebalancing_ctx = make_ctx();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity_threshold: rebalancing_ctx.equity_threshold,
+            usdc_threshold: rebalancing_ctx.usdc_threshold,
         };
 
         assert_eq!(trigger_config.equity_threshold.target, dec!(0.5));
@@ -339,11 +339,11 @@ mod tests {
 
     #[test]
     fn trigger_config_uses_usdc_threshold_from_config() {
-        let config = make_config();
+        let rebalancing_ctx = make_ctx();
 
         let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: config.equity_threshold,
-            usdc_threshold: config.usdc_threshold,
+            equity_threshold: rebalancing_ctx.equity_threshold,
+            usdc_threshold: rebalancing_ctx.usdc_threshold,
         };
 
         assert_eq!(trigger_config.usdc_threshold.target, dec!(0.6));
@@ -352,58 +352,51 @@ mod tests {
 
     #[test]
     fn private_key_signer_from_valid_bytes_succeeds() {
-        let config = make_config();
+        let rebalancing_ctx = make_ctx();
 
-        let result = PrivateKeySigner::from_bytes(&config.evm_private_key);
-
-        assert!(
-            result.is_ok(),
-            "Expected valid private key to parse successfully"
-        );
+        PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key).unwrap();
     }
 
     #[test]
     fn private_key_signer_from_zero_bytes_fails() {
         let zero_key = b256!("0x0000000000000000000000000000000000000000000000000000000000000000");
 
-        let result = PrivateKeySigner::from_bytes(&zero_key);
-
-        assert!(result.is_err(), "Expected zero private key to fail parsing");
+        PrivateKeySigner::from_bytes(&zero_key).unwrap_err();
     }
 
     async fn make_services_with_mock_wallet(
         server: &httpmock::MockServer,
-    ) -> (Services<impl Provider + Clone + 'static>, RebalancingConfig) {
+    ) -> (Services<impl Provider + Clone + 'static>, RebalancingCtx) {
         let anvil = Anvil::new().spawn();
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
 
-        let config = make_config();
-        let signer = PrivateKeySigner::from_bytes(&config.evm_private_key).unwrap();
+        let rebalancing_ctx = make_ctx();
+        let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key).unwrap();
         let ethereum_wallet = EthereumWallet::from(signer.clone());
 
         let ethereum_provider = ProviderBuilder::new()
             .wallet(ethereum_wallet)
-            .connect_http(config.ethereum_rpc_url.clone());
+            .connect_http(rebalancing_ctx.ethereum_rpc_url.clone());
 
         let tokenization = Arc::new(AlpacaTokenizationService::new(
             server.base_url(),
-            config.alpaca_account_id,
+            rebalancing_ctx.alpaca_account_id,
             "test_key".into(),
             "test_secret".into(),
             base_provider.clone(),
-            config.redemption_wallet,
+            rebalancing_ctx.redemption_wallet,
         ));
 
         // Mock the broker account verification endpoint
         let _account_mock = server.mock(|when, then| {
             when.method(GET).path(format!(
                 "/v1/trading/accounts/{}/account",
-                config.alpaca_account_id
+                rebalancing_ctx.alpaca_account_id
             ));
             then.status(200)
                 .header("content-type", "application/json")
                 .json_body(json!({
-                    "id": config.alpaca_account_id.to_string(),
+                    "id": rebalancing_ctx.alpaca_account_id.to_string(),
                     "status": "ACTIVE"
                 }));
         });
@@ -411,7 +404,7 @@ mod tests {
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
-            account_id: config.alpaca_account_id.to_string(),
+            account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
         let broker = Arc::new(
@@ -422,7 +415,7 @@ mod tests {
 
         let wallet = Arc::new(AlpacaWalletService::new(
             server.base_url(),
-            config.alpaca_account_id,
+            rebalancing_ctx.alpaca_account_id,
             "test_key".into(),
             "test_secret".into(),
         ));
@@ -460,13 +453,13 @@ mod tests {
             vault,
         };
 
-        (services, config)
+        (services, rebalancing_ctx)
     }
 
     #[tokio::test]
     async fn into_rebalancer_constructs_without_panic() {
         let server = MockServer::start();
-        let (services, config) = make_services_with_mock_wallet(&server).await;
+        let (services, rebalancing_ctx) = make_services_with_mock_wallet(&server).await;
 
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
@@ -479,7 +472,7 @@ mod tests {
         let usdc_cqrs = Arc::new(sqlite_cqrs(pool, vec![], ()));
 
         let _rebalancer = services.into_rebalancer(
-            &config,
+            &rebalancing_ctx,
             market_maker_wallet,
             rx,
             mint_cqrs,
@@ -500,23 +493,19 @@ mod tests {
                 .json_body(json!({"message": "Invalid API credentials"}));
         });
 
-        let config = make_config();
+        let rebalancing_ctx = make_ctx();
         let broker_auth = AlpacaBrokerApiCtx {
             api_key: "invalid_key".to_string(),
             api_secret: "invalid_secret".to_string(),
-            account_id: config.alpaca_account_id.to_string(),
+            account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 
-        let result = AlpacaBrokerApi::try_from_ctx(broker_auth).await;
-
-        assert!(
-            result.is_err(),
-            "Expected auth failure to return error, got: {result:?}"
-        );
-
         // Verify the error can be converted to SpawnRebalancerError
-        let spawn_error: SpawnRebalancerError = result.unwrap_err().into();
+        let spawn_error: SpawnRebalancerError = AlpacaBrokerApi::try_from_ctx(broker_auth)
+            .await
+            .unwrap_err()
+            .into();
         assert!(
             matches!(spawn_error, SpawnRebalancerError::AlpacaBrokerApi(_)),
             "Expected AlpacaBrokerApi error variant, got: {spawn_error:?}"

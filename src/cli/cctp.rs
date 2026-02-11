@@ -396,12 +396,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_allowance_requires_rebalancing_config() {
-        let config = create_config_without_rebalancing();
+        let ctx = create_ctx_without_rebalancing();
         let provider = create_mock_provider();
 
         let mut stdout = Vec::new();
         let result =
-            reset_allowance_command(&mut stdout, CctpChain::Ethereum, &config, provider).await;
+            reset_allowance_command(&mut stdout, CctpChain::Ethereum, &ctx, provider).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(

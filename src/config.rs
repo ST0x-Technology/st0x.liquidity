@@ -180,22 +180,63 @@ impl From<&LogLevel> for Level {
     }
 }
 
+pub(crate) trait HasSqlite {
+    async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
+}
+
+pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+    let pool = SqlitePool::connect(database_url).await?;
+
+    // SQLite Concurrency Configuration:
+    //
+    // WAL Mode: Allows concurrent readers but only ONE writer at a time across
+    // all processes. When both main bot and reporter try to write simultaneously,
+    // one will block until the other completes. This is a fundamental SQLite
+    // limitation.
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
+
+    // Busy Timeout: 10 seconds - when a write is blocked by another process,
+    // SQLite will wait up to 10 seconds before failing with "database is locked".
+    // This prevents immediate failures when main bot and reporter write concurrently.
+    //
+    // CRITICAL: Reporter must keep transactions SHORT (single INSERT per trade)
+    // to avoid blocking mission-critical main bot operations.
+    //
+    // Future: This limitation will be eliminated when migrating to Kafka +
+    // Elasticsearch with CQRS pattern for separate read/write paths.
+    sqlx::query("PRAGMA busy_timeout = 10000")
+        .execute(&pool)
+        .await?;
+
+    Ok(pool)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(transparent)]
-    Rebalancing(#[from] RebalancingConfigError),
+    Rebalancing(#[from] RebalancingCtxError),
     #[error("ORDER_OWNER required when rebalancing is disabled")]
     MissingOrderOwner,
     #[error("failed to derive address from EVM_PRIVATE_KEY")]
     PrivateKeyDerivation(#[source] alloy::signers::k256::ecdsa::Error),
     #[error("failed to read config file")]
     Io(#[from] std::io::Error),
-    #[error("failed to parse config file")]
+    #[error("failed to parse TOML")]
     Toml(#[from] toml::de::Error),
-    #[error("Invalid execution threshold: {0}")]
+    #[error(transparent)]
     InvalidThreshold(#[from] InvalidThresholdError),
-    #[error("Invalid shares value: {0}")]
+    #[error(transparent)]
     InvalidShares(#[from] st0x_execution::InvalidSharesError),
+    #[error("telemetry config present in config but telemetry secrets missing")]
+    TelemetrySecretsMissing,
+    #[error("telemetry secrets present but telemetry config missing in config")]
+    TelemetryConfigMissing,
+    #[error("rebalancing config present in config but rebalancing secrets missing")]
+    RebalancingSecretsMissing,
+    #[error("rebalancing secrets present but rebalancing config missing in config")]
+    RebalancingConfigMissing,
 }
 
 #[cfg(test)]
@@ -206,120 +247,69 @@ impl ConfigError {
             Self::MissingOrderOwner => "ORDER_OWNER required when rebalancing is disabled",
             Self::PrivateKeyDerivation(_) => "failed to derive address from EVM_PRIVATE_KEY",
             Self::Io(_) => "failed to read config file",
-            Self::Toml(_) => "failed to parse config file",
+            Self::Toml(_) => "failed to parse TOML",
             Self::InvalidThreshold(_) => "invalid execution threshold",
             Self::InvalidShares(_) => "invalid shares value",
+            Self::TelemetrySecretsMissing => "telemetry secrets missing",
+            Self::TelemetryConfigMissing => "telemetry config missing",
+            Self::RebalancingSecretsMissing => "rebalancing secrets missing",
+            Self::RebalancingConfigMissing => "rebalancing config missing",
         }
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Config {
-    pub(crate) database_url: String,
-    pub log_level: LogLevel,
-    pub(crate) server_port: u16,
-    pub(crate) evm: EvmConfig,
-    pub(crate) order_polling_interval: u64,
-    pub(crate) order_polling_max_jitter: u64,
-    pub(crate) broker: BrokerConfig,
-    pub hyperdx: Option<HyperDxConfig>,
-    pub(crate) rebalancing: Option<RebalancingConfig>,
-    pub(crate) execution_threshold: ExecutionThreshold,
-}
 
-impl<'de> Deserialize<'de> for Config {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct ConfigFields {
-            database_url: String,
-            log_level: Option<LogLevel>,
-            server_port: Option<u16>,
-            evm: EvmConfig,
-            order_polling_interval: Option<u64>,
-            order_polling_max_jitter: Option<u64>,
-            broker: BrokerConfig,
-            hyperdx: Option<HyperDxConfig>,
-            rebalancing: Option<RebalancingTomlFields>,
-        }
+impl Ctx {
+    pub fn load_files(config: &Path, secrets: &Path) -> Result<Self, ConfigError> {
+        let config_str = std::fs::read_to_string(config)?;
+        let secrets_str = std::fs::read_to_string(secrets)?;
+        Self::from_toml(&config_str, &secrets_str)
+    }
 
-        let fields = ConfigFields::deserialize(deserializer)?;
+    pub fn from_toml(config_toml: &str, secrets_toml: &str) -> Result<Self, ConfigError> {
+        let config: Config = toml::from_str(config_toml)?;
+        let secrets: Secrets = toml::from_str(secrets_toml)?;
 
-        let log_level = fields.log_level.unwrap_or(LogLevel::Debug);
+        let broker = assemble_broker(secrets.broker);
+        let evm = assemble_evm(config.evm, secrets.evm);
+        let telemetry = assemble_telemetry(config.telemetry, secrets.telemetry)?;
 
         // Execution threshold is determined by broker capabilities:
         // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
         // - Alpaca requires $1 minimum for fractional trading. We use $2 to provide buffer
         //   for slippage, fees, and price discrepancies that could push fills below $1.
         // - DryRun uses shares threshold for testing
-        let execution_threshold = match &fields.broker {
-            BrokerConfig::Schwab(_) | BrokerConfig::DryRun => {
-                ExecutionThreshold::shares(Positive::<FractionalShares>::ONE)
-            }
-            BrokerConfig::AlpacaTradingApi(_) | BrokerConfig::AlpacaBrokerApi(_) => {
-                ExecutionThreshold::dollar_value(Usdc(Decimal::TWO))
-                    .map_err(serde::de::Error::custom)?
-            }
-        };
+        let execution_threshold = derive_execution_threshold(&broker)?;
 
-        // Construct RebalancingConfig from TOML fields + broker's Alpaca auth.
-        // This ensures alpaca credentials are configured exactly once (in [broker])
-        // and rebalancing uses the same credentials, eliminating duplication.
-        //
-        // The type system enforces: RebalancingConfig can ONLY be constructed with
-        // AlpacaBrokerApiAuthConfig, making it impossible to have rebalancing
-        // without the correct broker type.
-        let rebalancing = match (fields.rebalancing, &fields.broker) {
-            (Some(toml_fields), BrokerConfig::AlpacaBrokerApi(broker_auth)) => Some(
-                RebalancingConfig::from_toml_and_broker(toml_fields, broker_auth.clone())
-                    .map_err(serde::de::Error::custom)?,
-            ),
-            (Some(_), _) => {
-                return Err(serde::de::Error::custom(
-                    RebalancingConfigError::NotAlpacaBroker,
-                ));
-            }
-            (None, _) => None,
-        };
+        // Rebalancing requires both config and secrets, plus an AlpacaBrokerApi broker.
+        let rebalancing =
+            assemble_rebalancing(config.rebalancing, secrets.rebalancing, &broker)?;
 
-        Ok(Self {
-            database_url: fields.database_url,
-            log_level,
-            server_port: fields.server_port.unwrap_or(8080),
-            evm: fields.evm,
-            order_polling_interval: fields.order_polling_interval.unwrap_or(15),
-            order_polling_max_jitter: fields.order_polling_max_jitter.unwrap_or(5),
-            broker: fields.broker,
-            hyperdx: fields.hyperdx,
-            rebalancing,
-            execution_threshold,
-        })
-    }
-}
+        let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 
-impl Config {
-    pub fn load_file(path: &std::path::Path) -> Result<Self, ConfigError> {
-        let contents = std::fs::read_to_string(path)?;
-        Self::load(&contents)
-    }
-
-    pub fn load(toml_str: &str) -> Result<Self, ConfigError> {
-        let config: Self = toml::from_str(toml_str)?;
-
-        if config.rebalancing.is_none() && config.evm.order_owner.is_none() {
+        if rebalancing.is_none() && evm.order_owner.is_none() {
             return Err(ConfigError::MissingOrderOwner);
         }
 
-        Ok(config)
+        Ok(Self {
+            database_url: config.database_url,
+            log_level,
+            server_port: config.server_port.unwrap_or(8080),
+            evm,
+            order_polling_interval: config.order_polling_interval.unwrap_or(15),
+            order_polling_max_jitter: config.order_polling_max_jitter.unwrap_or(5),
+            broker,
+            telemetry,
+            rebalancing,
+            execution_threshold,
+        })
     }
 
     pub async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error> {
         configure_sqlite_pool(&self.database_url).await
     }
 
-    pub(crate) fn rebalancing_config(&self) -> Option<&RebalancingConfig> {
+    pub(crate) fn rebalancing_config(&self) -> Option<&RebalancingCtx> {
         self.rebalancing.as_ref()
     }
 

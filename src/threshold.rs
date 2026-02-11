@@ -260,9 +260,7 @@ mod tests {
         let max = Usdc(Decimal::MAX);
         let one = Usdc(Decimal::ONE);
 
-        let result = max + one;
-
-        let err = result.unwrap_err();
+        let err = (max + one).unwrap_err();
         assert_eq!(err.operation, "+");
         assert_eq!(err.lhs, max);
         assert_eq!(err.rhs, one);
@@ -273,9 +271,7 @@ mod tests {
         let min = Usdc(Decimal::MIN);
         let one = Usdc(Decimal::ONE);
 
-        let result = min - one;
-
-        let err = result.unwrap_err();
+        let err = (min - one).unwrap_err();
         assert_eq!(err.operation, "-");
         assert_eq!(err.lhs, min);
         assert_eq!(err.rhs, one);

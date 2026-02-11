@@ -353,11 +353,9 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
-
+        let tokens = config.get_tokens_from_code("test_code").await.unwrap();
         mock.assert();
 
-        let tokens = result.unwrap();
         assert_eq!(tokens.access_token, "test_access_token");
         assert_eq!(tokens.refresh_token, "test_refresh_token");
 
@@ -378,11 +376,14 @@ mod tests {
                 .json_body(json!({"error": "invalid_request"}));
         });
 
-        let result = config.get_tokens_from_code("invalid_code").await;
-
+        let error = config
+            .get_tokens_from_code("invalid_code")
+            .await
+            .unwrap_err();
         mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
             if action == "get tokens" && status.as_u16() == 400
         ));
@@ -400,10 +401,10 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
-
+        let error = config.get_tokens_from_code("test_code").await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[tokio::test]
@@ -422,10 +423,10 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
-
+        let error = config.get_tokens_from_code("test_code").await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[tokio::test]
@@ -445,12 +446,12 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config
+        let tokens = config
             .get_tokens_from_code("code_with_special_chars_!@#$%^&*()")
-            .await;
-
+            .await
+            .unwrap();
         mock.assert();
-        let tokens = result.unwrap();
+
         assert_eq!(
             tokens.access_token,
             "access_token_with_special_chars_!@#$%^&*()"
@@ -486,11 +487,9 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.refresh_tokens("old_refresh_token").await;
-
+        let tokens = config.refresh_tokens("old_refresh_token").await.unwrap();
         mock.assert();
 
-        let tokens = result.unwrap();
         assert_eq!(tokens.access_token, "new_access_token");
         assert_eq!(tokens.refresh_token, "new_refresh_token");
 

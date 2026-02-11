@@ -27,7 +27,7 @@
 //!
 //! ```ignore
 //! // Optional telemetry setup through config
-//! let ctx = Ctx::load_file(&config_path, &secrets_path)?;
+//! let ctx = Ctx::load_files(&config_path, &secrets_path)?;
 //! let log_level: tracing::Level = (&config.log_level).into();
 //!
 //! let telemetry_guard = if let Some(ref telemetry) = config.telemetry {

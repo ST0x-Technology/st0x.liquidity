@@ -190,20 +190,21 @@ mod tests {
     #[tokio::test]
     async fn test_wait_until_market_open_always_returns_none() {
         let executor = MockExecutor::new();
-        let result = executor.wait_until_market_open().await;
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), std::time::Duration::MAX);
+        assert_eq!(
+            executor.wait_until_market_open().await.unwrap(),
+            std::time::Duration::MAX
+        );
     }
 
     #[tokio::test]
     async fn test_failure_executor_wait_until_market_open() {
         let executor = MockExecutor::with_failure("Test failure");
-        let result = executor.wait_until_market_open().await;
 
-        assert!(result.is_ok());
-        let dur = result.unwrap();
-        assert_eq!(dur, std::time::Duration::MAX);
+        assert_eq!(
+            executor.wait_until_market_open().await.unwrap(),
+            std::time::Duration::MAX
+        );
     }
 
     #[tokio::test]
@@ -230,8 +231,7 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = executor.place_market_order(order).await;
-        let placement = result.unwrap();
+        let placement = executor.place_market_order(order).await.unwrap();
 
         assert!(placement.order_id.starts_with("TEST_"));
         assert_eq!(placement.symbol, Symbol::new("AAPL").unwrap());
@@ -251,9 +251,8 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = executor.place_market_order(order).await;
         assert!(matches!(
-            result.unwrap_err(),
+            executor.place_market_order(order).await.unwrap_err(),
             ExecutionError::MockFailure { message } if message == "Simulated API error"
         ));
     }
@@ -261,18 +260,16 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pending_orders_success() {
         let executor = MockExecutor::new();
-        let result = executor.poll_pending_orders().await;
 
-        assert!(result.unwrap().is_empty());
+        assert!(executor.poll_pending_orders().await.unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn test_poll_pending_orders_failure() {
         let executor = MockExecutor::with_failure("Connection timeout");
-        let result = executor.poll_pending_orders().await;
 
         assert!(matches!(
-            result.unwrap_err(),
+            executor.poll_pending_orders().await.unwrap_err(),
             ExecutionError::MockFailure { message } if message == "Connection timeout"
         ));
     }
@@ -280,19 +277,20 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_success() {
         let executor = MockExecutor::new();
-        let result = executor.get_order_status(&"TEST_1".to_string()).await;
 
-        let state = result.unwrap();
+        let state = executor
+            .get_order_status(&"TEST_1".to_string())
+            .await
+            .unwrap();
         assert!(matches!(state, OrderState::Filled { .. }));
     }
 
     #[tokio::test]
     async fn test_get_order_status_failure() {
         let executor = MockExecutor::with_failure("Test failure");
-        let result = executor.get_order_status(&"TEST_1".to_string()).await;
 
         assert!(matches!(
-            result.unwrap_err(),
+            executor.get_order_status(&"TEST_1".to_string()).await.unwrap_err(),
             ExecutionError::OrderNotFound { order_id } if order_id == "TEST_1"
         ));
     }

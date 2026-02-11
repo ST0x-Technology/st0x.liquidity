@@ -107,10 +107,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = wait_until_market_open(&client).await;
+        let duration = wait_until_market_open(&client).await.unwrap();
 
         mock.assert();
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 
@@ -131,10 +130,9 @@ mod tests {
         });
 
         let client = create_test_client(&server);
-        let result = wait_until_market_open(&client).await;
+        let duration = wait_until_market_open(&client).await.unwrap();
 
         mock.assert();
-        let duration = result.unwrap();
         assert!(duration.as_secs() > 0);
     }
 }

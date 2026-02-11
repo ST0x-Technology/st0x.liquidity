@@ -369,8 +369,7 @@ mod tests {
 
         let poller = OrderStatusPoller::new(config, auth, pool, Schwab);
 
-        let result = poller.poll_pending_orders().await;
-        assert!(result.is_ok());
+        let () = poller.poll_pending_orders().await.unwrap();
     }
 
     #[tokio::test]
@@ -405,8 +404,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let result = poller.poll_execution_status(&execution).await;
-        assert!(result.is_ok());
+        let () = poller.poll_execution_status(&execution).await.unwrap();
     }
 
     #[tokio::test]
@@ -516,9 +514,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let poll_result = poller.poll_execution_status(&execution).await;
-
-        assert!(poll_result.is_ok());
+        let () = poller.poll_execution_status(&execution).await.unwrap();
 
         // Step 6: Verify final state - order should be FILLED with actual execution price
         let final_execution = crate::schwab::execution::find_execution_by_id(&pool, execution_id)
@@ -884,8 +880,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let poll_result = poller.poll_execution_status(&execution).await;
-        assert!(poll_result.is_ok());
+        let () = poller.poll_execution_status(&execution).await.unwrap();
 
         verify_failed_order_cleanup(&pool, execution_id).await;
 

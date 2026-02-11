@@ -259,15 +259,12 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = fetch_inventory(&client).await;
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaBrokerApiError::InvalidSymbol(_)
-        ));
+        assert!(matches!(error, AlpacaBrokerApiError::InvalidSymbol(_)));
     }
 
     #[tokio::test]
@@ -303,13 +300,13 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = fetch_inventory(&client).await;
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
         ));
     }
@@ -345,13 +342,13 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = fetch_inventory(&client).await;
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::MarketValueConversion { symbol, .. } if symbol.to_string() == "AAPL"
         ));
     }
@@ -381,14 +378,11 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = fetch_inventory(&client).await;
+        let error = fetch_inventory(&client).await.unwrap_err();
 
         positions_mock.assert();
         account_mock.assert();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            AlpacaBrokerApiError::FractionalCents(_)
-        ));
+        assert!(matches!(error, AlpacaBrokerApiError::FractionalCents(_)));
     }
 }

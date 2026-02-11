@@ -349,8 +349,9 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        mock.assert();
         let market_hours = fetch_market_hours(&config, &pool, None).await.unwrap();
+        mock.assert();
+
         assert_eq!(
             market_hours.date,
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap()
@@ -393,8 +394,11 @@ mod tests {
                 .json_body(mock_response);
         });
 
+        let market_hours = fetch_market_hours(&config, &pool, Some("2025-01-04"))
+            .await
+            .unwrap();
         mock.assert();
-        let market_hours = fetch_market_hours(&config, &pool, Some("2025-01-04")).await.unwrap();
+
         assert_eq!(
             market_hours.date,
             NaiveDate::from_ymd_opt(2025, 1, 4).unwrap()
@@ -421,8 +425,8 @@ mod tests {
         });
 
         let result = fetch_market_hours(&config, &pool, None).await;
-
         mock.assert();
+
         assert!(matches!(
             result.unwrap_err(),
             SchwabError::RequestFailed { action, status, .. }
@@ -445,8 +449,8 @@ mod tests {
         });
 
         let result = fetch_market_hours(&config, &pool, None).await;
-
         mock.assert();
+
         assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
     }
 

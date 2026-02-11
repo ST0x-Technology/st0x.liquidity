@@ -299,10 +299,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = client.verify_account().await;
+        let err = client.verify_account().await.unwrap_err();
 
         mock.assert();
-        let err = result.unwrap_err();
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401)
         );

@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, Symbol};
 
+use super::TransferDirection;
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
@@ -22,7 +23,7 @@ use crate::bindings::IERC20;
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
-use crate::config::{BrokerConfig, Config};
+use crate::config::{BrokerConfig, Ctx};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
@@ -34,15 +35,13 @@ use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::IssuerRequestId;
 use crate::usdc_rebalance::UsdcRebalanceId;
 
-use super::TransferDirection;
-
 pub(super) async fn transfer_equity_command<W: Write>(
     stdout: &mut W,
     direction: TransferDirection,
     symbol: &Symbol,
     quantity: FractionalShares,
     token_address: Option<Address>,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let direction_str = match direction {

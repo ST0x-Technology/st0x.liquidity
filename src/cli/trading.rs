@@ -1,20 +1,21 @@
 //! Trading order execution and transaction processing CLI commands.
 
-use std::io::Write;
-use std::sync::Arc;
-
 use alloy::primitives::B256;
 use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
+use std::io::Write;
+use std::sync::Arc;
+use tracing::{error, info};
+
 use st0x_execution::{
     Direction, Executor, FractionalShares, MarketOrder, MockExecutorCtx, OrderPlacement,
     OrderState, Positive, Symbol, TryIntoExecutor,
 };
-use tracing::{error, info};
 
-use crate::config::{BrokerConfig, Config};
+use super::auth::ensure_schwab_authentication;
+use crate::config::{BrokerConfig, Ctx};
 use crate::dual_write::DualWriteContext;
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
@@ -22,17 +23,15 @@ use crate::onchain::{OnchainTrade, accumulator};
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
 
-use super::auth::ensure_schwab_authentication;
-
 pub(super) async fn order_status_command<W: Write>(
     stdout: &mut W,
     order_id: &str,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "🔍 Checking order status for ID: {order_id}")?;
 
-    let state = get_broker_order_status(config, pool, order_id, stdout).await?;
+    let state = get_broker_order_status(ctx, pool, order_id, stdout).await?;
 
     match state {
         OrderState::Pending => {
@@ -78,14 +77,14 @@ pub(super) async fn order_status_command<W: Write>(
 }
 
 async fn get_broker_order_status<W: Write>(
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     order_id: &str,
     stdout: &mut W,
 ) -> anyhow::Result<OrderState> {
-    match &config.broker {
+    match &ctx.broker {
         BrokerConfig::Schwab(schwab_auth) => {
-            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
+            ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let broker = schwab_ctx.try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
@@ -109,7 +108,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
     quantity: u64,
     direction: Direction,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
@@ -121,7 +120,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 
     info!("Created order: symbol={symbol}, direction={direction:?}, quantity={quantity}");
 
-    match execute_broker_order(config, pool, market_order, stdout).await {
+    match execute_broker_order(ctx, pool, market_order, stdout).await {
         Ok(placement) => {
             info!(
                 symbol = %symbol,
@@ -153,21 +152,21 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 
 pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     tx_hash: B256,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
     provider: &P,
     cache: &SymbolCache,
 ) -> anyhow::Result<()> {
-    let evm = &config.evm;
+    let evm = &ctx.evm;
     let feed_id_cache = FeedIdCache::new();
-    let order_owner = config.order_owner()?;
+    let order_owner = ctx.order_owner()?;
 
     match OnchainTrade::try_from_tx_hash(tx_hash, provider, cache, evm, &feed_id_cache, order_owner)
         .await
     {
         Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, config, pool, stdout).await?;
+            process_found_trade(onchain_trade, ctx, pool, stdout).await?;
         }
         Ok(None) => {
             writeln!(
@@ -198,14 +197,14 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
 }
 
 pub(super) async fn execute_broker_order<W: Write>(
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     market_order: MarketOrder,
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
-    match &config.broker {
+    match &ctx.broker {
         BrokerConfig::Schwab(schwab_auth) => {
-            ensure_schwab_authentication(pool, &config.broker, stdout).await?;
+            ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
             writeln!(stdout, "🔄 Executing Schwab order...")?;
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let broker = schwab_ctx.try_into_executor().await?;
@@ -255,7 +254,7 @@ pub(super) async fn execute_broker_order<W: Write>(
 
 pub(super) async fn process_found_trade<W: Write>(
     onchain_trade: OnchainTrade,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
@@ -268,22 +267,17 @@ pub(super) async fn process_found_trade<W: Write>(
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
         Arc::new(sqlite_cqrs(pool.clone(), vec![], ())),
-        config.execution_threshold,
+        ctx.execution_threshold,
     );
 
-    update_position_aggregate(
-        &dual_write_context,
-        &onchain_trade,
-        config.execution_threshold,
-    )
-    .await;
+    update_position_aggregate(&dual_write_context, &onchain_trade, ctx.execution_threshold).await;
 
     let mut sql_tx = pool.begin().await?;
     let execution = accumulator::process_onchain_trade(
         &mut sql_tx,
         &dual_write_context,
         onchain_trade,
-        config.broker.to_supported_executor(),
+        ctx.broker.to_supported_executor(),
     )
     .await?;
     sql_tx.commit().await?;
@@ -295,7 +289,7 @@ pub(super) async fn process_found_trade<W: Write>(
         writeln!(
             stdout,
             "✅ Trade triggered execution for {:?} (ID: {execution_id})",
-            config.broker.to_supported_executor()
+            ctx.broker.to_supported_executor()
         )?;
 
         let market_order = MarketOrder {
@@ -304,7 +298,7 @@ pub(super) async fn process_found_trade<W: Write>(
             direction: execution.direction,
         };
 
-        let placement = execute_broker_order(config, pool, market_order, stdout).await?;
+        let placement = execute_broker_order(ctx, pool, market_order, stdout).await?;
 
         let submitted_state = OrderState::Submitted {
             order_id: placement.order_id.clone(),
@@ -389,24 +383,26 @@ fn display_trade_details<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::{Address, FixedBytes, address};
+    use httpmock::MockServer;
+    use serde_json::json;
+    use url::Url;
+
     use super::*;
     use crate::config::{LogLevel, SchwabAuth};
     use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
-    use alloy::primitives::{Address, FixedBytes, address};
-    use httpmock::MockServer;
-    use serde_json::json;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn create_schwab_test_config(mock_server: &MockServer) -> Config {
-        Config {
+    fn create_schwab_test_ctx(mock_server: &MockServer) -> Ctx {
+        Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
             evm: EvmCtx {
-                ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
+                ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
                 deployment_block: 1,
@@ -416,8 +412,8 @@ mod tests {
             broker: BrokerConfig::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
-                redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
-                base_url: Some(url::Url::parse(&mock_server.base_url()).expect("valid mock URL")),
+                redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
+                base_url: Some(Url::parse(&mock_server.base_url()).expect("valid mock URL")),
                 account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
@@ -427,8 +423,8 @@ mod tests {
         }
     }
 
-    fn get_schwab_auth(config: &Config) -> &SchwabAuth {
-        match &config.broker {
+    fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
+        match &ctx.broker {
             BrokerConfig::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config"),
         }
@@ -460,9 +456,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_buy_success() {
         let server = MockServer::start();
-        let config = create_schwab_test_config(&server);
+        let ctx = create_schwab_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
 
@@ -470,7 +466,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -484,9 +480,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_sell_success() {
         let server = MockServer::start();
-        let config = create_schwab_test_config(&server);
+        let ctx = create_schwab_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         let (account_mock, order_mock) = setup_schwab_order_mocks(&server);
 
@@ -494,7 +490,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
@@ -508,9 +504,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_api_failure() {
         let server = MockServer::start();
-        let config = create_schwab_test_config(&server);
+        let ctx = create_schwab_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -531,25 +527,24 @@ mod tests {
                 .json_body(json!({"error": "Invalid order"}));
         });
 
-        let result = execute_order_with_writers(
+        execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut std::io::sink(),
         )
-        .await;
-
-        assert!(result.is_err());
+        .await
+        .unwrap_err();
     }
 
     #[tokio::test]
     async fn test_execute_order_stdout_contains_details() {
         let server = MockServer::start();
-        let config = create_schwab_test_config(&server);
+        let ctx = create_schwab_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         setup_schwab_order_mocks(&server);
 
@@ -558,7 +553,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout_buffer,
         )
@@ -573,9 +568,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_failure_stdout_contains_error() {
         let server = MockServer::start();
-        let config = create_schwab_test_config(&server);
+        let ctx = create_schwab_test_ctx(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth(&ctx)).await;
 
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -597,17 +592,16 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        let result = execute_order_with_writers(
+        execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout_buffer,
         )
-        .await;
-
-        assert!(result.is_err());
+        .await
+        .unwrap_err();
         let output = String::from_utf8(stdout_buffer).unwrap();
         assert!(
             output.contains("❌ Failed to place order"),

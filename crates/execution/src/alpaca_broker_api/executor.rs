@@ -209,11 +209,11 @@ mod tests {
                 }));
         });
 
-        let result = AlpacaBrokerApi::try_from_ctx(ctx).await;
+        let error = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap_err();
 
         account_mock.assert();
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401
         ));
     }
@@ -267,10 +267,9 @@ mod tests {
         account_mock.assert();
 
         let valid_uuid = "904837e3-3b76-47ec-b432-046db621571b";
-        let result = executor.parse_order_id(valid_uuid);
 
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), valid_uuid);
+        let order_id = executor.parse_order_id(valid_uuid).unwrap();
+        assert_eq!(order_id, valid_uuid);
     }
 
     #[tokio::test]

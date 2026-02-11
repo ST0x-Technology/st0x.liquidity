@@ -181,15 +181,15 @@ mod tests {
     async fn failing_mock_still_increments_call_count() {
         let mock = MockRedeem::failing();
 
-        let _ = mock
-            .execute_redemption(
-                &RedemptionAggregateId::new("x"),
-                Symbol::new("AAPL").unwrap(),
-                FractionalShares::new(dec!(1)),
-                Address::ZERO,
-                U256::ZERO,
-            )
-            .await;
+        mock.execute_redemption(
+            &RedemptionAggregateId::new("x"),
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(dec!(1)),
+            Address::ZERO,
+            U256::ZERO,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(mock.calls(), 1);
     }
@@ -199,15 +199,15 @@ mod tests {
         let mock = MockRedeem::failing();
         let aggregate_id = RedemptionAggregateId::new("captured-agg");
 
-        let _ = mock
-            .execute_redemption(
-                &aggregate_id,
-                Symbol::new("NVDA").unwrap(),
-                FractionalShares::new(dec!(50)),
-                Address::ZERO,
-                U256::from(12345u64),
-            )
-            .await;
+        mock.execute_redemption(
+            &aggregate_id,
+            Symbol::new("NVDA").unwrap(),
+            FractionalShares::new(dec!(50)),
+            Address::ZERO,
+            U256::from(12345u64),
+        )
+        .await
+        .unwrap_err();
 
         let call = mock.last_call().unwrap();
         assert_eq!(call.aggregate_id, aggregate_id);

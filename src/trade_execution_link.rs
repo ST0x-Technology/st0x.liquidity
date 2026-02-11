@@ -289,10 +289,13 @@ mod tests {
 
         // Try to create duplicate link - should fail
         let link2 = TradeExecutionLink::new(trade_id, execution_id, 0.5);
-        let result = link2.save_within_transaction(&mut sql_tx).await;
-
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
-        assert!(error_msg.contains("UNIQUE constraint failed"));
+        assert!(
+            link2
+                .save_within_transaction(&mut sql_tx)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("UNIQUE constraint failed")
+        );
     }
 }

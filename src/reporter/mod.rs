@@ -470,7 +470,7 @@ mod tests {
     #[test]
     fn load_file_parses_minimal_config() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "database_url = \":memory:\"").unwrap();
+        let () = write!(file, "database_url = \":memory:\"").unwrap();
 
         let config = ReporterConfig::load_file(file.path()).unwrap();
 
@@ -482,9 +482,9 @@ mod tests {
     #[test]
     fn load_file_parses_all_fields() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(file, "database_url = \"test.db\"").unwrap();
-        writeln!(file, "processing_interval_secs = 30").unwrap();
-        writeln!(file, "log_level = \"info\"").unwrap();
+        let () = writeln!(file, "database_url = \"test.db\"").unwrap();
+        let () = writeln!(file, "processing_interval_secs = 30").unwrap();
+        let () = writeln!(file, "log_level = \"info\"").unwrap();
 
         let config = ReporterConfig::load_file(file.path()).unwrap();
 
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn load_file_returns_toml_error_for_invalid_content() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "this is not valid toml {{{{").unwrap();
+        let () = write!(file, "this is not valid toml {{{{").unwrap();
 
         let err = ReporterConfig::load_file(file.path()).unwrap_err();
 
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn load_file_returns_toml_error_when_required_field_missing() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write!(file, "processing_interval_secs = 30").unwrap();
+        let () = write!(file, "processing_interval_secs = 30").unwrap();
 
         let err = ReporterConfig::load_file(file.path()).unwrap_err();
 

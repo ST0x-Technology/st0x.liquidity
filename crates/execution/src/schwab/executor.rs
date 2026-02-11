@@ -368,9 +368,10 @@ mod tests {
         let auth = create_test_auth_env();
         let ctx = create_test_ctx(auth, pool);
 
-        let result = Schwab::try_from_ctx(ctx).await;
-
-        assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
+        assert!(matches!(
+            Schwab::try_from_ctx(ctx).await.unwrap_err(),
+            ExecutionError::Schwab(_)
+        ));
     }
 
     #[tokio::test]
@@ -392,9 +393,8 @@ mod tests {
             .unwrap();
 
         let ctx = create_test_ctx(auth, pool);
-        let result = Schwab::try_from_ctx(ctx).await;
 
-        let broker = result.unwrap();
+        let broker = Schwab::try_from_ctx(ctx).await.unwrap();
         assert_eq!(broker.auth.app_key, "test_key");
     }
 
@@ -434,9 +434,8 @@ mod tests {
         });
 
         let ctx = create_test_ctx(auth, pool.clone());
-        let result = Schwab::try_from_ctx(ctx).await;
 
-        assert!(result.is_ok());
+        Schwab::try_from_ctx(ctx).await.unwrap();
         refresh_mock.assert();
 
         // Verify tokens were updated
@@ -466,10 +465,9 @@ mod tests {
             .unwrap();
 
         let ctx = create_test_ctx(auth, pool);
-        let result = Schwab::try_from_ctx(ctx).await;
 
         assert!(matches!(
-            result.unwrap_err(),
+            Schwab::try_from_ctx(ctx).await.unwrap_err(),
             ExecutionError::Schwab(SchwabError::RefreshTokenExpired)
         ));
     }
@@ -537,9 +535,8 @@ mod tests {
         });
 
         let broker = Schwab { auth, pool };
-        let result = broker.wait_until_market_open().await;
 
-        let duration = result.unwrap();
+        let duration = broker.wait_until_market_open().await.unwrap();
         // Market is open, returns time until close (should be ~2 hours)
         assert!(duration.as_secs() > 0);
         assert!(duration.as_secs() < 7300); // Less than ~2 hours + buffer
@@ -634,9 +631,11 @@ mod tests {
         });
 
         let broker = Schwab { auth, pool };
-        let result = broker.wait_until_market_open().await;
 
-        assert!(matches!(result.unwrap_err(), ExecutionError::Schwab(_)));
+        assert!(matches!(
+            broker.wait_until_market_open().await.unwrap_err(),
+            ExecutionError::Schwab(_)
+        ));
         market_hours_mock.assert();
     }
 

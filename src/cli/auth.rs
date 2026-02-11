@@ -153,9 +153,9 @@ mod tests {
         setup_test_tokens(&pool, &schwab_auth).await;
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &config.broker, &mut stdout).await;
-
-        assert!(result.is_ok());
+        ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+            .await
+            .unwrap();
         let output = String::from_utf8(stdout).unwrap();
         assert!(output.contains("Refreshing authentication tokens"));
     }
@@ -163,7 +163,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_auth_with_expired_access_token_refreshes() {
         let server = MockServer::start();
-        let (config, schwab_auth) = create_schwab_config(&server);
+        let (ctx, schwab_auth) = create_schwab_ctx(&server);
         let pool = setup_test_db().await;
 
         let expired_access_tokens = SchwabTokens {
@@ -193,16 +193,16 @@ mod tests {
         });
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &config.broker, &mut stdout).await;
-
-        assert!(result.is_ok());
+        ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+            .await
+            .unwrap();
         refresh_mock.assert();
     }
 
     #[tokio::test]
     async fn test_ensure_auth_with_expired_refresh_token_returns_error() {
         let server = MockServer::start();
-        let (config, schwab_auth) = create_schwab_config(&server);
+        let (ctx, schwab_auth) = create_schwab_ctx(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -217,7 +217,7 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &config.broker, &mut stdout).await;
+        let result = ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout).await;
 
         assert!(matches!(
             result.unwrap_err().downcast_ref::<SchwabError>(),
@@ -231,9 +231,11 @@ mod tests {
         let broker = BrokerConfig::DryRun;
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &broker, &mut stdout).await;
 
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = ensure_schwab_authentication(&pool, &broker, &mut stdout)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("only required for Schwab"),
             "Expected Schwab-only error, got: {err_msg}"
@@ -248,10 +250,9 @@ mod tests {
         let mut stdout = Vec::new();
         let result = auth_command(&mut stdout, &broker, &pool).await;
 
-        let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("only supported for Schwab"),
-            "Expected Schwab-only error, got: {err_msg}"
+            result.unwrap_err().to_string().contains("only supported for Schwab"),
+            "Expected Schwab-only error"
         );
     }
 }

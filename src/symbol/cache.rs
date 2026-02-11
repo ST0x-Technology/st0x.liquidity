@@ -71,8 +71,7 @@ mod tests {
 
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let result = cache.get_io_symbol(provider, &io).await.unwrap();
-        assert_eq!(result, "TEST");
+        assert_eq!(cache.get_io_symbol(provider, &io).await.unwrap(), "TEST");
     }
 
     #[tokio::test]
@@ -88,9 +87,8 @@ mod tests {
         let asserter = Asserter::new();
         asserter.push_failure_msg("RPC failure");
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let result = cache.get_io_symbol(provider, &io).await;
         assert!(matches!(
-            result.unwrap_err(),
+            cache.get_io_symbol(provider, &io).await.unwrap_err(),
             OnChainError::Alloy(crate::error::AlloyError::GetSymbol(_))
         ));
     }

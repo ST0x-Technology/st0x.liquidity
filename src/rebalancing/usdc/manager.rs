@@ -1178,16 +1178,14 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-001");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_alpaca_to_base(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_alpaca_to_base(&id, amount).await,
                 Err(UsdcRebalanceManagerError::AlpacaWallet(
                     AlpacaWalletError::AddressNotWhitelisted { .. }
                 ))
             ),
-            "Expected AddressNotWhitelisted error, got: {result:?}"
+            "Expected AddressNotWhitelisted error"
         );
         whitelist_mock.assert();
     }
@@ -1242,16 +1240,14 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-002");
         let amount = Usdc(dec!(500));
 
-        let result = manager.execute_alpaca_to_base(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_alpaca_to_base(&id, amount).await,
                 Err(UsdcRebalanceManagerError::AlpacaWallet(
                     AlpacaWalletError::AddressNotWhitelisted { .. }
                 ))
             ),
-            "Expected AddressNotWhitelisted error for pending whitelist, got: {result:?}"
+            "Expected AddressNotWhitelisted error for pending whitelist"
         );
         whitelist_mock.assert();
     }
@@ -1297,11 +1293,9 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-003");
         let amount = Usdc(dec!(100));
 
-        let result = manager.execute_alpaca_to_base(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_alpaca_to_base(&id, amount).await,
                 Err(UsdcRebalanceManagerError::AlpacaWallet(
                     AlpacaWalletError::ApiError {
                         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1309,7 +1303,7 @@ mod tests {
                     }
                 ))
             ),
-            "Expected ApiError with INTERNAL_SERVER_ERROR, got: {result:?}"
+            "Expected ApiError with INTERNAL_SERVER_ERROR"
         );
         whitelist_mock.assert();
     }
@@ -1317,35 +1311,31 @@ mod tests {
     #[test]
     fn test_usdc_to_u256_positive_amount() {
         let amount = Usdc(dec!(1000.50));
-        let result = usdc_to_u256(amount).unwrap();
-        assert_eq!(result, U256::from(1_000_500_000u64));
+        assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1_000_500_000u64));
     }
 
     #[test]
     fn test_usdc_to_u256_negative_amount() {
         let amount = Usdc(dec!(-100));
-        let result = usdc_to_u256(amount);
         assert!(
             matches!(
-                &result,
+                usdc_to_u256(amount),
                 Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-100")
             ),
-            "Expected InvalidAmount error mentioning -100, got: {result:?}"
+            "Expected InvalidAmount error mentioning -100"
         );
     }
 
     #[test]
     fn test_usdc_to_u256_zero_amount() {
         let amount = Usdc(dec!(0));
-        let result = usdc_to_u256(amount).unwrap();
-        assert_eq!(result, U256::ZERO);
+        assert_eq!(usdc_to_u256(amount).unwrap(), U256::ZERO);
     }
 
     #[test]
     fn test_usdc_to_u256_fractional_truncation() {
         let amount = Usdc(dec!(100.1234567));
-        let result = usdc_to_u256(amount).unwrap();
-        assert_eq!(result, U256::from(100_123_456u64));
+        assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(100_123_456u64));
     }
 
     #[tokio::test]
@@ -1374,14 +1364,12 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-base-001");
         let amount = Usdc(dec!(-500));
 
-        let result = manager.execute_base_to_alpaca(&id, amount).await;
-
         assert!(
             matches!(
-                &result,
+                manager.execute_base_to_alpaca(&id, amount).await,
                 Err(UsdcRebalanceManagerError::InvalidAmount(msg)) if msg.contains("-500")
             ),
-            "Expected InvalidAmount error mentioning -500, got: {result:?}"
+            "Expected InvalidAmount error mentioning -500"
         );
     }
 
@@ -1411,16 +1399,14 @@ mod tests {
         let id = UsdcRebalanceId::new("rebalance-base-002");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_base_to_alpaca(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_base_to_alpaca(&id, amount).await,
                 Err(UsdcRebalanceManagerError::Aggregate(
                     AggregateError::UserError(UsdcRebalanceError::BridgingNotInitiated)
                 ))
             ),
-            "Expected Aggregate(UserError(BridgingNotInitiated)) error, got: {result:?}"
+            "Expected Aggregate(UserError(BridgingNotInitiated)) error"
         );
     }
 
@@ -1525,13 +1511,12 @@ mod tests {
         let id = UsdcRebalanceId::new("conversion-test-001");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
+        manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap();
 
         order_mock.assert();
-        assert!(
-            result.is_ok(),
-            "Expected successful conversion, got: {result:?}"
-        );
     }
 
     #[tokio::test]
@@ -1572,16 +1557,14 @@ mod tests {
 
         // execute_usdc_to_usd_conversion requires aggregate to be in DepositConfirmed state
         // (after a BaseToAlpaca deposit completes). With a fresh aggregate, it should fail.
-        let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_usdc_to_usd_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::Aggregate(
                     AggregateError::UserError(UsdcRebalanceError::DepositNotConfirmed)
                 ))
             ),
-            "Expected DepositNotConfirmed error when aggregate not in correct state, got: {result:?}"
+            "Expected DepositNotConfirmed error when aggregate not in correct state"
         );
     }
 
@@ -1623,12 +1606,10 @@ mod tests {
         let id = UsdcRebalanceId::new("conversion-test-003");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-
-        assert!(
-            result.is_ok(),
-            "Expected successful conversion after polling, got: {result:?}"
-        );
+        manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1669,11 +1650,9 @@ mod tests {
         let id = UsdcRebalanceId::new("conversion-test-004");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::AlpacaBrokerApi(
                     AlpacaBrokerApiError::CryptoOrderFailed {
                         reason: CryptoOrderFailureReason::Canceled,
@@ -1681,7 +1660,7 @@ mod tests {
                     }
                 ))
             ),
-            "Expected CryptoOrderFailed with Canceled reason, got: {result:?}"
+            "Expected CryptoOrderFailed with Canceled reason"
         );
     }
 
@@ -1782,11 +1761,9 @@ mod tests {
             "1000",
         );
 
-        let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_usdc_to_usd_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::AlpacaBrokerApi(
                     AlpacaBrokerApiError::CryptoOrderFailed {
                         reason: CryptoOrderFailureReason::Rejected,
@@ -1794,7 +1771,7 @@ mod tests {
                     }
                 ))
             ),
-            "Expected CryptoOrderFailed with Rejected reason, got: {result:?}"
+            "Expected CryptoOrderFailed with Rejected reason"
         );
     }
 
@@ -1832,10 +1809,10 @@ mod tests {
         let id = UsdcRebalanceId::new("conversion-fail-test-001");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-
-        // Should return an error
-        assert!(result.is_err(), "Expected error, got: {result:?}");
+        manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap_err();
 
         // Verify aggregate is in ConversionFailed state (not uninitialized) by attempting
         // InitiateConversion which should fail because aggregate is no longer uninitialized
@@ -1917,7 +1894,10 @@ mod tests {
         let id = UsdcRebalanceId::new("alpaca-to-base-conversion-test");
         let amount = Usdc(dec!(1000));
 
-        let _ = manager.execute_alpaca_to_base(&id, amount).await;
+        manager
+            .execute_alpaca_to_base(&id, amount)
+            .await
+            .unwrap_err();
 
         // Conversion MUST be called before withdrawal
         assert!(
@@ -1982,12 +1962,10 @@ mod tests {
 
         advance_to_deposit_confirmed_base_to_alpaca(&cqrs, &id, amount).await;
 
-        let result = manager.execute_usdc_to_usd_conversion(&id, amount).await;
-
-        assert!(
-            result.is_ok(),
-            "execute_usdc_to_usd_conversion should succeed, got: {result:?}"
-        );
+        manager
+            .execute_usdc_to_usd_conversion(&id, amount)
+            .await
+            .unwrap();
 
         assert!(
             conversion_mock.hits() >= 1,
@@ -2041,11 +2019,9 @@ mod tests {
         let id = UsdcRebalanceId::new("conversion-expired-test");
         let amount = Usdc(dec!(1000));
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-
         assert!(
             matches!(
-                result,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::AlpacaBrokerApi(
                     AlpacaBrokerApiError::CryptoOrderFailed {
                         reason: CryptoOrderFailureReason::Expired,
@@ -2053,7 +2029,7 @@ mod tests {
                     }
                 ))
             ),
-            "Expected CryptoOrderFailed with Expired reason, got: {result:?}"
+            "Expected CryptoOrderFailed with Expired reason"
         );
     }
 
@@ -2061,16 +2037,14 @@ mod tests {
     fn test_usdc_to_u256_fractional_precision() {
         // Test with precise fractional amounts (6 decimals for USDC)
         let amount = Usdc(dec!(1000.123456));
-        let result = usdc_to_u256(amount).unwrap();
-        assert_eq!(result, U256::from(1_000_123_456u64));
+        assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1_000_123_456u64));
     }
 
     #[test]
     fn test_usdc_to_u256_minimum_amount() {
         // Test near-minimum amounts (smallest USDC unit is 0.000001)
         let amount = Usdc(dec!(0.000001));
-        let result = usdc_to_u256(amount).unwrap();
-        assert_eq!(result, U256::from(1u64));
+        assert_eq!(usdc_to_u256(amount).unwrap(), U256::from(1u64));
     }
 
     #[test]
@@ -2078,8 +2052,10 @@ mod tests {
         // Test large amounts that should work without overflow
         // $1 trillion in USDC
         let amount = Usdc(dec!(1_000_000_000_000));
-        let result = usdc_to_u256(amount).unwrap();
-        assert_eq!(result, U256::from(1_000_000_000_000_000_000u64));
+        assert_eq!(
+            usdc_to_u256(amount).unwrap(),
+            U256::from(1_000_000_000_000_000_000u64)
+        );
     }
 
     #[test]
@@ -2145,16 +2121,14 @@ mod tests {
         });
 
         // Second call should fail because aggregate is already initialized
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-
         assert!(
             matches!(
-                &result,
+                manager.execute_usd_to_usdc_conversion(&id, amount).await,
                 Err(UsdcRebalanceManagerError::Aggregate(
                     AggregateError::UserError(UsdcRebalanceError::AlreadyInitiated)
                 ))
             ),
-            "Expected AlreadyInitiated error, got: {result:?}"
+            "Expected AlreadyInitiated error"
         );
 
         // Verify no order was placed - CQRS failure should prevent side effects
@@ -2198,8 +2172,10 @@ mod tests {
             then.status(500);
         });
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-        assert!(result.is_err(), "Expected error, got: {result:?}");
+        manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap_err();
 
         // Verify aggregate is in ConversionFailed state by attempting InitiateConversion
         // which should fail with AlreadyInitiated (not succeed with Uninitialized)
@@ -2259,8 +2235,10 @@ mod tests {
             "1000",
         );
 
-        let result = manager.execute_usd_to_usdc_conversion(&id, amount).await;
-        assert!(result.is_ok(), "Expected success, got: {result:?}");
+        manager
+            .execute_usd_to_usdc_conversion(&id, amount)
+            .await
+            .unwrap();
 
         // Verify aggregate is in ConversionComplete state by attempting to start withdrawal
         // which should succeed from ConversionComplete but fail from other states

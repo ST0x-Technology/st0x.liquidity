@@ -274,11 +274,11 @@ mod tests {
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let from_date = NaiveDate::from_ymd_opt(2025, 1, 4).unwrap();
-        let result = find_next_trading_day(&client, from_date).await;
+        let error = find_next_trading_day(&client, from_date).await.unwrap_err();
 
         mock.assert();
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             AlpacaBrokerApiError::NoTradingDaysFound { .. }
         ));
     }
