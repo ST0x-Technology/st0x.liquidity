@@ -4,8 +4,9 @@ use rocket::serde::{Deserialize, Serialize};
 use rocket::{Route, State, get, post, routes};
 use sqlx::SqlitePool;
 
-use crate::config::{BrokerConfig, Config};
-use st0x_execution::schwab::extract_code_from_url;
+use st0x_execution::extract_code_from_url;
+
+use crate::config::{BrokerConfig, Ctx};
 
 #[derive(Serialize, Deserialize)]
 struct HealthResponse {
@@ -39,7 +40,7 @@ enum AuthRefreshResponse {
 async fn auth_refresh(
     request: Json<AuthRefreshRequest>,
     pool: &State<SqlitePool>,
-    config: &State<Config>,
+    config: &State<Ctx>,
 ) -> Json<AuthRefreshResponse> {
     let BrokerConfig::Schwab(schwab_auth) = &config.broker else {
         return Json(AuthRefreshResponse::Error {
@@ -56,7 +57,8 @@ async fn auth_refresh(
         }
     };
 
-    let tokens = match schwab_auth.get_tokens_from_code(&code).await {
+    let schwab_ctx = schwab_auth.to_schwab_ctx(pool.inner().clone());
+    let tokens = match schwab_ctx.get_tokens_from_code(&code).await {
         Ok(tokens) => tokens,
         Err(e) => {
             return Json(AuthRefreshResponse::Error {
@@ -93,11 +95,11 @@ mod tests {
     use url::Url;
 
     use super::*;
+    use crate::config::SchwabAuth;
     use crate::config::{BrokerConfig, Config};
-    use crate::onchain::EvmConfig;
+    use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
-    use st0x_execution::schwab::SchwabAuthConfig;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -106,7 +108,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: crate::config::LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1111111111111111111111111111111111111111"),
                 order_owner: Some(address!("0x2222222222222222222222222222222222222222")),
@@ -114,7 +116,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuthConfig {
+            broker: BrokerConfig::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
                 redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
@@ -122,7 +124,7 @@ mod tests {
                 account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }

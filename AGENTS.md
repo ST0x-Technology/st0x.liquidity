@@ -349,8 +349,14 @@ tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
-All configuration is via TOML files passed with `--config-file`. See
-`example.toml` for available options.
+Configuration is split into plaintext config (`--config`, see
+`example.config.toml`) and encrypted secrets (`--secrets`, see
+`example.secrets.toml`). The reporter binary only takes `--config` (no secrets).
+
+### Naming Conventions
+
+Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which
+is the source of truth for terminology and naming conventions.
 
 ### Code Quality & Best Practices
 
@@ -446,22 +452,22 @@ All configuration is via TOML files passed with `--config-file`. See
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
-- **CRITICAL: Import Organization**: Follow a consistent two-group import
+- **CRITICAL: Import Organization**: Follow a consistent three-group import
   pattern throughout the codebase:
   - **Group 1 - External imports**: All imports from external crates including
-    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines between
-    external imports.
-  - **Empty line separating the groups**
-  - **Group 2 - Internal imports**: All imports from our codebase using
-    `crate::` and `super::`. No empty lines between internal imports.
-  - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
-    within a group
+    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines within.
+  - **Empty line**
+  - **Group 2 - Workspace imports**: Imports from other workspace crates
+    (`st0x_execution`). No empty lines within.
+  - **Empty line**
+  - **Group 3 - Crate-internal imports**: Imports using `crate::` and
+    `super::`. No empty lines within.
+  - Groups 2 or 3 may be absent if unused; never add an empty group
+  - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
-  - Example: `use std::sync::Arc; use alloy::primitives::Address;` [blank line]
-    `use crate::foo::Bar; use super::Baz;`
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
   module is clear (e.g. use `info!` instead of `tracing::info!`). Never use

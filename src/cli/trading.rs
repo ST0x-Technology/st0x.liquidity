@@ -8,9 +8,8 @@ use alloy::providers::Provider;
 use rust_decimal::Decimal;
 use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
-use st0x_execution::schwab::SchwabConfig;
 use st0x_execution::{
-    Direction, Executor, FractionalShares, MarketOrder, MockExecutorConfig, OrderPlacement,
+    Direction, Executor, FractionalShares, MarketOrder, MockExecutorCtx, OrderPlacement,
     OrderState, Positive, Symbol, TryIntoExecutor,
 };
 use tracing::{error, info};
@@ -87,11 +86,8 @@ async fn get_broker_order_status<W: Write>(
     match &config.broker {
         BrokerConfig::Schwab(schwab_auth) => {
             ensure_schwab_authentication(pool, &config.broker, stdout).await?;
-            let schwab_config = SchwabConfig {
-                auth: schwab_auth.clone(),
-                pool: pool.clone(),
-            };
-            let broker = schwab_config.try_into_executor().await?;
+            let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+            let broker = schwab_ctx.try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
         BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
@@ -103,7 +99,7 @@ async fn get_broker_order_status<W: Write>(
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
         BrokerConfig::DryRun => {
-            let broker = MockExecutorConfig.try_into_executor().await?;
+            let broker = MockExecutorCtx.try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
     }
@@ -211,11 +207,8 @@ pub(super) async fn execute_broker_order<W: Write>(
         BrokerConfig::Schwab(schwab_auth) => {
             ensure_schwab_authentication(pool, &config.broker, stdout).await?;
             writeln!(stdout, "🔄 Executing Schwab order...")?;
-            let schwab_config = SchwabConfig {
-                auth: schwab_auth.clone(),
-                pool: pool.clone(),
-            };
-            let broker = schwab_config.try_into_executor().await?;
+            let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+            let broker = schwab_ctx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -248,7 +241,7 @@ pub(super) async fn execute_broker_order<W: Write>(
         }
         BrokerConfig::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
-            let broker = MockExecutorConfig.try_into_executor().await?;
+            let broker = MockExecutorCtx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
             writeln!(
                 stdout,
@@ -396,16 +389,14 @@ fn display_trade_details<W: Write>(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::config::{LogLevel, SchwabAuth};
+    use crate::onchain::EvmCtx;
+    use crate::test_utils::{setup_test_db, setup_test_tokens};
+    use crate::threshold::ExecutionThreshold;
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
-    use st0x_execution::schwab::SchwabAuthConfig;
-
-    use super::*;
-    use crate::config::LogLevel;
-    use crate::onchain::EvmConfig;
-    use crate::test_utils::{setup_test_db, setup_test_tokens};
-    use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -414,7 +405,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -422,7 +413,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuthConfig {
+            broker: BrokerConfig::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
                 redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
@@ -430,13 +421,13 @@ mod tests {
                 account_index: Some(0),
                 encryption_key: TEST_ENCRYPTION_KEY,
             }),
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
 
-    fn get_schwab_auth(config: &Config) -> &SchwabAuthConfig {
+    fn get_schwab_auth(config: &Config) -> &SchwabAuth {
         match &config.broker {
             BrokerConfig::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config"),

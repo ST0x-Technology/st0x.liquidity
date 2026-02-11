@@ -7,7 +7,8 @@ use tracing::{debug, error, info};
 
 use super::broker::Broker;
 use super::execution::find_execution_by_id;
-use super::{SchwabAuthConfig, SchwabError, TradeState};
+use super::{SchwabError, TradeState};
+use crate::config::SchwabAuth;
 use crate::lock::{clear_execution_lease, clear_pending_execution_id};
 
 #[derive(Debug, Clone)]
@@ -27,7 +28,7 @@ impl Default for OrderPollerConfig {
 
 pub(crate) struct OrderStatusPoller<B: Broker> {
     config: OrderPollerConfig,
-    auth: SchwabAuthConfig,
+    auth: SchwabAuth,
     pool: SqlitePool,
     interval: Interval,
     broker: B,
@@ -36,7 +37,7 @@ pub(crate) struct OrderStatusPoller<B: Broker> {
 impl<B: Broker> OrderStatusPoller<B> {
     pub(crate) fn new(
         config: OrderPollerConfig,
-        auth: SchwabAuthConfig,
+        auth: SchwabAuth,
         pool: SqlitePool,
         broker: B,
     ) -> Self {
@@ -313,16 +314,18 @@ impl<B: Broker> OrderStatusPoller<B> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::primitives::FixedBytes;
+    use httpmock::Mock;
+    use httpmock::prelude::*;
+    use serde_json::json;
+    use url::Url;
+
     use super::*;
     use crate::schwab::Direction;
     use crate::schwab::TradeStatus;
     use crate::schwab::broker::Schwab;
     use crate::schwab::execution::SchwabExecution;
     use crate::test_utils::setup_test_db;
-    use alloy::primitives::FixedBytes;
-    use httpmock::Mock;
-    use httpmock::prelude::*;
-    use serde_json::json;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
@@ -336,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn test_order_poller_creation() {
         let config = OrderPollerConfig::default();
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuth {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -354,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pending_orders_empty_database() {
         let config = OrderPollerConfig::default();
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuth {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -373,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_execution_status_missing_order_id() {
         let config = OrderPollerConfig::default();
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuth {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
@@ -413,11 +416,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Setup test environment with mock server
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuth {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
-            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            base_url: Some(Url::parse(&server.base_url()).expect("mock server base_url")),
             account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
@@ -592,11 +595,11 @@ mod tests {
         let pool = setup_test_db().await;
 
         // Setup test environment
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuth {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
-            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            base_url: Some(Url::parse(&server.base_url()).expect("mock server base_url")),
             account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };
@@ -739,15 +742,15 @@ mod tests {
         account_mock.assert_hits(num_orders); // Called once per order status check
     }
 
-    async fn setup_failed_order_test() -> (MockServer, SqlitePool, SchwabAuthConfig, i64) {
+    async fn setup_failed_order_test() -> (MockServer, SqlitePool, SchwabAuth, i64) {
         let server = MockServer::start();
         let pool = setup_test_db().await;
 
-        let auth = SchwabAuthConfig {
+        let auth = SchwabAuth {
             app_key: "test_key".to_string(),
             app_secret: "test_secret".to_string(),
             redirect_uri: None,
-            base_url: Some(url::Url::parse(&server.base_url()).expect("mock server base_url")),
+            base_url: Some(Url::parse(&server.base_url()).expect("mock server base_url")),
             account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         };

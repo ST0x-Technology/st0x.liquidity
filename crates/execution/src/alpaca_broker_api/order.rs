@@ -446,21 +446,21 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use crate::alpaca_broker_api::auth::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
+            mode: Some(mode),
         }
     }
 
     #[tokio::test]
     async fn test_place_market_order_buy_success() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -485,7 +485,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
@@ -505,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn test_place_market_order_sell_success() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -530,7 +530,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let market_order = MarketOrder {
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(Decimal::from(50))).unwrap(),
@@ -550,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_pending() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let order_id = "904837e3-3b76-47ec-b432-046db621571b";
 
         let mock = server.mock(|when, then| {
@@ -569,7 +569,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let result = get_order_status(&client, order_id).await;
 
         mock.assert();
@@ -585,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_filled() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let order_id = "61e7b016-9c91-4a97-b912-615c9d365c9d";
 
         let mock = server.mock(|when, then| {
@@ -604,7 +604,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let result = get_order_status(&client, order_id).await;
 
         mock.assert();
@@ -620,7 +620,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_order_status_rejected() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
         let order_id = "c7ca82d4-3c95-4f89-9b42-abc123def456";
 
         let mock = server.mock(|when, then| {
@@ -639,7 +639,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let result = get_order_status(&client, order_id).await;
 
         mock.assert();
@@ -651,7 +651,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pending_orders_multiple() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -679,7 +679,7 @@ mod tests {
                 ]));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let result = poll_pending_orders(&client).await;
 
         mock.assert();
@@ -704,7 +704,7 @@ mod tests {
     #[tokio::test]
     async fn test_poll_pending_orders_empty() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -715,7 +715,7 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let result = poll_pending_orders(&client).await;
 
         mock.assert();
@@ -771,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn test_convert_usdc_to_usd() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -797,7 +797,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = Decimal::from_str("1000.50").unwrap();
 
         let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd).await;
@@ -813,7 +813,7 @@ mod tests {
     #[tokio::test]
     async fn test_convert_usd_to_usdc() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -839,7 +839,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = Decimal::from_str("500").unwrap();
 
         let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc).await;

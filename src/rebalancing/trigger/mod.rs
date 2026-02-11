@@ -7,6 +7,7 @@ use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use cqrs_es::persist::PersistedEventStore;
 use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
+use serde::Deserialize;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::collections::HashSet;
@@ -27,8 +28,7 @@ use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
 use crate::vault_registry::VaultRegistry;
 use chrono::Utc;
-use st0x_execution::Symbol;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
+use st0x_execution::{AlpacaBrokerApiCtx, Symbol};
 
 use crate::vault_registry::VaultRegistryError;
 
@@ -45,30 +45,31 @@ enum TokenAddressError {
 
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
-pub enum RebalancingConfigError {
+pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
     #[error("broker account_id is not a valid UUID: {0}")]
     InvalidAccountId(#[from] uuid::Error),
 }
 
-/// TOML fields for rebalancing configuration.
-/// Alpaca auth is NOT included here - it's derived from the broker config
-/// to eliminate duplication and ensure consistency.
-#[derive(Clone, serde::Deserialize)]
-pub(crate) struct RebalancingTomlFields {
+#[derive(Deserialize)]
+pub(crate) struct RebalancingSecrets {
+    pub(crate) ethereum_rpc_url: Url,
+    pub(crate) evm_private_key: B256,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+pub(crate) struct RebalancingConfig {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
     pub(crate) redemption_wallet: Address,
-    pub(crate) ethereum_rpc_url: Url,
-    pub(crate) evm_private_key: B256,
     pub(crate) usdc_vault_id: B256,
 }
 
 /// Runtime configuration for rebalancing operations.
-/// Constructed from `RebalancingTomlFields` + broker's `AlpacaBrokerApiAuthConfig`.
+/// Constructed from `RebalancingConfig` + `RebalancingSecrets` + broker's `AlpacaBrokerApiCtx`.
 #[derive(Clone)]
-pub(crate) struct RebalancingConfig {
+pub(crate) struct RebalancingCtx {
     pub(crate) equity_threshold: ImbalanceThreshold,
     pub(crate) usdc_threshold: ImbalanceThreshold,
     /// Issuer's wallet for tokenized equity redemptions.
@@ -79,36 +80,37 @@ pub(crate) struct RebalancingConfig {
     /// Derived from broker config's account_id.
     pub(crate) alpaca_account_id: AlpacaAccountId,
     /// Cloned from broker config - ensures consistency.
-    pub(crate) alpaca_broker_auth: AlpacaBrokerApiAuthConfig,
+    pub(crate) alpaca_broker_auth: AlpacaBrokerApiCtx,
 }
 
-impl RebalancingConfig {
-    /// Construct from TOML fields and broker's Alpaca auth config.
+impl RebalancingCtx {
+    /// Construct from config, secrets, and broker's Alpaca auth.
     ///
-    /// This is the ONLY way to construct a `RebalancingConfig`, which enforces
-    /// the invariant that rebalancing always has valid `AlpacaBrokerApiAuthConfig`.
-    pub(crate) fn from_toml_and_broker(
-        toml: RebalancingTomlFields,
-        broker_auth: AlpacaBrokerApiAuthConfig,
-    ) -> Result<Self, RebalancingConfigError> {
+    /// This is the ONLY way to construct a `RebalancingCtx`, which enforces
+    /// the invariant that rebalancing always has valid `AlpacaBrokerApiCtx`.
+    pub(crate) fn from_config_and_secrets(
+        config: RebalancingConfig,
+        secrets: RebalancingSecrets,
+        broker_auth: AlpacaBrokerApiCtx,
+    ) -> Result<Self, RebalancingCtxError> {
         let alpaca_account_id = AlpacaAccountId::new(broker_auth.account_id.parse()?);
 
         Ok(Self {
-            equity_threshold: toml.equity_threshold,
-            usdc_threshold: toml.usdc_threshold,
-            redemption_wallet: toml.redemption_wallet,
-            ethereum_rpc_url: toml.ethereum_rpc_url,
-            evm_private_key: toml.evm_private_key,
-            usdc_vault_id: toml.usdc_vault_id,
+            equity_threshold: config.equity_threshold,
+            usdc_threshold: config.usdc_threshold,
+            redemption_wallet: config.redemption_wallet,
+            ethereum_rpc_url: secrets.ethereum_rpc_url,
+            evm_private_key: secrets.evm_private_key,
+            usdc_vault_id: config.usdc_vault_id,
             alpaca_account_id,
             alpaca_broker_auth: broker_auth,
         })
     }
 }
 
-impl std::fmt::Debug for RebalancingConfig {
+impl std::fmt::Debug for RebalancingCtx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RebalancingConfig")
+        f.debug_struct("RebalancingCtx")
             .field("equity_threshold", &self.equity_threshold)
             .field("usdc_threshold", &self.usdc_threshold)
             .field("redemption_wallet", &self.redemption_wallet)
@@ -600,7 +602,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlite_es::sqlite_cqrs;
-    use st0x_execution::Direction;
+    use st0x_execution::{AlpacaBrokerApiMode, Direction};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1743,11 +1745,9 @@ mod tests {
         ));
     }
 
-    fn valid_rebalancing_toml() -> &'static str {
+    fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [equity_threshold]
@@ -1760,64 +1760,78 @@ mod tests {
         "#
     }
 
-    fn test_broker_auth() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn valid_rebalancing_secrets_toml() -> &'static str {
+        r#"
+            ethereum_rpc_url = "https://eth.example.com"
+            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        "#
+    }
+
+    fn test_broker_auth() -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
-            mode: Some(st0x_execution::alpaca_broker_api::AlpacaBrokerApiMode::Sandbox),
+            mode: Some(AlpacaBrokerApiMode::Sandbox),
         }
     }
 
     #[test]
-    fn deserialize_toml_fields_succeeds() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn deserialize_config_succeeds() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        assert_eq!(toml_fields.equity_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.equity_threshold.deviation, dec!(0.2));
-        assert_eq!(toml_fields.usdc_threshold.target, dec!(0.5));
-        assert_eq!(toml_fields.usdc_threshold.deviation, dec!(0.3));
+        assert_eq!(config.equity_threshold.target, dec!(0.5));
+        assert_eq!(config.equity_threshold.deviation, dec!(0.2));
+        assert_eq!(config.usdc_threshold.target, dec!(0.5));
+        assert_eq!(config.usdc_threshold.deviation, dec!(0.3));
         assert_eq!(
-            toml_fields.redemption_wallet,
+            config.redemption_wallet,
             address!("1234567890123456789012345678901234567890")
         );
     }
 
     #[test]
-    fn from_toml_and_broker_constructs_config() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn deserialize_secrets_succeeds() {
+        let _secrets: RebalancingSecrets =
+            toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
+    }
 
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
+    #[test]
+    fn from_config_and_secrets_constructs_ctx() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        assert_eq!(config.alpaca_broker_auth.api_key, "test_key");
-        assert_eq!(config.alpaca_broker_auth.api_secret, "test_secret");
+        let ctx =
+            RebalancingCtx::from_config_and_secrets(config, secrets, test_broker_auth()).unwrap();
+
+        assert_eq!(ctx.alpaca_broker_auth.api_key, "test_key");
+        assert_eq!(ctx.alpaca_broker_auth.api_secret, "test_secret");
         assert_eq!(
-            config.alpaca_account_id,
+            ctx.alpaca_account_id,
             AlpacaAccountId::new(uuid!("904837e3-3b76-47ec-b432-046db621571b"))
         );
     }
 
     #[test]
-    fn from_toml_and_broker_fails_with_invalid_account_id() {
-        let toml_fields: RebalancingTomlFields = toml::from_str(valid_rebalancing_toml()).unwrap();
+    fn from_config_and_secrets_fails_with_invalid_account_id() {
+        let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
         let mut broker_auth = test_broker_auth();
         broker_auth.account_id = "not-a-uuid".to_string();
 
-        let result = RebalancingConfig::from_toml_and_broker(toml_fields, broker_auth);
+        let result = RebalancingCtx::from_config_and_secrets(config, secrets, broker_auth);
 
         assert!(
-            matches!(result, Err(RebalancingConfigError::InvalidAccountId(_))),
+            matches!(result, Err(RebalancingCtxError::InvalidAccountId(_))),
             "Expected InvalidAccountId error, got {result:?}"
         );
     }
 
     #[test]
     fn deserialize_with_custom_thresholds() {
-        let toml_str = r#"
+        let config: RebalancingConfig = toml::from_str(
+            r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [equity_threshold]
@@ -1827,23 +1841,23 @@ mod tests {
             [usdc_threshold]
             target = "0.4"
             deviation = "0.15"
-        "#;
+        "#,
+        )
+        .unwrap();
+        let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let toml_fields: RebalancingTomlFields = toml::from_str(toml_str).unwrap();
-        let config =
-            RebalancingConfig::from_toml_and_broker(toml_fields, test_broker_auth()).unwrap();
+        let ctx =
+            RebalancingCtx::from_config_and_secrets(config, secrets, test_broker_auth()).unwrap();
 
-        assert_eq!(config.equity_threshold.target, dec!(0.6));
-        assert_eq!(config.equity_threshold.deviation, dec!(0.1));
-        assert_eq!(config.usdc_threshold.target, dec!(0.4));
-        assert_eq!(config.usdc_threshold.deviation, dec!(0.15));
+        assert_eq!(ctx.equity_threshold.target, dec!(0.6));
+        assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));
+        assert_eq!(ctx.usdc_threshold.target, dec!(0.4));
+        assert_eq!(ctx.usdc_threshold.deviation, dec!(0.15));
     }
 
     #[test]
     fn deserialize_missing_redemption_wallet_fails() {
         let toml_str = r#"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [equity_threshold]
@@ -1855,34 +1869,22 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     #[test]
     fn deserialize_missing_evm_private_key_fails() {
         let toml_str = r#"
-            redemption_wallet = "0x1234567890123456789012345678901234567890"
             ethereum_rpc_url = "https://eth.example.com"
-            usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
-
-            [equity_threshold]
-            target = "0.5"
-            deviation = "0.2"
-
-            [usdc_threshold]
-            target = "0.5"
-            deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingSecrets>(toml_str).is_err());
     }
 
     #[test]
     fn deserialize_missing_equity_threshold_fails() {
         let toml_str = r#"
             redemption_wallet = "0x1234567890123456789012345678901234567890"
-            ethereum_rpc_url = "https://eth.example.com"
-            evm_private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             usdc_vault_id = "0xfedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
             [usdc_threshold]
@@ -1890,7 +1892,7 @@ mod tests {
             deviation = "0.3"
         "#;
 
-        assert!(toml::from_str::<RebalancingTomlFields>(toml_str).is_err());
+        assert!(toml::from_str::<RebalancingConfig>(toml_str).is_err());
     }
 
     type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;

@@ -16,12 +16,11 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::dashboard::{EventBroadcaster, ServerMessage};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::{AlpacaBrokerApi, Executor};
+use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiError, Executor};
 
 use super::usdc::UsdcRebalanceManager;
 use super::{
-    MintManager, Rebalancer, RebalancingConfig, RebalancingTrigger, RedemptionManager,
+    MintManager, Rebalancer, RebalancingCtx, RebalancingTrigger, RedemptionManager,
     TriggeredOperation,
 };
 use crate::alpaca_tokenization::AlpacaTokenizationService;
@@ -77,7 +76,7 @@ pub(crate) struct RebalancingCqrsFrameworks {
 
 /// Spawns the rebalancing infrastructure.
 pub(crate) async fn spawn_rebalancer<BP>(
-    config: &RebalancingConfig,
+    config: &RebalancingCtx,
     base_provider: BP,
     orderbook: Address,
     market_maker_wallet: Address,

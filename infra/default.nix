@@ -32,7 +32,10 @@ let
     fi
   '';
 
+  tfPlanFile = "infra/tfplan";
+
   cleanup = "rm -f ${tfState} ${tfState}.backup ${tfVars}";
+  cleanupWithPlan = "${cleanup} ${tfPlanFile}";
 
   preamble = ''
     ${parseIdentity}
@@ -45,7 +48,7 @@ let
     ${parseIdentity}
     on_exit() {
       ${encryptState}
-      ${cleanup}
+      ${cleanupWithPlan}
     }
     trap on_exit EXIT
     ${decryptVars}
@@ -54,6 +57,7 @@ let
   resolveIp = ''
     ${parseIdentity}
     ${decryptState}
+    trap 'rm -f ${tfState}' EXIT
     host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${tfState})
     rm -f ${tfState}
   '';

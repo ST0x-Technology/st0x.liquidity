@@ -12,8 +12,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
-use st0x_execution::{AlpacaBrokerApi, Executor, Symbol};
+use st0x_execution::{AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, Symbol};
 
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
@@ -177,14 +176,14 @@ where
         AlpacaBrokerApiMode::Production
     };
 
-    let broker_auth = AlpacaBrokerApiAuthConfig {
+    let broker_auth = AlpacaBrokerApiCtx {
         api_key: alpaca_auth.api_key.clone(),
         api_secret: alpaca_auth.api_secret.clone(),
         account_id: rebalancing_config.alpaca_account_id.to_string(),
         mode: Some(broker_mode),
     };
 
-    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_config(broker_auth.clone()).await?);
+    let alpaca_broker = Arc::new(AlpacaBrokerApi::try_from_ctx(broker_auth.clone()).await?);
 
     let alpaca_wallet = Arc::new(AlpacaWalletService::new(
         broker_auth.base_url().to_string(),
@@ -526,12 +525,12 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use std::str::FromStr;
 
     use super::*;
     use crate::config::LogLevel;
-    use crate::onchain::EvmConfig;
+    use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
 
@@ -540,7 +539,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -549,7 +548,7 @@ mod tests {
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerConfig::DryRun,
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
@@ -557,7 +556,7 @@ mod tests {
 
     fn create_alpaca_config_without_rebalancing() -> Config {
         let mut config = create_config_without_rebalancing();
-        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
+        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
@@ -700,7 +699,7 @@ mod tests {
 
     #[test]
     fn cli_broker_mode_sandbox_when_sandbox_auth() {
-        let alpaca_auth = AlpacaBrokerApiAuthConfig {
+        let alpaca_auth = AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
@@ -722,7 +721,7 @@ mod tests {
 
     #[test]
     fn cli_broker_mode_production_when_production_auth() {
-        let alpaca_auth = AlpacaBrokerApiAuthConfig {
+        let alpaca_auth = AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),

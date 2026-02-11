@@ -1,16 +1,17 @@
 use clap::Parser;
-use st0x_hedge::config::{Config, Env, setup_tracing};
+use st0x_hedge::config::{Ctx, Env};
 use st0x_hedge::launch;
+use st0x_hedge::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let parsed_env = Env::parse();
-    let config = Config::load_file(&parsed_env.config_file)?;
+    let Env { config, secrets } = Env::parse();
+    let config = Ctx::load_file(&config, &secrets)?;
 
     let log_level: tracing::Level = (&config.log_level).into();
 
-    let telemetry_guard = if let Some(ref hyperdx) = config.hyperdx {
-        match hyperdx.setup_telemetry(log_level) {
+    let telemetry_guard = if let Some(ref telemetry) = config.telemetry {
+        match telemetry.setup(log_level) {
             Ok(guard) => Some(guard),
             Err(e) => {
                 eprintln!("Failed to setup telemetry: {e}");

@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, FixedBytes};
 use alloy::signers::local::PrivateKeySigner;
 use clap::Parser;
 use rust_decimal::Decimal;
@@ -7,16 +7,52 @@ use sqlx::SqlitePool;
 use std::path::PathBuf;
 use tracing::Level;
 
-use st0x_execution::{FractionalShares, Positive, SupportedExecutor};
+use st0x_execution::{
+    AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaTradingApiCtx, AlpacaTradingApiMode,
+    FractionalShares, Positive, SchwabCtx, SupportedExecutor,
+};
 
 use crate::offchain::order_poller::OrderPollerConfig;
-use crate::onchain::EvmConfig;
-use crate::rebalancing::{RebalancingConfig, RebalancingConfigError, RebalancingTomlFields};
-use crate::telemetry::HyperDxConfig;
+use crate::onchain::{EvmConfig, EvmCtx, EvmSecrets};
+use crate::rebalancing::{
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets,
+};
+use crate::telemetry::{TelemetryConfig, TelemetryCtx, TelemetrySecrets};
 use crate::threshold::{ExecutionThreshold, InvalidThresholdError, Usdc};
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiAuthConfig;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiAuthConfig;
-use st0x_execution::schwab::SchwabAuthConfig;
+
+#[derive(Deserialize)]
+pub struct Config {
+    database_url: String,
+    log_level: Option<LogLevel>,
+    server_port: Option<u16>,
+    evm: EvmConfig,
+    order_polling_interval: Option<u64>,
+    order_polling_max_jitter: Option<u64>,
+    broker: BrokerTag,
+    #[serde(rename = "hyperdx")]
+    hyperdx: Option<TelemetryConfig>,
+    rebalancing: Option<RebalancingConfig>,
+}
+
+/// Broker type and non-secret configuration fields.
+/// Deserialized from the plaintext `[broker]` TOML section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum BrokerTag {
+    Schwab {
+        redirect_uri: Option<Url>,
+        base_url: Option<Url>,
+        account_index: Option<usize>,
+    },
+    AlpacaTradingApi {
+        trading_mode: Option<AlpacaTradingApiMode>,
+    },
+    AlpacaBrokerApi {
+        account_id: String,
+        mode: Option<AlpacaBrokerApiMode>,
+    },
+    DryRun,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]

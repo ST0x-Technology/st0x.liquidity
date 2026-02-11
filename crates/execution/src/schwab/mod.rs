@@ -12,12 +12,12 @@ mod order_status;
 mod tokens;
 
 // Re-export only what's needed for executor construction
+pub(crate) use auth::SchwabAuthConfig;
 pub use auth::{
-    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthConfig, SchwabAuthError,
-    SchwabAuthEvent,
+    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthError, SchwabAuthEvent,
 };
 pub use encryption::{EncryptedToken, EncryptionError, EncryptionKey, decrypt_token};
-pub use executor::{SchwabConfig, SchwabExecutor};
+pub use executor::{Schwab, SchwabCtx};
 
 // Re-export for auth CLI command (Schwab-specific, not part of generic broker API)
 pub use tokens::SchwabTokens;

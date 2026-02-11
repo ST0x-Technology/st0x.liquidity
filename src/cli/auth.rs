@@ -4,9 +4,9 @@ use sqlx::SqlitePool;
 use std::io::Write;
 use tracing::{error, info};
 
-use st0x_execution::schwab::{SchwabAuthConfig, SchwabError, SchwabTokens, extract_code_from_url};
+use st0x_execution::{SchwabError, extract_code_from_url};
 
-use crate::config::BrokerConfig;
+use crate::config::{BrokerConfig, SchwabAuth};
 
 pub(super) async fn auth_command<W: Write>(
     stdout: &mut W,
@@ -61,7 +61,8 @@ pub(super) async fn ensure_schwab_authentication<W: Write>(
 
     writeln!(stdout, "Refreshing authentication tokens if needed")?;
 
-    match SchwabTokens::get_valid_access_token(pool, schwab_auth).await {
+    let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+    match schwab_ctx.get_valid_access_token().await {
         Ok(_access_token) => {
             info!("Authentication tokens are valid, access token obtained");
             Ok(())
@@ -73,13 +74,12 @@ pub(super) async fn ensure_schwab_authentication<W: Write>(
     }
 }
 
-async fn run_oauth_flow(
-    pool: &SqlitePool,
-    schwab_auth: &SchwabAuthConfig,
-) -> Result<(), SchwabError> {
+async fn run_oauth_flow(pool: &SqlitePool, schwab_auth: &SchwabAuth) -> Result<(), SchwabError> {
+    let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
+
     println!(
         "Authenticate portfolio brokerage account (not dev account) and paste URL: {}",
-        schwab_auth.get_auth_url()?
+        schwab_ctx.get_auth_url()?
     );
     print!("Paste the full redirect URL you were sent to: ");
     std::io::stdout().flush()?;
@@ -91,7 +91,7 @@ async fn run_oauth_flow(
     let code = extract_code_from_url(redirect_url)?;
     println!("Extracted code: {code}");
 
-    let tokens = schwab_auth.get_tokens_from_code(&code).await?;
+    let tokens = schwab_ctx.get_tokens_from_code(&code).await?;
     tokens.store(pool, &schwab_auth.encryption_key).await?;
 
     Ok(())
@@ -102,17 +102,20 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
+    use url::Url;
+
+    use st0x_execution::SchwabTokens;
 
     use super::*;
-    use crate::config::{Config, LogLevel};
-    use crate::onchain::EvmConfig;
+    use crate::config::{Ctx, LogLevel};
+    use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
-    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuthConfig) {
-        let schwab_auth = SchwabAuthConfig {
+    fn create_schwab_config(mock_server: &MockServer) -> (Config, SchwabAuth) {
+        let schwab_auth = SchwabAuth {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: Some(url::Url::parse("https://127.0.0.1").expect("valid test URL")),
@@ -125,7 +128,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -134,7 +137,7 @@ mod tests {
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerConfig::Schwab(schwab_auth.clone()),
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         };

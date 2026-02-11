@@ -12,11 +12,10 @@ use crate::cctp::{
     BridgeDirection, CctpBridge, CctpError, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
     USDC_BASE, USDC_ETHEREUM,
 };
-use crate::config::Config;
+use crate::config::Ctx;
 use crate::onchain::http_client_with_retry;
-use crate::rebalancing::RebalancingConfig;
+use crate::rebalancing::RebalancingCtx;
 use crate::threshold::Usdc;
-
 use super::CctpChain;
 
 impl CctpChain {
@@ -34,7 +33,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
     amount: Option<Usdc>,
     all: bool,
     from: CctpChain,
-    config: &Config,
+    config: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     let rebalancing = config
@@ -114,7 +113,7 @@ pub(super) async fn cctp_bridge_command<W: Write, BP: Provider + Clone + Send + 
 }
 
 fn build_cctp_bridge<BP: Provider + Clone>(
-    rebalancing: &RebalancingConfig,
+    rebalancing: &RebalancingCtx,
     base_provider: BP,
     signer: PrivateKeySigner,
 ) -> Result<CctpBridge<impl Provider + Clone, impl Provider + Clone>, CctpError> {
@@ -150,7 +149,7 @@ pub(super) async fn cctp_recover_command<W: Write, BP: Provider + Clone + Send +
     stdout: &mut W,
     burn_tx: B256,
     source_chain: CctpChain,
-    config: &Config,
+    config: &Ctx,
     base_provider: BP,
 ) -> anyhow::Result<()> {
     writeln!(stdout, "Recovering CCTP transfer")?;
@@ -273,7 +272,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use std::str::FromStr;
     use uuid::uuid;
 
@@ -281,8 +280,8 @@ mod tests {
     use crate::alpaca_wallet::AlpacaAccountId;
     use crate::config::{BrokerConfig, LogLevel};
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmConfig;
-    use crate::rebalancing::RebalancingConfig;
+    use crate::onchain::EvmCtx;
+    use crate::rebalancing::RebalancingCtx;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
@@ -290,7 +289,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -299,7 +298,7 @@ mod tests {
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerConfig::DryRun,
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
@@ -307,7 +306,7 @@ mod tests {
 
     fn create_config_with_rebalancing() -> Config {
         let mut config = create_config_without_rebalancing();
-        config.rebalancing = Some(RebalancingConfig {
+        config.rebalancing = Some(RebalancingCtx {
             evm_private_key: B256::ZERO,
             ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
             usdc_vault_id: B256::ZERO,
@@ -321,7 +320,7 @@ mod tests {
                 target: Decimal::from_str("0.5").unwrap(),
                 deviation: Decimal::from_str("0.1").unwrap(),
             },
-            alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+            alpaca_broker_auth: AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
                 account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),

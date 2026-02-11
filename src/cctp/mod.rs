@@ -1797,8 +1797,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_) | CctpError::Contract(_)),
-            "got: {err:?}"
+            matches!(err, CctpError::Revert(_)),
+            "expected CctpError::Revert, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),
@@ -1836,8 +1836,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(err, CctpError::Revert(_) | CctpError::Contract(_)),
-            "got: {err:?}"
+            matches!(err, CctpError::Revert(_)),
+            "expected CctpError::Revert, got: {err:?}"
         );
         assert!(
             err.to_string().contains("ECDSA: invalid signature"),

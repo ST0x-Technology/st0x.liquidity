@@ -5,6 +5,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::ops::{Add, Mul, Sub};
 use std::str::FromStr;
 
 use st0x_execution::{FractionalShares, Positive};
@@ -89,7 +90,7 @@ impl From<Usdc> for Decimal {
     }
 }
 
-impl std::ops::Mul<Decimal> for Usdc {
+impl Mul<Decimal> for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
     fn mul(self, rhs: Decimal) -> Self::Output {
@@ -104,7 +105,7 @@ impl std::ops::Mul<Decimal> for Usdc {
     }
 }
 
-impl std::ops::Add for Usdc {
+impl Add for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -119,7 +120,7 @@ impl std::ops::Add for Usdc {
     }
 }
 
-impl std::ops::Sub for Usdc {
+impl Sub for Usdc {
     type Output = Result<Self, ArithmeticError<Self>>;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -160,7 +161,7 @@ impl ExecutionThreshold {
 
     #[cfg(test)]
     pub(crate) fn whole_share() -> Self {
-        Self::Shares(Positive::new(FractionalShares::new(rust_decimal::Decimal::ONE)).unwrap())
+        Self::Shares(Positive::new(FractionalShares::new(Decimal::ONE)).unwrap())
     }
 }
 
@@ -174,9 +175,10 @@ pub enum InvalidThresholdError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::prelude::*;
     use rust_decimal::Decimal;
+
+    use super::*;
 
     fn arb_decimal() -> impl Strategy<Value = Decimal> {
         (any::<i64>(), 0u32..=10).prop_map(|(mantissa, scale)| Decimal::new(mantissa, scale))

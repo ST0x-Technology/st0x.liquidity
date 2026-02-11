@@ -1,24 +1,38 @@
 use chrono::{DateTime, Utc};
+use clap::Parser;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::config::{ConfigError, HasSqlite, LogLevel, configure_sqlite_pool};
-use crate::symbol::Symbol;
 use st0x_execution::Direction;
+
+use crate::config::{ConfigError, LogLevel, configure_sqlite_pool};
+use crate::symbol::Symbol;
 
 mod pnl;
 use pnl::{FifoInventory, PnlError, PnlResult, TradeType};
+
+#[derive(Parser, Debug)]
+pub struct ReporterEnv {
+    /// Path to plaintext TOML configuration file
+    #[clap(long)]
+    pub config: PathBuf,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ReporterConfig {
     database_url: String,
     processing_interval_secs: Option<u64>,
     log_level: Option<LogLevel>,
+}
+
+trait HasSqlite {
+    async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
 }
 
 impl HasSqlite for ReporterConfig {
@@ -390,8 +404,6 @@ pub(crate) async fn process_iteration(pool: &SqlitePool) -> anyhow::Result<usize
 }
 
 pub async fn run(config: ReporterConfig) -> anyhow::Result<()> {
-    use crate::config::HasSqlite;
-
     let pool = config.get_sqlite_pool().await?;
     let interval = config.processing_interval();
 
@@ -444,13 +456,79 @@ fn log_processing_result(result: anyhow::Result<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::Write;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     async fn create_test_pool() -> SqlitePool {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         pool
+    }
+
+    #[test]
+    fn load_file_parses_minimal_config() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "database_url = \":memory:\"").unwrap();
+
+        let config = ReporterConfig::load_file(file.path()).unwrap();
+
+        assert_eq!(config.database_url, ":memory:");
+        assert!(config.processing_interval_secs.is_none());
+        assert!(config.log_level.is_none());
+    }
+
+    #[test]
+    fn load_file_parses_all_fields() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "database_url = \"test.db\"").unwrap();
+        writeln!(file, "processing_interval_secs = 30").unwrap();
+        writeln!(file, "log_level = \"info\"").unwrap();
+
+        let config = ReporterConfig::load_file(file.path()).unwrap();
+
+        assert_eq!(config.database_url, "test.db");
+        assert_eq!(config.processing_interval_secs, Some(30));
+        assert!(matches!(config.log_level, Some(LogLevel::Info)));
+    }
+
+    #[test]
+    fn load_file_returns_io_error_for_missing_file() {
+        let path = std::path::Path::new("/nonexistent/path/config.toml");
+
+        let err = ReporterConfig::load_file(path).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::Io(_)),
+            "expected ConfigError::Io, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_file_returns_toml_error_for_invalid_content() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "this is not valid toml {{{{").unwrap();
+
+        let err = ReporterConfig::load_file(file.path()).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::Toml(_)),
+            "expected ConfigError::Toml, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_file_returns_toml_error_when_required_field_missing() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "processing_interval_secs = 30").unwrap();
+
+        let err = ReporterConfig::load_file(file.path()).unwrap_err();
+
+        assert!(
+            matches!(err, ConfigError::Toml(_)),
+            "expected ConfigError::Toml for missing database_url, got: {err:?}"
+        );
     }
 
     #[tokio::test]

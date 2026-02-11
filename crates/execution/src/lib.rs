@@ -17,22 +17,27 @@ pub mod schwab;
 #[cfg(test)]
 pub mod test_utils;
 
-pub use alpaca_broker_api::AlpacaBrokerApi;
-pub use alpaca_trading_api::AlpacaTradingApi;
+pub use alpaca_broker_api::{
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode,
+    ConversionDirection,
+};
+pub use alpaca_trading_api::{
+    AlpacaTradingApi, AlpacaTradingApiCtx, AlpacaTradingApiError, AlpacaTradingApiMode,
+};
 pub use error::PersistenceError;
-pub use mock::{MockExecutor, MockExecutorConfig};
+pub use mock::{MockExecutor, MockExecutorCtx};
 pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
-pub use schwab::SchwabExecutor;
+pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
 
 #[async_trait]
 pub trait Executor: Send + Sync + 'static {
     type Error: std::error::Error + Send + Sync + 'static;
     type OrderId: Display + Debug + Send + Sync + Clone;
-    type Config: Send + Sync + Clone + 'static;
+    type Ctx: Send + Sync + Clone + 'static;
 
-    /// Create and validate executor instance from config
+    /// Create and validate executor instance from context
     /// All initialization and validation happens here
-    async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error>
+    async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error>
     where
         Self: Sized;
 
@@ -597,7 +602,7 @@ pub enum ExecutionError {
     DateTimeParse(#[from] chrono::ParseError),
 }
 
-/// Trait for converting executor-specific configs into their corresponding executor implementations
+/// Trait for converting executor contexts into their corresponding executor implementations
 #[async_trait]
 pub trait TryIntoExecutor {
     type Executor: Executor;

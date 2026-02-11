@@ -6,7 +6,7 @@ use tracing::info;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountStatus, AlpacaBrokerApiAuthConfig};
+use super::auth::{AccountStatus, AlpacaBrokerApiCtx};
 use super::client::AlpacaBrokerApiClient;
 use super::order::{ConversionDirection, CryptoOrderResponse};
 use crate::{
@@ -24,10 +24,10 @@ pub struct AlpacaBrokerApi {
 impl Executor for AlpacaBrokerApi {
     type Error = AlpacaBrokerApiError;
     type OrderId = String;
-    type Config = AlpacaBrokerApiAuthConfig;
+    type Ctx = AlpacaBrokerApiCtx;
 
-    async fn try_from_config(config: Self::Config) -> Result<Self, Self::Error> {
-        let client = AlpacaBrokerApiClient::new(&config)?;
+    async fn try_from_ctx(ctx: Self::Ctx) -> Result<Self, Self::Error> {
+        let client = AlpacaBrokerApiClient::new(&ctx)?;
 
         let account = client.verify_account().await?;
 
@@ -113,13 +113,13 @@ impl Executor for AlpacaBrokerApi {
 }
 
 #[async_trait]
-impl TryIntoExecutor for AlpacaBrokerApiAuthConfig {
+impl TryIntoExecutor for AlpacaBrokerApiCtx {
     type Executor = AlpacaBrokerApi;
 
     async fn try_into_executor(
         self,
     ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        AlpacaBrokerApi::try_from_config(self).await
+        AlpacaBrokerApi::try_from_ctx(self).await
     }
 }
 
@@ -159,12 +159,12 @@ mod tests {
     use super::*;
     use crate::alpaca_broker_api::auth::AlpacaBrokerApiMode;
 
-    fn create_test_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
+            mode: Some(mode),
         }
     }
 
@@ -182,22 +182,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_try_from_config_success() {
+    async fn test_try_from_ctx_success() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
 
-        let result = AlpacaBrokerApi::try_from_config(config).await;
+        let result = AlpacaBrokerApi::try_from_ctx(ctx).await;
 
         account_mock.assert();
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_try_from_config_unauthorized() {
+    async fn test_try_from_ctx_unauthorized() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = server.mock(|when, then| {
             when.method(GET)
@@ -210,7 +210,7 @@ mod tests {
                 }));
         });
 
-        let result = AlpacaBrokerApi::try_from_config(config).await;
+        let result = AlpacaBrokerApi::try_from_ctx(ctx).await;
 
         account_mock.assert();
         assert!(matches!(
@@ -222,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn test_wait_until_market_open() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
 
@@ -248,7 +248,7 @@ mod tests {
                 ]));
         });
 
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
         let result = executor.wait_until_market_open().await;
 
         account_mock.assert();
@@ -260,11 +260,11 @@ mod tests {
     #[tokio::test]
     async fn test_parse_order_id_valid() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
 
         account_mock.assert();
 
@@ -278,11 +278,11 @@ mod tests {
     #[tokio::test]
     async fn test_parse_order_id_invalid() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
 
         account_mock.assert();
 
@@ -298,11 +298,11 @@ mod tests {
     #[tokio::test]
     async fn test_to_supported_executor() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
 
         account_mock.assert();
 
@@ -315,11 +315,11 @@ mod tests {
     #[tokio::test]
     async fn test_run_executor_maintenance_returns_none() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let account_mock = create_account_mock(&server);
 
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
 
         account_mock.assert();
 
@@ -331,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_inventory_returns_fetched() {
         let server = MockServer::start();
-        let config = create_test_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         // Mock account endpoint with all fields needed for both verify_account and fetch_inventory
         let account_mock = server.mock(|when, then| {
@@ -360,7 +360,7 @@ mod tests {
                 ]));
         });
 
-        let executor = AlpacaBrokerApi::try_from_config(config).await.unwrap();
+        let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
 
         let result = executor.get_inventory().await.unwrap();
 

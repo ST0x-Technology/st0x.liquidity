@@ -6,8 +6,9 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 use tracing::warn;
+
+use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
@@ -721,9 +722,10 @@ pub(crate) enum TriggerReason {
 mod tests {
     use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
-    use st0x_execution::Positive;
     use std::collections::HashMap;
     use std::str::FromStr;
+
+    use st0x_execution::Positive;
 
     use super::*;
     use crate::threshold::Usdc;

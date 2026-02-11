@@ -50,7 +50,7 @@ impl SymbolCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
+    use alloy::primitives::{B256, address};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
 
     #[tokio::test]
@@ -66,7 +66,7 @@ mod tests {
 
         let io = IOV2 {
             token: address,
-            vaultId: alloy::primitives::B256::ZERO,
+            vaultId: B256::ZERO,
         };
 
         let asserter = Asserter::new();
@@ -82,7 +82,7 @@ mod tests {
 
         let io = IOV2 {
             token: address,
-            vaultId: alloy::primitives::B256::ZERO,
+            vaultId: B256::ZERO,
         };
 
         let asserter = Asserter::new();

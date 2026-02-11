@@ -43,10 +43,10 @@ use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmConfig, OnchainTrade, accumulator};
+use crate::onchain::{EvmCtx, OnchainTrade, accumulator};
 use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::{
-    RebalancingConfig, RebalancingCqrsFrameworks, RebalancingTrigger, RebalancingTriggerConfig,
+    RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
     build_rebalancing_queries, spawn_rebalancer,
 };
 use crate::symbol::cache::SymbolCache;
@@ -60,7 +60,7 @@ type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
 
 /// Context for vault discovery operations during trade processing.
-struct VaultDiscoveryContext<'a> {
+struct VaultDiscoveryCtx<'a> {
     vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
     orderbook: Address,
     order_owner: Address,
@@ -279,7 +279,7 @@ impl Conductor {
             (),
         );
 
-        let rebalancer = match config.rebalancing_config() {
+        let rebalancer = match config.rebalancing_ctx() {
             Some(rebalancing_config) => Some(
                 spawn_rebalancing_infrastructure(
                     rebalancing_config,
@@ -365,7 +365,7 @@ impl Conductor {
 }
 
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
-    rebalancing_config: &RebalancingConfig,
+    rebalancing_config: &RebalancingCtx,
     pool: &SqlitePool,
     config: &Config,
     inventory: &Arc<RwLock<InventoryView>>,
@@ -735,7 +735,7 @@ async fn run_queue_processor<P, E>(
 
     let executor_type = executor.to_supported_executor();
 
-    let queue_context = QueueProcessingContext {
+    let queue_context = QueueProcessingCtx {
         cache,
         feed_id_cache: &feed_id_cache,
         vault_registry_cqrs,
@@ -794,7 +794,7 @@ async fn handle_queue_processing_result<E>(
 }
 
 /// Context for queue event processing containing caches and CQRS components.
-struct QueueProcessingContext<'a> {
+struct QueueProcessingCtx<'a> {
     cache: &'a SymbolCache,
     feed_id_cache: &'a FeedIdCache,
     vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
@@ -807,7 +807,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     pool: &SqlitePool,
     provider: &P,
     dual_write_context: &DualWriteContext,
-    queue_context: &QueueProcessingContext<'_>,
+    queue_context: &QueueProcessingCtx<'_>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     let queued_event = get_next_unprocessed_event(pool).await?;
     let Some(queued_event) = queued_event else {
@@ -829,7 +829,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return handle_filtered_event(pool, &queued_event, event_id).await;
     };
 
-    let vault_discovery_context = VaultDiscoveryContext {
+    let vault_discovery_context = VaultDiscoveryCtx {
         vault_registry_cqrs: queue_context.vault_registry_cqrs,
         orderbook: config.evm.orderbook,
         order_owner: config.order_owner()?,
@@ -865,7 +865,7 @@ fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingEr
 async fn discover_vaults_for_trade(
     queued_event: &QueuedEvent,
     trade: &OnchainTrade,
-    context: &VaultDiscoveryContext<'_>,
+    context: &VaultDiscoveryCtx<'_>,
 ) -> Result<(), EventProcessingError> {
     let tx_hash = queued_event.tx_hash;
     let base_symbol = trade.symbol.base();
@@ -1002,7 +1002,7 @@ async fn process_valid_trade(
     event_id: i64,
     trade: OnchainTrade,
     dual_write_context: &DualWriteContext,
-    vault_discovery_context: &VaultDiscoveryContext<'_>,
+    vault_discovery_context: &VaultDiscoveryCtx<'_>,
 ) -> Result<Option<OffchainExecution>, EventProcessingError> {
     info!(
         "Event successfully converted to trade: event_type={:?}, tx_hash={:?}, log_index={}, symbol={}, amount={}",
@@ -1263,7 +1263,7 @@ async fn process_trade_within_transaction(
 }
 
 fn reconstruct_log_from_queued_event(
-    config: &EvmConfig,
+    config: &EvmCtx,
     queued_event: &crate::queue::QueuedEvent,
 ) -> Log {
     use alloy::primitives::IntoLogData;
@@ -1542,7 +1542,7 @@ mod tests {
     use crate::tokenized_symbol;
     use rust_decimal::Decimal;
     use st0x_execution::{
-        Direction, FractionalShares, MockExecutorConfig, OrderState, OrderStatus, Positive,
+        Direction, FractionalShares, MockExecutorCtx, OrderState, OrderStatus, Positive,
         SupportedExecutor, Symbol, TryIntoExecutor,
     };
 
@@ -2182,7 +2182,7 @@ mod tests {
         let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
             sqlite_cqrs(pool.clone(), vec![], ());
 
-        let queue_context = QueueProcessingContext {
+        let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
             vault_registry_cqrs: &vault_registry_cqrs,
@@ -2208,7 +2208,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_not_found() {
         let pool = setup_test_db().await;
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let result =
@@ -2348,7 +2348,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_calls_confirm_submission() {
         let pool = setup_test_db().await;
-        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
+        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("AMZN").unwrap();
@@ -2419,7 +2419,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_updates_legacy_table_to_submitted() {
         let pool = setup_test_db().await;
-        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
+        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("BMNR").unwrap();
@@ -2514,7 +2514,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_stores_correct_order_id() {
         let pool = setup_test_db().await;
-        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
+        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("TSLA").unwrap();
@@ -2576,7 +2576,7 @@ mod tests {
     #[tokio::test]
     async fn test_order_poller_can_find_orders_after_execution() {
         let pool = setup_test_db().await;
-        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
+        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("NVDA").unwrap();
@@ -2660,7 +2660,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_pending_offchain_execution_dual_write_consistency() {
         let pool = setup_test_db().await;
-        let broker = MockExecutorConfig.try_into_executor().await.unwrap();
+        let broker = MockExecutorCtx.try_into_executor().await.unwrap();
         let dual_write_context = DualWriteContext::new(pool.clone());
 
         let symbol = Symbol::new("GOOGL").unwrap();
@@ -2740,7 +2740,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -2773,7 +2773,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -2821,7 +2821,7 @@ mod tests {
 
         let start_time = std::time::Instant::now();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -2854,7 +2854,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -2881,7 +2881,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -2917,7 +2917,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -2955,7 +2955,7 @@ mod tests {
         let clear_stream = stream::empty();
         let take_stream = stream::empty();
 
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = CqrsFrameworks {
             dual_write_context: DualWriteContext::new(pool.clone()),
             vault_registry_cqrs: sqlite_cqrs(pool.clone(), vec![], ()),
@@ -3031,7 +3031,7 @@ mod tests {
             .await
             .unwrap();
 
-        let queue_context = QueueProcessingContext {
+        let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
             vault_registry_cqrs: &vault_registry_cqrs,
@@ -3086,7 +3086,7 @@ mod tests {
             .await
             .unwrap();
 
-        let queue_context = QueueProcessingContext {
+        let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
             vault_registry_cqrs: &vault_registry_cqrs,
@@ -3173,7 +3173,7 @@ mod tests {
     async fn test_accumulated_position_execution_emits_placed_event_before_submission() {
         let pool = setup_test_db().await;
         let dual_write_context = DualWriteContext::new(pool.clone());
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let symbol = Symbol::new("RKLB").unwrap();
 
         let symbol_str =
@@ -3355,8 +3355,8 @@ mod tests {
 
     fn create_vault_discovery_context(
         vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
-    ) -> VaultDiscoveryContext<'_> {
-        VaultDiscoveryContext {
+    ) -> VaultDiscoveryCtx<'_> {
+        VaultDiscoveryCtx {
             vault_registry_cqrs,
             orderbook: TEST_ORDERBOOK,
             order_owner: ORDER_OWNER,

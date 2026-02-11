@@ -341,8 +341,8 @@ mod tests {
         let test_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log.inner.address,
             config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
+            input: B256::ZERO,
+            output: B256::ZERO,
         }));
 
         // Enqueue same event twice
@@ -454,8 +454,8 @@ mod tests {
         let take_event = TradeEvent::TakeOrderV3(Box::new(TakeOrderV3 {
             sender: log2.inner.address,
             config: TakeOrderConfigV4::default(),
-            input: alloy::primitives::B256::ZERO,
-            output: alloy::primitives::B256::ZERO,
+            input: B256::ZERO,
+            output: B256::ZERO,
         }));
 
         let event_buffer = vec![(clear_event, log1), (take_event, log2)];

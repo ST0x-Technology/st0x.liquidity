@@ -166,7 +166,7 @@ mod tests {
 
     use super::*;
     use crate::config::{BrokerConfig, LogLevel};
-    use crate::onchain::EvmConfig;
+    use crate::onchain::EvmCtx;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_rebalancing() -> Config {
@@ -174,7 +174,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -183,7 +183,7 @@ mod tests {
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerConfig::DryRun,
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }

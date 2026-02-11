@@ -1,11 +1,11 @@
 use clap::Parser;
-use st0x_hedge::config::{Env, setup_tracing};
-use st0x_hedge::reporter::{self, ReporterConfig};
+use st0x_hedge::reporter::{self, ReporterConfig, ReporterEnv};
+use st0x_hedge::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let env = Env::parse();
-    let config = ReporterConfig::load_file(&env.config_file)?;
+    let ReporterEnv { config } = ReporterEnv::parse();
+    let config = ReporterConfig::load_file(&config)?;
     setup_tracing(&config.log_level());
 
     reporter::run(config).await

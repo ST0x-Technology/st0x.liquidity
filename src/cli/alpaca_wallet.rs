@@ -5,8 +5,7 @@ use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
-use st0x_execution::Executor;
-use st0x_execution::alpaca_broker_api::ConversionDirection;
+use st0x_execution::{AlpacaBrokerApi, ConversionDirection, Executor};
 use std::io::Write;
 
 use super::ConvertDirection;
@@ -30,11 +29,10 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         anyhow::bail!("alpaca-deposit requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "alpaca-deposit requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
+    let rebalancing_config = config
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-deposit requires rebalancing configuration"))?;
 
     let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let ethereum_wallet = EthereumWallet::from(signer.clone());
@@ -46,18 +44,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
         .wallet(ethereum_wallet)
         .connect_http(rebalancing_config.ethereum_rpc_url.clone());
 
-    let broker_api_base_url = if alpaca_auth.is_sandbox() {
-        "https://broker-api.sandbox.alpaca.markets"
-    } else {
-        "https://broker-api.alpaca.markets"
-    };
-
-    let alpaca_wallet = AlpacaWalletService::new(
-        broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+    let alpaca_wallet = build_wallet_service(alpaca_auth, rebalancing_config);
 
     writeln!(stdout, "   Fetching Alpaca deposit address...")?;
     let usdc = TokenSymbol::new("USDC");
@@ -163,21 +150,10 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     let balance_before = usdc.balanceOf(destination).call().await?;
     writeln!(stdout, "   Balance before: {balance_before}")?;
 
-    let broker_api_base_url = if alpaca_auth.is_sandbox() {
-        "https://broker-api.sandbox.alpaca.markets"
-    } else {
-        "https://broker-api.alpaca.markets"
-    };
-
-    let alpaca_wallet = AlpacaWalletService::new(
-        broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+    let alpaca_wallet = build_wallet_service(alpaca_auth, rebalancing_config);
 
     let usdc_asset = TokenSymbol::new("USDC");
-    let amount_decimal: rust_decimal::Decimal = amount.into();
+    let amount_decimal: Decimal = amount.into();
 
     writeln!(stdout, "   Initiating withdrawal...")?;
     let transfer = alpaca_wallet
@@ -235,17 +211,16 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
 pub(super) async fn alpaca_whitelist_command<W: Write>(
     stdout: &mut W,
     address: Option<Address>,
-    config: &Config,
+    config: &Ctx,
 ) -> anyhow::Result<()> {
     let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
         anyhow::bail!("alpaca-whitelist requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "alpaca-whitelist requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
+    let rebalancing_config = config
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-whitelist requires rebalancing configuration"))?;
 
     let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
     let sender_address = signer.address();
@@ -256,18 +231,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     writeln!(stdout, "   Asset: USDC")?;
     writeln!(stdout, "   Network: Ethereum")?;
 
-    let broker_api_base_url = if alpaca_auth.is_sandbox() {
-        "https://broker-api.sandbox.alpaca.markets"
-    } else {
-        "https://broker-api.alpaca.markets"
-    };
-
-    let alpaca_wallet = AlpacaWalletService::new(
-        broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+    let alpaca_wallet = build_wallet_service(alpaca_auth, rebalancing_config);
 
     writeln!(stdout, "   Checking existing whitelist entries...")?;
     let existing = alpaca_wallet.get_whitelisted_addresses().await?;
@@ -311,30 +275,18 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
 
 pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
-    config: &Config,
+    config: &Ctx,
 ) -> anyhow::Result<()> {
     let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
         anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "alpaca-transfers requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
+    let rebalancing_config = config
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("alpaca-transfers requires rebalancing configuration"))?;
 
-    let broker_api_base_url = if alpaca_auth.is_sandbox() {
-        "https://broker-api.sandbox.alpaca.markets"
-    } else {
-        "https://broker-api.alpaca.markets"
-    };
-
-    let alpaca_wallet = AlpacaWalletService::new(
-        broker_api_base_url.to_string(),
-        rebalancing_config.alpaca_account_id,
-        alpaca_auth.api_key.clone(),
-        alpaca_auth.api_secret.clone(),
-    );
+    let alpaca_wallet = build_wallet_service(alpaca_auth, rebalancing_config);
 
     writeln!(stdout, "Fetching Alpaca crypto wallet transfers...")?;
     writeln!(
@@ -374,7 +326,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     stdout: &mut W,
     direction: ConvertDirection,
     amount: Usdc,
-    config: &Config,
+    config: &Ctx,
 ) -> anyhow::Result<()> {
     let direction_str = match direction {
         ConvertDirection::ToUsd => "USDC → USD",
@@ -388,16 +340,14 @@ pub(super) async fn alpaca_convert_command<W: Write>(
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
     };
 
-    let executor =
-        st0x_execution::alpaca_broker_api::AlpacaBrokerApi::try_from_config(alpaca_auth.clone())
-            .await?;
+    let executor = AlpacaBrokerApi::try_from_ctx(alpaca_auth.clone()).await?;
 
     let conversion_direction = match direction {
         ConvertDirection::ToUsd => ConversionDirection::UsdcToUsd,
         ConvertDirection::ToUsdc => ConversionDirection::UsdToUsdc,
     };
 
-    let amount_decimal: rust_decimal::Decimal = amount.into();
+    let amount_decimal: Decimal = amount.into();
 
     writeln!(stdout, "   Placing market order...")?;
 
@@ -436,7 +386,8 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_execution::alpaca_broker_api::{AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use url::Url;
     use uuid::uuid;
 
     use super::*;
@@ -444,8 +395,8 @@ mod tests {
     use crate::cli::ConvertDirection;
     use crate::config::LogLevel;
     use crate::inventory::ImbalanceThreshold;
-    use crate::onchain::EvmConfig;
-    use crate::rebalancing::RebalancingConfig;
+    use crate::onchain::EvmCtx;
+    use crate::rebalancing::RebalancingCtx;
     use crate::threshold::ExecutionThreshold;
 
     fn create_config_without_alpaca() -> Config {
@@ -453,7 +404,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -462,7 +413,7 @@ mod tests {
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
             broker: BrokerConfig::DryRun,
-            hyperdx: None,
+            telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
         }
@@ -470,7 +421,7 @@ mod tests {
 
     fn create_alpaca_config_without_rebalancing() -> Config {
         let mut config = create_config_without_alpaca();
-        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
+        config.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
@@ -485,7 +436,7 @@ mod tests {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
-            evm: EvmConfig {
+            evm: EvmCtx {
                 ws_rpc_url: url::Url::parse("ws://localhost:8545").unwrap(),
                 orderbook: address!("0x1234567890123456789012345678901234567890"),
                 order_owner: Some(Address::ZERO),
@@ -493,14 +444,14 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiAuthConfig {
+            broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
                 account_id: alpaca_account_id.to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
             }),
-            hyperdx: None,
-            rebalancing: Some(RebalancingConfig {
+            telemetry: None,
+            rebalancing: Some(RebalancingCtx {
                 evm_private_key: B256::ZERO,
                 ethereum_rpc_url: url::Url::parse("http://localhost:8545").unwrap(),
                 usdc_vault_id: B256::ZERO,
@@ -514,7 +465,7 @@ mod tests {
                     target: dec!(0.5),
                     deviation: dec!(0.1),
                 },
-                alpaca_broker_auth: AlpacaBrokerApiAuthConfig {
+                alpaca_broker_auth: AlpacaBrokerApiCtx {
                     api_key: "test-key".to_string(),
                     api_secret: "test-secret".to_string(),
                     account_id: alpaca_account_id.to_string(),

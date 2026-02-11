@@ -2,13 +2,14 @@ use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
-use alloy::primitives::{LogData, address, bytes, fixed_bytes};
+use alloy::primitives::{B256, LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
-use st0x_execution::OrderState;
-use st0x_execution::schwab::{SchwabAuthConfig, SchwabTokens};
+use st0x_execution::{OrderState, SchwabTokens};
+
+use crate::config::SchwabAuth;
 use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 
 /// Returns a test `OrderV4` instance that is shared across multiple
@@ -26,21 +27,21 @@ pub(crate) fn get_test_order() -> OrderV4 {
         validInputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
             IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
         ],
         validOutputs: vec![
             IOV2 {
                 token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
             IOV2 {
                 token: address!("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-                vaultId: alloy::primitives::B256::ZERO,
+                vaultId: B256::ZERO,
             },
         ],
     }
@@ -83,7 +84,7 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
 
 /// Centralized test token setup to eliminate duplication across test files.
 /// Creates and stores test tokens in the database for Schwab API authentication.
-pub(crate) async fn setup_test_tokens(pool: &SqlitePool, config: &SchwabAuthConfig) {
+pub(crate) async fn setup_test_tokens(pool: &SqlitePool, config: &SchwabAuth) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
         access_token_fetched_at: Utc::now(),
@@ -156,7 +157,7 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_tx_hash(mut self, hash: alloy::primitives::B256) -> Self {
+    pub(crate) fn with_tx_hash(mut self, hash: B256) -> Self {
         self.trade.tx_hash = hash;
         self
     }

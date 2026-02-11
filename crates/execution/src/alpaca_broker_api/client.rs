@@ -8,7 +8,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
-use super::auth::{AccountResponse, AlpacaBrokerApiAuthConfig, AlpacaBrokerApiMode};
+use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
 
 /// Alpaca Broker API HTTP client with Basic authentication
@@ -30,8 +30,8 @@ impl std::fmt::Debug for AlpacaBrokerApiClient {
 }
 
 impl AlpacaBrokerApiClient {
-    pub(crate) fn new(config: &AlpacaBrokerApiAuthConfig) -> Result<Self, AlpacaBrokerApiError> {
-        let credentials = format!("{}:{}", config.api_key, config.api_secret);
+    pub(crate) fn new(ctx: &AlpacaBrokerApiCtx) -> Result<Self, AlpacaBrokerApiError> {
+        let credentials = format!("{}:{}", ctx.api_key, ctx.api_secret);
         let encoded_credentials = BASE64_STANDARD.encode(credentials.as_bytes());
         let auth_value = format!("Basic {encoded_credentials}");
 
@@ -48,9 +48,9 @@ impl AlpacaBrokerApiClient {
 
         Ok(Self {
             http_client,
-            base_url: config.base_url().to_string(),
-            account_id: config.account_id.clone(),
-            mode: config.mode(),
+            base_url: ctx.base_url().to_string(),
+            account_id: ctx.account_id.clone(),
+            mode: ctx.mode(),
         })
     }
 
@@ -198,37 +198,19 @@ mod tests {
 
     use super::*;
 
-    fn create_test_sandbox_config() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
+    fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
+        AlpacaBrokerApiCtx {
             api_key: "test_key_id".to_string(),
             api_secret: "test_secret_key".to_string(),
             account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Sandbox),
-        }
-    }
-
-    fn create_test_production_config() -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
-            api_key: "test_key_id".to_string(),
-            api_secret: "test_secret_key".to_string(),
-            account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Production),
-        }
-    }
-
-    fn create_test_mock_config(base_url: &str) -> AlpacaBrokerApiAuthConfig {
-        AlpacaBrokerApiAuthConfig {
-            api_key: "test_key_id".to_string(),
-            api_secret: "test_secret_key".to_string(),
-            account_id: "test_account_123".to_string(),
-            mode: Some(AlpacaBrokerApiMode::Mock(base_url.to_string())),
+            mode: Some(mode),
         }
     }
 
     #[test]
-    fn test_alpaca_broker_api_client_new_valid_config() {
-        let config = create_test_sandbox_config();
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+    fn test_alpaca_broker_api_client_new_valid_ctx() {
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Sandbox);
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
 
         assert!(client.is_sandbox());
         assert_eq!(client.account_id(), "test_account_123");
@@ -236,13 +218,15 @@ mod tests {
 
     #[test]
     fn test_alpaca_broker_api_client_sandbox_vs_production() {
-        let sandbox_config = create_test_sandbox_config();
-        let production_config = create_test_production_config();
-        let mock_config = create_test_mock_config("http://localhost:8080");
+        let sandbox_ctx = create_test_ctx(AlpacaBrokerApiMode::Sandbox);
+        let production_ctx = create_test_ctx(AlpacaBrokerApiMode::Production);
+        let mock_ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(
+            "http://localhost:8080".to_string(),
+        ));
 
-        let sandbox_client = AlpacaBrokerApiClient::new(&sandbox_config).unwrap();
-        let production_client = AlpacaBrokerApiClient::new(&production_config).unwrap();
-        let mock_client = AlpacaBrokerApiClient::new(&mock_config).unwrap();
+        let sandbox_client = AlpacaBrokerApiClient::new(&sandbox_ctx).unwrap();
+        let production_client = AlpacaBrokerApiClient::new(&production_ctx).unwrap();
+        let mock_client = AlpacaBrokerApiClient::new(&mock_ctx).unwrap();
 
         assert!(sandbox_client.is_sandbox());
         assert!(!production_client.is_sandbox());
@@ -254,8 +238,8 @@ mod tests {
 
     #[test]
     fn test_alpaca_broker_api_client_debug_does_not_leak_credentials() {
-        let config = create_test_sandbox_config();
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Sandbox);
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
 
         let debug_output = format!("{client:?}");
 
@@ -268,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_account_success() {
         let server = MockServer::start();
-        let config = create_test_mock_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -287,7 +271,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let account = client.verify_account().await.unwrap();
 
         mock.assert();
@@ -301,7 +285,7 @@ mod tests {
     #[tokio::test]
     async fn test_verify_account_unauthorized() {
         let server = MockServer::start();
-        let config = create_test_mock_config(&server.base_url());
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
 
         let mock = server.mock(|when, then| {
             when.method(GET)
@@ -314,7 +298,7 @@ mod tests {
                 }));
         });
 
-        let client = AlpacaBrokerApiClient::new(&config).unwrap();
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let result = client.verify_account().await;
 
         mock.assert();

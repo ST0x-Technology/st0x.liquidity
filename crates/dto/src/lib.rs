@@ -278,6 +278,8 @@ pub fn export_bindings() -> Result<(), ts_rs::ExportError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -289,6 +291,50 @@ mod tests {
         assert!(json.contains("metrics"));
         assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
+    }
+
+    #[derive(TS)]
+    #[ts(export, export_to = "dashboard/src/lib/api/")]
+    struct TestOnlyBinding {
+        _canary: bool,
+    }
+
+    #[test]
+    fn export_bindings_generates_files_in_dashboard_directory() {
+        let export_dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api");
+
+        export_bindings().unwrap();
+
+        assert!(
+            export_dir.join("ServerMessage.ts").exists(),
+            "ServerMessage.ts should exist in {}/",
+            export_dir.display()
+        );
+        assert!(
+            export_dir.join("InitialState.ts").exists(),
+            "InitialState.ts should exist in {}/",
+            export_dir.display()
+        );
+
+        // Export a test-only type and verify it lands in the same directory with correct contents
+        TestOnlyBinding::export_all().unwrap();
+        let test_file = export_dir.join("TestOnlyBinding.ts");
+        let contents = std::fs::read_to_string(&test_file).unwrap_or_else(|e| {
+            panic!(
+                "test-only binding should be readable at {}: {e}",
+                test_file.display()
+            )
+        });
+        assert!(
+            contents.contains("TestOnlyBinding"),
+            "generated file should contain the type name, got: {contents}"
+        );
+        assert!(
+            contents.contains("_canary"),
+            "generated file should contain the field name, got: {contents}"
+        );
+        std::fs::remove_file(&test_file).unwrap();
     }
 
     #[test]

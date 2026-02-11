@@ -11,9 +11,9 @@ use crate::{
     OrderUpdate, SupportedExecutor, TryIntoExecutor,
 };
 
-/// Configuration for MockExecutor
+/// Context for MockExecutor (unit struct — no context needed)
 #[derive(Debug, Clone, Default)]
-pub struct MockExecutorConfig;
+pub struct MockExecutorCtx;
 
 /// Unified test executor for dry-run mode and testing that logs operations without executing real trades
 #[derive(Debug, Clone)]
@@ -66,9 +66,9 @@ impl Default for MockExecutor {
 impl Executor for MockExecutor {
     type Error = ExecutionError;
     type OrderId = String;
-    type Config = MockExecutorConfig;
+    type Ctx = MockExecutorCtx;
 
-    async fn try_from_config(_config: Self::Config) -> Result<Self, Self::Error> {
+    async fn try_from_ctx(_ctx: Self::Ctx) -> Result<Self, Self::Error> {
         warn!("[MOCK] Initializing mock executor - always ready in dry-run mode");
         Ok(Self::new())
     }
@@ -163,13 +163,13 @@ impl Executor for MockExecutor {
 }
 
 #[async_trait]
-impl TryIntoExecutor for MockExecutorConfig {
+impl TryIntoExecutor for MockExecutorCtx {
     type Executor = MockExecutor;
 
     async fn try_into_executor(
         self,
     ) -> Result<Self::Executor, <Self::Executor as Executor>::Error> {
-        MockExecutor::try_from_config(self).await
+        MockExecutor::try_from_ctx(self).await
     }
 }
 
@@ -181,8 +181,8 @@ mod tests {
     use crate::{Direction, FractionalShares, Positive, Symbol};
 
     #[tokio::test]
-    async fn test_try_from_config_success() {
-        let result = MockExecutor::try_from_config(MockExecutorConfig).await;
+    async fn test_try_from_ctx_success() {
+        let result = MockExecutor::try_from_ctx(MockExecutorCtx).await;
         assert!(result.is_ok());
 
         let executor = result.unwrap();

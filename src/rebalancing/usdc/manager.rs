@@ -23,8 +23,7 @@ use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
-use st0x_execution::AlpacaBrokerApi;
-use st0x_execution::alpaca_broker_api::ConversionDirection;
+use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
 ///
@@ -849,7 +848,7 @@ fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcRebalanceManagerError> {
     // USDC has 6 decimals
     let scaled = usdc
         .0
-        .checked_mul(rust_decimal::Decimal::from(1_000_000u64))
+        .checked_mul(Decimal::from(1_000_000u64))
         .ok_or_else(|| {
             UsdcRebalanceManagerError::ArithmeticOverflow(format!(
                 "USDC amount overflow during scaling: {}",
@@ -912,11 +911,8 @@ mod tests {
 
     use uuid::{Uuid, uuid};
 
-    use st0x_execution::Executor;
-    use st0x_execution::alpaca_broker_api::{
-        AlpacaBrokerApiAuthConfig, AlpacaBrokerApiError, AlpacaBrokerApiMode,
-        CryptoOrderFailureReason,
-    };
+    use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor};
 
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
@@ -1045,14 +1041,14 @@ mod tests {
     async fn create_test_broker_service(server: &MockServer) -> AlpacaBrokerApi {
         let _account_mock = create_broker_account_mock(server);
 
-        let auth = AlpacaBrokerApiAuthConfig {
+        let auth = AlpacaBrokerApiCtx {
             api_key: "test_key".to_string(),
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
         };
 
-        AlpacaBrokerApi::try_from_config(auth)
+        AlpacaBrokerApi::try_from_ctx(auth)
             .await
             .expect("Failed to create test broker API")
     }

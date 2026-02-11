@@ -1,5 +1,5 @@
 use st0x_hedge::cli;
-use st0x_hedge::config::setup_tracing;
+use st0x_hedge::setup_tracing;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
