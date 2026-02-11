@@ -648,7 +648,7 @@ mod tests {
     use super::*;
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
-    use crate::config::{BrokerConfig, LogLevel, SchwabAuth};
+    use crate::config::{BrokerCtx, LogLevel, SchwabAuth};
     use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
     use crate::onchain::EvmCtx;
     use crate::onchain::trade::OnchainTrade;
@@ -659,7 +659,7 @@ mod tests {
 
     fn get_schwab_auth_from_ctx(ctx: &Ctx) -> &SchwabAuth {
         match &ctx.broker {
-            BrokerConfig::Schwab(auth) => auth,
+            BrokerCtx::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config in tests"),
         }
     }
@@ -667,7 +667,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_buy_order() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -710,7 +710,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_sell_order() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -753,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_failure() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -779,7 +779,7 @@ mod tests {
                 }));
         });
 
-        let result = trading::execute_order_with_writers(
+        trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
@@ -787,9 +787,8 @@ mod tests {
             &pool,
             &mut std::io::sink(),
         )
-        .await;
-
-        assert!(result.is_err());
+        .await
+        .unwrap_err();
         account_mock.assert();
         order_mock.assert();
     }
@@ -797,7 +796,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_expired_refresh_token() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -830,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_successful_token_refresh() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_access_tokens = SchwabTokens {
@@ -899,7 +898,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_with_valid_tokens_no_refresh_needed() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let valid_tokens = SchwabTokens {
@@ -950,7 +949,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_success_stdout_output() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -993,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_order_failure_stderr_output() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -1020,7 +1019,7 @@ mod tests {
         });
 
         let mut stdout_buffer = Vec::new();
-        let result = trading::execute_order_with_writers(
+        trading::execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
@@ -1038,7 +1037,7 @@ mod tests {
     #[tokio::test]
     async fn test_authentication_with_oauth_flow_on_expired_refresh_token() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -1092,8 +1091,8 @@ mod tests {
         assert!(error_msg.contains("greater than zero"));
     }
 
-    fn create_test_config_for_cli(mock_server: &MockServer) -> Config {
-        Config {
+    fn create_test_ctx_for_cli(mock_server: &MockServer) -> Ctx {
+        Ctx {
             database_url: ":memory:".to_string(),
             log_level: LogLevel::Debug,
             server_port: 8080,
@@ -1105,7 +1104,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuth {
+            broker: BrokerCtx::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
                 redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
@@ -1278,31 +1277,37 @@ mod tests {
     fn test_cli_command_structure_validation() {
         let cmd = Cli::command();
 
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL"]);
-        assert!(result.is_err(), "buy without quantity should fail");
+        assert!(
+            cmd.clone()
+                .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL"])
+                .is_err(),
+            "buy without quantity should fail"
+        );
 
-        cmd.clone()
+        let _err = cmd
+            .clone()
             .try_get_matches_from(vec!["schwab", "sell", "-q", "100"])
             .unwrap_err();
 
-        cmd.clone()
+        let _err = cmd
+            .clone()
             .try_get_matches_from(vec!["schwab", "buy"])
             .unwrap_err();
 
-        cmd.clone()
+        let _matches = cmd
+            .clone()
             .try_get_matches_from(vec!["schwab", "buy", "-s", "AAPL", "-q", "100"])
             .unwrap();
 
-        cmd.try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"])
+        let _matches = cmd
+            .try_get_matches_from(vec!["schwab", "sell", "-s", "TSLA", "-q", "50"])
             .unwrap();
     }
 
     #[tokio::test]
     async fn test_integration_buy_command_end_to_end() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -1350,7 +1355,7 @@ mod tests {
     #[tokio::test]
     async fn test_integration_sell_command_end_to_end() {
         let server = MockServer::start();
-        let ctx = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
         setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
@@ -1382,7 +1387,7 @@ mod tests {
             quantity: 50,
         };
 
-        let result = run_command_with_writers(config, sell_command, &pool, &mut stdout).await;
+        let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
 
         assert!(
             result.is_ok(),
@@ -1398,7 +1403,7 @@ mod tests {
     #[tokio::test]
     async fn test_integration_authentication_failure_scenarios() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -1408,7 +1413,7 @@ mod tests {
             refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
         };
         expired_tokens
-            .store(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
             .await
             .unwrap();
 
@@ -1430,7 +1435,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout,
         )
@@ -1442,14 +1447,13 @@ mod tests {
         );
         token_refresh_mock.assert();
 
-        let error_msg = format!("{}", result.unwrap_err());
-        assert!(error_msg.contains("Refresh token expired"));
+        assert!(format!("{}", result.unwrap_err()).contains("Refresh token expired"));
     }
 
     #[tokio::test]
     async fn test_integration_token_refresh_flow() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let expired_tokens = SchwabTokens {
@@ -1459,7 +1463,7 @@ mod tests {
             refresh_token_fetched_at: chrono::Utc::now() - chrono::Duration::days(1),
         };
         expired_tokens
-            .store(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            .store(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
             .await
             .unwrap();
 
@@ -1505,7 +1509,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout,
         )
@@ -1520,7 +1524,7 @@ mod tests {
         order_mock.assert();
 
         let stored_tokens =
-            SchwabTokens::load(&pool, &get_schwab_auth_from_config(&config).encryption_key)
+            SchwabTokens::load(&pool, &get_schwab_auth_from_ctx(&ctx).encryption_key)
                 .await
                 .unwrap();
         assert_eq!(stored_tokens.access_token, "new_access_token");
@@ -1530,7 +1534,7 @@ mod tests {
     #[tokio::test]
     async fn test_integration_database_operations() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let mut stdout = Vec::new();
@@ -1539,7 +1543,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout,
         )
@@ -1547,10 +1551,9 @@ mod tests {
 
         assert!(result.is_err(), "CLI should fail when no tokens are stored");
 
-        let error_msg = format!("{}", result.unwrap_err());
-        assert!(error_msg.contains("no rows returned"));
+        assert!(format!("{}", result.unwrap_err()).contains("no rows returned"));
 
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1576,7 +1579,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout2,
         )
@@ -1593,9 +1596,9 @@ mod tests {
     #[tokio::test]
     async fn test_integration_network_error_handling() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1611,7 +1614,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout,
         )
@@ -1630,7 +1633,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_tx_command_transaction_not_found() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
 
         let tx_hash =
@@ -1642,15 +1645,9 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
 
-        let result = trading::process_tx_with_provider(
-            tx_hash,
-            &config,
-            &pool,
-            &mut stdout,
-            &provider,
-            &cache,
-        )
-        .await;
+        let result =
+            trading::process_tx_with_provider(tx_hash, &ctx, &pool, &mut stdout, &provider, &cache)
+                .await;
 
         assert!(
             result.is_ok(),
@@ -1667,9 +1664,9 @@ mod tests {
     #[tokio::test]
     async fn test_integration_invalid_order_parameters() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1699,7 +1696,7 @@ mod tests {
             Symbol::new("INVALID").unwrap(),
             999_999,
             Direction::Buy,
-            &config,
+            &ctx,
             &pool,
             &mut stdout,
         )
@@ -1723,22 +1720,22 @@ mod tests {
     #[tokio::test]
     async fn test_process_tx_with_database_integration_success() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let tx_hash =
             fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let mock_data = create_mock_blockchain_data(
-            config.evm.orderbook,
+            ctx.evm.orderbook,
             tx_hash,
             "9000000000000000000",
             100_000_000,
         );
 
-        let mut config = config;
-        config.evm.order_owner = Some(mock_data.order_owner);
+        let mut ctx = ctx;
+        ctx.evm.order_owner = Some(mock_data.order_owner);
 
         let (account_mock, order_mock) = setup_schwab_api_mocks(&server);
 
@@ -1747,15 +1744,9 @@ mod tests {
 
         let mut stdout = Vec::new();
 
-        let result = trading::process_tx_with_provider(
-            tx_hash,
-            &config,
-            &pool,
-            &mut stdout,
-            &provider,
-            &cache,
-        )
-        .await;
+        let result =
+            trading::process_tx_with_provider(tx_hash, &ctx, &pool, &mut stdout, &provider, &cache)
+                .await;
 
         assert!(
             result.is_ok(),
@@ -1809,22 +1800,22 @@ mod tests {
     #[tokio::test]
     async fn test_process_tx_database_duplicate_handling() {
         let server = MockServer::start();
-        let config = create_test_config_for_cli(&server);
+        let ctx = create_test_ctx_for_cli(&server);
         let pool = setup_test_db().await;
-        setup_test_tokens(&pool, get_schwab_auth_from_config(&config)).await;
+        setup_test_tokens(&pool, get_schwab_auth_from_ctx(&ctx)).await;
 
         let tx_hash =
             fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
 
         let mock_data = create_mock_blockchain_data(
-            config.evm.orderbook,
+            ctx.evm.orderbook,
             tx_hash,
             "5000000000000000000",
             50_000_000,
         );
 
-        let mut config = config;
-        config.evm.order_owner = Some(mock_data.order_owner);
+        let mut ctx = ctx;
+        ctx.evm.order_owner = Some(mock_data.order_owner);
 
         let account_mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -1867,7 +1858,7 @@ mod tests {
 
         let result1 = trading::process_tx_with_provider(
             tx_hash,
-            &config,
+            &ctx,
             &pool,
             &mut stdout1,
             &provider1,
@@ -1909,7 +1900,7 @@ mod tests {
 
         let result2 = trading::process_tx_with_provider(
             tx_hash,
-            &config,
+            &ctx,
             &pool,
             &mut stdout2,
             &provider2,

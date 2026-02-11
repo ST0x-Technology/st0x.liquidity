@@ -115,15 +115,8 @@ where
 
     info!("Market opened, conductor running");
 
-    run_conductor_until_market_close(
-        &mut conductor,
-        executor,
-        ctx,
-        pool,
-        timeout,
-        event_sender,
-    )
-    .await
+    run_conductor_until_market_close(&mut conductor, executor, ctx, pool, timeout, event_sender)
+        .await
 }
 
 fn log_market_status(timeout: Duration) {
@@ -365,7 +358,7 @@ impl Conductor {
 }
 
 async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
-    rebalancing_config: &RebalancingCtx,
+    rebalancing_ctx: &RebalancingCtx,
     pool: &SqlitePool,
     ctx: &Ctx,
     inventory: &Arc<RwLock<InventoryView>>,
@@ -374,7 +367,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
 ) -> anyhow::Result<JoinHandle<()>> {
     info!("Initializing rebalancing infrastructure");
 
-    let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+    let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
     let market_maker_wallet = signer.address();
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
@@ -382,8 +375,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
 
     let trigger = Arc::new(RebalancingTrigger::new(
         RebalancingTriggerConfig {
-            equity_threshold: rebalancing_config.equity_threshold,
-            usdc_threshold: rebalancing_config.usdc_threshold,
+            equity_threshold: rebalancing_ctx.equity_threshold,
+            usdc_threshold: rebalancing_ctx.usdc_threshold,
         },
         pool.clone(),
         ctx.evm.orderbook,
@@ -416,7 +409,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     };
 
     Ok(spawn_rebalancer(
-        rebalancing_config,
+        rebalancing_ctx,
         provider.clone(),
         ctx.evm.orderbook,
         market_maker_wallet,
@@ -1264,7 +1257,7 @@ async fn process_trade_within_transaction(
 }
 
 fn reconstruct_log_from_queued_event(
-    config: &EvmCtx,
+    evm_ctx: &EvmCtx,
     queued_event: &crate::queue::QueuedEvent,
 ) -> Log {
     use alloy::primitives::IntoLogData;
@@ -1280,7 +1273,7 @@ fn reconstruct_log_from_queued_event(
 
     Log {
         inner: alloy::primitives::Log {
-            address: config.orderbook,
+            address: evm_ctx.orderbook,
             data: log_data,
         },
         block_hash: None,
@@ -1538,7 +1531,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
-    use crate::config::tests::create_test_config;
+    use crate::config::tests::create_test_ctx;
     use crate::offchain::execution::{
         OffchainExecution, find_executions_by_symbol_status_and_broker,
     };
@@ -1672,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn test_complete_event_processing_flow() {
         let pool = setup_test_db().await;
-        let ctx = create_test_config();
+        let ctx = create_test_ctx();
 
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),
@@ -1923,7 +1916,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_queued_event_deserialization() {
         let pool = setup_test_db().await;
-        let ctx = create_test_config();
+        let ctx = create_test_ctx();
 
         let clear_event = ClearV3 {
             sender: address!("0x1111111111111111111111111111111111111111"),

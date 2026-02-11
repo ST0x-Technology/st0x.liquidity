@@ -492,10 +492,9 @@ mod tests {
             direction: Direction::Buy,
         };
 
-        let result = place_market_order(&client, market_order).await;
+        let placement = place_market_order(&client, market_order).await.unwrap();
 
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(placement.symbol.to_string(), "AAPL");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(100));
@@ -537,10 +536,9 @@ mod tests {
             direction: Direction::Sell,
         };
 
-        let result = place_market_order(&client, market_order).await;
+        let placement = place_market_order(&client, market_order).await.unwrap();
 
         mock.assert();
-        let placement = result.unwrap();
         assert_eq!(placement.order_id, "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(placement.symbol.to_string(), "TSLA");
         assert_eq!(placement.shares.inner().inner(), Decimal::from(50));
@@ -570,10 +568,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "AAPL");
         assert_eq!(order_update.shares.inner().inner(), Decimal::from(100));
@@ -605,10 +602,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.symbol.to_string(), "TSLA");
         assert_eq!(order_update.shares.inner().inner(), Decimal::from(50));
@@ -640,10 +636,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = get_order_status(&client, order_id).await;
+        let order_update = get_order_status(&client, order_id).await.unwrap();
 
         mock.assert();
-        let order_update = result.unwrap();
         assert_eq!(order_update.order_id, order_id);
         assert_eq!(order_update.status, OrderStatus::Failed);
     }
@@ -680,10 +675,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = poll_pending_orders(&client).await;
+        let order_updates = poll_pending_orders(&client).await.unwrap();
 
         mock.assert();
-        let order_updates = result.unwrap();
         assert_eq!(order_updates.len(), 2);
 
         assert_eq!(
@@ -716,10 +710,9 @@ mod tests {
         });
 
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
-        let result = poll_pending_orders(&client).await;
+        let order_updates = poll_pending_orders(&client).await.unwrap();
 
         mock.assert();
-        let order_updates = result.unwrap();
         assert!(order_updates.is_empty());
     }
 
@@ -800,10 +793,11 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = Decimal::from_str("1000.50").unwrap();
 
-        let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd).await;
+        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdcToUsd)
+            .await
+            .unwrap();
 
         mock.assert();
-        let order = result.unwrap();
         assert_eq!(order.id.to_string(), "904837e3-3b76-47ec-b432-046db621571b");
         assert_eq!(order.symbol, "USDCUSD");
         assert_eq!(order.quantity, Decimal::from_str("1000.50").unwrap());
@@ -842,10 +836,11 @@ mod tests {
         let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
         let amount = Decimal::from_str("500").unwrap();
 
-        let result = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc).await;
+        let order = convert_usdc_usd(&client, amount, ConversionDirection::UsdToUsdc)
+            .await
+            .unwrap();
 
         mock.assert();
-        let order = result.unwrap();
         assert_eq!(order.id.to_string(), "61e7b016-9c91-4a97-b912-615c9d365c9d");
         assert_eq!(order.symbol, "USDCUSD");
         assert_eq!(order.quantity, Decimal::from_str("500").unwrap());

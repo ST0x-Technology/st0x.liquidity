@@ -329,15 +329,14 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
+        let err = initiate_withdrawal(
             &client,
             Decimal::ZERO,
             "USDC",
             "0x1234567890abcdef1234567890abcdef12345678",
         )
-        .await;
-
-        let err = result.unwrap_err();
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::ZERO
@@ -354,15 +353,14 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = initiate_withdrawal(
+        let err = initiate_withdrawal(
             &client,
             Decimal::new(-100, 0),
             "USDC",
             "0x1234567890abcdef1234567890abcdef12345678",
         )
-        .await;
-
-        let err = result.unwrap_err();
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             AlpacaWalletError::InvalidAmount { amount } if amount == Decimal::new(-100, 0)

@@ -459,10 +459,10 @@ mod tests {
         };
 
         let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        let result = poller
+        poller
             .handle_filled_order(execution_id, &filled_state)
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -540,10 +540,10 @@ mod tests {
         };
 
         let poller = OrderStatusPoller::new(config, pool.clone(), broker, dual_write_context);
-        let result = poller
+        poller
             .handle_failed_order(execution_id, &failed_state)
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = execution_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(

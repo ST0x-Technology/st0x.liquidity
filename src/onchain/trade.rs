@@ -387,7 +387,7 @@ impl OnchainTrade {
         tx_hash: B256,
         provider: P,
         cache: &SymbolCache,
-        config: &EvmConfig,
+        evm_ctx: &EvmCtx,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
@@ -407,7 +407,7 @@ impl OnchainTrade {
             .filter(|log| {
                 (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == config.orderbook
+                    && log.address() == evm_ctx.orderbook
             })
             .collect();
 
@@ -423,7 +423,7 @@ impl OnchainTrade {
                 log,
                 &provider,
                 cache,
-                config,
+                evm_ctx,
                 feed_id_cache,
                 order_owner,
             )
@@ -449,7 +449,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     log: &Log,
     provider: P,
     cache: &SymbolCache,
-    config: &EvmConfig,
+    evm_ctx: &EvmCtx,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -466,7 +466,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
     if let Ok(clear_event) = log.log_decode::<ClearV3>() {
         return OnchainTrade::try_from_clear_v3(
-            config,
+            evm_ctx,
             cache,
             &provider,
             clear_event.data().clone(),
@@ -510,7 +510,7 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5;
-    use crate::onchain::EvmConfig;
+    use crate::onchain::EvmCtx;
     use crate::symbol::cache::SymbolCache;
     use crate::test_utils::setup_test_db;
 
@@ -824,7 +824,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
-        let config = EvmConfig {
+        let evm_ctx = EvmCtx {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             order_owner: Some(Address::ZERO),
@@ -839,7 +839,7 @@ mod tests {
             tx_hash,
             provider,
             &cache,
-            &config,
+            &evm_ctx,
             &feed_id_cache,
             Address::ZERO,
         )

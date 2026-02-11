@@ -433,9 +433,10 @@ mod tests {
             pyth_price,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyEnriched)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyEnriched)
+        ));
     }
 
     #[tokio::test]
@@ -455,9 +456,10 @@ mod tests {
             pyth_price,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::NotFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::NotFilled)
+        ));
     }
 
     #[tokio::test]
@@ -545,9 +547,10 @@ mod tests {
             block_timestamp: now,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyFilled)
+        ));
     }
 
     #[tokio::test]
@@ -590,9 +593,10 @@ mod tests {
             block_timestamp: now,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyFilled)
+        ));
     }
 
     #[test]
@@ -863,8 +867,9 @@ mod tests {
             pyth_price: None,
         };
 
-        let result = aggregate.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OnChainTradeError::AlreadyFilled)));
+        assert!(matches!(
+            aggregate.handle(command, &()).await,
+            Err(OnChainTradeError::AlreadyFilled)
+        ));
     }
 }

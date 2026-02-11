@@ -424,11 +424,11 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = fetch_market_hours(&config, &pool, None).await;
+        let error = fetch_market_hours(&config, &pool, None).await.unwrap_err();
         mock.assert();
 
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
             if action == "fetch market hours" && status.as_u16() == 500
         ));
@@ -448,10 +448,10 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = fetch_market_hours(&config, &pool, None).await;
+        let error = fetch_market_hours(&config, &pool, None).await.unwrap_err();
         mock.assert();
 
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[test]
@@ -469,46 +469,42 @@ mod tests {
             MarketSession::AfterHours
         );
 
-        let result = "INVALID".parse::<MarketSession>();
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "Invalid market session: INVALID");
+        assert_eq!(
+            "INVALID".parse::<MarketSession>().unwrap_err(),
+            "Invalid market session: INVALID"
+        );
     }
 
     #[test]
     fn test_parse_date_valid() {
-        let result = parse_date("2025-01-03");
         assert_eq!(
-            result.unwrap(),
+            parse_date("2025-01-03").unwrap(),
             NaiveDate::from_ymd_opt(2025, 1, 3).unwrap()
         );
     }
 
     #[test]
     fn test_parse_date_invalid() {
-        let result = parse_date("invalid-date");
-        assert!(result.is_err());
+        assert!(parse_date("invalid-date").is_err());
     }
 
     #[test]
     fn test_parse_datetime_rfc3339() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        let result = parse_datetime("2025-01-03T09:30:00-05:00", date);
-        assert!(result.is_ok());
+        assert!(parse_datetime("2025-01-03T09:30:00-05:00", date).is_ok());
     }
 
     #[test]
     fn test_parse_datetime_time_only() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        let result = parse_datetime("09:30:00", date);
-        assert!(result.is_ok());
+        assert!(parse_datetime("09:30:00", date).is_ok());
     }
 
     #[test]
     fn test_parse_datetime_invalid() {
         let date = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap();
-        let result = parse_datetime("invalid-time", date);
         assert!(matches!(
-            result.unwrap_err(),
+            parse_datetime("invalid-time", date).unwrap_err(),
             SchwabError::RequestFailed { action, .. }
             if action == "parse datetime"
         ));

@@ -279,7 +279,7 @@ mod tests {
 
     use super::*;
     use crate::alpaca_wallet::AlpacaAccountId;
-    use crate::config::{BrokerConfig, LogLevel};
+    use crate::config::{BrokerCtx, LogLevel};
     use crate::inventory::ImbalanceThreshold;
     use crate::onchain::EvmCtx;
     use crate::rebalancing::RebalancingCtx;
@@ -298,7 +298,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::DryRun,
+            broker: BrokerCtx::DryRun,
             telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
@@ -384,8 +384,9 @@ mod tests {
         let burn_tx = B256::ZERO;
 
         let mut stdout = Vec::new();
-        let _ =
-            cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &ctx, provider).await;
+        cctp_recover_command(&mut stdout, burn_tx, CctpChain::Ethereum, &ctx, provider)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

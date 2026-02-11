@@ -815,9 +815,8 @@ pub(crate) mod tests {
         });
 
         let request = create_mint_request();
-        let result = client.request_mint(request).await;
 
-        let err = result.unwrap_err();
+        let err = client.request_mint(request).await.unwrap_err();
         assert!(
             matches!(&err, AlpacaTokenizationError::InsufficientPosition { symbol } if symbol.to_string() == "AAPL"),
             "expected InsufficientPosition for AAPL, got: {err:?}"
@@ -843,9 +842,8 @@ pub(crate) mod tests {
         });
 
         let request = create_mint_request();
-        let result = client.request_mint(request).await;
 
-        let err = result.unwrap_err();
+        let err = client.request_mint(request).await.unwrap_err();
         assert!(
             matches!(&err, AlpacaTokenizationError::InvalidParameters { details } if details.contains("invalid wallet address")),
             "expected InvalidParameters with 'invalid wallet address', got: {err:?}"
@@ -1006,9 +1004,8 @@ pub(crate) mod tests {
         });
 
         let id = TokenizationRequestId("nonexistent".to_string());
-        let result = client.get_request(&id).await;
 
-        let err = result.unwrap_err();
+        let err = client.get_request(&id).await.unwrap_err();
         assert!(
             matches!(&err, AlpacaTokenizationError::RequestNotFound { id: found_id } if found_id.0 == "nonexistent"),
             "expected RequestNotFound, got: {err:?}"
@@ -1053,13 +1050,13 @@ pub(crate) mod tests {
         );
 
         let transfer_amount = U256::from(100_000u64);
-        let result = client
-            .send_tokens_for_redemption(token_address, transfer_amount)
-            .await;
 
         assert!(
-            result.is_ok(),
-            "expected successful transfer, got: {result:?}"
+            client
+                .send_tokens_for_redemption(token_address, transfer_amount)
+                .await
+                .is_ok(),
+            "expected successful transfer"
         );
 
         let balance = token
@@ -1196,10 +1193,9 @@ pub(crate) mod tests {
 
         let hash: TxHash =
             fixed_bytes!("0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
-        let result = client.find_redemption_by_tx(&hash).await.unwrap();
 
         assert!(
-            result.is_none(),
+            client.find_redemption_by_tx(&hash).await.unwrap().is_none(),
             "expected None when redemption not yet detected"
         );
 

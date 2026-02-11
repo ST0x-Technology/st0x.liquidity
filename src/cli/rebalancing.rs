@@ -23,7 +23,7 @@ use crate::bindings::IERC20;
 use crate::cctp::{
     CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
 };
-use crate::config::{BrokerConfig, Ctx};
+use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
@@ -53,17 +53,16 @@ pub(super) async fn transfer_equity_command<W: Write>(
     writeln!(stdout, "   Symbol: {symbol}")?;
     writeln!(stdout, "   Quantity: {quantity}")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &config.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("transfer-equity requires Alpaca Broker API configuration");
     };
 
-    let rebalancing_config = config.rebalancing.as_ref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "transfer-equity requires rebalancing configuration (set REBALANCING_ENABLED=true)"
-        )
-    })?;
+    let rebalancing_config = ctx
+        .rebalancing
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("transfer-equity requires rebalancing configuration"))?;
 
-    let ws = WsConnect::new(config.evm.ws_rpc_url.as_str());
+    let ws = WsConnect::new(ctx.evm.ws_rpc_url.as_str());
     let base_provider = ProviderBuilder::new().connect_ws(ws).await?;
 
     let tokenization_service = Arc::new(AlpacaTokenizationService::new(
@@ -136,7 +135,7 @@ pub(super) async fn transfer_usdc_command<W: Write, BP>(
     stdout: &mut W,
     direction: TransferDirection,
     amount: Usdc,
-    config: &Config,
+    ctx: &Ctx,
     pool: &SqlitePool,
     base_provider: BP,
 ) -> anyhow::Result<()>

@@ -15,7 +15,7 @@ use crate::alpaca_wallet::{
 };
 use crate::bindings::IERC20;
 use crate::cctp::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
-use crate::config::{BrokerConfig, Ctx};
+use crate::config::{BrokerCtx, Ctx};
 use crate::threshold::Usdc;
 
 pub(super) async fn alpaca_deposit_command<W: Write>(
@@ -26,7 +26,7 @@ pub(super) async fn alpaca_deposit_command<W: Write>(
     writeln!(stdout, "Depositing USDC directly to Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-deposit requires Alpaca Broker API configuration");
     };
 
@@ -123,7 +123,7 @@ pub(super) async fn alpaca_withdraw_command<W: Write>(
     writeln!(stdout, "Withdrawing USDC from Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-withdraw requires Alpaca Broker API configuration");
     };
 
@@ -223,7 +223,7 @@ pub(super) async fn alpaca_whitelist_command<W: Write>(
     address: Option<Address>,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-whitelist requires Alpaca Broker API configuration");
     };
 
@@ -292,7 +292,7 @@ pub(super) async fn alpaca_transfers_command<W: Write>(
     stdout: &mut W,
     ctx: &Ctx,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-transfers requires Alpaca Broker API configuration");
     };
 
@@ -356,7 +356,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
     writeln!(stdout, "Converting {direction_str} on Alpaca")?;
     writeln!(stdout, "   Amount: {amount} USDC")?;
 
-    let BrokerConfig::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
+    let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker else {
         anyhow::bail!("alpaca-convert requires Alpaca Broker API configuration");
     };
 
@@ -432,7 +432,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::DryRun,
+            broker: BrokerCtx::DryRun,
             telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
@@ -441,7 +441,7 @@ mod tests {
 
     fn create_alpaca_ctx_without_rebalancing() -> Ctx {
         let mut ctx = create_ctx_without_alpaca();
-        ctx.broker = BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+        ctx.broker = BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
             api_key: "test-key".to_string(),
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
@@ -464,7 +464,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::AlpacaBrokerApi(AlpacaBrokerApiCtx {
+            broker: BrokerCtx::AlpacaBrokerApi(AlpacaBrokerApiCtx {
                 api_key: "test-key".to_string(),
                 api_secret: "test-secret".to_string(),
                 account_id: alpaca_account_id.to_string(),
@@ -502,9 +502,10 @@ mod tests {
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let result = alpaca_deposit_command(&mut stdout, amount, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_deposit_command(&mut stdout, amount, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires Alpaca Broker API configuration"),
             "Expected Alpaca Broker API error, got: {err_msg}"
@@ -513,13 +514,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_deposit_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let result = alpaca_deposit_command(&mut stdout, amount, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_deposit_command(&mut stdout, amount, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -528,11 +530,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_deposit_writes_amount_to_stdout() {
-        let config = create_full_alpaca_config();
+        let ctx = create_full_alpaca_ctx();
         let amount = Usdc(dec!(500.50));
 
         let mut stdout = Vec::new();
-        let _ = alpaca_deposit_command(&mut stdout, amount, &config).await;
+        alpaca_deposit_command(&mut stdout, amount, &ctx)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -543,13 +547,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_withdraw_requires_alpaca_broker() {
-        let config = create_config_without_alpaca();
+        let ctx = create_ctx_without_alpaca();
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let result = alpaca_withdraw_command(&mut stdout, amount, None, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_withdraw_command(&mut stdout, amount, None, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires Alpaca Broker API configuration"),
             "Expected Alpaca Broker API error, got: {err_msg}"
@@ -558,13 +563,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_withdraw_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
-        let result = alpaca_withdraw_command(&mut stdout, amount, None, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_withdraw_command(&mut stdout, amount, None, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -573,12 +579,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_whitelist_requires_alpaca_broker() {
-        let config = create_config_without_alpaca();
+        let ctx = create_ctx_without_alpaca();
 
         let mut stdout = Vec::new();
-        let result = alpaca_whitelist_command(&mut stdout, None, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_whitelist_command(&mut stdout, None, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires Alpaca Broker API configuration"),
             "Expected Alpaca Broker API error, got: {err_msg}"
@@ -587,12 +594,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_whitelist_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();
-        let result = alpaca_whitelist_command(&mut stdout, None, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_whitelist_command(&mut stdout, None, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -601,12 +609,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_transfers_requires_alpaca_broker() {
-        let config = create_config_without_alpaca();
+        let ctx = create_ctx_without_alpaca();
 
         let mut stdout = Vec::new();
-        let result = alpaca_transfers_command(&mut stdout, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires Alpaca Broker API configuration"),
             "Expected Alpaca Broker API error, got: {err_msg}"
@@ -615,12 +624,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_transfers_requires_rebalancing_config() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
 
         let mut stdout = Vec::new();
-        let result = alpaca_transfers_command(&mut stdout, &config).await;
-
-        let err_msg = result.unwrap_err().to_string();
+        let err_msg = alpaca_transfers_command(&mut stdout, &ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err_msg.contains("requires rebalancing configuration"),
             "Expected rebalancing config error, got: {err_msg}"
@@ -629,12 +639,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_convert_requires_alpaca_broker() {
-        let config = create_config_without_alpaca();
+        let ctx = create_ctx_without_alpaca();
         let amount = Usdc(dec!(100));
 
         let mut stdout = Vec::new();
         let result =
-            alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &config).await;
+            alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &ctx).await;
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -645,11 +655,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_convert_writes_direction_to_stdout() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc(dec!(500.50));
 
         let mut stdout = Vec::new();
-        let _ = alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &config).await;
+        alpaca_convert_command(&mut stdout, ConvertDirection::ToUsd, amount, &ctx)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(
@@ -664,12 +676,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_alpaca_convert_to_usdc_writes_direction_to_stdout() {
-        let config = create_alpaca_config_without_rebalancing();
+        let ctx = create_alpaca_ctx_without_rebalancing();
         let amount = Usdc(dec!(250));
 
         let mut stdout = Vec::new();
-        let _ =
-            alpaca_convert_command(&mut stdout, ConvertDirection::ToUsdc, amount, &config).await;
+        alpaca_convert_command(&mut stdout, ConvertDirection::ToUsdc, amount, &ctx)
+            .await
+            .unwrap_err();
 
         let output = String::from_utf8(stdout).unwrap();
         assert!(

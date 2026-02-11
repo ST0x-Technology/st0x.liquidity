@@ -248,11 +248,11 @@ mod tests {
         });
 
         let executor = AlpacaBrokerApi::try_from_ctx(ctx).await.unwrap();
-        let result = executor.wait_until_market_open().await;
+        let wait = executor.wait_until_market_open().await.unwrap();
 
         account_mock.assert();
         calendar_mock.assert();
-        assert!(result.unwrap().as_secs() > 0);
+        assert!(wait.as_secs() > 0);
     }
 
     #[tokio::test]
@@ -284,10 +284,9 @@ mod tests {
         account_mock.assert();
 
         let invalid_uuid = "not-a-valid-uuid";
-        let result = executor.parse_order_id(invalid_uuid);
 
         assert!(matches!(
-            result.unwrap_err(),
+            executor.parse_order_id(invalid_uuid).unwrap_err(),
             AlpacaBrokerApiError::InvalidOrderId(_)
         ));
     }
@@ -320,9 +319,7 @@ mod tests {
 
         account_mock.assert();
 
-        let result = executor.run_executor_maintenance().await;
-
-        assert!(result.is_none());
+        assert!(executor.run_executor_maintenance().await.is_none());
     }
 
     #[tokio::test]

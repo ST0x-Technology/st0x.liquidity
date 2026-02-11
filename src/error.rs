@@ -5,13 +5,11 @@ use alloy::primitives::{B256, ruint::FromUintError};
 use alloy::transports::{RpcError, TransportErrorKind};
 use cqrs_es::AggregateError;
 use rain_math_float::FloatError;
-use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::order::status::ParseOrderStatusError;
-use st0x_execution::schwab::SchwabError;
 use st0x_execution::{
-    EmptySymbolError, ExecutionError, FractionalShares, InvalidDirectionError,
-    InvalidExecutorError, InvalidSharesError, PersistenceError, Positive,
+    AlpacaBrokerApiError, AlpacaTradingApiError, EmptySymbolError, ExecutionError,
+    FractionalShares, InvalidDirectionError, InvalidExecutorError, InvalidSharesError,
+    PersistenceError, Positive, SchwabError,
 };
 use std::num::{ParseFloatError, TryFromIntError};
 

@@ -94,22 +94,22 @@ pub struct Ctx {
     pub(crate) evm: EvmCtx,
     pub(crate) order_polling_interval: u64,
     pub(crate) order_polling_max_jitter: u64,
-    pub(crate) broker: BrokerConfig,
-    pub(crate) telemetry: Option<TelemetryCtx>,
+    pub(crate) broker: BrokerCtx,
+    pub telemetry: Option<TelemetryCtx>,
     pub(crate) rebalancing: Option<RebalancingCtx>,
     pub(crate) execution_threshold: ExecutionThreshold,
 }
 
 /// Runtime broker configuration assembled from `BrokerSecrets`.
 #[derive(Debug, Clone)]
-pub enum BrokerConfig {
+pub enum BrokerCtx {
     Schwab(SchwabAuth),
     AlpacaTradingApi(AlpacaTradingApiCtx),
     AlpacaBrokerApi(AlpacaBrokerApiCtx),
     DryRun,
 }
 
-impl BrokerConfig {
+impl BrokerCtx {
     pub fn to_supported_executor(&self) -> SupportedExecutor {
         match self {
             Self::Schwab(_) => SupportedExecutor::Schwab,
@@ -178,10 +178,6 @@ impl From<&LogLevel> for Level {
             LogLevel::Error => Self::ERROR,
         }
     }
-}
-
-pub(crate) trait HasSqlite {
-    async fn get_sqlite_pool(&self) -> Result<SqlitePool, sqlx::Error>;
 }
 
 pub(crate) async fn configure_sqlite_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
@@ -258,7 +254,6 @@ impl ConfigError {
     }
 }
 
-
 impl Ctx {
     pub fn load_files(config: &Path, secrets: &Path) -> Result<Self, ConfigError> {
         let config_str = std::fs::read_to_string(config)?;
@@ -271,7 +266,7 @@ impl Ctx {
         let secrets: Secrets = toml::from_str(secrets_toml)?;
 
         let broker = assemble_broker(secrets.broker);
-        let evm = assemble_evm(config.evm, secrets.evm);
+        let evm = assemble_evm(&config.evm, secrets.evm);
         let telemetry = assemble_telemetry(config.telemetry, secrets.telemetry)?;
 
         // Execution threshold is determined by broker capabilities:
@@ -282,8 +277,7 @@ impl Ctx {
         let execution_threshold = derive_execution_threshold(&broker)?;
 
         // Rebalancing requires both config and secrets, plus an AlpacaBrokerApi broker.
-        let rebalancing =
-            assemble_rebalancing(config.rebalancing, secrets.rebalancing, &broker)?;
+        let rebalancing = assemble_rebalancing(config.rebalancing, secrets.rebalancing, &broker)?;
 
         let log_level = config.log_level.unwrap_or(LogLevel::Debug);
 

@@ -492,12 +492,11 @@ mod tests {
 
         tokens.store(&pool, &config.encryption_key).await.unwrap();
 
-        let result = SchwabTokens::get_valid_access_token(&pool, &config).await;
+        let error = SchwabTokens::get_valid_access_token(&pool, &config)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            SchwabError::RefreshTokenExpired
-        ));
+        assert!(matches!(error, SchwabError::RefreshTokenExpired));
     }
 
     #[tokio::test]
@@ -531,10 +530,12 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = SchwabTokens::get_valid_access_token(&pool, &config).await;
-
+        let access_token = SchwabTokens::get_valid_access_token(&pool, &config)
+            .await
+            .unwrap();
         mock.assert();
-        assert_eq!(result.unwrap(), "refreshed_access_token");
+
+        assert_eq!(access_token, "refreshed_access_token");
 
         let stored_tokens = SchwabTokens::load(&pool, &config.encryption_key)
             .await
@@ -566,13 +567,12 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = SchwabTokens::get_valid_access_token(&pool, &config).await;
-
+        let error = SchwabTokens::get_valid_access_token(&pool, &config)
+            .await
+            .unwrap_err();
         mock.assert();
-        assert!(matches!(
-            result.unwrap_err(),
-            SchwabError::RequestFailed { .. }
-        ));
+
+        assert!(matches!(error, SchwabError::RequestFailed { .. }));
     }
 
     #[tokio::test]
@@ -580,9 +580,11 @@ mod tests {
         let pool = setup_test_db().await;
         let config = create_test_config();
 
-        let result = SchwabTokens::get_valid_access_token(&pool, &config).await;
+        let error = SchwabTokens::get_valid_access_token(&pool, &config)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(result.unwrap_err(), SchwabError::Sqlx(_)));
+        assert!(matches!(error, SchwabError::Sqlx(_)));
     }
 
     #[tokio::test]
@@ -621,10 +623,12 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = SchwabTokens::refresh_if_needed(&pool, &config).await;
-
+        let refreshed = SchwabTokens::refresh_if_needed(&pool, &config)
+            .await
+            .unwrap();
         mock.assert();
-        assert!(result.unwrap());
+
+        assert!(refreshed);
 
         let stored_tokens = SchwabTokens::load(&pool, &config.encryption_key)
             .await
@@ -649,12 +653,11 @@ mod tests {
 
         tokens.store(&pool, &config.encryption_key).await.unwrap();
 
-        let result = SchwabTokens::refresh_if_needed(&pool, &config).await;
+        let error = SchwabTokens::refresh_if_needed(&pool, &config)
+            .await
+            .unwrap_err();
 
-        assert!(matches!(
-            result.unwrap_err(),
-            SchwabError::RefreshTokenExpired
-        ));
+        assert!(matches!(error, SchwabError::RefreshTokenExpired));
     }
 
     #[tokio::test]
@@ -673,9 +676,11 @@ mod tests {
 
         tokens.store(&pool, &config.encryption_key).await.unwrap();
 
-        let result = SchwabTokens::refresh_if_needed(&pool, &config).await;
+        let refreshed = SchwabTokens::refresh_if_needed(&pool, &config)
+            .await
+            .unwrap();
 
-        assert!(!result.unwrap());
+        assert!(!refreshed);
 
         let stored_tokens = SchwabTokens::load(&pool, &config.encryption_key)
             .await
@@ -719,10 +724,12 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = SchwabTokens::refresh_if_needed(&pool, &config).await;
-
+        let refreshed = SchwabTokens::refresh_if_needed(&pool, &config)
+            .await
+            .unwrap();
         mock.assert();
-        assert!(result.unwrap());
+
+        assert!(refreshed);
 
         let stored_tokens = SchwabTokens::load(&pool, &config.encryption_key)
             .await

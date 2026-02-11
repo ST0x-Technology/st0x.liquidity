@@ -510,13 +510,13 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = config.refresh_tokens("invalid_refresh_token").await;
-
+        let error = config
+            .refresh_tokens("invalid_refresh_token")
+            .await
+            .unwrap_err();
         mock.assert();
-        assert!(matches!(
-            result.unwrap_err(),
-            SchwabError::RequestFailed { .. }
-        ));
+
+        assert!(matches!(error, SchwabError::RequestFailed { .. }));
     }
 
     #[tokio::test]
@@ -531,10 +531,13 @@ mod tests {
                 .body("invalid json");
         });
 
-        let result = config.refresh_tokens("test_refresh_token").await;
-
+        let error = config
+            .refresh_tokens("test_refresh_token")
+            .await
+            .unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[tokio::test]
@@ -553,10 +556,13 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.refresh_tokens("test_refresh_token").await;
-
+        let error = config
+            .refresh_tokens("test_refresh_token")
+            .await
+            .unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));
+
+        assert!(matches!(error, SchwabError::Reqwest(_)));
     }
 
     #[test]
@@ -636,10 +642,10 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let hash = config.get_account_hash(&pool).await.unwrap();
         mock.assert();
-        assert_eq!(result.unwrap(), "ABC123DEF456");
+
+        assert_eq!(hash, "ABC123DEF456");
     }
 
     #[tokio::test]
@@ -671,10 +677,10 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let hash = config.get_account_hash(&pool).await.unwrap();
         mock.assert();
-        assert_eq!(result.unwrap(), "XYZ789GHI012");
+
+        assert_eq!(hash, "XYZ789GHI012");
     }
 
     #[tokio::test]
@@ -699,11 +705,11 @@ mod tests {
                 .json_body(mock_response);
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let error = config.get_account_hash(&pool).await.unwrap_err();
         mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::AccountIndexOutOfBounds { index: 2, count: 1 }
         ));
     }
@@ -722,10 +728,10 @@ mod tests {
                 .json_body(json!([]));
         });
 
-        let result = config.get_account_hash(&pool).await;
-
+        let error = config.get_account_hash(&pool).await.unwrap_err();
         mock.assert();
-        assert!(matches!(result.unwrap_err(), SchwabError::NoAccountsFound));
+
+        assert!(matches!(error, SchwabError::NoAccountsFound));
     }
 
     #[tokio::test]
@@ -738,11 +744,11 @@ mod tests {
             then.status(500);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
+        let error = config.get_tokens_from_code("test_code").await.unwrap_err();
 
         assert_eq!(mock.hits(), 1);
-        match result {
-            Err(SchwabError::RequestFailed { action, status, .. }) => {
+        match error {
+            SchwabError::RequestFailed { action, status, .. } => {
                 assert_eq!(action, "get tokens");
                 assert_eq!(status.as_u16(), 500);
             }

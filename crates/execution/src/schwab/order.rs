@@ -470,11 +470,10 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&config, &pool).await;
-
+        let response = order.place(&config, &pool).await.unwrap();
         account_mock.assert();
         order_mock.assert();
-        let response = result.unwrap();
+
         assert_eq!(response.order_id, "12345");
     }
 
@@ -504,11 +503,10 @@ mod tests {
         });
 
         let order = Order::new("INVALID".to_string(), Instruction::Buy, 100);
-        let result = order.place(&config, &pool).await;
-
+        let error = order.place(&config, &pool).await.unwrap_err();
         account_mock.assert();
         order_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(
             matches!(error, super::SchwabError::RequestFailed { action, status, .. } if action == "place order" && status.as_u16() == 400)
         );
@@ -551,11 +549,10 @@ mod tests {
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
-        let result = order.place(&config, &pool).await;
-
+        let response = order.place(&config, &pool).await.unwrap();
         account_mock.assert();
         order_mock.assert();
-        let response = result.unwrap();
+
         assert_eq!(response.order_id, "67890");
     }
 
@@ -584,11 +581,10 @@ mod tests {
         });
 
         let order = Order::new("SPY".to_string(), Instruction::Buy, 25);
-        let result = order.place(&config, &pool).await;
-
+        let error = order.place(&config, &pool).await.unwrap_err();
         account_mock.assert();
         order_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, body, .. }
@@ -621,11 +617,10 @@ mod tests {
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Buy, 100);
-        let result = order.place(&config, &pool).await;
-
+        let error = order.place(&config, &pool).await.unwrap_err();
         account_mock.assert();
         order_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, body, .. }
@@ -664,12 +659,9 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&config, &pool).await;
+        let error = order.place(&config, &pool).await.unwrap_err();
 
         account_mock.assert();
-
-        // The test ensures error handling works correctly, regardless of retry count
-        let error = result.unwrap_err();
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
@@ -709,11 +701,10 @@ mod tests {
         });
 
         let order = Order::new("TSLA".to_string(), Instruction::Sell, 50);
-        let result = order.place(&config, &pool).await;
+        let error = order.place(&config, &pool).await.unwrap_err();
 
         account_mock.assert();
         order_mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
@@ -746,11 +737,10 @@ mod tests {
         });
 
         let order = Order::new("SPY".to_string(), Instruction::Buy, 25);
-        let result = order.place(&config, &pool).await;
+        let error = order.place(&config, &pool).await.unwrap_err();
 
         account_mock.assert();
         order_mock.assert();
-        let error = result.unwrap_err();
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
@@ -772,10 +762,9 @@ mod tests {
         });
 
         let order = Order::new("AAPL".to_string(), Instruction::Buy, 100);
-        let result = order.place(&config, &pool).await;
+        let error = order.place(&config, &pool).await.unwrap_err();
 
         account_mock.assert();
-        let error = result.unwrap_err();
         // Should fail with JSON serialization error due to malformed account response
         assert!(matches!(error, SchwabError::Reqwest(_)));
     }
@@ -806,11 +795,10 @@ mod tests {
         });
 
         let order = Order::new("MSFT".to_string(), Instruction::Sell, 50);
-        let result = order.place(&config, &pool).await;
-
+        let error = order.place(&config, &pool).await.unwrap_err();
         account_mock.assert();
         order_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, body, .. }
@@ -862,11 +850,12 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538123", &config, &pool).await;
-
+        let order_status = Order::get_order_status("1004055538123", &config, &pool)
+            .await
+            .unwrap();
         account_mock.assert();
         order_status_mock.assert();
-        let order_status = result.unwrap();
+
         assert_eq!(order_status.order_id, Some("1004055538123".to_string()));
         assert!(order_status.is_filled());
         assert!((order_status.filled_quantity.unwrap() - 100.0).abs() < f64::EPSILON);
@@ -911,11 +900,12 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538456", &config, &pool).await;
-
+        let order_status = Order::get_order_status("1004055538456", &config, &pool)
+            .await
+            .unwrap();
         account_mock.assert();
         order_status_mock.assert();
-        let order_status = result.unwrap();
+
         assert_eq!(order_status.order_id, Some("1004055538456".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
@@ -975,11 +965,12 @@ mod tests {
                 }));
         });
 
-        let result = Order::get_order_status("1004055538789", &config, &pool).await;
-
+        let order_status = Order::get_order_status("1004055538789", &config, &pool)
+            .await
+            .unwrap();
         account_mock.assert();
         order_status_mock.assert();
-        let order_status = result.unwrap();
+
         assert_eq!(order_status.order_id, Some("1004055538789".to_string()));
         assert!(order_status.is_pending());
         assert!(!order_status.is_filled());
@@ -1018,11 +1009,12 @@ mod tests {
                 .json_body(json!({"error": "Order not found"}));
         });
 
-        let result = Order::get_order_status("NONEXISTENT", &config, &pool).await;
-
+        let error = Order::get_order_status("NONEXISTENT", &config, &pool)
+            .await
+            .unwrap_err();
         account_mock.assert();
         order_status_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, body }
@@ -1058,11 +1050,12 @@ mod tests {
                 .json_body(json!({"error": "Unauthorized"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &config, &pool).await;
-
+        let error = Order::get_order_status("1004055538123", &config, &pool)
+            .await
+            .unwrap_err();
         account_mock.assert();
         order_status_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
@@ -1096,11 +1089,12 @@ mod tests {
                 .json_body(json!({"error": "Internal server error"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &config, &pool).await;
-
+        let error = Order::get_order_status("1004055538123", &config, &pool)
+            .await
+            .unwrap_err();
         account_mock.assert();
         order_status_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
@@ -1134,11 +1128,12 @@ mod tests {
                 .body("invalid json response");
         });
 
-        let result = Order::get_order_status("1004055538123", &config, &pool).await;
-
+        let error = Order::get_order_status("1004055538123", &config, &pool)
+            .await
+            .unwrap_err();
         account_mock.assert();
         order_status_mock.assert();
-        let error = result.unwrap_err();
+
         assert!(matches!(error, SchwabError::InvalidConfiguration(_)));
     }
 
@@ -1169,12 +1164,13 @@ mod tests {
                 .json_body(json!({"error": "Bad Gateway"}));
         });
 
-        let result = Order::get_order_status("1004055538123", &config, &pool).await;
-
+        let error = Order::get_order_status("1004055538123", &config, &pool)
+            .await
+            .unwrap_err();
         account_mock.assert();
+
         // Should have made at least one request (retry logic is handled by backon)
         assert!(order_status_mock.hits() >= 1);
-        let error = result.unwrap_err();
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }

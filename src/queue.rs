@@ -182,7 +182,11 @@ pub(crate) async fn enqueue<E: Enqueueable>(
 }
 
 /// Enqueues buffered events that were collected during coordination phase
-#[tracing::instrument(skip(pool, event_buffer), fields(buffer_size = event_buffer.len()), level = tracing::Level::INFO)]
+#[tracing::instrument(
+    skip(pool, event_buffer),
+    fields(buffer_size = event_buffer.len()),
+    level = tracing::Level::INFO,
+)]
 pub(crate) async fn enqueue_buffer(
     pool: &sqlx::SqlitePool,
     event_buffer: Vec<(TradeEvent, alloy::rpc::types::Log)>,

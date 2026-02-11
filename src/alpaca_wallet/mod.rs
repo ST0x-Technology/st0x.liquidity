@@ -208,12 +208,11 @@ mod tests {
         let asset = TokenSymbol::new("USDC");
         let to_address = address!("0x1234567890abcdef1234567890abcdef12345678");
 
-        let result = service
-            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
-            .await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            service
+                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .await
+                .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
         ));
         whitelist_mock.assert();
@@ -243,12 +242,11 @@ mod tests {
 
         let asset = TokenSymbol::new("USDC");
 
-        let result = service
-            .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
-            .await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            service
+                .initiate_withdrawal(Decimal::new(100, 0), &asset, &to_address)
+                .await
+                .unwrap_err(),
             AlpacaWalletError::AddressNotWhitelisted { .. }
         ));
         whitelist_mock.assert();

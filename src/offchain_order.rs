@@ -918,9 +918,10 @@ mod tests {
             executor: SupportedExecutor::Schwab,
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::AlreadyPlaced)
+        ));
     }
 
     #[tokio::test]
@@ -944,9 +945,10 @@ mod tests {
             executor: SupportedExecutor::Schwab,
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::AlreadyPlaced)
+        ));
     }
 
     #[tokio::test]
@@ -968,9 +970,10 @@ mod tests {
             executor: SupportedExecutor::Schwab,
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::AlreadyPlaced)
+        ));
     }
 
     #[tokio::test]
@@ -1008,10 +1011,8 @@ mod tests {
             broker_order_id: BrokerOrderId("ORD123".to_string()),
         };
 
-        let result = order.handle(command, &()).await;
-
         assert!(matches!(
-            result,
+            order.handle(command, &()).await,
             Err(OffchainOrderError::State(LifecycleError::Uninitialized))
         ));
     }
@@ -1032,10 +1033,8 @@ mod tests {
             broker_order_id: BrokerOrderId("ORD456".to_string()),
         };
 
-        let result = order.handle(command, &()).await;
-
         assert!(matches!(
-            result,
+            order.handle(command, &()).await,
             Err(OffchainOrderError::ConflictingBrokerOrderId { .. })
         ));
     }
@@ -1180,9 +1179,10 @@ mod tests {
             price_cents: PriceCents(15000),
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::NotSubmitted)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::NotSubmitted)
+        ));
     }
 
     #[tokio::test]
@@ -1203,9 +1203,10 @@ mod tests {
             price_cents: PriceCents(15000),
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::AlreadyCompleted)
+        ));
     }
 
     #[tokio::test]
@@ -1312,9 +1313,10 @@ mod tests {
             error: "Test error".to_string(),
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyCompleted)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::AlreadyCompleted)
+        ));
     }
 
     #[tokio::test]
@@ -2171,9 +2173,10 @@ mod tests {
             executed_at: None,
         };
 
-        let result = order.handle(command, &()).await;
-
-        assert!(matches!(result, Err(OffchainOrderError::AlreadyPlaced)));
+        assert!(matches!(
+            order.handle(command, &()).await,
+            Err(OffchainOrderError::AlreadyPlaced)
+        ));
     }
 
     /// Bug: ConfirmSubmission is not idempotent, blocking recovery after partial
@@ -2214,9 +2217,9 @@ mod tests {
             broker_order_id: broker_order_id.clone(),
         };
 
-        let retry_result = order.handle(retry_command, &()).await;
-
-        let events = retry_result
+        let events = order
+            .handle(retry_command, &())
+            .await
             .expect("Retry with same broker_order_id should succeed for idempotent behavior");
 
         assert!(

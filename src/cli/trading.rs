@@ -15,7 +15,7 @@ use st0x_execution::{
 };
 
 use super::auth::ensure_schwab_authentication;
-use crate::config::{BrokerConfig, Ctx};
+use crate::config::{BrokerCtx, Ctx};
 use crate::dual_write::DualWriteContext;
 use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
@@ -83,21 +83,21 @@ async fn get_broker_order_status<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<OrderState> {
     match &ctx.broker {
-        BrokerConfig::Schwab(schwab_auth) => {
+        BrokerCtx::Schwab(schwab_auth) => {
             ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
             let broker = schwab_ctx.try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
-        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+        BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             let broker = alpaca_auth.clone().try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
-        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             let broker = alpaca_auth.clone().try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
-        BrokerConfig::DryRun => {
+        BrokerCtx::DryRun => {
             let broker = MockExecutorCtx.try_into_executor().await?;
             Ok(broker.get_order_status(&order_id.to_string()).await?)
         }
@@ -203,7 +203,7 @@ pub(super) async fn execute_broker_order<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<OrderPlacement<String>> {
     match &ctx.broker {
-        BrokerConfig::Schwab(schwab_auth) => {
+        BrokerCtx::Schwab(schwab_auth) => {
             ensure_schwab_authentication(pool, &ctx.broker, stdout).await?;
             writeln!(stdout, "🔄 Executing Schwab order...")?;
             let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
@@ -216,7 +216,7 @@ pub(super) async fn execute_broker_order<W: Write>(
             )?;
             Ok(placement)
         }
-        BrokerConfig::AlpacaTradingApi(alpaca_auth) => {
+        BrokerCtx::AlpacaTradingApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Trading API order...")?;
             let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
@@ -227,7 +227,7 @@ pub(super) async fn execute_broker_order<W: Write>(
             )?;
             Ok(placement)
         }
-        BrokerConfig::AlpacaBrokerApi(alpaca_auth) => {
+        BrokerCtx::AlpacaBrokerApi(alpaca_auth) => {
             writeln!(stdout, "🔄 Executing Alpaca Broker API order...")?;
             let broker = alpaca_auth.clone().try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
@@ -238,7 +238,7 @@ pub(super) async fn execute_broker_order<W: Write>(
             )?;
             Ok(placement)
         }
-        BrokerConfig::DryRun => {
+        BrokerCtx::DryRun => {
             writeln!(stdout, "🔄 Executing dry-run order...")?;
             let broker = MockExecutorCtx.try_into_executor().await?;
             let placement = broker.place_market_order(market_order).await?;
@@ -409,7 +409,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuth {
+            broker: BrokerCtx::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
                 redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),
@@ -425,7 +425,7 @@ mod tests {
 
     fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
         match &ctx.broker {
-            BrokerConfig::Schwab(auth) => auth,
+            BrokerCtx::Schwab(auth) => auth,
             _ => panic!("Expected Schwab broker config"),
         }
     }

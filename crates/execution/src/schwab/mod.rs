@@ -195,14 +195,17 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = config.get_tokens_from_code("invalid_code").await;
+        let error = config
+            .get_tokens_from_code("invalid_code")
+            .await
+            .unwrap_err();
+        mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
             if action == "get tokens" && status.as_u16() == 401
         ));
-
-        mock.assert();
     }
 
     #[tokio::test]
@@ -215,14 +218,14 @@ mod tests {
             then.status(500);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
+        let error = config.get_tokens_from_code("test_code").await.unwrap_err();
+        mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
             if action == "get tokens" && status.as_u16() == 500
         ));
-
-        mock.assert();
     }
 
     #[tokio::test]

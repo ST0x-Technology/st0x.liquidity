@@ -338,8 +338,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::ZERO,  // Zero input
-            output: alloy::primitives::B256::ZERO, // Zero output
+            input: B256::ZERO,  // Zero input
+            output: B256::ZERO, // Zero output
         };
 
         let log = get_test_log();
@@ -423,6 +423,6 @@ mod tests {
         .await;
 
         // Should return an error due to invalid IO index
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 }

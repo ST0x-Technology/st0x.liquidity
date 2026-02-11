@@ -45,7 +45,7 @@ enum TokenAddressError {
 
 /// Error type for rebalancing configuration validation.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum RebalancingCtxError {
+pub enum RebalancingCtxError {
     #[error("rebalancing requires alpaca-broker-api broker type")]
     NotAlpacaBroker,
     #[error("broker account_id is not a valid UUID: {0}")]

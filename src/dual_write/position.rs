@@ -248,8 +248,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = acknowledge_onchain_fill(&context, &trade).await;
-        assert!(result.is_ok());
+        acknowledge_onchain_fill(&context, &trade).await.unwrap();
 
         let event_count = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL'"
@@ -298,11 +297,11 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = acknowledge_onchain_fill(&context, &trade).await;
-
-        assert!(result.is_err());
+        let error = acknowledge_onchain_fill(&context, &trade)
+            .await
+            .unwrap_err();
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             DualWriteError::MissingBlockTimestamp { .. }
         ));
     }
@@ -349,8 +348,9 @@ mod tests {
 
         acknowledge_onchain_fill(&context, &trade).await.unwrap();
 
-        let result = place_offchain_order(&context, &execution, &symbol).await;
-        assert!(result.is_ok());
+        place_offchain_order(&context, &execution, &symbol)
+            .await
+            .unwrap();
 
         let event_count = sqlx::query_scalar!(
             "SELECT COUNT(*) FROM events WHERE aggregate_type = 'Position' AND aggregate_id = 'AAPL'"
@@ -412,8 +412,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result = complete_offchain_order(&context, &execution, &symbol).await;
-        assert!(result.is_ok());
+        complete_offchain_order(&context, &execution, &symbol)
+            .await
+            .unwrap();
 
         let event_type = sqlx::query_scalar!(
             "SELECT event_type FROM events
@@ -473,9 +474,9 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            fail_offchain_order(&context, 1, &symbol, "Broker API timeout".to_string()).await;
-        assert!(result.is_ok());
+        fail_offchain_order(&context, 1, &symbol, "Broker API timeout".to_string())
+            .await
+            .unwrap();
 
         let event_type = sqlx::query_scalar!(
             "SELECT event_type FROM events
@@ -504,13 +505,10 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        let result = complete_offchain_order(&context, &execution, &symbol).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DualWriteError::InvalidOrderState { .. }
-        ));
+        let error = complete_offchain_order(&context, &execution, &symbol)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DualWriteError::InvalidOrderState { .. }));
     }
 
     #[tokio::test]
@@ -528,13 +526,10 @@ mod tests {
             state: OrderState::Pending,
         };
 
-        let result = place_offchain_order(&context, &execution, &symbol).await;
-
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DualWriteError::MissingExecutionId
-        ));
+        let error = place_offchain_order(&context, &execution, &symbol)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DualWriteError::MissingExecutionId));
     }
 
     #[tokio::test]
@@ -544,7 +539,6 @@ mod tests {
 
         let symbol = Symbol::new("AAPL").unwrap();
         let result = load_position(&context, &symbol).await.unwrap();
-
         assert!(result.is_none());
     }
 
@@ -558,10 +552,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = load_position(&context, &symbol).await.unwrap();
-
-        assert!(result.is_some());
-        let position = result.unwrap();
+        let position = load_position(&context, &symbol).await.unwrap().unwrap();
         assert_eq!(position.symbol, symbol);
         assert_eq!(position.net, FractionalShares::ZERO);
         assert_eq!(position.threshold, ExecutionThreshold::whole_share());
@@ -625,7 +616,6 @@ mod tests {
 
         let aapl_position = load_position(&context, &aapl).await.unwrap();
         let msft_position = load_position(&context, &msft).await.unwrap();
-
         assert!(aapl_position.is_some());
         assert!(msft_position.is_none());
     }

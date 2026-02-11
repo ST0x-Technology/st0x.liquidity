@@ -880,7 +880,8 @@ mod tests {
         let _guard = symbol_lock.lock().await;
 
         // Initialize Position aggregate and acknowledge fill BEFORE processing
-        // so threshold check sees current state
+        // so threshold check sees current state. Ignore AlreadyInitialized error
+        // since this helper may be called multiple times for the same symbol.
         let _ = crate::dual_write::initialize_position(
             &dual_write_context,
             base_symbol,
@@ -1097,9 +1098,7 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await;
-        // Should succeed because INVALID0x has valid format, even if INVALID isn't a real ticker
-        assert!(result.is_ok());
+        process_trade_with_tx(&pool, trade).await.unwrap();
     }
 
     #[tokio::test]
@@ -1217,11 +1216,10 @@ mod tests {
         };
 
         // Attempt to add trade - should fail when trying to save execution due to unique constraint
-        let result = process_trade_with_tx(&pool, trade).await;
-
-        // Verify the operation failed due to execution save failure (unique constraint violation)
-        assert!(result.is_err());
-        let error_msg = result.unwrap_err().to_string();
+        let error_msg = process_trade_with_tx(&pool, trade)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error_msg.contains("UNIQUE constraint failed"));
 
         // Verify transaction was rolled back - no new trade should have been saved
@@ -1830,9 +1828,8 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await.unwrap();
-
         // Should succeed and create new execution (because stale one was cleaned up)
+        let result = process_trade_with_tx(&pool, trade).await.unwrap();
         assert!(result.is_some());
         let new_execution = result.unwrap();
         assert_eq!(new_execution.symbol, Symbol::new("AAPL").unwrap());
@@ -1931,9 +1928,8 @@ mod tests {
             pyth_publish_time: None,
         };
 
-        let result = process_trade_with_tx(&pool, trade).await.unwrap();
-
         // Should succeed and create new execution (because stale PENDING one was cleaned up)
+        let result = process_trade_with_tx(&pool, trade).await.unwrap();
         assert!(result.is_some());
         let new_execution = result.unwrap();
         assert_eq!(new_execution.symbol, Symbol::new("NVDA").unwrap());

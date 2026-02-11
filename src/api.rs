@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 
 use st0x_execution::extract_code_from_url;
 
-use crate::config::{BrokerConfig, Ctx};
+use crate::config::{BrokerCtx, Ctx};
 
 #[derive(Serialize, Deserialize)]
 struct HealthResponse {
@@ -42,7 +42,7 @@ async fn auth_refresh(
     pool: &State<SqlitePool>,
     ctx: &State<Ctx>,
 ) -> Json<AuthRefreshResponse> {
-    let BrokerConfig::Schwab(schwab_auth) = &ctx.broker else {
+    let BrokerCtx::Schwab(schwab_auth) = &ctx.broker else {
         return Json(AuthRefreshResponse::Error {
             error: "Auth refresh is only supported for Schwab broker".to_string(),
         });
@@ -96,7 +96,7 @@ mod tests {
 
     use super::*;
     use crate::config::SchwabAuth;
-    use crate::config::{BrokerConfig, Ctx};
+    use crate::config::{BrokerCtx, Ctx};
     use crate::onchain::EvmCtx;
     use crate::test_utils::setup_test_db;
     use crate::threshold::ExecutionThreshold;
@@ -116,7 +116,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(SchwabAuth {
+            broker: BrokerCtx::Schwab(SchwabAuth {
                 app_key: "test_app_key".to_string(),
                 app_secret: "test_app_secret".to_string(),
                 redirect_uri: Some(Url::parse("https://127.0.0.1").expect("valid test URL")),

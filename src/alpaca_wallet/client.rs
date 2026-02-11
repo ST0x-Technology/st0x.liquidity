@@ -305,10 +305,8 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = client.get("/v1/error").await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            client.get("/v1/error").await.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::UNAUTHORIZED
         ));
 
@@ -331,10 +329,8 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = client.get("/v1/server_error").await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            client.get("/v1/server_error").await.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::INTERNAL_SERVER_ERROR
         ));
 
@@ -389,10 +385,9 @@ mod tests {
         );
 
         let body = json!({"test": "data"});
-        let result = client.post("/v1/error", &body).await;
 
         assert!(matches!(
-            result.unwrap_err(),
+            client.post("/v1/error", &body).await.unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST
         ));
 
@@ -456,12 +451,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = client
-            .get_wallet_address(&TokenSymbol::new("INVALID"), &Network::new("ethereum"))
-            .await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            client
+                .get_wallet_address(&TokenSymbol::new("INVALID"), &Network::new("ethereum"))
+                .await
+                .unwrap_err(),
             AlpacaWalletError::ApiError { status, .. } if status == StatusCode::BAD_REQUEST
         ));
         mock.assert();
@@ -486,12 +480,11 @@ mod tests {
             "test_secret_key".to_string(),
         );
 
-        let result = client
-            .get_wallet_address(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
-            .await;
-
         assert!(matches!(
-            result.unwrap_err(),
+            client
+                .get_wallet_address(&TokenSymbol::new("USDC"), &Network::new("ethereum"))
+                .await
+                .unwrap_err(),
             AlpacaWalletError::ParseError(_)
         ));
         mock.assert();

@@ -6,14 +6,14 @@ use tracing::{error, info};
 
 use st0x_execution::{SchwabError, extract_code_from_url};
 
-use crate::config::{BrokerConfig, SchwabAuth};
+use crate::config::{BrokerCtx, SchwabAuth};
 
 pub(super) async fn auth_command<W: Write>(
     stdout: &mut W,
-    broker: &BrokerConfig,
+    broker: &BrokerCtx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::Schwab(schwab_auth) = broker else {
+    let BrokerCtx::Schwab(schwab_auth) = broker else {
         anyhow::bail!("Auth command is only supported for Schwab broker")
     };
 
@@ -52,10 +52,10 @@ pub(super) async fn auth_command<W: Write>(
 
 pub(super) async fn ensure_schwab_authentication<W: Write>(
     pool: &SqlitePool,
-    broker: &BrokerConfig,
+    broker: &BrokerCtx,
     stdout: &mut W,
 ) -> anyhow::Result<()> {
-    let BrokerConfig::Schwab(schwab_auth) = broker else {
+    let BrokerCtx::Schwab(schwab_auth) = broker else {
         anyhow::bail!("Authentication is only required for Schwab broker")
     };
 
@@ -136,7 +136,7 @@ mod tests {
             },
             order_polling_interval: 15,
             order_polling_max_jitter: 5,
-            broker: BrokerConfig::Schwab(schwab_auth.clone()),
+            broker: BrokerCtx::Schwab(schwab_auth.clone()),
             telemetry: None,
             rebalancing: None,
             execution_threshold: ExecutionThreshold::whole_share(),
@@ -153,7 +153,7 @@ mod tests {
         setup_test_tokens(&pool, &schwab_auth).await;
 
         let mut stdout = Vec::new();
-        ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+        let () = ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
             .await
             .unwrap();
         let output = String::from_utf8(stdout).unwrap();
@@ -193,7 +193,7 @@ mod tests {
         });
 
         let mut stdout = Vec::new();
-        ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+        let () = ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
             .await
             .unwrap();
         refresh_mock.assert();
@@ -217,10 +217,11 @@ mod tests {
             .unwrap();
 
         let mut stdout = Vec::new();
-        let result = ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout).await;
-
         assert!(matches!(
-            result.unwrap_err().downcast_ref::<SchwabError>(),
+            ensure_schwab_authentication(&pool, &ctx.broker, &mut stdout)
+                .await
+                .unwrap_err()
+                .downcast_ref::<SchwabError>(),
             Some(SchwabError::RefreshTokenExpired)
         ));
     }
@@ -228,7 +229,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_auth_rejects_non_schwab_broker() {
         let pool = setup_test_db().await;
-        let broker = BrokerConfig::DryRun;
+        let broker = BrokerCtx::DryRun;
 
         let mut stdout = Vec::new();
 
@@ -245,13 +246,16 @@ mod tests {
     #[tokio::test]
     async fn test_auth_command_rejects_non_schwab_broker() {
         let pool = setup_test_db().await;
-        let broker = BrokerConfig::DryRun;
+        let broker = BrokerCtx::DryRun;
 
         let mut stdout = Vec::new();
-        let result = auth_command(&mut stdout, &broker, &pool).await;
+        let err_msg = auth_command(&mut stdout, &broker, &pool)
+            .await
+            .unwrap_err()
+            .to_string();
 
         assert!(
-            result.unwrap_err().to_string().contains("only supported for Schwab"),
+            err_msg.contains("only supported for Schwab"),
             "Expected Schwab-only error"
         );
     }
