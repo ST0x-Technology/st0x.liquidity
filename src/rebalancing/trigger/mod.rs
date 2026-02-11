@@ -24,7 +24,7 @@ use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
 use crate::lifecycle::{Lifecycle, Never};
-use crate::position::{Position, PositionEvent};
+use crate::position::{Position, PositionAggregate, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
@@ -183,7 +183,7 @@ impl RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for RebalancingTrigger {
+impl Query<PositionAggregate> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,

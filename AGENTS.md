@@ -203,8 +203,8 @@ resolution and feature selection.
 ### Development Tools
 
 - `rainix-rs-static` - Run Rust static analysis
-- `cargo clippy --workspace --all-targets --all-features -- -D clippy::all` -
-  Run Clippy for linting
+- `cargo clippy --workspace --all-targets --all-features` - Run Clippy for
+  linting
 - `cargo fmt` - Format code
 
 ### Nix Development Environment
@@ -221,6 +221,9 @@ resolution and feature selection.
   you want to understand CLI commands or configuration options, read the code.
   If you want to test functionality, write proper tests. There is never a reason
   to run the application speculatively.
+- When handling clippy errors about function lengths or cognitive complexity,
+  don't split up the functions more than necessary to get below the limit.
+  Instead ask the user if we can add a clippy allow for that error.
 
 ### Updating ROADMAP.md
 

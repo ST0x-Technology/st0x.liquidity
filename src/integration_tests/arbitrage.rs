@@ -433,7 +433,6 @@ async fn position_checker_recovers_failed_execution() -> Result<(), Box<dyn std:
 
 /// Tests that two symbols processed through the pipeline don't contaminate each other's
 /// Position state or event streams.
-#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn multi_symbol_isolation() -> Result<(), Box<dyn std::error::Error>> {
     let pool = setup_test_db().await;

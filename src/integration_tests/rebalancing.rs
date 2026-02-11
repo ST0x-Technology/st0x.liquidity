@@ -1,4 +1,4 @@
-use alloy::primitives::{Address, TxHash, address, fixed_bytes};
+use alloy::primitives::{Address, B256, TxHash, address, keccak256};
 use chrono::Utc;
 use cqrs_es::persist::GenericQuery;
 use httpmock::prelude::*;
@@ -25,32 +25,36 @@ use crate::rebalancing::{MintManager, Rebalancer, RebalancingTrigger, Rebalancin
 use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
-use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
+use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
 use st0x_execution::{
     Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
 };
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
-const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
+/// Derives a deterministic token address and vault ID from the symbol, then
+/// seeds the VaultRegistry. Returns the token address for use in assertions.
+async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) -> Address {
+    let hash = keccak256(symbol.to_string().as_bytes());
+    let token = Address::from_slice(&hash[..20]);
+    let vault_id = B256::from(hash);
 
-async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-    let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+    let cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
     let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
 
     cqrs.execute(
         &aggregate_id,
         VaultRegistryCommand::DiscoverEquityVault {
-            token: TEST_TOKEN,
-            vault_id: fixed_bytes!(
-                "0x0000000000000000000000000000000000000000000000000000000000000001"
-            ),
+            token,
+            vault_id,
             discovered_in: TxHash::ZERO,
             symbol: symbol.clone(),
         },
     )
     .await
     .unwrap();
+
+    token
 }
 
 fn test_trigger_config() -> RebalancingTriggerConfig {
@@ -206,73 +210,6 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
     }
 }
 
-/// Asserts the full event sequence for an equity mint pipeline: position events,
-/// vault discovery, and the 4-step mint lifecycle.
-async fn assert_mint_pipeline_events(pool: &SqlitePool, position_agg_id: &str, vault_agg_id: &str) {
-    // Extract the mint aggregate_id (UUID assigned by the rebalancer at runtime).
-    let events = fetch_events(pool).await;
-    let mint_agg_id = events
-        .iter()
-        .find(|e| e.aggregate_type == "TokenizedEquityMint")
-        .expect("Expected at least one TokenizedEquityMint event")
-        .aggregate_id
-        .clone();
-
-    let e = |agg_type, agg_id: &str, event_type| ExpectedEvent::new(agg_type, agg_id, event_type);
-
-    assert_events(
-        pool,
-        &[
-            e(
-                "Position",
-                position_agg_id,
-                "PositionEvent::OnChainOrderFilled",
-            ),
-            e(
-                "Position",
-                position_agg_id,
-                "PositionEvent::OffChainOrderPlaced",
-            ),
-            e(
-                "Position",
-                position_agg_id,
-                "PositionEvent::OffChainOrderFilled",
-            ),
-            e(
-                "VaultRegistry",
-                vault_agg_id,
-                "VaultRegistryEvent::EquityVaultDiscovered",
-            ),
-            e(
-                "Position",
-                position_agg_id,
-                "PositionEvent::OnChainOrderFilled",
-            ),
-            e(
-                "TokenizedEquityMint",
-                &mint_agg_id,
-                "TokenizedEquityMintEvent::MintRequested",
-            ),
-            e(
-                "TokenizedEquityMint",
-                &mint_agg_id,
-                "TokenizedEquityMintEvent::MintAccepted",
-            ),
-            e(
-                "TokenizedEquityMint",
-                &mint_agg_id,
-                "TokenizedEquityMintEvent::TokensReceived",
-            ),
-            e(
-                "TokenizedEquityMint",
-                &mint_agg_id,
-                "TokenizedEquityMintEvent::MintCompleted",
-            ),
-        ],
-    )
-    .await;
-}
-
 /// Verifies the full equity mint rebalancing pipeline: position CQRS commands
 /// flow through the RebalancingTrigger (registered as a Query processor),
 /// update the InventoryView, detect an equity imbalance, and dispatch a Mint
@@ -378,8 +315,67 @@ async fn equity_offchain_imbalance_triggers_mint() {
     mint_mock.assert();
     poll_mock.assert();
 
+    // Extract the mint aggregate_id (UUID assigned by the rebalancer at runtime).
+    let events = fetch_events(&pool).await;
+    let mint_agg_id = events
+        .iter()
+        .find(|e| e.aggregate_type == "TokenizedEquityMint")
+        .expect("Expected at least one TokenizedEquityMint event")
+        .aggregate_id
+        .clone();
     let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
-    assert_mint_pipeline_events(&pool, &aggregate_id, &vault_agg_id).await;
+
+    assert_events(
+        &pool,
+        &[
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OffChainOrderPlaced",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OffChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "VaultRegistry",
+                &vault_agg_id,
+                "VaultRegistryEvent::EquityVaultDiscovered",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::MintRequested",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::MintAccepted",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::TokensReceived",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::MintCompleted",
+            ),
+        ],
+    )
+    .await;
 }
 
 /// Verifies the equity redemption rebalancing pipeline: too much onchain equity
@@ -420,7 +416,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     .await;
 
     // Now seed VaultRegistry so the next Position event triggers a real Redemption.
-    seed_vault_registry(&pool, &symbol).await;
+    let token = seed_vault_registry(&pool, &symbol).await;
 
     let mint = Arc::new(MockMint::new());
     let redeem = Arc::new(MockRedeem::new());
@@ -467,10 +463,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         FractionalShares::new(dec!(30)),
         "Expected excess of 30 shares (target 50 - actual 80 inverted: 80 - 50)"
     );
-    assert_eq!(
-        call.token, TEST_TOKEN,
-        "Token should match VaultRegistry entry"
-    );
+    assert_eq!(call.token, token, "Token should match VaultRegistry entry");
 
     assert_eq!(mint.calls(), 0, "Mint should not have been called");
     assert_eq!(
