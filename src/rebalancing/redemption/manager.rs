@@ -181,15 +181,23 @@ where
 
 #[cfg(test)]
 mod tests {
+    use alloy::network::EthereumWallet;
     use alloy::primitives::address;
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::ext::AnvilApi as _;
+    use alloy::signers::local::PrivateKeySigner;
     use cqrs_es::CqrsFramework;
     use cqrs_es::mem_store::MemStore;
+    use httpmock::prelude::*;
     use rust_decimal_macros::dec;
+    use serde_json::json;
 
     use super::*;
     use crate::alpaca_tokenization::tests::{
         TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil,
+        tokenization_requests_path,
     };
+    use crate::bindings::{IERC20, TestERC20};
 
     type TestCqrs = CqrsFramework<
         Lifecycle<EquityRedemption, Never>,
@@ -253,5 +261,129 @@ mod tests {
 
         // Without mocked token contract, this will fail at send_for_redemption
         assert!(matches!(result, Err(RedemptionError::Alpaca(_))));
+    }
+
+    /// Discovers the deterministic tx_hash that Anvil will produce for a given
+    /// ERC20 transfer by executing the transfer, capturing the hash, then
+    /// reverting to the pre-transfer snapshot.
+    async fn discover_deterministic_tx_hash(
+        provider: &impl Provider,
+        token_address: Address,
+        recipient: Address,
+        amount: U256,
+    ) -> alloy::primitives::TxHash {
+        let snapshot_id = provider.anvil_snapshot().await.unwrap();
+
+        let erc20 = IERC20::new(token_address, provider);
+        let receipt = erc20
+            .transfer(recipient, amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let tx_hash = receipt.transaction_hash;
+
+        provider.anvil_revert(snapshot_id).await.unwrap();
+
+        tx_hash
+    }
+
+    #[tokio::test]
+    async fn execute_redemption_happy_path() {
+        let server = httpmock::MockServer::start();
+        let (_anvil, endpoint, key) = setup_anvil();
+
+        let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+        let wallet = EthereumWallet::from(signer.clone());
+        let provider = ProviderBuilder::new()
+            .wallet(wallet)
+            .connect(&endpoint)
+            .await
+            .unwrap();
+
+        // Deploy TestERC20 and mint tokens for the redemption transfer
+        let token = TestERC20::deploy(&provider).await.unwrap();
+        let token_address = *token.address();
+        let transfer_amount = U256::from(30_000_000_000_000_000_000_u128); // 30 * 10^18
+
+        token
+            .mint(signer.address(), transfer_amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        // Anvil is deterministic: same sender + nonce + calldata = same tx_hash.
+        // Execute the transfer once to capture the hash, then revert so the
+        // real manager can execute the same transfer and get the same hash.
+        let expected_tx_hash = discover_deterministic_tx_hash(
+            &provider,
+            token_address,
+            TEST_REDEMPTION_WALLET,
+            transfer_amount,
+        )
+        .await;
+
+        let detection_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path(tokenization_requests_path())
+                .query_param("type", "redeem");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "tokenization_request_id": "redeem_happy_path",
+                    "type": "redeem",
+                    "status": "pending",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "30.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "tx_hash": expected_tx_hash,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
+        });
+
+        let completion_mock = server.mock(|when, then| {
+            when.method(GET).path(tokenization_requests_path());
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!([{
+                    "tokenization_request_id": "redeem_happy_path",
+                    "type": "redeem",
+                    "status": "completed",
+                    "underlying_symbol": "AAPL",
+                    "token_symbol": "tAAPL",
+                    "qty": "30.0",
+                    "issuer": "st0x",
+                    "network": "base",
+                    "tx_hash": expected_tx_hash,
+                    "created_at": "2024-01-15T10:30:00Z"
+                }]));
+        });
+
+        let service = Arc::new(
+            create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+        );
+        let cqrs = create_test_cqrs();
+        let manager = RedemptionManager::new(service, cqrs);
+
+        manager
+            .execute_redemption_impl(
+                &RedemptionAggregateId::new("redemption-happy"),
+                Symbol::new("AAPL").unwrap(),
+                FractionalShares::new(dec!(30)),
+                token_address,
+                transfer_amount,
+            )
+            .await
+            .unwrap();
+
+        detection_mock.assert();
+        completion_mock.assert();
     }
 }

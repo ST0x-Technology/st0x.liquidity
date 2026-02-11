@@ -1,4 +1,8 @@
-use alloy::primitives::{Address, B256, TxHash, address, keccak256};
+use alloy::network::EthereumWallet;
+use alloy::primitives::{Address, B256, TxHash, U256, address, keccak256};
+use alloy::providers::ProviderBuilder;
+use alloy::providers::ext::AnvilApi as _;
+use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
 use cqrs_es::persist::GenericQuery;
 use httpmock::prelude::*;
@@ -14,6 +18,8 @@ use crate::alpaca_tokenization::tests::{
     TEST_REDEMPTION_WALLET, create_test_service_from_mock, setup_anvil, tokenization_mint_path,
     tokenization_requests_path,
 };
+use crate::bindings::{IERC20, TestERC20};
+use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{ImbalanceThreshold, InventoryView};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::offchain_order::{OffchainOrder, PriceCents};
@@ -21,7 +27,9 @@ use crate::position::{Position, PositionAggregate, PositionCommand};
 use crate::rebalancing::mint::mock::MockMint;
 use crate::rebalancing::redemption::mock::MockRedeem;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
-use crate::rebalancing::{MintManager, Rebalancer, RebalancingTrigger, RebalancingTriggerConfig};
+use crate::rebalancing::{
+    MintManager, Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, RedemptionManager,
+};
 use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -32,12 +40,10 @@ use st0x_execution::{
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
-/// Derives a deterministic token address and vault ID from the symbol, then
-/// seeds the VaultRegistry. Returns the token address for use in assertions.
-async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) -> Address {
-    let hash = keccak256(symbol.to_string().as_bytes());
-    let token = Address::from_slice(&hash[..20]);
-    let vault_id = B256::from(hash);
+/// Seeds the VaultRegistry with the given token address and a deterministic
+/// vault ID derived from the symbol.
+async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol, token: Address) {
+    let vault_id = B256::from(keccak256(symbol.to_string().as_bytes()));
 
     let cqrs = sqlite_cqrs::<VaultRegistryAggregate>(pool.clone(), vec![], ());
     let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
@@ -53,8 +59,33 @@ async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) -> Address {
     )
     .await
     .unwrap();
+}
 
-    token
+/// Uses Anvil snapshot/revert to discover the deterministic tx_hash that will
+/// be produced by an ERC20 transfer. Anvil is deterministic: same sender +
+/// nonce + calldata = same tx_hash.
+async fn discover_deterministic_tx_hash(
+    provider: &impl alloy::providers::Provider,
+    token: Address,
+    recipient: Address,
+    amount: U256,
+) -> TxHash {
+    let snapshot_id = provider.anvil_snapshot().await.unwrap();
+
+    let erc20 = IERC20::new(token, provider);
+    let receipt = erc20
+        .transfer(recipient, amount)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+    let tx_hash = receipt.transaction_hash;
+
+    provider.anvil_revert(snapshot_id).await.unwrap();
+
+    tx_hash
 }
 
 fn test_trigger_config() -> RebalancingTriggerConfig {
@@ -248,7 +279,8 @@ async fn equity_offchain_imbalance_triggers_mint() {
     .await;
 
     // Now seed VaultRegistry so the next Position event triggers a real Mint.
-    seed_vault_registry(&pool, &symbol).await;
+    let token = Address::from_slice(&keccak256(symbol.to_string().as_bytes())[..20]);
+    seed_vault_registry(&pool, &symbol, token).await;
 
     let server = MockServer::start();
     let (_anvil, endpoint, key) = setup_anvil();
@@ -264,7 +296,9 @@ async fn equity_offchain_imbalance_triggers_mint() {
     let mint_mgr = MintManager::new(service, mint_cqrs);
 
     let mint_mock = server.mock(|when, then| {
-        when.method(POST).path(tokenization_mint_path());
+        when.method(POST)
+            .path(tokenization_mint_path())
+            .json_body_partial(r#"{"underlying_symbol":"AAPL","qty":"30.5","wallet_address":"0x0000000000000000000000000000000000000000"}"#);
         then.status(200)
             .header("content-type", "application/json")
             .json_body(sample_pending_response("mint_int_test"));
@@ -378,16 +412,106 @@ async fn equity_offchain_imbalance_triggers_mint() {
     .await;
 }
 
-/// Verifies the equity redemption rebalancing pipeline: too much onchain equity
-/// triggers a Redemption operation dispatched to MockRedeem. 79 onchain + 20
-/// offchain is built without VaultRegistry, then after seeding, a Buy of 1 more
-/// share (total 80 onchain / 20 offchain = 80% ratio > 70% upper) triggers the
-/// Redemption with excess = 80 - 50 = 30 shares.
+/// Verifies the full equity redemption rebalancing pipeline: position CQRS
+/// commands flow through the RebalancingTrigger, detect too much onchain equity,
+/// and dispatch a Redemption operation through the Rebalancer to the real
+/// RedemptionManager. The manager sends tokens on Anvil, then drives the
+/// EquityRedemption aggregate through TokensSent -> Detected -> Completed via
+/// the mocked Alpaca tokenization API.
+///
+/// Uses Anvil snapshot/revert to discover the deterministic tx_hash before
+/// setting up httpmock responses, so the mock detection endpoint can match
+/// the exact hash produced by the real onchain transfer.
 #[tokio::test]
 async fn equity_onchain_imbalance_triggers_redemption() {
     let pool = setup_test_db().await;
     let symbol = Symbol::new("AAPL").unwrap();
     let aggregate_id = Position::aggregate_id(&symbol);
+    let server = MockServer::start();
+    let (_anvil, endpoint, key) = setup_anvil();
+
+    // Deploy TestERC20 and mint exactly 30 * 10^18 tokens (the redemption amount:
+    // 80 onchain - 50 target = 30 shares excess).
+    let signer = PrivateKeySigner::from_bytes(&key).unwrap();
+    let wallet = EthereumWallet::from(signer.clone());
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect(&endpoint)
+        .await
+        .unwrap();
+
+    let token_contract = TestERC20::deploy(&provider).await.unwrap();
+    let token_address = *token_contract.address();
+    let transfer_amount = U256::from(30_000_000_000_000_000_000_u128);
+
+    token_contract
+        .mint(signer.address(), transfer_amount)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+    // Anvil is deterministic: same sender + nonce + calldata = same tx_hash.
+    // Execute the transfer once to capture the hash, then revert so the real
+    // RedemptionManager can execute the same transfer and get the same hash.
+    let expected_tx_hash = discover_deterministic_tx_hash(
+        &provider,
+        token_address,
+        TEST_REDEMPTION_WALLET,
+        transfer_amount,
+    )
+    .await;
+
+    let detection_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path(tokenization_requests_path())
+            .query_param("type", "redeem");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([{
+                "tokenization_request_id": "redeem_int_test",
+                "type": "redeem",
+                "status": "pending",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "30.0",
+                "issuer": "st0x",
+                "network": "base",
+                "tx_hash": expected_tx_hash,
+                "created_at": "2024-01-15T10:30:00Z"
+            }]));
+    });
+
+    let completion_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([{
+                "tokenization_request_id": "redeem_int_test",
+                "type": "redeem",
+                "status": "completed",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "30.0",
+                "issuer": "st0x",
+                "network": "base",
+                "tx_hash": expected_tx_hash,
+                "created_at": "2024-01-15T10:30:00Z"
+            }]));
+    });
+
+    let service = Arc::new(
+        create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+    );
+
+    let redemption_cqrs = Arc::new(sqlite_cqrs::<Lifecycle<EquityRedemption, Never>>(
+        pool.clone(),
+        vec![],
+        (),
+    ));
+    let redeem_mgr = RedemptionManager::new(service, redemption_cqrs);
 
     let inventory = Arc::new(RwLock::new(
         InventoryView::default().with_equity(symbol.clone()),
@@ -415,16 +539,16 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     })
     .await;
 
-    // Now seed VaultRegistry so the next Position event triggers a real Redemption.
-    let token = seed_vault_registry(&pool, &symbol).await;
+    // Seed VaultRegistry with the deployed TestERC20 address so the trigger
+    // passes the real token address to the RedemptionManager.
+    seed_vault_registry(&pool, &symbol, token_address).await;
 
     let mint = Arc::new(MockMint::new());
-    let redeem = Arc::new(MockRedeem::new());
     let usdc = Arc::new(MockUsdcRebalance::new());
 
     let rebalancer = Rebalancer::new(
         Arc::clone(&mint),
-        Arc::clone(&redeem),
+        Arc::new(redeem_mgr),
         Arc::clone(&usdc),
         receiver,
         Address::ZERO,
@@ -454,16 +578,65 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 
     rebalancer.run().await;
 
-    assert_eq!(redeem.calls(), 1, "Expected MockRedeem to be called once");
+    detection_mock.assert();
+    completion_mock.assert();
 
-    let call = redeem.last_call().expect("Expected a captured redeem call");
-    assert_eq!(call.symbol, symbol);
-    assert_eq!(
-        call.quantity,
-        FractionalShares::new(dec!(30)),
-        "Expected excess of 30 shares (target 50 - actual 80 inverted: 80 - 50)"
-    );
-    assert_eq!(call.token, token, "Token should match VaultRegistry entry");
+    // Extract the redemption aggregate_id (UUID assigned by the rebalancer).
+    let events = fetch_events(&pool).await;
+    let redemption_agg_id = events
+        .iter()
+        .find(|e| e.aggregate_type == "EquityRedemption")
+        .expect("Expected at least one EquityRedemption event")
+        .aggregate_id
+        .clone();
+    let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+
+    assert_events(
+        &pool,
+        &[
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OffChainOrderPlaced",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OffChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "VaultRegistry",
+                &vault_agg_id,
+                "VaultRegistryEvent::EquityVaultDiscovered",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::TokensSent",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::Detected",
+            ),
+            ExpectedEvent::new(
+                "EquityRedemption",
+                &redemption_agg_id,
+                "EquityRedemptionEvent::Completed",
+            ),
+        ],
+    )
+    .await;
 
     assert_eq!(mint.calls(), 0, "Mint should not have been called");
     assert_eq!(
