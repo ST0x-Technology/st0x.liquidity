@@ -105,10 +105,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Token Address: {token}")?;
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
-            let redemption_store =
-                Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
-            let redemption_manager =
-                RedemptionManager::new(tokenization_service, redemption_store);
+            let redemption_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
+            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_store);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));

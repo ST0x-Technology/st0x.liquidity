@@ -222,9 +222,7 @@ impl Conductor {
             backfill_events(pool, &provider, &ctx.evm, end_block).await?;
         }
 
-        let onchain_trade = Arc::new(
-            CqrsBuilder::<OnChainTrade>::new(pool.clone()).build(()),
-        );
+        let onchain_trade = Arc::new(CqrsBuilder::<OnChainTrade>::new(pool.clone()).build(()));
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
@@ -254,11 +252,9 @@ impl Conductor {
         };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-        let offchain_order = Arc::new(
-            CqrsBuilder::<OffchainOrder>::new(pool.clone()).build(order_placer),
-        );
-        let vault_registry =
-            CqrsBuilder::<VaultRegistry>::new(pool.clone()).build(());
+        let offchain_order =
+            Arc::new(CqrsBuilder::<OffchainOrder>::new(pool.clone()).build(order_placer));
+        let vault_registry = CqrsBuilder::<VaultRegistry>::new(pool.clone()).build(());
 
         let snapshot = build_inventory_snapshot_store(pool, inventory.clone());
 
@@ -352,7 +348,11 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
     market_maker_wallet: Address,
-) -> anyhow::Result<(Arc<Store<Position>>, Arc<SqliteQuery<Position>>, JoinHandle<()>)> {
+) -> anyhow::Result<(
+    Arc<Store<Position>>,
+    Arc<SqliteQuery<Position>>,
+    JoinHandle<()>,
+)> {
     info!("Initializing rebalancing infrastructure");
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
@@ -412,22 +412,15 @@ fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) 
 
 /// Constructs the position CQRS framework with its view query
 /// (without rebalancing trigger). Used when rebalancing is disabled.
-fn build_position_cqrs(
-    pool: &SqlitePool,
-) -> (Arc<Store<Position>>, Arc<SqliteQuery<Position>>) {
+fn build_position_cqrs(pool: &SqlitePool) -> (Arc<Store<Position>>, Arc<SqliteQuery<Position>>) {
     let position_view_repo = Arc::new(sqlite_es::SqliteViewRepository::new(
         pool.clone(),
         "position_view".to_string(),
     ));
-    let position_query =
-        cqrs_es::persist::GenericQuery::new(position_view_repo.clone());
+    let position_query = cqrs_es::persist::GenericQuery::new(position_view_repo.clone());
 
-    let view: wire::UnwiredQuery<
-        SqliteQuery<Position>,
-        wire::Cons<Position, wire::Nil>,
-    > = wire::UnwiredQuery::new(
-        cqrs_es::persist::GenericQuery::new(position_view_repo),
-    );
+    let view: wire::UnwiredQuery<SqliteQuery<Position>, wire::Cons<Position, wire::Nil>> =
+        wire::UnwiredQuery::new(cqrs_es::persist::GenericQuery::new(position_view_repo));
 
     let (store, (view, ())) = CqrsBuilder::<Position>::new(pool.clone())
         .wire(view)
@@ -450,10 +443,9 @@ fn build_inventory_snapshot_store(
         wire::Cons<InventorySnapshot, wire::Nil>,
     > = wire::UnwiredQuery::new(snapshot_query);
 
-    let (store, (_query, ())) =
-        CqrsBuilder::<InventorySnapshot>::new(pool.clone())
-            .wire(query)
-            .build(());
+    let (store, (_query, ())) = CqrsBuilder::<InventorySnapshot>::new(pool.clone())
+        .wire(query)
+        .build(());
 
     store
 }
@@ -471,13 +463,8 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_ctx.polling_interval, poller_ctx.max_jitter
     );
 
-    let poller = OrderStatusPoller::new(
-        poller_ctx,
-        pool.clone(),
-        executor,
-        offchain_order,
-        position,
-    );
+    let poller =
+        OrderStatusPoller::new(poller_ctx, pool.clone(), executor, offchain_order, position);
     tokio::spawn(async move {
         if let Err(error) = poller.run().await {
             error!("Order poller failed: {error}");
@@ -529,7 +516,7 @@ fn spawn_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     cqrs: TradeProcessingCqrs,
-    vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: Store<VaultRegistry>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -549,7 +536,7 @@ where
             &cache_clone,
             provider,
             &cqrs,
-            &vault_registry_cqrs,
+            &vault_registry,
         )
         .await;
     })
@@ -558,9 +545,9 @@ where
 fn spawn_periodic_accumulated_position_check<E>(
     executor: E,
     pool: SqlitePool,
-    position_cqrs: Arc<PositionCqrs>,
-    position_query: Arc<PositionQuery>,
-    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    position: Arc<Store<Position>>,
+    position_query: Arc<SqliteQuery<Position>>,
+    offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
 ) -> JoinHandle<()>
 where
@@ -578,17 +565,17 @@ where
         loop {
             interval.tick().await;
             debug!("Running periodic accumulated position check");
-            if let Err(e) = check_and_execute_accumulated_positions(
+            if let Err(error) = check_and_execute_accumulated_positions(
                 &executor,
                 &pool,
-                &position_cqrs,
+                &position,
                 &position_query,
-                &offchain_order_cqrs,
+                &offchain_order,
                 &execution_threshold,
             )
             .await
             {
-                error!("Periodic accumulated position check failed: {e}");
+                error!("Periodic accumulated position check failed: {error}");
             }
         }
     })
@@ -600,7 +587,7 @@ fn spawn_inventory_poller<P, E>(
     executor: E,
     orderbook: Address,
     order_owner: Address,
-    snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+    snapshot: Store<InventorySnapshot>,
 ) -> JoinHandle<()>
 where
     P: Provider + Clone + Send + 'static,
@@ -614,7 +601,7 @@ where
         pool,
         orderbook,
         order_owner,
-        snapshot_cqrs,
+        snapshot,
     );
 
     tokio::spawn(async move {
@@ -667,7 +654,7 @@ async fn receive_blockchain_events<S1, S2>(
                     break;
                 }
             }
-            Err(e) => error!("Error in event stream: {e}"),
+            Err(error) => error!("Error in event stream: {error}"),
         }
     }
 }
@@ -746,7 +733,7 @@ async fn run_queue_processor<P, E>(
     cache: &SymbolCache,
     provider: P,
     cqrs: &TradeProcessingCqrs,
-    vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: &Store<VaultRegistry>,
 ) where
     P: Provider + Clone,
     E: Executor + Clone,
@@ -761,7 +748,7 @@ async fn run_queue_processor<P, E>(
             info!("Found {count} unprocessed events from previous sessions to process");
         }
         Ok(_) => info!("No unprocessed events found, starting fresh"),
-        Err(e) => error!("Failed to count unprocessed events: {e}"),
+        Err(error) => error!("Failed to count unprocessed events: {error}"),
     }
 
     let executor_type = executor.to_supported_executor();
@@ -769,7 +756,7 @@ async fn run_queue_processor<P, E>(
     let queue_context = QueueProcessingCtx {
         cache,
         feed_id_cache: &feed_id_cache,
-        vault_registry_cqrs,
+        vault_registry,
     };
 
     loop {
@@ -782,8 +769,8 @@ async fn run_queue_processor<P, E>(
             Ok(None) => {
                 sleep(Duration::from_millis(100)).await;
             }
-            Err(e) => {
-                error!("Error processing queued event: {e}");
+            Err(error) => {
+                error!("Error processing queued event: {error}");
                 sleep(Duration::from_millis(500)).await;
             }
         }
@@ -794,7 +781,7 @@ async fn run_queue_processor<P, E>(
 struct QueueProcessingCtx<'a> {
     cache: &'a SymbolCache,
     feed_id_cache: &'a FeedIdCache,
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: &'a Store<VaultRegistry>,
 }
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
@@ -839,7 +826,7 @@ async fn process_next_queued_event<P: Provider + Clone>(
     };
 
     let vault_discovery_ctx = VaultDiscoveryCtx {
-        vault_registry_cqrs: queue_context.vault_registry_cqrs,
+        vault_registry: queue_context.vault_registry,
         orderbook: ctx.evm.orderbook,
         order_owner: ctx.order_owner()?,
     };
@@ -887,7 +874,10 @@ async fn discover_vaults_for_trade(
         .into_iter()
         .filter(|vault| vault.owner == context.order_owner);
 
-    let aggregate_id = VaultRegistry::aggregate_id(context.orderbook, context.order_owner);
+    let vault_registry_id = VaultRegistryId {
+        orderbook: context.orderbook,
+        owner: context.order_owner,
+    };
 
     for owned_vault in our_vaults {
         let vault = owned_vault.vault;
@@ -916,8 +906,8 @@ async fn discover_vaults_for_trade(
         };
 
         context
-            .vault_registry_cqrs
-            .execute(&aggregate_id, command)
+            .vault_registry
+            .send(&vault_registry_id, command)
             .await?;
     }
 
@@ -1006,11 +996,14 @@ async fn process_valid_trade(
 }
 
 async fn execute_witness_trade(
-    onchain_trade_cqrs: &OnChainTradeCqrs,
+    onchain_trade: &Store<OnChainTrade>,
     trade: &OnchainTrade,
     block_number: u64,
 ) {
-    let aggregate_id = OnChainTrade::aggregate_id(trade.tx_hash, trade.log_index);
+    let trade_id = OnChainTradeId {
+        tx_hash: trade.tx_hash,
+        log_index: trade.log_index,
+    };
 
     let amount = trade.amount.inner();
     let price_usdc = trade.price.value();
@@ -1032,25 +1025,24 @@ async fn execute_witness_trade(
         block_timestamp,
     };
 
-    match onchain_trade_cqrs.execute(&aggregate_id, command).await {
+    match onchain_trade.send(&trade_id, command).await {
         Ok(()) => info!(
             "Successfully executed OnChainTrade::Witness command: tx_hash={:?}, log_index={}",
             trade.tx_hash, trade.log_index
         ),
-        Err(e) => error!(
-            "Failed to execute OnChainTrade::Witness command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+        Err(error) => error!(
+            "Failed to execute OnChainTrade::Witness command: {error}, tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
     }
 }
 
 async fn execute_acknowledge_fill(
-    position_cqrs: &PositionCqrs,
+    position: &Store<Position>,
     trade: &OnchainTrade,
     threshold: ExecutionThreshold,
 ) {
     let base_symbol = trade.symbol.base();
-    let aggregate_id = Position::aggregate_id(base_symbol);
 
     let amount = trade.amount.inner();
     let price_usdc = trade.price.value();
@@ -1076,7 +1068,7 @@ async fn execute_acknowledge_fill(
         block_timestamp,
     };
 
-    match position_cqrs.execute(&aggregate_id, command).await {
+    match position.send(base_symbol, command).await {
         Ok(()) => info!(
             "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
@@ -1097,7 +1089,7 @@ async fn process_queued_trade(
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
-    execute_acknowledge_fill(&cqrs.position_cqrs, &trade, cqrs.execution_threshold).await;
+    execute_acknowledge_fill(&cqrs.position, &trade, cqrs.execution_threshold).await;
 
     mark_event_processed(pool, event_id).await.map_err(|e| {
         error!("Failed to mark event {event_id} as processed: {e}");
@@ -1109,7 +1101,7 @@ async fn process_queued_trade(
         event_id, queued_event.tx_hash, queued_event.log_index
     );
 
-    execute_witness_trade(&cqrs.onchain_trade_cqrs, &trade, queued_event.block_number).await;
+    execute_witness_trade(&cqrs.onchain_trade, &trade, queued_event.block_number).await;
 
     let base_symbol = trade.symbol.base();
 
@@ -1120,7 +1112,6 @@ async fn process_queued_trade(
     };
 
     let offchain_order_id = OffchainOrderId::new();
-    let position_agg_id = Position::aggregate_id(&params.symbol);
 
     let command = PositionCommand::PlaceOffChainOrder {
         offchain_order_id,
@@ -1130,7 +1121,7 @@ async fn process_queued_trade(
         threshold: cqrs.execution_threshold,
     };
 
-    match cqrs.position_cqrs.execute(&position_agg_id, command).await {
+    match cqrs.position.send(&params.symbol, command).await {
         Ok(()) => info!(
             %offchain_order_id,
             symbol = %params.symbol,
@@ -1143,8 +1134,6 @@ async fn process_queued_trade(
         ),
     }
 
-    let offchain_agg_id = OffchainOrder::aggregate_id(offchain_order_id);
-
     let command = OffchainOrderCommand::Place {
         symbol: params.symbol.clone(),
         shares: params.shares,
@@ -1152,11 +1141,7 @@ async fn process_queued_trade(
         executor: params.executor,
     };
 
-    match cqrs
-        .offchain_order_cqrs
-        .execute(&offchain_agg_id, command)
-        .await
-    {
+    match cqrs.offchain_order.send(&offchain_order_id, command).await {
         Ok(()) => info!(
             %offchain_order_id,
             symbol = %params.symbol,
@@ -1204,9 +1189,9 @@ fn reconstruct_log_from_queued_event(
 async fn check_and_execute_accumulated_positions<E>(
     executor: &E,
     pool: &SqlitePool,
-    position_cqrs: &PositionCqrs,
-    position_query: &PositionQuery,
-    offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
+    position: &Store<Position>,
+    position_query: &SqliteQuery<Position>,
+    offchain_order: &Arc<Store<OffchainOrder>>,
     threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>
 where
@@ -1237,8 +1222,6 @@ where
             "Executing accumulated position"
         );
 
-        let position_agg_id = Position::aggregate_id(&params.symbol);
-
         let command = PositionCommand::PlaceOffChainOrder {
             offchain_order_id,
             shares: params.shares,
@@ -1247,7 +1230,7 @@ where
             threshold: *threshold,
         };
 
-        match position_cqrs.execute(&position_agg_id, command).await {
+        match position.send(&params.symbol, command).await {
             Ok(()) => info!(
                 %offchain_order_id,
                 symbol = %params.symbol,
@@ -1260,8 +1243,6 @@ where
             ),
         }
 
-        let offchain_agg_id = OffchainOrder::aggregate_id(offchain_order_id);
-
         let command = OffchainOrderCommand::Place {
             symbol: params.symbol.clone(),
             shares: params.shares,
@@ -1269,7 +1250,7 @@ where
             executor: params.executor,
         };
 
-        match offchain_order_cqrs.execute(&offchain_agg_id, command).await {
+        match offchain_order.send(&offchain_order_id, command).await {
             Ok(()) => info!(
                 %offchain_order_id,
                 symbol = %params.symbol,
@@ -1343,14 +1324,14 @@ async fn buffer_live_events<S1, S2>(
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
                     event_buffer.push((TradeEvent::ClearV3(Box::new(event)), log));
                 }
-                Err(e) => error!("Error in clear event stream during backfill: {e}"),
+                Err(error) => error!("Error in clear event stream during backfill: {error}"),
                 _ => {}
             },
             Some(result) = take_stream.next() => match result {
                 Ok((event, log)) if log.block_number.unwrap_or(0) >= cutoff_block => {
                     event_buffer.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
                 }
-                Err(e) => error!("Error in take event stream during backfill: {e}"),
+                Err(error) => error!("Error in take event stream during backfill: {error}"),
                 _ => {}
             },
             else => break,
@@ -1383,7 +1364,8 @@ mod tests {
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::ImbalanceThreshold;
-    use crate::offchain_order::{OffchainOrderId, PriceCents};
+    use crate::lifecycle::Lifecycle;
+    use crate::offchain_order::{OffchainOrderId, PriceCents, build_offchain_order_cqrs};
     use crate::onchain::trade::OnchainTrade;
     use crate::position::PositionEvent;
     use crate::rebalancing::{RebalancingTrigger, TriggeredOperation};
@@ -1392,10 +1374,10 @@ mod tests {
 
     fn trade_processing_cqrs(frameworks: &CqrsFrameworks) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
-            onchain_trade_cqrs: frameworks.onchain_trade_cqrs.clone(),
-            position_cqrs: frameworks.position_cqrs.clone(),
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
             position_query: frameworks.position_query.clone(),
-            offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
         }
     }
@@ -1461,7 +1443,7 @@ mod tests {
         let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
-            vault_registry_cqrs: &frameworks.vault_registry_cqrs,
+            vault_registry: &frameworks.vault_registry,
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1517,7 +1499,7 @@ mod tests {
         let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
-            vault_registry_cqrs: &frameworks.vault_registry_cqrs,
+            vault_registry: &frameworks.vault_registry,
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -1571,7 +1553,7 @@ mod tests {
         let queue_context = QueueProcessingCtx {
             cache: &cache,
             feed_id_cache: &feed_id_cache,
-            vault_registry_cqrs: &frameworks.vault_registry_cqrs,
+            vault_registry: &frameworks.vault_registry,
         };
 
         let cqrs = trade_processing_cqrs(&frameworks);
@@ -2352,10 +2334,10 @@ mod tests {
     }
 
     fn create_vault_discovery_context(
-        vault_registry_cqrs: &SqliteCqrs<VaultRegistryAggregate>,
+        vault_registry: &Store<VaultRegistry>,
     ) -> VaultDiscoveryCtx<'_> {
         VaultDiscoveryCtx {
-            vault_registry_cqrs,
+            vault_registry,
             orderbook: TEST_ORDERBOOK,
             order_owner: ORDER_OWNER,
         }
@@ -2364,15 +2346,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_usdc_vault() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -2390,15 +2371,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_discovers_equity_vault() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -2416,14 +2396,13 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_from_take_event() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
 
         let order = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let queued_event = create_queued_take_event(order);
         let trade = create_test_trade("MSFT");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed when cache is populated");
@@ -2447,15 +2426,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_filters_non_owner_vaults() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed even when no vaults match");
@@ -2471,21 +2449,23 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_correct_aggregate_id() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("AAPL");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed");
 
-        let expected_aggregate_id =
-            crate::vault_registry::VaultRegistry::aggregate_id(TEST_ORDERBOOK, ORDER_OWNER);
+        let expected_aggregate_id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: ORDER_OWNER,
+        }
+        .to_string();
 
         let aggregate_ids: Vec<String> = sqlx::query_scalar!(
             "SELECT DISTINCT aggregate_id FROM events WHERE aggregate_type = 'VaultRegistry'"
@@ -2504,15 +2484,14 @@ mod tests {
     #[tokio::test]
     async fn test_discover_vaults_for_trade_uses_trade_symbol_for_equity() {
         let pool = setup_test_db().await;
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
 
         let alice = create_order_with_usdc_and_equity_vaults(ORDER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let queued_event = create_queued_clear_event(alice, bob);
         let trade = create_test_trade("GOOG");
 
-        let context = create_vault_discovery_context(&vault_registry_cqrs);
+        let context = create_vault_discovery_context(&vault_registry);
         discover_vaults_for_trade(&queued_event, &trade, &context)
             .await
             .expect("Should succeed");
@@ -2556,30 +2535,30 @@ mod tests {
         pool: &SqlitePool,
         order_placer: Arc<dyn OrderPlacer>,
     ) -> CqrsFrameworks {
-        let onchain_trade_cqrs = Arc::new(wire::test_cqrs(pool.clone(), vec![], ()));
+        let onchain_trade = Arc::new(wire::test_cqrs(pool.clone(), vec![], ()));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
+            Lifecycle<Position>,
+            Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
         let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position_cqrs = Arc::new(wire::test_cqrs(
+        let position = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(position_view_repo))],
             (),
         ));
 
-        let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
-        let vault_registry_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
-        let snapshot_cqrs = wire::test_cqrs(pool.clone(), vec![], ());
+        let offchain_order = Arc::new(wire::test_cqrs(pool.clone(), vec![], order_placer));
+        let vault_registry = wire::test_cqrs(pool.clone(), vec![], ());
+        let snapshot = wire::test_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
-            onchain_trade_cqrs,
-            position_cqrs,
+            onchain_trade,
+            position,
             position_query,
-            offchain_order_cqrs,
-            vault_registry_cqrs,
-            snapshot_cqrs,
+            offchain_order,
+            vault_registry,
+            snapshot,
         }
     }
 
@@ -2588,10 +2567,10 @@ mod tests {
         threshold: ExecutionThreshold,
     ) -> TradeProcessingCqrs {
         TradeProcessingCqrs {
-            onchain_trade_cqrs: frameworks.onchain_trade_cqrs.clone(),
-            position_cqrs: frameworks.position_cqrs.clone(),
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
             position_query: frameworks.position_query.clone(),
-            offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
             execution_threshold: threshold,
         }
     }
@@ -2719,7 +2698,7 @@ mod tests {
         let (_, offchain_order_query) = build_offchain_order_cqrs(&pool, succeeding_order_placer());
 
         let offchain_lifecycle = offchain_order_query
-            .load(&OffchainOrder::aggregate_id(offchain_order_id))
+            .load(&offchain_order_id.to_string())
             .await
             .expect("offchain order view should exist");
 
@@ -2885,12 +2864,11 @@ mod tests {
         .unwrap();
 
         // Complete the first order via CQRS
-        let position_agg_id =
-            crate::position::Position::aggregate_id(&Symbol::new("AAPL").unwrap());
+        let symbol = Symbol::new("AAPL").unwrap();
 
-        cqrs.position_cqrs
-            .execute(
-                &position_agg_id,
+        cqrs.position
+            .send(
+                &symbol,
                 PositionCommand::CompleteOffChainOrder {
                     offchain_order_id: first_order_id,
                     shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
@@ -2921,9 +2899,9 @@ mod tests {
         check_and_execute_accumulated_positions(
             &executor,
             &pool,
-            &cqrs.position_cqrs,
+            &cqrs.position,
             &cqrs.position_query,
-            &cqrs.offchain_order_cqrs,
+            &cqrs.offchain_order,
             &cqrs.execution_threshold,
         )
         .await
@@ -3089,11 +3067,13 @@ mod tests {
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // Seed vault registry so the trigger can resolve the token address.
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
-        vault_registry_cqrs
-            .execute(
-                &VaultRegistry::aggregate_id(orderbook, order_owner),
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        vault_registry
+            .send(
+                &VaultRegistryId {
+                    orderbook,
+                    owner: order_owner,
+                },
                 VaultRegistryCommand::DiscoverEquityVault {
                     token: test_token,
                     vault_id: fixed_bytes!(
@@ -3128,25 +3108,23 @@ mod tests {
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
+            Lifecycle<Position>,
+            Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_cqrs = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
-                    as Box<dyn Query<PositionAggregate>>,
-                Box::new(trigger.clone()) as Box<dyn Query<PositionAggregate>>,
+                    as Box<dyn Query<Lifecycle<Position>>>,
+                Box::new(trigger.clone()) as Box<dyn Query<Lifecycle<Position>>>,
             ],
             (),
         ));
 
-        let position_agg_id = Position::aggregate_id(&symbol);
-
         // Acknowledge a fill -> fires position events -> trigger should react.
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
@@ -3215,25 +3193,23 @@ mod tests {
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
+            Lifecycle<Position>,
+            Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_cqrs = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
-                    as Box<dyn Query<PositionAggregate>>,
-                Box::new(trigger.clone()) as Box<dyn Query<PositionAggregate>>,
+                    as Box<dyn Query<Lifecycle<Position>>>,
+                Box::new(trigger.clone()) as Box<dyn Query<Lifecycle<Position>>>,
             ],
             (),
         ));
 
-        let position_agg_id = Position::aggregate_id(&symbol);
-
         // Add 50 onchain shares via CQRS -> trigger applies to inventory.
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
@@ -3323,25 +3299,23 @@ mod tests {
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
+            Lifecycle<Position>,
+            Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_cqrs = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
-                    as Box<dyn Query<PositionAggregate>>,
-                Box::new(trigger.clone()) as Box<dyn Query<PositionAggregate>>,
+                    as Box<dyn Query<Lifecycle<Position>>>,
+                Box::new(trigger.clone()) as Box<dyn Query<Lifecycle<Position>>>,
             ],
             (),
         ));
 
-        let position_agg_id = Position::aggregate_id(&symbol);
-
         // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
@@ -3369,9 +3343,9 @@ mod tests {
 
     /// Sets up an initialized position with 65% onchain / 35% offchain inventory
     /// (within the 30%-70% threshold bounds), a seeded vault registry, and the
-    /// trigger wired into `position_cqrs` via `build_position_cqrs`.
+    /// trigger wired into the position store via `build_position_cqrs`.
     async fn setup_near_upper_threshold_position() -> (
-        Arc<PositionCqrs>,
+        Arc<Store<Position>>,
         mpsc::Receiver<TriggeredOperation>,
         Symbol,
     ) {
@@ -3382,11 +3356,13 @@ mod tests {
         let order_owner = address!("0x0000000000000000000000000000000000000002");
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
-        let vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate> =
-            wire::test_cqrs(pool.clone(), vec![], ());
-        vault_registry_cqrs
-            .execute(
-                &VaultRegistry::aggregate_id(orderbook, order_owner),
+        let vault_registry: Store<VaultRegistry> = wire::test_cqrs(pool.clone(), vec![], ());
+        vault_registry
+            .send(
+                &VaultRegistryId {
+                    orderbook,
+                    owner: order_owner,
+                },
                 VaultRegistryCommand::DiscoverEquityVault {
                     token: test_token,
                     vault_id: fixed_bytes!(
@@ -3452,25 +3428,25 @@ mod tests {
         ));
 
         let position_view_repo = Arc::new(SqliteViewRepository::<
-            PositionAggregate,
-            PositionAggregate,
+            Lifecycle<Position>,
+            Lifecycle<Position>,
         >::new(pool.clone(), "position_view".to_string()));
-        let position_cqrs = Arc::new(wire::test_cqrs(
+        let position_store = Arc::new(wire::test_cqrs(
             pool.clone(),
             vec![
                 Box::new(GenericQuery::new(position_view_repo))
-                    as Box<dyn Query<PositionAggregate>>,
-                Box::new(trigger.clone()) as Box<dyn Query<PositionAggregate>>,
+                    as Box<dyn Query<Lifecycle<Position>>>,
+                Box::new(trigger.clone()) as Box<dyn Query<Lifecycle<Position>>>,
             ],
             (),
         ));
 
-        (position_cqrs, receiver, symbol)
+        (position_store, receiver, symbol)
     }
 
     #[tokio::test]
     async fn position_event_causing_imbalance_triggers_redemption() {
-        let (position_cqrs, mut receiver, symbol) = setup_near_upper_threshold_position().await;
+        let (position_store, mut receiver, symbol) = setup_near_upper_threshold_position().await;
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // No position commands yet -> no triggers fired.
@@ -3484,10 +3460,9 @@ mod tests {
 
         // +20 onchain: 85 onchain, 35 offchain, total=120, target=60, excess=25.
         // 85/120 = 70.8% > 70% upper bound -> triggers Redemption.
-        let position_agg_id = Position::aggregate_id(&symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
@@ -3517,14 +3492,13 @@ mod tests {
 
     #[tokio::test]
     async fn in_progress_guard_blocks_duplicate_trigger() {
-        let (position_cqrs, mut receiver, symbol) = setup_near_upper_threshold_position().await;
+        let (position_store, mut receiver, symbol) = setup_near_upper_threshold_position().await;
         let test_token = address!("0x1234567890123456789012345678901234567890");
 
         // First fill pushes over: 85/120 = 70.8% > 70% -> triggers Redemption(25).
-        let position_agg_id = Position::aggregate_id(&symbol);
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
@@ -3552,9 +3526,9 @@ mod tests {
         );
 
         // Second fill while in-progress NOT cleared -> no second trigger.
-        position_cqrs
-            .execute(
-                &position_agg_id,
+        position_store
+            .send(
+                &symbol,
                 PositionCommand::AcknowledgeOnChainFill {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
@@ -3585,15 +3559,13 @@ mod tests {
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
-        // First "session": create position_cqrs, execute commands.
+        // First "session": create position store, execute commands.
         {
-            let (position_cqrs, position_query) = build_position_cqrs(&pool);
+            let (position_store, position_query) = build_position_cqrs(&pool);
 
-            let position_agg_id = Position::aggregate_id(&symbol);
-
-            position_cqrs
-                .execute(
-                    &position_agg_id,
+            position_store
+                .send(
+                    &symbol,
                     PositionCommand::AcknowledgeOnChainFill {
                         symbol: symbol.clone(),
                         threshold: ExecutionThreshold::whole_share(),
@@ -3618,11 +3590,11 @@ mod tests {
             assert_eq!(position.net, FractionalShares::new(dec!(10)));
             assert_eq!(position.accumulated_long, FractionalShares::new(dec!(10)));
         }
-        // position_cqrs dropped here, simulating shutdown.
+        // position_store dropped here, simulating shutdown.
 
-        // Second "session": create NEW position_cqrs against the same pool.
+        // Second "session": create NEW position store against the same pool.
         {
-            let (_position_cqrs, position_query) = build_position_cqrs(&pool);
+            let (_position_store, position_query) = build_position_cqrs(&pool);
 
             let position = crate::position::load_position(&position_query, &symbol)
                 .await

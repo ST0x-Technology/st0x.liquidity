@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::persist::GenericQuery;
 use cqrs_es::DomainEvent;
+use cqrs_es::persist::GenericQuery;
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
@@ -19,15 +19,15 @@ use st0x_execution::{
 use crate::event_sourced::{EventSourced, SqliteQuery};
 use crate::lifecycle::Lifecycle;
 
-pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder>>;
-pub(crate) type OffchainOrderQuery = SqliteQuery<OffchainOrder>;
-
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by `Conductor::start`, CLI, and tests.
 pub(crate) fn build_offchain_order_cqrs(
     pool: &SqlitePool,
     order_placer: Arc<dyn OrderPlacer>,
-) -> (Arc<OffchainOrderCqrs>, Arc<OffchainOrderQuery>) {
+) -> (
+    Arc<SqliteCqrs<Lifecycle<OffchainOrder>>>,
+    Arc<SqliteQuery<OffchainOrder>>,
+) {
     let view_repo = Arc::new(SqliteViewRepository::new(
         pool.clone(),
         "offchain_order_view".to_string(),
@@ -106,13 +106,274 @@ impl EventSourced for OffchainOrder {
     const AGGREGATE_TYPE: &'static str = "OffchainOrder";
     const SCHEMA_VERSION: u64 = 1;
 
+    fn originate(event: &Self::Event) -> Option<Self> {
+        use OffchainOrderEvent::*;
+        match event {
+            Placed {
+                symbol,
+                shares,
+                direction,
+                executor,
+                placed_at,
+            } => Some(Self::Pending {
+                symbol: symbol.clone(),
+                shares: *shares,
+                direction: *direction,
+                executor: *executor,
+                placed_at: *placed_at,
+            }),
+            _ => None,
+        }
+    }
+
+    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        use OffchainOrderEvent::*;
+        match event {
+            Placed { .. } => Ok(None),
+
+            Submitted {
+                executor_order_id,
+                submitted_at,
+            } => {
+                let Self::Pending {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                } = state
+                else {
+                    return Ok(None);
+                };
+
+                Ok(Some(Self::Submitted {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    executor: *executor,
+                    executor_order_id: executor_order_id.clone(),
+                    placed_at: *placed_at,
+                    submitted_at: *submitted_at,
+                }))
+            }
+
+            PartiallyFilled {
+                shares_filled,
+                avg_price_cents,
+                partially_filled_at,
+            } => Ok(match state {
+                Self::Submitted {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                }
+                | Self::PartiallyFilled {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                    ..
+                } => Some(Self::PartiallyFilled {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    shares_filled: *shares_filled,
+                    direction: *direction,
+                    executor: *executor,
+                    executor_order_id: executor_order_id.clone(),
+                    avg_price_cents: *avg_price_cents,
+                    placed_at: *placed_at,
+                    submitted_at: *submitted_at,
+                    partially_filled_at: *partially_filled_at,
+                }),
+
+                Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => None,
+            }),
+
+            Filled {
+                price_cents,
+                filled_at,
+            } => Ok(match state {
+                Self::Submitted {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                }
+                | Self::PartiallyFilled {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    executor_order_id,
+                    placed_at,
+                    submitted_at,
+                    ..
+                } => Some(Self::Filled {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    executor: *executor,
+                    executor_order_id: executor_order_id.clone(),
+                    price_cents: *price_cents,
+                    placed_at: *placed_at,
+                    submitted_at: *submitted_at,
+                    filled_at: *filled_at,
+                }),
+
+                Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => None,
+            }),
+
+            Failed { error, failed_at } => Ok(match state {
+                Self::Pending {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                }
+                | Self::Submitted {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                    ..
+                }
+                | Self::PartiallyFilled {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at,
+                    ..
+                } => Some(Self::Failed {
+                    symbol: symbol.clone(),
+                    shares: *shares,
+                    direction: *direction,
+                    executor: *executor,
+                    error: error.to_string(),
+                    placed_at: *placed_at,
+                    failed_at: *failed_at,
+                }),
+
+                Self::Filled { .. } | Self::Failed { .. } => None,
+            }),
+        }
+    }
+
+    async fn initialize(
+        command: Self::Command,
+        services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        use OffchainOrderCommand::*;
+        match command {
+            Place {
+                symbol,
+                shares,
+                direction,
+                executor,
+            } => {
+                let now = Utc::now();
+                let market_order = MarketOrder {
+                    symbol: symbol.clone(),
+                    shares,
+                    direction,
+                };
+
+                let placed = OffchainOrderEvent::Placed {
+                    symbol,
+                    shares,
+                    direction,
+                    executor,
+                    placed_at: now,
+                };
+
+                match services.place_market_order(market_order).await {
+                    Ok(executor_order_id) => Ok(vec![
+                        placed,
+                        OffchainOrderEvent::Submitted {
+                            executor_order_id,
+                            submitted_at: now,
+                        },
+                    ]),
+                    Err(error) => Ok(vec![
+                        placed,
+                        OffchainOrderEvent::Failed {
+                            error: error.to_string(),
+                            failed_at: now,
+                        },
+                    ]),
+                }
+            }
+
+            _ => Err(OffchainOrderError::NotPlaced),
+        }
+    }
+
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        match command {
+            OffchainOrderCommand::Place { .. } => Err(OffchainOrderError::AlreadyPlaced),
+
+            OffchainOrderCommand::UpdatePartialFill {
+                shares_filled,
+                avg_price_cents,
+            } => match self {
+                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::PartiallyFilled {
+                        shares_filled,
+                        avg_price_cents,
+                        partially_filled_at: Utc::now(),
+                    }])
+                }
+                Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Self::Filled { .. } | Self::Failed { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+
+            OffchainOrderCommand::CompleteFill { price_cents } => match self {
+                Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::Filled {
+                        price_cents,
+                        filled_at: Utc::now(),
+                    }])
+                }
+                Self::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
+                Self::Filled { .. } | Self::Failed { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+
+            OffchainOrderCommand::MarkFailed { error } => match self {
+                Self::Pending { .. } | Self::Submitted { .. } | Self::PartiallyFilled { .. } => {
+                    Ok(vec![OffchainOrderEvent::Failed {
+                        error,
+                        failed_at: Utc::now(),
+                    }])
+                }
+                Self::Filled { .. } | Self::Failed { .. } => {
+                    Err(OffchainOrderError::AlreadyCompleted)
+                }
+            },
+        }
+    }
 }
 
 impl OffchainOrder {
-    pub(crate) fn aggregate_id(id: OffchainOrderId) -> String {
-        id.to_string()
-    }
-
     pub(crate) fn symbol(&self) -> &Symbol {
         use OffchainOrder::*;
         match self {
@@ -171,240 +432,6 @@ impl OffchainOrder {
             } => Some(executor_order_id),
 
             Pending { .. } | Failed { .. } => None,
-        }
-    }
-
-    pub(crate) fn apply_transition(
-        event: &OffchainOrderEvent,
-        order: &Self,
-    ) -> Result<Self, LifecycleError<OffchainOrder>> {
-        match event {
-            OffchainOrderEvent::Submitted {
-                executor_order_id,
-                submitted_at,
-            } => Self::apply_submitted(order, executor_order_id, *submitted_at, event),
-
-            OffchainOrderEvent::PartiallyFilled {
-                shares_filled,
-                avg_price_cents,
-                partially_filled_at,
-            } => Self::apply_partially_filled(
-                order,
-                *shares_filled,
-                *avg_price_cents,
-                *partially_filled_at,
-                event,
-            ),
-
-            OffchainOrderEvent::Filled {
-                price_cents,
-                filled_at,
-            } => Self::apply_filled(order, *price_cents, *filled_at, event),
-
-            OffchainOrderEvent::Failed { error, failed_at } => {
-                Self::apply_failed(order, error, *failed_at, event)
-            }
-
-            OffchainOrderEvent::Placed { .. } => Err(LifecycleError::Mismatch {
-                state: Box::new(Lifecycle::Live(order.clone())),
-                event: event.clone(),
-            }),
-        }
-    }
-
-    fn apply_submitted(
-        order: &Self,
-        executor_order_id: &ExecutorOrderId,
-        submitted_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<OffchainOrder>> {
-        let Self::Pending {
-            symbol,
-            shares,
-            direction,
-            executor,
-            placed_at,
-        } = order
-        else {
-            return Err(LifecycleError::Mismatch {
-                state: Box::new(Lifecycle::Live(order.clone())),
-                event: event.clone(),
-            });
-        };
-
-        Ok(Self::Submitted {
-            symbol: symbol.clone(),
-            shares: *shares,
-            direction: *direction,
-            executor: *executor,
-            executor_order_id: executor_order_id.clone(),
-            placed_at: *placed_at,
-            submitted_at,
-        })
-    }
-
-    fn apply_partially_filled(
-        order: &Self,
-        shares_filled: FractionalShares,
-        avg_price_cents: PriceCents,
-        partially_filled_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<OffchainOrder>> {
-        match order {
-            Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-                ..
-            } => Ok(Self::PartiallyFilled {
-                symbol: symbol.clone(),
-                shares: *shares,
-                shares_filled,
-                direction: *direction,
-                executor: *executor,
-                executor_order_id: executor_order_id.clone(),
-                avg_price_cents,
-                placed_at: *placed_at,
-                submitted_at: *submitted_at,
-                partially_filled_at,
-            }),
-
-            Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
-                Err(LifecycleError::Mismatch {
-                    state: Box::new(Lifecycle::Live(order.clone())),
-                    event: event.clone(),
-                })
-            }
-        }
-    }
-
-    fn apply_filled(
-        order: &Self,
-        price_cents: PriceCents,
-        filled_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<OffchainOrder>> {
-        match order {
-            Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                executor_order_id,
-                placed_at,
-                submitted_at,
-                ..
-            } => Ok(Self::Filled {
-                symbol: symbol.clone(),
-                shares: *shares,
-                direction: *direction,
-                executor: *executor,
-                executor_order_id: executor_order_id.clone(),
-                price_cents,
-                placed_at: *placed_at,
-                submitted_at: *submitted_at,
-                filled_at,
-            }),
-
-            Self::Pending { .. } | Self::Filled { .. } | Self::Failed { .. } => {
-                Err(LifecycleError::Mismatch {
-                    state: Box::new(Lifecycle::Live(order.clone())),
-                    event: event.clone(),
-                })
-            }
-        }
-    }
-
-    fn apply_failed(
-        order: &Self,
-        error: &str,
-        failed_at: DateTime<Utc>,
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<OffchainOrder>> {
-        match order {
-            Self::Pending {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-            }
-            | Self::Submitted {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-                ..
-            }
-            | Self::PartiallyFilled {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-                ..
-            } => Ok(Self::Failed {
-                symbol: symbol.clone(),
-                shares: *shares,
-                direction: *direction,
-                executor: *executor,
-                error: error.to_string(),
-                placed_at: *placed_at,
-                failed_at,
-            }),
-
-            Self::Filled { .. } | Self::Failed { .. } => Err(LifecycleError::Mismatch {
-                state: Box::new(Lifecycle::Live(order.clone())),
-                event: event.clone(),
-            }),
-        }
-    }
-
-    pub(crate) fn from_event(
-        event: &OffchainOrderEvent,
-    ) -> Result<Self, LifecycleError<OffchainOrder>> {
-        match event {
-            OffchainOrderEvent::Placed {
-                symbol,
-                shares,
-                direction,
-                executor,
-                placed_at,
-            } => Ok(Self::Pending {
-                symbol: symbol.clone(),
-                shares: *shares,
-                direction: *direction,
-                executor: *executor,
-                placed_at: *placed_at,
-            }),
-
-            _ => Err(LifecycleError::Mismatch {
-                state: Box::new(Lifecycle::Uninitialized),
-                event: event.clone(),
-            }),
         }
     }
 }
@@ -549,7 +576,7 @@ impl OffchainOrderId {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum OffchainOrderError {
     #[error("Cannot place order: order has already been placed")]
     AlreadyPlaced,
@@ -557,8 +584,8 @@ pub(crate) enum OffchainOrderError {
     NotSubmitted,
     #[error("Cannot update order: order has already been completed (filled or failed)")]
     AlreadyCompleted,
-    #[error(transparent)]
-    Lifecycle(#[from] LifecycleError<OffchainOrder>),
+    #[error("Order has not been placed yet")]
+    NotPlaced,
 }
 
 impl TryFrom<i64> for PriceCents {
@@ -572,7 +599,7 @@ impl TryFrom<i64> for PriceCents {
 #[cfg(test)]
 mod tests {
     use cqrs_es::mem_store::MemStore;
-    use cqrs_es::{AggregateContext, AggregateError, CqrsFramework, EventStore};
+    use cqrs_es::{Aggregate, AggregateContext, AggregateError, CqrsFramework, EventStore};
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -660,7 +687,7 @@ mod tests {
         let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
             err,
-            AggregateError::UserError(OffchainOrderError::AlreadyPlaced)
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
         ));
     }
 
@@ -681,7 +708,7 @@ mod tests {
         let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
             err,
-            AggregateError::UserError(OffchainOrderError::AlreadyPlaced)
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
         ));
     }
 
@@ -702,7 +729,7 @@ mod tests {
         let err = cqrs.execute("order-1", place_command()).await.unwrap_err();
         assert!(matches!(
             err,
-            AggregateError::UserError(OffchainOrderError::AlreadyPlaced)
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyPlaced))
         ));
     }
 
@@ -823,7 +850,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            AggregateError::UserError(OffchainOrderError::Lifecycle(LifecycleError::Uninitialized))
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::NotPlaced))
         ));
     }
 
@@ -852,7 +879,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            AggregateError::UserError(OffchainOrderError::AlreadyCompleted)
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyCompleted))
         ));
     }
 
@@ -930,12 +957,10 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            AggregateError::UserError(OffchainOrderError::AlreadyCompleted)
+            AggregateError::UserError(LifecycleError::Apply(OffchainOrderError::AlreadyCompleted))
         ));
     }
 
-    // Direct apply test: verifies that applying an event to an uninitialized
-    // aggregate transitions to Failed state (corruption detection)
     #[test]
     fn transition_on_uninitialized_corrupts_state() {
         let mut order = Lifecycle::<OffchainOrder>::default();

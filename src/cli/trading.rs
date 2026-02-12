@@ -13,15 +13,15 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use st0x_execution::{
-    ArithmeticError, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
-    MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, MockExecutorCtx,
+    OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
+    OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
 };
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
@@ -300,12 +300,11 @@ pub(super) async fn process_found_trade<W: Write>(
         "position_view".to_string(),
     ));
     let position_query = GenericQuery::new(position_view_repo.clone());
-    let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position>>> =
-        Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(position_view_repo))],
-            (),
-        ));
+    let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position>>> = Arc::new(sqlite_cqrs(
+        pool.clone(),
+        vec![Box::new(GenericQuery::new(position_view_repo))],
+        (),
+    ));
     let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
 
     update_position_aggregate(&position_cqrs, &onchain_trade, ctx.execution_threshold).await;
@@ -374,12 +373,12 @@ pub(super) async fn process_found_trade<W: Write>(
 }
 
 async fn update_position_aggregate(
-    position_cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    position_cqrs: &SqliteCqrs<Lifecycle<Position>>,
     onchain_trade: &OnchainTrade,
     execution_threshold: ExecutionThreshold,
 ) {
     let base_symbol = onchain_trade.symbol.base();
-    let aggregate_id = Position::aggregate_id(base_symbol);
+    let aggregate_id = base_symbol.to_string();
 
     acknowledge_fill(
         position_cqrs,
@@ -409,7 +408,7 @@ fn extract_fill_params(
 }
 
 async fn acknowledge_fill(
-    position_cqrs: &SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>,
+    position_cqrs: &SqliteCqrs<Lifecycle<Position>>,
     aggregate_id: &str,
     onchain_trade: &OnchainTrade,
     execution_threshold: ExecutionThreshold,

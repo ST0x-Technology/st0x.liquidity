@@ -20,7 +20,9 @@ use tracing::debug;
 use st0x_execution::{Executor, InventoryResult};
 
 use crate::event_sourced::{SendError, Store};
-use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId};
+use crate::inventory::snapshot::{
+    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
+};
 use crate::lifecycle::Lifecycle;
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
@@ -175,7 +177,10 @@ where
         }
 
         self.snapshot
-            .send(snapshot_id, InventorySnapshotCommand::OnchainEquity { balances })
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::OnchainEquity { balances },
+            )
             .await?;
 
         Ok(())
@@ -258,7 +263,8 @@ mod tests {
     use st0x_execution::{EquityPosition, FractionalShares, Inventory, MockExecutor, Symbol};
 
     use super::*;
-    use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
+    use crate::event_sourced::Store;
+    use crate::inventory::snapshot::InventorySnapshotEvent;
     use crate::test_utils::setup_test_db;
     use crate::vault_registry::VaultRegistryCommand;
 
@@ -317,7 +323,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -364,7 +370,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -407,7 +413,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -439,7 +445,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         // Should succeed without error
@@ -488,7 +494,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -535,7 +541,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -576,14 +582,17 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
 
         // Verify events were stored under the correct aggregate ID
-        let expected_aggregate_id =
-            InventorySnapshotId { orderbook, owner: order_owner }.to_string();
+        let expected_aggregate_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        }
+        .to_string();
         let events = load_events_for_aggregate(&pool, &expected_aggregate_id).await;
 
         assert!(
@@ -665,7 +674,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -709,7 +718,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -754,7 +763,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         service.poll_and_record().await.unwrap();
@@ -798,7 +807,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -829,7 +838,7 @@ mod tests {
             pool.clone(),
             orderbook,
             order_owner,
-            sqlite_cqrs(pool.clone(), vec![], ()),
+            Store::new(sqlite_cqrs(pool.clone(), vec![], ())),
         );
 
         let error = service.poll_and_record().await.unwrap_err();
@@ -846,7 +855,11 @@ mod tests {
         orderbook: Address,
         order_owner: Address,
     ) -> Vec<InventorySnapshotEvent> {
-        let aggregate_id = InventorySnapshotId { orderbook, owner: order_owner }.to_string();
+        let aggregate_id = InventorySnapshotId {
+            orderbook,
+            owner: order_owner,
+        }
+        .to_string();
         load_events_for_aggregate(pool, &aggregate_id).await
     }
 

@@ -18,7 +18,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, warn};
 use url::Url;
 
-use st0x_execution::{AlpacaBrokerApiCtx, ArithmeticError, FractionalShares, Symbol};
+use st0x_execution::{AlpacaBrokerApiCtx, FractionalShares, Symbol};
 
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
@@ -186,11 +186,7 @@ impl RebalancingTrigger {
 
 #[async_trait]
 impl Query<Lifecycle<Position>> for RebalancingTrigger {
-    async fn dispatch(
-        &self,
-        aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<Position>>],
-    ) {
+    async fn dispatch(&self, aggregate_id: &str, events: &[EventEnvelope<Lifecycle<Position>>]) {
         let Ok(symbol) = Symbol::new(aggregate_id) else {
             warn!(aggregate_id = %aggregate_id, "Invalid symbol in position aggregate_id");
             return;
@@ -382,7 +378,7 @@ impl RebalancingTrigger {
     /// Clears the in-progress flag for an equity symbol.
     pub(crate) fn clear_equity_in_progress(&self, symbol: &Symbol) {
         let mut guard = match self.equity_in_progress.write() {
-            Ok(g) => g,
+            Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
         guard.remove(symbol);
@@ -394,8 +390,8 @@ impl RebalancingTrigger {
     }
 
     async fn apply_position_event_and_check(&self, symbol: &Symbol, event: &PositionEvent) {
-        if let Err(e) = self.apply_position_event_to_inventory(symbol, event).await {
-            warn!(symbol = %symbol, error = %e, "Failed to apply position event to inventory");
+        if let Err(error) = self.apply_position_event_to_inventory(symbol, event).await {
+            warn!(symbol = %symbol, error = %error, "Failed to apply position event to inventory");
             return;
         }
 
@@ -460,8 +456,8 @@ impl RebalancingTrigger {
                 *inventory = new_inventory;
                 drop(inventory);
             }
-            Err(e) => {
-                warn!(symbol = %symbol, error = %e, "Failed to apply mint event to inventory");
+            Err(error) => {
+                warn!(symbol = %symbol, error = %error, "Failed to apply mint event to inventory");
             }
         }
     }
@@ -511,8 +507,8 @@ impl RebalancingTrigger {
                 *inventory = new_inventory;
                 drop(inventory);
             }
-            Err(e) => {
-                warn!(symbol = %symbol, error = %e, "Failed to apply redemption event to inventory");
+            Err(error) => {
+                warn!(symbol = %symbol, error = %error, "Failed to apply redemption event to inventory");
             }
         }
     }
@@ -587,8 +583,8 @@ impl RebalancingTrigger {
                 *inventory = new_inventory;
                 drop(inventory);
             }
-            Err(e) => {
-                warn!(error = %e, "Failed to apply USDC rebalance event to inventory");
+            Err(error) => {
+                warn!(error = %error, "Failed to apply USDC rebalance event to inventory");
             }
         }
     }
@@ -772,7 +768,11 @@ mod tests {
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
         let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
-        let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+        let aggregate_id = VaultRegistryId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        }
+        .to_string();
 
         cqrs.execute(
             &aggregate_id,

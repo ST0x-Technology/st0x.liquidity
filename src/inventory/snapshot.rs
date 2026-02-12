@@ -9,12 +9,27 @@ use std::collections::BTreeMap;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use cqrs_es::{Aggregate, DomainEvent};
+use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 use st0x_execution::{FractionalShares, Symbol};
 
-use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
+use crate::event_sourced::EventSourced;
+use crate::lifecycle::Never;
 use crate::threshold::Usdc;
+
+/// Typed identifier for InventorySnapshot aggregates, keyed
+/// by orderbook and owner address pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct InventorySnapshotId {
+    pub(crate) orderbook: Address,
+    pub(crate) owner: Address,
+}
+
+impl std::fmt::Display for InventorySnapshotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.orderbook, self.owner)
+    }
+}
 
 /// State tracking the latest inventory snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,88 +46,41 @@ pub(crate) struct InventorySnapshot {
     pub(crate) last_updated: DateTime<Utc>,
 }
 
-impl InventorySnapshot {
-    /// Creates the aggregate ID from orderbook and owner addresses.
-    pub(crate) fn aggregate_id(orderbook: Address, owner: Address) -> String {
-        format!("{orderbook}:{owner}")
-    }
+#[async_trait]
+impl EventSourced for InventorySnapshot {
+    type Id = InventorySnapshotId;
+    type Event = InventorySnapshotEvent;
+    type Command = InventorySnapshotCommand;
+    type Error = Never;
+    type Services = ();
 
-    fn empty(timestamp: DateTime<Utc>) -> Self {
-        Self {
+    const AGGREGATE_TYPE: &'static str = "InventorySnapshot";
+    const SCHEMA_VERSION: u64 = 1;
+
+    fn originate(event: &Self::Event) -> Option<Self> {
+        let mut snapshot = Self {
             onchain_equity: BTreeMap::new(),
             onchain_cash: None,
             offchain_equity: BTreeMap::new(),
             offchain_cash_cents: None,
-            last_updated: timestamp,
-        }
-    }
-
-    pub(crate) fn from_event(event: &InventorySnapshotEvent) -> Self {
-        let mut snapshot = Self::empty(event.timestamp());
+            last_updated: event.timestamp(),
+        };
         snapshot.apply_event(event);
-        snapshot
+        Some(snapshot)
     }
 
-    pub(crate) fn apply_transition(event: &InventorySnapshotEvent, snapshot: &Self) -> Self {
-        let mut new_snapshot = snapshot.clone();
-        new_snapshot.apply_event(event);
-        new_snapshot
+    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error> {
+        let mut snapshot = state.clone();
+        snapshot.apply_event(event);
+        Ok(Some(snapshot))
     }
 
-    fn apply_event(&mut self, event: &InventorySnapshotEvent) {
-        self.last_updated = event.timestamp();
-
-        match event {
-            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
-                self.onchain_equity = balances.clone();
-            }
-            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => {
-                self.onchain_cash = Some(*usdc_balance);
-            }
-            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
-                self.offchain_equity = positions.clone();
-            }
-            InventorySnapshotEvent::OffchainCash {
-                cash_balance_cents, ..
-            } => {
-                self.offchain_cash_cents = Some(*cash_balance_cents);
-            }
-        }
-    }
-}
-
-impl EventSourced for InventorySnapshot {
-    type Event = InventorySnapshotEvent;
-}
-
-#[async_trait]
-impl Aggregate for Lifecycle<InventorySnapshot> {
-    type Command = InventorySnapshotCommand;
-    type Event = InventorySnapshotEvent;
-    type Error = InventorySnapshotError;
-    type Services = ();
-
-    fn aggregate_type() -> String {
-        "InventorySnapshot".to_string()
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        *self = self
-            .clone()
-            .transition(&event, |event, state| {
-                Ok(InventorySnapshot::apply_transition(event, state))
-            })
-            .or_initialize(&event, |event| Ok(InventorySnapshot::from_event(event)));
-    }
-
-    async fn handle(
-        &self,
+    async fn initialize(
         command: Self::Command,
         _services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         let now = Utc::now();
-
-        let event = match command {
+        Ok(vec![match command {
             InventorySnapshotCommand::OnchainEquity { balances } => {
                 InventorySnapshotEvent::OnchainEquity {
                     balances,
@@ -137,16 +105,65 @@ impl Aggregate for Lifecycle<InventorySnapshot> {
                     fetched_at: now,
                 }
             }
-        };
+        }])
+    }
 
-        Ok(vec![event])
+    async fn transition(
+        &self,
+        command: Self::Command,
+        _services: &Self::Services,
+    ) -> Result<Vec<Self::Event>, Self::Error> {
+        let now = Utc::now();
+        Ok(vec![match command {
+            InventorySnapshotCommand::OnchainEquity { balances } => {
+                InventorySnapshotEvent::OnchainEquity {
+                    balances,
+                    fetched_at: now,
+                }
+            }
+            InventorySnapshotCommand::OnchainCash { usdc_balance } => {
+                InventorySnapshotEvent::OnchainCash {
+                    usdc_balance,
+                    fetched_at: now,
+                }
+            }
+            InventorySnapshotCommand::OffchainEquity { positions } => {
+                InventorySnapshotEvent::OffchainEquity {
+                    positions,
+                    fetched_at: now,
+                }
+            }
+            InventorySnapshotCommand::OffchainCash { cash_balance_cents } => {
+                InventorySnapshotEvent::OffchainCash {
+                    cash_balance_cents,
+                    fetched_at: now,
+                }
+            }
+        }])
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum InventorySnapshotError {
-    #[error(transparent)]
-    State(#[from] LifecycleError<InventorySnapshot>),
+impl InventorySnapshot {
+    fn apply_event(&mut self, event: &InventorySnapshotEvent) {
+        self.last_updated = event.timestamp();
+
+        match event {
+            InventorySnapshotEvent::OnchainEquity { balances, .. } => {
+                self.onchain_equity = balances.clone();
+            }
+            InventorySnapshotEvent::OnchainCash { usdc_balance, .. } => {
+                self.onchain_cash = Some(*usdc_balance);
+            }
+            InventorySnapshotEvent::OffchainEquity { positions, .. } => {
+                self.offchain_equity = positions.clone();
+            }
+            InventorySnapshotEvent::OffchainCash {
+                cash_balance_cents, ..
+            } => {
+                self.offchain_cash_cents = Some(*cash_balance_cents);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,10 +230,12 @@ impl DomainEvent for InventorySnapshotEvent {
 
 #[cfg(test)]
 mod tests {
+    use cqrs_es::Aggregate;
     use rust_decimal::Decimal;
     use std::str::FromStr;
 
     use super::*;
+    use crate::lifecycle::Lifecycle;
 
     type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 

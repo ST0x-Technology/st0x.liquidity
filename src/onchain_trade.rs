@@ -14,9 +14,6 @@ use serde::{Deserialize, Serialize};
 use st0x_execution::{Direction, Symbol};
 
 use crate::event_sourced::EventSourced;
-use crate::lifecycle::Lifecycle;
-
-pub(crate) type OnChainTradeCqrs = sqlite_es::SqliteCqrs<Lifecycle<OnChainTrade>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OnChainTradeId {
@@ -234,7 +231,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::lifecycle::LifecycleError;
+    use crate::lifecycle::{Lifecycle, LifecycleError};
 
     fn make_envelope(
         aggregate_id: &str,

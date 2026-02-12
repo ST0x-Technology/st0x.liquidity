@@ -78,8 +78,8 @@
 use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
 use cqrs_es::{Aggregate, AggregateError, DomainEvent};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 use std::fmt::{Debug, Display};
 
@@ -202,7 +202,7 @@ pub(crate) trait EventSourced:
 /// materializes a `Lifecycle<Entity>` as its own view.
 ///
 /// Used as the query type for entity views:
-/// `type PositionQuery = SqliteQuery<Position>;`
+/// `SqliteQuery<Position>`
 pub(crate) type SqliteQuery<Entity> = GenericQuery<
     SqliteViewRepository<Lifecycle<Entity>, Lifecycle<Entity>>,
     Lifecycle<Entity>,
@@ -238,11 +238,11 @@ pub(crate) struct Store<Entity: EventSourced> {
 impl<Entity: EventSourced> Store<Entity>
 where
     Lifecycle<Entity>: Aggregate<
-        Command = Entity::Command,
-        Event = Entity::Event,
-        Error = LifecycleError<Entity>,
-        Services = Entity::Services,
-    >,
+            Command = Entity::Command,
+            Event = Entity::Event,
+            Error = LifecycleError<Entity>,
+            Services = Entity::Services,
+        >,
 {
     /// Wrap an existing `SqliteCqrs` framework.
     ///
@@ -274,8 +274,7 @@ where
 /// Wraps the cqrs-es `AggregateError` containing a
 /// `LifecycleError` so that consumers don't import from cqrs-es
 /// or lifecycle directly.
-pub(crate) type SendError<Entity> =
-    AggregateError<LifecycleError<Entity>>;
+pub(crate) type SendError<Entity> = AggregateError<LifecycleError<Entity>>;
 
 /// Bounds required for domain error types used with
 /// [`EventSourced`].
@@ -286,25 +285,11 @@ pub(crate) type SendError<Entity> =
 /// one place so implementors see a single meaningful name
 /// instead of a long bound list.
 pub(crate) trait DomainError:
-    std::error::Error
-    + Clone
-    + Serialize
-    + DeserializeOwned
-    + Send
-    + Sync
-    + PartialEq
-    + Eq
+    std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
 {
 }
 
 impl<T> DomainError for T where
-    T: std::error::Error
-        + Clone
-        + Serialize
-        + DeserializeOwned
-        + Send
-        + Sync
-        + PartialEq
-        + Eq
+    T: std::error::Error + Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq
 {
 }

@@ -33,18 +33,11 @@ use crate::rebalancing::{RebalancingTrigger, RebalancingTriggerConfig, Triggered
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
-type RebalancingTriggerDeps = Cons<
-    Position,
-    Cons<
-        TokenizedEquityMint,
-        Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>,
-    >,
->;
+type RebalancingTriggerDeps =
+    Cons<Position, Cons<TokenizedEquityMint, Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>>>;
 
-type EventBroadcasterDeps = Cons<
-    TokenizedEquityMint,
-    Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>,
->;
+type EventBroadcasterDeps =
+    Cons<TokenizedEquityMint, Cons<EquityRedemption, Cons<UsdcRebalance, Nil>>>;
 
 /// All query processors that must be created and wired when
 /// rebalancing is enabled.

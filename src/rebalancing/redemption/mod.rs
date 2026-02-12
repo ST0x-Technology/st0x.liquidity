@@ -15,7 +15,8 @@ use thiserror::Error;
 use st0x_execution::{FractionalShares, Symbol};
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
-use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
+use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
+use crate::lifecycle::LifecycleError;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {
@@ -23,7 +24,7 @@ pub(crate) enum RedemptionError {
     Alpaca(#[from] AlpacaTokenizationError),
 
     #[error("Aggregate error: {0}")]
-    Aggregate(#[from] AggregateError<EquityRedemptionError>),
+    Aggregate(#[from] AggregateError<LifecycleError<EquityRedemption>>),
 
     #[error("Redemption was rejected by Alpaca")]
     Rejected,

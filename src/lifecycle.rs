@@ -9,7 +9,7 @@
 //! design rationale.
 
 use async_trait::async_trait;
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, Query, View};
+use cqrs_es::{Aggregate, EventEnvelope, Query, View};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
