@@ -12,11 +12,10 @@ use alloy::providers::{ProviderBuilder, WsConnect};
 use clap::{Parser, Subcommand, ValueEnum};
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+use st0x_execution::{Direction, Symbol, TimeInForce};
 use std::io::Write;
 use thiserror::Error;
 use tracing::info;
-
-use st0x_execution::{Direction, Symbol};
 
 use crate::config::{Ctx, Env};
 use crate::shares::FractionalShares;
@@ -75,6 +74,9 @@ pub enum Commands {
         /// Number of shares to buy (whole shares only)
         #[arg(short = 'q', long = "quantity")]
         quantity: u64,
+        /// Time-in-force for the order (Alpaca Broker API only)
+        #[arg(long = "time-in-force")]
+        time_in_force: Option<TimeInForce>,
     },
     /// Sell shares of a stock
     Sell {
@@ -84,6 +86,9 @@ pub enum Commands {
         /// Number of shares to sell (whole shares only)
         #[arg(short = 'q', long = "quantity")]
         quantity: u64,
+        /// Time-in-force for the order (Alpaca Broker API only)
+        #[arg(long = "time-in-force")]
+        time_in_force: Option<TimeInForce>,
     },
     /// Process a transaction hash to execute opposite-side trade
     ProcessTx {
@@ -334,6 +339,7 @@ async fn execute_order<W: Write>(
     symbol: Symbol,
     quantity: u64,
     direction: Direction,
+    time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
@@ -342,7 +348,16 @@ async fn execute_order<W: Write>(
         return Err(CliError::InvalidQuantity { value: quantity }.into());
     }
     info!("Processing {direction:?} order: symbol={symbol}, quantity={quantity}");
-    trading::execute_order_with_writers(symbol, quantity, direction, ctx, pool, stdout).await
+    trading::execute_order_with_writers(
+        symbol,
+        quantity,
+        direction,
+        time_in_force,
+        ctx,
+        pool,
+        stdout,
+    )
+    .await
 }
 
 /// Commands that don't require a WebSocket provider.
@@ -350,10 +365,12 @@ enum SimpleCommand {
     Buy {
         symbol: Symbol,
         quantity: u64,
+        time_in_force: Option<TimeInForce>,
     },
     Sell {
         symbol: Symbol,
         quantity: u64,
+        time_in_force: Option<TimeInForce>,
     },
     Auth,
     TransferEquity {
@@ -442,8 +459,24 @@ async fn run_command_with_writers<W: Write>(
 
 fn classify_command(command: Commands) -> Result<SimpleCommand, ProviderCommand> {
     match command {
-        Commands::Buy { symbol, quantity } => Ok(SimpleCommand::Buy { symbol, quantity }),
-        Commands::Sell { symbol, quantity } => Ok(SimpleCommand::Sell { symbol, quantity }),
+        Commands::Buy {
+            symbol,
+            quantity,
+            time_in_force,
+        } => Ok(SimpleCommand::Buy {
+            symbol,
+            quantity,
+            time_in_force,
+        }),
+        Commands::Sell {
+            symbol,
+            quantity,
+            time_in_force,
+        } => Ok(SimpleCommand::Sell {
+            symbol,
+            quantity,
+            time_in_force,
+        }),
         Commands::Auth => Ok(SimpleCommand::Auth),
         Commands::TransferEquity {
             direction,
@@ -522,11 +555,37 @@ async fn run_simple_command<W: Write>(
     stdout: &mut W,
 ) -> anyhow::Result<()> {
     match command {
-        SimpleCommand::Buy { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Buy, ctx, pool, stdout).await
+        SimpleCommand::Buy {
+            symbol,
+            quantity,
+            time_in_force,
+        } => {
+            execute_order(
+                symbol,
+                quantity,
+                Direction::Buy,
+                time_in_force,
+                ctx,
+                pool,
+                stdout,
+            )
+            .await
         }
-        SimpleCommand::Sell { symbol, quantity } => {
-            execute_order(symbol, quantity, Direction::Sell, ctx, pool, stdout).await
+        SimpleCommand::Sell {
+            symbol,
+            quantity,
+            time_in_force,
+        } => {
+            execute_order(
+                symbol,
+                quantity,
+                Direction::Sell,
+                time_in_force,
+                ctx,
+                pool,
+                stdout,
+            )
+            .await
         }
         SimpleCommand::Auth => auth::auth_command(stdout, &ctx.broker, pool).await,
         SimpleCommand::TransferEquity {
@@ -696,6 +755,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -739,6 +799,7 @@ mod tests {
             Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -783,6 +844,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -814,6 +876,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -883,6 +946,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -936,6 +1000,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut std::io::sink(),
@@ -976,6 +1041,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1023,6 +1089,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout_buffer,
@@ -1301,6 +1368,68 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn test_time_in_force_cli_option() {
+        let cmd = Cli::command();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "cli",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "day",
+            ])
+            .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "cli",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "market-on-close",
+            ])
+            .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "cli",
+                "sell",
+                "-s",
+                "TSLA",
+                "-q",
+                "50",
+                "--time-in-force",
+                "market-on-close",
+            ])
+            .unwrap();
+
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "buy", "-s", "AAPL", "-q", "100"])
+            .unwrap();
+
+        let err = cmd
+            .try_get_matches_from(vec![
+                "cli",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "invalid",
+            ])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
     #[tokio::test]
     async fn test_integration_buy_command_end_to_end() {
         let server = MockServer::start();
@@ -1334,6 +1463,7 @@ mod tests {
         let buy_command = Commands::Buy {
             symbol: Symbol::new("AAPL").unwrap(),
             quantity: 100,
+            time_in_force: None,
         };
 
         let result = run_command_with_writers(ctx, buy_command, &pool, &mut stdout).await;
@@ -1382,6 +1512,7 @@ mod tests {
         let sell_command = Commands::Sell {
             symbol: Symbol::new("TSLA").unwrap(),
             quantity: 50,
+            time_in_force: None,
         };
 
         let result = run_command_with_writers(ctx, sell_command, &pool, &mut stdout).await;
@@ -1432,6 +1563,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1506,6 +1638,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1540,6 +1673,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1576,6 +1710,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout2,
@@ -1611,6 +1746,7 @@ mod tests {
             Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,
@@ -1693,6 +1829,7 @@ mod tests {
             Symbol::new("INVALID").unwrap(),
             999_999,
             Direction::Buy,
+            None,
             &ctx,
             &pool,
             &mut stdout,

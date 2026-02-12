@@ -912,7 +912,7 @@ mod tests {
 
     use uuid::{Uuid, uuid};
 
-    use st0x_execution::alpaca_broker_api::CryptoOrderFailureReason;
+    use st0x_execution::alpaca_broker_api::{CryptoOrderFailureReason, TimeInForce};
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError, AlpacaBrokerApiMode, Executor};
 
     use super::*;
@@ -1047,6 +1047,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         };
 
         AlpacaBrokerApi::try_from_ctx(auth)

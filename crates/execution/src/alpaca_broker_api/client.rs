@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use super::AlpacaBrokerApiError;
 use super::auth::{AccountResponse, AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+use super::executor::AssetResponse;
 use super::order::{CryptoOrderRequest, CryptoOrderResponse, OrderRequest, OrderResponse};
+use crate::Symbol;
 
 /// Alpaca Broker API HTTP client with Basic authentication
 pub(crate) struct AlpacaBrokerApiClient {
@@ -122,6 +124,16 @@ impl AlpacaBrokerApiClient {
         self.get(&url).await
     }
 
+    /// Get asset information by symbol
+    pub(super) async fn get_asset(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<AssetResponse, AlpacaBrokerApiError> {
+        let url = format!("{}/v1/assets/{symbol}", self.base_url);
+        debug!("Fetching asset info for {symbol}");
+        self.get(&url).await
+    }
+
     /// Place a crypto order (e.g., USDC/USD conversion)
     pub(crate) async fn place_crypto_order(
         &self,
@@ -197,6 +209,7 @@ mod tests {
     use httpmock::prelude::*;
 
     use super::*;
+    use crate::alpaca_broker_api::{AssetStatus, TimeInForce};
 
     fn create_test_ctx(mode: AlpacaBrokerApiMode) -> AlpacaBrokerApiCtx {
         AlpacaBrokerApiCtx {
@@ -204,6 +217,8 @@ mod tests {
             api_secret: "test_secret_key".to_string(),
             account_id: "test_account_123".to_string(),
             mode: Some(mode),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         }
     }
 
@@ -304,6 +319,58 @@ mod tests {
         mock.assert();
         assert!(
             matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 401)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_asset_success() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/AAPL");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "status": "active",
+                    "tradable": true
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let asset = client.get_asset(&symbol).await.unwrap();
+
+        mock.assert();
+        assert_eq!(asset.status, AssetStatus::Active);
+        assert!(asset.tradable);
+    }
+
+    #[tokio::test]
+    async fn test_get_asset_not_found() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(GET).path("/v1/assets/INVALID");
+            then.status(404)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "code": 40_410_000,
+                    "message": "asset not found for INVALID"
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let symbol = Symbol::new("INVALID").unwrap();
+        let result = client.get_asset(&symbol).await;
+
+        mock.assert();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, AlpacaBrokerApiError::ApiError { status, .. } if status.as_u16() == 404)
         );
     }
 }

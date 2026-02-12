@@ -260,6 +260,7 @@ mod tests {
     use serde_json::json;
     use sqlite_es::sqlite_cqrs;
     use sqlx::SqlitePool;
+    use st0x_execution::alpaca_broker_api::TimeInForce;
     use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
     use uuid::Uuid;
 
@@ -293,6 +294,8 @@ mod tests {
                 api_secret: "test_secret".to_string(),
                 account_id: Uuid::nil().to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::Day,
             },
         }
     }
@@ -380,6 +383,8 @@ mod tests {
             api_secret: "test_secret".to_string(),
             account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         };
         let broker = Arc::new(
             AlpacaBrokerApi::try_from_ctx(broker_auth)
@@ -473,6 +478,8 @@ mod tests {
             api_secret: "invalid_secret".to_string(),
             account_id: rebalancing_ctx.alpaca_account_id.to_string(),
             mode: Some(AlpacaBrokerApiMode::Mock(server.base_url())),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         };
 
         // Verify the error can be converted to SpawnRebalancerError

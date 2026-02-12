@@ -407,7 +407,7 @@ pub(super) async fn alpaca_convert_command<W: Write>(
 mod tests {
     use alloy::primitives::{Address, B256, address};
     use rust_decimal_macros::dec;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use url::Url;
     use uuid::uuid;
 
@@ -447,6 +447,8 @@ mod tests {
             api_secret: "test-secret".to_string(),
             account_id: "test-account-id".to_string(),
             mode: Some(AlpacaBrokerApiMode::Sandbox),
+            asset_cache_ttl: std::time::Duration::from_secs(3600),
+            time_in_force: TimeInForce::Day,
         });
         ctx
     }
@@ -470,6 +472,8 @@ mod tests {
                 api_secret: "test-secret".to_string(),
                 account_id: alpaca_account_id.to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::Day,
             }),
             telemetry: None,
             rebalancing: Some(RebalancingCtx {
@@ -491,6 +495,8 @@ mod tests {
                     api_secret: "test-secret".to_string(),
                     account_id: alpaca_account_id.to_string(),
                     mode: Some(AlpacaBrokerApiMode::Sandbox),
+                    asset_cache_ttl: std::time::Duration::from_secs(3600),
+                    time_in_force: TimeInForce::Day,
                 },
             }),
             execution_threshold: ExecutionThreshold::whole_share(),

@@ -272,7 +272,7 @@ mod tests {
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use rust_decimal::Decimal;
-    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode};
+    use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiMode, TimeInForce};
     use std::str::FromStr;
     use url::Url;
     use uuid::uuid;
@@ -326,6 +326,8 @@ mod tests {
                 api_secret: "test-secret".to_string(),
                 account_id: "904837e3-3b76-47ec-b432-046db621571b".to_string(),
                 mode: Some(AlpacaBrokerApiMode::Sandbox),
+                asset_cache_ttl: std::time::Duration::from_secs(3600),
+                time_in_force: TimeInForce::Day,
             },
         });
         ctx
