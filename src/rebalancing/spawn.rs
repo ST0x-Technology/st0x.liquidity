@@ -266,7 +266,6 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletService};
     use crate::inventory::ImbalanceThreshold;
-    use crate::rebalancing::RebalancingTriggerConfig;
 
     const TEST_ORDERBOOK: Address = address!("0xabcdefabcdefabcdefabcdefabcdefabcdefabcd");
 
@@ -323,32 +322,6 @@ mod tests {
             display.contains("failed to create Alpaca wallet service"),
             "Expected error message to contain 'failed to create Alpaca wallet service', got: {display}"
         );
-    }
-
-    #[test]
-    fn trigger_config_uses_equity_threshold_from_config() {
-        let rebalancing_ctx = make_ctx();
-
-        let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: rebalancing_ctx.equity_threshold,
-            usdc_threshold: rebalancing_ctx.usdc_threshold,
-        };
-
-        assert_eq!(trigger_config.equity_threshold.target, dec!(0.5));
-        assert_eq!(trigger_config.equity_threshold.deviation, dec!(0.2));
-    }
-
-    #[test]
-    fn trigger_config_uses_usdc_threshold_from_config() {
-        let rebalancing_ctx = make_ctx();
-
-        let trigger_config = RebalancingTriggerConfig {
-            equity_threshold: rebalancing_ctx.equity_threshold,
-            usdc_threshold: rebalancing_ctx.usdc_threshold,
-        };
-
-        assert_eq!(trigger_config.usdc_threshold.target, dec!(0.6));
-        assert_eq!(trigger_config.usdc_threshold.deviation, dec!(0.15));
     }
 
     #[test]

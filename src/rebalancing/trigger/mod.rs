@@ -90,7 +90,7 @@ impl RebalancingCtx {
     ///
     /// This is the ONLY way to construct a `RebalancingCtx`, which enforces
     /// the invariant that rebalancing always has valid `AlpacaBrokerApiCtx`.
-    pub(crate) fn from_config_and_secrets(
+    pub(crate) fn new(
         config: RebalancingConfig,
         secrets: RebalancingSecrets,
         broker_auth: AlpacaBrokerApiCtx,
@@ -1841,12 +1841,11 @@ mod tests {
     }
 
     #[test]
-    fn from_config_and_secrets_constructs_ctx() {
+    fn new_constructs_ctx() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
         let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let ctx =
-            RebalancingCtx::from_config_and_secrets(config, secrets, test_broker_auth()).unwrap();
+        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
 
         assert_eq!(ctx.alpaca_broker_auth.api_key, "test_key");
         assert_eq!(ctx.alpaca_broker_auth.api_secret, "test_secret");
@@ -1857,13 +1856,13 @@ mod tests {
     }
 
     #[test]
-    fn from_config_and_secrets_fails_with_invalid_account_id() {
+    fn new_fails_with_invalid_account_id() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
         let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
         let mut broker_auth = test_broker_auth();
         broker_auth.account_id = "not-a-uuid".to_string();
 
-        let result = RebalancingCtx::from_config_and_secrets(config, secrets, broker_auth);
+        let result = RebalancingCtx::new(config, secrets, broker_auth);
 
         assert!(
             matches!(result, Err(RebalancingCtxError::InvalidAccountId(_))),
@@ -1890,8 +1889,7 @@ mod tests {
         .unwrap();
         let secrets: RebalancingSecrets = toml::from_str(valid_rebalancing_secrets_toml()).unwrap();
 
-        let ctx =
-            RebalancingCtx::from_config_and_secrets(config, secrets, test_broker_auth()).unwrap();
+        let ctx = RebalancingCtx::new(config, secrets, test_broker_auth()).unwrap();
 
         assert_eq!(ctx.equity_threshold.target, dec!(0.6));
         assert_eq!(ctx.equity_threshold.deviation, dec!(0.1));

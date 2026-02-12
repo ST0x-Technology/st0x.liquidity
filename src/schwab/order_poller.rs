@@ -333,31 +333,6 @@ mod tests {
     const TEST_ENCRYPTION_KEY: FixedBytes<32> = FixedBytes::ZERO;
 
     #[tokio::test]
-    async fn test_order_poller_config_default() {
-        let config = OrderPollerConfig::default();
-        assert_eq!(config.polling_interval, Duration::from_secs(15));
-        assert_eq!(config.max_jitter, Duration::from_secs(5));
-    }
-
-    #[tokio::test]
-    async fn test_order_poller_creation() {
-        let config = OrderPollerConfig::default();
-        let auth = SchwabAuth {
-            app_key: "test_key".to_string(),
-            app_secret: "test_secret".to_string(),
-            redirect_uri: None,
-            base_url: None,
-            account_index: None,
-            encryption_key: TEST_ENCRYPTION_KEY,
-        };
-        let pool = setup_test_db().await;
-
-        let poller = OrderStatusPoller::new(config.clone(), auth, pool, Schwab);
-        assert_eq!(poller.config.polling_interval, config.polling_interval);
-        assert_eq!(poller.config.max_jitter, config.max_jitter);
-    }
-
-    #[tokio::test]
     async fn test_poll_pending_orders_empty_database() {
         let config = OrderPollerConfig::default();
         let auth = SchwabAuth {

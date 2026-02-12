@@ -300,7 +300,7 @@ impl Ctx {
 
         let broker = BrokerCtx::from(secrets.broker);
         let evm = EvmCtx::new(&config.evm, secrets.evm);
-        let telemetry = TelemetryCtx::from_config_and_secrets(config.telemetry, secrets.telemetry)?;
+        let telemetry = TelemetryCtx::new(config.telemetry, secrets.telemetry)?;
 
         // Execution threshold is determined by broker capabilities:
         // - Schwab API doesn't support fractional shares, so use 1 whole share threshold
@@ -315,7 +315,7 @@ impl Ctx {
                 let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &broker else {
                     return Err(RebalancingCtxError::NotAlpacaBroker.into());
                 };
-                Some(RebalancingCtx::from_config_and_secrets(
+                Some(RebalancingCtx::new(
                     rebalancing_config,
                     rebalancing_secrets,
                     alpaca_auth.clone(),
@@ -570,7 +570,7 @@ pub(crate) mod tests {
         let pool = crate::test_utils::setup_test_db().await;
 
         let BrokerCtx::Schwab(schwab_auth) = &ctx.broker else {
-            panic!("Expected Schwab broker config");
+            panic!("Expected Schwab broker ctx");
         };
         let schwab_ctx = schwab_auth.to_schwab_ctx(pool.clone());
         schwab_ctx.try_into_executor().await.unwrap_err();
@@ -730,7 +730,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn telemetry_assembled_from_config_and_secrets() {
+    fn telemetry_ctx_assembled_from_config_and_secrets() {
         let config = r#"
             database_url = ":memory:"
             [evm]

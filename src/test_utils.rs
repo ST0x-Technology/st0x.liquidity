@@ -87,14 +87,14 @@ pub(crate) async fn setup_test_db() -> SqlitePool {
 
 /// Centralized test token setup to eliminate duplication across test files.
 /// Creates and stores test tokens in the database for Schwab API authentication.
-pub(crate) async fn setup_test_tokens(pool: &SqlitePool, config: &SchwabAuth) {
+pub(crate) async fn setup_test_tokens(pool: &SqlitePool, auth: &SchwabAuth) {
     let tokens = SchwabTokens {
         access_token: "test_access_token".to_string(),
         access_token_fetched_at: Utc::now(),
         refresh_token: "test_refresh_token".to_string(),
         refresh_token_fetched_at: Utc::now(),
     };
-    tokens.store(pool, &config.encryption_key).await.unwrap();
+    tokens.store(pool, &auth.encryption_key).await.unwrap();
 }
 
 /// Builder for creating OnchainTrade test instances with sensible defaults.

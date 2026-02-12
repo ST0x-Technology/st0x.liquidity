@@ -129,7 +129,7 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+    fn create_test_ctx_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
         SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_http_401() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -195,10 +195,7 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let error = config
-            .get_tokens_from_code("invalid_code")
-            .await
-            .unwrap_err();
+        let error = ctx.get_tokens_from_code("invalid_code").await.unwrap_err();
         mock.assert();
 
         assert!(matches!(
@@ -211,14 +208,14 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_http_500() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
             then.status(500);
         });
 
-        let error = config.get_tokens_from_code("test_code").await.unwrap_err();
+        let error = ctx.get_tokens_from_code("test_code").await.unwrap_err();
         mock.assert();
 
         assert!(matches!(
@@ -231,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_invalid_json_response() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -241,7 +238,7 @@ mod tests {
         });
 
         assert!(matches!(
-            config.get_tokens_from_code("test_code").await.unwrap_err(),
+            ctx.get_tokens_from_code("test_code").await.unwrap_err(),
             SchwabError::Reqwest(_)
         ));
 

@@ -26,11 +26,11 @@
 //! # Usage
 //!
 //! ```ignore
-//! // Optional telemetry setup through config
+//! // Optional telemetry setup through ctx
 //! let ctx = Ctx::load_files(&config_path, &secrets_path)?;
-//! let log_level: tracing::Level = (&config.log_level).into();
+//! let log_level: tracing::Level = (&ctx.log_level).into();
 //!
-//! let telemetry_guard = if let Some(ref telemetry) = config.telemetry {
+//! let telemetry_guard = if let Some(ref telemetry) = ctx.telemetry {
 //!     match telemetry.setup(log_level) {
 //!         Ok(guard) => Some(guard),
 //!         Err(e) => {
@@ -100,7 +100,7 @@ impl std::fmt::Debug for TelemetryCtx {
 }
 
 impl TelemetryCtx {
-    pub(crate) fn from_config_and_secrets(
+    pub(crate) fn new(
         config: Option<TelemetryConfig>,
         secrets: Option<TelemetrySecrets>,
     ) -> Result<Option<Self>, TelemetryAssemblyError> {

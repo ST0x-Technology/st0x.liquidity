@@ -426,7 +426,7 @@ mod tests {
     fn get_schwab_auth(ctx: &Ctx) -> &SchwabAuth {
         match &ctx.broker {
             BrokerCtx::Schwab(auth) => auth,
-            _ => panic!("Expected Schwab broker config"),
+            _ => panic!("Expected Schwab broker ctx"),
         }
     }
 
