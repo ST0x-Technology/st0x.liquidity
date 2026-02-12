@@ -106,7 +106,7 @@ async fn get_broker_order_status<W: Write>(
 
 pub(super) async fn execute_order_with_writers<W: Write>(
     symbol: Symbol,
-    quantity: u64,
+    quantity: f64,
     direction: Direction,
     time_in_force: Option<TimeInForce>,
     ctx: &Ctx,
@@ -115,7 +115,7 @@ pub(super) async fn execute_order_with_writers<W: Write>(
 ) -> anyhow::Result<()> {
     let market_order = MarketOrder {
         symbol: symbol.clone(),
-        shares: Positive::new(FractionalShares::new(Decimal::from(quantity)))?,
+        shares: Positive::new(FractionalShares::new(Decimal::try_from(quantity)?))?,
         direction,
     };
 
@@ -470,7 +470,7 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -495,7 +495,7 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("TSLA").unwrap(),
-            50,
+            50.0,
             Direction::Sell,
             None,
             &ctx,
@@ -537,7 +537,7 @@ mod tests {
 
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -560,7 +560,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
@@ -604,7 +604,7 @@ mod tests {
         let mut stdout_buffer = Vec::new();
         execute_order_with_writers(
             Symbol::new("AAPL").unwrap(),
-            100,
+            100.0,
             Direction::Buy,
             None,
             &ctx,
