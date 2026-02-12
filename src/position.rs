@@ -161,7 +161,7 @@ impl Position {
         position: &Self,
         event: &PositionEvent,
         offchain_order_id: OffchainOrderId,
-        shares_filled: FractionalShares,
+        shares_filled: Positive<FractionalShares>,
         direction: Direction,
         broker_timestamp: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<ArithmeticError<FractionalShares>>> {
@@ -171,13 +171,13 @@ impl Position {
 
         match direction {
             Direction::Sell => Ok(Self {
-                net: (position.net - shares_filled)?,
+                net: (position.net - shares_filled.inner())?,
                 pending_offchain_order_id: None,
                 last_updated: Some(broker_timestamp),
                 ..position.clone()
             }),
             Direction::Buy => Ok(Self {
-                net: (position.net + shares_filled)?,
+                net: (position.net + shares_filled.inner())?,
                 pending_offchain_order_id: None,
                 last_updated: Some(broker_timestamp),
                 ..position.clone()
@@ -322,7 +322,7 @@ impl Position {
     fn handle_complete_offchain_order(
         &self,
         offchain_order_id: OffchainOrderId,
-        shares_filled: FractionalShares,
+        shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
@@ -617,7 +617,7 @@ pub(crate) enum PositionCommand {
     },
     CompleteOffChainOrder {
         offchain_order_id: OffchainOrderId,
-        shares_filled: FractionalShares,
+        shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
@@ -666,7 +666,7 @@ pub(crate) enum PositionEvent {
     },
     OffChainOrderFilled {
         offchain_order_id: OffchainOrderId,
-        shares_filled: FractionalShares,
+        shares_filled: Positive<FractionalShares>,
         direction: Direction,
         executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
@@ -997,7 +997,7 @@ mod tests {
                 ])
                 .when(PositionCommand::CompleteOffChainOrder {
                     offchain_order_id,
-                    shares_filled: FractionalShares::ONE,
+                    shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
                     direction: Direction::Sell,
                     executor_order_id,
                     price_cents,
@@ -1091,7 +1091,7 @@ mod tests {
             },
             PositionEvent::OffChainOrderFilled {
                 offchain_order_id,
-                shares_filled: FractionalShares::new(dec!(1.5)),
+                shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                 direction: Direction::Sell,
                 executor_order_id,
                 price_cents,
@@ -1153,7 +1153,7 @@ mod tests {
             },
             PositionEvent::OffChainOrderFilled {
                 offchain_order_id,
-                shares_filled: FractionalShares::new(dec!(1.5)),
+                shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                 direction: Direction::Buy,
                 executor_order_id,
                 price_cents,
@@ -1377,7 +1377,7 @@ mod tests {
 
         let event = PositionEvent::OffChainOrderFilled {
             offchain_order_id,
-            shares_filled: FractionalShares::new(dec!(100)),
+            shares_filled: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Sell,
             executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15025),
@@ -1415,7 +1415,7 @@ mod tests {
 
         let event = PositionEvent::OffChainOrderFilled {
             offchain_order_id,
-            shares_filled: FractionalShares::new(dec!(25)),
+            shares_filled: Positive::new(FractionalShares::new(dec!(25))).unwrap(),
             direction: Direction::Buy,
             executor_order_id: ExecutorOrderId::new("ORD456"),
             price_cents: PriceCents(14500),
@@ -1638,7 +1638,7 @@ mod tests {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderFilled {
             offchain_order_id: OffchainOrderId::new(),
-            shares_filled: FractionalShares::ONE,
+            shares_filled: Positive::new(FractionalShares::ONE).unwrap(),
             direction: Direction::Sell,
             executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),

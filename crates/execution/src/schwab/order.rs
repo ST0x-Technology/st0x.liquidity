@@ -1134,7 +1134,7 @@ mod tests {
         account_mock.assert();
         order_status_mock.assert();
 
-        assert!(matches!(error, SchwabError::InvalidConfiguration(_)));
+        assert!(matches!(error, SchwabError::ApiResponseParse { .. }));
     }
 
     #[tokio::test]

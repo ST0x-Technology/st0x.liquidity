@@ -91,14 +91,15 @@ pub enum SchwabError {
     /// Schwab API response body parsing failed.
     /// `action`: Description of the attempted operation.
     /// `response_text`: Raw API response body.
-    /// `parse_error`: Error message from parser.
+    /// `source`: The JSON deserialization error.
     #[error(
-        "Failed to parse API response: {action}, response: {response_text}, error: {parse_error}"
+        "Failed to parse API response: {action}, response: {response_text}, error: {source}"
     )]
     ApiResponseParse {
         action: String,
         response_text: String,
-        parse_error: String,
+        #[source]
+        source: serde_json::Error,
     },
 
     /// Token encryption or decryption failed, wraps [`encryption::EncryptionError`].

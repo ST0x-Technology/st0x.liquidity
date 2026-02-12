@@ -708,7 +708,7 @@ mod tests {
         });
 
         trading::execute_order_with_writers(
-            Symbol::new("AAPL").unwrap(),
+            Symbol::new("tAAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -751,7 +751,7 @@ mod tests {
         });
 
         trading::execute_order_with_writers(
-            Symbol::new("TSLA").unwrap(),
+            Symbol::new("tTSLA").unwrap(),
             50,
             Direction::Sell,
             &ctx,
@@ -795,7 +795,7 @@ mod tests {
         });
 
         trading::execute_order_with_writers(
-            Symbol::new("AAPL").unwrap(),
+            Symbol::new("tAAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -826,7 +826,7 @@ mod tests {
             .unwrap();
 
         let result = trading::execute_order_with_writers(
-            Symbol::new("AAPL").unwrap(),
+            Symbol::new("tAAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -895,7 +895,7 @@ mod tests {
         });
 
         let result = trading::execute_order_with_writers(
-            Symbol::new("AAPL").unwrap(),
+            Symbol::new("tAAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,

@@ -659,6 +659,7 @@ where
                 &position_cqrs,
                 &position_query,
                 &offchain_order_cqrs,
+                &execution_threshold,
             )
             .await
             {
@@ -1222,76 +1223,6 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
     }
 }
 
-async fn execute_new_execution_cqrs(
-    position_cqrs: &PositionCqrs,
-    offchain_order_cqrs: &OffchainOrderCqrs,
-    offchain_order_id: OffchainOrderId,
-    params: &ExecutionParams,
-    threshold: &ExecutionThreshold,
-) {
-    execute_place_offchain_order_position(position_cqrs, offchain_order_id, params, threshold)
-        .await;
-    execute_place_offchain_order(offchain_order_cqrs, offchain_order_id, params).await;
-}
-
-async fn execute_place_offchain_order_position(
-    position_cqrs: &PositionCqrs,
-    offchain_order_id: OffchainOrderId,
-    params: &ExecutionParams,
-    threshold: &ExecutionThreshold,
-) {
-    let position_agg_id = Position::aggregate_id(&params.symbol);
-
-    let command = PositionCommand::PlaceOffChainOrder {
-        offchain_order_id,
-        shares: params.shares,
-        direction: params.direction,
-        executor: params.executor,
-        threshold: *threshold,
-    };
-
-    match position_cqrs.execute(&position_agg_id, command).await {
-        Ok(()) => info!(
-            %offchain_order_id,
-            symbol = %params.symbol,
-            "Position::PlaceOffChainOrder succeeded"
-        ),
-        Err(error) => error!(
-            %offchain_order_id,
-            symbol = %params.symbol,
-            "Position::PlaceOffChainOrder failed: {error}"
-        ),
-    }
-}
-
-async fn execute_place_offchain_order(
-    offchain_order_cqrs: &OffchainOrderCqrs,
-    offchain_order_id: OffchainOrderId,
-    params: &ExecutionParams,
-) {
-    let offchain_agg_id = offchain_order_id.to_string();
-
-    let command = OffchainOrderCommand::Place {
-        symbol: params.symbol.clone(),
-        shares: params.shares,
-        direction: params.direction,
-        executor: params.executor,
-    };
-
-    match offchain_order_cqrs.execute(&offchain_agg_id, command).await {
-        Ok(()) => info!(
-            %offchain_order_id,
-            symbol = %params.symbol,
-            "OffchainOrder::Place succeeded"
-        ),
-        Err(error) => error!(
-            %offchain_order_id,
-            symbol = %params.symbol,
-            "OffchainOrder::Place failed: {error}"
-        ),
-    }
-}
-
 async fn process_queued_trade(
     executor_type: SupportedExecutor,
     pool: &SqlitePool,
@@ -1328,14 +1259,50 @@ async fn process_queued_trade(
     };
 
     let offchain_order_id = OffchainOrderId::new();
-    execute_new_execution_cqrs(
-        &cqrs.position_cqrs,
-        &cqrs.offchain_order_cqrs,
+    let position_agg_id = Position::aggregate_id(&params.symbol);
+
+    let command = PositionCommand::PlaceOffChainOrder {
         offchain_order_id,
-        &params,
-        &cqrs.execution_threshold,
-    )
-    .await;
+        shares: params.shares,
+        direction: params.direction,
+        executor: params.executor,
+        threshold: cqrs.execution_threshold,
+    };
+
+    match cqrs.position_cqrs.execute(&position_agg_id, command).await {
+        Ok(()) => info!(
+            %offchain_order_id,
+            symbol = %params.symbol,
+            "Position::PlaceOffChainOrder succeeded"
+        ),
+        Err(error) => error!(
+            %offchain_order_id,
+            symbol = %params.symbol,
+            "Position::PlaceOffChainOrder failed: {error}"
+        ),
+    }
+
+    let offchain_agg_id = offchain_order_id.to_string();
+
+    let command = OffchainOrderCommand::Place {
+        symbol: params.symbol.clone(),
+        shares: params.shares,
+        direction: params.direction,
+        executor: params.executor,
+    };
+
+    match cqrs.offchain_order_cqrs.execute(&offchain_agg_id, command).await {
+        Ok(()) => info!(
+            %offchain_order_id,
+            symbol = %params.symbol,
+            "OffchainOrder::Place succeeded"
+        ),
+        Err(error) => error!(
+            %offchain_order_id,
+            symbol = %params.symbol,
+            "OffchainOrder::Place failed: {error}"
+        ),
+    }
 
     Ok(Some(offchain_order_id))
 }
@@ -1375,6 +1342,7 @@ async fn check_and_execute_accumulated_positions<E>(
     position_cqrs: &PositionCqrs,
     position_query: &PositionQuery,
     offchain_order_cqrs: &Arc<OffchainOrderCqrs>,
+    threshold: &ExecutionThreshold,
 ) -> Result<(), EventProcessingError>
 where
     E: Executor + Clone + Send + 'static,
@@ -1405,14 +1373,50 @@ where
             "Executing accumulated position"
         );
 
-        execute_new_execution_cqrs(
-            position_cqrs,
-            offchain_order_cqrs,
+        let position_agg_id = Position::aggregate_id(&params.symbol);
+
+        let command = PositionCommand::PlaceOffChainOrder {
             offchain_order_id,
-            &params,
-            threshold,
-        )
-        .await;
+            shares: params.shares,
+            direction: params.direction,
+            executor: params.executor,
+            threshold: *threshold,
+        };
+
+        match position_cqrs.execute(&position_agg_id, command).await {
+            Ok(()) => info!(
+                %offchain_order_id,
+                symbol = %params.symbol,
+                "Position::PlaceOffChainOrder succeeded"
+            ),
+            Err(error) => error!(
+                %offchain_order_id,
+                symbol = %params.symbol,
+                "Position::PlaceOffChainOrder failed: {error}"
+            ),
+        }
+
+        let offchain_agg_id = offchain_order_id.to_string();
+
+        let command = OffchainOrderCommand::Place {
+            symbol: params.symbol.clone(),
+            shares: params.shares,
+            direction: params.direction,
+            executor: params.executor,
+        };
+
+        match offchain_order_cqrs.execute(&offchain_agg_id, command).await {
+            Ok(()) => info!(
+                %offchain_order_id,
+                symbol = %params.symbol,
+                "OffchainOrder::Place succeeded"
+            ),
+            Err(error) => error!(
+                %offchain_order_id,
+                symbol = %params.symbol,
+                "OffchainOrder::Place failed: {error}"
+            ),
+        }
     }
 
     Ok(())
@@ -3117,6 +3121,7 @@ mod tests {
             &cqrs.position_cqrs,
             &cqrs.position_query,
             &cqrs.offchain_order_cqrs,
+            &cqrs.execution_threshold,
         )
         .await
         .unwrap();
