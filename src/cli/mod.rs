@@ -1372,82 +1372,62 @@ mod tests {
     fn test_time_in_force_cli_option() {
         let cmd = Cli::command();
 
-        // Buy with --time-in-force day
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "buy",
-            "-s",
-            "AAPL",
-            "-q",
-            "100",
-            "--time-in-force",
-            "day",
-        ]);
-        assert!(
-            result.is_ok(),
-            "buy with --time-in-force day should succeed: {:?}",
-            result.err()
-        );
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "cli",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "day",
+            ])
+            .unwrap();
 
-        // Buy with --time-in-force market-on-close
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "buy",
-            "-s",
-            "AAPL",
-            "-q",
-            "100",
-            "--time-in-force",
-            "market-on-close",
-        ]);
-        assert!(
-            result.is_ok(),
-            "buy with --time-in-force market-on-close should succeed: {:?}",
-            result.err()
-        );
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "cli",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "market-on-close",
+            ])
+            .unwrap();
 
-        // Sell with --time-in-force market-on-close
-        let result = cmd.clone().try_get_matches_from(vec![
-            "cli",
-            "sell",
-            "-s",
-            "TSLA",
-            "-q",
-            "50",
-            "--time-in-force",
-            "market-on-close",
-        ]);
-        assert!(
-            result.is_ok(),
-            "sell with --time-in-force market-on-close should succeed: {:?}",
-            result.err()
-        );
+        cmd.clone()
+            .try_get_matches_from(vec![
+                "cli",
+                "sell",
+                "-s",
+                "TSLA",
+                "-q",
+                "50",
+                "--time-in-force",
+                "market-on-close",
+            ])
+            .unwrap();
 
-        // Buy without --time-in-force (should still work, it's optional)
-        let result = cmd
-            .clone()
-            .try_get_matches_from(vec!["cli", "buy", "-s", "AAPL", "-q", "100"]);
-        assert!(
-            result.is_ok(),
-            "buy without --time-in-force should succeed: {:?}",
-            result.err()
-        );
+        cmd.clone()
+            .try_get_matches_from(vec!["cli", "buy", "-s", "AAPL", "-q", "100"])
+            .unwrap();
 
-        // Invalid --time-in-force value
-        let result = cmd.try_get_matches_from(vec![
-            "cli",
-            "buy",
-            "-s",
-            "AAPL",
-            "-q",
-            "100",
-            "--time-in-force",
-            "invalid",
-        ]);
-        assert!(
-            result.is_err(),
-            "buy with invalid --time-in-force should fail"
-        );
+        let err = cmd
+            .try_get_matches_from(vec![
+                "cli",
+                "buy",
+                "-s",
+                "AAPL",
+                "-q",
+                "100",
+                "--time-in-force",
+                "invalid",
+            ])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[tokio::test]
