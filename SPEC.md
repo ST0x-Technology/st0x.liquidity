@@ -196,57 +196,61 @@ job handler never touches `Services` directly - it operates through the CQRS
 command interface.
 
 ```mermaid
-graph TB
-    subgraph "apalis Data T (orchestration layer)"
+graph TD
+    subgraph "Orchestration Layer - apalis Data T"
+        direction LR
         JH[Job Handler]
-        JH -->|"Data&lt;Cqrs&lt;Position&gt;&gt;"| CQRS[Cqrs::execute]
-        JH -->|"Data&lt;SqliteStorage&lt;Job&gt;&gt;"| PQ[Push downstream jobs]
-        JH -->|"Data&lt;View&lt;A&gt;&gt;"| VR[Read projections]
+        CQRS_I["Cqrs&lt;A&gt; instance"]
+        JQ["SqliteStorage&lt;Job&gt;"]
+        VIEW["View&lt;A&gt;"]
+        JH -->|receives| CQRS_I
+        JH -->|receives| JQ
+        JH -->|receives| VIEW
     end
 
-    subgraph "CQRS Services (domain layer)"
-        CQRS -->|"internally injects Services"| AH[Aggregate::handle]
-        AH -->|"&dyn Executor"| Broker[Broker API]
-        AH -->|"&dyn Provider"| RPC[Ethereum RPC]
-        AH -->|"&dyn Tokenizer"| TOK[Tokenization API]
-    end
+    CQRS_I -->|"execute(command)"| HANDLE
 
-    style JH fill:#e1f5fe
-    style AH fill:#fff3e0
+    subgraph "Domain Layer - CQRS Aggregate::Services"
+        direction LR
+        HANDLE["Aggregate::handle()"]
+        BROKER[Broker API]
+        RPC[Ethereum RPC]
+        TOKEN[Tokenization API]
+        HANDLE -->|uses| BROKER
+        HANDLE -->|uses| RPC
+        HANDLE -->|uses| TOKEN
+    end
 ```
 
 ##### System Overview
 
 ```mermaid
-graph TB
-    subgraph "Persistent Job Queue (SQLite)"
-        Q1[ProcessOnchainEvent]
-        Q2[PlaceOffchainOrder]
-        Q3[ExecuteRebalancing]
-        Q4[EnrichOnchainTrade]
+graph TD
+    WS[DEX WebSocket - tokio::spawn]
+
+    subgraph QUEUE["Persistent Job Queue (SQLite)"]
+        direction LR
+        POE[ProcessOnchainEvent]
+        PFO[PlaceOffchainOrder]
+        EOT[EnrichOnchainTrade]
+        ER[ExecuteRebalancing]
     end
 
-    subgraph "Monitor (single tokio task)"
-        W1[Trade Processing Worker]
-        W2[Order Placement Worker]
-        W3[Rebalancing Worker]
-        W4[Enrichment Worker]
+    subgraph MON[Monitor]
+        direction LR
+        W1[Trade Worker]
+        W2[Order Worker]
+        W3[Enrichment Worker]
+        W4[Rebalancing Worker]
         W5[Cron Workers]
     end
 
-    WS[DEX WebSocket<br/>tokio::spawn] -->|push| Q1
-    Q1 --> W1
-    W1 -->|push| Q2
-    W1 -->|push| Q4
-    Q2 --> W2
-    Q3 --> W3
-    Q4 --> W4
-    W5 -->|push| Q3
+    CQRS[CQRS Aggregates]
 
-    W1 -->|execute| CQRS[CQRS Aggregates]
-    W2 -->|execute| CQRS
-    W3 -->|execute| CQRS
-    W4 -->|execute| CQRS
+    WS -->|push| QUEUE
+    QUEUE --> MON
+    MON -->|push| QUEUE
+    MON -->|execute| CQRS
 ```
 
 ### Trade Execution
@@ -2684,36 +2688,40 @@ by a dedicated worker with typed `Data<T>` dependencies.
 
 #### Job Dependency Graph
 
-```mermaid
-graph TD
-    WS[DEX WebSocket Listener<br/>tokio::spawn] -->|push| POE[ProcessOnchainEvent]
+##### Job-to-Job Flow
 
+How jobs produce other jobs. Solid arrows are persistent job pushes, dashed
+arrows are external reads/calls.
+
+```mermaid
+graph LR
+    WS[DEX WebSocket] -->|push| POE[ProcessOnchainEvent]
     POE -->|push| PFO[PlaceOffchainOrder]
     POE -->|push| EOT[EnrichOnchainTrade]
+    CAP[CheckAccumulatedPositions] -->|push| PFO
+    RT[RebalancingTrigger] -->|push| ER[ExecuteRebalancing]
 
-    POS[PollOrderStatus<br/>cron 5s] -.->|reads| Broker[Broker API]
-    CAP[CheckAccumulatedPositions<br/>cron 10s] -->|push| PFO
+    POS[PollOrderStatus] -.->|reads| Broker[Broker API]
+    PI[PollInventory] -.->|reads| Broker
+    EM[ExecutorMaintenance] -.->|calls| Broker
+    CA[ComputeAnalytics] -.->|reads| Views[CQRS Views]
+```
 
-    RT[RebalancingTrigger<br/>CQRS Query] -->|push| ER[ExecuteRebalancing]
+##### Job-to-Aggregate Mapping
 
-    PI[PollInventory<br/>cron 60s] -.->|reads| Broker
-    EM[ExecutorMaintenance<br/>cron 30min] -.->|calls| Broker
+Which jobs write to which CQRS aggregates.
 
-    CA[ComputeAnalytics<br/>cron, future] -.->|reads| Views[CQRS Views]
-
-    POE -->|execute| OT_AGG[OnChainTrade Aggregate]
-    POE -->|execute| P_AGG[Position Aggregate]
-    PFO -->|execute| OO_AGG[OffchainOrder Aggregate]
-    PFO -->|execute| P_AGG
-    EOT -->|execute| OT_AGG
-    POS -->|execute| OO_AGG
-    POS -->|execute| P_AGG
-    ER -->|execute| Rebalance_AGG[UsdcRebalance Aggregate]
-    PI -->|execute| INV_AGG[InventorySnapshot Aggregate]
-
-    style WS fill:#e1f5fe
-    style RT fill:#fff3e0
-    style CA fill:#f3e5f5,stroke-dasharray: 5 5
+```mermaid
+graph LR
+    POE[ProcessOnchainEvent] --> OT[OnChainTrade]
+    POE --> P[Position]
+    EOT[EnrichOnchainTrade] --> OT
+    PFO[PlaceOffchainOrder] --> OO[OffchainOrder]
+    PFO --> P
+    POS[PollOrderStatus] --> OO
+    POS --> P
+    ER[ExecuteRebalancing] --> REB[UsdcRebalance]
+    PI[PollInventory] --> INV[InventorySnapshot]
 ```
 
 #### Trade Processing Pipeline
