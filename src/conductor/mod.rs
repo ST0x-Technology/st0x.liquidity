@@ -41,8 +41,8 @@ use crate::inventory::{
 };
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
-    OffchainOrderId, OrderPlacer,
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
+    OrderPlacer,
 };
 use crate::onchain::accumulator::{
     ExecutionParams, check_all_positions, check_execution_readiness,
@@ -277,13 +277,13 @@ impl Conductor {
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let (trigger, rebalancer) = match ctx.rebalancing_config() {
-            Some(rebalancing_config) => {
-                let signer = PrivateKeySigner::from_bytes(&rebalancing_config.evm_private_key)?;
+        let (trigger, rebalancer) = match ctx.rebalancing_ctx() {
+            Some(rebalancing_ctx) => {
+                let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
                 let market_maker_wallet = signer.address();
 
                 let (trigger, rebalancer_handle) = spawn_rebalancing_infrastructure(
-                    rebalancing_config,
+                    rebalancing_ctx,
                     pool,
                     ctx,
                     &inventory,
@@ -301,8 +301,8 @@ impl Conductor {
         let (position_cqrs, position_query) = build_position_cqrs(pool, trigger.as_ref());
 
         let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
+            Lifecycle<OffchainOrder>,
+            Lifecycle<OffchainOrder>,
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
@@ -412,8 +412,8 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
 
     let trigger = Arc::new(RebalancingTrigger::new(
         RebalancingTriggerConfig {
-            equity_threshold: rebalancing_config.equity_threshold,
-            usdc_threshold: rebalancing_config.usdc_threshold,
+            equity_threshold: rebalancing_ctx.equity_threshold,
+            usdc_threshold: rebalancing_ctx.usdc_threshold,
         },
         pool.clone(),
         ctx.evm.orderbook,
@@ -446,7 +446,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     };
 
     let handle = spawn_rebalancer(
-        rebalancing_config,
+        rebalancing_ctx,
         provider.clone(),
         ctx.evm.orderbook,
         market_maker_wallet,
@@ -512,14 +512,14 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
     position_cqrs: Arc<PositionCqrs>,
 ) -> JoinHandle<()> {
-    let poller_config = ctx.get_order_poller_config();
+    let poller_ctx = ctx.get_order_poller_ctx();
     info!(
         "Starting order status poller with interval: {:?}, max jitter: {:?}",
-        poller_config.polling_interval, poller_config.max_jitter
+        poller_ctx.polling_interval, poller_ctx.max_jitter
     );
 
     let poller = OrderStatusPoller::new(
-        poller_config,
+        poller_ctx,
         pool.clone(),
         executor,
         offchain_order_cqrs,
@@ -1512,7 +1512,7 @@ mod tests {
     use super::*;
     use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
     use crate::conductor::builder::CqrsFrameworks;
-    use crate::config::tests::create_test_config;
+    use crate::config::tests::create_test_ctx;
     use crate::inventory::ImbalanceThreshold;
     use crate::offchain_order::PriceCents;
     use crate::onchain::trade::OnchainTrade;
@@ -1581,7 +1581,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_v2_event_filtering_without_errors() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
@@ -1637,7 +1637,7 @@ mod tests {
     #[tokio::test]
     async fn test_logs_info_when_event_is_filtered_out() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
@@ -1691,7 +1691,7 @@ mod tests {
     #[tokio::test]
     async fn test_logs_event_type_when_processing() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
@@ -1744,7 +1744,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_abort_all() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1773,7 +1773,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_individual_abort() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1806,7 +1806,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_builder_returns_immediately() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1840,7 +1840,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_without_rebalancer() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1871,7 +1871,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_with_rebalancer() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1909,7 +1909,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_rebalancer_aborted_on_abort_all() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -1948,7 +1948,7 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
         let pool = setup_test_db().await;
-        let config = create_test_config();
+        let config = create_test_ctx();
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2716,8 +2716,8 @@ mod tests {
         ));
 
         let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
+            Lifecycle<OffchainOrder>,
+            Lifecycle<OffchainOrder>,
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
@@ -2875,8 +2875,8 @@ mod tests {
         );
 
         let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
+            Lifecycle<OffchainOrder>,
+            Lifecycle<OffchainOrder>,
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
