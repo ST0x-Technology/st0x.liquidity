@@ -437,7 +437,7 @@ async fn run_command_with_writers<W: Write>(
         Ok(simple) => run_simple_command(simple, &ctx, pool, stdout).await?,
         Err(provider_cmd) => {
             let order_placer = trading::create_order_placer(&ctx, pool);
-            run_provider_command(provider_cmd, &ctx, pool, stdout, order_placer).await?
+            run_provider_command(provider_cmd, &ctx, pool, stdout, order_placer).await?;
         }
     }
 
@@ -665,9 +665,8 @@ mod tests {
     use crate::bindings::IERC20::{decimalsCall, symbolCall};
     use crate::bindings::IOrderBookV5::{AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3};
     use crate::config::{BrokerCtx, LogLevel, SchwabAuth};
-    use crate::offchain::execution::find_executions_by_symbol_status_and_broker;
+    use crate::offchain::execution::find_orders_by_status;
     use crate::onchain::EvmCtx;
-    use crate::onchain::trade::OnchainTrade;
     use crate::test_utils::{get_test_order, setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 
@@ -1783,39 +1782,23 @@ mod tests {
             result.as_ref().err()
         );
 
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
+        let executions = find_orders_by_status(&pool, OrderStatus::Submitted)
             .await
             .unwrap();
-        assert_eq!(trade.symbol.to_string(), "tAAPL");
-        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
-
-        let executions = find_executions_by_symbol_status_and_broker(
-            &pool,
-            Some(Symbol::new("AAPL").unwrap()),
-            OrderStatus::Submitted,
-            None,
-        )
-        .await
-        .unwrap();
         assert_eq!(executions.len(), 1);
+
+        let (order_id, lifecycle) = &executions[0];
+        let order = lifecycle.live().unwrap();
         assert_eq!(
-            executions[0].shares,
+            order.shares(),
             Positive::new(FractionalShares::new(Decimal::from(9))).unwrap()
         );
-        assert_eq!(executions[0].direction, Direction::Buy);
-
-        let execution_id = executions[0].id.unwrap();
-        let row = sqlx::query!(
-            "SELECT order_id FROM offchain_trades WHERE id = ?1",
-            execution_id
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        assert_eq!(order.direction(), Direction::Buy);
         assert!(
-            row.order_id.is_some(),
-            "Order ID should be stored for polling"
+            order.executor_order_id().is_some(),
+            "Executor order ID should be set after submission"
         );
+        assert!(!order_id.to_string().is_empty());
 
         account_mock.assert();
         order_mock.assert();
@@ -1902,11 +1885,15 @@ mod tests {
             result1.as_ref().err()
         );
 
-        let trade = OnchainTrade::find_by_tx_hash_and_log_index(&pool, tx_hash, 0)
+        let executions = find_orders_by_status(&pool, OrderStatus::Submitted)
             .await
             .unwrap();
-        assert_eq!(trade.symbol.to_string(), "tTSLA");
-        assert_eq!(trade.amount, FractionalShares::new(dec!(5)));
+        assert_eq!(executions.len(), 1);
+        let order = executions[0].1.live().unwrap();
+        assert_eq!(
+            order.shares(),
+            Positive::new(FractionalShares::new(dec!(5))).unwrap()
+        );
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();
         assert!(stdout_str1.contains("Processing trade with TradeAccumulator"));
@@ -1944,8 +1931,13 @@ mod tests {
             "Second process_tx should succeed with graceful duplicate handling"
         );
 
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 1, "Only one trade should exist in database");
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events WHERE aggregate_type = 'Position'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "Only one position aggregate should exist");
 
         let stdout_str2 = String::from_utf8(stdout2).unwrap();
         assert!(stdout_str2.contains("Processing trade with TradeAccumulator"));

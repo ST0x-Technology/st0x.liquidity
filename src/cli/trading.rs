@@ -20,7 +20,9 @@ use st0x_execution::{
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::lifecycle::Lifecycle;
-use crate::offchain_order::{OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer};
+use crate::offchain_order::{
+    OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer, build_offchain_order_cqrs,
+};
 use crate::onchain::accumulator::check_execution_readiness;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
@@ -304,17 +306,7 @@ pub(super) async fn process_found_trade<W: Write>(
             vec![Box::new(GenericQuery::new(position_view_repo))],
             (),
         ));
-    let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-        Lifecycle<OffchainOrder>,
-        Lifecycle<OffchainOrder>,
-    >::new(
-        pool.clone(), "offchain_order_view".to_string()
-    ));
-    let offchain_order_cqrs: Arc<SqliteCqrs<Lifecycle<OffchainOrder>>> = Arc::new(sqlite_cqrs(
-        pool.clone(),
-        vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-        order_placer,
-    ));
+    let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
 
     update_position_aggregate(&position_cqrs, &onchain_trade, ctx.execution_threshold).await;
 
@@ -428,12 +420,25 @@ async fn acknowledge_fill(
         return;
     };
 
+    // Ensure the position aggregate exists before acknowledging
+    // the fill. AlreadyInitialized is expected on subsequent
+    // trades for the same symbol.
+    let _ = position_cqrs
+        .execute(
+            aggregate_id,
+            PositionCommand::Initialize {
+                symbol: base_symbol.clone(),
+                threshold: execution_threshold,
+            },
+        )
+        .await;
+
     let trade_id = TradeId {
         tx_hash: onchain_trade.tx_hash,
         log_index: onchain_trade.log_index,
     };
 
-    if let Err(e) = position_cqrs
+    if let Err(error) = position_cqrs
         .execute(
             aggregate_id,
             PositionCommand::AcknowledgeOnChainFill {
@@ -452,7 +457,7 @@ async fn acknowledge_fill(
             tx_hash = %onchain_trade.tx_hash,
             log_index = onchain_trade.log_index,
             block_timestamp = ?onchain_trade.block_timestamp,
-            error = ?e,
+            %error,
             "Failed to acknowledge onchain fill in position aggregate"
         );
     }

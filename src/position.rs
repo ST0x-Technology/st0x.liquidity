@@ -1911,4 +1911,95 @@ mod tests {
             shares.inner()
         );
     }
+
+    #[tokio::test]
+    async fn load_position_returns_none_when_no_aggregate_exists() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let view_repo =
+            std::sync::Arc::new(sqlite_es::SqliteViewRepository::<
+                PositionAggregate,
+                PositionAggregate,
+            >::new(pool.clone(), "position_view".to_string()));
+        let query = cqrs_es::persist::GenericQuery::new(view_repo);
+
+        let result = load_position(&query, &Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "Should return None for non-existent aggregate"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_position_returns_none_for_uninitialized_lifecycle() {
+        let pool = crate::test_utils::setup_test_db().await;
+
+        // Manually insert an Uninitialized lifecycle into the view table
+        sqlx::query("INSERT INTO position_view (view_id, version, payload) VALUES (?, ?, ?)")
+            .bind("AAPL")
+            .bind(0i64)
+            .bind(
+                serde_json::to_string(
+                    &Lifecycle::<Position, ArithmeticError<FractionalShares>>::default(),
+                )
+                .unwrap(),
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let view_repo =
+            std::sync::Arc::new(sqlite_es::SqliteViewRepository::<
+                PositionAggregate,
+                PositionAggregate,
+            >::new(pool.clone(), "position_view".to_string()));
+        let query = cqrs_es::persist::GenericQuery::new(view_repo);
+
+        let result = load_position(&query, &Symbol::new("AAPL").unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "Should return None for uninitialized lifecycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_position_returns_position_for_live_lifecycle() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let view_repo =
+            std::sync::Arc::new(sqlite_es::SqliteViewRepository::<
+                PositionAggregate,
+                PositionAggregate,
+            >::new(pool.clone(), "position_view".to_string()));
+        let position_query =
+            std::sync::Arc::new(cqrs_es::persist::GenericQuery::new(view_repo.clone()));
+
+        let cqrs = sqlite_es::sqlite_cqrs(
+            pool.clone(),
+            vec![Box::new(cqrs_es::persist::GenericQuery::new(view_repo))],
+            (),
+        );
+
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        cqrs.execute(
+            &Position::aggregate_id(&symbol),
+            PositionCommand::Initialize {
+                symbol: symbol.clone(),
+                threshold: one_share_threshold(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = load_position(&position_query, &symbol).await.unwrap();
+
+        let position = result.expect("Should return Some for live lifecycle");
+        assert_eq!(position.symbol, symbol);
+        assert_eq!(position.net.inner(), dec!(0));
+    }
 }

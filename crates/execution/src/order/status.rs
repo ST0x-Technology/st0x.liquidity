@@ -46,3 +46,44 @@ impl std::str::FromStr for OrderStatus {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn serde_round_trip() {
+        for status in [
+            OrderStatus::Pending,
+            OrderStatus::Submitted,
+            OrderStatus::Filled,
+            OrderStatus::Failed,
+        ] {
+            let json = serde_json::to_string(&status).unwrap();
+            let deserialized: OrderStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, deserialized, "round-trip failed for {status}");
+        }
+    }
+
+    #[test]
+    fn display_from_str_round_trip() {
+        for status in [
+            OrderStatus::Pending,
+            OrderStatus::Submitted,
+            OrderStatus::Filled,
+            OrderStatus::Failed,
+        ] {
+            let displayed = status.to_string();
+            let parsed = OrderStatus::from_str(&displayed).unwrap();
+            assert_eq!(status, parsed, "round-trip failed for {displayed}");
+        }
+    }
+
+    #[test]
+    fn from_str_invalid() {
+        let err = OrderStatus::from_str("UNKNOWN").unwrap_err();
+        assert!(matches!(err, ParseOrderStatusError::InvalidStatus(s) if s == "UNKNOWN"));
+    }
+}

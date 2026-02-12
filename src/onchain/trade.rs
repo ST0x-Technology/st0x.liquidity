@@ -147,8 +147,8 @@ pub struct OnchainTrade {
     pub(crate) created_at: Option<DateTime<Utc>>,
     pub(crate) gas_used: Option<u64>,
     pub(crate) effective_gas_price: Option<u128>,
-    pub(crate) pyth_price: Option<f64>,
-    pub(crate) pyth_confidence: Option<f64>,
+    pub(crate) pyth_price: Option<Decimal>,
+    pub(crate) pyth_confidence: Option<Decimal>,
     pub(crate) pyth_exponent: Option<i32>,
     pub(crate) pyth_publish_time: Option<DateTime<Utc>>,
 }
@@ -197,13 +197,13 @@ impl OnchainTrade {
             onchain_output_amount,
         )?;
 
-        if trade_details.equity_amount().value().is_zero() {
+        if trade_details.equity_amount().inner().is_zero() {
             return Ok(None);
         }
 
         // Calculate price per share in USDC (always USDC amount / equity amount)
         let price_per_share_usdc =
-            trade_details.usdc_amount().value() / trade_details.equity_amount().value();
+            trade_details.usdc_amount().value() / trade_details.equity_amount().inner();
 
         if price_per_share_usdc <= Decimal::ZERO {
             return Ok(None);
@@ -240,7 +240,7 @@ impl OnchainTrade {
             log_index,
             symbol: tokenized_symbol,
             equity_token,
-            amount: FractionalShares::new(trade_details.equity_amount().value()),
+            amount: trade_details.equity_amount(),
             direction: trade_details.direction(),
             price,
             block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
@@ -374,7 +374,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 /// a string, then parses it to Decimal for precision-safe arithmetic.
 fn float_to_decimal(float: B256) -> Result<Decimal, OnChainError> {
     let float = Float::from_raw(float);
-    let formatted = float.format()?;
+    let formatted = float.format_with_scientific(false)?;
     Ok(formatted.parse::<Decimal>()?)
 }
 
@@ -553,12 +553,12 @@ mod tests {
         assert!((result - dec!(1_000_000_000_000_000.0)).abs() < dec!(1.0));
 
         // Test with very small value (high negative exponent)
+        // 1e-50 exceeds Decimal's 28-digit precision, so it truncates to zero
         let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_small).unwrap();
-        // 1 × 10^-50 is extremely small
-        assert!(result > dec!(0.0) && result < dec!(0.0000000000000000000000000001));
+        assert_eq!(result, dec!(0.0));
     }
 
     #[test]

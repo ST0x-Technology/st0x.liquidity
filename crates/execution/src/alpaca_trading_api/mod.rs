@@ -27,8 +27,8 @@ pub enum AlpacaTradingApiError {
     InvalidOrderId(#[from] uuid::Error),
     #[error("Empty symbol")]
     EmptySymbol(#[from] crate::EmptySymbolError),
-    #[error("Invalid shares: {0}")]
-    InvalidShares(#[from] crate::InvalidSharesError),
+    #[error(transparent)]
+    NonPositive(#[from] crate::NonPositiveError),
     #[error("Decimal parse error: {0}")]
     DecimalParse(#[from] rust_decimal::Error),
     #[error("Num parse error: {0}")]

@@ -37,11 +37,10 @@ use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
 };
-use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
-    OrderPlacer,
+    OrderPlacer, build_offchain_order_cqrs,
 };
 use crate::onchain::accumulator::{check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
@@ -255,18 +254,8 @@ impl Conductor {
 
         let (position_cqrs, position_query) = build_position_cqrs(pool, trigger.as_ref());
 
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            Lifecycle<OffchainOrder>,
-            Lifecycle<OffchainOrder>,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            order_placer,
-        ));
+        let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         let snapshot_query = InventorySnapshotQuery::new(inventory.clone());
@@ -1053,7 +1042,11 @@ async fn execute_witness_trade(
     }
 }
 
-async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainTrade) {
+async fn execute_acknowledge_fill(
+    position_cqrs: &PositionCqrs,
+    trade: &OnchainTrade,
+    threshold: ExecutionThreshold,
+) {
     let base_symbol = trade.symbol.base();
     let aggregate_id = Position::aggregate_id(base_symbol);
 
@@ -1067,6 +1060,16 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
         );
         return;
     };
+
+    // Ensure the position aggregate exists before acknowledging
+    // the fill. AlreadyInitialized is the expected steady-state
+    // result for subsequent trades on the same symbol.
+    let init_command = PositionCommand::Initialize {
+        symbol: base_symbol.clone(),
+        threshold,
+    };
+
+    let _ = position_cqrs.execute(&aggregate_id, init_command).await;
 
     let command = PositionCommand::AcknowledgeOnChainFill {
         trade_id: TradeId {
@@ -1084,8 +1087,8 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
             "Successfully executed Position::AcknowledgeOnChainFill command: tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
-        Err(e) => error!(
-            "Failed to execute Position::AcknowledgeOnChainFill command: {e}, tx_hash={:?}, log_index={}, symbol={}",
+        Err(error) => error!(
+            "Failed to execute Position::AcknowledgeOnChainFill command: {error}, tx_hash={:?}, log_index={}, symbol={}",
             trade.tx_hash, trade.log_index, trade.symbol
         ),
     }
@@ -1100,7 +1103,7 @@ async fn process_queued_trade(
     cqrs: &TradeProcessingCqrs,
 ) -> Result<Option<OffchainOrderId>, EventProcessingError> {
     // Update Position aggregate FIRST so threshold check sees current state
-    execute_acknowledge_fill(&cqrs.position_cqrs, &trade).await;
+    execute_acknowledge_fill(&cqrs.position_cqrs, &trade, cqrs.execution_threshold).await;
 
     mark_event_processed(pool, event_id).await.map_err(|e| {
         error!("Failed to mark event {event_id} as processed: {e}");
@@ -1379,7 +1382,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4};
+    use crate::bindings::IOrderBookV5::{
+        ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4,
+    };
     use crate::conductor::builder::CqrsFrameworks;
     use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::ImbalanceThreshold;
@@ -2569,17 +2574,7 @@ mod tests {
             (),
         ));
 
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            Lifecycle<OffchainOrder>,
-            Lifecycle<OffchainOrder>,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            order_placer,
-        ));
+        let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
         let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
@@ -2726,13 +2721,7 @@ mod tests {
             "Position should track the pending offchain order"
         );
 
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            Lifecycle<OffchainOrder>,
-            Lifecycle<OffchainOrder>,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
-        let offchain_order_query = GenericQuery::new(offchain_order_view_repo);
+        let (_, offchain_order_query) = build_offchain_order_cqrs(&pool, succeeding_order_placer());
 
         let offchain_lifecycle = offchain_order_query
             .load(&OffchainOrder::aggregate_id(offchain_order_id))
@@ -3147,6 +3136,17 @@ mod tests {
 
         let position_agg_id = Position::aggregate_id(&symbol);
 
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
+
         // Acknowledge a fill -> fires position events -> trigger should react.
         position_cqrs
             .execute(
@@ -3219,6 +3219,17 @@ mod tests {
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
 
         let position_agg_id = Position::aggregate_id(&symbol);
+
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
 
         // Add 50 onchain shares via CQRS -> trigger applies to inventory.
         position_cqrs
@@ -3313,6 +3324,17 @@ mod tests {
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
 
         let position_agg_id = Position::aggregate_id(&symbol);
+
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
 
         // Small onchain fill: 55/105 = 52.4%, within 30%-70%.
         position_cqrs
@@ -3426,6 +3448,18 @@ mod tests {
         ));
 
         let (position_cqrs, _) = build_position_cqrs(&pool, Some(&trigger));
+
+        let position_agg_id = Position::aggregate_id(&symbol);
+        position_cqrs
+            .execute(
+                &position_agg_id,
+                PositionCommand::Initialize {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                },
+            )
+            .await
+            .unwrap();
 
         (position_cqrs, receiver, symbol)
     }
@@ -3546,6 +3580,17 @@ mod tests {
             let (position_cqrs, position_query) = build_position_cqrs(&pool, None);
 
             let position_agg_id = Position::aggregate_id(&symbol);
+
+            position_cqrs
+                .execute(
+                    &position_agg_id,
+                    PositionCommand::Initialize {
+                        symbol: symbol.clone(),
+                        threshold: ExecutionThreshold::whole_share(),
+                    },
+                )
+                .await
+                .unwrap();
 
             position_cqrs
                 .execute(

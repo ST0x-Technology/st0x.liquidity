@@ -16,29 +16,119 @@ they're derived from events.
 This is the power of event sourcing: unlimited flexibility in how you interpret
 historical data, as long as you preserve the raw facts.
 
-## Snapshots
+## sqlite-es Table Schemas
 
-Performance optimization that caches aggregate state to skip replaying old
-events. **Not currently enabled** — all aggregates use `new_event_store`.
+sqlite-es and cqrs-es mandate specific table schemas. All three tables are
+created in the `event_store` migration.
 
-**Enabling:** Replace `new_event_store(repo)` with `new_snapshot_store(repo, N)`
-where `N` is the snapshot frequency (events between snapshots). On load, replays
-only events after the last snapshot. On commit, writes a new snapshot when the
-event count crosses a frequency boundary. Switching between `new_event_store`
-and `new_snapshot_store` is safe **only when** existing snapshots are compatible
-with the current aggregate shape — if you've changed the aggregate's struct
-layout (fields, variants) since the last snapshot was written, you must reset
-snapshots first to avoid deserialization failures.
-
-**Resetting:** Deleting snapshots is safe anytime — the next load replays all
-events from the beginning. **Must** reset after changing an aggregate's struct
-layout (fields, variants) since the serialized snapshot won't deserialize
-against the new shape. Events are unaffected.
+### Events Table
 
 ```sql
--- Example: reset snapshots for the Mint aggregate
+CREATE TABLE IF NOT EXISTS events (
+    aggregate_type TEXT NOT NULL,
+    aggregate_id   TEXT NOT NULL,
+    sequence       BIGINT NOT NULL,
+    event_type     TEXT NOT NULL,
+    event_version  TEXT NOT NULL,
+    payload        JSON NOT NULL,
+    metadata       JSON NOT NULL,
+    PRIMARY KEY (aggregate_type, aggregate_id, sequence)
+);
+```
+
+- **aggregate_type**: From `Aggregate::aggregate_type()` (e.g., `"Position"`)
+- **aggregate_id**: Caller-provided ID string
+- **sequence**: Auto-incremented per aggregate instance (1, 2, 3, ...)
+- **event_type**: From `DomainEvent::event_type()` (e.g.,
+  `"PositionEvent::Initialized"`)
+- **event_version**: From `DomainEvent::event_version()` (e.g., `"1.0"`)
+- **payload**: Event serialized via `serde_json::to_value(&event)`
+- **metadata**: Arbitrary JSON metadata passed via `execute_with_metadata()`
+
+**NEVER** write to this table directly. Use `CqrsFramework::execute()`.
+
+### Snapshots Table
+
+```sql
+CREATE TABLE IF NOT EXISTS snapshots (
+    aggregate_type TEXT NOT NULL,
+    aggregate_id   TEXT NOT NULL,
+    last_sequence  BIGINT NOT NULL,
+    payload        JSON NOT NULL,
+    timestamp      TEXT NOT NULL,
+    PRIMARY KEY (aggregate_type, aggregate_id)
+);
+```
+
+- **payload**: Aggregate state serialized via `serde_json::to_value(&aggregate)`
+- **last_sequence**: The event sequence at the time of the snapshot
+- **timestamp**: ISO 8601 timestamp of when the snapshot was taken
+
+**Not currently enabled** -- all aggregates use `new_event_store`. To enable,
+replace `new_event_store(repo)` with `new_snapshot_store(repo, N)` where `N` is
+the snapshot frequency. Must reset snapshots after changing aggregate struct
+layout. Deleting snapshots is always safe (replays from events).
+
+```sql
+-- Reset snapshots for an aggregate after struct changes
 DELETE FROM snapshots WHERE aggregate_type = 'Mint';
 ```
+
+### View Tables (Projections)
+
+```sql
+CREATE TABLE IF NOT EXISTS my_view (
+    view_id TEXT PRIMARY KEY,
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL
+);
+```
+
+- **view_id**: The aggregate ID string
+- **version**: Event sequence number (used for optimistic locking)
+- **payload**: The view serialized via `serde_json::to_value(&view)`
+
+`SqliteViewRepository` stores views with `serde_json::to_value()` and loads them
+with `serde_json::from_value()`.
+
+### Lifecycle Serialization in View Payloads
+
+All our aggregates use `Lifecycle<T, E>` as both the aggregate and its own view
+(via the blanket `View` impl). Serde's default externally-tagged enum
+representation means:
+
+- `Lifecycle::Uninitialized` -> `"Uninitialized"`
+- `Lifecycle::Live(data)` -> `{"Live": <data>}`
+- `Lifecycle::Failed { error, last_valid_state }` -> `{"Failed": {...}}`
+
+When `T` is a **struct** (e.g., `Position`, `OnChainTrade`), `<data>` is a flat
+JSON object: `{"Live": {"symbol": "AAPL", "net": "0", ...}}`. JSON paths:
+`$.Live.symbol`, `$.Live.net`.
+
+When `T` is an **enum** (e.g., `OffchainOrder`, `UsdcRebalance`), `<data>` is
+another tagged enum: `{"Live": {"Pending": {"symbol": "AAPL", ...}}}`. JSON
+paths depend on the active variant and are unsuitable for generated columns. Use
+`GenericQuery::load()` and deserialize in Rust instead.
+
+### Generated Columns on Views
+
+SQLite generated columns can extract fields from `payload` for indexing and
+querying. Only appropriate for **struct-typed views** where the JSON path is
+stable:
+
+```sql
+CREATE TABLE IF NOT EXISTS position_view (
+    view_id TEXT PRIMARY KEY,
+    version BIGINT NOT NULL,
+    payload JSON NOT NULL,
+    symbol TEXT GENERATED ALWAYS AS (
+        json_extract(payload, '$.Live.symbol')
+    ) STORED
+);
+```
+
+Generated columns on enum-typed views (the path changes per variant) should be
+avoided in favor of using native cqrs-es tooling, e.g.`GenericQuery::load()`.
 
 ## Event Upcasters
 
@@ -184,10 +274,9 @@ For aggregates that don't need services, use `type Services = ()`.
      `CqrsFramework::execute_with_metadata()` to emit events through aggregate
      commands
    - **WHY**: Direct writes break aggregate consistency, event ordering, and
-     violate the CQRS pattern. Events must be emitted through aggregate
-     commands that generate domain events. The framework handles event
-     persistence, sequence numbers, aggregate loading, and consistency
-     guarantees.
+     violate the CQRS pattern. Events must be emitted through aggregate commands
+     that generate domain events. The framework handles event persistence,
+     sequence numbers, aggregate loading, and consistency guarantees.
    - **NOTE**: If you see existing code writing directly to `events` table, that
      code is incorrect and should be refactored to use CqrsFramework
 
@@ -197,13 +286,14 @@ For aggregates that don't need services, use `type Services = ()`.
    trait methods or the framework's query API
 3. **Never query view tables with raw SQL** - use `GenericQuery::load()`
 4. **Never modify or delete events** - they're immutable historical facts
-5. **Never worry about changing aggregates/views** - they're just interpretations
+5. **Never worry about changing aggregates/views** - they're just
+   interpretations
 6. **Never add events you don't need yet** - YAGNI applies especially to events
 
 ## Single Framework Instance Per Aggregate
 
-**CRITICAL**: Each aggregate type must have exactly ONE `SqliteCqrs<A>` instance,
-constructed once in `Conductor::start`, then shared via `Arc` clones.
+**CRITICAL**: Each aggregate type must have exactly ONE `SqliteCqrs<A>`
+instance, constructed once in `Conductor::start`, then shared via `Arc` clones.
 
 ### Why This Matters
 
@@ -215,8 +305,8 @@ worked.
 
 ### Rules
 
-- **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` in the
-  server binary outside `Conductor::start`
+- **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` in the server
+  binary outside `Conductor::start`
 - **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
   aggregate type in the bot flow
 - **REQUIRED**: Add all query processors to the single instance at construction
@@ -254,10 +344,22 @@ async fn test_my_command() {
 }
 ```
 
-Or for more direct testing, use `AggregateContext`:
+To verify aggregate state after executing commands, clone the store before
+passing it to the framework and use `load_aggregate`:
 
 ```rust
+let store = MemStore::<MyAggregate>::default();
+let cqrs = CqrsFramework::new(store.clone(), vec![], services);
+
+cqrs.execute(&id, MyCommand { ... }).await.unwrap();
+
 let ctx = store.load_aggregate(&id).await.unwrap();
 let aggregate = ctx.aggregate();
 // assert on aggregate state
 ```
+
+**FORBIDDEN**: Calling `Aggregate::handle()` + `Aggregate::apply()` manually in
+tests. This bypasses the framework and doesn't test the real execution path. Use
+`CqrsFramework::execute()` instead. The only exception is testing the `apply()`
+method itself (e.g., verifying corruption detection when applying events to
+invalid states).

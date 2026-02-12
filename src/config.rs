@@ -386,8 +386,6 @@ pub enum CtxError {
     #[error(transparent)]
     InvalidThreshold(#[from] InvalidThresholdError),
     #[error(transparent)]
-    InvalidShares(#[from] st0x_execution::InvalidSharesError),
-    #[error(transparent)]
     Telemetry(#[from] crate::telemetry::TelemetryAssemblyError),
     #[error("rebalancing config present in config but rebalancing secrets missing")]
     RebalancingSecretsMissing,
@@ -405,7 +403,6 @@ impl CtxError {
             Self::Io(_) => "failed to read config file",
             Self::Toml(_) => "failed to parse TOML",
             Self::InvalidThreshold(_) => "invalid execution threshold",
-            Self::InvalidShares(_) => "invalid shares value",
             Self::Telemetry(_) => "telemetry assembly error",
             Self::RebalancingSecretsMissing => "rebalancing secrets missing",
             Self::RebalancingConfigMissing => "rebalancing config missing",

@@ -10,7 +10,7 @@ use rust_decimal::Decimal;
 use std::fmt;
 use std::str::FromStr;
 
-use st0x_execution::{Direction, Symbol};
+use st0x_execution::{Direction, FractionalShares, Symbol};
 
 use super::OnChainError;
 use crate::onchain::trade::TradeValidationError;
@@ -31,23 +31,6 @@ macro_rules! symbol {
     ($symbol:expr) => {
         st0x_execution::Symbol::new($symbol).unwrap()
     };
-}
-
-/// Represents a validated number of shares (non-negative)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Shares(Decimal);
-
-impl Shares {
-    pub(crate) fn new(value: Decimal) -> Result<Self, TradeValidationError> {
-        if value < Decimal::ZERO {
-            return Err(TradeValidationError::NegativeShares(value));
-        }
-        Ok(Self(value))
-    }
-
-    pub(crate) fn value(self) -> Decimal {
-        self.0
-    }
 }
 
 /// Represents a validated USDC amount (non-negative)
@@ -114,7 +97,7 @@ impl FromStr for TokenizedEquitySymbol {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TradeDetails {
     ticker: Symbol,
-    equity_amount: Shares,
+    equity_amount: FractionalShares,
     usdc_amount: Usdc,
     direction: Direction,
 }
@@ -127,7 +110,7 @@ impl TradeDetails {
     }
 
     /// Gets the equity amount
-    pub(crate) fn equity_amount(&self) -> Shares {
+    pub(crate) fn equity_amount(&self) -> FractionalShares {
         self.equity_amount
     }
 
@@ -167,7 +150,10 @@ impl TradeDetails {
             .into());
         };
 
-        let equity_amount = Shares::new(equity_amount_raw)?;
+        if equity_amount_raw < Decimal::ZERO {
+            return Err(TradeValidationError::NegativeShares(equity_amount_raw).into());
+        }
+        let equity_amount = FractionalShares::new(equity_amount_raw);
         let usdc_amount = Usdc::new(usdc_amount_raw)?;
 
         Ok(Self {
@@ -334,21 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shares_validation() {
-        let shares = Shares::new(dec!(100.5)).unwrap();
-        assert_eq!(shares.value(), dec!(100.5));
-
-        let shares = Shares::new(Decimal::ZERO).unwrap();
-        assert_eq!(shares.value(), Decimal::ZERO);
-
-        let result = Shares::new(dec!(-1));
-        assert!(matches!(
-            result.unwrap_err(),
-            TradeValidationError::NegativeShares(_)
-        ));
-    }
-
-    #[test]
     fn test_usdc_validation() {
         let usdc = Usdc::new(dec!(1000.50)).unwrap();
         assert_eq!(usdc.value(), dec!(1000.50));
@@ -364,14 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shares_usdc_equality() {
-        let shares1 = Shares::new(dec!(100)).unwrap();
-        let shares2 = Shares::new(dec!(100)).unwrap();
-        let shares3 = Shares::new(dec!(200)).unwrap();
-
-        assert_eq!(shares1, shares2);
-        assert_ne!(shares1, shares3);
-
+    fn test_usdc_equality() {
         let usdc1 = Usdc::new(dec!(1000)).unwrap();
         let usdc2 = Usdc::new(dec!(1000)).unwrap();
         let usdc3 = Usdc::new(dec!(2000)).unwrap();
@@ -442,7 +406,7 @@ mod tests {
         let details = TradeDetails::try_from_io("USDC", dec!(100), "tAAPL", dec!(0.5)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert_eq!(details.equity_amount().value(), dec!(0.5));
+        assert_eq!(details.equity_amount().inner(), dec!(0.5));
         assert_eq!(details.usdc_amount().value(), dec!(100));
         assert_eq!(details.direction(), Direction::Sell);
     }
@@ -452,7 +416,7 @@ mod tests {
         let details = TradeDetails::try_from_io("tAAPL", dec!(0.5), "USDC", dec!(100)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert_eq!(details.equity_amount().value(), dec!(0.5));
+        assert_eq!(details.equity_amount().inner(), dec!(0.5));
         assert_eq!(details.usdc_amount().value(), dec!(100));
         assert_eq!(details.direction(), Direction::Buy);
     }
@@ -462,14 +426,14 @@ mod tests {
         let details = TradeDetails::try_from_io("USDC", dec!(64.17), "tNVDA", dec!(0.374)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().value(), dec!(0.374));
+        assert_eq!(details.equity_amount().inner(), dec!(0.374));
         assert_eq!(details.usdc_amount().value(), dec!(64.17));
         assert_eq!(details.direction(), Direction::Sell);
 
         let details = TradeDetails::try_from_io("tNVDA", dec!(0.374), "USDC", dec!(64.17)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().value(), dec!(0.374));
+        assert_eq!(details.equity_amount().inner(), dec!(0.374));
         assert_eq!(details.usdc_amount().value(), dec!(64.17));
         assert_eq!(details.direction(), Direction::Buy);
     }
@@ -540,7 +504,7 @@ mod tests {
             TradeDetails::try_from_io("USDC", dec!(64.169234), "tNVDA", dec!(0.374)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().value(), dec!(0.374));
+        assert_eq!(details.equity_amount().inner(), dec!(0.374));
         assert_eq!(details.usdc_amount().value(), dec!(64.169234));
         assert_eq!(details.direction(), Direction::Sell);
 
@@ -555,7 +519,7 @@ mod tests {
             TradeDetails::try_from_io("USDC", dec!(34.645024), "tNVDA", dec!(0.2)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert_eq!(details.equity_amount().value(), dec!(0.2));
+        assert_eq!(details.equity_amount().inner(), dec!(0.2));
         assert_eq!(details.usdc_amount().value(), dec!(34.645024));
         assert_eq!(details.direction(), Direction::Sell);
 
@@ -567,7 +531,7 @@ mod tests {
     fn test_edge_case_validation_very_small_amounts() {
         let details = TradeDetails::try_from_io("USDC", dec!(0.01), "tAAPL", dec!(0.0001)).unwrap();
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert_eq!(details.equity_amount().value(), dec!(0.0001));
+        assert_eq!(details.equity_amount().inner(), dec!(0.0001));
         assert_eq!(details.usdc_amount().value(), dec!(0.01));
     }
 
@@ -575,7 +539,7 @@ mod tests {
     fn test_edge_case_validation_very_large_amounts() {
         let details = TradeDetails::try_from_io("USDC", dec!(1000000), "tBRK", dec!(100)).unwrap();
         assert_eq!(details.ticker(), &symbol!("BRK"));
-        assert_eq!(details.equity_amount().value(), dec!(100));
+        assert_eq!(details.equity_amount().inner(), dec!(100));
         assert_eq!(details.usdc_amount().value(), dec!(1000000));
     }
 }

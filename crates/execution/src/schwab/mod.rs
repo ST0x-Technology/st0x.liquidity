@@ -2,7 +2,7 @@ use reqwest::header::InvalidHeaderValue;
 use std::fmt;
 use thiserror::Error;
 
-use crate::InvalidSharesError;
+use crate::WholeSharesError;
 
 /// Identifies the Schwab API operation that failed, used in error context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +141,7 @@ pub enum SchwabError {
 
     /// Invalid share quantity for Schwab API (requires whole shares).
     #[error("Invalid shares for Schwab API: {0}")]
-    InvalidShares(#[from] InvalidSharesError),
+    WholeShares(#[from] WholeSharesError),
 }
 
 pub fn extract_code_from_url(url: &str) -> Result<String, SchwabError> {

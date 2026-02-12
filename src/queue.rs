@@ -195,7 +195,7 @@ pub(crate) async fn mark_event_processed(
 
 /// Generic function to enqueue any event that implements Enqueueable
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
-pub(crate) async fn enqueue<E: Enqueueable>(
+pub(crate) async fn enqueue<E: Enqueueable + Sync>(
     pool: &SqlitePool,
     event: &E,
     log: &Log,

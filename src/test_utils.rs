@@ -1,15 +1,13 @@
 //! Shared test fixtures: database setup, stub orders/logs,
 //! and builders for onchain trades and offchain executions.
 
-use alloy::primitives::{Address, B256, LogData, TxHash, address, bytes, fixed_bytes};
+use alloy::primitives::{Address, B256, LogData, address, bytes, fixed_bytes};
 use alloy::rpc::types::Log;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
 
-use st0x_execution::{
-    Direction, FractionalShares, SchwabTokens,
-};
+use st0x_execution::{Direction, FractionalShares, SchwabTokens};
 
 use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
@@ -125,7 +123,7 @@ impl OnchainTradeBuilder {
                 amount: FractionalShares::new(Decimal::ONE),
                 direction: Direction::Buy,
                 price: Usdc::new(Decimal::new(150, 0)).unwrap(),
-                block_timestamp: None,
+                block_timestamp: Some(Utc::now()),
                 created_at: None,
                 gas_used: None,
                 effective_gas_price: None,
@@ -158,12 +156,6 @@ impl OnchainTradeBuilder {
     #[must_use]
     pub(crate) fn with_price(mut self, price: Decimal) -> Self {
         self.trade.price = Usdc::new(price).unwrap();
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn with_tx_hash(mut self, hash: TxHash) -> Self {
-        self.trade.tx_hash = hash;
         self
     }
 
