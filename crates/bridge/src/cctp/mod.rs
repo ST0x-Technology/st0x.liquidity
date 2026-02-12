@@ -31,17 +31,19 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! // Create bridge instance
-//! let ethereum = Evm::new(ethereum_provider, owner, usdc,
-//!     token_messenger, message_transmitter);
-//! let base = Evm::new(base_provider, owner, usdc,
-//!     token_messenger, message_transmitter);
-//! let bridge = CctpBridge::new(ethereum, base);
+//! let bridge = CctpBridge::try_from_ctx(CctpCtx {
+//!     ethereum_provider,
+//!     base_provider,
+//!     owner,
+//!     usdc_ethereum,
+//!     usdc_base,
+//! })?;
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
 //! let amount = U256::from(1_000_000); // 1 USDC
-//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount,
-//!     recipient).await?;
+//! let receipt = bridge.burn(
+//!     BridgeDirection::EthereumToBase, amount, recipient,
+//! ).await?;
 //! ```
 //!
 //! ## CCTP V2 Fast Transfer
@@ -219,12 +221,12 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
     ))
 }
 
-/// Configuration for constructing a [`CctpBridge`].
+/// Runtime context for constructing a [`CctpBridge`].
 ///
 /// Provides the minimal set of values needed to construct the bridge.
 /// CCTP contract addresses are hardcoded internally since they're the
 /// same on all supported chains.
-pub struct CctpConfig<EP, BP> {
+pub struct CctpCtx<EP, BP> {
     /// Ethereum provider (must be wallet-enabled for signing transactions)
     pub ethereum_provider: EP,
     /// Base provider (must be wallet-enabled for signing transactions)
@@ -247,7 +249,7 @@ pub struct CctpConfig<EP, BP> {
 /// # Example
 ///
 /// ```rust,ignore
-/// let bridge = CctpBridge::try_from_config(CctpConfig {
+/// let bridge = CctpBridge::try_from_ctx(CctpCtx {
 ///     ethereum_provider: eth_provider,
 ///     base_provider,
 ///     owner,
@@ -343,20 +345,20 @@ where
     EP: Provider + Clone,
     BP: Provider + Clone,
 {
-    /// Constructs a `CctpBridge` from a configuration.
-    pub fn try_from_config(config: CctpConfig<EP, BP>) -> Result<Self, CctpError> {
+    /// Constructs a `CctpBridge` from a runtime context.
+    pub fn try_from_ctx(ctx: CctpCtx<EP, BP>) -> Result<Self, CctpError> {
         let ethereum = Evm::new(
-            config.ethereum_provider,
-            config.owner,
-            config.usdc_ethereum,
+            ctx.ethereum_provider,
+            ctx.owner,
+            ctx.usdc_ethereum,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );
 
         let base = Evm::new(
-            config.base_provider,
-            config.owner,
-            config.usdc_base,
+            ctx.base_provider,
+            ctx.owner,
+            ctx.usdc_base,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
         );

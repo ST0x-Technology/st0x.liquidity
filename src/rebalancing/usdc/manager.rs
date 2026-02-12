@@ -921,7 +921,7 @@ mod tests {
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
-    use st0x_bridge::cctp::{CctpBridge, CctpConfig};
+    use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
@@ -1089,7 +1089,7 @@ mod tests {
     ) {
         let owner = signer.address();
 
-        let cctp_bridge = CctpBridge::try_from_config(CctpConfig {
+        let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
             ethereum_provider: provider.clone(),
             base_provider: provider.clone(),
             owner,

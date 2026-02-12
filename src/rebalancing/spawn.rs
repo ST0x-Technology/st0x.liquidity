@@ -23,7 +23,7 @@ use super::{
     MintManager, Rebalancer, RebalancingCtx, RebalancingTrigger, RedemptionManager,
     TriggeredOperation,
 };
-use st0x_bridge::cctp::{CctpBridge, CctpConfig};
+use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
@@ -169,7 +169,7 @@ where
             broker_auth.api_secret.clone(),
         ));
 
-        let cctp = Arc::new(CctpBridge::try_from_config(CctpConfig {
+        let cctp = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
             ethereum_provider,
             base_provider: base_provider.clone(),
             owner,
@@ -392,7 +392,7 @@ mod tests {
         let owner = signer.address();
 
         let cctp = Arc::new(
-            CctpBridge::try_from_config(CctpConfig {
+            CctpBridge::try_from_ctx(CctpCtx {
                 ethereum_provider,
                 base_provider: base_provider.clone(),
                 owner,

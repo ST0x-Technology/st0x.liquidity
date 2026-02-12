@@ -37,7 +37,7 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 2. **The `Attestation` trait** - For opaque attestation data access
 3. **Domain types** - `BridgeDirection`, `BurnReceipt`, `MintReceipt`
 4. **Implementation type** - `CctpBridge` (behind `cctp` feature)
-5. **Configuration type** - `CctpConfig` (behind `cctp` feature)
+5. **Context type** - `CctpCtx` (behind `cctp` feature)
 
 **What must remain private:**
 

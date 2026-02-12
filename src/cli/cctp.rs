@@ -5,7 +5,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use rust_decimal::Decimal;
-use st0x_bridge::cctp::{CctpBridge, CctpConfig, CctpError};
+use st0x_bridge::cctp::{CctpBridge, CctpCtx, CctpError};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection};
 use std::io::Write;
 
@@ -125,7 +125,7 @@ fn build_cctp_bridge<BP: Provider + Clone>(
         .wallet(EthereumWallet::from(signer))
         .connect_provider(base_provider);
 
-    CctpBridge::try_from_config(CctpConfig {
+    CctpBridge::try_from_ctx(CctpCtx {
         ethereum_provider,
         base_provider,
         owner,

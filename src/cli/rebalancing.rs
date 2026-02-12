@@ -12,7 +12,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use st0x_bridge::cctp::{CctpBridge, CctpConfig};
+use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, Executor, Symbol, TimeInForce,
 };
@@ -196,7 +196,7 @@ where
 
     let owner = signer.address();
 
-    let bridge = Arc::new(CctpBridge::try_from_config(CctpConfig {
+    let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
         ethereum_provider,
         base_provider: base_provider_with_wallet.clone(),
         owner,
