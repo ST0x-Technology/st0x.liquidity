@@ -202,7 +202,7 @@ where
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
-            self.common.frameworks.pool.clone(),
+            self.common.pool.clone(),
             self.common.frameworks.position_cqrs.clone(),
             self.common.frameworks.position_query.clone(),
             self.common.frameworks.offchain_order_cqrs.clone(),

@@ -237,13 +237,12 @@ impl DomainEvent for VaultRegistryEvent {
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{address, b256};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use async_trait::async_trait;
     use cqrs_es::{EventEnvelope, Query, View};
     use sqlite_es::sqlite_cqrs;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::test_utils::setup_test_db;

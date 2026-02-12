@@ -200,6 +200,37 @@ For aggregates that don't need services, use `type Services = ()`.
 5. **Never worry about changing aggregates/views** - they're just interpretations
 6. **Never add events you don't need yet** - YAGNI applies especially to events
 
+## Single Framework Instance Per Aggregate
+
+**CRITICAL**: Each aggregate type must have exactly ONE `SqliteCqrs<A>` instance,
+constructed once in `Conductor::start`, then shared via `Arc` clones.
+
+### Why This Matters
+
+Multiple `SqliteCqrs<A>` instances for the same aggregate cause **silent
+production bugs**: events persist to the database, but query processors
+registered on OTHER instances never see them. Views and projections go stale
+without any warnings while the application continues operating as if everything
+worked.
+
+### Rules
+
+- **FORBIDDEN**: Calling `sqlite_cqrs()` or `CqrsFramework::new()` in the
+  server binary outside `Conductor::start`
+- **FORBIDDEN**: Creating multiple `SqliteCqrs<A>` instances for the same
+  aggregate type in the bot flow
+- **REQUIRED**: Add all query processors to the single instance at construction
+- **ALLOWED**: Direct construction in tests, CLI, and migration code (different
+  execution contexts with intentionally different processor needs)
+
+### Adding a New Query Processor
+
+1. Add it to the query processor vector in `Conductor::start`
+2. Never create a new framework instance just to add a processor
+3. The framework registers processors at construction time -- the only way to
+   ensure all events trigger all required side effects is to have every
+   processor on the single instance from the start
+
 ## Testing Aggregates
 
 Use the Given-When-Then pattern with in-memory stores:

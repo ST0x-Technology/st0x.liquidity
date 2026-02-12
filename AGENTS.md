@@ -592,30 +592,10 @@ Unauthorized access to secrets can lead to:
 - Financial losses
 - Security breaches
 
-#### Files That Require Explicit Permission
-
-The following files MUST NOT be read without explicit user permission:
-
-- `.env` - Environment variables containing API keys, secrets, and credentials
-- `.env.*` - Environment-specific configuration files (`.env.local`,
-  `.env.production`, etc.)
-- `credentials.json` - Credential storage files
-- `*.key`, `*.pem` - Private keys and certificates
-- `*.p12`, `*.pfx` - Certificate bundles
-- Database files containing sensitive data (unless necessary for debugging with
-  permission)
-- Any file that may contain API keys, tokens, passwords, or other secrets
-
-#### Required Practice
-
-**Before reading any file that may contain secrets:**
-
-1. **Ask the user explicitly** for permission to read the file
-2. **Explain why** you need to read it
-3. **Wait for confirmation** before proceeding
-
-**Alternatives**: Ask user to verify env vars are set, request sanitized output,
-check `.env.example` instead of `.env`, or review code that uses configuration.
+**Protected files** (require explicit permission): `.env*`, `credentials.json`,
+`*.key`, `*.pem`, `*.p12`, `*.pfx`, database files with sensitive data. Ask
+permission, explain why, wait for confirmation. Prefer `.env.example` or
+reviewing code that uses configuration instead of reading secrets directly.
 
 ### Testing Strategy
 
@@ -654,13 +634,9 @@ check `.env.example` instead of `.env`, or review code that uses configuration.
 
 #### Writing Meaningful Tests
 
-Tests should verify our application logic, not just language features. Avoid
-tests that only exercise struct construction or field access without testing any
-business logic.
-
-❌ Bad: Testing struct field assignments (just tests Rust, not our code). ✅
-Good: Testing actual business logic like `config.calculate_next_poll_delay()`
-returning values within expected bounds.
+Tests must verify application logic, not language features. Testing struct field
+assignments is useless; test actual behavior like
+`config.calculate_next_poll_delay()` returning expected values.
 
 ### Workflow Best Practices
 
@@ -730,47 +706,17 @@ that cannot be expressed through code structure alone.
   without access to your internal state. If the code needs explanation, explain
   WHAT it does and WHY - not which task number led to writing it.
 
-#### Good Comment Examples
+#### Examples
 
-```rust
-// If the on-chain order has USDC as input and a tokenized stock (t prefix)
-// as output then it means the order received USDC and gave away a
-// tokenized stock, i.e. sold, which means that to take the opposite
-// trade in schwab we need to buy and vice versa.
-let (schwab_ticker, schwab_instruction) =
-    if onchain_input_symbol == "USDC" && onchain_output_symbol.starts_with("t") {
-        // ... complex mapping logic
-    }
+Good: explaining non-obvious business logic ("USDC input + t-prefix output
+means the order sold tokenized equity, so hedge by buying on Schwab"), test
+data context ("9 shares with 18 decimal places"), or external system
+constraints ("ClearV2 doesn't contain amounts, so query AfterClear").
 
-// We need to get the corresponding AfterClear event as ClearV2 doesn't
-// contain the amounts. So we query the same block number, filter out
-// logs with index lower than the ClearV2 log index and with tx hashes
-// that don't match the ClearV2 tx hash.
-let after_clear_logs = provider.get_logs(/* ... */).await?;
+Bad: restating what code does (`// Store test tokens`), redundant with function
+name, test section markers (`// 1. Test token refresh`).
 
-// Test data representing 9 shares with 18 decimal places
-alice_output: U256::from_str("9000000000000000000").unwrap(), // 9 shares (18 dps)
-
-/// Helper that converts a fixed-decimal `U256` amount into an `f64` using
-/// the provided number of decimals.
-///
-/// NOTE: Parsing should never fail but precision may be lost.
-fn u256_to_f64(amount: U256, decimals: u8) -> Result<f64, ParseFloatError> {
-```
-
-#### Bad Comment Examples
-
-```rust
-// ❌ Redundant - function name says this: spawn_automatic_token_refresh(pool, env);
-// ❌ Obvious from context: // Store test tokens
-// ❌ Test section markers: // 1. Test token refresh integration
-```
-
-#### Comment Maintenance
-
-Use `///` doc comments for public APIs. Remove/update comments when refactoring.
-If a comment is needed to explain what code does, consider refactoring instead.
-Keep comments focused on "why" rather than "what".
+Use `///` for public APIs. Keep comments focused on "why" not "what".
 
 ### Code style
 
@@ -842,33 +788,10 @@ assert!(matches!(error, SomeError::SpecificVariant { .. }));
 
 #### Assertions must be specific
 
-Test assertions must check for the exact expected behavior, not vague
-alternatives. Never use `||` in assertions to accept multiple possible outcomes
-unless those outcomes are genuinely equivalent.
-
-```rust
-// ❌ BAD - Lazy, accepts vaguely similar outcomes
-assert!(
-    output.contains("Failed") || output.contains("❌"),
-    "Output should indicate failure"
-);
-
-// ❌ BAD - Too permissive, doesn't verify actual behavior
-assert!(result.is_some());
-
-// ✅ GOOD - Checks for exact expected output
-assert!(
-    output.contains("❌ Failed to place order"),
-    "Expected failure message, got: {output}"
-);
-
-// ✅ GOOD - Verifies specific value
-assert_eq!(result.unwrap().order_id, "12345");
-```
-
-If you find yourself writing `||` in an assertion, ask: are these outcomes
-actually equivalent? If not, you probably don't understand what the code should
-do, and need to investigate before writing the test.
+Check for exact expected behavior. Never use `||` in assertions to accept
+multiple outcomes unless genuinely equivalent. Use `assert_eq!` with specific
+values, not `assert!(result.is_some())`. If writing `||` in an assertion, you
+likely don't understand the expected behavior - investigate first.
 
 #### Type modeling examples
 

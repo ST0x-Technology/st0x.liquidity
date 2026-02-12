@@ -125,8 +125,8 @@ impl<'de> serde::Deserialize<'de> for Network {
     where
         D: serde::Deserializer<'de>,
     {
-        let s = String::deserialize(deserializer)?;
-        Ok(Self::new(s))
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self::new(raw))
     }
 }
 
@@ -158,8 +158,8 @@ fn deserialize_decimal_from_string<'de, D>(deserializer: D) -> Result<Decimal, D
 where
     D: Deserializer<'de>,
 {
-    let s = String::deserialize(deserializer)?;
-    s.parse::<Decimal>().map_err(serde::de::Error::custom)
+    let raw = String::deserialize(deserializer)?;
+    raw.parse::<Decimal>().map_err(serde::de::Error::custom)
 }
 
 fn validate_amount(amount: Decimal) -> Result<(), AlpacaWalletError> {

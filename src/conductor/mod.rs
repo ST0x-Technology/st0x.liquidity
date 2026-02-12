@@ -14,6 +14,7 @@ use cqrs_es::persist::GenericQuery;
 use cqrs_es::{AggregateError, Query};
 use futures_util::{Stream, StreamExt};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -134,7 +135,15 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("Market hours check failed: {e}"))?;
 
-    log_market_status(timeout);
+    let timeout_minutes = timeout.as_secs() / 60;
+    if timeout_minutes < 60 * 24 {
+        info!(
+            "Market is open, starting conductor \
+             (will timeout in {timeout_minutes} minutes)"
+        );
+    } else {
+        info!("Starting conductor (no market hours restrictions)");
+    }
 
     let mut conductor = match Conductor::start(
         &ctx,
@@ -146,125 +155,47 @@ where
     .await
     {
         Ok(c) => c,
-        Err(e) => {
-            return retry_after_failure(executor, ctx, pool, e, RERUN_DELAY_SECS, event_sender)
-                .await;
+        Err(error) => {
+            error!("Failed to start conductor: {error}, retrying in {RERUN_DELAY_SECS} seconds");
+            tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
+
+            let new_maintenance = executor.run_executor_maintenance().await;
+            return Box::pin(run_market_hours_loop(
+                executor,
+                ctx,
+                pool,
+                new_maintenance,
+                event_sender,
+            ))
+            .await;
         }
     };
 
     info!("Market opened, conductor running");
 
-    run_conductor_until_market_close(&mut conductor, executor, ctx, pool, timeout, event_sender)
-        .await
-}
-
-fn log_market_status(timeout: Duration) {
-    let timeout_minutes = timeout.as_secs() / 60;
-    if timeout_minutes < 60 * 24 {
-        info!(
-            "Market is open, starting conductor \
-             (will timeout in {timeout_minutes} minutes)"
-        );
-    } else {
-        info!("Starting conductor (no market hours restrictions)");
-    }
-}
-
-async fn retry_after_failure<E>(
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    error: anyhow::Error,
-    delay_secs: u64,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    error!("Failed to start conductor: {error}, retrying in {delay_secs} seconds");
-    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
-
-    let new_maintenance = executor.run_executor_maintenance().await;
-    Box::pin(run_market_hours_loop(
-        executor,
-        ctx,
-        pool,
-        new_maintenance,
-        event_sender,
-    ))
-    .await
-}
-
-async fn run_conductor_until_market_close<E>(
-    conductor: &mut Conductor,
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    timeout: Duration,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
     tokio::select! {
         result = conductor.wait_for_completion() => {
-            handle_conductor_completion(conductor, result)
+            info!("Conductor completed");
+            conductor.abort_all_tasks();
+            result?;
+            info!("Conductor completed successfully, continuing to next market session");
+            Ok(())
         }
         () = tokio::time::sleep(timeout) => {
-            handle_market_close(conductor, executor, ctx, pool, event_sender).await
+            info!("Market closed, shutting down trading tasks");
+            conductor.abort_trading_tasks();
+            let next_maintenance = conductor.executor_maintenance.take();
+            info!("Trading tasks shutdown, DEX events buffering");
+            Box::pin(run_market_hours_loop(
+                executor,
+                ctx,
+                pool,
+                next_maintenance,
+                event_sender,
+            ))
+            .await
         }
     }
-}
-
-fn handle_conductor_completion(
-    conductor: &Conductor,
-    result: Result<(), anyhow::Error>,
-) -> anyhow::Result<()> {
-    info!("Conductor completed");
-    conductor.order_poller.abort();
-    conductor.dex_event_receiver.abort();
-    conductor.event_processor.abort();
-    conductor.position_checker.abort();
-    conductor.queue_processor.abort();
-    if let Some(ref handle) = conductor.executor_maintenance {
-        handle.abort();
-    }
-    if let Some(ref handle) = conductor.rebalancer {
-        handle.abort();
-    }
-    if let Some(ref handle) = conductor.inventory_poller {
-        handle.abort();
-    }
-    result?;
-    info!("Conductor completed successfully, continuing to next market session");
-    Ok(())
-}
-
-async fn handle_market_close<E>(
-    conductor: &mut Conductor,
-    executor: E,
-    ctx: Ctx,
-    pool: SqlitePool,
-    event_sender: broadcast::Sender<ServerMessage>,
-) -> anyhow::Result<()>
-where
-    E: Executor + Clone + Send + 'static,
-    EventProcessingError: From<E::Error>,
-{
-    info!("Market closed, shutting down trading tasks");
-    conductor.abort_trading_tasks();
-    let next_maintenance = conductor.executor_maintenance.take();
-    info!("Trading tasks shutdown, DEX events buffering");
-    Box::pin(run_market_hours_loop(
-        executor,
-        ctx,
-        pool,
-        next_maintenance,
-        event_sender,
-    ))
-    .await
 }
 
 /// Context for vault discovery operations during trade processing.
@@ -403,6 +334,14 @@ impl Conductor {
         log_task_result(queue, "Queue processor");
 
         Ok(())
+    }
+
+    pub(crate) fn abort_all_tasks(&self) {
+        self.abort_trading_tasks();
+        self.dex_event_receiver.abort();
+        if let Some(ref handle) = self.executor_maintenance {
+            handle.abort();
+        }
     }
 
     pub(crate) fn abort_trading_tasks(&self) {
@@ -730,31 +669,21 @@ async fn receive_blockchain_events<S1, S2>(
             }
         };
 
-        if !handle_event_result(event_result, &event_sender) {
-            break;
-        }
-    }
-}
-
-fn handle_event_result(
-    result: Result<(TradeEvent, Log), sol_types::Error>,
-    sender: &UnboundedSender<(TradeEvent, Log)>,
-) -> bool {
-    match result {
-        Ok((event, log)) => {
-            trace!(
-                "Received blockchain event: tx_hash={:?}, \
-                 log_index={:?}, block_number={:?}",
-                log.transaction_hash, log.log_index, log.block_number
-            );
-            if sender.send((event, log)).is_err() {
-                error!("Event receiver dropped, shutting down");
-                return false;
+        match event_result {
+            Ok((event, log)) => {
+                trace!(
+                    "Received blockchain event: tx_hash={:?}, \
+                     log_index={:?}, block_number={:?}",
+                    log.transaction_hash, log.log_index, log.block_number
+                );
+                if event_sender.send((event, log)).is_err() {
+                    error!("Event receiver dropped, shutting down");
+                    break;
+                }
             }
+            Err(e) => error!("Error in event stream: {e}"),
         }
-        Err(e) => error!("Error in event stream: {e}"),
     }
-    true
 }
 
 pub(crate) async fn get_cutoff_block<S1, S2, P>(
@@ -841,7 +770,13 @@ async fn run_queue_processor<P, E>(
 
     let feed_id_cache = FeedIdCache::default();
 
-    log_unprocessed_event_count(pool).await;
+    match crate::queue::count_unprocessed(pool).await {
+        Ok(count) if count > 0 => {
+            info!("Found {count} unprocessed events from previous sessions to process");
+        }
+        Ok(_) => info!("No unprocessed events found, starting fresh"),
+        Err(e) => error!("Failed to count unprocessed events: {e}"),
+    }
 
     let executor_type = executor.to_supported_executor();
 
@@ -852,37 +787,19 @@ async fn run_queue_processor<P, E>(
     };
 
     loop {
-        let result =
-            process_next_queued_event(executor_type, ctx, pool, &provider, cqrs, &queue_context)
-                .await;
-
-        handle_queue_processing_result(result).await;
-    }
-}
-
-async fn log_unprocessed_event_count(pool: &SqlitePool) {
-    match crate::queue::count_unprocessed(pool).await {
-        Ok(count) if count > 0 => {
-            info!("Found {count} unprocessed events from previous sessions to process");
-        }
-        Ok(_) => info!("No unprocessed events found, starting fresh"),
-        Err(e) => error!("Failed to count unprocessed events: {e}"),
-    }
-}
-
-async fn handle_queue_processing_result(
-    result: Result<Option<OffchainOrderId>, EventProcessingError>,
-) {
-    match result {
-        Ok(Some(offchain_order_id)) => {
-            info!(%offchain_order_id, "Offchain order placed successfully");
-        }
-        Ok(None) => {
-            sleep(Duration::from_millis(100)).await;
-        }
-        Err(e) => {
-            error!("Error processing queued event: {e}");
-            sleep(Duration::from_millis(500)).await;
+        match process_next_queued_event(executor_type, ctx, pool, &provider, cqrs, &queue_context)
+            .await
+        {
+            Ok(Some(offchain_order_id)) => {
+                info!(%offchain_order_id, "Offchain order placed successfully");
+            }
+            Ok(None) => {
+                sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                error!("Error processing queued event: {e}");
+                sleep(Duration::from_millis(500)).await;
+            }
         }
     }
 }
@@ -908,7 +825,9 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return Ok(None);
     };
 
-    let event_id = extract_event_id(&queued_event)?;
+    let event_id = queued_event
+        .id
+        .ok_or(EventProcessingError::Queue(EventQueueError::MissingQueuedEventId))?;
 
     let onchain_trade = convert_event_to_trade(
         ctx,
@@ -920,7 +839,17 @@ async fn process_next_queued_event<P: Provider + Clone>(
     .await?;
 
     let Some(trade) = onchain_trade else {
-        return handle_filtered_event(pool, &queued_event, event_id).await;
+        info!(
+            "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
+            match &queued_event.event {
+                TradeEvent::ClearV3(_) => "ClearV3",
+                TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
+            },
+            queued_event.tx_hash,
+            queued_event.log_index
+        );
+        mark_event_processed(pool, event_id).await?;
+        return Ok(None);
     };
 
     let vault_discovery_ctx = VaultDiscoveryCtx {
@@ -939,12 +868,6 @@ async fn process_next_queued_event<P: Provider + Clone>(
         &vault_discovery_ctx,
     )
     .await
-}
-
-fn extract_event_id(queued_event: &QueuedEvent) -> Result<i64, EventProcessingError> {
-    queued_event.id.ok_or(EventProcessingError::Queue(
-        EventQueueError::MissingQueuedEventId,
-    ))
 }
 
 /// Discovers vaults from a trade and emits VaultRegistryCommands.
@@ -1053,27 +976,6 @@ async fn convert_event_to_trade<P: Provider + Clone>(
     };
 
     Ok(onchain_trade)
-}
-
-#[tracing::instrument(skip(pool, queued_event), fields(event_id), level = tracing::Level::DEBUG)]
-async fn handle_filtered_event(
-    pool: &SqlitePool,
-    queued_event: &QueuedEvent,
-    event_id: i64,
-) -> Result<Option<OffchainOrderId>, EventProcessingError> {
-    info!(
-        "Event filtered out (no matching owner): event_type={:?}, tx_hash={:?}, log_index={}",
-        match &queued_event.event {
-            TradeEvent::ClearV3(_) => "ClearV3",
-            TradeEvent::TakeOrderV3(_) => "TakeOrderV3",
-        },
-        queued_event.tx_hash,
-        queued_event.log_index
-    );
-
-    mark_event_processed(pool, event_id).await?;
-
-    Ok(None)
 }
 
 #[tracing::instrument(
@@ -1410,58 +1312,28 @@ where
     let mut events = Vec::new();
 
     loop {
-        tokio::select! {
+        let event_result = tokio::select! {
             Some(result) = clear_stream.next() => {
-                if let Some(first_event) = handle_startup_clear_event(result, &mut events) {
-                    return Some(first_event);
-                }
+                result.map(|(event, log)| (TradeEvent::ClearV3(Box::new(event)), log))
             }
             Some(result) = take_stream.next() => {
-                if let Some(first_event) = handle_startup_take_event(result, &mut events) {
-                    return Some(first_event);
-                }
+                result.map(|(event, log)| (TradeEvent::TakeOrderV3(Box::new(event)), log))
             }
             () = &mut deadline => return None,
-        }
-    }
-}
+        };
 
-fn handle_startup_clear_event(
-    result: Result<(ClearV3, Log), sol_types::Error>,
-    events: &mut Vec<(TradeEvent, Log)>,
-) -> Option<(Vec<(TradeEvent, Log)>, u64)> {
-    match result {
-        Ok((event, log)) => {
-            let Some(block_number) = log.block_number else {
-                error!("ClearV3 event missing block number");
-                return None;
-            };
-            events.push((TradeEvent::ClearV3(Box::new(event)), log));
-            Some((std::mem::take(events), block_number))
-        }
-        Err(e) => {
-            error!("Error in clear event stream during startup: {e}");
-            None
-        }
-    }
-}
-
-fn handle_startup_take_event(
-    result: Result<(TakeOrderV3, Log), sol_types::Error>,
-    events: &mut Vec<(TradeEvent, Log)>,
-) -> Option<(Vec<(TradeEvent, Log)>, u64)> {
-    match result {
-        Ok((event, log)) => {
-            let Some(block_number) = log.block_number else {
-                error!("TakeOrderV3 event missing block number");
-                return None;
-            };
-            events.push((TradeEvent::TakeOrderV3(Box::new(event)), log));
-            Some((std::mem::take(events), block_number))
-        }
-        Err(e) => {
-            error!("Error in take event stream during startup: {e}");
-            None
+        match event_result {
+            Ok((event, log)) => {
+                let Some(block_number) = log.block_number else {
+                    error!("Event missing block number during startup");
+                    continue;
+                };
+                events.push((event, log));
+                return Some((std::mem::take(&mut events), block_number));
+            }
+            Err(error) => {
+                error!("Error in event stream during startup: {error}");
+            }
         }
     }
 }
@@ -1529,26 +1401,6 @@ mod tests {
             position_query: frameworks.position_query.clone(),
             offchain_order_cqrs: frameworks.offchain_order_cqrs.clone(),
             execution_threshold: ExecutionThreshold::whole_share(),
-        }
-    }
-
-    fn abort_all_conductor_tasks(conductor: Conductor) {
-        conductor.order_poller.abort();
-        conductor.event_processor.abort();
-        conductor.position_checker.abort();
-        conductor.queue_processor.abort();
-        conductor.dex_event_receiver.abort();
-
-        if let Some(rebalancer) = conductor.rebalancer {
-            rebalancer.abort();
-        }
-
-        if let Some(inventory_poller) = conductor.inventory_poller {
-            inventory_poller.abort();
-        }
-
-        if let Some(executor_maintenance) = conductor.executor_maintenance {
-            executor_maintenance.abort();
         }
     }
 
@@ -1768,7 +1620,7 @@ mod tests {
         .with_dex_event_streams(clear_stream, take_stream)
         .spawn();
 
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all_tasks();
     }
 
     #[tokio::test]
@@ -1835,7 +1687,7 @@ mod tests {
         assert!(!conductor.position_checker.is_finished());
         assert!(!conductor.queue_processor.is_finished());
 
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all_tasks();
     }
 
     #[tokio::test]
@@ -1866,7 +1718,7 @@ mod tests {
 
         assert!(conductor.rebalancer.is_none());
 
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all_tasks();
     }
 
     #[tokio::test]
@@ -1904,7 +1756,7 @@ mod tests {
 
         assert!(conductor.rebalancer.is_some());
 
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all_tasks();
     }
 
     #[tokio::test]
@@ -1943,7 +1795,7 @@ mod tests {
         let rebalancer_handle = conductor.rebalancer.as_ref().unwrap();
         assert!(!rebalancer_handle.is_finished());
 
-        abort_all_conductor_tasks(conductor);
+        conductor.abort_all_tasks();
     }
 
     #[tokio::test]
@@ -2827,7 +2679,7 @@ mod tests {
 
         assert_eq!(
             position.net.inner(),
-            rust_decimal_macros::dec!(0.5),
+            dec!(0.5),
             "Position net should reflect the accumulated trade"
         );
         assert!(
@@ -2872,7 +2724,7 @@ mod tests {
                 .unwrap()
                 .expect("position should exist");
 
-        assert_eq!(position.net.inner(), rust_decimal_macros::dec!(1.5));
+        assert_eq!(position.net.inner(), dec!(1.5));
         assert_eq!(
             position.pending_offchain_order_id,
             Some(offchain_order_id),
@@ -2952,7 +2804,7 @@ mod tests {
                 .unwrap()
                 .expect("position should exist");
 
-        assert_eq!(position.net.inner(), rust_decimal_macros::dec!(1.2));
+        assert_eq!(position.net.inner(), dec!(1.2));
         assert!(position.pending_offchain_order_id.is_some());
     }
 
@@ -3005,7 +2857,7 @@ mod tests {
 
         assert_eq!(
             position.net.inner(),
-            rust_decimal_macros::dec!(3.0),
+            dec!(3.0),
             "Both fills should be accumulated"
         );
         assert_eq!(
@@ -3062,7 +2914,7 @@ mod tests {
                 &position_agg_id,
                 PositionCommand::CompleteOffChainOrder {
                     offchain_order_id: first_order_id,
-                    shares_filled: Positive::new(FractionalShares::new(rust_decimal_macros::dec!(1.5))).unwrap(),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(1.5))).unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     price_cents: crate::offchain_order::PriceCents(15000),
@@ -3148,7 +3000,7 @@ mod tests {
                 .unwrap()
                 .expect("position should exist");
 
-        assert_eq!(position.net.inner(), rust_decimal_macros::dec!(2.0));
+        assert_eq!(position.net.inner(), dec!(2.0));
         assert!(position.pending_offchain_order_id.is_some());
 
         assert_eq!(

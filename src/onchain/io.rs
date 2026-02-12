@@ -439,50 +439,52 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_usdc_to_tokenized() {
-        let details = TradeDetails::try_from_io("USDC", 100.0, "tAAPL", 0.5).unwrap();
+        let details = TradeDetails::try_from_io("USDC", dec!(100), "tAAPL", dec!(0.5)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert!((details.equity_amount().value() - 0.5).abs() < f64::EPSILON);
-        assert!((details.usdc_amount().value() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(details.equity_amount().value(), dec!(0.5));
+        assert_eq!(details.usdc_amount().value(), dec!(100));
         assert_eq!(details.direction(), Direction::Sell);
     }
 
     #[test]
     fn test_trade_details_try_from_io_tokenized_to_usdc() {
-        let details = TradeDetails::try_from_io("tAAPL", 0.5, "USDC", 100.0).unwrap();
+        let details = TradeDetails::try_from_io("tAAPL", dec!(0.5), "USDC", dec!(100)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert!((details.equity_amount().value() - 0.5).abs() < f64::EPSILON);
-        assert!((details.usdc_amount().value() - 100.0).abs() < f64::EPSILON);
+        assert_eq!(details.equity_amount().value(), dec!(0.5));
+        assert_eq!(details.usdc_amount().value(), dec!(100));
         assert_eq!(details.direction(), Direction::Buy);
     }
 
     #[test]
     fn test_trade_details_try_from_io_nvda() {
-        let details = TradeDetails::try_from_io("USDC", 64.17, "tNVDA", 0.374).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", dec!(64.17), "tNVDA", dec!(0.374)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert!((details.equity_amount().value() - 0.374).abs() < f64::EPSILON);
-        assert!((details.usdc_amount().value() - 64.17).abs() < f64::EPSILON);
+        assert_eq!(details.equity_amount().value(), dec!(0.374));
+        assert_eq!(details.usdc_amount().value(), dec!(64.17));
         assert_eq!(details.direction(), Direction::Sell);
 
-        let details = TradeDetails::try_from_io("tNVDA", 0.374, "USDC", 64.17).unwrap();
+        let details =
+            TradeDetails::try_from_io("tNVDA", dec!(0.374), "USDC", dec!(64.17)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert!((details.equity_amount().value() - 0.374).abs() < f64::EPSILON);
-        assert!((details.usdc_amount().value() - 64.17).abs() < f64::EPSILON);
+        assert_eq!(details.equity_amount().value(), dec!(0.374));
+        assert_eq!(details.usdc_amount().value(), dec!(64.17));
         assert_eq!(details.direction(), Direction::Buy);
     }
 
     #[test]
     fn test_trade_details_try_from_io_invalid_configurations() {
-        let result = TradeDetails::try_from_io("USDC", 100.0, "USDC", 100.0);
+        let result = TradeDetails::try_from_io("USDC", dec!(100), "USDC", dec!(100));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
         ));
 
-        let result = TradeDetails::try_from_io("BTC", 1.0, "ETH", 3000.0);
+        let result = TradeDetails::try_from_io("BTC", dec!(1), "ETH", dec!(3000));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::InvalidSymbolConfiguration(_, _))
@@ -491,13 +493,13 @@ mod tests {
 
     #[test]
     fn test_trade_details_negative_amount_validation() {
-        let result = TradeDetails::try_from_io("USDC", 100.0, "tAAPL", -0.5);
+        let result = TradeDetails::try_from_io("USDC", dec!(100), "tAAPL", dec!(-0.5));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::NegativeShares(_))
         ));
 
-        let result = TradeDetails::try_from_io("USDC", -100.0, "tAAPL", 0.5);
+        let result = TradeDetails::try_from_io("USDC", dec!(-100), "tAAPL", dec!(0.5));
         assert!(matches!(
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::NegativeUsdc(_))
@@ -536,45 +538,49 @@ mod tests {
     fn test_real_transaction_nvda_amount_extraction() {
         // Real transaction: 0.374 tNVDA sold for 64.169234 USDC
         // Verifies equity vs USDC amounts are not swapped
-        let details = TradeDetails::try_from_io("USDC", 64.169_234, "tNVDA", 0.374).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", dec!(64.169234), "tNVDA", dec!(0.374)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert!((details.equity_amount().value() - 0.374).abs() < 0.0001);
-        assert!((details.usdc_amount().value() - 64.169_234).abs() < 0.0001);
+        assert_eq!(details.equity_amount().value(), dec!(0.374));
+        assert_eq!(details.usdc_amount().value(), dec!(64.169234));
         assert_eq!(details.direction(), Direction::Sell);
 
-        let price_per_share = 64.169_234 / 0.374;
-        assert!((price_per_share - 171.58_f64).abs() < 0.01);
+        let price_per_share = dec!(64.169234) / dec!(0.374);
+        assert!((price_per_share - dec!(171.58)).abs() < dec!(0.01));
     }
 
     #[test]
     fn test_real_transaction_nvda_small_trade() {
         // Real transaction: 0.2 tNVDA sold for 34.645024 USDC
-        let details = TradeDetails::try_from_io("USDC", 34.645_024, "tNVDA", 0.2).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", dec!(34.645024), "tNVDA", dec!(0.2)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
-        assert!((details.equity_amount().value() - 0.2).abs() < 0.0001);
-        assert!((details.usdc_amount().value() - 34.645_024).abs() < 0.0001);
+        assert_eq!(details.equity_amount().value(), dec!(0.2));
+        assert_eq!(details.usdc_amount().value(), dec!(34.645024));
         assert_eq!(details.direction(), Direction::Sell);
 
-        let price_per_share = 34.645_024 / 0.2;
-        assert!((price_per_share - 173.23_f64).abs() < 0.01);
+        let price_per_share = dec!(34.645024) / dec!(0.2);
+        assert!((price_per_share - dec!(173.23)).abs() < dec!(0.01));
     }
 
     #[test]
     fn test_edge_case_validation_very_small_amounts() {
-        let details = TradeDetails::try_from_io("USDC", 0.01, "tAAPL", 0.0001).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", dec!(0.01), "tAAPL", dec!(0.0001)).unwrap();
         assert_eq!(details.ticker(), &symbol!("AAPL"));
-        assert!((details.equity_amount().value() - 0.0001).abs() < f64::EPSILON);
-        assert!((details.usdc_amount().value() - 0.01).abs() < f64::EPSILON);
+        assert_eq!(details.equity_amount().value(), dec!(0.0001));
+        assert_eq!(details.usdc_amount().value(), dec!(0.01));
     }
 
     #[test]
     fn test_edge_case_validation_very_large_amounts() {
-        let details = TradeDetails::try_from_io("USDC", 1_000_000.0, "tBRK", 100.0).unwrap();
+        let details =
+            TradeDetails::try_from_io("USDC", dec!(1000000), "tBRK", dec!(100)).unwrap();
         assert_eq!(details.ticker(), &symbol!("BRK"));
-        assert!((details.equity_amount().value() - 100.0).abs() < f64::EPSILON);
-        assert!((details.usdc_amount().value() - 1_000_000.0).abs() < f64::EPSILON);
+        assert_eq!(details.equity_amount().value(), dec!(100));
+        assert_eq!(details.usdc_amount().value(), dec!(1000000));
     }
 
 }

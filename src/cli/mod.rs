@@ -224,7 +224,7 @@ pub enum Commands {
     CctpRecover {
         /// Transaction hash of the burn transaction on the source chain
         #[arg(long = "burn-tx")]
-        burn_tx: B256,
+        burn_tx: TxHash,
         /// Source chain where the burn occurred
         #[arg(long = "source-chain")]
         source_chain: CctpChain,
@@ -408,7 +408,7 @@ enum ProviderCommand {
         from: CctpChain,
     },
     CctpRecover {
-        burn_tx: B256,
+        burn_tx: TxHash,
         source_chain: CctpChain,
     },
     ResetAllowance {

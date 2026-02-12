@@ -952,4 +952,64 @@ mod tests {
     fn dry_run_supports_fractional_shares() {
         assert!(SupportedExecutor::DryRun.supports_fractional_shares());
     }
+
+    #[test]
+    fn executor_order_id_new_from_string() {
+        let id = ExecutorOrderId::new("12345");
+        assert_eq!(id.to_string(), "12345");
+    }
+
+    #[test]
+    fn executor_order_id_new_from_string_ref() {
+        let order_id_str = "abc-123-xyz".to_string();
+        let id = ExecutorOrderId::new(&order_id_str);
+        assert_eq!(id.to_string(), "abc-123-xyz");
+    }
+
+    #[test]
+    fn executor_order_id_display_impl() {
+        let id = ExecutorOrderId::new("order_789");
+        assert_eq!(format!("{}", id), "order_789");
+        assert_eq!(format!("{id}"), "order_789");
+    }
+
+    #[test]
+    fn executor_order_id_as_ref_str() {
+        let id = ExecutorOrderId::new("test-id");
+        let s: &str = id.as_ref();
+        assert_eq!(s, "test-id");
+    }
+
+    #[test]
+    fn executor_order_id_equality() {
+        let id1 = ExecutorOrderId::new("same-id");
+        let id2 = ExecutorOrderId::new("same-id");
+        let id3 = ExecutorOrderId::new("different-id");
+
+        assert_eq!(id1, id2);
+        assert_ne!(id1, id3);
+        assert_ne!(id2, id3);
+    }
+
+    #[test]
+    fn executor_order_id_clone() {
+        let id1 = ExecutorOrderId::new("clone-test");
+        let id2 = id1.clone();
+
+        assert_eq!(id1, id2);
+        assert_eq!(id1.to_string(), id2.to_string());
+    }
+
+    #[test]
+    fn executor_order_id_empty_string() {
+        let id = ExecutorOrderId::new("");
+        assert_eq!(id.to_string(), "");
+        assert_eq!(id.as_ref(), "");
+    }
+
+    #[test]
+    fn executor_order_id_special_characters() {
+        let id = ExecutorOrderId::new("order-123_ABC.xyz/456");
+        assert_eq!(id.to_string(), "order-123_ABC.xyz/456");
+    }
 }

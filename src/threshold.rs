@@ -237,20 +237,20 @@ mod tests {
 
     #[test]
     fn usdc_add_succeeds() {
-        let a = Usdc(Decimal::ONE);
-        let b = Usdc(Decimal::TWO);
+        let smaller = Usdc(Decimal::ONE);
+        let larger = Usdc(Decimal::TWO);
 
-        let result = (a + b).unwrap();
+        let result = (smaller + larger).unwrap();
 
         assert_eq!(result.0, Decimal::from(3));
     }
 
     #[test]
     fn usdc_sub_succeeds() {
-        let a = Usdc(Decimal::from(5));
-        let b = Usdc(Decimal::TWO);
+        let larger = Usdc(Decimal::from(5));
+        let smaller = Usdc(Decimal::TWO);
 
-        let result = (a - b).unwrap();
+        let result = (larger - smaller).unwrap();
 
         assert_eq!(result.0, Decimal::from(3));
     }
