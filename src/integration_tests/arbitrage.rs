@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use alloy::network::EthereumWallet;
 use alloy::node_bindings::AnvilInstance;
 use alloy::primitives::{Address, B256, Bytes, U256, address, keccak256, utils::parse_units};
@@ -19,6 +16,8 @@ use sqlx::SqlitePool;
 use st0x_execution::{
     Direction, FractionalShares, MockExecutor, OrderState, SupportedExecutor, Symbol,
 };
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::{ExpectedEvent, assert_events, fetch_events};
 use crate::alpaca_tokenization::tests::setup_anvil;

@@ -10,6 +10,9 @@ use rust_decimal_macros::dec;
 use serde_json::json;
 use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
+use st0x_execution::{
+    Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
+};
 use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 
@@ -34,9 +37,6 @@ use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
-use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, Positive, SupportedExecutor, Symbol,
-};
 
 const TEST_ORDERBOOK: Address = address!("0x0000000000000000000000000000000000000001");
 const TEST_ORDER_OWNER: Address = address!("0x0000000000000000000000000000000000000002");
