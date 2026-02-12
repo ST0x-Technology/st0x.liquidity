@@ -242,8 +242,8 @@ where
 
     match opt {
         None => Ok(None),
-        Some(s) if s.is_empty() => Ok(None),
-        Some(s) => s.parse().map(Some).map_err(serde::de::Error::custom),
+        Some(value) if value.is_empty() => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
 }
 

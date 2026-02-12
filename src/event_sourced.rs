@@ -75,8 +75,9 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
+use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
-use cqrs_es::{Aggregate, DomainEvent};
+use cqrs_es::{Aggregate, AggregateError, DomainEvent};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteViewRepository};
@@ -146,13 +147,14 @@ use crate::lifecycle::{Lifecycle, LifecycleError};
 ///   the handler only deals with live state.
 ///
 /// [`Never`]: crate::lifecycle::Never
+#[async_trait]
 pub(crate) trait EventSourced:
     Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned
 {
     type Id: Display;
     type Event: DomainEvent + Eq;
     type Command: Send + Sync;
-    type Error: std::error::Error;
+    type Error: DomainError;
     type Services: Send + Sync;
 
     const AGGREGATE_TYPE: &'static str;
@@ -235,7 +237,12 @@ pub(crate) struct Store<Entity: EventSourced> {
 
 impl<Entity: EventSourced> Store<Entity>
 where
-    Lifecycle<Entity>: Aggregate,
+    Lifecycle<Entity>: Aggregate<
+        Command = Entity::Command,
+        Event = Entity::Event,
+        Error = LifecycleError<Entity>,
+        Services = Entity::Services,
+    >,
 {
     /// Wrap an existing `SqliteCqrs` framework.
     ///
@@ -257,7 +264,47 @@ where
         &self,
         id: &Entity::Id,
         command: Entity::Command,
-    ) -> Result<(), cqrs_es::AggregateError<LifecycleError<Entity>>> {
+    ) -> Result<(), SendError<Entity>> {
         self.inner.execute(&id.to_string(), command).await
     }
+}
+
+/// Error returned by [`Store::send`].
+///
+/// Wraps the cqrs-es `AggregateError` containing a
+/// `LifecycleError` so that consumers don't import from cqrs-es
+/// or lifecycle directly.
+pub(crate) type SendError<Entity> =
+    AggregateError<LifecycleError<Entity>>;
+
+/// Bounds required for domain error types used with
+/// [`EventSourced`].
+///
+/// [`LifecycleError`] stores the entity's error in its `Apply`
+/// variant and derives `Clone`, `Serialize`, `Deserialize`,
+/// `PartialEq`, and `Eq`. This trait captures those bounds in
+/// one place so implementors see a single meaningful name
+/// instead of a long bound list.
+pub(crate) trait DomainError:
+    std::error::Error
+    + Clone
+    + Serialize
+    + DeserializeOwned
+    + Send
+    + Sync
+    + PartialEq
+    + Eq
+{
+}
+
+impl<T> DomainError for T where
+    T: std::error::Error
+        + Clone
+        + Serialize
+        + DeserializeOwned
+        + Send
+        + Sync
+        + PartialEq
+        + Eq
+{
 }

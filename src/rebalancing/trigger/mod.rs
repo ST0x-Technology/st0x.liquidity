@@ -7,7 +7,7 @@ use alloy::primitives::{Address, B256};
 use async_trait::async_trait;
 use chrono::Utc;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{AggregateContext, EventEnvelope, EventStore, Query};
+use cqrs_es::{AggregateContext, AggregateError, EventEnvelope, EventStore, Query};
 use serde::Deserialize;
 use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
@@ -23,12 +23,12 @@ use st0x_execution::{AlpacaBrokerApiCtx, ArithmeticError, FractionalShares, Symb
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent};
-use crate::vault_registry::{VaultRegistry, VaultRegistryError};
+use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +38,7 @@ enum TokenAddressError {
     #[error("vault registry aggregate in failed state")]
     Failed,
     #[error(transparent)]
-    Persistence(#[from] cqrs_es::AggregateError<VaultRegistryError>),
+    Persistence(#[from] AggregateError<LifecycleError<VaultRegistry>>),
 }
 
 /// Error type for rebalancing configuration validation.
@@ -185,11 +185,11 @@ impl RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for RebalancingTrigger {
+impl Query<Lifecycle<Position>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<Position, ArithmeticError<FractionalShares>>>],
+        events: &[EventEnvelope<Lifecycle<Position>>],
     ) {
         let Ok(symbol) = Symbol::new(aggregate_id) else {
             warn!(aggregate_id = %aggregate_id, "Invalid symbol in position aggregate_id");
@@ -299,8 +299,8 @@ impl RebalancingTrigger {
             return;
         };
 
-        if let Err(e) = self.sender.try_send(operation.clone()) {
-            warn!(error = %e, "Failed to send triggered operation");
+        if let Err(error) = self.sender.try_send(operation.clone()) {
+            warn!(error = %error, "Failed to send triggered operation");
             return;
         }
 
@@ -315,8 +315,8 @@ impl RebalancingTrigger {
                 error!(symbol = %symbol, "Skipped equity trigger: token not in vault registry");
                 return None;
             }
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to load vault registry");
+            Err(error) => {
+                error!(symbol = %symbol, error = %error, "Failed to load vault registry");
                 return None;
             }
         };
@@ -341,7 +341,11 @@ impl RebalancingTrigger {
                 repo,
             );
 
-        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
+        let aggregate_id = VaultRegistryId {
+            orderbook: self.orderbook,
+            owner: self.order_owner,
+        }
+        .to_string();
         let aggregate_context = store.load_aggregate(&aggregate_id).await?;
 
         match aggregate_context.aggregate() {
@@ -366,8 +370,8 @@ impl RebalancingTrigger {
             return;
         };
 
-        if let Err(e) = self.sender.try_send(operation.clone()) {
-            warn!(error = %e, "Failed to send USDC triggered operation");
+        if let Err(error) = self.sender.try_send(operation.clone()) {
+            warn!(error = %error, "Failed to send USDC triggered operation");
             return;
         }
 

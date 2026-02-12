@@ -5,6 +5,7 @@
 //! the fact with gas costs and Pyth oracle price data.
 
 use alloy::primitives::TxHash;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::DomainEvent;
 use rust_decimal::Decimal;
@@ -41,6 +42,7 @@ pub(crate) struct OnChainTrade {
     pub(crate) enrichment: Option<Enrichment>,
 }
 
+#[async_trait]
 impl EventSourced for OnChainTrade {
     type Id = OnChainTradeId;
     type Event = OnChainTradeEvent;

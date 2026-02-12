@@ -14,13 +14,12 @@ use st0x_execution::{
 };
 
 use super::execution::find_orders_by_status;
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{Lifecycle, LifecycleError};
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderError, OffchainOrderId,
-    PriceCents,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, PriceCents,
 };
 use crate::onchain::OnChainError;
-use crate::position::{Position, PositionCommand, PositionCqrs, PositionError};
+use crate::position::{Position, PositionCommand, PositionCqrs};
 
 /// Order polling errors for order status monitoring.
 #[derive(Debug, thiserror::Error)]
@@ -34,9 +33,9 @@ pub(crate) enum OrderPollingError {
     #[error("Onchain error: {0}")]
     OnChain(#[from] OnChainError),
     #[error("Offchain order aggregate error: {0}")]
-    OffchainOrderAggregate(#[from] AggregateError<OffchainOrderError>),
+    OffchainOrderAggregate(#[from] AggregateError<LifecycleError<OffchainOrder>>),
     #[error("Position aggregate error: {0}")]
-    PositionAggregate(#[from] AggregateError<PositionError>),
+    PositionAggregate(#[from] AggregateError<LifecycleError<Position>>),
 }
 
 impl From<ExecutionError> for OrderPollingError {

@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::persist::GenericQuery;
-use cqrs_es::{Aggregate, DomainEvent};
+use cqrs_es::DomainEvent;
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
@@ -16,10 +16,11 @@ use st0x_execution::{
     SupportedExecutor, Symbol,
 };
 
-use crate::lifecycle::{EventSourced, Lifecycle, LifecycleError};
+use crate::event_sourced::{EventSourced, SqliteQuery};
+use crate::lifecycle::Lifecycle;
 
 pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder>>;
-pub(crate) type OffchainOrderQuery = crate::lifecycle::SqliteQuery<OffchainOrder>;
+pub(crate) type OffchainOrderQuery = SqliteQuery<OffchainOrder>;
 
 /// Constructs the offchain order CQRS framework with its view
 /// query. Used by `Conductor::start`, CLI, and tests.
@@ -40,124 +41,6 @@ pub(crate) fn build_offchain_order_cqrs(
     ));
 
     (cqrs, Arc::new(query))
-}
-
-#[async_trait]
-impl Aggregate for Lifecycle<OffchainOrder> {
-    type Command = OffchainOrderCommand;
-    type Event = OffchainOrderEvent;
-    type Error = OffchainOrderError;
-    type Services = Arc<dyn OrderPlacer>;
-
-    fn aggregate_type() -> String {
-        "OffchainOrder".to_string()
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        *self = self
-            .clone()
-            .transition(&event, OffchainOrder::apply_transition)
-            .or_initialize(&event, OffchainOrder::from_event);
-    }
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match (self.live(), &command) {
-            (
-                Err(LifecycleError::Uninitialized),
-                OffchainOrderCommand::Place {
-                    symbol,
-                    shares,
-                    direction,
-                    executor,
-                },
-            ) => {
-                let now = Utc::now();
-                let market_order = MarketOrder {
-                    symbol: symbol.clone(),
-                    shares: *shares,
-                    direction: *direction,
-                };
-
-                let placed = OffchainOrderEvent::Placed {
-                    symbol: symbol.clone(),
-                    shares: *shares,
-                    direction: *direction,
-                    executor: *executor,
-                    placed_at: now,
-                };
-
-                match services.place_market_order(market_order).await {
-                    Ok(executor_order_id) => Ok(vec![
-                        placed,
-                        OffchainOrderEvent::Submitted {
-                            executor_order_id,
-                            submitted_at: now,
-                        },
-                    ]),
-                    Err(e) => Ok(vec![
-                        placed,
-                        OffchainOrderEvent::Failed {
-                            error: e.to_string(),
-                            failed_at: now,
-                        },
-                    ]),
-                }
-            }
-
-            (Ok(_), OffchainOrderCommand::Place { .. }) => Err(OffchainOrderError::AlreadyPlaced),
-
-            (Err(e), _) => Err(e.into()),
-
-            (
-                Ok(order),
-                OffchainOrderCommand::UpdatePartialFill {
-                    shares_filled,
-                    avg_price_cents,
-                },
-            ) => match order {
-                OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-                    Ok(vec![OffchainOrderEvent::PartiallyFilled {
-                        shares_filled: *shares_filled,
-                        avg_price_cents: *avg_price_cents,
-                        partially_filled_at: Utc::now(),
-                    }])
-                }
-                OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-                OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
-                    Err(OffchainOrderError::AlreadyCompleted)
-                }
-            },
-
-            (Ok(order), OffchainOrderCommand::CompleteFill { price_cents }) => match order {
-                OffchainOrder::Submitted { .. } | OffchainOrder::PartiallyFilled { .. } => {
-                    Ok(vec![OffchainOrderEvent::Filled {
-                        price_cents: *price_cents,
-                        filled_at: Utc::now(),
-                    }])
-                }
-                OffchainOrder::Pending { .. } => Err(OffchainOrderError::NotSubmitted),
-                OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
-                    Err(OffchainOrderError::AlreadyCompleted)
-                }
-            },
-
-            (Ok(order), OffchainOrderCommand::MarkFailed { error }) => match order {
-                OffchainOrder::Pending { .. }
-                | OffchainOrder::Submitted { .. }
-                | OffchainOrder::PartiallyFilled { .. } => Ok(vec![OffchainOrderEvent::Failed {
-                    error: error.clone(),
-                    failed_at: Utc::now(),
-                }]),
-                OffchainOrder::Filled { .. } | OffchainOrder::Failed { .. } => {
-                    Err(OffchainOrderError::AlreadyCompleted)
-                }
-            },
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -212,8 +95,17 @@ pub(crate) enum OffchainOrder {
     },
 }
 
+#[async_trait]
 impl EventSourced for OffchainOrder {
+    type Id = OffchainOrderId;
     type Event = OffchainOrderEvent;
+    type Command = OffchainOrderCommand;
+    type Error = OffchainOrderError;
+    type Services = Arc<dyn OrderPlacer>;
+
+    const AGGREGATE_TYPE: &'static str = "OffchainOrder";
+    const SCHEMA_VERSION: u64 = 1;
+
 }
 
 impl OffchainOrder {

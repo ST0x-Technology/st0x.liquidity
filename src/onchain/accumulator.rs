@@ -133,7 +133,7 @@ mod tests {
         direction: Direction,
     ) {
         cqrs.execute(
-            &Position::aggregate_id(symbol),
+            &symbol.to_string(),
             PositionCommand::AcknowledgeOnChainFill {
                 symbol: symbol.clone(),
                 threshold: ExecutionThreshold::whole_share(),

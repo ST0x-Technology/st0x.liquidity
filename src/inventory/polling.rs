@@ -9,9 +9,9 @@
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use cqrs_es::persist::PersistedEventStore;
-use cqrs_es::{AggregateContext, AggregateError, EventStore};
+use cqrs_es::{AggregateContext, EventStore};
 use futures_util::future::try_join_all;
-use sqlite_es::{SqliteCqrs, SqliteEventRepository};
+use sqlite_es::SqliteEventRepository;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -19,14 +19,11 @@ use tracing::debug;
 
 use st0x_execution::{Executor, InventoryResult};
 
-use crate::inventory::snapshot::{
-    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
-};
+use crate::event_sourced::{SendError, Store};
+use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId};
 use crate::lifecycle::Lifecycle;
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
-use crate::vault_registry::{VaultRegistry, VaultRegistryError};
-
-pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
+use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]
@@ -36,9 +33,9 @@ pub(crate) enum InventoryPollingError<ExecutorError> {
     #[error(transparent)]
     Executor(ExecutorError),
     #[error(transparent)]
-    SnapshotAggregate(#[from] AggregateError<InventorySnapshotError>),
+    SnapshotAggregate(#[from] SendError<InventorySnapshot>),
     #[error(transparent)]
-    VaultRegistryAggregate(#[from] AggregateError<VaultRegistryError>),
+    VaultRegistryAggregate(#[from] SendError<VaultRegistry>),
     #[error("vault balance mismatch: expected {expected:?}, got {actual:?}")]
     VaultBalanceMismatch {
         expected: Vec<Address>,
@@ -56,7 +53,7 @@ where
     pool: SqlitePool,
     orderbook: Address,
     order_owner: Address,
-    snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+    snapshot: Store<InventorySnapshot>,
 }
 
 impl<P, E> InventoryPollingService<P, E>
@@ -70,7 +67,7 @@ where
         pool: SqlitePool,
         orderbook: Address,
         order_owner: Address,
-        snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+        snapshot: Store<InventorySnapshot>,
     ) -> Self {
         Self {
             vault_service,
@@ -78,7 +75,7 @@ where
             pool,
             orderbook,
             order_owner,
-            snapshot_cqrs,
+            snapshot,
         }
     }
 
@@ -91,21 +88,20 @@ where
     ///
     /// Registered queries are dispatched when commands are executed.
     pub(crate) async fn poll_and_record(&self) -> Result<(), InventoryPollingError<E::Error>> {
-        let snapshot_aggregate_id =
-            InventorySnapshot::aggregate_id(self.orderbook, self.order_owner);
+        let snapshot_id = InventorySnapshotId {
+            orderbook: self.orderbook,
+            owner: self.order_owner,
+        };
 
-        self.poll_onchain(&snapshot_aggregate_id, &self.snapshot_cqrs)
-            .await?;
-        self.poll_offchain(&snapshot_aggregate_id, &self.snapshot_cqrs)
-            .await?;
+        self.poll_onchain(&snapshot_id).await?;
+        self.poll_offchain(&snapshot_id).await?;
 
         Ok(())
     }
 
     async fn poll_onchain(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let vault_registry = self.load_vault_registry().await?;
 
@@ -114,10 +110,8 @@ where
             return Ok(());
         };
 
-        self.poll_onchain_equity(snapshot_aggregate_id, snapshot_cqrs, &registry)
-            .await?;
-        self.poll_onchain_cash(snapshot_aggregate_id, snapshot_cqrs, &registry)
-            .await?;
+        self.poll_onchain_equity(snapshot_id, &registry).await?;
+        self.poll_onchain_cash(snapshot_id, &registry).await?;
 
         Ok(())
     }
@@ -131,7 +125,11 @@ where
                 repo,
             );
 
-        let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
+        let aggregate_id = VaultRegistryId {
+            orderbook: self.orderbook,
+            owner: self.order_owner,
+        }
+        .to_string();
         let aggregate_context = store.load_aggregate(&aggregate_id).await?;
         let aggregate = aggregate_context.aggregate();
 
@@ -143,8 +141,7 @@ where
 
     async fn poll_onchain_equity(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         if registry.equity_vaults.is_empty() {
@@ -177,11 +174,8 @@ where
             });
         }
 
-        snapshot_cqrs
-            .execute(
-                snapshot_aggregate_id,
-                InventorySnapshotCommand::OnchainEquity { balances },
-            )
+        self.snapshot
+            .send(snapshot_id, InventorySnapshotCommand::OnchainEquity { balances })
             .await?;
 
         Ok(())
@@ -189,8 +183,7 @@ where
 
     async fn poll_onchain_cash(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        snapshot_id: &InventorySnapshotId,
         registry: &VaultRegistry,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let Some(usdc_vault) = &registry.usdc_vault else {
@@ -203,9 +196,9 @@ where
             .get_usdc_balance(self.order_owner, VaultId(usdc_vault.vault_id))
             .await?;
 
-        snapshot_cqrs
-            .execute(
-                snapshot_aggregate_id,
+        self.snapshot
+            .send(
+                snapshot_id,
                 InventorySnapshotCommand::OnchainCash { usdc_balance },
             )
             .await?;
@@ -215,8 +208,7 @@ where
 
     async fn poll_offchain(
         &self,
-        snapshot_aggregate_id: &str,
-        snapshot_cqrs: &SqliteCqrs<InventorySnapshotAggregate>,
+        snapshot_id: &InventorySnapshotId,
     ) -> Result<(), InventoryPollingError<E::Error>> {
         let inventory_result = self
             .executor
@@ -235,16 +227,16 @@ where
             .map(|position| (position.symbol, position.quantity))
             .collect();
 
-        snapshot_cqrs
-            .execute(
-                snapshot_aggregate_id,
+        self.snapshot
+            .send(
+                snapshot_id,
                 InventorySnapshotCommand::OffchainEquity { positions },
             )
             .await?;
 
-        snapshot_cqrs
-            .execute(
-                snapshot_aggregate_id,
+        self.snapshot
+            .send(
+                snapshot_id,
                 InventorySnapshotCommand::OffchainCash {
                     cash_balance_cents: inventory.cash_balance_cents,
                 },
@@ -590,7 +582,8 @@ mod tests {
         service.poll_and_record().await.unwrap();
 
         // Verify events were stored under the correct aggregate ID
-        let expected_aggregate_id = InventorySnapshot::aggregate_id(orderbook, order_owner);
+        let expected_aggregate_id =
+            InventorySnapshotId { orderbook, owner: order_owner }.to_string();
         let events = load_events_for_aggregate(&pool, &expected_aggregate_id).await;
 
         assert!(
@@ -614,7 +607,11 @@ mod tests {
         symbol: Symbol,
     ) {
         let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
-        let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
+        let aggregate_id = VaultRegistryId {
+            orderbook,
+            owner: order_owner,
+        }
+        .to_string();
 
         cqrs.execute(
             &aggregate_id,
@@ -636,7 +633,11 @@ mod tests {
         vault_id: B256,
     ) {
         let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
-        let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
+        let aggregate_id = VaultRegistryId {
+            orderbook,
+            owner: order_owner,
+        }
+        .to_string();
 
         cqrs.execute(
             &aggregate_id,
@@ -845,7 +846,7 @@ mod tests {
         orderbook: Address,
         order_owner: Address,
     ) -> Vec<InventorySnapshotEvent> {
-        let aggregate_id = InventorySnapshot::aggregate_id(orderbook, order_owner);
+        let aggregate_id = InventorySnapshotId { orderbook, owner: order_owner }.to_string();
         load_events_for_aggregate(pool, &aggregate_id).await
     }
 

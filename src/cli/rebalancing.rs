@@ -4,9 +4,7 @@ use alloy::network::EthereumWallet;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::signers::local::PrivateKeySigner;
-use cqrs_es::CqrsFramework;
-use cqrs_es::persist::PersistedEventStore;
-use sqlite_es::SqliteEventRepository;
+use sqlite_es::sqlite_cqrs;
 use sqlx::SqlitePool;
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -27,6 +25,7 @@ use crate::cctp::{
 };
 use crate::config::{BrokerCtx, Ctx};
 use crate::equity_redemption::RedemptionAggregateId;
+use crate::event_sourced::Store;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::rebalancing::mint::Mint;
 use crate::rebalancing::redemption::Redeem;
@@ -79,10 +78,8 @@ pub(super) async fn transfer_equity_command<W: Write>(
         TransferDirection::ToRaindex => {
             writeln!(stdout, "   Creating mint request...")?;
 
-            let mint_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let mint_cqrs = Arc::new(CqrsFramework::new(mint_store, vec![], ()));
-            let mint_manager = MintManager::new(tokenization_service, mint_cqrs);
+            let mint_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
+            let mint_manager = MintManager::new(tokenization_service, mint_store);
 
             let issuer_request_id =
                 IssuerRequestId::new(format!("cli-mint-{}", uuid::Uuid::new_v4()));
@@ -109,9 +106,9 @@ pub(super) async fn transfer_equity_command<W: Write>(
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
             let redemption_store =
-                PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-            let redemption_cqrs = Arc::new(CqrsFramework::new(redemption_store, vec![], ()));
-            let redemption_manager = RedemptionManager::new(tokenization_service, redemption_cqrs);
+                Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
+            let redemption_manager =
+                RedemptionManager::new(tokenization_service, redemption_store);
 
             let aggregate_id =
                 RedemptionAggregateId::new(format!("cli-redeem-{}", uuid::Uuid::new_v4()));
@@ -215,16 +212,14 @@ where
         base_provider_with_wallet,
         ctx.evm.orderbook,
     ));
-    let event_store =
-        PersistedEventStore::new_event_store(SqliteEventRepository::new(pool.clone()));
-    let cqrs = Arc::new(CqrsFramework::new(event_store, vec![], ()));
+    let usdc_store = Arc::new(Store::new(sqlite_cqrs(pool.clone(), vec![], ())));
 
     let rebalance_manager = UsdcRebalanceManager::new(
         alpaca_broker,
         alpaca_wallet,
         bridge,
         vault_service,
-        cqrs,
+        usdc_store,
         owner,
         VaultId(rebalancing_config.usdc_vault_id),
     );

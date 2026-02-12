@@ -43,6 +43,7 @@ use crate::event_sourced::EventSourced;
 /// Failed { .. } ---- any event ----> Failed { .. } (unchanged)
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(bound = "")]
 pub(crate) enum Lifecycle<Entity: EventSourced> {
     Uninitialized,
     Live(Entity),
@@ -84,6 +85,7 @@ impl<Entity: EventSourced> Default for Lifecycle<Entity> {
 ///
 /// [`Apply`]: LifecycleError::Apply
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
+#[serde(bound = "")]
 pub(crate) enum LifecycleError<Entity: EventSourced> {
     #[error("operation on uninitialized state")]
     Uninitialized,
@@ -127,7 +129,6 @@ impl<Entity> Aggregate for Lifecycle<Entity>
 where
     Entity: EventSourced,
     Entity::Event: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + PartialEq,
-    Entity::Error: Clone + Debug + Serialize + DeserializeOwned + Send + Sync + PartialEq + Eq,
 {
     type Command = Entity::Command;
     type Event = Entity::Event;

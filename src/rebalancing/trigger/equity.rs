@@ -37,7 +37,7 @@ impl InProgressGuard {
     ) -> Option<Self> {
         {
             let mut guard = match in_progress.write() {
-                Ok(g) => g,
+                Ok(guard) => guard,
                 Err(poison) => poison.into_inner(),
             };
 
@@ -66,7 +66,7 @@ impl Drop for InProgressGuard {
     fn drop(&mut self) {
         if !self.defused {
             let mut guard = match self.in_progress.write() {
-                Ok(g) => g,
+                Ok(guard) => guard,
                 Err(poison) => poison.into_inner(),
             };
             guard.remove(&self.symbol);

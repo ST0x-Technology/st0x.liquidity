@@ -4,7 +4,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use alloy::sol_types;
 use futures_util::Stream;
-use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -20,27 +19,28 @@ use super::{
 };
 use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::config::Ctx;
-use crate::inventory::InventorySnapshotAggregate;
-use crate::offchain_order::OffchainOrderCqrs;
+use crate::event_sourced::{SqliteQuery, Store};
+use crate::inventory::InventorySnapshot;
+use crate::offchain_order::OffchainOrder;
 use crate::onchain::trade::TradeEvent;
 use crate::onchain::vault::VaultService;
-use crate::onchain_trade::OnChainTradeCqrs;
-use crate::position::{PositionCqrs, PositionQuery};
+use crate::onchain_trade::OnChainTrade;
+use crate::position::Position;
 use crate::symbol::cache::SymbolCache;
 use crate::threshold::ExecutionThreshold;
-use crate::vault_registry::VaultRegistryAggregate;
+use crate::vault_registry::VaultRegistry;
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
 type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
 pub(crate) struct CqrsFrameworks {
-    pub(crate) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
-    pub(crate) position_cqrs: Arc<PositionCqrs>,
-    pub(crate) position_query: Arc<PositionQuery>,
-    pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
-    pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
+    pub(crate) onchain_trade: Arc<Store<OnChainTrade>>,
+    pub(crate) position: Arc<Store<Position>>,
+    pub(crate) position_query: Arc<SqliteQuery<Position>>,
+    pub(crate) offchain_order: Arc<Store<OffchainOrder>>,
+    pub(crate) vault_registry: Store<VaultRegistry>,
+    pub(crate) snapshot: Store<InventorySnapshot>,
 }
 
 struct CommonFields<P, E> {
@@ -175,7 +175,7 @@ where
                     self.common.executor.clone(),
                     self.common.ctx.evm.orderbook,
                     order_owner,
-                    self.common.frameworks.snapshot_cqrs,
+                    self.common.frameworks.snapshot,
                 ))
             }
             Err(error) => {
@@ -189,8 +189,8 @@ where
             &self.common.ctx,
             &self.common.pool,
             self.common.executor.clone(),
-            self.common.frameworks.offchain_order_cqrs.clone(),
-            self.common.frameworks.position_cqrs.clone(),
+            self.common.frameworks.offchain_order.clone(),
+            self.common.frameworks.position.clone(),
         );
         let dex_event_receiver = spawn_onchain_event_receiver(
             self.state.event_sender,
@@ -202,16 +202,16 @@ where
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
             self.common.pool.clone(),
-            self.common.frameworks.position_cqrs.clone(),
+            self.common.frameworks.position.clone(),
             self.common.frameworks.position_query.clone(),
-            self.common.frameworks.offchain_order_cqrs.clone(),
+            self.common.frameworks.offchain_order.clone(),
             self.common.execution_threshold,
         );
         let trade_cqrs = super::TradeProcessingCqrs {
-            onchain_trade_cqrs: self.common.frameworks.onchain_trade_cqrs,
-            position_cqrs: self.common.frameworks.position_cqrs,
+            onchain_trade: self.common.frameworks.onchain_trade,
+            position: self.common.frameworks.position,
             position_query: self.common.frameworks.position_query,
-            offchain_order_cqrs: self.common.frameworks.offchain_order_cqrs,
+            offchain_order: self.common.frameworks.offchain_order,
             execution_threshold: self.common.execution_threshold,
         };
         let queue_processor = spawn_queue_processor(
@@ -221,7 +221,7 @@ where
             &self.common.cache,
             self.common.provider,
             trade_cqrs,
-            self.common.frameworks.vault_registry_cqrs,
+            self.common.frameworks.vault_registry,
         );
 
         Conductor {

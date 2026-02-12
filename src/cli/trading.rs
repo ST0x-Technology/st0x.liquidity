@@ -167,16 +167,16 @@ pub(super) async fn execute_order_with_writers<W: Write>(
             writeln!(stdout, "   Action: {direction:?}")?;
             writeln!(stdout, "   Quantity: {quantity}")?;
         }
-        Err(e) => {
+        Err(error) => {
             error!(
                 symbol = %symbol,
                 direction = ?direction,
                 quantity = quantity,
-                error = ?e,
+                error = ?error,
                 "Failed to place order"
             );
-            writeln!(stdout, "❌ Failed to place order: {e}")?;
-            return Err(e);
+            writeln!(stdout, "❌ Failed to place order: {error}")?;
+            return Err(error);
         }
     }
 
@@ -219,9 +219,9 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
                 "   Please verify the transaction hash and ensure the RPC endpoint is correct."
             )?;
         }
-        Err(e) => {
-            writeln!(stdout, "❌ Error processing transaction: {e}")?;
-            return Err(e.into());
+        Err(error) => {
+            writeln!(stdout, "❌ Error processing transaction: {error}")?;
+            return Err(error.into());
         }
     }
 
@@ -300,7 +300,7 @@ pub(super) async fn process_found_trade<W: Write>(
         "position_view".to_string(),
     ));
     let position_query = GenericQuery::new(position_view_repo.clone());
-    let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position, ArithmeticError<FractionalShares>>>> =
+    let position_cqrs: Arc<SqliteCqrs<Lifecycle<Position>>> =
         Arc::new(sqlite_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(position_view_repo))],
@@ -334,8 +334,8 @@ pub(super) async fn process_found_trade<W: Write>(
         "Trade triggered execution for {executor_type:?} (ID: {offchain_order_id})"
     )?;
 
-    let aggregate_id = Position::aggregate_id(&params.symbol);
-    if let Err(e) = position_cqrs
+    let aggregate_id = params.symbol.to_string();
+    if let Err(error) = position_cqrs
         .execute(
             &aggregate_id,
             PositionCommand::PlaceOffChainOrder {
@@ -348,10 +348,10 @@ pub(super) async fn process_found_trade<W: Write>(
         )
         .await
     {
-        error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {e}");
+        error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {error}");
     }
 
-    let agg_id = OffchainOrder::aggregate_id(offchain_order_id);
+    let agg_id = offchain_order_id.to_string();
 
     if let Err(error) = offchain_order_cqrs
         .execute(

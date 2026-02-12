@@ -5,6 +5,7 @@
 
 mod builder;
 mod manifest;
+pub(crate) mod schema_registry;
 pub(crate) mod wire;
 
 use alloy::primitives::{Address, IntoLogData};
@@ -12,10 +13,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::AggregateError;
-use cqrs_es::persist::GenericQuery;
 use futures_util::{Stream, StreamExt};
-use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 use sqlx::SqlitePool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,14 +33,13 @@ use st0x_execution::{ExecutionError, Executor, FractionalShares, SupportedExecut
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
 use crate::config::{Ctx, CtxError};
+use crate::event_sourced::{SendError, SqliteQuery, Store};
 use crate::inventory::{
-    InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
+    InventoryPollingService, InventorySnapshot, InventorySnapshotQuery, InventoryView,
 };
-use crate::lifecycle::Lifecycle;
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
-    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
-    OrderPlacer, build_offchain_order_cqrs,
+    ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
 use crate::onchain::accumulator::{check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
@@ -50,33 +47,29 @@ use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
 use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
-use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
-use crate::position::{
-    Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
-};
+use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId};
+use crate::position::{Position, PositionCommand, TradeId};
 use crate::queue::{
     EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed,
 };
 use crate::rebalancing::{
     RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTriggerConfig, spawn_rebalancer,
 };
-
-use self::manifest::QueryManifest;
-use self::wire::CqrsBuilder;
 use crate::symbol::cache::SymbolCache;
 use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
-use crate::vault_registry::{
-    VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError,
-};
+use crate::vault_registry::{VaultRegistry, VaultRegistryCommand, VaultRegistryId};
+
+use self::manifest::QueryManifest;
+use self::wire::CqrsBuilder;
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
 struct TradeProcessingCqrs {
-    onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
-    position_cqrs: Arc<PositionCqrs>,
-    position_query: Arc<PositionQuery>,
-    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    onchain_trade: Arc<Store<OnChainTrade>>,
+    position: Arc<Store<Position>>,
+    position_query: Arc<SqliteQuery<Position>>,
+    offchain_order: Arc<Store<OffchainOrder>>,
     execution_threshold: ExecutionThreshold,
 }
 
@@ -105,7 +98,7 @@ pub(crate) enum EventProcessingError {
     #[error("Ctx error: {0}")]
     Ctx(#[from] CtxError),
     #[error("Vault registry command failed: {0}")]
-    VaultRegistry(#[from] AggregateError<VaultRegistryError>),
+    VaultRegistry(#[from] SendError<VaultRegistry>),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
     #[error("Alpaca trading API error: {0}")]
@@ -151,7 +144,7 @@ where
     )
     .await
     {
-        Ok(c) => c,
+        Ok(conductor) => conductor,
         Err(error) => {
             error!("Failed to start conductor: {error}, retrying in {RERUN_DELAY_SECS} seconds");
             tokio::time::sleep(std::time::Duration::from_secs(RERUN_DELAY_SECS)).await;
@@ -197,7 +190,7 @@ where
 
 /// Context for vault discovery operations during trade processing.
 struct VaultDiscoveryCtx<'a> {
-    vault_registry_cqrs: &'a SqliteCqrs<VaultRegistryAggregate>,
+    vault_registry: &'a Store<VaultRegistry>,
     orderbook: Address,
     order_owner: Address,
 }
@@ -229,17 +222,18 @@ impl Conductor {
             backfill_events(pool, &provider, &ctx.evm, end_block).await?;
         }
 
-        let onchain_trade_cqrs =
-            Arc::new(CqrsBuilder::<Lifecycle<OnChainTrade>>::new(pool.clone()).build(()));
+        let onchain_trade = Arc::new(
+            CqrsBuilder::<OnChainTrade>::new(pool.clone()).build(()),
+        );
 
         let inventory = Arc::new(RwLock::new(InventoryView::default()));
 
-        let (position_cqrs, position_query, rebalancer) = match ctx.rebalancing_ctx() {
+        let (position, position_query, rebalancer) = match ctx.rebalancing_ctx() {
             Some(rebalancing_ctx) => {
                 let signer = PrivateKeySigner::from_bytes(&rebalancing_ctx.evm_private_key)?;
                 let market_maker_wallet = signer.address();
 
-                let (position_cqrs, position_query, rebalancer_handle) =
+                let (position, position_query, rebalancer_handle) =
                     spawn_rebalancing_infrastructure(
                         rebalancing_ctx,
                         pool,
@@ -251,28 +245,30 @@ impl Conductor {
                     )
                     .await?;
 
-                (position_cqrs, position_query, Some(rebalancer_handle))
+                (position, position_query, Some(rebalancer_handle))
             }
             None => {
-                let (position_cqrs, position_query) = build_position_cqrs(pool);
-                (position_cqrs, position_query, None)
+                let (position, position_query) = build_position_cqrs(pool);
+                (position, position_query, None)
             }
         };
 
         let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
-        let (offchain_order_cqrs, _) = build_offchain_order_cqrs(pool, order_placer);
-        let vault_registry_cqrs =
-            CqrsBuilder::<VaultRegistryAggregate>::new(pool.clone()).build(());
+        let offchain_order = Arc::new(
+            CqrsBuilder::<OffchainOrder>::new(pool.clone()).build(order_placer),
+        );
+        let vault_registry =
+            CqrsBuilder::<VaultRegistry>::new(pool.clone()).build(());
 
-        let snapshot_cqrs = build_inventory_snapshot_cqrs(pool, inventory.clone());
+        let snapshot = build_inventory_snapshot_store(pool, inventory.clone());
 
         let frameworks = CqrsFrameworks {
-            onchain_trade_cqrs,
-            position_cqrs,
+            onchain_trade,
+            position,
             position_query,
-            offchain_order_cqrs,
-            vault_registry_cqrs,
-            snapshot_cqrs,
+            offchain_order,
+            vault_registry,
+            snapshot,
         };
 
         let mut builder = ConductorBuilder::new(
@@ -356,7 +352,7 @@ async fn spawn_rebalancing_infrastructure<P: Provider + Clone + Send + 'static>(
     event_sender: broadcast::Sender<ServerMessage>,
     provider: &P,
     market_maker_wallet: Address,
-) -> anyhow::Result<(Arc<PositionCqrs>, Arc<PositionQuery>, JoinHandle<()>)> {
+) -> anyhow::Result<(Arc<Store<Position>>, Arc<SqliteQuery<Position>>, JoinHandle<()>)> {
     info!("Initializing rebalancing infrastructure");
 
     const OPERATION_CHANNEL_CAPACITY: usize = 100;
@@ -409,56 +405,65 @@ async fn wait_for_optional_task(handle: &mut Option<JoinHandle<()>>, task_name: 
 }
 
 fn log_task_result(result: Result<(), tokio::task::JoinError>, task_name: &str) {
-    if let Err(e) = result {
-        error!("{task_name} task panicked: {e}");
+    if let Err(error) = result {
+        error!("{task_name} task panicked: {error}");
     }
 }
 
 /// Constructs the position CQRS framework with its view query
 /// (without rebalancing trigger). Used when rebalancing is disabled.
-fn build_position_cqrs(pool: &SqlitePool) -> (Arc<PositionCqrs>, Arc<PositionQuery>) {
-    let position_view_repo = Arc::new(SqliteViewRepository::new(
+fn build_position_cqrs(
+    pool: &SqlitePool,
+) -> (Arc<Store<Position>>, Arc<SqliteQuery<Position>>) {
+    let position_view_repo = Arc::new(sqlite_es::SqliteViewRepository::new(
         pool.clone(),
         "position_view".to_string(),
     ));
-    let position_query = GenericQuery::new(position_view_repo.clone());
+    let position_query =
+        cqrs_es::persist::GenericQuery::new(position_view_repo.clone());
 
-    let view: wire::UnwiredQuery<PositionQuery, wire::Cons<PositionAggregate, wire::Nil>> =
-        wire::UnwiredQuery::new(GenericQuery::new(position_view_repo));
+    let view: wire::UnwiredQuery<
+        SqliteQuery<Position>,
+        wire::Cons<Position, wire::Nil>,
+    > = wire::UnwiredQuery::new(
+        cqrs_es::persist::GenericQuery::new(position_view_repo),
+    );
 
-    let (cqrs, (view, ())) = CqrsBuilder::<PositionAggregate>::new(pool.clone())
+    let (store, (view, ())) = CqrsBuilder::<Position>::new(pool.clone())
         .wire(view)
         .build(());
 
     drop(view);
 
-    (Arc::new(cqrs), Arc::new(position_query))
+    (Arc::new(store), Arc::new(position_query))
 }
 
-/// Constructs the inventory snapshot CQRS framework with its query.
-fn build_inventory_snapshot_cqrs(
+/// Constructs the inventory snapshot store with its query.
+fn build_inventory_snapshot_store(
     pool: &SqlitePool,
     inventory: Arc<RwLock<InventoryView>>,
-) -> SqliteCqrs<InventorySnapshotAggregate> {
+) -> Store<InventorySnapshot> {
     let snapshot_query = InventorySnapshotQuery::new(inventory);
 
     let query: wire::UnwiredQuery<
         InventorySnapshotQuery,
-        wire::Cons<InventorySnapshotAggregate, wire::Nil>,
+        wire::Cons<InventorySnapshot, wire::Nil>,
     > = wire::UnwiredQuery::new(snapshot_query);
 
-    CqrsBuilder::<InventorySnapshotAggregate>::new(pool.clone())
-        .wire(query)
-        .build(())
-        .0
+    let (store, (_query, ())) =
+        CqrsBuilder::<InventorySnapshot>::new(pool.clone())
+            .wire(query)
+            .build(());
+
+    store
 }
 
 fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
     ctx: &Ctx,
     pool: &SqlitePool,
     executor: E,
-    offchain_order_cqrs: Arc<OffchainOrderCqrs>,
-    position_cqrs: Arc<PositionCqrs>,
+    offchain_order: Arc<Store<OffchainOrder>>,
+    position: Arc<Store<Position>>,
 ) -> JoinHandle<()> {
     let poller_ctx = ctx.get_order_poller_ctx();
     info!(
@@ -470,12 +475,12 @@ fn spawn_order_poller<E: Executor + Clone + Send + 'static>(
         poller_ctx,
         pool.clone(),
         executor,
-        offchain_order_cqrs,
-        position_cqrs,
+        offchain_order,
+        position,
     );
     tokio::spawn(async move {
-        if let Err(e) = poller.run().await {
-            error!("Order poller failed: {e}");
+        if let Err(error) = poller.run().await {
+            error!("Order poller failed: {error}");
         } else {
             info!("Order poller completed successfully");
         }
@@ -509,8 +514,8 @@ fn spawn_event_processor(
                 "Processing live event: tx_hash={:?}, log_index={:?}",
                 log.transaction_hash, log.log_index
             );
-            if let Err(e) = process_live_event(&pool, event, log).await {
-                error!("Failed to process live event: {e}");
+            if let Err(error) = process_live_event(&pool, event, log).await {
+                error!("Failed to process live event: {error}");
             }
         }
         info!("Event processing loop ended");
