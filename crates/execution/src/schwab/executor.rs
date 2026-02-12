@@ -8,9 +8,7 @@ use url::Url;
 use crate::schwab::SchwabAuthCtx;
 use crate::schwab::market_hours::{MarketStatus, fetch_market_hours};
 use crate::schwab::tokens::{SchwabTokens, spawn_automatic_token_refresh};
-use crate::{
-    ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, OrderStatus, TryIntoExecutor,
-};
+use crate::{ExecutionError, Executor, MarketOrder, OrderPlacement, OrderState, TryIntoExecutor};
 
 /// Everything the Schwab executor needs to initialize: auth credentials,
 /// endpoint configuration, and database pool for token storage.

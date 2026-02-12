@@ -26,7 +26,7 @@ pub use alpaca_trading_api::{
 };
 pub use error::PersistenceError;
 pub use mock::{MockExecutor, MockExecutorCtx};
-pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus, OrderUpdate};
+pub use order::{MarketOrder, OrderPlacement, OrderState, OrderStatus};
 pub use schwab::{Schwab, SchwabCtx, SchwabError, SchwabTokens, extract_code_from_url};
 
 #[async_trait]
@@ -55,10 +55,6 @@ pub trait Executor: Send + Sync + 'static {
     /// Get the current status of a specific order
     /// Used to check if pending orders have been filled or failed
     async fn get_order_status(&self, order_id: &Self::OrderId) -> Result<OrderState, Self::Error>;
-
-    /// Poll all pending orders for status updates
-    /// More efficient than individual get_order_status calls for multiple orders
-    async fn poll_pending_orders(&self) -> Result<Vec<OrderUpdate<Self::OrderId>>, Self::Error>;
 
     /// Return the enum variant representing this executor type
     /// Used for database storage and conditional logic
@@ -609,6 +605,30 @@ pub trait TryIntoExecutor {
 
     async fn try_into_executor(self)
     -> Result<Self::Executor, <Self::Executor as Executor>::Error>;
+}
+
+/// The order ID assigned by the executor (broker) when an order is placed.
+///
+/// Wraps the executor's string order ID for type safety in the CQRS domain.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutorOrderId(String);
+
+impl ExecutorOrderId {
+    pub fn new(id: &(impl ToString + ?Sized)) -> Self {
+        Self(id.to_string())
+    }
+}
+
+impl AsRef<str> for ExecutorOrderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Display for ExecutorOrderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 #[cfg(test)]
