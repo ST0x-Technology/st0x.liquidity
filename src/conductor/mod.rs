@@ -1369,6 +1369,7 @@ mod tests {
     use alloy::sol_types;
     use cqrs_es::persist::GenericQuery;
     use futures_util::stream;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use std::sync::Arc;
@@ -2341,7 +2342,7 @@ mod tests {
             .build()
     }
 
-    fn test_trade_with_amount(amount: f64, log_index: u64) -> OnchainTrade {
+    fn test_trade_with_amount(amount: Decimal, log_index: u64) -> OnchainTrade {
         OnchainTradeBuilder::default()
             .with_symbol("tAAPL")
             .with_equity_token(TEST_EQUITY_TOKEN)
@@ -2647,7 +2648,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 10).await;
-        let trade = test_trade_with_amount(0.5, 10);
+        let trade = test_trade_with_amount(dec!(0.5), 10);
 
         let result = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2696,7 +2697,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 20).await;
-        let trade = test_trade_with_amount(1.5, 20);
+        let trade = test_trade_with_amount(dec!(1.5), 20);
 
         let result = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2756,7 +2757,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 30).await;
-        let trade_1 = test_trade_with_amount(0.5, 30);
+        let trade_1 = test_trade_with_amount(dec!(0.5), 30);
 
         let result_1 = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2775,7 +2776,7 @@ mod tests {
         );
 
         let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 31).await;
-        let trade_2 = test_trade_with_amount(0.7, 31);
+        let trade_2 = test_trade_with_amount(dec!(0.7), 31);
 
         let result_2 = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2810,7 +2811,7 @@ mod tests {
             trade_processing_cqrs_with_threshold(&frameworks, ExecutionThreshold::whole_share());
 
         let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 40).await;
-        let trade_1 = test_trade_with_amount(1.5, 40);
+        let trade_1 = test_trade_with_amount(dec!(1.5), 40);
 
         let first_order_id = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2825,7 +2826,7 @@ mod tests {
         .expect("first trade should place an order");
 
         let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 41).await;
-        let trade_2 = test_trade_with_amount(1.5, 41);
+        let trade_2 = test_trade_with_amount(dec!(1.5), 41);
 
         let result_2 = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2870,7 +2871,7 @@ mod tests {
 
         // Process first trade -> places order
         let (queued_event_1, event_id_1) = enqueue_and_fetch(&pool, 50).await;
-        let trade_1 = test_trade_with_amount(1.5, 50);
+        let trade_1 = test_trade_with_amount(dec!(1.5), 50);
 
         let first_order_id = process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2886,7 +2887,7 @@ mod tests {
 
         // Process second trade -> blocked by pending order
         let (queued_event_2, event_id_2) = enqueue_and_fetch(&pool, 51).await;
-        let trade_2 = test_trade_with_amount(1.5, 51);
+        let trade_2 = test_trade_with_amount(dec!(1.5), 51);
 
         process_queued_trade(
             SupportedExecutor::DryRun,
@@ -2970,7 +2971,7 @@ mod tests {
 
         // Enqueue an event (simulating events persisted before a crash)
         let (queued_event, event_id) = enqueue_and_fetch(&pool, 60).await;
-        let trade = test_trade_with_amount(2.0, 60);
+        let trade = test_trade_with_amount(dec!(2.0), 60);
 
         // Simulate restart: process the unprocessed event
         let result = process_queued_trade(
@@ -3084,7 +3085,7 @@ mod tests {
                 symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: FractionalShares::new(dec!(80)),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(80))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
                     price_cents: PriceCents(15000),
@@ -3191,7 +3192,7 @@ mod tests {
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: FractionalShares::new(dec!(50)),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("SEED"),
                     price_cents: PriceCents(15000),
@@ -3279,7 +3280,7 @@ mod tests {
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: FractionalShares::new(dec!(50)),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(50))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
                     price_cents: PriceCents(15000),

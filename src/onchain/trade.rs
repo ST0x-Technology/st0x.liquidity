@@ -436,6 +436,7 @@ mod tests {
     use alloy::primitives::{Address, U256, address, b256, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use rain_math_float::Float;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::bindings::IOrderBookV5;
@@ -453,7 +454,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x01, // coefficient = 1
         ]);
-        assert!((float_to_decimal(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
 
         // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
         let float_half = B256::from([
@@ -462,7 +463,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x05, // coefficient = 5
         ]);
-        assert!((float_to_decimal(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_half).unwrap() - dec!(0.5)).abs() < dec!(0.000001));
 
         // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
         let float_two = B256::from([
@@ -471,7 +472,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x02, // coefficient = 2
         ]);
-        assert!((float_to_decimal(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_two).unwrap() - dec!(2.0)).abs() < dec!(0.000001));
     }
 
     /// Test with real production event data from tx
@@ -488,7 +489,7 @@ mod tests {
             fixed_bytes!("ffffffee00000000000000000000000000000000000000001bc16d674ec80000");
         let shares_amount = float_to_decimal(event_input_float).unwrap();
         assert!(
-            (shares_amount - 2.0).abs() < f64::EPSILON,
+            (shares_amount - dec!(2.0)).abs() < dec!(0.000001),
             "Expected 2.0 shares but got {shares_amount}"
         );
 
@@ -498,7 +499,7 @@ mod tests {
             fixed_bytes!("ffffffe500000000000000000000000000000002057d2cd516a29b6174400000");
         let usdc_amount = float_to_decimal(event_output_float).unwrap();
         assert!(
-            (usdc_amount - 160.155_077_52).abs() < 0.00001,
+            (usdc_amount - dec!(160.155_077_52)).abs() < dec!(0.00001),
             "Expected ~160.15 USDC but got {usdc_amount}"
         );
 
@@ -515,30 +516,30 @@ mod tests {
         let float_zero = Float::from_fixed_decimal(uint!(0_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_decimal(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_zero).unwrap() - dec!(0.0)).abs() < dec!(0.000001));
 
         let float_one = Float::from_fixed_decimal(uint!(1_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_decimal(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_one).unwrap() - dec!(1.0)).abs() < dec!(0.000001));
 
         let float_nine = Float::from_fixed_decimal(uint!(9_U256), 0)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_nine).unwrap();
-        assert!((result - 9.0).abs() < f64::EPSILON);
+        assert!((result - dec!(9.0)).abs() < dec!(0.000001));
 
         let float_hundred = Float::from_fixed_decimal(uint!(100_U256), 0)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_hundred).unwrap();
-        assert!((result - 100.0).abs() < f64::EPSILON);
+        assert!((result - dec!(100.0)).abs() < dec!(0.000001));
 
         let float_half = Float::from_fixed_decimal(uint!(5_U256), 1)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_half).unwrap();
-        assert!((result - 0.5).abs() < f64::EPSILON);
+        assert!((result - dec!(0.5)).abs() < dec!(0.000001));
     }
 
     #[test]
@@ -549,17 +550,15 @@ mod tests {
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_large).unwrap();
-        assert!(result.is_finite());
-        assert!((result - 1_000_000_000_000_000.0).abs() < 1.0);
+        assert!((result - dec!(1_000_000_000_000_000.0)).abs() < dec!(1.0));
 
         // Test with very small value (high negative exponent)
         let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_small).unwrap();
-        assert!(result.is_finite());
         // 1 × 10^-50 is extremely small
-        assert!(result > 0.0 && result < 1e-40);
+        assert!(result > dec!(0.0) && result < dec!(0.0000000000000000000000000001));
     }
 
     #[test]
@@ -568,25 +567,25 @@ mod tests {
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - 0.123_456).abs() < f64::EPSILON);
+        assert!((result - dec!(0.123_456)).abs() < dec!(0.000001));
 
         let float_amount = Float::from_fixed_decimal(uint!(5_U256), 10)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - 5e-10).abs() < 1e-15);
+        assert!((result - dec!(0.0000000005)).abs() < dec!(0.000000000000001));
 
         let float_amount = Float::from_fixed_decimal(uint!(12_345_U256), 0)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - 12_345.0).abs() < f64::EPSILON);
+        assert!((result - dec!(12_345.0)).abs() < dec!(0.000001));
 
         let float_amount = Float::from_fixed_decimal(uint!(5000_U256), 0)
             .unwrap()
             .get_inner();
         let result = float_to_decimal(float_amount).unwrap();
-        assert!((result - 5000.0).abs() < f64::EPSILON);
+        assert!((result - dec!(5000.0)).abs() < dec!(0.000001));
     }
 
     #[tokio::test]

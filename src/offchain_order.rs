@@ -567,9 +567,6 @@ pub(crate) enum OffchainOrderCommand {
         direction: Direction,
         executor: SupportedExecutor,
     },
-    ConfirmSubmission {
-        executor_order_id: ExecutorOrderId,
-    },
     UpdatePartialFill {
         shares_filled: FractionalShares,
         avg_price_cents: PriceCents,
