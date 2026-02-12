@@ -228,6 +228,13 @@ resolution and feature selection.
 
 ### Updating ROADMAP.md
 
+**CRITICAL: Timing** - Mark issues as done and link PRs on the **development
+branch** at any point before the PR is merged. The master roadmap is updated
+when the PR merges, so forgetting before merge means the issue won't show as
+done on master. It's fine to mark an issue done "too early" (e.g., before
+implementation is complete, when creating a draft PR) - it's much worse to
+forget. A plan/feature is not considered complete until the roadmap is updated.
+
 After completing work or creating new issues, update ROADMAP.md:
 
 **Section ordering (newest first):**
