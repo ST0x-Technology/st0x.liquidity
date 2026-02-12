@@ -195,31 +195,72 @@ CQRS framework internally passes the aggregate's `Services` into `handle()`. The
 job handler never touches `Services` directly - it operates through the CQRS
 command interface.
 
+<!-- DIAGRAM CANDIDATES - pick the best, delete the rest -->
+
+##### Option A: DI Layers as Sequence Diagram
+
 ```mermaid
 sequenceDiagram
     participant JH as Job Handler
-    participant CQ as Cqrs&lt;A&gt;
-    participant AGG as Aggregate::handle()
+    participant CQ as Cqrs instance
+    participant AGG as Aggregate handle
     participant EXT as External APIs
 
-    Note over JH: apalis Data&lt;T&gt; layer
+    Note over JH: Orchestration layer
     JH->>CQ: execute(command)
-    Note over CQ,EXT: CQRS Services layer
-    CQ->>AGG: handle(command, &services)
-    AGG->>EXT: services.place_order() etc.
+    Note over CQ,EXT: Domain layer
+    CQ->>AGG: handle(command, services)
+    AGG->>EXT: services.place_order()
 ```
 
-A job handler also receives `Data<SqliteStorage<Job>>` to push downstream jobs
-and `Data<View<A>>` to read projections - but these stay within the
-orchestration layer and never cross into the CQRS domain layer.
+##### Option B: DI Layers as Flowchart (no subgraphs)
 
-##### System Overview
+```mermaid
+graph LR
+    JH[Job Handler] -->|"Data Cqrs"| CQ[Cqrs::execute]
+    JH -->|"Data JobQueue"| PQ[Push downstream jobs]
+    JH -->|"Data View"| VR[Read projections]
+    CQ -->|injects Services| AGG[Aggregate::handle]
+    AGG --> B[Broker API]
+    AGG --> R[Ethereum RPC]
+    AGG --> T[Tokenization API]
+```
+
+##### Option C: DI Layers as Class Diagram
+
+```mermaid
+classDiagram
+    class JobHandler {
+        Orchestration Layer
+        Data~Cqrs~ cqrs
+        Data~JobQueue~ queue
+        Data~View~ views
+    }
+    class CqrsFramework {
+        Domain Layer
+        execute(command)
+    }
+    class AggregateHandle {
+        handle(command, services)
+    }
+    class BrokerAPI
+    class EthereumRPC
+    class TokenizationAPI
+
+    JobHandler --> CqrsFramework : calls execute
+    CqrsFramework --> AggregateHandle : injects Services
+    AggregateHandle --> BrokerAPI : uses
+    AggregateHandle --> EthereumRPC : uses
+    AggregateHandle --> TokenizationAPI : uses
+```
+
+##### Option D: System Overview as Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     participant WS as DEX WebSocket
     participant Q as Persistent Job Queue
-    participant W as Workers (Monitor)
+    participant W as Workers in Monitor
     participant CQRS as CQRS Aggregates
 
     WS->>Q: push ProcessOnchainEvent
@@ -230,6 +271,92 @@ sequenceDiagram
         W->>Q: push downstream jobs
     end
 ```
+
+##### Option E: System Overview as Flowchart (flat, no subgraphs)
+
+```mermaid
+graph TD
+    WS[DEX WebSocket] -->|push| Q[Persistent Job Queue]
+    Q -->|dequeue| W[Monitor / Workers]
+    W -->|execute| CQRS[CQRS Aggregates]
+    W -->|push downstream| Q
+```
+
+##### Option F: System Overview as Flowchart (detailed, no subgraphs)
+
+```mermaid
+graph TD
+    WS[DEX WebSocket] -->|push| POE[ProcessOnchainEvent]
+    POE -->|push| PFO[PlaceOffchainOrder]
+    POE -->|push| EOT[EnrichOnchainTrade]
+    CAP[CheckAccumulatedPositions cron] -->|push| PFO
+    RT[RebalancingTrigger] -->|push| ER[ExecuteRebalancing]
+
+    POE -->|execute| OT[OnChainTrade agg]
+    POE -->|execute| POS[Position agg]
+    PFO -->|execute| OO[OffchainOrder agg]
+    PFO -->|execute| POS
+    EOT -->|execute| OT
+    ER -->|execute| REB[UsdcRebalance agg]
+```
+
+##### Option G: System Overview as ER Diagram (job-aggregate relationships)
+
+```mermaid
+erDiagram
+    ProcessOnchainEvent ||--o{ OnChainTrade : writes
+    ProcessOnchainEvent ||--o{ Position : writes
+    ProcessOnchainEvent ||--o{ PlaceOffchainOrder : pushes
+    ProcessOnchainEvent ||--o{ EnrichOnchainTrade : pushes
+    EnrichOnchainTrade ||--o{ OnChainTrade : writes
+    PlaceOffchainOrder ||--o{ OffchainOrder : writes
+    PlaceOffchainOrder ||--o{ Position : writes
+    PollOrderStatus ||--o{ OffchainOrder : writes
+    PollOrderStatus ||--o{ Position : writes
+    ExecuteRebalancing ||--o{ UsdcRebalance : writes
+    PollInventory ||--o{ InventorySnapshot : writes
+    CheckAccumulatedPositions ||--o{ PlaceOffchainOrder : pushes
+    RebalancingTrigger ||--o{ ExecuteRebalancing : pushes
+```
+
+##### Option H: Full Architecture as C4 Context
+
+```mermaid
+C4Context
+    title System Context - Apalis Orchestration
+
+    Person(ws, "DEX WebSocket", "Stream producer")
+
+    System_Boundary(monitor, "Monitor") {
+        System(trade, "Trade Worker", "ProcessOnchainEvent")
+        System(order, "Order Worker", "PlaceOffchainOrder")
+        System(enrich, "Enrichment Worker", "EnrichOnchainTrade")
+        System(rebal, "Rebalancing Worker", "ExecuteRebalancing")
+        System(cron, "Cron Workers", "Poll, Check, Maintain")
+    }
+
+    SystemDb(queue, "Persistent Job Queue", "SQLite")
+    SystemDb(cqrs, "CQRS Aggregates", "Event Store")
+    System_Ext(broker, "Broker API", "Schwab/Alpaca")
+    System_Ext(rpc, "Ethereum RPC", "Blockchain")
+
+    Rel(ws, queue, "push")
+    Rel(queue, trade, "dequeue")
+    Rel(queue, order, "dequeue")
+    Rel(queue, enrich, "dequeue")
+    Rel(queue, rebal, "dequeue")
+    Rel(trade, queue, "push downstream")
+    Rel(trade, cqrs, "execute")
+    Rel(order, cqrs, "execute")
+    Rel(order, broker, "place order")
+    Rel(enrich, cqrs, "execute")
+    Rel(enrich, rpc, "trace tx")
+    Rel(rebal, cqrs, "execute")
+    Rel(cron, cqrs, "execute")
+    Rel(cron, broker, "poll/maintain")
+```
+
+<!-- END DIAGRAM CANDIDATES -->
 
 ### Trade Execution
 
