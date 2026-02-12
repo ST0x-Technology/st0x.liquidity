@@ -159,34 +159,35 @@ pub struct AttestationResponse {
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
     attestation: Bytes,
-    /// The real CCTP nonce extracted from the attested message.
-    /// This is the authoritative nonce value, not the placeholder from MessageSent.
-    nonce: FixedBytes<32>,
+    /// The real CCTP nonce pre-validated as u64 at construction time.
+    validated_nonce: u64,
 }
 
 impl AttestationResponse {
-    /// Returns the nonce as a u64 by taking the last 8 bytes.
-    ///
-    /// CCTP nonces are 32 bytes but the significant portion fits in u64 for our use case.
-    /// Returns an error if the first 24 bytes are non-zero, indicating the nonce exceeds u64.
-    fn nonce_as_u64(&self) -> Result<u64, CctpError> {
-        let bytes: &[u8; 32] = self.nonce.as_ref();
+    /// Constructs an `AttestationResponse`, validating that the 32-byte
+    /// nonce fits in a u64 at construction time rather than deferring to
+    /// runtime.
+    fn new(message: Bytes, attestation: Bytes, nonce: FixedBytes<32>) -> Result<Self, CctpError> {
+        let bytes: &[u8; 32] = nonce.as_ref();
         let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
 
         if padding.iter().any(|&b| b != 0) {
-            return Err(CctpError::NonceOverflow { nonce: self.nonce });
+            return Err(CctpError::NonceOverflow { nonce });
         }
 
-        Ok(u64::from_be_bytes(value.try_into()?))
+        let validated_nonce = u64::from_be_bytes(value.try_into()?);
+
+        Ok(Self {
+            message,
+            attestation,
+            validated_nonce,
+        })
     }
 }
 
 impl crate::Attestation for AttestationResponse {
     fn nonce(&self) -> u64 {
-        // CCTP nonces in practice never exceed u64.
-        // If they do, this is a protocol-level problem worth panicking on.
-        self.nonce_as_u64()
-            .expect("CCTP nonce should fit in u64; upper 24 bytes were non-zero")
+        self.validated_nonce
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -525,11 +526,7 @@ where
 
         let nonce = extract_nonce_from_message(&message)?;
 
-        Ok(AttestationResponse {
-            message,
-            attestation,
-            nonce,
-        })
+        AttestationResponse::new(message, attestation, nonce)
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
