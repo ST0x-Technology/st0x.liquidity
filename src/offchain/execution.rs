@@ -1,16 +1,18 @@
 use serde::Serialize;
 use sqlx::SqlitePool;
+
 use st0x_execution::{OrderStatus, SupportedExecutor, Symbol};
 
-use crate::error::OnChainError;
-use crate::offchain_order::{OffchainOrderAggregate, OffchainOrderId};
+use crate::lifecycle::Lifecycle;
+use crate::offchain_order::{OffchainOrder, OffchainOrderId};
+use crate::onchain::OnChainError;
 
 pub(crate) async fn find_executions_by_symbol_status_and_broker(
     pool: &SqlitePool,
     symbol: Option<Symbol>,
     status: OrderStatus,
     broker: Option<SupportedExecutor>,
-) -> Result<Vec<(OffchainOrderId, OffchainOrderAggregate)>, OnChainError> {
+) -> Result<Vec<(OffchainOrderId, Lifecycle<OffchainOrder>)>, OnChainError> {
     let status_str = to_json_str(&status)?;
 
     let rows = match (symbol, broker) {

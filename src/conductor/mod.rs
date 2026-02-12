@@ -12,7 +12,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::Log;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types;
-use cqrs_es::Query;
+use cqrs_es::{AggregateError, Query};
 use cqrs_es::persist::GenericQuery;
 use futures_util::{Stream, StreamExt};
 use rust_decimal::Decimal;
@@ -27,14 +27,18 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
+use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
+use st0x_execution::alpaca_trading_api::AlpacaTradingApiError;
 use st0x_execution::{
-    Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor, Symbol,
+    ExecutionError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
+    Symbol,
 };
 
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
 use crate::bindings::IOrderBookV5::{ClearV3, IOrderBookV5Instance, TakeOrderV3};
 use crate::cctp::USDC_BASE;
-use crate::config::Ctx;
+use crate::config::{Ctx, CtxError};
+use crate::lifecycle::Lifecycle;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::{
     InventoryPollingService, InventorySnapshotAggregate, InventorySnapshotQuery, InventoryView,
@@ -51,12 +55,12 @@ use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
 use crate::onchain::vault::VaultService;
-use crate::onchain::{EvmCtx, OnchainTrade};
+use crate::onchain::{EvmCtx, OnChainError, OnchainTrade};
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeCqrs};
 use crate::position::{
     Position, PositionAggregate, PositionCommand, PositionCqrs, PositionQuery, TradeId,
 };
-use crate::queue::{QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
+use crate::queue::{EventQueueError, QueuedEvent, enqueue, get_next_unprocessed_event, mark_event_processed};
 use crate::rebalancing::{
     RebalancingCqrsFrameworks, RebalancingCtx, RebalancingTrigger, RebalancingTriggerConfig,
     build_rebalancing_queries, spawn_rebalancer,
@@ -66,7 +70,7 @@ use crate::symbol::lock::get_symbol_lock;
 use crate::threshold::ExecutionThreshold;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
-use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand};
+use crate::vault_registry::{VaultRegistry, VaultRegistryAggregate, VaultRegistryCommand, VaultRegistryError};
 
 /// Bundles CQRS frameworks used throughout the trade processing pipeline.
 struct TradeProcessingCqrs {
@@ -86,6 +90,29 @@ pub(crate) struct Conductor {
     pub(crate) queue_processor: JoinHandle<()>,
     pub(crate) rebalancer: Option<JoinHandle<()>>,
     pub(crate) inventory_poller: Option<JoinHandle<()>>,
+}
+
+/// Event processing errors for live event handling.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum EventProcessingError {
+    #[error("Event queue error: {0}")]
+    Queue(#[from] EventQueueError),
+    #[error("Failed to enqueue ClearV3 event: {0}")]
+    EnqueueClearV3(#[source] EventQueueError),
+    #[error("Failed to enqueue TakeOrderV3 event: {0}")]
+    EnqueueTakeOrderV3(#[source] EventQueueError),
+    #[error("Onchain trade processing error: {0}")]
+    OnChain(#[from] OnChainError),
+    #[error("Ctx error: {0}")]
+    Ctx(#[from] CtxError),
+    #[error("Vault registry command failed: {0}")]
+    VaultRegistry(#[from] AggregateError<VaultRegistryError>),
+    #[error("Execution error: {0}")]
+    Execution(#[from] ExecutionError),
+    #[error("Alpaca trading API error: {0}")]
+    AlpacaTradingApi(#[from] AlpacaTradingApiError),
+    #[error("Alpaca broker API error: {0}")]
+    AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
 }
 
 pub(crate) async fn run_market_hours_loop<E>(
@@ -1244,7 +1271,7 @@ async fn execute_place_offchain_order(
 ) {
     let offchain_agg_id = offchain_order_id.to_string();
 
-    let command = OffchainOrderCommand::PlaceOrder {
+    let command = OffchainOrderCommand::Place {
         symbol: params.symbol.clone(),
         shares: params.shares,
         direction: params.direction,
@@ -1255,12 +1282,12 @@ async fn execute_place_offchain_order(
         Ok(()) => info!(
             %offchain_order_id,
             symbol = %params.symbol,
-            "OffchainOrder::PlaceOrder succeeded"
+            "OffchainOrder::Place succeeded"
         ),
-        Err(e) => error!(
+        Err(error) => error!(
             %offchain_order_id,
             symbol = %params.symbol,
-            "OffchainOrder::PlaceOrder failed: {e}"
+            "OffchainOrder::Place failed: {error}"
         ),
     }
 }
@@ -1329,7 +1356,7 @@ fn reconstruct_log_from_queued_event(
 
     Log {
         inner: alloy::primitives::Log {
-            address: evm_ctx.orderbook,
+            address: ctx.orderbook,
             data: log_data,
         },
         block_hash: None,

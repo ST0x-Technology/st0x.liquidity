@@ -494,6 +494,9 @@ is the source of truth for terminology and naming conventions.
   - Groups 2 or 3 may be absent if unused; never add an empty group
   - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
+    **Sole exception**: enum variant imports (`use MyEnum::*` or
+    `use MyEnum::{A, B, C}`) inside function bodies to avoid repetitive
+    qualification. Enum variant imports are never allowed at module level.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
@@ -769,6 +772,15 @@ Keep comments focused on "why" rather than "what".
 Use ASCII characters only in code and comments. For arrows, use `->` not `→`.
 Unicode breaks vim navigation and grep workflows.
 
+#### No single-letter variables or arguments
+
+Single-letter names (`e`, `x`, `n`, `s`, etc.) are **FORBIDDEN** everywhere -
+variables, function arguments, closure parameters, generic type params in
+function signatures. Always use descriptive names. The only exception is
+conventional iterator variables in very short closures where the type makes the
+meaning unambiguous (e.g., `|event| event.payload`), but even then prefer a
+descriptive name.
+
 #### Module Organization
 
 Organize code within modules by importance to the reader, not by when it was
@@ -884,7 +896,7 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 - **Early returns** with `?` and `return Err(...)` instead of nested `if let`
 - **let-else** for guard clauses:
-  `let Some(x) = expr else { return Err(...); };`
+  `let Some(value) = expr else { return Err(...); };`
 - **Pattern matching with guards** instead of nested `if let` chains
 
 #### Struct field access

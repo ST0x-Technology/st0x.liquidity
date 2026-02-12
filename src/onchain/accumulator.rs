@@ -1,9 +1,10 @@
 use sqlx::SqlitePool;
-use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
 use tracing::{debug, info};
 
+use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor, Symbol};
+
 use crate::onchain::OnChainError;
-use crate::position::{PositionQuery, load_position};
+use crate::position::{PositionError, PositionQuery, load_position};
 use crate::threshold::ExecutionThreshold;
 
 #[derive(Debug, Clone)]
@@ -31,7 +32,7 @@ pub(crate) async fn check_execution_readiness(
         return Ok(None);
     };
 
-    let Some((direction, shares)) = position.is_ready_for_execution(executor_type, threshold)?
+    let Some((direction, shares)) = position.is_ready_for_execution(executor_type)?
     else {
         debug!(
             symbol = %symbol,

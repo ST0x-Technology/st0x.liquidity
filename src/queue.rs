@@ -49,7 +49,9 @@ pub(crate) enum EventQueueError {
     #[error("Log missing required field: {0}")]
     MissingLogField(&'static str),
     #[error("Queued event missing ID")]
-    MissingEventId,
+    MissingQueuedEventId,
+    #[error("Event ID {0} not found in queue")]
+    MissingEventId(i64),
     #[error("Integer conversion error: {0}")]
     IntConversion(#[from] TryFromIntError),
     #[error("Event serialization failed: {0}")]
@@ -172,7 +174,7 @@ pub(crate) async fn mark_event_processed(
     pool: &SqlitePool,
     event_id: i64,
 ) -> Result<(), EventQueueError> {
-    sqlx::query!(
+    let result = sqlx::query!(
         r#"
         UPDATE event_queue
         SET processed = 1, processed_at = CURRENT_TIMESTAMP
@@ -182,6 +184,10 @@ pub(crate) async fn mark_event_processed(
     )
     .execute(pool)
     .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(EventQueueError::MissingEventId(event_id));
+    }
 
     Ok(())
 }

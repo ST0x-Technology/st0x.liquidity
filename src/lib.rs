@@ -11,6 +11,9 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tracing::{error, info, info_span, warn};
 
 use st0x_dto::ServerMessage;
+use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
+
+use crate::config::{BrokerCtx, Ctx};
 
 mod alpaca_tokenization;
 mod alpaca_wallet;
@@ -43,10 +46,6 @@ pub use telemetry::{TelemetryError, TelemetryGuard, setup_tracing};
 
 #[cfg(test)]
 pub mod test_utils;
-
-use st0x_execution::{ExecutionError, Executor, MockExecutorCtx, SchwabError, TryIntoExecutor};
-
-use crate::config::{BrokerCtx, Ctx};
 
 pub async fn launch(ctx: Ctx) -> anyhow::Result<()> {
     let launch_span = info_span!("launch");

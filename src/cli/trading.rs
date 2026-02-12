@@ -22,7 +22,7 @@ use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OrderPlacer,
+    OffchainOrder, OffchainOrderCommand, OffchainOrderId, OrderPlacer,
 };
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain::accumulator::check_execution_readiness;
@@ -201,7 +201,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
         .await
     {
         Ok(Some(onchain_trade)) => {
-            process_found_trade(onchain_trade, ctx, pool, stdout).await?;
+            process_found_trade(onchain_trade, ctx, pool, stdout, order_placer).await?;
         }
         Ok(None) => {
             writeln!(
@@ -310,8 +310,8 @@ pub(super) async fn process_found_trade<W: Write>(
             (),
         ));
     let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-        OffchainOrderAggregate,
-        OffchainOrderAggregate,
+        Lifecycle<OffchainOrder>,
+        Lifecycle<OffchainOrder>,
     >::new(
         pool.clone(), "offchain_order_view".to_string()
     ));
@@ -346,7 +346,7 @@ pub(super) async fn process_found_trade<W: Write>(
         return Ok(());
     };
 
-    let offchain_order_id = OffchainOrder::aggregate_id();
+    let offchain_order_id = OffchainOrderId::new();
 
     writeln!(
         stdout,
@@ -372,10 +372,10 @@ pub(super) async fn process_found_trade<W: Write>(
 
     let agg_id = offchain_order_id.to_string();
 
-    if let Err(e) = offchain_order_cqrs
+    if let Err(error) = offchain_order_cqrs
         .execute(
             &agg_id,
-            OffchainOrderCommand::PlaceOrder {
+            OffchainOrderCommand::Place {
                 symbol: params.symbol.clone(),
                 shares: params.shares,
                 direction: params.direction,
@@ -384,7 +384,7 @@ pub(super) async fn process_found_trade<W: Write>(
         )
         .await
     {
-        error!(%offchain_order_id, "Failed to execute OffchainOrder::PlaceOrder: {e}");
+        error!(%offchain_order_id, "Failed to execute OffchainOrder::Place: {error}");
     }
 
     writeln!(stdout, "Trade processing completed!")?;
@@ -519,12 +519,13 @@ mod tests {
     use alloy::primitives::{Address, FixedBytes, address};
     use httpmock::MockServer;
     use serde_json::json;
+    use url::Url;
 
-    use st0x_execution::schwab::SchwabAuthConfig;
+    use st0x_execution::schwab::{SchwabAuth, SchwabAuthConfig};
 
     use super::*;
     use crate::config::LogLevel;
-    use crate::onchain::EvmConfig;
+    use crate::onchain::{EvmConfig, EvmCtx};
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 

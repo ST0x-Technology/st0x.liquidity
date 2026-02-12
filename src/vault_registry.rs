@@ -6,12 +6,12 @@
 //! - **USDC Vaults**: Hold USDC for trading
 
 use std::collections::BTreeMap;
-
 use alloy::primitives::{Address, B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent};
 use serde::{Deserialize, Serialize};
+
 use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};

@@ -8,13 +8,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-
-use crate::inventory::snapshot::{
-    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
-};
-use crate::lifecycle::Lifecycle;
-use crate::onchain::vault::{VaultError, VaultId, VaultService};
-use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use cqrs_es::persist::PersistedEventStore;
@@ -22,8 +15,16 @@ use cqrs_es::{AggregateContext, AggregateError, EventStore};
 use futures_util::future::try_join_all;
 use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
-use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
+
+use st0x_execution::{Executor, InventoryResult};
+
+use crate::inventory::snapshot::{
+    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
+};
+use crate::lifecycle::Lifecycle;
+use crate::onchain::vault::{VaultError, VaultId, VaultService};
+use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 
 pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 

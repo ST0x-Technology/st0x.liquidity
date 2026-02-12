@@ -14,15 +14,30 @@ use serde::{Deserialize, Serialize};
 use sqlite_es::SqliteCqrs;
 use tracing::warn;
 
-use st0x_execution::{ArithmeticError, Direction, FractionalShares, SupportedExecutor, Symbol};
+use st0x_execution::{ArithmeticError, Direction, ExecutorOrderId, FractionalShares, SupportedExecutor, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, SqliteQuery};
-use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+use crate::offchain_order::{OffchainOrderId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
 
 pub(crate) type PositionAggregate = Lifecycle<Position, ArithmeticError<FractionalShares>>;
 pub(crate) type PositionCqrs = SqliteCqrs<PositionAggregate>;
 pub(crate) type PositionQuery = SqliteQuery<Position, ArithmeticError<FractionalShares>>;
+
+pub(crate) async fn load_position(
+    query: &PositionQuery,
+    symbol: &Symbol,
+) -> Result<Option<Position>, PositionError> {
+    let aggregate_id = Position::aggregate_id(symbol);
+    let Some(lifecycle) = query.load(&aggregate_id).await else {
+        return Ok(None);
+    };
+    match lifecycle.live() {
+        Ok(position) => Ok(Some(position.clone())),
+        Err(LifecycleError::Uninitialized) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Position {
@@ -30,7 +45,7 @@ pub(crate) struct Position {
     pub(crate) net: FractionalShares,
     pub(crate) accumulated_long: FractionalShares,
     pub(crate) accumulated_short: FractionalShares,
-    pub(crate) pending_execution_id: Option<ExecutionId>,
+    pub(crate) pending_offchain_order_id: Option<OffchainOrderId>,
     pub(crate) threshold: ExecutionThreshold,
     pub(crate) last_price_usdc: Option<Decimal>,
     pub(crate) last_updated: Option<DateTime<Utc>>,
@@ -55,13 +70,13 @@ impl Position {
             } => Self::apply_onchain_fill(position, *amount, *direction, *price_usdc, *seen_at),
 
             PositionEvent::OffChainOrderPlaced {
-                execution_id,
+                offchain_order_id,
                 placed_at,
                 ..
-            } => Self::apply_offchain_placed(position, event, *execution_id, *placed_at),
+            } => Self::apply_offchain_placed(position, event, *offchain_order_id, *placed_at),
 
             PositionEvent::OffChainOrderFilled {
-                execution_id,
+                offchain_order_id,
                 shares_filled,
                 direction,
                 broker_timestamp,
@@ -69,17 +84,17 @@ impl Position {
             } => Self::apply_offchain_filled(
                 position,
                 event,
-                *execution_id,
+                *offchain_order_id,
                 *shares_filled,
                 *direction,
                 *broker_timestamp,
             ),
 
             PositionEvent::OffChainOrderFailed {
-                execution_id,
+                offchain_order_id,
                 failed_at,
                 ..
-            } => Self::apply_offchain_failed(position, event, *execution_id, *failed_at),
+            } => Self::apply_offchain_failed(position, event, *offchain_order_id, *failed_at),
 
             PositionEvent::ThresholdUpdated {
                 new_threshold,
@@ -127,15 +142,15 @@ impl Position {
     fn apply_offchain_placed(
         position: &Self,
         event: &PositionEvent,
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         placed_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<ArithmeticError<FractionalShares>>> {
-        if position.pending_execution_id.is_some() {
+        if position.pending_offchain_order_id.is_some() {
             return Err(Self::mismatch_error(position, event));
         }
 
         Ok(Self {
-            pending_execution_id: Some(execution_id),
+            pending_offchain_order_id: Some(offchain_order_id),
             last_updated: Some(placed_at),
             ..position.clone()
         })
@@ -144,25 +159,25 @@ impl Position {
     fn apply_offchain_filled(
         position: &Self,
         event: &PositionEvent,
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares_filled: FractionalShares,
         direction: Direction,
         broker_timestamp: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<ArithmeticError<FractionalShares>>> {
-        if position.pending_execution_id != Some(execution_id) {
+        if position.pending_offchain_order_id != Some(offchain_order_id) {
             return Err(Self::mismatch_error(position, event));
         }
 
         match direction {
             Direction::Sell => Ok(Self {
                 net: (position.net - shares_filled).map_err(LifecycleError::from)?,
-                pending_execution_id: None,
+                pending_offchain_order_id: None,
                 last_updated: Some(broker_timestamp),
                 ..position.clone()
             }),
             Direction::Buy => Ok(Self {
                 net: (position.net + shares_filled).map_err(LifecycleError::from)?,
-                pending_execution_id: None,
+                pending_offchain_order_id: None,
                 last_updated: Some(broker_timestamp),
                 ..position.clone()
             }),
@@ -172,15 +187,15 @@ impl Position {
     fn apply_offchain_failed(
         position: &Self,
         event: &PositionEvent,
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         failed_at: DateTime<Utc>,
     ) -> Result<Self, LifecycleError<ArithmeticError<FractionalShares>>> {
-        if position.pending_execution_id != Some(execution_id) {
+        if position.pending_offchain_order_id != Some(offchain_order_id) {
             return Err(Self::mismatch_error(position, event));
         }
 
         Ok(Self {
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             last_updated: Some(failed_at),
             ..position.clone()
         })
@@ -209,7 +224,7 @@ impl Position {
                 net: FractionalShares::ZERO,
                 accumulated_long: FractionalShares::ZERO,
                 accumulated_short: FractionalShares::ZERO,
-                pending_execution_id: None,
+                pending_offchain_order_id: None,
                 threshold: *threshold,
                 last_price_usdc: None,
                 last_updated: Some(*initialized_at),
@@ -228,7 +243,7 @@ impl Position {
                 net: *net_position,
                 accumulated_long: *accumulated_long,
                 accumulated_short: *accumulated_short,
-                pending_execution_id: None,
+                pending_offchain_order_id: None,
                 threshold: *threshold,
                 last_price_usdc: *last_price_usdc,
                 last_updated: Some(*migrated_at),
@@ -285,15 +300,15 @@ impl Position {
         }
     }
 
-    fn validate_pending_execution(&self, execution_id: ExecutionId) -> Result<(), PositionError> {
-        let Some(pending_id) = self.pending_execution_id else {
+    fn validate_pending_execution(&self, offchain_order_id: OffchainOrderId) -> Result<(), PositionError> {
+        let Some(pending_id) = self.pending_offchain_order_id else {
             return Err(PositionError::NoPendingExecution);
         };
 
-        if pending_id != execution_id {
-            return Err(PositionError::ExecutionIdMismatch {
+        if pending_id != offchain_order_id {
+            return Err(PositionError::OffchainOrderIdMismatch {
                 expected: pending_id,
-                actual: execution_id,
+                actual: offchain_order_id,
             });
         }
 
@@ -302,20 +317,20 @@ impl Position {
 
     fn handle_complete_offchain_order(
         &self,
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares_filled: FractionalShares,
         direction: Direction,
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
         broker_timestamp: DateTime<Utc>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
-        self.validate_pending_execution(execution_id)?;
+        self.validate_pending_execution(offchain_order_id)?;
 
         Ok(vec![PositionEvent::OffChainOrderFilled {
-            execution_id,
+            offchain_order_id,
             shares_filled,
             direction,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             broker_timestamp,
         }])
@@ -323,13 +338,13 @@ impl Position {
 
     fn handle_fail_offchain_order(
         &self,
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         error: String,
     ) -> Result<Vec<PositionEvent>, PositionError> {
-        self.validate_pending_execution(execution_id)?;
+        self.validate_pending_execution(offchain_order_id)?;
 
         Ok(vec![PositionEvent::OffChainOrderFailed {
-            execution_id,
+            offchain_order_id,
             error,
             failed_at: Utc::now(),
         }])
@@ -349,7 +364,7 @@ impl Position {
         &self,
         executor: SupportedExecutor,
     ) -> Result<Option<(Direction, FractionalShares)>, PositionError> {
-        if self.pending_execution_id.is_some() {
+        if self.pending_offchain_order_id.is_some() {
             return Ok(None);
         }
 
@@ -383,14 +398,14 @@ impl Position {
 
     fn handle_place_offchain_order(
         &self,
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
     ) -> Result<Vec<PositionEvent>, PositionError> {
-        if let Some(pending) = self.pending_execution_id {
+        if let Some(pending) = self.pending_offchain_order_id {
             return Err(PositionError::PendingExecution {
-                execution_id: pending,
+                offchain_order_id: pending,
             });
         }
 
@@ -402,7 +417,7 @@ impl Position {
                 })?;
 
         Ok(vec![PositionEvent::OffChainOrderPlaced {
-            execution_id,
+            offchain_order_id,
             shares,
             direction,
             executor,
@@ -491,30 +506,31 @@ impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
             (
                 Ok(position),
                 PositionCommand::PlaceOffChainOrder {
-                    execution_id,
+                    offchain_order_id,
                     shares,
                     direction,
                     executor,
+                    ..
                 },
             ) => {
-                position.handle_place_offchain_order(*execution_id, *shares, *direction, *executor)
+                position.handle_place_offchain_order(*offchain_order_id, *shares, *direction, *executor)
             }
 
             (
                 Ok(position),
                 PositionCommand::CompleteOffChainOrder {
-                    execution_id,
+                    offchain_order_id,
                     shares_filled,
                     direction,
-                    broker_order_id,
+                    executor_order_id,
                     price_cents,
                     broker_timestamp,
                 },
             ) => position.handle_complete_offchain_order(
-                *execution_id,
+                *offchain_order_id,
                 *shares_filled,
                 *direction,
-                broker_order_id.clone(),
+                executor_order_id.clone(),
                 *price_cents,
                 *broker_timestamp,
             ),
@@ -522,10 +538,10 @@ impl Aggregate for Lifecycle<Position, ArithmeticError<FractionalShares>> {
             (
                 Ok(position),
                 PositionCommand::FailOffChainOrder {
-                    execution_id,
+                    offchain_order_id,
                     error,
                 },
-            ) => position.handle_fail_offchain_order(*execution_id, error.clone()),
+            ) => position.handle_fail_offchain_order(*offchain_order_id, error.clone()),
 
             (Ok(position), PositionCommand::UpdateThreshold { threshold }) => {
                 Ok(vec![PositionEvent::ThresholdUpdated {
@@ -548,14 +564,14 @@ pub(crate) enum PositionError {
         net_position: FractionalShares,
         threshold: ExecutionThreshold,
     },
-    #[error("Cannot place offchain order: already have pending execution {execution_id:?}")]
-    PendingExecution { execution_id: ExecutionId },
+    #[error("Cannot place offchain order: already have pending execution {offchain_order_id:?}")]
+    PendingExecution { offchain_order_id: OffchainOrderId },
     #[error("Cannot complete offchain order: no pending execution")]
     NoPendingExecution,
-    #[error("Execution ID mismatch: expected {expected:?}, got {actual:?}")]
-    ExecutionIdMismatch {
-        expected: ExecutionId,
-        actual: ExecutionId,
+    #[error("Offchain order ID mismatch: expected {expected:?}, got {actual:?}")]
+    OffchainOrderIdMismatch {
+        expected: OffchainOrderId,
+        actual: OffchainOrderId,
     },
     #[error(transparent)]
     State(#[from] LifecycleError<ArithmeticError<FractionalShares>>),
@@ -585,21 +601,22 @@ pub(crate) enum PositionCommand {
         block_timestamp: DateTime<Utc>,
     },
     PlaceOffChainOrder {
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
+        threshold: ExecutionThreshold,
     },
     CompleteOffChainOrder {
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares_filled: FractionalShares,
         direction: Direction,
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
         broker_timestamp: DateTime<Utc>,
     },
     FailOffChainOrder {
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         error: String,
     },
     UpdateThreshold {
@@ -632,7 +649,7 @@ pub(crate) enum PositionEvent {
         seen_at: DateTime<Utc>,
     },
     OffChainOrderPlaced {
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
@@ -640,15 +657,15 @@ pub(crate) enum PositionEvent {
         placed_at: DateTime<Utc>,
     },
     OffChainOrderFilled {
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         shares_filled: FractionalShares,
         direction: Direction,
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
         broker_timestamp: DateTime<Utc>,
     },
     OffChainOrderFailed {
-        execution_id: ExecutionId,
+        offchain_order_id: OffchainOrderId,
         error: String,
         failed_at: DateTime<Utc>,
     },
@@ -807,7 +824,7 @@ mod tests {
             log_index: 2,
         };
 
-        let execution_id = ExecutionId(1);
+        let offchain_order_id = OffchainOrderId::new();
         let shares = FractionalShares::ONE;
 
         let result =
@@ -836,7 +853,7 @@ mod tests {
                     },
                 ])
                 .when(PositionCommand::PlaceOffChainOrder {
-                    execution_id,
+                    offchain_order_id,
                     shares,
                     direction: Direction::Sell,
                     executor: SupportedExecutor::Schwab,
@@ -853,7 +870,7 @@ mod tests {
             tx_hash: TxHash::random(),
             log_index: 1,
         };
-        let execution_id = ExecutionId(1);
+        let offchain_order_id = OffchainOrderId::new();
 
         TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
             .given(vec![
@@ -872,7 +889,7 @@ mod tests {
                 },
             ])
             .when(PositionCommand::PlaceOffChainOrder {
-                execution_id,
+                offchain_order_id,
                 shares: FractionalShares::ONE,
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
@@ -890,7 +907,7 @@ mod tests {
             tx_hash: TxHash::random(),
             log_index: 1,
         };
-        let execution_id = ExecutionId(1);
+        let offchain_order_id = OffchainOrderId::new();
 
         TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
             .given(vec![
@@ -908,7 +925,7 @@ mod tests {
                     seen_at: Utc::now(),
                 },
                 PositionEvent::OffChainOrderPlaced {
-                    execution_id,
+                    offchain_order_id,
                     shares: FractionalShares::ONE,
                     direction: Direction::Sell,
                     executor: SupportedExecutor::Schwab,
@@ -920,12 +937,12 @@ mod tests {
                 },
             ])
             .when(PositionCommand::PlaceOffChainOrder {
-                execution_id: ExecutionId(2),
+                offchain_order_id: OffchainOrderId::new(),
                 shares: FractionalShares::new(dec!(0.5)),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
             })
-            .then_expect_error(PositionError::PendingExecution { execution_id });
+            .then_expect_error(PositionError::PendingExecution { offchain_order_id });
     }
 
     #[test]
@@ -935,8 +952,8 @@ mod tests {
             tx_hash: TxHash::random(),
             log_index: 1,
         };
-        let execution_id = ExecutionId(1);
-        let broker_order_id = BrokerOrderId("ORDER123".to_string());
+        let offchain_order_id = OffchainOrderId::new();
+        let executor_order_id = ExecutorOrderId::new("ORDER123");
         let price_cents = PriceCents(15050);
 
         let result =
@@ -956,7 +973,7 @@ mod tests {
                         seen_at: Utc::now(),
                     },
                     PositionEvent::OffChainOrderPlaced {
-                        execution_id,
+                        offchain_order_id,
                         shares: FractionalShares::ONE,
                         direction: Direction::Sell,
                         executor: SupportedExecutor::Schwab,
@@ -968,10 +985,10 @@ mod tests {
                     },
                 ])
                 .when(PositionCommand::CompleteOffChainOrder {
-                    execution_id,
+                    offchain_order_id,
                     shares_filled: FractionalShares::ONE,
                     direction: Direction::Sell,
-                    broker_order_id,
+                    executor_order_id,
                     price_cents,
                     broker_timestamp: Utc::now(),
                 })
@@ -987,7 +1004,7 @@ mod tests {
             tx_hash: TxHash::random(),
             log_index: 1,
         };
-        let execution_id = ExecutionId(1);
+        let offchain_order_id = OffchainOrderId::new();
 
         let result =
             TestFramework::<Lifecycle<Position, ArithmeticError<FractionalShares>>>::with(())
@@ -1006,7 +1023,7 @@ mod tests {
                         seen_at: Utc::now(),
                     },
                     PositionEvent::OffChainOrderPlaced {
-                        execution_id,
+                        offchain_order_id,
                         shares: FractionalShares::ONE,
                         direction: Direction::Sell,
                         executor: SupportedExecutor::Schwab,
@@ -1018,7 +1035,7 @@ mod tests {
                     },
                 ])
                 .when(PositionCommand::FailOffChainOrder {
-                    execution_id,
+                    offchain_order_id,
                     error: "Broker API timeout".to_string(),
                 })
                 .inspect_result();
@@ -1029,8 +1046,8 @@ mod tests {
     #[test]
     fn offchain_sell_reduces_net_position() {
         let threshold = one_share_threshold();
-        let execution_id = ExecutionId(1);
-        let broker_order_id = BrokerOrderId("ORDER123".to_string());
+        let offchain_order_id = OffchainOrderId::new();
+        let executor_order_id = ExecutorOrderId::new("ORDER123");
         let price_cents = PriceCents(15050);
 
         let events = vec![
@@ -1051,7 +1068,7 @@ mod tests {
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
-                execution_id,
+                offchain_order_id,
                 shares: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Sell,
                 executor: SupportedExecutor::Schwab,
@@ -1062,10 +1079,10 @@ mod tests {
                 placed_at: Utc::now(),
             },
             PositionEvent::OffChainOrderFilled {
-                execution_id,
+                offchain_order_id,
                 shares_filled: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Sell,
-                broker_order_id,
+                executor_order_id,
                 price_cents,
                 broker_timestamp: Utc::now(),
             },
@@ -1083,16 +1100,16 @@ mod tests {
         // OnChain buy of 2.0 + OffChain sell of 1.5 = net position of 0.5
         assert_eq!(position.net, FractionalShares::new(dec!(0.5)));
         assert!(
-            position.pending_execution_id.is_none(),
-            "pending_execution_id should be cleared after OffChainOrderFilled"
+            position.pending_offchain_order_id.is_none(),
+            "pending_offchain_order_id should be cleared after OffChainOrderFilled"
         );
     }
 
     #[test]
     fn offchain_buy_increases_net_position() {
         let threshold = one_share_threshold();
-        let execution_id = ExecutionId(1);
-        let broker_order_id = BrokerOrderId("ORDER456".to_string());
+        let offchain_order_id = OffchainOrderId::new();
+        let executor_order_id = ExecutorOrderId::new("ORDER456");
         let price_cents = PriceCents(15050);
 
         let events = vec![
@@ -1113,7 +1130,7 @@ mod tests {
                 seen_at: Utc::now(),
             },
             PositionEvent::OffChainOrderPlaced {
-                execution_id,
+                offchain_order_id,
                 shares: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Buy,
                 executor: SupportedExecutor::Schwab,
@@ -1124,10 +1141,10 @@ mod tests {
                 placed_at: Utc::now(),
             },
             PositionEvent::OffChainOrderFilled {
-                execution_id,
+                offchain_order_id,
                 shares_filled: FractionalShares::new(dec!(1.5)),
                 direction: Direction::Buy,
-                broker_order_id,
+                executor_order_id,
                 price_cents,
                 broker_timestamp: Utc::now(),
             },
@@ -1145,8 +1162,8 @@ mod tests {
         // OnChain sell of 2.0 + OffChain buy of 1.5 = net position of -0.5
         assert_eq!(position.net, FractionalShares::new(dec!(-0.5)));
         assert!(
-            position.pending_execution_id.is_none(),
-            "pending_execution_id should be cleared after OffChainOrderFilled"
+            position.pending_offchain_order_id.is_none(),
+            "pending_offchain_order_id should be cleared after OffChainOrderFilled"
         );
     }
 
@@ -1197,7 +1214,7 @@ mod tests {
         assert_eq!(position.net, FractionalShares::ZERO);
         assert_eq!(position.accumulated_long, FractionalShares::ZERO);
         assert_eq!(position.accumulated_short, FractionalShares::ZERO);
-        assert_eq!(position.pending_execution_id, None);
+        assert_eq!(position.pending_offchain_order_id, None);
         assert_eq!(position.last_updated, Some(initialized_at));
     }
 
@@ -1212,7 +1229,7 @@ mod tests {
             net: FractionalShares::ZERO,
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
@@ -1256,7 +1273,7 @@ mod tests {
             net: FractionalShares::new(dec!(20.0)),
             accumulated_long: FractionalShares::new(dec!(20.0)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
@@ -1294,21 +1311,21 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let initialized_at = Utc::now();
         let placed_at = Utc::now();
-        let execution_id = ExecutionId(42);
+        let offchain_order_id = OffchainOrderId::new();
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares::new(dec!(100.0)),
             accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
         });
 
         let event = PositionEvent::OffChainOrderPlaced {
-            execution_id,
+            offchain_order_id,
             shares: FractionalShares::new(dec!(100)),
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
@@ -1325,7 +1342,7 @@ mod tests {
             panic!("Expected Active state");
         };
 
-        assert_eq!(position.pending_execution_id, Some(execution_id));
+        assert_eq!(position.pending_offchain_order_id, Some(offchain_order_id));
         assert_eq!(position.last_updated, Some(placed_at));
     }
 
@@ -1334,24 +1351,24 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let initialized_at = Utc::now();
         let broker_timestamp = Utc::now();
-        let execution_id = ExecutionId(42);
+        let offchain_order_id = OffchainOrderId::new();
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares::new(dec!(100.0)),
             accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: Some(execution_id),
+            pending_offchain_order_id: Some(offchain_order_id),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
         });
 
         let event = PositionEvent::OffChainOrderFilled {
-            execution_id,
+            offchain_order_id,
             shares_filled: FractionalShares::new(dec!(100)),
             direction: Direction::Sell,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15025),
             broker_timestamp,
         };
@@ -1363,7 +1380,7 @@ mod tests {
         };
 
         assert_eq!(position.net, FractionalShares::ZERO);
-        assert_eq!(position.pending_execution_id, None);
+        assert_eq!(position.pending_offchain_order_id, None);
         assert_eq!(position.last_updated, Some(broker_timestamp));
     }
 
@@ -1372,24 +1389,24 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let initialized_at = Utc::now();
         let broker_timestamp = Utc::now();
-        let execution_id = ExecutionId(43);
+        let offchain_order_id = OffchainOrderId::new();
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares::new(dec!(50.0)),
             accumulated_long: FractionalShares::new(dec!(50.0)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: Some(execution_id),
+            pending_offchain_order_id: Some(offchain_order_id),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
         });
 
         let event = PositionEvent::OffChainOrderFilled {
-            execution_id,
+            offchain_order_id,
             shares_filled: FractionalShares::new(dec!(25)),
             direction: Direction::Buy,
-            broker_order_id: BrokerOrderId("ORD456".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD456"),
             price_cents: PriceCents(14500),
             broker_timestamp,
         };
@@ -1401,7 +1418,7 @@ mod tests {
         };
 
         assert_eq!(position.net, FractionalShares::new(dec!(75.0)));
-        assert_eq!(position.pending_execution_id, None);
+        assert_eq!(position.pending_offchain_order_id, None);
         assert_eq!(position.last_updated, Some(broker_timestamp));
     }
 
@@ -1410,21 +1427,21 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let initialized_at = Utc::now();
         let failed_at = Utc::now();
-        let execution_id = ExecutionId(42);
+        let offchain_order_id = OffchainOrderId::new();
 
         let mut view = Lifecycle::Live(Position {
             symbol: symbol.clone(),
             net: FractionalShares::new(dec!(100.0)),
             accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: Some(execution_id),
+            pending_offchain_order_id: Some(offchain_order_id),
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: None,
             last_updated: Some(initialized_at),
         });
 
         let event = PositionEvent::OffChainOrderFailed {
-            execution_id,
+            offchain_order_id,
             error: "Market closed".to_string(),
             failed_at,
         };
@@ -1436,7 +1453,7 @@ mod tests {
         };
 
         assert_eq!(position.net, FractionalShares::new(dec!(100.0)));
-        assert_eq!(position.pending_execution_id, None);
+        assert_eq!(position.pending_offchain_order_id, None);
         assert_eq!(position.last_updated, Some(failed_at));
     }
 
@@ -1451,7 +1468,7 @@ mod tests {
             net: FractionalShares::new(dec!(100.0)),
             accumulated_long: FractionalShares::new(dec!(100.0)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::shares(
                 Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             ),
@@ -1512,7 +1529,7 @@ mod tests {
             position.accumulated_short,
             FractionalShares::new(dec!(49.5))
         );
-        assert_eq!(position.pending_execution_id, None);
+        assert_eq!(position.pending_offchain_order_id, None);
         assert_eq!(position.last_updated, Some(migrated_at));
     }
 
@@ -1591,7 +1608,7 @@ mod tests {
     fn timestamp_returns_placed_at_for_offchain_order_placed_event() {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderPlaced {
-            execution_id: ExecutionId(1),
+            offchain_order_id: OffchainOrderId::new(),
             shares: FractionalShares::ONE,
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
@@ -1609,10 +1626,10 @@ mod tests {
     fn timestamp_returns_broker_timestamp_for_offchain_order_filled_event() {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
+            offchain_order_id: OffchainOrderId::new(),
             shares_filled: FractionalShares::ONE,
             direction: Direction::Sell,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             broker_timestamp: timestamp,
         };
@@ -1624,7 +1641,7 @@ mod tests {
     fn timestamp_returns_failed_at_for_offchain_order_failed_event() {
         let timestamp = Utc::now();
         let event = PositionEvent::OffChainOrderFailed {
-            execution_id: ExecutionId(1),
+            offchain_order_id: OffchainOrderId::new(),
             error: "Market closed".to_string(),
             failed_at: timestamp,
         };
@@ -1782,7 +1799,7 @@ mod tests {
             net: FractionalShares::new(dec!(1.212)),
             accumulated_long: FractionalShares::new(dec!(1.212)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
@@ -1809,7 +1826,7 @@ mod tests {
             net: FractionalShares::new(dec!(-2.567)),
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(dec!(2.567)),
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::whole_share(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
@@ -1836,7 +1853,7 @@ mod tests {
             net: FractionalShares::new(dec!(1.212)),
             accumulated_long: FractionalShares::new(dec!(1.212)),
             accumulated_short: FractionalShares::ZERO,
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),
@@ -1863,7 +1880,7 @@ mod tests {
             net: FractionalShares::new(dec!(-2.567)),
             accumulated_long: FractionalShares::ZERO,
             accumulated_short: FractionalShares::new(dec!(2.567)),
-            pending_execution_id: None,
+            pending_offchain_order_id: None,
             threshold: ExecutionThreshold::dollar_value(Usdc(dec!(1))).unwrap(),
             last_price_usdc: Some(dec!(150.0)),
             last_updated: Some(Utc::now()),

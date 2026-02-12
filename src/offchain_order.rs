@@ -78,6 +78,12 @@ impl BrokerOrderId {
     }
 }
 
+impl AsRef<str> for BrokerOrderId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PriceCents(pub(crate) u64);
 
@@ -136,6 +142,50 @@ pub(crate) enum OffchainOrder {
 impl OffchainOrder {
     pub(crate) fn aggregate_id(id: i64) -> String {
         format!("{id}")
+    }
+
+    pub(crate) fn symbol(&self) -> &Symbol {
+        use OffchainOrder::*;
+        match self {
+            Pending { symbol, .. }
+            | Submitted { symbol, .. }
+            | PartiallyFilled { symbol, .. }
+            | Filled { symbol, .. }
+            | Failed { symbol, .. } => symbol,
+        }
+    }
+
+    pub(crate) fn shares(&self) -> FractionalShares {
+        use OffchainOrder::*;
+        match self {
+            Pending { shares, .. }
+            | Submitted { shares, .. }
+            | PartiallyFilled { shares, .. }
+            | Filled { shares, .. }
+            | Failed { shares, .. } => *shares,
+        }
+    }
+
+    pub(crate) fn direction(&self) -> Direction {
+        use OffchainOrder::*;
+        match self {
+            Pending { direction, .. }
+            | Submitted { direction, .. }
+            | PartiallyFilled { direction, .. }
+            | Filled { direction, .. }
+            | Failed { direction, .. } => *direction,
+        }
+    }
+
+    pub(crate) fn executor_order_id(&self) -> Option<&BrokerOrderId> {
+        use OffchainOrder::*;
+        match self {
+            Pending { .. } | Failed { .. } => None,
+
+            Submitted { broker_order_id, .. }
+            | PartiallyFilled { broker_order_id, .. }
+            | Filled { broker_order_id, .. } => Some(broker_order_id),
+        }
     }
 
     pub(crate) fn apply_transition(

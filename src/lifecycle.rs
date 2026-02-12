@@ -47,7 +47,6 @@
 
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
-
 use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
 use cqrs_es::{Aggregate, EventEnvelope, Query, View};
@@ -261,10 +260,17 @@ where
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::{Aggregate, DomainEvent};
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use chrono::Utc;
+    use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
+    use rust_decimal_macros::dec;
+
+    use st0x_execution::FractionalShares;
 
     use super::*;
+    use crate::position::{Position, PositionEvent};
+    use crate::threshold::ExecutionThreshold;
 
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
     struct TestState {
@@ -572,5 +578,72 @@ mod tests {
             dispatch_called.load(Ordering::SeqCst),
             "Expected dispatch to be called on inner query"
         );
+    }
+
+    type PositionLifecycle = Lifecycle<Position, st0x_execution::ArithmeticError<FractionalShares>>;
+
+    #[test]
+    fn view_update_transitions_uninitialized_to_live() {
+        let mut lifecycle = PositionLifecycle::default();
+        assert!(matches!(lifecycle, Lifecycle::Uninitialized));
+
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let initialized_at = Utc::now();
+
+        let event = PositionEvent::Initialized {
+            symbol: symbol.clone(),
+            threshold: ExecutionThreshold::whole_share(),
+            initialized_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: symbol.to_string(),
+            sequence: 1,
+            payload: event,
+            metadata: HashMap::new(),
+        };
+
+        lifecycle.update(&envelope);
+
+        let Lifecycle::Live(position) = lifecycle else {
+            panic!("Expected Live state after update, got: {lifecycle:?}");
+        };
+
+        assert_eq!(position.symbol, symbol);
+        assert_eq!(position.net, FractionalShares::ZERO);
+        assert_eq!(position.accumulated_long, FractionalShares::ZERO);
+        assert_eq!(position.accumulated_short, FractionalShares::ZERO);
+        assert_eq!(position.pending_offchain_order_id, None);
+        assert_eq!(position.last_updated, Some(initialized_at));
+    }
+
+    #[test]
+    fn view_update_clones_payload_leaving_envelope_usable() {
+        let mut lifecycle = PositionLifecycle::default();
+
+        let symbol = st0x_execution::Symbol::new("TSLA").unwrap();
+        let initialized_at = Utc::now();
+
+        let event = PositionEvent::Initialized {
+            symbol: symbol.clone(),
+            threshold: ExecutionThreshold::whole_share(),
+            initialized_at,
+        };
+
+        let envelope = EventEnvelope {
+            aggregate_id: symbol.to_string(),
+            sequence: 1,
+            payload: event.clone(),
+            metadata: HashMap::new(),
+        };
+
+        lifecycle.update(&envelope);
+
+        assert_eq!(envelope.aggregate_id, symbol.to_string());
+        assert_eq!(envelope.sequence, 1);
+        assert_eq!(envelope.payload, event);
+        assert!(envelope.metadata.is_empty());
+
+        assert!(matches!(lifecycle, Lifecycle::Live(_)));
     }
 }

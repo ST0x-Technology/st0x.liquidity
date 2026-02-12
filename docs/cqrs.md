@@ -174,12 +174,31 @@ For aggregates that don't need services, use `type Services = ()`.
 
 ## Forbidden Patterns
 
-1. **Never query the `events` table directly** - use `EventStore` trait methods
-2. **Never query view tables with raw SQL** - use `GenericQuery::load()`
-3. **Never modify or delete events** - they're immutable historical facts
-4. **Never worry about changing aggregates/views** - they're just
-   interpretations
-5. **Never add events you don't need yet** - YAGNI applies especially to events
+### CRITICAL: Event Writes Are Strictly Controlled
+
+1. **NEVER write directly to the `events` table** - this is STRICTLY FORBIDDEN:
+   - **FORBIDDEN**: Direct INSERT statements into the `events` table
+   - **FORBIDDEN**: Manual sequence number management for events
+   - **FORBIDDEN**: Bypassing the CqrsFramework to write events
+   - **REQUIRED**: Always use `CqrsFramework::execute()` or
+     `CqrsFramework::execute_with_metadata()` to emit events through aggregate
+     commands
+   - **WHY**: Direct writes break aggregate consistency, event ordering, and
+     violate the CQRS pattern. Events must be emitted through aggregate
+     commands that generate domain events. The framework handles event
+     persistence, sequence numbers, aggregate loading, and consistency
+     guarantees.
+   - **NOTE**: If you see existing code writing directly to `events` table, that
+     code is incorrect and should be refactored to use CqrsFramework
+
+### Other Forbidden Patterns
+
+2. **Never query the `events` table directly with raw SQL** - use `EventStore`
+   trait methods or the framework's query API
+3. **Never query view tables with raw SQL** - use `GenericQuery::load()`
+4. **Never modify or delete events** - they're immutable historical facts
+5. **Never worry about changing aggregates/views** - they're just interpretations
+6. **Never add events you don't need yet** - YAGNI applies especially to events
 
 ## Testing Aggregates
 

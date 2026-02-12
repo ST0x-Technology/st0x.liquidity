@@ -10,9 +10,13 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteCqrs;
+
 use st0x_execution::{Direction, Symbol};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
+
+pub(crate) type OnChainTradeCqrs = SqliteCqrs<Lifecycle<OnChainTrade>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct OnChainTrade {
