@@ -196,164 +196,214 @@ job handler never touches `Services` directly - it operates through the CQRS
 command interface.
 
 <!-- DIAGRAM CANDIDATES - pick the best, delete the rest -->
+<!--
+  Shape legend used in flowcharts below:
+    [Rectangle]    = apalis job
+    (Rounded)      = CQRS aggregate
+    {{Hexagon}}    = CQRS query processor (event reactor)
+    ([Stadium])    = external API
+-->
 
-##### Option A: DI Layers as Sequence Diagram
+##### Option A: Trade & Hedging Pipeline (flowchart)
 
-```mermaid
-sequenceDiagram
-    participant JH as Job Handler
-    participant CQ as Cqrs instance
-    participant AGG as Aggregate handle
-    participant EXT as External APIs
-
-    Note over JH: Orchestration layer
-    JH->>CQ: execute(command)
-    Note over CQ,EXT: Domain layer
-    CQ->>AGG: handle(command, services)
-    AGG->>EXT: services.place_order()
-```
-
-##### Option B: DI Layers as Flowchart (no subgraphs)
+Shows the full cycle: job -> CQRS command -> event -> query processor -> next
+job. This is the latency-sensitive path from blockchain event to hedge order.
 
 ```mermaid
-graph LR
-    JH[Job Handler] -->|"Data Cqrs"| CQ[Cqrs::execute]
-    JH -->|"Data JobQueue"| PQ[Push downstream jobs]
-    JH -->|"Data View"| VR[Read projections]
-    CQ -->|injects Services| AGG[Aggregate::handle]
-    AGG --> B[Broker API]
-    AGG --> R[Ethereum RPC]
-    AGG --> T[Tokenization API]
+graph TD
+    WS([DEX WebSocket]) -->|push| POE[ProcessOnchainEvent]
+
+    POE -->|Witness command| OT(OnChainTrade)
+    OT -->|Filled event| TM{{TradeManager query}}
+    TM -->|AcknowledgeOnChainFill| P(Position)
+
+    P -->|OffChainOrderPlaced event| OM{{OrderManager query}}
+    OM -->|push| PFO[PlaceOffchainOrder]
+
+    PFO -->|place order| BROKER([Broker API])
+    PFO -->|ConfirmSubmission| OO(OffchainOrder)
+
+    POS[PollOrderStatus cron] -->|get status| BROKER
+    POS -->|CompleteFill| OO
+    OO -->|Filled event| OM2{{OrderManager query}}
+    OM2 -->|CompleteOffChainOrder| P
+
+    CAP[CheckAccumulatedPositions cron] -->|reads view| P
+    CAP -->|push| PFO
 ```
 
-##### Option C: DI Layers as Class Diagram
+##### Option B: Trade & Hedging Pipeline (sequence diagram)
 
-```mermaid
-classDiagram
-    class JobHandler {
-        Orchestration Layer
-        Data~Cqrs~ cqrs
-        Data~JobQueue~ queue
-        Data~View~ views
-    }
-    class CqrsFramework {
-        Domain Layer
-        execute(command)
-    }
-    class AggregateHandle {
-        handle(command, services)
-    }
-    class BrokerAPI
-    class EthereumRPC
-    class TokenizationAPI
-
-    JobHandler --> CqrsFramework : calls execute
-    CqrsFramework --> AggregateHandle : injects Services
-    AggregateHandle --> BrokerAPI : uses
-    AggregateHandle --> EthereumRPC : uses
-    AggregateHandle --> TokenizationAPI : uses
-```
-
-##### Option D: System Overview as Sequence Diagram
+Same flow as Option A but as a sequence diagram.
 
 ```mermaid
 sequenceDiagram
     participant WS as DEX WebSocket
-    participant Q as Persistent Job Queue
-    participant W as Workers in Monitor
-    participant CQRS as CQRS Aggregates
+    participant POE as ProcessOnchainEvent
+    participant OT as OnChainTrade
+    participant TM as TradeManager query
+    participant P as Position
+    participant OM as OrderManager query
+    participant PFO as PlaceOffchainOrder
+    participant Broker as Broker API
+    participant OO as OffchainOrder
 
-    WS->>Q: push ProcessOnchainEvent
+    WS->>POE: push job
+    POE->>OT: Witness command
+    OT->>TM: Filled event
+    TM->>P: AcknowledgeOnChainFill
+    P->>OM: OffChainOrderPlaced event
+    OM->>PFO: push job
 
-    loop Workers consume and produce
-        Q->>W: dequeue job
-        W->>CQRS: execute commands
-        W->>Q: push downstream jobs
-    end
+    PFO->>Broker: place order
+    PFO->>OO: ConfirmSubmission
+
+    Note over Broker,OO: PollOrderStatus cron detects fill
+    Broker->>OO: CompleteFill
+    OO->>OM: Filled event
+    OM->>P: CompleteOffChainOrder
 ```
 
-##### Option E: System Overview as Flowchart (flat, no subgraphs)
+##### Option C: Enrichment Pipeline (flowchart)
+
+Decoupled from the trade pipeline. Slow RPC calls don't block hedging.
+
+```mermaid
+graph LR
+    POE[ProcessOnchainEvent] -->|push| EOT[EnrichOnchainTrade]
+    EOT -->|debug_traceTransaction| RPC([Ethereum RPC])
+    RPC -->|Pyth price data| EOT
+    EOT -->|Enrich command| OT(OnChainTrade)
+    OT -->|Enriched event| V{{Views update}}
+```
+
+##### Option D: Rebalancing Pipeline (flowchart)
+
+Shows how CQRS query processors bridge event-driven and job-driven worlds.
 
 ```mermaid
 graph TD
-    WS[DEX WebSocket] -->|push| Q[Persistent Job Queue]
-    Q -->|dequeue| W[Monitor / Workers]
-    W -->|execute| CQRS[CQRS Aggregates]
-    W -->|push downstream| Q
+    PI[PollInventory cron] -->|poll balances| BROKER([Broker API])
+    PI -->|RecordSnapshot| INV(InventorySnapshot)
+
+    P(Position) -->|events| RT{{RebalancingTrigger query}}
+    INV -->|events| RT
+    RT -->|push| ER[ExecuteRebalancing]
+
+    ER -->|Initialize| REB(UsdcRebalance)
+    ER -->|mint/redeem| TOK([Tokenizer API])
+    ER -->|transfer| BRIDGE([Bridge API])
+    ER -->|deposit/withdraw| VAULT([Vault API])
+    ER -->|Complete| REB
 ```
 
-##### Option F: System Overview as Flowchart (detailed, no subgraphs)
+##### Option E: Complete System (single flowchart)
+
+Everything in one diagram. May be too dense but shows all connections.
 
 ```mermaid
 graph TD
-    WS[DEX WebSocket] -->|push| POE[ProcessOnchainEvent]
-    POE -->|push| PFO[PlaceOffchainOrder]
+    WS([DEX WebSocket]) -->|push| POE[ProcessOnchainEvent]
+
+    POE -->|Witness| OT(OnChainTrade)
+    OT -->|Filled| TM{{TradeManager}}
+    TM -->|AcknowledgeOnChainFill| P(Position)
+    P -->|OffChainOrderPlaced| OM{{OrderManager}}
+    OM -->|push| PFO[PlaceOffchainOrder]
+
+    PFO -->|place order| BROKER([Broker API])
+    PFO -->|ConfirmSubmission| OO(OffchainOrder)
+
+    POS[PollOrderStatus cron] -->|get status| BROKER
+    POS -->|CompleteFill| OO
+    OO -->|Filled| OM
+    OM -->|CompleteOffChainOrder| P
+
+    CAP[CheckAccumulatedPositions cron] -->|reads| P
+    CAP -->|push| PFO
+
     POE -->|push| EOT[EnrichOnchainTrade]
-    CAP[CheckAccumulatedPositions cron] -->|push| PFO
-    RT[RebalancingTrigger] -->|push| ER[ExecuteRebalancing]
+    EOT -->|trace tx| RPC([Ethereum RPC])
+    EOT -->|Enrich| OT
 
-    POE -->|execute| OT[OnChainTrade agg]
-    POE -->|execute| POS[Position agg]
-    PFO -->|execute| OO[OffchainOrder agg]
-    PFO -->|execute| POS
-    EOT -->|execute| OT
-    ER -->|execute| REB[UsdcRebalance agg]
+    PI[PollInventory cron] -->|poll| BROKER
+    PI -->|RecordSnapshot| INV(InventorySnapshot)
+    P -->|events| RT{{RebalancingTrigger}}
+    INV -->|events| RT
+    RT -->|push| ER[ExecuteRebalancing]
+    ER -->|Initialize/Complete| REB(UsdcRebalance)
+    ER -->|calls| EXT([Tokenizer/Bridge/Vault])
+
+    EM[ExecutorMaintenance cron] -->|maintain| BROKER
 ```
 
-##### Option G: System Overview as ER Diagram (job-aggregate relationships)
+##### Option F: Complete System (sequence diagram)
+
+Everything as a sequence diagram with more participants.
+
+```mermaid
+sequenceDiagram
+    participant WS as DEX WebSocket
+    participant POE as ProcessOnchainEvent
+    participant OT as OnChainTrade
+    participant TM as TradeManager
+    participant P as Position
+    participant OM as OrderManager
+    participant PFO as PlaceOffchainOrder
+    participant Broker as Broker API
+    participant OO as OffchainOrder
+
+    WS->>POE: push job
+    POE->>OT: Witness
+    OT->>TM: Filled event
+    TM->>P: AcknowledgeOnChainFill
+
+    alt Threshold met
+        P->>OM: OffChainOrderPlaced event
+        OM->>PFO: push job
+        PFO->>Broker: place order
+        PFO->>OO: ConfirmSubmission
+    end
+
+    Note over POE,OT: Enrichment (parallel)
+    POE-->>OT: push EnrichOnchainTrade
+
+    Note over Broker,OO: Later - PollOrderStatus cron
+    Broker->>OO: CompleteFill
+    OO->>OM: Filled event
+    OM->>P: CompleteOffChainOrder
+
+    Note over P,OM: Rebalancing feedback
+    P-->>P: RebalancingTrigger evaluates
+    P-->>PFO: push ExecuteRebalancing
+```
+
+##### Option G: Job-Aggregate Relationships (ER diagram)
+
+Shows writes/reads/pushes as relationship types.
 
 ```mermaid
 erDiagram
-    ProcessOnchainEvent ||--o{ OnChainTrade : writes
-    ProcessOnchainEvent ||--o{ Position : writes
-    ProcessOnchainEvent ||--o{ PlaceOffchainOrder : pushes
-    ProcessOnchainEvent ||--o{ EnrichOnchainTrade : pushes
-    EnrichOnchainTrade ||--o{ OnChainTrade : writes
-    PlaceOffchainOrder ||--o{ OffchainOrder : writes
-    PlaceOffchainOrder ||--o{ Position : writes
-    PollOrderStatus ||--o{ OffchainOrder : writes
-    PollOrderStatus ||--o{ Position : writes
-    ExecuteRebalancing ||--o{ UsdcRebalance : writes
-    PollInventory ||--o{ InventorySnapshot : writes
-    CheckAccumulatedPositions ||--o{ PlaceOffchainOrder : pushes
-    RebalancingTrigger ||--o{ ExecuteRebalancing : pushes
-```
+    ProcessOnchainEvent ||--o{ OnChainTrade : "Witness command"
+    OnChainTrade ||--|| TradeManager : "Filled event"
+    TradeManager ||--o{ Position : "AcknowledgeOnChainFill"
+    Position ||--|| OrderManager : "OffChainOrderPlaced event"
+    OrderManager ||--o{ PlaceOffchainOrder : "pushes job"
 
-##### Option H: Full Architecture as C4 Context
+    PlaceOffchainOrder ||--o{ OffchainOrder : "ConfirmSubmission"
+    PollOrderStatus ||--o{ OffchainOrder : "CompleteFill"
+    OffchainOrder ||--|| OrderManager : "Filled event"
+    OrderManager ||--o{ Position : "CompleteOffChainOrder"
 
-```mermaid
-C4Context
-    title System Context - Apalis Orchestration
+    ProcessOnchainEvent ||--o{ EnrichOnchainTrade : "pushes job"
+    EnrichOnchainTrade ||--o{ OnChainTrade : "Enrich command"
 
-    Person(ws, "DEX WebSocket", "Stream producer")
-
-    System_Boundary(monitor, "Monitor") {
-        System(trade, "Trade Worker", "ProcessOnchainEvent")
-        System(order, "Order Worker", "PlaceOffchainOrder")
-        System(enrich, "Enrichment Worker", "EnrichOnchainTrade")
-        System(rebal, "Rebalancing Worker", "ExecuteRebalancing")
-        System(cron, "Cron Workers", "Poll, Check, Maintain")
-    }
-
-    SystemDb(queue, "Persistent Job Queue", "SQLite")
-    SystemDb(cqrs, "CQRS Aggregates", "Event Store")
-    System_Ext(broker, "Broker API", "Schwab/Alpaca")
-    System_Ext(rpc, "Ethereum RPC", "Blockchain")
-
-    Rel(ws, queue, "push")
-    Rel(queue, trade, "dequeue")
-    Rel(queue, order, "dequeue")
-    Rel(queue, enrich, "dequeue")
-    Rel(queue, rebal, "dequeue")
-    Rel(trade, queue, "push downstream")
-    Rel(trade, cqrs, "execute")
-    Rel(order, cqrs, "execute")
-    Rel(order, broker, "place order")
-    Rel(enrich, cqrs, "execute")
-    Rel(enrich, rpc, "trace tx")
-    Rel(rebal, cqrs, "execute")
-    Rel(cron, cqrs, "execute")
-    Rel(cron, broker, "poll/maintain")
+    Position ||--|| RebalancingTrigger : "events"
+    InventorySnapshot ||--|| RebalancingTrigger : "events"
+    RebalancingTrigger ||--o{ ExecuteRebalancing : "pushes job"
+    ExecuteRebalancing ||--o{ UsdcRebalance : "Initialize/Complete"
+    PollInventory ||--o{ InventorySnapshot : "RecordSnapshot"
+    CheckAccumulatedPositions ||--o{ PlaceOffchainOrder : "pushes job"
 ```
 
 <!-- END DIAGRAM CANDIDATES -->
