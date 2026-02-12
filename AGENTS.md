@@ -21,6 +21,10 @@ the limit:
   ENTIRE file meets the limit, not just your additions.
 - **No warnings or errors pass through** - CI and review catch everything. If
   you see a warning/error, it's your responsibility to fix it now.
+- **Work until all tasks are complete** - do not stop until every assigned task
+  is done, unless you need input from the user to proceed. If blocked on one
+  task, move to the next. Only stop working when the task list is clear or you
+  genuinely cannot proceed without user input.
 
 ## Communication
 
@@ -349,8 +353,14 @@ tracking (pending → completed/failed), retry logic with exponential backoff
 
 ### Configuration
 
-All configuration is via TOML files passed with `--config-file`. See
-`example.toml` for available options.
+Configuration is split into plaintext config (`--config`, see
+`example.config.toml`) and encrypted secrets (`--secrets`, see
+`example.secrets.toml`). The reporter binary only takes `--config` (no secrets).
+
+### Naming Conventions
+
+Code names must be consistent with **[docs/domain.md](docs/domain.md)**, which
+is the source of truth for terminology and naming conventions.
 
 ### Code Quality & Best Practices
 
@@ -446,22 +456,22 @@ All configuration is via TOML files passed with `--config-file`. See
   below)
 - **Spacing**: Leave an empty line in between code blocks to allow vim curly
   braces jumping between blocks and for easier reading
-- **CRITICAL: Import Organization**: Follow a consistent two-group import
+- **CRITICAL: Import Organization**: Follow a consistent three-group import
   pattern throughout the codebase:
   - **Group 1 - External imports**: All imports from external crates including
-    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines between
-    external imports.
-  - **Empty line separating the groups**
-  - **Group 2 - Internal imports**: All imports from our codebase using
-    `crate::` and `super::`. No empty lines between internal imports.
-  - **FORBIDDEN**: Three or more import groups, imports separated by empty lines
-    within a group
+    `std`, `alloy`, `cqrs_es`, `serde`, `tokio`, etc. No empty lines within.
+  - **Empty line**
+  - **Group 2 - Workspace imports**: Imports from other workspace crates
+    (`st0x_execution`). No empty lines within.
+  - **Empty line**
+  - **Group 3 - Crate-internal imports**: Imports using `crate::` and `super::`.
+    No empty lines within.
+  - Groups 2 or 3 may be absent if unused; never add an empty group
+  - **FORBIDDEN**: Empty lines within a group, imports out of group order
   - **FORBIDDEN**: Function-level imports. Always use top-of-module imports.
   - Module declarations (`mod foo;`) can appear between imports if needed
   - This pattern applies to ALL modules including test modules
     (`#[cfg(test)] mod tests`)
-  - Example: `use std::sync::Arc; use alloy::primitives::Address;` [blank line]
-    `use crate::foo::Bar; use super::Baz;`
 - **Import Conventions**: Use qualified imports when they prevent ambiguity
   (e.g. `contract::Error` for `alloy::contract::Error`), but avoid them when the
   module is clear (e.g. use `info!` instead of `tracing::info!`). Never use
@@ -736,30 +746,55 @@ Unicode breaks vim navigation and grep workflows.
 
 #### Module Organization
 
-Organize code within modules by importance and visibility:
+Organize code within modules by importance to the reader, not by when it was
+added. Public API first, then private implementation, then tests. A reader
+should understand what a module provides and how to use it before encountering
+implementation details.
 
-- **Public API first**: Place public functions, types, and traits at the top of
-  the module where they are immediately visible to consumers
-- **Private helpers below public code**: Place private helper functions, types,
-  and traits immediately after the public code that uses them
-- **Implementation blocks next to type definitions**: Place `impl` blocks after
-  the type definition
+**Module docstrings**: Every module should have a `//!` docstring explaining
+what it provides. This makes it obvious what parts of the module are most
+important (and should be placed higher up) while also helping identify when
+something doesn't belong in the module and should be moved elsewhere.
 
-This organization pattern makes the module's public interface clear at a glance
-and keeps implementation details appropriately subordinate.
+**Determining importance**: What a module _does_ (types consumers use, functions
+they call) matters more than what _supports_ it (error types, internal helpers,
+private traits). If code A uses code B, then A is more important than B -
+because B exists to serve A, not the other way around. For example, a function
+that can fail is more important than the error type it returns, since the error
+type is a byproduct of the function's implementation.
 
-**Example:** Public types first -> impl blocks -> public functions -> private
-helpers.
+#### Line width in docstrings and macros
 
-This pattern applies across the entire workspace, including both the main crate
-and sub-crates like `st0x-execution`.
+All doc comments (`//!` and `///`) and long strings inside attribute macros
+(e.g., `#[error(...)]`) must not exceed 80 characters per line. `cargo fmt` does
+not enforce this (without nightly rustfmt), so be careful and check manually.
 
-#### Use `.unwrap` over boolean result assertions in tests
+For multi-line `#[error]` strings, use `\` continuation:
 
-Instead of `assert!(result.is_err()); assert!(matches!(...))`, write
-`assert!(matches!(result.unwrap_err(), SchwabError::Reqwest(_)));` directly.
-Similarly, instead of `assert!(result.is_ok()); assert_eq!(...)`, write
-`assert_eq!(result.unwrap(), "expected_value");` so unexpected values are shown.
+```rust
+#[error(
+    "Expected IO to contain USDC and one tokenized equity \
+     (t prefix, 0x or s1 suffix) but got {0} and {1}"
+)]
+```
+
+#### Never use `is_err()`/`is_ok()` assertions in tests
+
+`assert!(result.is_err())` is never acceptable - every error test must verify
+the exact error variant:
+
+```rust
+// FORBIDDEN: doesn't check which error
+assert!(result.is_err());
+
+// REQUIRED: unwrap first, then assert the exact variant
+let error = result.unwrap_err();
+assert!(matches!(error, SomeError::SpecificVariant { .. }));
+```
+
+`assert!(result.is_ok())` is equally bad - just call `.unwrap()`.
+
+**FORBIDDEN**: `assert!(x.is_err())`, `assert!(x.is_ok())`
 
 #### Assertions must be specific
 
@@ -799,73 +834,20 @@ enums, newtypes, or other constructs best represent the concept at hand.
 
 ##### Make invalid states unrepresentable:
 
-Instead of using multiple fields that can contradict each other:
-
-```rust
-// ❌ Bad: Multiple fields can be in invalid combinations
-pub struct Order {
-    pub status: String,  // "pending", "completed", "failed"
-    pub order_id: Option<String>,  // Some when completed, None when pending
-    pub executed_at: Option<DateTime<Utc>>,  // Some when completed
-    pub price_cents: Option<i64>,  // Some when completed
-    pub error_reason: Option<String>,  // Some when failed
-}
-```
-
-Use enum variants to encode valid states:
-
-```rust
-// ✅ Good: Each state has exactly the data it needs
-pub enum OrderStatus {
-    Pending,
-    Completed {
-        order_id: String,
-        executed_at: DateTime<Utc>,
-        price_cents: i64,
-    },
-    Failed {
-        failed_at: DateTime<Utc>,
-        error_reason: String,
-    },
-}
-```
+Instead of multiple optional fields that can contradict each other (e.g.,
+`status: String` + `order_id: Option<String>` + `error_reason: Option<String>`),
+use enum variants where each state carries exactly the data it needs.
 
 ##### Use newtypes for domain concepts:
 
-```rust
-// ❌ Bad: Easy to mix up parameters of the same type
-fn place_order(symbol: String, account: String, amount: i64, price: i64) { }
-
-// ✅ Good: Type system prevents mixing incompatible values
-#[derive(Debug, Clone)]
-struct Symbol(String);
-
-#[derive(Debug, Clone)]
-struct AccountId(String);
-
-#[derive(Debug)]
-struct Shares(i64);
-
-#[derive(Debug)]
-struct PriceCents(i64);
-
-fn place_order(symbol: Symbol, account: AccountId, amount: Shares, price: PriceCents) { }
-```
+Wrap primitives in newtypes to prevent mixing incompatible values at call sites
+(e.g., `Symbol(String)`, `AccountId(String)`, `Shares(i64)`, `PriceCents(i64)`).
 
 ##### The Typestate Pattern:
 
-Encodes runtime state in compile-time types, eliminating runtime checks.
-
-```rust
-// ✅ Good: State transitions enforced at compile time
-struct Task<State> { data: TaskData, state: State }
-impl Task<Start> { fn begin(self) -> Task<InProgress> { ... } }
-impl Task<InProgress> { fn complete(self) -> Task<Complete> { ... } }
-```
-
-Use typestate for protocol enforcement (`Connection<Unauthenticated>` →
-`Connection<Authenticated>`) and builder patterns (`RequestBuilder<NoUrl>` →
-`RequestBuilder<HasUrl>`).
+Encode runtime state in compile-time types to eliminate runtime checks. Use for
+protocol enforcement and builder patterns (e.g., `Connection<Unauthenticated>`
+-> `Connection<Authenticated>`).
 
 #### Avoid deep nesting
 
@@ -875,35 +857,10 @@ maintainability. This includes test modules - do NOT nest submodules inside
 
 ##### Techniques for flat code:
 
-```rust
-// ❌ Nested: if let Some(data) = data { if !data.is_empty() { if data.len() > 5 { ... } } }
-// ✅ Flat with early returns:
-fn process_data(data: Option<&str>) -> Result<String, Error> {
-    let data = data.ok_or(Error::None)?;
-    if data.is_empty() { return Err(Error::Empty); }
-    if data.len() <= 5 { return Err(Error::TooShort); }
-    Ok(data.to_uppercase())
-}
-```
-
-##### Use let-else pattern for guard clauses:
-
-```rust
-// Use let-else to flatten nested if-let chains
-let Some(trade_data) = convert_event_to_trade(event) else {
-    return Err(Error::ConversionFailed);
-};
-let Some(symbol) = trade_data.extract_symbol() else {
-    return Err(Error::NoSymbol);
-};
-```
-
-##### Use pattern matching with guards:
-
-```rust
-// ❌ Nested if-let: if let Some(data) = input { if state == Ready && data.is_valid() { ... } }
-// ✅ Pattern match: match (input, state) { (Some(d), Ready) if d.is_valid() => process(d), ... }
-```
+- **Early returns** with `?` and `return Err(...)` instead of nested `if let`
+- **let-else** for guard clauses:
+  `let Some(x) = expr else { return Err(...); };`
+- **Pattern matching with guards** instead of nested `if let` chains
 
 #### Struct field access
 

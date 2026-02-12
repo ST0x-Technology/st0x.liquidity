@@ -18,6 +18,7 @@ pub enum ServerMessage {
     Event(EventStoreEntry),
 }
 
+/// Full dashboard snapshot sent to the frontend on connection.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -47,6 +48,7 @@ impl InitialState {
     }
 }
 
+/// Single event from the event store for live updates.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 pub struct EventStoreEntry {
@@ -58,7 +60,7 @@ pub struct EventStoreEntry {
     pub timestamp: DateTime<Utc>,
 }
 
-/// Placeholder for trade information.
+/// Completed trade record.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -66,7 +68,7 @@ pub struct Trade {
     pub id: String,
 }
 
-/// Position information for a symbol.
+/// Per-symbol net position.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +78,7 @@ pub struct Position {
     pub net: Decimal,
 }
 
+/// Per-symbol onchain/offchain/net balances.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -89,6 +92,7 @@ pub struct SymbolInventory {
     pub net: Decimal,
 }
 
+/// Onchain and offchain USDC balances.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -99,6 +103,7 @@ pub struct UsdcInventory {
     pub offchain: Decimal,
 }
 
+/// Full inventory snapshot across all symbols and USDC.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -119,6 +124,7 @@ impl Inventory {
     }
 }
 
+/// Absolute and percentage profit/loss.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 pub struct PnL {
@@ -128,6 +134,7 @@ pub struct PnL {
     pub percent: Decimal,
 }
 
+/// Performance metrics for a single time window.
 #[derive(Debug, Clone, Copy, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -171,6 +178,7 @@ impl TimeframeMetrics {
     }
 }
 
+/// Metrics across all tracked timeframes.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 pub struct PerformanceMetrics {
@@ -198,6 +206,7 @@ impl PerformanceMetrics {
     }
 }
 
+/// Current bid/ask spread for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -214,6 +223,7 @@ pub struct SpreadSummary {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Incremental spread change for a symbol.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -230,7 +240,7 @@ pub struct SpreadUpdate {
     pub pyth_price: Decimal,
 }
 
-/// Placeholder for rebalance operation tracking.
+/// Active or completed rebalance operation.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(rename_all = "camelCase")]
@@ -238,7 +248,7 @@ pub struct RebalanceOperation {
     pub id: String,
 }
 
-/// Circuit breaker status for the trading system.
+/// Whether the trading circuit breaker is active.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -246,7 +256,7 @@ pub enum CircuitBreakerStatus {
     Active,
 }
 
-/// Authentication status for broker connections.
+/// Broker authentication status.
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "dashboard/src/lib/api/")]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -278,6 +288,8 @@ pub fn export_bindings() -> Result<(), ts_rs::ExportError> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[test]
@@ -289,6 +301,49 @@ mod tests {
         assert!(json.contains("metrics"));
         assert!(json.contains("authStatus"));
         assert!(json.contains("circuitBreaker"));
+    }
+
+    #[derive(TS)]
+    #[ts(export, export_to = "dashboard/src/lib/api/")]
+    struct TestOnlyBinding {
+        _canary: bool,
+    }
+
+    #[test]
+    fn export_bindings_generates_files_in_dashboard_directory() {
+        let export_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dashboard/src/lib/api");
+
+        export_bindings().unwrap();
+
+        assert!(
+            export_dir.join("ServerMessage.ts").exists(),
+            "ServerMessage.ts should exist in {}/",
+            export_dir.display()
+        );
+        assert!(
+            export_dir.join("InitialState.ts").exists(),
+            "InitialState.ts should exist in {}/",
+            export_dir.display()
+        );
+
+        // Export a test-only type and verify it lands in the same directory with correct contents
+        TestOnlyBinding::export_all().unwrap();
+        let test_file = export_dir.join("TestOnlyBinding.ts");
+        let contents = std::fs::read_to_string(&test_file).unwrap_or_else(|e| {
+            panic!(
+                "test-only binding should be readable at {}: {e}",
+                test_file.display()
+            )
+        });
+        assert!(
+            contents.contains("TestOnlyBinding"),
+            "generated file should contain the type name, got: {contents}"
+        );
+        assert!(
+            contents.contains("_canary"),
+            "generated file should contain the field name, got: {contents}"
+        );
+        std::fs::remove_file(&test_file).unwrap();
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub(crate) enum Imbalance<T> {
 
 /// Threshold configuration for imbalance detection.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ImbalanceThreshold {
     /// Target ratio of onchain to total (e.g., 0.5 for 50/50 split).
     pub(crate) target: Decimal,
@@ -547,8 +548,8 @@ impl InventoryView {
     /// Applies a USDC rebalance event to update USDC inventory.
     ///
     /// - `Initiated`: Move amount from source venue's available to inflight.
-    ///   - `AlpacaToBase`: offchain → onchain (move offchain to inflight)
-    ///   - `BaseToAlpaca`: onchain → offchain (move onchain to inflight)
+    ///   - `AlpacaToBase`: offchain -> onchain (move offchain to inflight)
+    ///   - `BaseToAlpaca`: onchain -> offchain (move onchain to inflight)
     /// - `WithdrawalConfirmed`: No balance change (awaiting bridge).
     /// - `WithdrawalFailed`: Keep inflight until manually resolved.
     /// - `BridgingInitiated`, `BridgeAttestationReceived`: No balance change.

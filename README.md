@@ -70,13 +70,13 @@ code, a regular shell is fine.
 
 ### Configuration
 
-The application uses TOML configuration files. See `example.toml` for all
-available options. Each service instance takes a `--config-file` flag pointing
-to its config:
+The application uses TOML configuration files split into plaintext config and
+encrypted secrets. See `example.config.toml` and `example.secrets.toml` for all
+available options.
 
 ```bash
-cargo run --bin server -- --config-file path/to/config.toml
-cargo run --bin reporter -- --config-file path/to/config.toml
+cargo run --bin server -- --config path/to/config.toml --secrets path/to/secrets.toml
+cargo run --bin reporter -- --config path/to/config.toml
 ```
 
 ### Brokerage Setup
@@ -101,7 +101,7 @@ For individual accounts. Create an account at
 dashboard.
 
 Add credentials to your TOML config file under the `[broker]` section (see
-`example.toml`).
+`example.config.toml` and `example.secrets.toml`).
 
 ### Token Encryption (Schwab only)
 
@@ -364,8 +364,11 @@ CI will fail if `bun.nix` is out of sync with `bun.lock`.
 ## Documentation
 
 - **[SPEC.md](SPEC.md)** - Complete technical specification and architecture
+- **[docs/domain.md](docs/domain.md)** - Domain model, terminology, and naming
+  conventions
 - **[AGENTS.md](AGENTS.md)** - Development guidelines for AI-assisted coding
-- **[example.toml](example.toml)** - Configuration reference
+- **[example.config.toml](example.config.toml)** - Configuration reference
+- **[example.secrets.toml](example.secrets.toml)** - Secrets reference
 
 ## How It Works
 

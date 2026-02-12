@@ -12,12 +12,12 @@ mod order_status;
 mod tokens;
 
 // Re-export only what's needed for executor construction
+pub(crate) use auth::SchwabAuthCtx;
 pub use auth::{
-    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthConfig, SchwabAuthError,
-    SchwabAuthEvent,
+    AccessToken, RefreshToken, SchwabAuth, SchwabAuthCommand, SchwabAuthError, SchwabAuthEvent,
 };
 pub use encryption::{EncryptedToken, EncryptionError, EncryptionKey, decrypt_token};
-pub use executor::{SchwabConfig, SchwabExecutor};
+pub use executor::{Schwab, SchwabCtx};
 
 // Re-export for auth CLI command (Schwab-specific, not part of generic broker API)
 pub use tokens::SchwabTokens;
@@ -129,8 +129,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
-    fn create_test_config_with_mock_server(mock_server: &MockServer) -> SchwabAuthConfig {
-        SchwabAuthConfig {
+    fn create_test_ctx_with_mock_server(mock_server: &MockServer) -> SchwabAuthCtx {
+        SchwabAuthCtx {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
@@ -178,7 +178,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_tokens_from_code_http_401() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST)
@@ -195,40 +195,40 @@ mod tests {
                 .json_body(json!({"error": "invalid_grant"}));
         });
 
-        let result = config.get_tokens_from_code("invalid_code").await;
+        let error = ctx.get_tokens_from_code("invalid_code").await.unwrap_err();
+        mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
             if action == "get tokens" && status.as_u16() == 401
         ));
-
-        mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_tokens_from_code_http_500() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
             then.status(500);
         });
 
-        let result = config.get_tokens_from_code("test_code").await;
+        let error = ctx.get_tokens_from_code("test_code").await.unwrap_err();
+        mock.assert();
+
         assert!(matches!(
-            result.unwrap_err(),
+            error,
             SchwabError::RequestFailed { action, status, .. }
             if action == "get tokens" && status.as_u16() == 500
         ));
-
-        mock.assert();
     }
 
     #[tokio::test]
     async fn test_get_tokens_from_code_invalid_json_response() {
         let server = MockServer::start();
-        let config = create_test_config_with_mock_server(&server);
+        let ctx = create_test_ctx_with_mock_server(&server);
 
         let mock = server.mock(|when, then| {
             when.method(POST).path("/v1/oauth/token");
@@ -238,7 +238,7 @@ mod tests {
         });
 
         assert!(matches!(
-            config.get_tokens_from_code("test_code").await.unwrap_err(),
+            ctx.get_tokens_from_code("test_code").await.unwrap_err(),
             SchwabError::Reqwest(_)
         ));
 

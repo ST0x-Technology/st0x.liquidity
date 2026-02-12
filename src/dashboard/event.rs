@@ -1,11 +1,14 @@
+//! CQRS query processor that broadcasts aggregate events to WebSocket
+//! dashboard clients.
+
 use async_trait::async_trait;
 use chrono::Utc;
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, Query};
-use st0x_dto::EventStoreEntry;
 use tokio::sync::broadcast;
 use tracing::warn;
 
-use super::ServerMessage;
+use st0x_dto::{EventStoreEntry, ServerMessage};
+
 use crate::equity_redemption::EquityRedemption;
 use crate::lifecycle::{Lifecycle, Never};
 use crate::tokenized_equity_mint::TokenizedEquityMint;

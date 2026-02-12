@@ -211,9 +211,8 @@ impl DomainEvent for InventorySnapshotEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
-
     use rust_decimal::Decimal;
+    use std::str::FromStr;
 
     use super::*;
 

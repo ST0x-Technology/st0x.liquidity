@@ -1,7 +1,8 @@
 //! RedemptionManager orchestrates the EquityRedemption workflow.
 //!
-//! Coordinates between `AlpacaTokenizationService` and the `EquityRedemption` aggregate
-//! to execute the full redemption lifecycle: send tokens -> poll detection -> poll completion.
+//! Coordinates between `AlpacaTokenizationService` and the
+//! `EquityRedemption` aggregate to execute the full redemption
+//! lifecycle: send tokens -> poll detection -> poll completion.
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;

@@ -1,14 +1,16 @@
-//! Inventory polling service for fetching actual balances and emitting snapshot events.
+//! Inventory polling service for fetching actual balances and emitting
+//! snapshot events.
 //!
-//! This service polls onchain vaults and offchain broker accounts to fetch actual
-//! inventory balances, then emits InventorySnapshotCommands to record the fetched
-//! values. The InventoryView reacts to these events to reconcile tracked inventory.
+//! This service polls onchain vaults and offchain broker accounts to fetch
+//! actual inventory balances, then emits InventorySnapshotCommands to record
+//! the fetched values. The InventoryView reacts to these events to reconcile
+//! tracked inventory.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::inventory::snapshot::{
-    InventorySnapshot, InventorySnapshotAggregate, InventorySnapshotCommand, InventorySnapshotError,
+    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
 };
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
@@ -22,6 +24,8 @@ use sqlite_es::{SqliteCqrs, SqliteEventRepository};
 use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
+
+pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]
@@ -833,8 +837,6 @@ mod tests {
             "Expected Vault error when RPC fails, got {error:?}"
         );
     }
-
-    // ==================== Helper Functions ====================
 
     /// Loads all InventorySnapshotEvents for the given orderbook/owner from the event store.
     async fn load_snapshot_events(

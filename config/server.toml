@@ -1,0 +1,22 @@
+database_url = "sqlite:///mnt/data/alpaca.db"
+log_level = "debug"
+server_port = 8001
+
+[hyperdx]
+service_name = "st0x-hedge"
+
+[evm]
+orderbook = "0x52CEB8eBEf648744fFDDE89F7Bc9C3aC35944775"
+deployment_block = 40850446
+
+[rebalancing]
+redemption_wallet = "0x1c66D6708914C40239D54919320b4C48cAE3D1A9"
+usdc_vault_id = "0x0000000000000000000000000000000000000000000000000000000000ffaabb"
+
+[rebalancing.equity_threshold]
+target = "0.5"
+deviation = "0.2"
+
+[rebalancing.usdc_threshold]
+target = "0.5"
+deviation = "0.3"

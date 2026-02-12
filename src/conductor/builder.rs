@@ -1,4 +1,4 @@
-use std::sync::Arc;
+//! Typestate builder for constructing a fully-wired Conductor instance.
 
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -6,50 +6,43 @@ use alloy::sol_types;
 use futures_util::Stream;
 use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
-use st0x_execution::Executor;
+use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
-use crate::config::Config;
-use crate::error::EventProcessingError;
-use crate::inventory::InventorySnapshotAggregate;
-use crate::offchain_order::OffchainOrderCqrs;
-use crate::onchain::trade::TradeEvent;
-use crate::onchain::vault::VaultService;
-use crate::onchain_trade::OnChainTradeCqrs;
-use crate::position::{PositionCqrs, PositionQuery};
-use crate::symbol::cache::SymbolCache;
-use crate::threshold::ExecutionThreshold;
-use crate::vault_registry::VaultRegistryAggregate;
+use st0x_execution::Executor;
 
+use super::EventProcessingError;
 use super::{
     Conductor, spawn_event_processor, spawn_inventory_poller, spawn_onchain_event_receiver,
     spawn_order_poller, spawn_periodic_accumulated_position_check, spawn_queue_processor,
 };
+use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
+use crate::config::Ctx;
+use crate::dual_write::DualWriteContext;
+use crate::inventory::InventorySnapshotAggregate;
+use crate::onchain::trade::TradeEvent;
+use crate::onchain::vault::VaultService;
+use crate::symbol::cache::SymbolCache;
+use crate::vault_registry::VaultRegistryAggregate;
 
 type ClearStream = Box<dyn Stream<Item = Result<(ClearV3, Log), sol_types::Error>> + Unpin + Send>;
 type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
 pub(crate) struct CqrsFrameworks {
-    pub(crate) pool: SqlitePool,
-    pub(crate) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
-    pub(crate) position_cqrs: Arc<PositionCqrs>,
-    pub(crate) position_query: Arc<PositionQuery>,
-    pub(crate) offchain_order_cqrs: Arc<OffchainOrderCqrs>,
+    pub(crate) dual_write_context: DualWriteContext,
     pub(crate) vault_registry_cqrs: SqliteCqrs<VaultRegistryAggregate>,
     pub(crate) snapshot_cqrs: SqliteCqrs<InventorySnapshotAggregate>,
 }
 
 struct CommonFields<P, E> {
-    config: Config,
+    ctx: Ctx,
     pool: SqlitePool,
     cache: SymbolCache,
     provider: P,
     executor: E,
-    execution_threshold: ExecutionThreshold,
     frameworks: CqrsFrameworks,
 }
 
@@ -77,22 +70,20 @@ impl<P: Provider + Clone + Send + 'static, E: Executor + Clone + Send + 'static>
     ConductorBuilder<P, E, Initial>
 {
     pub(crate) fn new(
-        config: Config,
+        ctx: Ctx,
         pool: SqlitePool,
         cache: SymbolCache,
         provider: P,
         executor: E,
-        execution_threshold: ExecutionThreshold,
         frameworks: CqrsFrameworks,
     ) -> Self {
         Self {
             common: CommonFields {
-                config,
+                ctx,
                 pool,
                 cache,
                 provider,
                 executor,
-                execution_threshold,
                 frameworks,
             },
             state: Initial,
@@ -163,17 +154,17 @@ where
         log_optional_task_status("executor maintenance", executor_maintenance.is_some());
         log_optional_task_status("rebalancer", rebalancer.is_some());
 
-        let inventory_poller = match self.common.config.order_owner() {
+        let inventory_poller = match self.common.ctx.order_owner() {
             Ok(order_owner) => {
                 let vault_service = Arc::new(VaultService::new(
                     self.common.provider.clone(),
-                    self.common.config.evm.orderbook,
+                    self.common.ctx.evm.orderbook,
                 ));
                 Some(spawn_inventory_poller(
                     self.common.pool.clone(),
                     vault_service,
                     self.common.executor.clone(),
-                    self.common.config.evm.orderbook,
+                    self.common.ctx.evm.orderbook,
                     order_owner,
                     self.common.frameworks.snapshot_cqrs,
                 ))
@@ -186,11 +177,10 @@ where
         log_optional_task_status("inventory poller", inventory_poller.is_some());
 
         let order_poller = spawn_order_poller(
-            &self.common.config,
+            &self.common.ctx,
             &self.common.pool,
             self.common.executor.clone(),
-            self.common.frameworks.offchain_order_cqrs.clone(),
-            self.common.frameworks.position_cqrs.clone(),
+            self.common.frameworks.dual_write_context.clone(),
         );
         let dex_event_receiver = spawn_onchain_event_receiver(
             self.state.event_sender,
@@ -201,26 +191,16 @@ where
             spawn_event_processor(self.common.pool.clone(), self.state.event_receiver);
         let position_checker = spawn_periodic_accumulated_position_check(
             self.common.executor.clone(),
-            self.common.frameworks.pool.clone(),
-            self.common.frameworks.position_cqrs.clone(),
-            self.common.frameworks.position_query.clone(),
-            self.common.frameworks.offchain_order_cqrs.clone(),
-            self.common.execution_threshold,
+            self.common.pool.clone(),
+            self.common.frameworks.dual_write_context.clone(),
         );
-        let trade_cqrs = super::TradeProcessingCqrs {
-            onchain_trade_cqrs: self.common.frameworks.onchain_trade_cqrs,
-            position_cqrs: self.common.frameworks.position_cqrs,
-            position_query: self.common.frameworks.position_query,
-            offchain_order_cqrs: self.common.frameworks.offchain_order_cqrs,
-            execution_threshold: self.common.execution_threshold,
-        };
         let queue_processor = spawn_queue_processor(
             self.common.executor,
-            &self.common.config,
+            &self.common.ctx,
             &self.common.pool,
             &self.common.cache,
             self.common.provider,
-            trade_cqrs,
+            self.common.frameworks.dual_write_context,
             self.common.frameworks.vault_registry_cqrs,
         );
 

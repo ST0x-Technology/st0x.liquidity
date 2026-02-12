@@ -6,6 +6,7 @@ let
 
   tfState = "infra/terraform.tfstate";
   tfVars = "infra/terraform.tfvars";
+  tfPlanFile = "infra/tfplan";
 
   parseIdentity = ''
     set -eo pipefail
@@ -33,6 +34,7 @@ let
   '';
 
   cleanup = "rm -f ${tfState} ${tfState}.backup ${tfVars}";
+  cleanupWithPlan = "${cleanup} ${tfPlanFile}";
 
   preamble = ''
     ${parseIdentity}
@@ -45,7 +47,7 @@ let
     ${parseIdentity}
     on_exit() {
       ${encryptState}
-      ${cleanup}
+      ${cleanupWithPlan}
     }
     trap on_exit EXIT
     ${decryptVars}
@@ -53,6 +55,7 @@ let
 
   resolveIp = ''
     ${parseIdentity}
+    trap 'rm -f ${tfState}' EXIT
     ${decryptState}
     host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${tfState})
     rm -f ${tfState}
@@ -71,11 +74,12 @@ let
 
   tfRekey = ''
     ${parseIdentity}
+    on_exit() { ${cleanup}; }
+    trap on_exit EXIT
     ${decryptState}
     ${encryptState}
     ${decryptVars}
     ${encryptVars}
-    ${cleanup}
   '';
 
 in {

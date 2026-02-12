@@ -1,8 +1,5 @@
-//! USDC Rebalance aggregate for cross-chain USDC transfers between Alpaca and Base.
-//!
-//! This module implements the CQRS-ES aggregate pattern for managing the asynchronous workflow
-//! of rebalancing USDC between Alpaca (offchain) and Base (onchain) via Circle's Cross-Chain
-//! Transfer Protocol (CCTP).
+//! Aggregate modeling the lifecycle of cross-chain USDC
+//! rebalancing between Alpaca and Base via CCTP.
 //!
 //! # State Flow
 //!
@@ -121,7 +118,10 @@ pub(crate) enum UsdcRebalanceError {
     #[error("Post-deposit conversion is only valid for BaseToAlpaca direction")]
     WrongDirectionForPostDepositConversion,
     /// Conversion amount doesn't match aggregate deposit amount
-    #[error("Conversion amount mismatch: aggregate has {expected}, command provided {provided}")]
+    #[error(
+        "Conversion amount mismatch: aggregate has {expected}, \
+         command provided {provided}"
+    )]
     ConversionAmountMismatch { expected: Usdc, provided: Usdc },
     /// Withdrawal has not been initiated yet
     #[error("Withdrawal has not been initiated")]
@@ -163,8 +163,8 @@ pub(crate) enum UsdcRebalanceError {
 /// # Conversion Commands
 ///
 /// There are two conversion commands because conversion happens at different points in each flow:
-/// - **AlpacaToBase**: Convert USD→USDC BEFORE withdrawal (need USDC for CCTP bridge)
-/// - **BaseToAlpaca**: Convert USDC→USD AFTER deposit (USDC arrives in crypto wallet)
+/// - **AlpacaToBase**: Convert USD->USDC BEFORE withdrawal (need USDC for CCTP bridge)
+/// - **BaseToAlpaca**: Convert USDC->USD AFTER deposit (USDC arrives in crypto wallet)
 #[derive(Debug, Clone)]
 pub(crate) enum UsdcRebalanceCommand {
     /// Start pre-withdrawal conversion for AlpacaToBase direction.

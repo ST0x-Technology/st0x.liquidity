@@ -1,7 +1,8 @@
 //! Contract error decoding utilities.
 //!
-//! Provides helpers to decode Solidity revert data into human-readable error messages
-//! using the OpenChain selector registry.
+//! Provides helpers to decode Solidity revert data into
+//! human-readable error messages using the OpenChain selector
+//! registry.
 
 use rain_error_decoding::{AbiDecodedErrorType, ErrorRegistry};
 use tracing::debug;

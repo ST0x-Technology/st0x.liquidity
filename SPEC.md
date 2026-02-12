@@ -2,7 +2,8 @@
 
 System specification for st0x liquidity. Covers architecture, behavior, and
 design decisions at a level sufficient to understand the system without
-prescribing exact commands or code.
+prescribing exact commands or code. For terminology and naming conventions, see
+[docs/domain.md](docs/domain.md).
 
 ## Background
 
@@ -294,9 +295,10 @@ system configuration).
 
 _Configuration management_:
 
-- Single TOML config file per service containing complete configuration
-- Files encrypted with ragenix, decrypted at activation to `/run/agenix/`
-- Services use `serde` + `toml` to load config via `--config-file` flag
+- Plaintext config per service (`config/*.toml`) baked into Nix closure
+- Encrypted secrets per service (`secret/*.toml.age`) decrypted at activation to
+  `/run/agenix/`
+- Server uses `--config` + `--secrets` flags; reporter uses `--config` only
 
 _Infrastructure_:
 

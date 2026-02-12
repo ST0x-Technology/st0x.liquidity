@@ -1,7 +1,8 @@
 //! Rebalancing orchestration managers.
 //!
-//! This module provides managers that coordinate rebalancing operations between
-//! external services (Alpaca tokenization, CCTP bridge, vault) and CQRS-ES aggregates.
+//! This module provides managers that coordinate rebalancing
+//! operations between external services (Alpaca tokenization, CCTP
+//! bridge, vault) and CQRS-ES aggregates.
 //!
 //! # Manager Pattern
 //!
@@ -27,6 +28,6 @@ pub(crate) use rebalancer::Rebalancer;
 pub(crate) use redemption::manager::RedemptionManager;
 pub(crate) use spawn::{RebalancingCqrsFrameworks, build_rebalancing_queries, spawn_rebalancer};
 pub(crate) use trigger::{
-    RebalancingConfig, RebalancingConfigError, RebalancingTomlFields, RebalancingTrigger,
+    RebalancingConfig, RebalancingCtx, RebalancingCtxError, RebalancingSecrets, RebalancingTrigger,
     RebalancingTriggerConfig, TriggeredOperation,
 };

@@ -1,3 +1,6 @@
+//! Pyth oracle price feed integration for onchain price lookups via
+//! transaction traces.
+
 use alloy::primitives::{Address, B256, Bytes, U256, address};
 use alloy::providers::Provider;
 use alloy::providers::ext::DebugApi;
@@ -275,7 +278,10 @@ fn find_call_by_cached_feed_id<'a>(
         .chain(rest.iter())
         .find(|call| call.price_feed_id == feed_id)
         .ok_or_else(|| {
-            warn!("No Pyth call found matching cached feed ID {feed_id} for {symbol} in transaction {tx_hash}");
+            warn!(
+                "No Pyth call found matching cached feed ID {feed_id} \
+                 for {symbol} in transaction {tx_hash}"
+            );
             PythError::NoMatchingFeedId(feed_id)
         })
 }
@@ -755,7 +761,7 @@ mod tests {
     #[test]
     fn test_scale_with_exponent_decimal_overflow() {
         let result = scale_with_exponent(u64::MAX, 10);
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 
     #[test]
@@ -829,9 +835,10 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xff);
         let cache = FeedIdCache::new();
 
-        let result = extract_pyth_price(tx_hash, &provider, "TEST", &cache).await;
-
-        assert!(matches!(result, Err(PythError::NoPythCall)));
+        assert!(matches!(
+            extract_pyth_price(tx_hash, &provider, "TEST", &cache).await,
+            Err(PythError::NoPythCall)
+        ));
     }
 
     #[tokio::test]
@@ -866,8 +873,9 @@ mod tests {
         let tx_hash = B256::repeat_byte(0xff);
         let cache = FeedIdCache::new();
 
-        let result = PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache).await;
-
-        assert!(matches!(result, Err(PythError::InvalidTimestamp(_))));
+        assert!(matches!(
+            PythPricing::try_from_tx_hash(tx_hash, provider, "TEST", &cache).await,
+            Err(PythError::InvalidTimestamp(_))
+        ));
     }
 }

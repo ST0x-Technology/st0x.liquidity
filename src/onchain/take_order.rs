@@ -1,9 +1,11 @@
+//! Processes TakeOrderV3 events from the Raindex orderbook.
+
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 
+use super::OnChainError;
 use crate::bindings::IOrderBookV5::{TakeOrderConfigV4, TakeOrderV3};
-use crate::error::OnChainError;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{OnchainTrade, OrderFill};
 use crate::symbol::cache::SymbolCache;
@@ -338,8 +340,8 @@ mod tests {
                     context: vec![],
                 }],
             },
-            input: alloy::primitives::B256::ZERO,  // Zero input
-            output: alloy::primitives::B256::ZERO, // Zero output
+            input: B256::ZERO,  // Zero input
+            output: B256::ZERO, // Zero output
         };
 
         let log = get_test_log();
@@ -423,6 +425,6 @@ mod tests {
         .await;
 
         // Should return an error due to invalid IO index
-        assert!(result.is_err());
+        result.unwrap_err();
     }
 }

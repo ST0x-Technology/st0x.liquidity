@@ -26,7 +26,10 @@ impl std::fmt::Display for OrderStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseOrderStatusError {
-    #[error("Invalid order status: '{0}'. Expected one of: PENDING, SUBMITTED, FILLED, FAILED")]
+    #[error(
+        "Invalid order status: '{0}'. Expected one of: \
+         PENDING, SUBMITTED, FILLED, FAILED"
+    )]
     InvalidStatus(String),
 }
 

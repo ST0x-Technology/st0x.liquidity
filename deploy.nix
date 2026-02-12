@@ -3,16 +3,13 @@
 let
   system = "x86_64-linux";
   inherit (deploy-rs.lib.${system}) activate;
-
   profileBase = "/nix/var/nix/profiles/per-service";
 
   st0xPackage = self.packages.${system}.st0x-liquidity;
-
   mkServiceProfile = name:
     activate.custom st0xPackage "systemctl restart ${name}";
 
   services = import ./services.nix;
-
   enabledServices = builtins.attrNames (builtins.removeAttrs services
     (builtins.filter (n: !services.${n}.enabled)
       (builtins.attrNames services)));

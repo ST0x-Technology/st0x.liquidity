@@ -1,7 +1,7 @@
 //! Redemption operations for tokenized equity.
 //!
-//! This module provides the trait and implementations for redeeming tokenized equities
-//! through the Alpaca tokenization API.
+//! This module provides the trait and implementations for redeeming
+//! tokenized equities through the Alpaca tokenization API.
 
 pub(crate) mod manager;
 #[cfg(test)]

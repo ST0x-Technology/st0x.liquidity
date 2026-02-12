@@ -27,9 +27,8 @@
       nixosConfigurations.st0x-liquidity =
         rainix.inputs.nixpkgs.lib.nixosSystem {
           system = "x86_64-linux";
-          # specialArgs = {
-          #   dashboard = self.packages.x86_64-linux.st0x-dashboard;
-          # };
+          specialArgs.dashboard = self.packages.x86_64-linux.st0x-dashboard;
+
           modules =
             [ disko.nixosModules.disko ragenix.nixosModules.default ./os.nix ];
         };
@@ -53,11 +52,13 @@
         packages = let
           rainixPkgs = rainix.packages.${system};
           infraPkgs = import ./infra { inherit pkgs ragenix rainix system; };
+
           deployPkgs =
             (import ./deploy.nix { inherit deploy-rs self; }).wrappers {
               inherit pkgs infraPkgs;
               localSystem = system;
             };
+
           st0xRust = pkgs.callPackage ./rust.nix {
             inherit craneLib;
             inherit (pkgs) sqlx-cli;
@@ -67,9 +68,7 @@
           inherit (infraPkgs) tfInit tfPlan tfApply tfDestroy tfEditVars;
 
           st0x-dto = st0xRust.dto;
-
           st0x-liquidity = st0xRust.package;
-
           st0x-clippy = st0xRust.clippy;
 
           st0x-dashboard = pkgs.callPackage ./dashboard {
@@ -128,12 +127,18 @@
                   | awk '{print $1 " " $2}'
               )
 
+              valid_key='^ssh-ed25519 [A-Za-z0-9+/=]+$'
+              if [ -z "$new_key" ] || ! echo "$new_key" | grep -qE "$valid_key"; then
+                echo "ERROR: SSH host key is empty or malformed: '$new_key'" >&2
+                exit 1
+              fi
+
               ${pkgs.gnused}/bin/sed -i \
                 '/host =/{n;s|"ssh-ed25519 [A-Za-z0-9+/=]*"|"'"$new_key"'"|;}' \
                 keys.nix
 
               echo "Updated host key in keys.nix, rekeying secrets..."
-              ragenix --rules ./config/secrets.nix -i "$identity" -r
+              ragenix --rules ./secret/secrets.nix -i "$identity" -r
             '';
           };
 
@@ -142,8 +147,7 @@
             additionalBuildInputs = [ ragenix.packages.${system}.default ];
             body = ''
               ${infraPkgs.parseIdentity}
-              ragenix --rules ./config/secrets.nix -i "$identity" -e "$@"
-              exec ragenix --rules ./config/secrets.nix -i "$identity" -r
+              exec ragenix --rules ./secret/secrets.nix -i "$identity" -e "$@"
             '';
           };
 
