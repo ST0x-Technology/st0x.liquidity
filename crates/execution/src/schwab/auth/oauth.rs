@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use tracing::{debug, info};
 use url::Url;
 
-use super::super::{SchwabError, tokens::SchwabTokens};
+use super::super::{SchwabAction, SchwabError, tokens::SchwabTokens};
 
 static DEFAULT_REDIRECT_URI: LazyLock<Result<Url, url::ParseError>> =
     LazyLock::new(|| Url::parse("https://127.0.0.1"));
@@ -91,7 +91,7 @@ impl SchwabAuthCtx {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
             return Err(SchwabError::RequestFailed {
-                action: "get account hash".to_string(),
+                action: SchwabAction::GetAccountHash,
                 status,
                 body,
             });
@@ -161,7 +161,7 @@ impl SchwabAuthCtx {
             let status = response.status();
             let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
-                action: "get tokens".to_string(),
+                action: SchwabAction::GetTokens,
                 status,
                 body,
             });
@@ -216,7 +216,7 @@ impl SchwabAuthCtx {
             let status = response.status();
             let body = extract_error_body(response).await;
             return Err(SchwabError::RequestFailed {
-                action: "token request".to_string(),
+                action: SchwabAction::TokenRequest,
                 status,
                 body,
             });
@@ -379,7 +379,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get tokens" && status.as_u16() == 400
+            if action == SchwabAction::GetTokens && status.as_u16() == 400
         ));
     }
 
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(mock.hits(), 1);
         match error {
             SchwabError::RequestFailed { action, status, .. } => {
-                assert_eq!(action, "get tokens");
+                assert_eq!(action, SchwabAction::GetTokens);
                 assert_eq!(status.as_u16(), 500);
             }
             other => panic!("Expected RequestFailed error, got: {other:?}"),

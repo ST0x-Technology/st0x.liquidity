@@ -35,7 +35,6 @@ type TakeStream =
     Box<dyn Stream<Item = Result<(TakeOrderV3, Log), sol_types::Error>> + Unpin + Send>;
 
 pub(crate) struct CqrsFrameworks {
-    pub(crate) pool: SqlitePool,
     pub(crate) onchain_trade_cqrs: Arc<OnChainTradeCqrs>,
     pub(crate) position_cqrs: Arc<PositionCqrs>,
     pub(crate) position_query: Arc<PositionQuery>,

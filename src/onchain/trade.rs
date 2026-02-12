@@ -14,7 +14,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
-use st0x_execution::{Direction, FractionalShares, Positive};
+use st0x_execution::{Direction, FractionalShares};
 
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
@@ -400,14 +400,6 @@ pub(crate) enum TradeValidationError {
          equity (t prefix) but got {0} and {1}"
     )]
     InvalidSymbolConfiguration(String, String),
-    #[error(
-        "Could not fully allocate execution shares for \
-         symbol {symbol}. Remaining: {remaining_shares}"
-    )]
-    InsufficientTradeAllocation {
-        symbol: String,
-        remaining_shares: f64,
-    },
     #[error("Transaction not found: {0}")]
     TransactionNotFound(TxHash),
     #[error(
@@ -430,8 +422,6 @@ pub(crate) enum TradeValidationError {
     },
     #[error("Negative shares amount: {0}")]
     NegativeShares(Decimal),
-    #[error("Share quantity {0} cannot be converted to f64")]
-    ShareConversionFailed(Positive<FractionalShares>),
     #[error("Negative USDC amount: {0}")]
     NegativeUsdc(Decimal),
     #[error(

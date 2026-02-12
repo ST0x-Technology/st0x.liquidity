@@ -1,7 +1,42 @@
+use std::fmt;
 use reqwest::header::InvalidHeaderValue;
 use thiserror::Error;
 
 use crate::InvalidSharesError;
+
+/// Identifies the Schwab API operation that failed, used in error context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchwabAction {
+    PlaceOrder,
+    GetOrderStatus,
+    ExtractOrderId,
+    GetAccountHash,
+    GetTokens,
+    TokenRequest,
+    FormatUrl,
+    FetchMarketHours,
+    ParseMarketHours,
+    ParseMarketHoursDate,
+    ParseDatetime,
+}
+
+impl fmt::Display for SchwabAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlaceOrder => write!(f, "place order"),
+            Self::GetOrderStatus => write!(f, "get order status"),
+            Self::ExtractOrderId => write!(f, "extract order ID"),
+            Self::GetAccountHash => write!(f, "get account hash"),
+            Self::GetTokens => write!(f, "get tokens"),
+            Self::TokenRequest => write!(f, "token request"),
+            Self::FormatUrl => write!(f, "format URL"),
+            Self::FetchMarketHours => write!(f, "fetch market hours"),
+            Self::ParseMarketHours => write!(f, "parse market hours"),
+            Self::ParseMarketHoursDate => write!(f, "parse market hours date"),
+            Self::ParseDatetime => write!(f, "parse datetime"),
+        }
+    }
+}
 
 mod auth;
 mod encryption;
@@ -70,12 +105,12 @@ pub enum SchwabError {
     AccountIndexOutOfBounds { index: usize, count: usize },
 
     /// Schwab API request completed with non-success HTTP status.
-    /// `action`: Description of the attempted operation.
+    /// `action`: The attempted operation.
     /// `status`: HTTP status code returned.
     /// `body`: Response body text.
     #[error("{action} failed with status: {status}, body: {body}")]
     RequestFailed {
-        action: String,
+        action: SchwabAction,
         status: reqwest::StatusCode,
         body: String,
     },
@@ -89,14 +124,14 @@ pub enum SchwabError {
     ExecutionPersistence(#[from] crate::error::PersistenceError),
 
     /// Schwab API response body parsing failed.
-    /// `action`: Description of the attempted operation.
+    /// `action`: The attempted operation.
     /// `response_text`: Raw API response body.
     /// `source`: The JSON deserialization error.
     #[error(
         "Failed to parse API response: {action}, response: {response_text}, error: {source}"
     )]
     ApiResponseParse {
-        action: String,
+        action: SchwabAction,
         response_text: String,
         #[source]
         source: serde_json::Error,
@@ -202,7 +237,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get tokens" && status.as_u16() == 401
+            if action == SchwabAction::GetTokens && status.as_u16() == 401
         ));
     }
 
@@ -222,7 +257,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get tokens" && status.as_u16() == 500
+            if action == SchwabAction::GetTokens && status.as_u16() == 500
         ));
     }
 

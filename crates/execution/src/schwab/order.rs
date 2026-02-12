@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{SchwabAuthCtx, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
+use super::{SchwabAction, SchwabAuthCtx, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -90,7 +90,7 @@ impl Order {
             let status = response.status();
             let error_body = response.text().await.unwrap_or_default();
             return Err(SchwabError::RequestFailed {
-                action: "place order".to_string(),
+                action: SchwabAction::PlaceOrder,
                 status,
                 body: error_body,
             });
@@ -139,7 +139,7 @@ impl Order {
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Err(SchwabError::RequestFailed {
-                action: "get order status".to_string(),
+                action: SchwabAction::GetOrderStatus,
                 status,
                 body: format!("Order ID {order_id} not found"),
             });
@@ -148,7 +148,7 @@ impl Order {
         if !response.status().is_success() {
             let error_body = response.text().await.unwrap_or_default();
             return Err(SchwabError::RequestFailed {
-                action: "get order status".to_string(),
+                action: SchwabAction::GetOrderStatus,
                 status,
                 body: error_body,
             });
@@ -169,9 +169,11 @@ impl Order {
                     parse_error = %parse_error,
                     "Failed to parse Schwab order status response"
                 );
-                Err(SchwabError::InvalidConfiguration(format!(
-                    "Failed to parse order status response: {parse_error}"
-                )))
+                Err(SchwabError::ApiResponseParse {
+                    action: SchwabAction::GetOrderStatus,
+                    response_text,
+                    source: parse_error,
+                })
             }
         }
     }
@@ -189,13 +191,13 @@ fn extract_order_id_from_location_header(
         .headers()
         .get(reqwest::header::LOCATION)
         .ok_or_else(|| SchwabError::RequestFailed {
-            action: "extract order ID".to_string(),
+            action: SchwabAction::ExtractOrderId,
             status: response.status(),
             body: "Missing Location header in order placement response".to_string(),
         })?
         .to_str()
         .map_err(|_| SchwabError::RequestFailed {
-            action: "extract order ID".to_string(),
+            action: SchwabAction::ExtractOrderId,
             status: response.status(),
             body: "Invalid Location header value".to_string(),
         })?;
@@ -204,7 +206,7 @@ fn extract_order_id_from_location_header(
     // Must contain the expected path structure
     if !location.contains("/trader/v1/accounts/") || !location.contains("/orders/") {
         return Err(SchwabError::RequestFailed {
-            action: "extract order ID".to_string(),
+            action: SchwabAction::ExtractOrderId,
             status: response.status(),
             body: format!(
                 "Invalid Location header format, expected '/trader/v1/accounts/{{accountHash}}/orders/{{orderId}}': {location}"
@@ -216,7 +218,7 @@ fn extract_order_id_from_location_header(
         .split('/')
         .next_back()
         .ok_or_else(|| SchwabError::RequestFailed {
-            action: "extract order ID".to_string(),
+            action: SchwabAction::ExtractOrderId,
             status: response.status(),
             body: format!("Cannot extract order ID from Location header: {location}"),
         })?
@@ -224,7 +226,7 @@ fn extract_order_id_from_location_header(
 
     if order_id.is_empty() {
         return Err(SchwabError::RequestFailed {
-            action: "extract order ID".to_string(),
+            action: SchwabAction::ExtractOrderId,
             status: response.status(),
             body: format!("Empty order ID extracted from Location header: {location}"),
         });
@@ -507,9 +509,11 @@ mod tests {
         account_mock.assert();
         order_mock.assert();
 
-        assert!(
-            matches!(error, super::SchwabError::RequestFailed { action, status, .. } if action == "place order" && status.as_u16() == 400)
-        );
+        assert!(matches!(
+            error,
+            SchwabError::RequestFailed { action, status, .. }
+            if action == SchwabAction::PlaceOrder && status.as_u16() == 400
+        ));
     }
 
     fn create_test_ctx_with_mock_server(mock_server: &httpmock::MockServer) -> SchwabAuthCtx {
@@ -517,7 +521,7 @@ mod tests {
             app_key: "test_app_key".to_string(),
             app_secret: "test_app_secret".to_string(),
             redirect_uri: None,
-            base_url: Some(url::Url::parse(&mock_server.base_url()).expect("mock server base_url")),
+            base_url: Some(Url::parse(&mock_server.base_url()).expect("mock server base_url")),
             account_index: None,
             encryption_key: TEST_ENCRYPTION_KEY,
         }
@@ -588,7 +592,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, body, .. }
-            if action == "extract order ID" && body.contains("Missing Location header")
+            if action == SchwabAction::ExtractOrderId && body.contains("Missing Location header")
         ));
     }
 
@@ -624,7 +628,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, body, .. }
-            if action == "extract order ID" && body.contains("Invalid Location header format")
+            if action == SchwabAction::ExtractOrderId && body.contains("Invalid Location header format")
         ));
     }
 
@@ -665,7 +669,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "place order" && status.as_u16() == 502
+            if action == SchwabAction::PlaceOrder && status.as_u16() == 502
         ));
 
         // At least one attempt should have been made
@@ -708,7 +712,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "place order" && status.as_u16() == 500
+            if action == SchwabAction::PlaceOrder && status.as_u16() == 500
         ));
     }
 
@@ -744,7 +748,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "place order" && status.as_u16() == 401
+            if action == SchwabAction::PlaceOrder && status.as_u16() == 401
         ));
     }
 
@@ -802,7 +806,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, body, .. }
-            if action == "extract order ID" && body.contains("Empty order ID")
+            if action == SchwabAction::ExtractOrderId && body.contains("Empty order ID")
         ));
     }
 
@@ -1018,7 +1022,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, body }
-            if action == "get order status"
+            if action == SchwabAction::GetOrderStatus
                 && status == reqwest::StatusCode::NOT_FOUND
                 && body.contains("NONEXISTENT")
         ));
@@ -1059,7 +1063,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get order status" && status == reqwest::StatusCode::UNAUTHORIZED
+            if action == SchwabAction::GetOrderStatus && status == reqwest::StatusCode::UNAUTHORIZED
         ));
     }
 
@@ -1098,7 +1102,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get order status" && status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            if action == SchwabAction::GetOrderStatus && status == reqwest::StatusCode::INTERNAL_SERVER_ERROR
         ));
     }
 
@@ -1174,7 +1178,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "get order status" && status == reqwest::StatusCode::BAD_GATEWAY
+            if action == SchwabAction::GetOrderStatus && status == reqwest::StatusCode::BAD_GATEWAY
         ));
     }
 

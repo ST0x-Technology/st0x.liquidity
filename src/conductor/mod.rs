@@ -13,8 +13,6 @@ use alloy::sol_types;
 use cqrs_es::persist::GenericQuery;
 use cqrs_es::{AggregateError, Query};
 use futures_util::{Stream, StreamExt};
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -45,9 +43,7 @@ use crate::offchain_order::{
     ExecutorOrderPlacer, OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId,
     OrderPlacer,
 };
-use crate::onchain::accumulator::{
-    ExecutionParams, check_all_positions, check_execution_readiness,
-};
+use crate::onchain::accumulator::{check_all_positions, check_execution_readiness};
 use crate::onchain::backfill::backfill_events;
 use crate::onchain::pyth::FeedIdCache;
 use crate::onchain::trade::{TradeEvent, extract_owned_vaults, extract_vaults_from_clear};
@@ -281,7 +277,6 @@ impl Conductor {
         );
 
         let frameworks = CqrsFrameworks {
-            pool: pool.clone(),
             onchain_trade_cqrs,
             position_cqrs,
             position_query,
@@ -2588,7 +2583,6 @@ mod tests {
         let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
 
         CqrsFrameworks {
-            pool: pool.clone(),
             onchain_trade_cqrs,
             position_cqrs,
             position_query,
