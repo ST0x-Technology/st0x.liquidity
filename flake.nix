@@ -127,6 +127,12 @@
                   | awk '{print $1 " " $2}'
               )
 
+              valid_key='^ssh-ed25519 [A-Za-z0-9+/=]+$'
+              if [ -z "$new_key" ] || ! echo "$new_key" | grep -qE "$valid_key"; then
+                echo "ERROR: SSH host key is empty or malformed: '$new_key'" >&2
+                exit 1
+              fi
+
               ${pkgs.gnused}/bin/sed -i \
                 '/host =/{n;s|"ssh-ed25519 [A-Za-z0-9+/=]*"|"'"$new_key"'"|;}' \
                 keys.nix

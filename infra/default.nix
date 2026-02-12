@@ -55,8 +55,8 @@ let
 
   resolveIp = ''
     ${parseIdentity}
-    ${decryptState}
     trap 'rm -f ${tfState}' EXIT
+    ${decryptState}
     host_ip=$(jq -r '.outputs.droplet_ipv4.value' ${tfState})
     rm -f ${tfState}
   '';
@@ -74,11 +74,12 @@ let
 
   tfRekey = ''
     ${parseIdentity}
+    on_exit() { ${cleanup}; }
+    trap on_exit EXIT
     ${decryptState}
     ${encryptState}
     ${decryptVars}
     ${encryptVars}
-    ${cleanup}
   '';
 
 in {
