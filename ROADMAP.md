@@ -28,6 +28,7 @@ All auto-rebalancing logic uses ES/CQRS. Time to disable legacy:
 - [ ] [#288 Remove the legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/issues/288)
   - PR:
     [#273 Remove legacy persistence layer](https://github.com/ST0x-Technology/st0x.liquidity/pull/273)
+- [ ] [#267 Use cqrs-es Services to make OffchainOrder aggregate self-contained](https://github.com/ST0x-Technology/st0x.liquidity/issues/267)
 
 ---
 
@@ -77,9 +78,6 @@ boundaries, and reduced coupling. Sequenced around CQRS/ES migration.
 
 Extract external API wrappers (no CQRS/ES dependencies):
 
-- [ ] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
-  - PR:
-    [#193 Pull out bridging logic into st0x-bridge](https://github.com/ST0x-Technology/st0x.liquidity/pull/193)
 - [ ] [#269 Extract st0x-tokenization crate with Tokenizer trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/269)
 - [ ] [#270 Extract st0x-vault crate with Vault trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/270)
 
@@ -321,6 +319,9 @@ remains manual).
 
 ## Completed: Multi-Crate Architecture Phase 1
 
+- [x] [#268 Extract st0x-bridge crate with Bridge trait](https://github.com/ST0x-Technology/st0x.liquidity/issues/268)
+      PR:
+      [#193 Pull out bridging logic into st0x-bridge](https://github.com/ST0x-Technology/st0x.liquidity/pull/193)
 - [x] [#199 Proposal: multi-crate architecture for faster builds and stricter boundaries](https://github.com/ST0x-Technology/st0x.liquidity/issues/199)
   - PR:
     [#200 Add multi-crate architecture section to SPEC.md](https://github.com/ST0x-Technology/st0x.liquidity/pull/200)

@@ -31,17 +31,19 @@
 //! ## Usage
 //!
 //! ```rust,ignore
-//! // Create bridge instance
-//! let ethereum = Evm::new(ethereum_provider, owner, usdc,
-//!     token_messenger, message_transmitter);
-//! let base = Evm::new(base_provider, owner, usdc,
-//!     token_messenger, message_transmitter);
-//! let bridge = CctpBridge::new(ethereum, base);
+//! let bridge = CctpBridge::try_from_ctx(CctpCtx {
+//!     ethereum_provider,
+//!     base_provider,
+//!     owner,
+//!     usdc_ethereum,
+//!     usdc_base,
+//! })?;
 //!
 //! // Bridge 1 USDC from Ethereum to Base (USDC has 6 decimals)
 //! let amount = U256::from(1_000_000); // 1 USDC
-//! let tx_hash = bridge.burn(BridgeDirection::EthereumToBase, amount,
-//!     recipient).await?;
+//! let receipt = bridge.burn(
+//!     BridgeDirection::EthereumToBase, amount, recipient,
+//! ).await?;
 //! ```
 //!
 //! ## CCTP V2 Fast Transfer
@@ -64,12 +66,15 @@ use std::time::Duration;
 use alloy::primitives::{Address, Bytes, FixedBytes, TxHash, U256, address};
 use alloy::providers::Provider;
 use alloy::sol;
+use async_trait::async_trait;
 use backon::Retryable;
 use rain_error_decoding::AbiDecodedErrorType;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
+
+use crate::BridgeDirection;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
 sol!(
@@ -95,18 +100,9 @@ const ETHEREUM_DOMAIN: u32 = 0;
 /// CCTP domain identifier for Base
 const BASE_DOMAIN: u32 = 6;
 
-/// Direction of a CCTP bridge transfer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BridgeDirection {
-    /// Bridge USDC from Ethereum to Base
-    EthereumToBase,
-    /// Bridge USDC from Base to Ethereum
-    BaseToEthereum,
-}
-
 impl BridgeDirection {
     /// Returns the source CCTP domain for this bridge direction.
-    const fn source_domain(self) -> u32 {
+    pub(crate) const fn source_domain(self) -> u32 {
         match self {
             Self::EthereumToBase => ETHEREUM_DOMAIN,
             Self::BaseToEthereum => BASE_DOMAIN,
@@ -114,7 +110,7 @@ impl BridgeDirection {
     }
 
     /// Returns the destination CCTP domain for this bridge direction.
-    const fn dest_domain(self) -> u32 {
+    pub(crate) const fn dest_domain(self) -> u32 {
         match self {
             Self::EthereumToBase => BASE_DOMAIN,
             Self::BaseToEthereum => ETHEREUM_DOMAIN,
@@ -122,50 +118,29 @@ impl BridgeDirection {
     }
 }
 
-pub(crate) const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
-pub(crate) const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
+/// CCTP TokenMessengerV2 contract address (same on all supported chains).
+const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
 
-pub(crate) const USDC_ETHEREUM_SEPOLIA: Address =
-    address!("0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238");
-
-pub(crate) const TOKEN_MESSENGER_V2: Address =
-    address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
-pub(crate) const MESSAGE_TRANSMITTER_V2: Address =
-    address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
+/// CCTP MessageTransmitterV2 contract address (same on all supported chains).
+const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
 
 const CIRCLE_API_BASE: &str = "https://iris-api.circle.com";
 
 /// Minimum finality threshold for CCTP V2 fast transfer (enables ~30 second transfers)
 const FAST_TRANSFER_THRESHOLD: u32 = 1000;
 
-/// Receipt from burning USDC on the source chain.
-///
-/// Note: The nonce is NOT included here because in CCTP V2, the MessageSent event
-/// contains a placeholder nonce (bytes32(0)). The real nonce is only available after
-/// receiving the attestation from Circle's API, which fills in the actual value.
-#[derive(Debug)]
-pub(crate) struct BurnReceipt {
-    /// Transaction hash of the burn transaction
-    pub(crate) tx: TxHash,
-    /// Amount of USDC burned (in smallest unit, 6 decimals for USDC).
-    /// This is the INPUT amount sent to the contract, NOT the amount received
-    /// on the destination chain (which is amount minus fee).
-    pub(crate) amount: U256,
-}
-
-/// Receipt from minting USDC on the destination chain.
+/// Internal receipt from minting USDC on the destination chain.
 ///
 /// Contains the actual amounts from the `MintAndWithdraw` event, which is the
 /// source of truth for what was actually received after fee deduction.
 #[derive(Debug)]
-pub(crate) struct MintReceipt {
+struct MintReceipt {
     /// Transaction hash of the mint transaction
-    pub(crate) tx: TxHash,
+    tx: TxHash,
     /// Actual USDC minted to recipient (NET of fees).
-    /// This is what the recipient actually received.
-    pub(crate) amount: U256,
+    amount: U256,
     /// Actual fee collected by Circle for this transfer.
-    pub(crate) fee_collected: U256,
+    fee_collected: U256,
 }
 
 /// Response from Circle's attestation API for CCTP V2.
@@ -176,33 +151,47 @@ pub(crate) struct MintReceipt {
 /// The nonce is extracted from the attested message, NOT from the original MessageSent
 /// event (which contains a placeholder bytes32(0) in CCTP V2).
 #[derive(Debug)]
-pub(crate) struct AttestationResponse {
+pub struct AttestationResponse {
     /// CCTP message bytes from the attestation API.
     /// Unlike the MessageSent event message, this contains the real nonce
     /// filled in by Circle's attestation service.
-    pub(crate) message: Bytes,
+    message: Bytes,
     /// Circle's attestation signature for the message.
     /// Required to prove the burn happened and authorize minting.
-    pub(crate) attestation: Bytes,
-    /// The real CCTP nonce extracted from the attested message.
-    /// This is the authoritative nonce value, not the placeholder from MessageSent.
-    pub(crate) nonce: FixedBytes<32>,
+    attestation: Bytes,
+    /// The real CCTP nonce pre-validated as u64 at construction time.
+    validated_nonce: u64,
 }
 
 impl AttestationResponse {
-    /// Returns the nonce as a u64 by taking the last 8 bytes.
-    ///
-    /// CCTP nonces are 32 bytes but the significant portion fits in u64 for our use case.
-    /// Returns an error if the first 24 bytes are non-zero, indicating the nonce exceeds u64.
-    pub(crate) fn nonce_as_u64(&self) -> Result<u64, CctpError> {
-        let bytes: &[u8; 32] = self.nonce.as_ref();
+    /// Constructs an `AttestationResponse`, validating that the 32-byte
+    /// nonce fits in a u64 at construction time rather than deferring to
+    /// runtime.
+    fn new(message: Bytes, attestation: Bytes, nonce: FixedBytes<32>) -> Result<Self, CctpError> {
+        let bytes: &[u8; 32] = nonce.as_ref();
         let (padding, value) = bytes.split_at(bytes.len() - size_of::<u64>());
 
         if padding.iter().any(|&b| b != 0) {
-            return Err(CctpError::NonceOverflow { nonce: self.nonce });
+            return Err(CctpError::NonceOverflow { nonce });
         }
 
-        Ok(u64::from_be_bytes(value.try_into()?))
+        let validated_nonce = u64::from_be_bytes(value.try_into()?);
+
+        Ok(Self {
+            message,
+            attestation,
+            validated_nonce,
+        })
+    }
+}
+
+impl crate::Attestation for AttestationResponse {
+    fn nonce(&self) -> u64 {
+        self.validated_nonce
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.attestation
     }
 }
 
@@ -233,10 +222,25 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
     ))
 }
 
-/// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
+/// Runtime context for constructing a [`CctpBridge`].
 ///
-/// Provides both low-level methods (burn, poll, mint) and high-level convenience
-/// methods (bridge_ethereum_to_base, bridge_base_to_ethereum) for cross-chain transfers.
+/// Provides the minimal set of values needed to construct the bridge.
+/// CCTP contract addresses are hardcoded internally since they're the
+/// same on all supported chains.
+pub struct CctpCtx<EP, BP> {
+    /// Ethereum provider (must be wallet-enabled for signing transactions)
+    pub ethereum_provider: EP,
+    /// Base provider (must be wallet-enabled for signing transactions)
+    pub base_provider: BP,
+    /// Wallet address that owns tokens and signs transactions
+    pub owner: Address,
+    /// USDC token address on Ethereum
+    pub usdc_ethereum: Address,
+    /// USDC token address on Base
+    pub usdc_base: Address,
+}
+
+/// Circle CCTP bridge for Ethereum <-> Base USDC transfers.
 ///
 /// # Type Parameters
 ///
@@ -246,20 +250,18 @@ fn extract_nonce_from_message(message: &[u8]) -> Result<FixedBytes<32>, CctpErro
 /// # Example
 ///
 /// ```rust,ignore
-/// let ethereum = Evm::new(
-///     eth_provider, owner, USDC_ETHEREUM,
-///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
-/// );
-/// let base = Evm::new(
-///     base_provider, owner, USDC_BASE,
-///     TOKEN_MESSENGER_V2, MESSAGE_TRANSMITTER_V2,
-/// );
-/// let bridge = CctpBridge::new(ethereum, base);
+/// let bridge = CctpBridge::try_from_ctx(CctpCtx {
+///     ethereum_provider: eth_provider,
+///     base_provider,
+///     owner,
+///     usdc_ethereum: USDC_ETHEREUM,
+///     usdc_base: USDC_BASE,
+/// })?;
 ///
 /// let amount = U256::from(1_000_000); // 1 USDC
-/// let tx_hash = bridge.bridge_ethereum_to_base(amount, recipient).await?;
+/// let receipt = bridge.burn(BridgeDirection::EthereumToBase, amount, recipient).await?;
 /// ```
-pub(crate) struct CctpBridge<EP, BP>
+pub struct CctpBridge<EP, BP>
 where
     EP: Provider + Clone,
     BP: Provider + Clone,
@@ -272,7 +274,7 @@ where
 
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum CctpError {
+pub enum CctpError {
     #[error("Transaction error: {0}")]
     Transaction(#[from] alloy::providers::PendingTransactionError),
     #[error("Contract error: {0}")]
@@ -310,7 +312,7 @@ pub(crate) enum CctpError {
 
 /// Errors specific to attestation polling from Circle's API.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AttestationError {
+pub enum AttestationError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Invalid hex encoding: {0}")]
@@ -344,7 +346,28 @@ where
     EP: Provider + Clone,
     BP: Provider + Clone,
 {
-    pub(crate) fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Result<Self, CctpError> {
+    /// Constructs a `CctpBridge` from a runtime context.
+    pub fn try_from_ctx(ctx: CctpCtx<EP, BP>) -> Result<Self, CctpError> {
+        let ethereum = Evm::new(
+            ctx.ethereum_provider,
+            ctx.owner,
+            ctx.usdc_ethereum,
+            TOKEN_MESSENGER_V2,
+            MESSAGE_TRANSMITTER_V2,
+        );
+
+        let base = Evm::new(
+            ctx.base_provider,
+            ctx.owner,
+            ctx.usdc_base,
+            TOKEN_MESSENGER_V2,
+            MESSAGE_TRANSMITTER_V2,
+        );
+
+        Self::new(ethereum, base)
+    }
+
+    fn new(ethereum: Evm<EP>, base: Evm<BP>) -> Result<Self, CctpError> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -411,7 +434,7 @@ where
     }
 
     /// Polls for attestation using CCTP V2 API.
-    pub(crate) async fn poll_attestation(
+    async fn poll_attestation_internal(
         &self,
         direction: BridgeDirection,
         tx_hash: TxHash,
@@ -503,20 +526,16 @@ where
 
         let nonce = extract_nonce_from_message(&message)?;
 
-        Ok(AttestationResponse {
-            message,
-            attestation,
-            nonce,
-        })
+        AttestationResponse::new(message, attestation, nonce)
     }
 
     /// Burns USDC on the source chain for the given bridge direction.
-    pub(crate) async fn burn(
+    async fn burn_internal(
         &self,
         direction: BridgeDirection,
         amount: U256,
         recipient: Address,
-    ) -> Result<BurnReceipt, CctpError> {
+    ) -> Result<crate::BurnReceipt, CctpError> {
         let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
 
         match direction {
@@ -539,7 +558,7 @@ where
     ///
     /// Returns the actual minted amount and fee collected from the `MintAndWithdraw` event.
     /// This is the source of truth for what the recipient actually received after fee deduction.
-    pub(crate) async fn mint(
+    async fn mint_internal(
         &self,
         direction: BridgeDirection,
         message: Bytes,
@@ -552,9 +571,56 @@ where
     }
 
     #[cfg(test)]
-    pub(crate) fn with_circle_api_base(mut self, base_url: String) -> Self {
+    fn with_circle_api_base(mut self, base_url: String) -> Self {
         self.circle_api_base = base_url;
         self
+    }
+}
+
+#[async_trait]
+impl<EP, BP> crate::Bridge for CctpBridge<EP, BP>
+where
+    EP: Provider + Clone + Send + Sync + 'static,
+    BP: Provider + Clone + Send + Sync + 'static,
+{
+    type Error = CctpError;
+    type Attestation = AttestationResponse;
+
+    async fn burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<crate::BurnReceipt, Self::Error> {
+        self.burn_internal(direction, amount, recipient).await
+    }
+
+    async fn poll_attestation(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<Self::Attestation, Self::Error> {
+        self.poll_attestation_internal(direction, burn_tx).await
+    }
+
+    async fn mint(
+        &self,
+        direction: BridgeDirection,
+        attestation: &Self::Attestation,
+    ) -> Result<crate::MintReceipt, Self::Error> {
+        let internal = self
+            .mint_internal(
+                direction,
+                attestation.message.clone(),
+                attestation.attestation.clone(),
+            )
+            .await?;
+
+        Ok(crate::MintReceipt {
+            tx: internal.tx,
+            amount: internal.amount,
+            fee: internal.fee_collected,
+        })
     }
 }
 
@@ -572,7 +638,12 @@ mod tests {
     use rand::Rng;
     use rust_decimal_macros::dec;
 
+    use alloy::primitives::address;
+
     use super::*;
+
+    const USDC_ETHEREUM: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
+    const USDC_BASE: Address = address!("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913");
 
     fn setup_anvil() -> (AnvilInstance, String, B256) {
         let anvil = Anvil::new().spawn();
@@ -1584,7 +1655,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
-            .burn(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1607,7 +1678,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let receipt = bridge
-            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1630,7 +1701,7 @@ mod tests {
         let amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1642,7 +1713,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint(
+            .mint_internal(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
                 attestation,
@@ -1663,7 +1734,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1675,7 +1746,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint(
+            .mint_internal(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 attestation,
@@ -1696,7 +1767,7 @@ mod tests {
         let amount = U256::from(2_500_000u64); // 2.5 USDC
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1735,7 +1806,7 @@ mod tests {
         let amount = U256::from(7_500_000u64); // 7.5 USDC
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1774,7 +1845,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+            .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
             .await
             .unwrap();
 
@@ -1788,7 +1859,7 @@ mod tests {
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint(
+            .mint_internal(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 invalid_attestation,
@@ -1815,7 +1886,7 @@ mod tests {
         let amount = U256::from(1_000_000u64);
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::EthereumToBase, amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, amount, recipient)
             .await
             .unwrap();
 
@@ -1827,7 +1898,7 @@ mod tests {
         let invalid_attestation = Bytes::from(vec![0u8; 65]);
 
         let err = bridge
-            .mint(
+            .mint_internal(
                 BridgeDirection::EthereumToBase,
                 message,
                 invalid_attestation,
@@ -1987,7 +2058,7 @@ mod tests {
         // First burn sets allowance to 1 USDC
         let small_amount = U256::from(1_000_000u64); // 1 USDC
         bridge
-            .burn(BridgeDirection::EthereumToBase, small_amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, small_amount, recipient)
             .await
             .unwrap();
 
@@ -2008,7 +2079,7 @@ mod tests {
         // Second burn with larger amount should update allowance and succeed
         let large_amount = U256::from(100_000_000u64); // 100 USDC
         let receipt = bridge
-            .burn(BridgeDirection::EthereumToBase, large_amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, large_amount, recipient)
             .await
             .unwrap();
 
@@ -2025,7 +2096,7 @@ mod tests {
         let burn_amount = U256::from(1_000_000u64); // 1 USDC
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::EthereumToBase, burn_amount, recipient)
+            .burn_internal(BridgeDirection::EthereumToBase, burn_amount, recipient)
             .await
             .unwrap();
 
@@ -2037,7 +2108,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint(
+            .mint_internal(
                 BridgeDirection::EthereumToBase,
                 message_with_nonce,
                 attestation,
@@ -2073,7 +2144,7 @@ mod tests {
         let burn_amount = U256::from(5_000_000u64); // 5 USDC
 
         let burn_receipt = bridge
-            .burn(BridgeDirection::BaseToEthereum, burn_amount, recipient)
+            .burn_internal(BridgeDirection::BaseToEthereum, burn_amount, recipient)
             .await
             .unwrap();
 
@@ -2085,7 +2156,7 @@ mod tests {
         let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
 
         let mint_receipt = bridge
-            .mint(
+            .mint_internal(
                 BridgeDirection::BaseToEthereum,
                 message_with_nonce,
                 attestation,
@@ -2115,7 +2186,7 @@ mod tests {
 
         for i in 1..=5 {
             let receipt = bridge
-                .burn(BridgeDirection::BaseToEthereum, amount, recipient)
+                .burn_internal(BridgeDirection::BaseToEthereum, amount, recipient)
                 .await
                 .unwrap();
 

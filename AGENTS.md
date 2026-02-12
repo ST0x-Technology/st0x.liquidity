@@ -260,6 +260,11 @@ above older completed sections.
 3. Move completed items from "Current Development Focus" to the appropriate
    "Completed" section (or create a new one if it represents a milestone)
 
+**CRITICAL: Mark issues as `[x]` on the branch that completes the work.** The
+roadmap is checked into the repo — if you leave an issue as `[ ]` and merge the
+PR that completes it, master will show the issue as incomplete. Always mark the
+issue done in the same branch/PR that implements it.
+
 **When creating new issues:**
 
 1. Add the issue to the appropriate roadmap section
@@ -303,60 +308,13 @@ For detailed implementation requirements and module organization, see
 
 ### Core Event Processing Flow
 
-**Main Event Loop ([`launch` function in `src/lib.rs`])**
-
-- Monitors two concurrent WebSocket event streams: `ClearV2` and `TakeOrderV2`
-  from the Raindex orderbook
-- Uses `tokio::select!` to handle events from either stream without blocking
-- Converts blockchain events to structured `Trade` objects for processing
-
-**Trade Conversion Logic ([`Trade` struct and methods in `src/trade/mod.rs`])**
-
-- Parses onchain events into actionable trade data with strict validation
-- Expects symbol pairs of USDC + tokenized equity with "0x" suffix (e.g.,
-  "AAPL0x")
-- Determines Schwab trade direction: buying tokenized equity onchain → selling
-  on Schwab
-- Calculates prices in cents and maintains onchain/offchain trade ratios
-
-**Async Event Processing Architecture**
-
-- Each blockchain event spawns independent async execution flow
-- Handles throughput mismatch: fast onchain events vs slower Schwab API calls
-- No artificial concurrency limits - processes events as they arrive
-- Flow: Parse Event → SQLite Deduplication Check → Schwab API Call → Record
-  Result
-
-### Authentication & API Integration
-
-**Charles Schwab OAuth (`src/schwab.rs`)**
-
-- OAuth 2.0 flow with 30-minute access tokens and 7-day refresh tokens
-- Token storage and retrieval from SQLite database
-- Comprehensive error handling for authentication failures
-
-**Symbol Caching (`crate::symbol::cache::SymbolCache`)**
-
-- Thread-safe caching of ERC20 token symbols using `tokio::sync::RwLock`
-- Prevents repeated RPC calls for the same token addresses
-
-### Database Schema & Idempotency
-
-**Key tables** (see migrations for full schema):
-
-- `onchain_trades`: Immutable blockchain trade records, keyed by
-  `(tx_hash, log_index)`
-- `schwab_executions`: Order execution tracking with status transitions
-- `trade_accumulators`: Unified position tracking per symbol
-- `trade_execution_links`: Many-to-many audit trail between trades and
-  executions
-- `schwab_auth`: OAuth token storage (singleton)
-- `event_queue`: Idempotent event processing queue, keyed by
-  `(tx_hash, log_index)`
-- `symbol_locks`: Per-symbol execution concurrency control
-
-**Idempotency**: Uses `(tx_hash, log_index)` as unique identifier, status
-tracking (pending → completed/failed), retry logic with exponential backoff
+- Main event loop (`launch` in `src/lib.rs`): monitors `ClearV2` and
+  `TakeOrderV2` WebSocket streams via `tokio::select!`
+- Trade conversion (`src/trade/mod.rs`): parses onchain events, expects USDC +
+  "0x"-suffixed tokenized equity pairs, determines hedge direction
+- Each event spawns independent async task: Parse -> Deduplicate -> Execute ->
+  Record
+- Idempotency via `(tx_hash, log_index)` unique key with status tracking
 
 ### Configuration
 

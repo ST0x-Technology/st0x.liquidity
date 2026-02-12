@@ -23,16 +23,16 @@ use super::{
     MintManager, Rebalancer, RebalancingCtx, RebalancingTrigger, RedemptionManager,
     TriggeredOperation,
 };
+use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+
 use crate::alpaca_tokenization::AlpacaTokenizationService;
 use crate::alpaca_wallet::{AlpacaWalletError, AlpacaWalletService};
-use crate::cctp::{
-    CctpBridge, Evm, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2, USDC_BASE, USDC_ETHEREUM,
-};
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
+use crate::onchain::{USDC_BASE, USDC_ETHEREUM};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
 use crate::usdc_rebalance::{UsdcEventStore, UsdcRebalance};
 
@@ -46,7 +46,7 @@ pub(crate) enum SpawnRebalancerError {
     #[error("failed to create Alpaca broker API: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
     #[error("failed to create CCTP bridge: {0}")]
-    Cctp(#[from] crate::cctp::CctpError),
+    Cctp(#[from] st0x_bridge::cctp::CctpError),
 }
 
 /// Provider type returned by `ProviderBuilder::connect_http` with wallet.
@@ -169,23 +169,13 @@ where
             broker_auth.api_secret.clone(),
         ));
 
-        let ethereum_evm = Evm::new(
+        let cctp = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
             ethereum_provider,
+            base_provider: base_provider.clone(),
             owner,
-            USDC_ETHEREUM,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-
-        let base_evm_for_cctp = Evm::new(
-            base_provider.clone(),
-            owner,
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        );
-
-        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp)?);
+            usdc_ethereum: USDC_ETHEREUM,
+            usdc_base: USDC_BASE,
+        })?);
         let vault = Arc::new(VaultService::new(base_provider, orderbook));
 
         Ok(Self {
@@ -401,25 +391,16 @@ mod tests {
 
         let owner = signer.address();
 
-        let ethereum_evm = Evm::new(
-            ethereum_provider,
-            owner,
-            USDC_ETHEREUM,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let base_evm_for_cctp = Evm::new(
-            base_provider.clone(),
-            owner,
-            USDC_BASE,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let cctp = Arc::new(CctpBridge::new(ethereum_evm, base_evm_for_cctp).unwrap());
+        let cctp = Arc::new(
+            CctpBridge::try_from_ctx(CctpCtx {
+                ethereum_provider,
+                base_provider: base_provider.clone(),
+                owner,
+                usdc_ethereum: USDC_ETHEREUM,
+                usdc_base: USDC_BASE,
+            })
+            .unwrap(),
+        );
         let vault = Arc::new(
             VaultService::new(base_provider, TEST_ORDERBOOK).with_required_confirmations(1),
         );

@@ -16,10 +16,10 @@ use thiserror::Error;
 use alloy::primitives::ruint::FromUintError;
 
 use crate::alpaca_wallet::AlpacaWalletError;
-use crate::cctp::CctpError;
 use crate::onchain::vault::VaultError;
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{UsdcRebalanceError, UsdcRebalanceId};
+use st0x_bridge::cctp::CctpError;
 use st0x_execution::AlpacaBrokerApiError;
 
 #[derive(Debug, Error)]

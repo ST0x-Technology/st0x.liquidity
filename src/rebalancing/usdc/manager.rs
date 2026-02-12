@@ -17,13 +17,14 @@ use super::{UsdcRebalance as UsdcRebalanceTrait, UsdcRebalanceManagerError};
 use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
-use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
 use crate::lifecycle::{Lifecycle, Never};
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
     RebalanceDirection, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
 };
+use st0x_bridge::cctp::{AttestationResponse, CctpBridge};
+use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, MintReceipt};
 use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 
 /// Orchestrates USDC rebalancing between Alpaca (Ethereum) and Rain (Base).
@@ -431,10 +432,12 @@ where
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
     ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
-        let response = match self
-            .cctp_bridge
-            .poll_attestation(BridgeDirection::EthereumToBase, burn_receipt.tx)
-            .await
+        let response = match Bridge::poll_attestation(
+            self.cctp_bridge.as_ref(),
+            BridgeDirection::EthereumToBase,
+            burn_receipt.tx,
+        )
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -455,8 +458,8 @@ where
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: response.attestation.to_vec(),
-                    cctp_nonce: response.nonce_as_u64()?,
+                    attestation: response.as_bytes().to_vec(),
+                    cctp_nonce: response.nonce(),
                 },
             )
             .await?;
@@ -471,14 +474,12 @@ where
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
     ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
-        let mint_receipt = match self
-            .cctp_bridge
-            .mint(
-                BridgeDirection::EthereumToBase,
-                attestation_response.message,
-                attestation_response.attestation,
-            )
-            .await
+        let mint_receipt = match Bridge::mint(
+            self.cctp_bridge.as_ref(),
+            BridgeDirection::EthereumToBase,
+            &attestation_response,
+        )
+        .await
         {
             Ok(receipt) => receipt,
             Err(e) => {
@@ -501,7 +502,7 @@ where
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
                     amount_received: u256_to_usdc(mint_receipt.amount)?,
-                    fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
+                    fee_collected: u256_to_usdc(mint_receipt.fee)?,
                 },
             )
             .await?;
@@ -509,7 +510,7 @@ where
         info!(
             mint_tx = %mint_receipt.tx,
             amount = %mint_receipt.amount,
-            fee = %mint_receipt.fee_collected,
+            fee = %mint_receipt.fee,
             "CCTP mint executed"
         );
         Ok(mint_receipt)
@@ -692,10 +693,12 @@ where
         id: &UsdcRebalanceId,
         burn_receipt: &BurnReceipt,
     ) -> Result<AttestationResponse, UsdcRebalanceManagerError> {
-        let response = match self
-            .cctp_bridge
-            .poll_attestation(BridgeDirection::BaseToEthereum, burn_receipt.tx)
-            .await
+        let response = match Bridge::poll_attestation(
+            self.cctp_bridge.as_ref(),
+            BridgeDirection::BaseToEthereum,
+            burn_receipt.tx,
+        )
+        .await
         {
             Ok(r) => r,
             Err(e) => {
@@ -716,8 +719,8 @@ where
             .execute(
                 &id.0,
                 UsdcRebalanceCommand::ReceiveAttestation {
-                    attestation: response.attestation.to_vec(),
-                    cctp_nonce: response.nonce_as_u64()?,
+                    attestation: response.as_bytes().to_vec(),
+                    cctp_nonce: response.nonce(),
                 },
             )
             .await?;
@@ -732,14 +735,12 @@ where
         id: &UsdcRebalanceId,
         attestation_response: AttestationResponse,
     ) -> Result<MintReceipt, UsdcRebalanceManagerError> {
-        let mint_receipt = match self
-            .cctp_bridge
-            .mint(
-                BridgeDirection::BaseToEthereum,
-                attestation_response.message,
-                attestation_response.attestation,
-            )
-            .await
+        let mint_receipt = match Bridge::mint(
+            self.cctp_bridge.as_ref(),
+            BridgeDirection::BaseToEthereum,
+            &attestation_response,
+        )
+        .await
         {
             Ok(receipt) => receipt,
             Err(e) => {
@@ -762,7 +763,7 @@ where
                 UsdcRebalanceCommand::ConfirmBridging {
                     mint_tx: mint_receipt.tx,
                     amount_received: u256_to_usdc(mint_receipt.amount)?,
-                    fee_collected: u256_to_usdc(mint_receipt.fee_collected)?,
+                    fee_collected: u256_to_usdc(mint_receipt.fee)?,
                 },
             )
             .await?;
@@ -770,7 +771,7 @@ where
         info!(
             mint_tx = %mint_receipt.tx,
             amount = %mint_receipt.amount,
-            fee = %mint_receipt.fee_collected,
+            fee = %mint_receipt.fee,
             "CCTP mint on Ethereum executed"
         );
         Ok(mint_receipt)
@@ -918,12 +919,10 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::alpaca_wallet::{AlpacaAccountId, AlpacaWalletClient, AlpacaWalletError};
-    use crate::cctp::{CctpBridge, Evm};
     use crate::onchain::vault::VaultService;
     use crate::usdc_rebalance::{RebalanceDirection, TransferRef, UsdcRebalanceError};
+    use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 
-    const TOKEN_MESSENGER_V2: Address = address!("0x28b5a0e9C621a5BadaA536219b3a228C8168cf5d");
-    const MESSAGE_TRANSMITTER_V2: Address = address!("0x81D40F21F12A8F0E3252Bccb954D722d4c464B64");
     const USDC_ADDRESS: Address = address!("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
     const ORDERBOOK_ADDRESS: Address = address!("0x1234567890123456789012345678901234567890");
     const TEST_VAULT_ID: VaultId = VaultId(b256!(
@@ -1090,25 +1089,14 @@ mod tests {
     ) {
         let owner = signer.address();
 
-        let ethereum = Evm::new(
-            provider.clone(),
+        let cctp_bridge = CctpBridge::try_from_ctx(CctpCtx {
+            ethereum_provider: provider.clone(),
+            base_provider: provider.clone(),
             owner,
-            USDC_ADDRESS,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let base = Evm::new(
-            provider.clone(),
-            owner,
-            USDC_ADDRESS,
-            TOKEN_MESSENGER_V2,
-            MESSAGE_TRANSMITTER_V2,
-        )
-        .with_required_confirmations(1);
-
-        let cctp_bridge = CctpBridge::new(ethereum, base).unwrap();
+            usdc_ethereum: USDC_ADDRESS,
+            usdc_base: USDC_ADDRESS,
+        })
+        .unwrap();
 
         let vault_service =
             VaultService::new(provider, ORDERBOOK_ADDRESS).with_required_confirmations(1);

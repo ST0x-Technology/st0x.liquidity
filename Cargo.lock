@@ -6597,6 +6597,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "st0x-bridge"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "async-trait",
+ "backon",
+ "httpmock",
+ "itertools 0.14.0",
+ "proptest",
+ "rain-error-decoding",
+ "rand 0.8.5",
+ "reqwest 0.12.24",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "st0x-dto"
 version = "0.1.0"
 dependencies = [
@@ -6679,6 +6701,7 @@ dependencies = [
  "serial_test",
  "sqlite-es",
  "sqlx",
+ "st0x-bridge",
  "st0x-dto",
  "st0x-execution",
  "temp-env",

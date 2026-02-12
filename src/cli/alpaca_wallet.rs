@@ -15,8 +15,8 @@ use crate::alpaca_wallet::{
     AlpacaWalletService, Network, TokenSymbol, TransferStatus, WhitelistStatus,
 };
 use crate::bindings::IERC20;
-use crate::cctp::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use crate::config::{BrokerCtx, Ctx};
+use crate::onchain::{USDC_ETHEREUM, USDC_ETHEREUM_SEPOLIA};
 use crate::threshold::Usdc;
 
 pub(super) async fn alpaca_deposit_command<W: Write>(
