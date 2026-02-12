@@ -413,33 +413,8 @@ fn extract_fill_params(
         return None;
     };
 
-    let amount = match Decimal::try_from(onchain_trade.amount) {
-        Ok(d) => FractionalShares::new(d),
-        Err(e) => {
-            error!(
-                amount = onchain_trade.amount,
-                tx_hash = %onchain_trade.tx_hash,
-                log_index = onchain_trade.log_index,
-                error = ?e,
-                "Failed to convert trade amount to FractionalShares"
-            );
-            return None;
-        }
-    };
-
-    let price_usdc = match Decimal::try_from(onchain_trade.price.value()) {
-        Ok(price) => price,
-        Err(e) => {
-            error!(
-                price = onchain_trade.price.value(),
-                tx_hash = %onchain_trade.tx_hash,
-                log_index = onchain_trade.log_index,
-                error = ?e,
-                "Failed to convert trade price to Decimal"
-            );
-            return None;
-        }
-    };
+    let amount = onchain_trade.amount;
+    let price_usdc = onchain_trade.price.value();
 
     Some((amount, price_usdc, block_timestamp))
 }

@@ -10,8 +10,8 @@ use alloy::rpc::types::Log;
 use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::num::ParseFloatError;
 use tracing::{error, warn};
 
 use st0x_execution::{Direction, FractionalShares, Positive};
@@ -140,7 +140,7 @@ pub struct OnchainTrade {
     pub(crate) log_index: u64,
     pub(crate) symbol: TokenizedEquitySymbol,
     pub(crate) equity_token: Address,
-    pub(crate) amount: f64,
+    pub(crate) amount: FractionalShares,
     pub(crate) direction: Direction,
     pub(crate) price: Usdc,
     pub(crate) block_timestamp: Option<DateTime<Utc>>,
@@ -183,10 +183,10 @@ impl OnchainTrade {
             .get(fill.output_index)
             .ok_or(TradeValidationError::NoOutputAtIndex(fill.output_index))?;
 
-        let onchain_input_amount = float_to_f64(fill.input_amount)?;
+        let onchain_input_amount = float_to_decimal(fill.input_amount)?;
         let onchain_input_symbol = cache.get_io_symbol(&provider, input).await?;
 
-        let onchain_output_amount = float_to_f64(fill.output_amount)?;
+        let onchain_output_amount = float_to_decimal(fill.output_amount)?;
         let onchain_output_symbol = cache.get_io_symbol(&provider, output).await?;
 
         // Use centralized TradeDetails::try_from_io to extract all trade data consistently
@@ -197,7 +197,7 @@ impl OnchainTrade {
             onchain_output_amount,
         )?;
 
-        if trade_details.equity_amount().value() == 0.0 {
+        if trade_details.equity_amount().value().is_zero() {
             return Ok(None);
         }
 
@@ -205,7 +205,7 @@ impl OnchainTrade {
         let price_per_share_usdc =
             trade_details.usdc_amount().value() / trade_details.equity_amount().value();
 
-        if price_per_share_usdc.is_nan() || price_per_share_usdc <= 0.0 {
+        if price_per_share_usdc <= Decimal::ZERO {
             return Ok(None);
         }
 
@@ -240,7 +240,7 @@ impl OnchainTrade {
             log_index,
             symbol: tokenized_symbol,
             equity_token,
-            amount: trade_details.equity_amount().value(),
+            amount: FractionalShares::new(trade_details.equity_amount().value()),
             direction: trade_details.direction(),
             price,
             block_timestamp: log.block_timestamp.and_then(|timestamp_secs| {
@@ -368,15 +368,14 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
     Ok(None)
 }
 
-/// Converts a Float (bytes32) amount to f64.
+/// Converts a Float (bytes32) amount to Decimal.
 ///
 /// Uses the rain-math-float library's format() method to convert the Float to
-/// a string, then parses it to f64. Float.format() handles the proper
-/// formatting internally.
-fn float_to_f64(float: B256) -> Result<f64, OnChainError> {
+/// a string, then parses it to Decimal for precision-safe arithmetic.
+fn float_to_decimal(float: B256) -> Result<Decimal, OnChainError> {
     let float = Float::from_raw(float);
     let formatted = float.format()?;
-    Ok(formatted.parse::<f64>()?)
+    Ok(formatted.parse::<Decimal>()?)
 }
 
 /// Business logic validation errors for trade processing rules.
@@ -409,8 +408,6 @@ pub(crate) enum TradeValidationError {
         symbol: String,
         remaining_shares: f64,
     },
-    #[error("Failed to convert U256 to f64: {0}")]
-    U256ToF64(#[from] ParseFloatError),
     #[error("Transaction not found: {0}")]
     TransactionNotFound(TxHash),
     #[error(
@@ -432,11 +429,11 @@ pub(crate) enum TradeValidationError {
         clear_log_index: u64,
     },
     #[error("Negative shares amount: {0}")]
-    NegativeShares(f64),
+    NegativeShares(Decimal),
     #[error("Share quantity {0} cannot be converted to f64")]
     ShareConversionFailed(Positive<FractionalShares>),
     #[error("Negative USDC amount: {0}")]
-    NegativeUsdc(f64),
+    NegativeUsdc(Decimal),
     #[error(
         "Symbol '{0}' is not a tokenized equity \
          (must have 't' prefix, e.g. tAAPL, tSPYM)"
@@ -466,7 +463,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x01, // coefficient = 1
         ]);
-        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
         // FLOAT_HALF = 0xffffffff...05 = coefficient=5, exponent=-1 → 0.5
         let float_half = B256::from([
@@ -475,7 +472,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x05, // coefficient = 5
         ]);
-        assert!((float_to_f64(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_half).unwrap() - 0.5).abs() < f64::EPSILON);
 
         // FLOAT_TWO = bytes32(uint256(2)) = coefficient=2, exponent=0 → 2.0
         let float_two = B256::from([
@@ -484,7 +481,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x02, // coefficient = 2
         ]);
-        assert!((float_to_f64(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_two).unwrap() - 2.0).abs() < f64::EPSILON);
     }
 
     /// Test with real production event data from tx
@@ -494,12 +491,12 @@ mod tests {
     /// - event.input = amount the order GAVE = 2 tSPLG shares
     /// - event.output = amount the order RECEIVED = ~160 USDC
     #[test]
-    fn test_float_to_f64_production_event_data() {
+    fn test_float_to_decimal_production_event_data() {
         // event.input Float: 2 shares the order gave
         // Raw bytes: ffffffee00000000000000000000000000000000000000001bc16d674ec80000
         let event_input_float =
             fixed_bytes!("ffffffee00000000000000000000000000000000000000001bc16d674ec80000");
-        let shares_amount = float_to_f64(event_input_float).unwrap();
+        let shares_amount = float_to_decimal(event_input_float).unwrap();
         assert!(
             (shares_amount - 2.0).abs() < f64::EPSILON,
             "Expected 2.0 shares but got {shares_amount}"
@@ -509,7 +506,7 @@ mod tests {
         // Raw bytes: ffffffe500000000000000000000000000000002057d2cd516a29b6174400000
         let event_output_float =
             fixed_bytes!("ffffffe500000000000000000000000000000002057d2cd516a29b6174400000");
-        let usdc_amount = float_to_f64(event_output_float).unwrap();
+        let usdc_amount = float_to_decimal(event_output_float).unwrap();
         assert!(
             (usdc_amount - 160.155_077_52).abs() < 0.00001,
             "Expected ~160.15 USDC but got {usdc_amount}"
@@ -524,44 +521,44 @@ mod tests {
     }
 
     #[test]
-    fn test_float_to_f64_edge_cases() {
+    fn test_float_to_decimal_edge_cases() {
         let float_zero = Float::from_fixed_decimal(uint!(0_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_f64(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_zero).unwrap() - 0.0).abs() < f64::EPSILON);
 
         let float_one = Float::from_fixed_decimal(uint!(1_U256), 0)
             .unwrap()
             .get_inner();
-        assert!((float_to_f64(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
+        assert!((float_to_decimal(float_one).unwrap() - 1.0).abs() < f64::EPSILON);
 
         let float_nine = Float::from_fixed_decimal(uint!(9_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_nine).unwrap();
+        let result = float_to_decimal(float_nine).unwrap();
         assert!((result - 9.0).abs() < f64::EPSILON);
 
         let float_hundred = Float::from_fixed_decimal(uint!(100_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_hundred).unwrap();
+        let result = float_to_decimal(float_hundred).unwrap();
         assert!((result - 100.0).abs() < f64::EPSILON);
 
         let float_half = Float::from_fixed_decimal(uint!(5_U256), 1)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_half).unwrap();
+        let result = float_to_decimal(float_half).unwrap();
         assert!((result - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_float_to_f64_precision_loss() {
+    fn test_float_to_decimal_precision_loss() {
         // Test with very large coefficient
         let large_coeff = 1_000_000_000_000_000_i128;
         let float_large = Float::from_fixed_decimal_lossy(U256::from(large_coeff), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_large).unwrap();
+        let result = float_to_decimal(float_large).unwrap();
         assert!(result.is_finite());
         assert!((result - 1_000_000_000_000_000.0).abs() < 1.0);
 
@@ -569,36 +566,36 @@ mod tests {
         let float_small = Float::from_fixed_decimal_lossy(uint!(1_U256), 50)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_small).unwrap();
+        let result = float_to_decimal(float_small).unwrap();
         assert!(result.is_finite());
         // 1 × 10^-50 is extremely small
         assert!(result > 0.0 && result < 1e-40);
     }
 
     #[test]
-    fn test_float_to_f64_formatting_edge_cases() {
+    fn test_float_to_decimal_formatting_edge_cases() {
         let float_amount = Float::from_fixed_decimal(uint!(123_456_U256), 6)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
+        let result = float_to_decimal(float_amount).unwrap();
         assert!((result - 0.123_456).abs() < f64::EPSILON);
 
         let float_amount = Float::from_fixed_decimal(uint!(5_U256), 10)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
+        let result = float_to_decimal(float_amount).unwrap();
         assert!((result - 5e-10).abs() < 1e-15);
 
         let float_amount = Float::from_fixed_decimal(uint!(12_345_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
+        let result = float_to_decimal(float_amount).unwrap();
         assert!((result - 12_345.0).abs() < f64::EPSILON);
 
         let float_amount = Float::from_fixed_decimal(uint!(5000_U256), 0)
             .unwrap()
             .get_inner();
-        let result = float_to_f64(float_amount).unwrap();
+        let result = float_to_decimal(float_amount).unwrap();
         assert!((result - 5000.0).abs() < f64::EPSILON);
     }
 

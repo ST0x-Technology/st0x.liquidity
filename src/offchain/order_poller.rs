@@ -403,9 +403,8 @@ mod tests {
             tx_hash: onchain_trade.tx_hash,
             log_index: onchain_trade.log_index,
         };
-        let decimal_amount =
-            FractionalShares::new(Decimal::try_from(onchain_trade.amount).unwrap());
-        let price_usdc = Decimal::try_from(onchain_trade.price.value()).unwrap();
+        let decimal_amount = onchain_trade.amount;
+        let price_usdc = onchain_trade.price.value();
 
         position_cqrs
             .execute(
@@ -487,7 +486,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
 
-        setup_position_with_onchain_fill(&position_cqrs, &symbol, "AAPL0x", 10.0).await;
+        setup_position_with_onchain_fill(&position_cqrs, &symbol, "tAAPL", 10.0).await;
 
         let offchain_order_id = OffchainOrder::aggregate_id();
         setup_offchain_order_aggregate(
@@ -522,7 +521,7 @@ mod tests {
             submitted_at: Utc::now(),
         };
 
-        let result = poller
+        poller
             .handle_filled_order(
                 offchain_order_id,
                 &order,
@@ -530,8 +529,8 @@ mod tests {
                 &ExecutorOrderId::new("ORD123"),
                 Utc::now(),
             )
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = offchain_order_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
@@ -572,7 +571,7 @@ mod tests {
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
 
-        setup_position_with_onchain_fill(&position_cqrs, &symbol, "TSLA0x", 5.0).await;
+        setup_position_with_onchain_fill(&position_cqrs, &symbol, "tTSLA", 5.0).await;
 
         let offchain_order_id = OffchainOrder::aggregate_id();
         setup_offchain_order_aggregate(
@@ -607,10 +606,10 @@ mod tests {
             submitted_at: Utc::now(),
         };
 
-        let result = poller
+        poller
             .handle_failed_order(offchain_order_id, &order, "Broker API timeout".to_string())
-            .await;
-        assert!(result.is_ok());
+            .await
+            .unwrap();
 
         let aggregate_id = offchain_order_id.to_string();
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(

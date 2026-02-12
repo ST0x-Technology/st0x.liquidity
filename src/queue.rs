@@ -12,7 +12,7 @@ use crate::bindings::IOrderBookV5::{ClearV3, TakeOrderV3};
 use crate::onchain::trade::TradeEvent;
 
 /// Trait for events that can be enqueued
-pub trait Enqueueable {
+pub(crate) trait Enqueueable {
     fn to_trade_event(&self) -> TradeEvent;
 }
 

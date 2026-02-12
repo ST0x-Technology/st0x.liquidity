@@ -425,7 +425,7 @@ impl InventoryView {
                 direction,
                 ..
             } => {
-                let shares = *shares_filled;
+                let shares = shares_filled.inner();
                 self.update_equity(
                     symbol,
                     |inv| match direction {

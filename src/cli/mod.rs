@@ -653,6 +653,7 @@ mod tests {
     use clap::CommandFactory;
     use httpmock::MockServer;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use st0x_execution::{
         Direction, FractionalShares, OrderStatus, Positive, SchwabError, SchwabTokens,
@@ -708,7 +709,7 @@ mod tests {
         });
 
         trading::execute_order_with_writers(
-            Symbol::new("tAAPL").unwrap(),
+            Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -751,7 +752,7 @@ mod tests {
         });
 
         trading::execute_order_with_writers(
-            Symbol::new("tTSLA").unwrap(),
+            Symbol::new("TSLA").unwrap(),
             50,
             Direction::Sell,
             &ctx,
@@ -795,7 +796,7 @@ mod tests {
         });
 
         trading::execute_order_with_writers(
-            Symbol::new("tAAPL").unwrap(),
+            Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -826,7 +827,7 @@ mod tests {
             .unwrap();
 
         let result = trading::execute_order_with_writers(
-            Symbol::new("tAAPL").unwrap(),
+            Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -895,7 +896,7 @@ mod tests {
         });
 
         let result = trading::execute_order_with_writers(
-            Symbol::new("tAAPL").unwrap(),
+            Symbol::new("AAPL").unwrap(),
             100,
             Direction::Buy,
             &ctx,
@@ -1786,7 +1787,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trade.symbol.to_string(), "tAAPL");
-        assert!((trade.amount - 9.0).abs() < f64::EPSILON);
+        assert_eq!(trade.amount, FractionalShares::new(dec!(9)));
 
         let executions = find_executions_by_symbol_status_and_broker(
             &pool,
@@ -1905,7 +1906,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(trade.symbol.to_string(), "tTSLA");
-        assert!((trade.amount - 5.0).abs() < f64::EPSILON);
+        assert_eq!(trade.amount, FractionalShares::new(dec!(5)));
 
         let stdout_str1 = String::from_utf8(stdout1).unwrap();
         assert!(stdout_str1.contains("Processing trade with TradeAccumulator"));

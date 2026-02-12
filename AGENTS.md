@@ -331,8 +331,8 @@ For detailed implementation requirements and module organization, see
 **Trade Conversion Logic ([`Trade` struct and methods in `src/trade/mod.rs`])**
 
 - Parses onchain events into actionable trade data with strict validation
-- Expects symbol pairs of USDC + tokenized equity with "0x" suffix (e.g.,
-  "AAPL0x")
+- Expects symbol pairs of USDC + tokenized equity with "t" prefix (e.g.,
+  "tAAPL")
 - Determines Schwab trade direction: buying tokenized equity onchain → selling
   on Schwab
 - Calculates prices in cents and maintains onchain/offchain trade ratios
@@ -412,8 +412,8 @@ is the source of truth for terminology and naming conventions.
   maximum throughput
 - **SQLite Persistence**: Embedded database for trade tracking and
   authentication tokens
-- **Symbol Suffix Convention**: Tokenized equities use "0x" suffix to
-  distinguish from base assets
+- **Symbol Prefix Convention**: Tokenized equities use "t" prefix to
+  distinguish from base assets (e.g., tAAPL, tTSLA, tSPYM)
 - **Price Direction Logic**: Onchain buy = offchain sell (and vice versa) to
   hedge directional exposure
 - **Comprehensive Error Handling**: Custom error types (`OnChainError`,
@@ -516,6 +516,13 @@ is the source of truth for terminology and naming conventions.
   - **FORBIDDEN**: `SomeError { message: String }` - loses context and source
   - **FORBIDDEN**: Converting errors to strings with `.to_string()` or string
     interpolation
+  - **FORBIDDEN**: Using `format!()` to convert typed values into String fields
+    in error variants (e.g., `format!("{side:?}")`) - store the actual typed
+    value instead
+  - **FORBIDDEN**: Unpacking newtypes into their inner type to store in error
+    variants or anywhere else. If you have `Symbol(String)`, store `Symbol`,
+    not `String`. If you have `OrderSide`, store `OrderSide`, not a `String`
+    representation. Never discard type safety by extracting inner values.
   - **REQUIRED**: Use `#[from]` attribute with thiserror to wrap errors and
     preserve all type information
   - **REQUIRED**: Each error variant must preserve the complete error chain with
@@ -726,12 +733,12 @@ that cannot be expressed through code structure alone.
 #### Good Comment Examples
 
 ```rust
-// If the on-chain order has USDC as input and an 0x tokenized stock as
-// output then it means the order received USDC and gave away an 0x  
+// If the on-chain order has USDC as input and a tokenized stock (t prefix)
+// as output then it means the order received USDC and gave away a
 // tokenized stock, i.e. sold, which means that to take the opposite
 // trade in schwab we need to buy and vice versa.
-let (schwab_ticker, schwab_instruction) = 
-    if onchain_input_symbol == "USDC" && onchain_output_symbol.ends_with("0x") {
+let (schwab_ticker, schwab_instruction) =
+    if onchain_input_symbol == "USDC" && onchain_output_symbol.starts_with("t") {
         // ... complex mapping logic
     }
 
@@ -811,7 +818,7 @@ For multi-line `#[error]` strings, use `\` continuation:
 ```rust
 #[error(
     "Expected IO to contain USDC and one tokenized equity \
-     (t prefix, 0x or s1 suffix) but got {0} and {1}"
+     (t prefix) but got {0} and {1}"
 )]
 ```
 

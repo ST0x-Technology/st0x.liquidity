@@ -1117,32 +1117,6 @@ async fn process_valid_trade(
     process_queued_trade(executor_type, pool, queued_event, event_id, trade, cqrs).await
 }
 
-/// Extracts amount and price as Decimals from a trade, logging errors on failure.
-fn extract_trade_decimals(trade: &OnchainTrade) -> Option<(Decimal, Decimal)> {
-    let amount = match Decimal::try_from(trade.amount) {
-        Ok(decimal) => decimal,
-        Err(error) => {
-            error!(
-                "Failed to convert trade amount to Decimal: {error}, tx_hash={:?}",
-                trade.tx_hash
-            );
-            return None;
-        }
-    };
-
-    let price_usdc = match Decimal::try_from(trade.price.value()) {
-        Ok(decimal) => decimal,
-        Err(error) => {
-            error!(
-                "Failed to convert trade price to Decimal: {error}, tx_hash={:?}",
-                trade.tx_hash
-            );
-            return None;
-        }
-    };
-
-    Some((amount, price_usdc))
-}
 
 async fn execute_witness_trade(
     onchain_trade_cqrs: &OnChainTradeCqrs,
@@ -1151,9 +1125,8 @@ async fn execute_witness_trade(
 ) {
     let aggregate_id = OnChainTrade::aggregate_id(trade.tx_hash, trade.log_index);
 
-    let Some((amount, price_usdc)) = extract_trade_decimals(trade) else {
-        return;
-    };
+    let amount = trade.amount.inner();
+    let price_usdc = trade.price.value();
 
     let Some(block_timestamp) = trade.block_timestamp else {
         error!(
@@ -1188,9 +1161,8 @@ async fn execute_acknowledge_fill(position_cqrs: &PositionCqrs, trade: &OnchainT
     let base_symbol = trade.symbol.base();
     let aggregate_id = Position::aggregate_id(base_symbol);
 
-    let Some((amount, price_usdc)) = extract_trade_decimals(trade) else {
-        return;
-    };
+    let amount = trade.amount.inner();
+    let price_usdc = trade.price.value();
 
     let Some(block_timestamp) = trade.block_timestamp else {
         error!(
@@ -3090,7 +3062,7 @@ mod tests {
                 &position_agg_id,
                 PositionCommand::CompleteOffChainOrder {
                     offchain_order_id: first_order_id,
-                    shares_filled: FractionalShares::new(rust_decimal_macros::dec!(1.5)),
+                    shares_filled: Positive::new(FractionalShares::new(rust_decimal_macros::dec!(1.5))).unwrap(),
                     direction: st0x_execution::Direction::Sell,
                     executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
                     price_cents: crate::offchain_order::PriceCents(15000),

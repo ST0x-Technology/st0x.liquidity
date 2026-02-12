@@ -1,10 +1,11 @@
 //! Mock implementation of the Mint trait for testing.
 
-use alloy::primitives::Address;
-use async_trait::async_trait;
-use st0x_execution::{FractionalShares, Symbol};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use alloy::primitives::Address;
+use async_trait::async_trait;
+
+use st0x_execution::{FractionalShares, Symbol};
 
 use super::{Mint, MintError};
 use crate::tokenized_equity_mint::IssuerRequestId;

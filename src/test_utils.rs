@@ -122,9 +122,9 @@ impl OnchainTradeBuilder {
                 log_index: 1,
                 symbol: "tAAPL".parse::<TokenizedEquitySymbol>().unwrap(),
                 equity_token: address!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-                amount: 1.0,
+                amount: FractionalShares::new(Decimal::ONE),
                 direction: Direction::Buy,
-                price: Usdc::new(150.0).unwrap(),
+                price: Usdc::new(Decimal::new(150, 0)).unwrap(),
                 block_timestamp: None,
                 created_at: None,
                 gas_used: None,
@@ -150,13 +150,13 @@ impl OnchainTradeBuilder {
     }
 
     #[must_use]
-    pub(crate) fn with_amount(mut self, amount: f64) -> Self {
-        self.trade.amount = amount;
+    pub(crate) fn with_amount(mut self, amount: Decimal) -> Self {
+        self.trade.amount = FractionalShares::new(amount);
         self
     }
 
     #[must_use]
-    pub(crate) fn with_price(mut self, price: f64) -> Self {
+    pub(crate) fn with_price(mut self, price: Decimal) -> Self {
         self.trade.price = Usdc::new(price).unwrap();
         self
     }

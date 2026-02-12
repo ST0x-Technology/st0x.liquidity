@@ -9,7 +9,7 @@ use alloy::transports::layers::RetryBackoffLayer;
 use alloy::transports::{RpcError, TransportErrorKind};
 use rain_math_float::FloatError;
 use serde::Deserialize;
-use std::num::{ParseFloatError, TryFromIntError};
+use std::num::TryFromIntError;
 use url::Url;
 
 use st0x_execution::order::status::ParseOrderStatusError;
@@ -119,6 +119,8 @@ pub(crate) enum OnChainError {
     Position(#[from] PositionError),
     #[error("Shares conversion error: {0}")]
     SharesConversion(#[from] SharesConversionError),
+    #[error("Decimal parse error: {0}")]
+    DecimalParse(#[from] rust_decimal::Error),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("UUID parse error: {0}")]
@@ -137,11 +139,6 @@ impl From<alloy::contract::Error> for OnChainError {
     }
 }
 
-impl From<ParseFloatError> for OnChainError {
-    fn from(err: ParseFloatError) -> Self {
-        Self::Validation(TradeValidationError::U256ToF64(err))
-    }
-}
 
 impl From<FromUintError<usize>> for OnChainError {
     fn from(err: FromUintError<usize>) -> Self {
