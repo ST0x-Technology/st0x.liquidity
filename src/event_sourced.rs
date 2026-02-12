@@ -75,14 +75,14 @@
 //! immediately obvious whether code belongs to this crate or
 //! to cqrs-es.
 
-use async_trait::async_trait;
 use cqrs_es::persist::GenericQuery;
-use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, Query, View};
+use cqrs_es::{Aggregate, DomainEvent};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlite_es::{SqliteCqrs, SqliteViewRepository};
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
-use tracing::error;
+
+use crate::lifecycle::{Lifecycle, LifecycleError};
 
 /// The core abstraction for event-sourced domain entities.
 ///
@@ -144,6 +144,8 @@ use tracing::error;
 /// - `transition`: Handle a command against existing state.
 ///   Receives `&self` (the domain type, not `Lifecycle`), so
 ///   the handler only deals with live state.
+///
+/// [`Never`]: crate::lifecycle::Never
 pub(crate) trait EventSourced:
     Clone + Debug + Send + Sync + Sized + Serialize + DeserializeOwned
 {
@@ -171,10 +173,7 @@ pub(crate) trait EventSourced:
     ///   (becomes [`LifecycleError::Mismatch`])
     /// - `Err(error)` -- domain error during application
     ///   (becomes [`LifecycleError::Apply`])
-    fn evolve(
-        event: &Self::Event,
-        state: &Self,
-    ) -> Result<Option<Self>, Self::Error>;
+    fn evolve(event: &Self::Event, state: &Self) -> Result<Option<Self>, Self::Error>;
 
     /// Handle a command when the entity doesn't exist yet.
     ///
@@ -195,248 +194,6 @@ pub(crate) trait EventSourced:
         command: Self::Command,
         services: &Self::Services,
     ) -> Result<Vec<Self::Event>, Self::Error>;
-}
-
-/// Adapter that bridges [`EventSourced`] to cqrs-es `Aggregate`.
-///
-/// Wraps a domain entity and tracks whether it has been
-/// initialized, is live, or has entered an error state. The
-/// blanket `Aggregate` impl delegates to `EventSourced` methods
-/// and translates between the two interfaces.
-///
-/// Application code should not construct or match on `Lifecycle`
-/// directly in most cases. Interact through [`Store::send`] for
-/// commands and through views for queries.
-///
-/// # State machine
-///
-/// ```text
-/// Uninitialized --originate(event)--> Live(state)
-/// Uninitialized --originate(None)---> Failed { Mismatch }
-///
-/// Live(state) --evolve(Ok(Some))--> Live(new_state)
-/// Live(state) --evolve(Ok(None))--> Failed { Mismatch }
-/// Live(state) --evolve(Err(e))----> Failed { Apply(e) }
-///
-/// Failed { .. } ---- any event ----> Failed { .. } (unchanged)
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum Lifecycle<Entity: EventSourced> {
-    /// No events have been applied yet.
-    Uninitialized,
-
-    /// Normal operational state containing valid entity data.
-    Live(Entity),
-
-    /// Error state entered when event application fails.
-    ///
-    /// The entity becomes inert -- further events are ignored.
-    /// `last_valid_state` preserves the state before failure
-    /// for debugging and potential recovery.
-    Failed {
-        error: LifecycleError<Entity>,
-        last_valid_state: Option<Box<Entity>>,
-    },
-}
-
-impl<Entity: EventSourced> Default for Lifecycle<Entity> {
-    fn default() -> Self {
-        Self::Uninitialized
-    }
-}
-
-/// Errors from lifecycle state management.
-///
-/// These are infrastructure-level errors produced by
-/// [`Lifecycle`]'s blanket `Aggregate` impl, not by domain
-/// code directly. Domain errors are wrapped in the [`Apply`]
-/// variant.
-///
-/// The error carries typed state and event information rather
-/// than opaque debug strings, enabling meaningful error
-/// handling and debugging.
-///
-/// [`Apply`]: LifecycleError::Apply
-#[derive(
-    Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error,
-)]
-pub(crate) enum LifecycleError<Entity: EventSourced> {
-    /// A transition event or command was applied to an entity
-    /// that hasn't been initialized yet.
-    #[error("operation on uninitialized state")]
-    Uninitialized,
-
-    /// An initialization event or command was applied to an
-    /// entity that already exists.
-    #[error("initialization on already-live state")]
-    AlreadyInitialized,
-
-    /// An event doesn't match the current state. Carries the
-    /// actual state and event for debugging.
-    #[error(
-        "event '{event:?}' not applicable to state '{state:?}'"
-    )]
-    Mismatch {
-        state: Box<Lifecycle<Entity>>,
-        event: Entity::Event,
-    },
-
-    /// A domain-specific error during event application (e.g.,
-    /// arithmetic overflow in Position). Wraps
-    /// `Entity::Error`.
-    #[error(transparent)]
-    Apply(Entity::Error),
-}
-
-/// Uninhabited error type for entities with infallible
-/// operations.
-///
-/// Similar to `std::convert::Infallible` but derives
-/// `Serialize`/`Deserialize` for cqrs-es compatibility.
-/// Use as `type Error = Never` on entities where neither
-/// command handling nor event application can fail.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    thiserror::Error,
-)]
-#[error("never")]
-pub(crate) enum Never {}
-
-/// Bridges [`EventSourced`] to cqrs-es `Aggregate`.
-///
-/// This blanket impl eliminates per-entity boilerplate. All
-/// command routing (uninitialized -> `initialize`, live ->
-/// `transition`) and event application (uninitialized ->
-/// `originate`, live -> `evolve`) is handled here.
-///
-/// The `apply` method uses `std::mem::take` to move out of
-/// `&mut self`, avoiding unnecessary clones when transitioning
-/// between lifecycle states.
-#[async_trait]
-impl<Entity> Aggregate for Lifecycle<Entity>
-where
-    Entity: EventSourced,
-    Entity::Event:
-        Clone + Debug + Serialize + DeserializeOwned + Send + Sync + PartialEq,
-    Entity::Error:
-        Clone + Serialize + DeserializeOwned + Send + Sync + PartialEq,
-{
-    type Command = Entity::Command;
-    type Event = Entity::Event;
-    type Error = LifecycleError<Entity>;
-    type Services = Entity::Services;
-
-    fn aggregate_type() -> String {
-        Entity::AGGREGATE_TYPE.to_string()
-    }
-
-    async fn handle(
-        &self,
-        command: Self::Command,
-        services: &Self::Services,
-    ) -> Result<Vec<Self::Event>, Self::Error> {
-        match self {
-            Self::Uninitialized => Entity::initialize(command, services)
-                .await
-                .map_err(LifecycleError::Apply),
-
-            Self::Live(state) => state
-                .transition(command, services)
-                .await
-                .map_err(LifecycleError::Apply),
-
-            Self::Failed { error, .. } => Err(error.clone()),
-        }
-    }
-
-    fn apply(&mut self, event: Self::Event) {
-        *self = match std::mem::take(self) {
-            Self::Uninitialized => match Entity::originate(&event) {
-                Some(state) => Self::Live(state),
-                None => {
-                    let err = LifecycleError::Mismatch {
-                        state: Box::new(Self::Uninitialized),
-                        event,
-                    };
-                    error!("lifecycle failed during originate: {err}");
-                    Self::Failed {
-                        error: err,
-                        last_valid_state: None,
-                    }
-                }
-            },
-
-            Self::Live(state) => match Entity::evolve(&event, &state) {
-                Ok(Some(new_state)) => Self::Live(new_state),
-                Ok(None) => {
-                    let err = LifecycleError::Mismatch {
-                        state: Box::new(Self::Live(state.clone())),
-                        event,
-                    };
-                    error!("lifecycle failed during evolve: {err}");
-                    Self::Failed {
-                        error: err,
-                        last_valid_state: Some(Box::new(state)),
-                    }
-                }
-                Err(domain_err) => {
-                    let err = LifecycleError::Apply(domain_err);
-                    error!("lifecycle failed during evolve: {err}");
-                    Self::Failed {
-                        error: err,
-                        last_valid_state: Some(Box::new(state)),
-                    }
-                }
-            },
-
-            failed @ Self::Failed { .. } => failed,
-        };
-    }
-}
-
-/// Allows any `Lifecycle<Entity>` to serve as its own
-/// materialized view by replaying events through `apply`.
-///
-/// This enables using
-/// `SqliteViewRepository<Lifecycle<E>, Lifecycle<E>>` to
-/// maintain a view that mirrors the aggregate's current state,
-/// useful for queries that need the full entity.
-impl<Entity> View<Self> for Lifecycle<Entity>
-where
-    Self: Aggregate,
-    Entity: EventSourced,
-{
-    fn update(&mut self, event: &EventEnvelope<Self>) {
-        self.apply(event.payload.clone());
-    }
-}
-
-/// Enables sharing a single query processor across multiple
-/// CQRS frameworks via `Arc`.
-///
-/// Without this, each `SqliteCqrs` framework would need its
-/// own query instance. With it, a single `Arc<RebalancingTrigger>`
-/// can be wired to position, mint, redemption, and USDC
-/// frameworks simultaneously.
-#[async_trait]
-impl<QueryImpl, Entity> Query<Lifecycle<Entity>> for Arc<QueryImpl>
-where
-    QueryImpl: Query<Lifecycle<Entity>> + Send + Sync,
-    Entity: EventSourced,
-    Lifecycle<Entity>: Aggregate,
-{
-    async fn dispatch(
-        &self,
-        aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<Entity>>],
-    ) {
-        QueryImpl::dispatch(self, aggregate_id, events).await;
-    }
 }
 
 /// Convenience alias for a `GenericQuery` backed by SQLite that
@@ -461,11 +218,11 @@ pub(crate) type SqliteQuery<Entity> = GenericQuery<
 /// # Usage
 ///
 /// ```ignore
-/// let position_store: Store<Position> = /* built by CqrsBuilder */;
+/// let positions: Store<Position> = /* built by CqrsBuilder */;
 ///
 /// // Typed ID -- can't accidentally pass an OffchainOrderId
 /// let symbol = Symbol::new("AAPL").unwrap();
-/// position_store.send(&symbol, PositionCommand::AcknowledgeFill { .. }).await?;
+/// positions.send(&symbol, PositionCommand::AcknowledgeFill { .. }).await?;
 /// ```
 ///
 /// Produced by [`CqrsBuilder::build()`] during conductor
@@ -499,9 +256,8 @@ where
     pub(crate) async fn send(
         &self,
         id: &Entity::Id,
-        command: <Lifecycle<Entity> as Aggregate>::Command,
-    ) -> Result<(), cqrs_es::AggregateError<LifecycleError<Entity>>>
-    {
+        command: Entity::Command,
+    ) -> Result<(), cqrs_es::AggregateError<LifecycleError<Entity>>> {
         self.inner.execute(&id.to_string(), command).await
     }
 }
