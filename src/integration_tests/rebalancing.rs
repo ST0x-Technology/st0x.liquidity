@@ -5,6 +5,7 @@ use alloy::providers::ext::AnvilApi as _;
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
 use cqrs_es::persist::GenericQuery;
+use httpmock::Mock;
 use httpmock::prelude::*;
 use rust_decimal_macros::dec;
 use serde_json::json;
@@ -32,6 +33,7 @@ use crate::rebalancing::redemption::mock::MockRedeem;
 use crate::rebalancing::usdc::mock::MockUsdcRebalance;
 use crate::rebalancing::{
     MintManager, Rebalancer, RebalancingTrigger, RebalancingTriggerConfig, RedemptionManager,
+    TriggeredOperation,
 };
 use crate::test_utils::setup_test_db;
 use crate::threshold::{ExecutionThreshold, Usdc};
@@ -121,6 +123,92 @@ fn build_position_cqrs_with_trigger(
     ];
 
     Arc::new(sqlite_cqrs(pool.clone(), queries, ()))
+}
+
+/// Shared state for equity rebalancing tests (mint and redemption) that
+/// wires up the Position CQRS with a RebalancingTrigger as a query processor.
+struct EquityTriggerFixture {
+    pool: SqlitePool,
+    symbol: Symbol,
+    aggregate_id: String,
+    trigger: Arc<RebalancingTrigger>,
+    position_cqrs: Arc<PositionCqrs>,
+    receiver: mpsc::Receiver<TriggeredOperation>,
+}
+
+async fn setup_equity_trigger() -> EquityTriggerFixture {
+    let pool = setup_test_db().await;
+    let symbol = Symbol::new("AAPL").unwrap();
+    let aggregate_id = Position::aggregate_id(&symbol);
+
+    let inventory = Arc::new(RwLock::new(
+        InventoryView::default().with_equity(symbol.clone()),
+    ));
+    let (sender, receiver) = mpsc::channel(10);
+
+    let trigger = Arc::new(RebalancingTrigger::new(
+        test_trigger_config(),
+        pool.clone(),
+        TEST_ORDERBOOK,
+        TEST_ORDER_OWNER,
+        Arc::clone(&inventory),
+        sender,
+    ));
+
+    let position_cqrs = build_position_cqrs_with_trigger(&pool, &trigger);
+
+    EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id,
+        trigger,
+        position_cqrs,
+        receiver,
+    }
+}
+
+/// Creates httpmock responses for the Alpaca tokenization API detection and
+/// completion polling endpoints, matching the given tx_hash.
+fn setup_redemption_mocks(server: &MockServer, expected_tx_hash: TxHash) -> (Mock<'_>, Mock<'_>) {
+    let detection_mock = server.mock(|when, then| {
+        when.method(GET)
+            .path(tokenization_requests_path())
+            .query_param("type", "redeem");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([{
+                "tokenization_request_id": "redeem_int_test",
+                "type": "redeem",
+                "status": "pending",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "30.0",
+                "issuer": "st0x",
+                "network": "base",
+                "tx_hash": expected_tx_hash,
+                "created_at": "2024-01-15T10:30:00Z"
+            }]));
+    });
+
+    let completion_mock = server.mock(|when, then| {
+        when.method(GET).path(tokenization_requests_path());
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!([{
+                "tokenization_request_id": "redeem_int_test",
+                "type": "redeem",
+                "status": "completed",
+                "underlying_symbol": "AAPL",
+                "token_symbol": "tAAPL",
+                "qty": "30.0",
+                "issuer": "st0x",
+                "network": "base",
+                "tx_hash": expected_tx_hash,
+                "created_at": "2024-01-15T10:30:00Z"
+            }]));
+    });
+
+    (detection_mock, completion_mock)
 }
 
 fn sample_pending_response(id: &str) -> serde_json::Value {
@@ -248,25 +336,14 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
 /// TokenizedEquityMint aggregate to completion via the Alpaca tokenization API.
 #[tokio::test]
 async fn equity_offchain_imbalance_triggers_mint() {
-    let pool = setup_test_db().await;
-    let symbol = Symbol::new("AAPL").unwrap();
-    let aggregate_id = Position::aggregate_id(&symbol);
-
-    let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_equity(symbol.clone()),
-    ));
-    let (sender, receiver) = mpsc::channel(10);
-
-    let trigger = Arc::new(RebalancingTrigger::new(
-        test_trigger_config(),
-        pool.clone(),
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
-        Arc::clone(&inventory),
-        sender,
-    ));
-
-    let position_cqrs = build_position_cqrs_with_trigger(&pool, &trigger);
+    let EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id,
+        trigger,
+        position_cqrs,
+        receiver,
+    } = setup_equity_trigger().await;
 
     // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain.
     // Without VaultRegistry seeded, the trigger silently skips Mint operations.
@@ -295,6 +372,9 @@ async fn equity_offchain_imbalance_triggers_mint() {
     ));
     let mint_mgr = MintManager::new(service, mint_cqrs);
 
+    // json_body_partial acts as an implicit assertion: the mock only matches if
+    // the request contains these exact fields. mint_mock.assert() below then
+    // verifies the mock was called, confirming the correct qty was sent.
     let mint_mock = server.mock(|when, then| {
         when.method(POST)
             .path(tokenization_mint_path())
@@ -423,11 +503,15 @@ async fn equity_offchain_imbalance_triggers_mint() {
 /// setting up httpmock responses, so the mock detection endpoint can match
 /// the exact hash produced by the real onchain transfer.
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn equity_onchain_imbalance_triggers_redemption() {
-    let pool = setup_test_db().await;
-    let symbol = Symbol::new("AAPL").unwrap();
-    let aggregate_id = Position::aggregate_id(&symbol);
+    let EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id,
+        trigger,
+        position_cqrs,
+        receiver,
+    } = setup_equity_trigger().await;
     let server = MockServer::start();
     let (_anvil, endpoint, key) = setup_anvil();
 
@@ -465,43 +549,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     )
     .await;
 
-    let detection_mock = server.mock(|when, then| {
-        when.method(GET)
-            .path(tokenization_requests_path())
-            .query_param("type", "redeem");
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([{
-                "tokenization_request_id": "redeem_int_test",
-                "type": "redeem",
-                "status": "pending",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "30.0",
-                "issuer": "st0x",
-                "network": "base",
-                "tx_hash": expected_tx_hash,
-                "created_at": "2024-01-15T10:30:00Z"
-            }]));
-    });
-
-    let completion_mock = server.mock(|when, then| {
-        when.method(GET).path(tokenization_requests_path());
-        then.status(200)
-            .header("content-type", "application/json")
-            .json_body(json!([{
-                "tokenization_request_id": "redeem_int_test",
-                "type": "redeem",
-                "status": "completed",
-                "underlying_symbol": "AAPL",
-                "token_symbol": "tAAPL",
-                "qty": "30.0",
-                "issuer": "st0x",
-                "network": "base",
-                "tx_hash": expected_tx_hash,
-                "created_at": "2024-01-15T10:30:00Z"
-            }]));
-    });
+    let (detection_mock, completion_mock) = setup_redemption_mocks(&server, expected_tx_hash);
 
     let service = Arc::new(
         create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
@@ -513,22 +561,6 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         (),
     ));
     let redeem_mgr = RedemptionManager::new(service, redemption_cqrs);
-
-    let inventory = Arc::new(RwLock::new(
-        InventoryView::default().with_equity(symbol.clone()),
-    ));
-    let (sender, receiver) = mpsc::channel(10);
-
-    let trigger = Arc::new(RebalancingTrigger::new(
-        test_trigger_config(),
-        pool.clone(),
-        TEST_ORDERBOOK,
-        TEST_ORDER_OWNER,
-        Arc::clone(&inventory),
-        sender,
-    ));
-
-    let position_cqrs = build_position_cqrs_with_trigger(&pool, &trigger);
 
     // Build inventory: 79 onchain, 20 offchain = 79.8% ratio -> TooMuchOnchain.
     // Without VaultRegistry seeded, the trigger silently skips Redemption operations.

@@ -137,9 +137,12 @@ struct AnvilOrderBook<P> {
     feed_id_cache: FeedIdCache,
 }
 
-/// Places USDC contract code and storage directly at `USDC_BASE` via Anvil cheatcodes,
-/// avoiding a temporary deploy + clone. Initializes the OpenZeppelin ERC20 storage layout:
-/// totalSupply, name ("USD Coin"), symbol ("USDC"), decimals (6), and balance for `owner`.
+/// Places USDC contract code and storage directly at the canonical `USDC_BASE` address
+/// via Anvil cheatcodes. The system hardcodes this address for vault discovery, so the
+/// contract must live at that exact address -- a normal deploy would land elsewhere.
+///
+/// Initializes the OpenZeppelin ERC20 storage layout: totalSupply, name ("USD Coin"),
+/// symbol ("USDC"), decimals (6), and balance for `owner`.
 async fn deploy_usdc_at_base<P: alloy::providers::Provider>(provider: &P, owner: Address) {
     let total_supply = U256::from(1_000_000_000_000u64);
 
@@ -248,24 +251,9 @@ async fn setup_anvil_orderbook() -> AnvilOrderBook<impl alloy::providers::Provid
 }
 
 impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
-    /// Creates an order on the real OrderBook, takes it, and parses the resulting
-    /// `TakeOrderV3` event through the full `OnchainTrade` pipeline.
-    ///
-    /// Equity tokens are deployed on first use per symbol and reused for subsequent calls.
-    /// For Buy direction, only `price = 1` is supported (Rain expression ioRatio limitation).
-    #[allow(clippy::too_many_lines)]
-    async fn take_order(
-        &mut self,
-        symbol: &str,
-        amount: f64,
-        direction: Direction,
-        price: u32,
-    ) -> AnvilTrade {
-        let orderbook =
-            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
-        let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
-
-        // Deploy equity token on first use per symbol, reuse on subsequent calls
+    /// Deploys an equity token for the given symbol if one doesn't already exist.
+    /// Returns the token address (newly deployed or cached from a previous call).
+    async fn ensure_equity_token(&mut self, symbol: &str) -> Address {
         if !self.equity_tokens.contains_key(symbol) {
             let equity = DeployableERC20::deploy(
                 &self.provider,
@@ -282,9 +270,83 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
                 .insert(symbol.to_string(), *equity.address());
         }
 
+        self.equity_tokens[symbol]
+    }
+
+    /// Parses a `TakeOrderV3` log through the full `OnchainTrade` pipeline and
+    /// wraps the result into an `AnvilTrade` ready for CQRS processing.
+    async fn take_log_to_anvil_trade(&self, take_log: &Log, order_owner: Address) -> AnvilTrade {
+        let take_event = take_log.log_decode::<TakeOrderV3>().unwrap().data().clone();
+        let take_event_for_queue = take_event.clone();
+
+        let log_metadata = Log {
+            inner: take_log.inner.clone(),
+            block_hash: take_log.block_hash,
+            block_number: take_log.block_number,
+            block_timestamp: take_log.block_timestamp,
+            transaction_hash: take_log.transaction_hash,
+            transaction_index: take_log.transaction_index,
+            log_index: take_log.log_index,
+            removed: false,
+        };
+
+        let trade = OnchainTrade::try_from_take_order_if_target_owner(
+            &self.symbol_cache,
+            &self.provider,
+            take_event,
+            log_metadata,
+            order_owner,
+            &self.feed_id_cache,
+        )
+        .await
+        .unwrap()
+        .expect("Pipeline should produce an OnchainTrade");
+
+        let tx_hash = trade.tx_hash;
+        let log_index = trade.log_index;
+
+        let queued_event = QueuedEvent {
+            id: Some(1),
+            tx_hash,
+            log_index,
+            block_number: take_log.block_number.unwrap_or(1),
+            event: TradeEvent::TakeOrderV3(Box::new(take_event_for_queue)),
+            processed: false,
+            created_at: None,
+            processed_at: None,
+            block_timestamp: trade.block_timestamp,
+        };
+
+        AnvilTrade {
+            trade,
+            queued_event,
+            tx_hash,
+            log_index,
+        }
+    }
+
+    /// Creates an order on the real OrderBook, takes it, and parses the resulting
+    /// `TakeOrderV3` event through the full `OnchainTrade` pipeline.
+    ///
+    /// Equity tokens are deployed on first use per symbol and reused for subsequent calls.
+    /// For Buy direction, only `price = 1` is supported (Rain expression ioRatio limitation).
+    async fn take_order(
+        &mut self,
+        symbol: &str,
+        amount: f64,
+        direction: Direction,
+        price: u32,
+    ) -> AnvilTrade {
+        // Mutable borrow must happen before creating orderbook/deployer instances
+        // which hold immutable references to self.provider.
+        let equity_addr = self.ensure_equity_token(symbol).await;
+
+        let orderbook =
+            IOrderBookV5::IOrderBookV5Instance::new(self.orderbook_addr, &self.provider);
+        let deployer_instance = Deployer::DeployerInstance::new(self.deployer_addr, &self.provider);
+
         let is_sell = direction == Direction::Sell;
         let usdc_addr = self.usdc_addr;
-        let equity_addr = self.equity_tokens[symbol];
         let usdc_total = amount * f64::from(price);
 
         // Format amounts with fixed precision to avoid f64 representation artifacts
@@ -407,7 +469,7 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             .await
             .unwrap();
 
-        // Take the order
+        // Take the order with permissive bounds (large maximumInput/maximumIORatio)
         let take_config = IOrderBookV5::TakeOrdersConfigV4 {
             minimumInput: B256::ZERO,
             maximumInput: Float::from_fixed_decimal_lossy(U256::from(1_000_000), 0)
@@ -440,7 +502,6 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             take_receipt.inner.logs()
         );
 
-        // Extract and parse TakeOrderV3 event
         let take_log = take_receipt
             .inner
             .logs()
@@ -448,53 +509,7 @@ impl<P: alloy::providers::Provider + Clone> AnvilOrderBook<P> {
             .find(|log| log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
             .expect("TakeOrderV3 event not found");
 
-        let take_event = take_log.log_decode::<TakeOrderV3>().unwrap().data().clone();
-        let take_event_for_queue = take_event.clone();
-
-        let log_metadata = Log {
-            inner: take_log.inner.clone(),
-            block_hash: take_log.block_hash,
-            block_number: take_log.block_number,
-            block_timestamp: take_log.block_timestamp,
-            transaction_hash: take_log.transaction_hash,
-            transaction_index: take_log.transaction_index,
-            log_index: take_log.log_index,
-            removed: false,
-        };
-
-        let trade = OnchainTrade::try_from_take_order_if_target_owner(
-            &self.symbol_cache,
-            &self.provider,
-            take_event,
-            log_metadata,
-            order.owner,
-            &self.feed_id_cache,
-        )
-        .await
-        .unwrap()
-        .expect("Pipeline should produce an OnchainTrade");
-
-        let tx_hash = trade.tx_hash;
-        let log_index = trade.log_index;
-
-        let queued_event = QueuedEvent {
-            id: Some(1),
-            tx_hash,
-            log_index,
-            block_number: take_log.block_number.unwrap_or(1),
-            event: TradeEvent::TakeOrderV3(Box::new(take_event_for_queue)),
-            processed: false,
-            created_at: None,
-            processed_at: None,
-            block_timestamp: trade.block_timestamp,
-        };
-
-        AnvilTrade {
-            trade,
-            queued_event,
-            tx_hash,
-            log_index,
-        }
+        self.take_log_to_anvil_trade(take_log, order.owner).await
     }
 }
 
