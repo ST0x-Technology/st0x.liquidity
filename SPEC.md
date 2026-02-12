@@ -130,19 +130,124 @@ excellent async ecosystem for handling concurrent trading flows.
 - Generate unique identifiers using transaction hash and log index for trade
   tracking
 
-#### Event-Driven Async Architecture
+#### Orchestration Architecture (apalis)
 
-- Each blockchain event spawns an independent async execution flow using Rust's
-  async/await
-- Multiple trade flows run concurrently without blocking each other
-- Handles throughput mismatch: fast onchain events vs slower broker
-  execution/confirmation
-- No artificial concurrency limits - process events as fast as they arrive
-- Tokio async runtime manages hundreds of concurrent trades efficiently on
-  limited hardware
-- Each flow: Parse Event -> Event Queue -> Deduplication Check -> Position
-  Accumulation -> Broker Execution (when threshold reached) -> Record Result
-- Failed flows retry independently without affecting other trades
+The system uses [apalis](https://github.com/geofmureithi/apalis) for job
+orchestration - a tower-based job processing framework with SQLite-backed
+persistence, retry/timeout/concurrency middleware, and typed dependency
+injection.
+
+##### Key Concepts
+
+- **Job**: A serializable work unit (a Rust struct implementing
+  `serde::Serialize + serde::Deserialize`). Jobs are pushed to a persistent
+  queue and processed by workers. Persistent jobs survive process crashes.
+- **Worker**: A `tower::Service` handler that processes jobs of a specific type.
+  Workers are constructed via `WorkerBuilder` with a middleware stack (retry,
+  timeout, concurrency limits, tracing) and receive dependencies through
+  `Data<T>` injection.
+- **Monitor**: A multi-worker lifecycle coordinator. A single `Monitor` instance
+  registers all workers and manages their collective startup, shutdown, and
+  health. The monitor runs as a single tokio task.
+- **Persistent Job Queue**: A SQLite-backed durable queue (`SqliteStorage<Job>`)
+  that persists pending jobs across restarts. Jobs are enqueued via `.push()`
+  and consumed by workers registered with that storage backend. apalis manages
+  its own tables (`Jobs`, `Workers`) via `SqliteStorage::setup()`.
+
+##### Job Taxonomy
+
+Jobs fall into three categories based on how they're triggered:
+
+1. **Persistent jobs** (event-driven): Pushed to the queue by other components
+   (WebSocket listener, CQRS query processors, other job handlers). Survive
+   crashes. Examples: `ProcessOnchainEvent`, `PlaceOffchainOrder`,
+   `ExecuteRebalancing`, `EnrichOnchainTrade`.
+
+2. **Cron jobs** (time-driven): Scheduled at fixed intervals via `apalis-cron`.
+   Examples: `PollOrderStatus`, `CheckAccumulatedPositions`, `PollInventory`,
+   `ExecutorMaintenance`, `ComputeAnalytics` (future).
+
+3. **Stream-driven** (external source): The DEX WebSocket listener remains a raw
+   `tokio::spawn` task since it's a stream producer, not a job consumer. It
+   pushes `ProcessOnchainEvent` jobs to the persistent queue as blockchain
+   events arrive.
+
+##### Dependency Injection Layers
+
+Dependency injection operates at two distinct layers, each with its own scope
+and purpose:
+
+- **apalis `Data<T>`** (orchestration layer): Injects dependencies into **job
+  handlers**. This is where a handler receives the tools it needs to do its
+  work: CQRS framework instances (`Cqrs<A>`), persistent job queues (to push
+  downstream jobs), and view repositories (to read projections). Configured via
+  `.data(x)` on the `WorkerBuilder`.
+
+- **CQRS `Aggregate::Services`** (domain layer): Injects dependencies into
+  **aggregate command handlers**. This is where an aggregate's `handle()` method
+  receives the external capabilities it needs to process a command: broker APIs,
+  blockchain providers, tokenization services. Configured once when constructing
+  the `CqrsFramework` (see `docs/cqrs.md`).
+
+The layers are hierarchical, not interchangeable. A job handler receives a
+`Cqrs<Position>` instance via `Data<T>`, then calls `cqrs.execute(command)`. The
+CQRS framework internally passes the aggregate's `Services` into `handle()`. The
+job handler never touches `Services` directly - it operates through the CQRS
+command interface.
+
+```mermaid
+graph TB
+    subgraph "apalis Data T (orchestration layer)"
+        JH[Job Handler]
+        JH -->|"Data&lt;Cqrs&lt;Position&gt;&gt;"| CQRS[Cqrs::execute]
+        JH -->|"Data&lt;SqliteStorage&lt;Job&gt;&gt;"| PQ[Push downstream jobs]
+        JH -->|"Data&lt;View&lt;A&gt;&gt;"| VR[Read projections]
+    end
+
+    subgraph "CQRS Services (domain layer)"
+        CQRS -->|"internally injects Services"| AH[Aggregate::handle]
+        AH -->|"&dyn Executor"| Broker[Broker API]
+        AH -->|"&dyn Provider"| RPC[Ethereum RPC]
+        AH -->|"&dyn Tokenizer"| TOK[Tokenization API]
+    end
+
+    style JH fill:#e1f5fe
+    style AH fill:#fff3e0
+```
+
+##### System Overview
+
+```mermaid
+graph TB
+    subgraph "Persistent Job Queue (SQLite)"
+        Q1[ProcessOnchainEvent]
+        Q2[PlaceOffchainOrder]
+        Q3[ExecuteRebalancing]
+        Q4[EnrichOnchainTrade]
+    end
+
+    subgraph "Monitor (single tokio task)"
+        W1[Trade Processing Worker]
+        W2[Order Placement Worker]
+        W3[Rebalancing Worker]
+        W4[Enrichment Worker]
+        W5[Cron Workers]
+    end
+
+    WS[DEX WebSocket<br/>tokio::spawn] -->|push| Q1
+    Q1 --> W1
+    W1 -->|push| Q2
+    W1 -->|push| Q4
+    Q2 --> W2
+    Q3 --> W3
+    Q4 --> W4
+    W5 -->|push| Q3
+
+    W1 -->|execute| CQRS[CQRS Aggregates]
+    W2 -->|execute| CQRS
+    W3 -->|execute| CQRS
+    W4 -->|execute| CQRS
+```
 
 ### Trade Execution
 
@@ -383,10 +488,10 @@ The system provides two top-level capabilities:
 ├───────────────────────────────────────────────────────────────────────┤
 │                                                                       │
 │  st0x-hedge                            st0x-rebalance                 │
-│  ├─ Conductor                          ├─ Rebalancer                  │
-│  ├─ Accumulator                        ├─ Trigger logic               │
+│  ├─ Conductor (apalis orchestration)   ├─ Rebalancer                  │
+│  ├─ Job handlers                       ├─ Trigger logic               │
 │  ├─ Position tracking                  ├─ Mint/Redeem managers        │
-│  └─ Queue processing                   └─ CQRS aggregates             │
+│  └─ CQRS aggregates                    └─ CQRS aggregates             │
 │                                                                       │
 │  depends on: execution                 depends on: tokenization,      │
 │                                                    bridge, vault      │
@@ -2556,124 +2661,181 @@ enum Resolution {
 This would provide complete audit trail for all manual interventions and allow
 proper tracking of asset movements that required manual resolution.
 
-### Event Processing Flow
+### Job Processing Flows
 
-#### OnChain Event Processing
+This section describes how apalis jobs orchestrate the system's event
+processing, replacing the previous conductor-based `tokio::spawn` tasks. Each
+job is a serializable struct pushed to a persistent SQLite queue and processed
+by a dedicated worker with typed `Data<T>` dependencies.
 
-**Current Flow** (Event-driven with Conductor):
+#### Job Types
+
+| Job                         | Type          | Replaces                           | Concurrency    | Retry | Timeout |
+| --------------------------- | ------------- | ---------------------------------- | -------------- | ----- | ------- |
+| `ProcessOnchainEvent`       | Persistent    | Event processor + queue processor  | 1 (ordered)    | 3     | 30s     |
+| `PlaceOffchainOrder`        | Persistent    | Queue processor (broker execution) | 1 (per symbol) | 3     | 60s     |
+| `EnrichOnchainTrade`        | Persistent    | Inline Pyth extraction             | unbounded      | 5     | 120s    |
+| `ExecuteRebalancing`        | Persistent    | Rebalancer task                    | 1              | 3     | 300s    |
+| `PollOrderStatus`           | Cron (5s)     | Order poller task                  | 1              | 0     | 30s     |
+| `CheckAccumulatedPositions` | Cron (10s)    | Position checker task              | 1              | 0     | 30s     |
+| `PollInventory`             | Cron (60s)    | Inventory poller task              | 1              | 0     | 60s     |
+| `ExecutorMaintenance`       | Cron (30min)  | Executor maintenance task          | 1              | 1     | 60s     |
+| `ComputeAnalytics`          | Cron (future) | Reporter binary                    | 1              | 1     | 300s    |
+
+#### Job Dependency Graph
+
+```mermaid
+graph TD
+    WS[DEX WebSocket Listener<br/>tokio::spawn] -->|push| POE[ProcessOnchainEvent]
+
+    POE -->|push| PFO[PlaceOffchainOrder]
+    POE -->|push| EOT[EnrichOnchainTrade]
+
+    POS[PollOrderStatus<br/>cron 5s] -.->|reads| Broker[Broker API]
+    CAP[CheckAccumulatedPositions<br/>cron 10s] -->|push| PFO
+
+    RT[RebalancingTrigger<br/>CQRS Query] -->|push| ER[ExecuteRebalancing]
+
+    PI[PollInventory<br/>cron 60s] -.->|reads| Broker
+    EM[ExecutorMaintenance<br/>cron 30min] -.->|calls| Broker
+
+    CA[ComputeAnalytics<br/>cron, future] -.->|reads| Views[CQRS Views]
+
+    POE -->|execute| OT_AGG[OnChainTrade Aggregate]
+    POE -->|execute| P_AGG[Position Aggregate]
+    PFO -->|execute| OO_AGG[OffchainOrder Aggregate]
+    PFO -->|execute| P_AGG
+    EOT -->|execute| OT_AGG
+    POS -->|execute| OO_AGG
+    POS -->|execute| P_AGG
+    ER -->|execute| Rebalance_AGG[UsdcRebalance Aggregate]
+    PI -->|execute| INV_AGG[InventorySnapshot Aggregate]
+
+    style WS fill:#e1f5fe
+    style RT fill:#fff3e0
+    style CA fill:#f3e5f5,stroke-dasharray: 5 5
+```
+
+#### Trade Processing Pipeline
+
+The core latency-sensitive path: blockchain event to hedge order placement.
 
 ```mermaid
 sequenceDiagram
     participant BC as Blockchain
-    participant DER as DEX Event Receiver
-    participant EP as Event Processor
-    participant Q as Event Queue (SQLite)
-    participant QP as Queue Processor
-    participant Acc as Accumulator
+    participant WS as DEX WebSocket
+    participant Q as Persistent Queue
+    participant POE as ProcessOnchainEvent
+    participant OT as OnChainTrade Agg
+    participant P as Position Agg
+    participant PFO as PlaceOffchainOrder
+    participant OO as OffchainOrder Agg
     participant Broker as Broker API
-    participant OP as Order Poller
-    participant PC as Position Checker
 
-    BC->>DER: ClearV2/TakeOrderV2 event
-    DER->>EP: Send via channel
-    EP->>Q: Enqueue event
+    BC->>WS: ClearV2/TakeOrderV2
+    WS->>Q: push ProcessOnchainEvent
 
-    loop Process Queue
-        QP->>Q: Get next unprocessed
-        Q-->>QP: Queued event
-        QP->>QP: Convert to OnchainTrade
-        QP->>Acc: Process trade
-        Acc->>Acc: Update accumulators
-        alt Threshold met
-            Acc-->>QP: Create pending execution
-            QP->>Broker: Place market order
-        end
-        QP->>Q: Mark processed
+    Q->>POE: dequeue
+    POE->>OT: OnChainTradeCommand::Witness
+    OT-->>POE: OnChainTradeEvent::Filled
+    POE->>P: PositionCommand::AcknowledgeOnChainFill
+    alt Threshold met
+        P-->>POE: [OnChainOrderFilled, OffChainOrderPlaced]
+        POE->>Q: push PlaceOffchainOrder
+    else Threshold not met
+        P-->>POE: [OnChainOrderFilled]
     end
+    POE->>Q: push EnrichOnchainTrade
 
-    loop Poll Orders
-        OP->>Broker: Get order status
-        Broker-->>OP: Order filled
-        OP->>Acc: Update execution status
-    end
+    Q->>PFO: dequeue
+    PFO->>Broker: Place market order
+    PFO->>OO: OffchainOrderCommand::ConfirmSubmission
+    OO-->>PFO: OffchainOrderEvent::Submitted
 
-    loop Periodic Check
-        PC->>Acc: Check accumulated positions
-        alt Position ready
-            PC->>Broker: Execute accumulated order
-        end
-    end
+    Note over Broker,OO: Order fill detected by PollOrderStatus cron
+    PFO->>OO: OffchainOrderCommand::CompleteFill
+    OO-->>PFO: OffchainOrderEvent::Filled
+    PFO->>P: PositionCommand::CompleteOffChainOrder
+    P-->>PFO: PositionEvent::OffChainOrderFilled
 ```
 
-**New Flow** (CQRS/ES with Managers):
+#### Enrichment Pipeline
+
+Decoupled from the trade pipeline to avoid blocking latency-sensitive hedging on
+slow RPC calls. Currently extracts Pyth oracle reference prices; designed to
+accommodate future enrichment sources.
 
 ```mermaid
 sequenceDiagram
-    participant BC as Blockchain
-    participant App as Application Layer
-    participant OT as OnChainTrade Aggregate
-    participant TM as TradeManager
-    participant P as Position Aggregate
-    participant OM as OrderManager
-    participant OO as OffchainOrder Aggregate
-    participant Broker as Broker API
-    participant Views as Views
+    participant Q as Persistent Queue
+    participant EOT as EnrichOnchainTrade
+    participant RPC as Ethereum RPC
+    participant OT as OnChainTrade Agg
 
-    BC->>App: Blockchain Event
-    App->>App: Parse
-    App->>OT: OnChainTradeCommand::Witness
-    OT->>OT: handle()
-    OT-->>App: OnChainTradeEvent::Filled
-    App->>Views: Persist & Publish
-
-    App->>TM: OnChainTradeEvent::Filled
-    TM->>TM: Extract trade data
-    TM->>P: PositionCommand::AcknowledgeOnChainFill
-    P->>P: Check threshold
-    alt Threshold not met
-        P-->>TM: [PositionEvent::OnChainOrderFilled]
-    else Threshold met
-        P-->>TM: [PositionEvent::OnChainOrderFilled,<br/>PositionEvent::OffChainOrderPlaced]
-    end
-    TM->>Views: Persist & Update
-
-    TM->>OM: PositionEvent::OffChainOrderPlaced
-    OM->>Broker: Execute trade
-    OM->>OO: OffchainOrderCommand::ConfirmSubmission
-    OO-->>OM: OffchainOrderEvent::Submitted
-    OM->>Views: Persist
-    OM->>OM: Poll for fill
-    OM->>OO: OffchainOrderCommand::CompleteFill
-    OO-->>OM: OffchainOrderEvent::Filled
-    OM->>Views: Persist & Publish
-
-    OM->>P: PositionCommand::CompleteOffChainOrder
-    P-->>OM: PositionEvent::OffChainOrderFilled
-    OM->>Views: Update
-
-    Note over App,Views: Metadata enrichment (async)
-    App->>App: Extract Pyth Price
-    App->>OT: OnChainTradeCommand::Enrich
-    OT-->>App: OnChainTradeEvent::Enriched
-    App->>Views: Update OnChainTradeView
+    Q->>EOT: dequeue
+    EOT->>RPC: debug_traceTransaction
+    RPC-->>EOT: Pyth price data
+    EOT->>OT: OnChainTradeCommand::Enrich
+    OT-->>EOT: OnChainTradeEvent::Enriched
 ```
 
-#### Manager Pattern
+#### Rebalancing Pipeline
 
-Managers coordinate between aggregates by subscribing to events and sending
-commands. They can be stateless (simple event->command reactions) or stateful
-(long-running processes with state).
+The `RebalancingTrigger` is a CQRS `Query` implementation registered on the
+Position and InventorySnapshot aggregates. When it observes events indicating a
+rebalancing condition, it pushes an `ExecuteRebalancing` job to the persistent
+queue instead of sending to an mpsc channel.
 
-**TradeManager**: Stateless - listens to OnChainTradeEvent::Filled and sends
-PositionCommand::AcknowledgeOnChainFill
+```mermaid
+sequenceDiagram
+    participant CQRS as CQRS Framework
+    participant RT as RebalancingTrigger<br/>(Query impl)
+    participant Q as Persistent Queue
+    participant ER as ExecuteRebalancing
+    participant R as UsdcRebalance Agg
+    participant Ext as External APIs
 
-**OrderManager**: Stateful - manages broker order lifecycle:
+    CQRS->>RT: dispatch(PositionEvent/InventoryEvent)
+    RT->>RT: Evaluate rebalancing condition
+    alt Rebalancing needed
+        RT->>Q: push ExecuteRebalancing
+    end
 
-- Listens to PositionEvent::OffChainOrderPlaced
-- Executes broker API calls
-- Polls for order completion
-- Tracks in-flight orders
-- Sends commands to OffchainOrder and Position aggregates
+    Q->>ER: dequeue
+    ER->>R: UsdcRebalanceCommand::Initialize
+    R-->>ER: UsdcRebalanceEvent::Initialized
+    ER->>Ext: Execute transfers
+    ER->>R: UsdcRebalanceCommand::Complete
+    R-->>ER: UsdcRebalanceEvent::Completed
+```
+
+#### Data Flow by Aggregate
+
+Which jobs write to which aggregates, and which jobs read from their views:
+
+| Aggregate         | Written by                                               | Read by                                                                  |
+| ----------------- | -------------------------------------------------------- | ------------------------------------------------------------------------ |
+| OnChainTrade      | ProcessOnchainEvent, EnrichOnchainTrade                  | ComputeAnalytics (future)                                                |
+| Position          | ProcessOnchainEvent, PlaceOffchainOrder, PollOrderStatus | CheckAccumulatedPositions, RebalancingTrigger, ComputeAnalytics (future) |
+| OffchainOrder     | PlaceOffchainOrder, PollOrderStatus                      | PollOrderStatus, ComputeAnalytics (future)                               |
+| InventorySnapshot | PollInventory                                            | RebalancingTrigger                                                       |
+| UsdcRebalance     | ExecuteRebalancing                                       | Dashboard (future)                                                       |
+| Mint / Redemption | ExecuteRebalancing                                       | Dashboard (future)                                                       |
+
+#### Market Hours Handling
+
+The apalis `Monitor` coordinates market-hours lifecycle for all workers. The DEX
+WebSocket listener runs 24/7 (crypto markets never close), but broker-facing
+workers respect market hours:
+
+- **Always active**: ProcessOnchainEvent, EnrichOnchainTrade, PollInventory
+- **Market hours only**: PlaceOffchainOrder, PollOrderStatus,
+  CheckAccumulatedPositions, ExecuteRebalancing, ExecutorMaintenance
+
+Market hours filtering is implemented as tower middleware on the relevant
+workers, rejecting jobs outside trading hours (jobs remain in the queue and are
+retried when markets reopen). The Monitor's graceful shutdown ensures in-flight
+jobs complete before the process exits.
 
 #### Future Consideration: Reorg Handling
 
