@@ -11,13 +11,18 @@ use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlite_es::SqliteCqrs;
 use tracing::warn;
 
 use st0x_execution::{ArithmeticError, Direction, FractionalShares, SupportedExecutor, Symbol};
 
-use crate::lifecycle::{Lifecycle, LifecycleError};
+use crate::lifecycle::{Lifecycle, LifecycleError, SqliteQuery};
 use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
 use crate::threshold::{ExecutionThreshold, Usdc};
+
+pub(crate) type PositionAggregate = Lifecycle<Position, ArithmeticError<FractionalShares>>;
+pub(crate) type PositionCqrs = SqliteCqrs<PositionAggregate>;
+pub(crate) type PositionQuery = SqliteQuery<Position, ArithmeticError<FractionalShares>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Position {

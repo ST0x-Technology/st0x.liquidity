@@ -55,7 +55,7 @@ use crate::tokenized_equity_mint::TokenizationRequestId;
 
 /// SQLite-backed event store for EquityRedemption aggregates.
 pub(crate) type RedemptionEventStore =
-    PersistedEventStore<SqliteEventRepository, Lifecycle<EquityRedemption, Never>>;
+    PersistedEventStore<SqliteEventRepository, Lifecycle<EquityRedemption>>;
 
 /// Unique identifier for a redemption aggregate instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +214,7 @@ pub(crate) enum EquityRedemption {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<EquityRedemption, Never> {
+impl Aggregate for Lifecycle<EquityRedemption> {
     type Command = EquityRedemptionCommand;
     type Event = EquityRedemptionEvent;
     type Error = EquityRedemptionError;
@@ -259,7 +259,7 @@ impl Aggregate for Lifecycle<EquityRedemption, Never> {
     }
 }
 
-impl Lifecycle<EquityRedemption, Never> {
+impl Lifecycle<EquityRedemption> {
     fn handle_send_tokens(
         &self,
         symbol: &Symbol,

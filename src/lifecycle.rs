@@ -84,7 +84,7 @@ pub(crate) enum Never {}
 /// - `E`: The custom error type for domain-specific failures (e.g., `ArithmeticError`).
 ///   Use [`Never`] for entities with no fallible operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) enum Lifecycle<T, E> {
+pub(crate) enum Lifecycle<T, E = Never> {
     /// No events have been applied yet. This is the default state.
     Uninitialized,
 

@@ -1,6 +1,7 @@
 //! OffchainOrder CQRS/ES aggregate for tracking broker
 //! order lifecycle: Pending -> Submitted -> Filled/Failed.
 
+use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use cqrs_es::{Aggregate, DomainEvent, EventEnvelope, View};
@@ -9,10 +10,14 @@ use sqlite_es::SqliteCqrs;
 use tracing::error;
 use uuid::Uuid;
 
-use st0x_execution::{Direction, FractionalShares, SupportedExecutor, Symbol};
+use st0x_execution::{
+    Direction, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor, Symbol,
+};
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
+pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder>;
+pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExecutionId(pub(crate) i64);
@@ -375,7 +380,7 @@ impl OffchainOrder {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<OffchainOrder, Never> {
+impl Aggregate for Lifecycle<OffchainOrder> {
     type Command = OffchainOrderCommand;
     type Event = OffchainOrderEvent;
     type Error = OffchainOrderError;
@@ -555,8 +560,8 @@ impl Default for OffchainOrderView {
     }
 }
 
-impl View<Lifecycle<OffchainOrder, Never>> for OffchainOrderView {
-    fn update(&mut self, event: &EventEnvelope<Lifecycle<OffchainOrder, Never>>) {
+impl View<Lifecycle<OffchainOrder>> for OffchainOrderView {
+    fn update(&mut self, event: &EventEnvelope<Lifecycle<OffchainOrder>>) {
         let Ok(execution_id) = event.aggregate_id.parse::<i64>() else {
             error!(
                 aggregate_id = %event.aggregate_id,
@@ -716,6 +721,30 @@ impl OffchainOrderView {
 
         *status = ExecutionStatus::Failed;
         *completed_at = Some(failed_at);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub(crate) struct OffchainOrderId(Uuid);
+
+impl std::fmt::Display for OffchainOrderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for OffchainOrderId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl OffchainOrderId {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
     }
 }
 

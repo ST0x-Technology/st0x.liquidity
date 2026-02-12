@@ -58,7 +58,7 @@ use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
 /// SQLite-backed event store for TokenizedEquityMint aggregates.
 pub(crate) type MintEventStore =
-    PersistedEventStore<SqliteEventRepository, Lifecycle<TokenizedEquityMint, Never>>;
+    PersistedEventStore<SqliteEventRepository, Lifecycle<TokenizedEquityMint>>;
 
 /// Alpaca issuer request identifier returned when a tokenization request is accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -265,7 +265,7 @@ pub(crate) enum TokenizedEquityMint {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
+impl Aggregate for Lifecycle<TokenizedEquityMint> {
     type Command = TokenizedEquityMintCommand;
     type Event = TokenizedEquityMintEvent;
     type Error = TokenizedEquityMintError;
@@ -314,7 +314,7 @@ impl Aggregate for Lifecycle<TokenizedEquityMint, Never> {
     }
 }
 
-impl Lifecycle<TokenizedEquityMint, Never> {
+impl Lifecycle<TokenizedEquityMint> {
     fn handle_request_mint(
         &self,
         symbol: &Symbol,

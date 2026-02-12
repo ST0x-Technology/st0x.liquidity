@@ -123,7 +123,7 @@ impl OnChainTrade {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<OnChainTrade, Never> {
+impl Aggregate for Lifecycle<OnChainTrade> {
     type Command = OnChainTradeCommand;
     type Event = OnChainTradeEvent;
     type Error = OnChainTradeError;
@@ -329,7 +329,7 @@ mod tests {
         aggregate_id: &str,
         sequence: usize,
         event: OnChainTradeEvent,
-    ) -> EventEnvelope<Lifecycle<OnChainTrade, Never>> {
+    ) -> EventEnvelope<Lifecycle<OnChainTrade>> {
         EventEnvelope {
             aggregate_id: aggregate_id.to_string(),
             sequence,
@@ -340,7 +340,7 @@ mod tests {
 
     #[tokio::test]
     async fn witness_command_creates_filled_event() {
-        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -361,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn enrich_command_creates_enriched_event() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -396,7 +396,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_enrich_twice() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -438,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_enrich_before_fill() {
-        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let aggregate = Lifecycle::<OnChainTrade>::default();
         let now = Utc::now();
 
         let pyth_price = PythPrice {
@@ -461,7 +461,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_event_with_enrichment() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -494,7 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn migrated_event_without_enrichment() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -520,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_witness_twice_when_filled() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -552,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn cannot_witness_when_enriched() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -611,7 +611,7 @@ mod tests {
             filled_at: now,
         };
 
-        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        let mut view = Lifecycle::<OnChainTrade>::default();
         assert!(matches!(view, Lifecycle::Uninitialized));
 
         view.update(&make_envelope("0x1234:0", 1, event));
@@ -690,7 +690,7 @@ mod tests {
             migrated_at: now,
         };
 
-        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        let mut view = Lifecycle::<OnChainTrade>::default();
         view.update(&make_envelope("0x1234:0", 1, event));
 
         let Lifecycle::Live(trade) = view else {
@@ -720,7 +720,7 @@ mod tests {
             migrated_at: now,
         };
 
-        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        let mut view = Lifecycle::<OnChainTrade>::default();
         view.update(&make_envelope("0x1234:0", 1, event));
 
         let Lifecycle::Live(trade) = view else {
@@ -733,7 +733,7 @@ mod tests {
 
     #[test]
     fn transition_on_uninitialized_fails() {
-        let mut view = Lifecycle::<OnChainTrade, Never>::default();
+        let mut view = Lifecycle::<OnChainTrade>::default();
 
         let pyth_price = PythPrice {
             value: "150250000".to_string(),
@@ -755,7 +755,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_command_creates_migrated_event() {
-        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -798,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_command_with_enrichment() {
-        let aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -838,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cannot_migrate_when_already_filled() {
-        let mut aggregate = Lifecycle::<OnChainTrade, Never>::default();
+        let mut aggregate = Lifecycle::<OnChainTrade>::default();
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 

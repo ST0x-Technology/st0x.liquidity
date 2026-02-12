@@ -10,7 +10,7 @@ use tracing::warn;
 use st0x_dto::{EventStoreEntry, ServerMessage};
 
 use crate::equity_redemption::EquityRedemption;
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -57,33 +57,33 @@ impl EventBroadcaster {
 }
 
 #[async_trait]
-impl Query<Lifecycle<TokenizedEquityMint, Never>> for EventBroadcaster {
+impl Query<Lifecycle<TokenizedEquityMint>> for EventBroadcaster {
     async fn dispatch(
         &self,
         _aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
     ) {
         self.broadcast_events(events);
     }
 }
 
 #[async_trait]
-impl Query<Lifecycle<EquityRedemption, Never>> for EventBroadcaster {
+impl Query<Lifecycle<EquityRedemption>> for EventBroadcaster {
     async fn dispatch(
         &self,
         _aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) {
         self.broadcast_events(events);
     }
 }
 
 #[async_trait]
-impl Query<Lifecycle<UsdcRebalance, Never>> for EventBroadcaster {
+impl Query<Lifecycle<UsdcRebalance>> for EventBroadcaster {
     async fn dispatch(
         &self,
         _aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) {
         self.broadcast_events(events);
     }
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn event_store_entry_from_envelope_extracts_fields() {
-        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> = EventEnvelope {
+        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint>> = EventEnvelope {
             aggregate_id: "test-aggregate-123".to_string(),
             sequence: 5,
             payload: make_mint_requested("AAPL", 100),
@@ -143,7 +143,7 @@ mod tests {
         let (sender, mut receiver) = broadcast::channel(16);
         let broadcaster = EventBroadcaster::new(sender);
 
-        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> = EventEnvelope {
+        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint>> = EventEnvelope {
             aggregate_id: "mint-123".to_string(),
             sequence: 1,
             payload: make_mint_requested("TSLA", 50),
@@ -170,7 +170,7 @@ mod tests {
         let (sender, _) = broadcast::channel::<ServerMessage>(16);
         let broadcaster = EventBroadcaster::new(sender);
 
-        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> = EventEnvelope {
+        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint>> = EventEnvelope {
             aggregate_id: "mint-456".to_string(),
             sequence: 1,
             payload: make_mint_requested("GOOG", 10),
@@ -185,7 +185,7 @@ mod tests {
         let (sender, mut receiver) = broadcast::channel(16);
         let broadcaster = EventBroadcaster::new(sender);
 
-        let events: Vec<EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>> = vec![
+        let events: Vec<EventEnvelope<Lifecycle<TokenizedEquityMint>>> = vec![
             EventEnvelope {
                 aggregate_id: "mint-multi".to_string(),
                 sequence: 1,
@@ -202,7 +202,7 @@ mod tests {
             },
         ];
 
-        Query::<Lifecycle<TokenizedEquityMint, Never>>::dispatch(
+        Query::<Lifecycle<TokenizedEquityMint>>::dispatch(
             &broadcaster,
             "mint-multi",
             &events,
@@ -237,14 +237,14 @@ mod tests {
         let (sender, mut receiver) = broadcast::channel(16);
         let broadcaster = EventBroadcaster::new(sender);
 
-        let events: Vec<EventEnvelope<Lifecycle<EquityRedemption, Never>>> = vec![EventEnvelope {
+        let events: Vec<EventEnvelope<Lifecycle<EquityRedemption>>> = vec![EventEnvelope {
             aggregate_id: "redemption-123".to_string(),
             sequence: 1,
             payload: make_redemption_completed(),
             metadata: HashMap::new(),
         }];
 
-        Query::<Lifecycle<EquityRedemption, Never>>::dispatch(
+        Query::<Lifecycle<EquityRedemption>>::dispatch(
             &broadcaster,
             "redemption-123",
             &events,
@@ -268,14 +268,14 @@ mod tests {
         let (sender, mut receiver) = broadcast::channel(16);
         let broadcaster = EventBroadcaster::new(sender);
 
-        let events: Vec<EventEnvelope<Lifecycle<UsdcRebalance, Never>>> = vec![EventEnvelope {
+        let events: Vec<EventEnvelope<Lifecycle<UsdcRebalance>>> = vec![EventEnvelope {
             aggregate_id: "usdc-456".to_string(),
             sequence: 1,
             payload: make_usdc_withdrawal_confirmed(),
             metadata: HashMap::new(),
         }];
 
-        Query::<Lifecycle<UsdcRebalance, Never>>::dispatch(&broadcaster, "usdc-456", &events).await;
+        Query::<Lifecycle<UsdcRebalance>>::dispatch(&broadcaster, "usdc-456", &events).await;
 
         let msg = receiver.recv().await.expect("should receive message");
 
@@ -296,7 +296,7 @@ mod tests {
         let mut receiver3 = sender.subscribe();
         let broadcaster = EventBroadcaster::new(sender);
 
-        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> = EventEnvelope {
+        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint>> = EventEnvelope {
             aggregate_id: "multi-sub".to_string(),
             sequence: 1,
             payload: make_mint_requested("MSFT", 100),
@@ -338,7 +338,7 @@ mod tests {
         let (sender, mut receiver) = broadcast::channel(16);
         let broadcaster = EventBroadcaster::new(sender);
 
-        let events: Vec<EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>> = vec![];
+        let events: Vec<EventEnvelope<Lifecycle<TokenizedEquityMint>>> = vec![];
 
         broadcaster.broadcast_events(&events);
 
@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn event_store_entry_serializes_correctly() {
-        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> = EventEnvelope {
+        let envelope: EventEnvelope<Lifecycle<TokenizedEquityMint>> = EventEnvelope {
             aggregate_id: "serialize-test".to_string(),
             sequence: 42,
             payload: make_mint_requested("GOOG", 10),

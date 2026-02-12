@@ -23,7 +23,7 @@ use st0x_execution::{AlpacaBrokerApiCtx, ArithmeticError, FractionalShares, Symb
 use crate::alpaca_wallet::AlpacaAccountId;
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionEvent};
 use crate::inventory::{ImbalanceThreshold, InventoryView, InventoryViewError};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::position::{Position, PositionEvent};
 use crate::threshold::Usdc;
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
@@ -204,11 +204,11 @@ impl Query<Lifecycle<Position, ArithmeticError<FractionalShares>>> for Rebalanci
 }
 
 #[async_trait]
-impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
+impl Query<Lifecycle<TokenizedEquityMint>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
     ) {
         let Some((symbol, quantity)) = Self::extract_mint_info(events) else {
             warn!(aggregate_id = %aggregate_id, "No MintRequested event found in mint dispatch");
@@ -231,11 +231,11 @@ impl Query<Lifecycle<TokenizedEquityMint, Never>> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
+impl Query<Lifecycle<EquityRedemption>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) {
         let Some((symbol, quantity)) = Self::extract_redemption_info(events) else {
             warn!(aggregate_id = %aggregate_id, "No TokensSent event found in redemption dispatch");
@@ -258,11 +258,11 @@ impl Query<Lifecycle<EquityRedemption, Never>> for RebalancingTrigger {
 }
 
 #[async_trait]
-impl Query<Lifecycle<UsdcRebalance, Never>> for RebalancingTrigger {
+impl Query<Lifecycle<UsdcRebalance>> for RebalancingTrigger {
     async fn dispatch(
         &self,
         aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) {
         let Some((direction, amount)) = Self::extract_usdc_rebalance_info(events) else {
             warn!(aggregate_id = %aggregate_id, "No Initiated event found in USDC rebalance dispatch");
@@ -338,7 +338,7 @@ impl RebalancingTrigger {
         let repo = SqliteEventRepository::new(self.pool.clone());
         let store = PersistedEventStore::<
             SqliteEventRepository,
-            Lifecycle<VaultRegistry, Never>,
+            Lifecycle<VaultRegistry>,
         >::new_event_store(repo);
 
         let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
@@ -414,7 +414,7 @@ impl RebalancingTrigger {
     }
 
     fn extract_mint_info(
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
     ) -> Option<(Symbol, FractionalShares)> {
         for envelope in events {
             if let TokenizedEquityMintEvent::MintRequested {
@@ -429,7 +429,7 @@ impl RebalancingTrigger {
     }
 
     fn has_terminal_mint_event(
-        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint, Never>>],
+        events: &[EventEnvelope<Lifecycle<TokenizedEquityMint>>],
     ) -> bool {
         events.iter().any(|envelope| {
             matches!(
@@ -465,7 +465,7 @@ impl RebalancingTrigger {
     }
 
     fn extract_redemption_info(
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) -> Option<(Symbol, FractionalShares)> {
         for envelope in events {
             if let EquityRedemptionEvent::TokensSent {
@@ -480,7 +480,7 @@ impl RebalancingTrigger {
     }
 
     fn has_terminal_redemption_event(
-        events: &[EventEnvelope<Lifecycle<EquityRedemption, Never>>],
+        events: &[EventEnvelope<Lifecycle<EquityRedemption>>],
     ) -> bool {
         events.iter().any(|envelope| {
             matches!(
@@ -516,7 +516,7 @@ impl RebalancingTrigger {
     }
 
     fn extract_usdc_rebalance_info(
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) -> Option<(RebalanceDirection, Usdc)> {
         for envelope in events {
             if let UsdcRebalanceEvent::Initiated {
@@ -530,7 +530,7 @@ impl RebalancingTrigger {
     }
 
     fn has_terminal_usdc_rebalance_event(
-        events: &[EventEnvelope<Lifecycle<UsdcRebalance, Never>>],
+        events: &[EventEnvelope<Lifecycle<UsdcRebalance>>],
     ) -> bool {
         // IMPORTANT: This function must work with incremental dispatch - cqrs-es 0.4
         // only sends newly committed events to Query::dispatch, not full history.
@@ -769,7 +769,7 @@ mod tests {
     const TEST_TOKEN: Address = address!("0x1234567890123456789012345678901234567890");
 
     async fn seed_vault_registry(pool: &SqlitePool, symbol: &Symbol) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
 
         cqrs.execute(
@@ -1031,7 +1031,7 @@ mod tests {
 
     fn make_mint_envelope(
         event: TokenizedEquityMintEvent,
-    ) -> EventEnvelope<Lifecycle<TokenizedEquityMint, Never>> {
+    ) -> EventEnvelope<Lifecycle<TokenizedEquityMint>> {
         EventEnvelope {
             aggregate_id: "mint-123".to_string(),
             sequence: 1,
@@ -1221,7 +1221,7 @@ mod tests {
 
     fn make_redemption_envelope(
         event: EquityRedemptionEvent,
-    ) -> EventEnvelope<Lifecycle<EquityRedemption, Never>> {
+    ) -> EventEnvelope<Lifecycle<EquityRedemption>> {
         EventEnvelope {
             aggregate_id: "redemption-123".to_string(),
             sequence: 1,
@@ -1452,7 +1452,7 @@ mod tests {
 
     fn make_usdc_rebalance_envelope(
         event: UsdcRebalanceEvent,
-    ) -> EventEnvelope<Lifecycle<UsdcRebalance, Never>> {
+    ) -> EventEnvelope<Lifecycle<UsdcRebalance>> {
         EventEnvelope {
             aggregate_id: "usdc-rebalance-123".to_string(),
             sequence: 1,
@@ -1947,7 +1947,7 @@ mod tests {
         );
     }
 
-    type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance, Never>;
+    type UsdcRebalanceLifecycle = Lifecycle<UsdcRebalance>;
     type UsdcRebalanceMemStore = MemStore<UsdcRebalanceLifecycle>;
 
     /// Spy query that records all dispatched events for verification.

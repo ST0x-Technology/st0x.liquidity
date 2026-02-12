@@ -73,7 +73,7 @@ use crate::threshold::Usdc;
 
 /// SQLite-backed event store for UsdcRebalance aggregates.
 pub(crate) type UsdcEventStore =
-    PersistedEventStore<SqliteEventRepository, Lifecycle<UsdcRebalance, Never>>;
+    PersistedEventStore<SqliteEventRepository, Lifecycle<UsdcRebalance>>;
 
 /// Unique identifier for a USDC rebalance operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -478,7 +478,7 @@ pub(crate) enum UsdcRebalance {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<UsdcRebalance, Never> {
+impl Aggregate for Lifecycle<UsdcRebalance> {
     type Command = UsdcRebalanceCommand;
     type Event = UsdcRebalanceEvent;
     type Error = UsdcRebalanceError;
@@ -555,7 +555,7 @@ impl Aggregate for Lifecycle<UsdcRebalance, Never> {
     }
 }
 
-impl Lifecycle<UsdcRebalance, Never> {
+impl Lifecycle<UsdcRebalance> {
     fn handle_initiate_conversion(
         &self,
         direction: &RebalanceDirection,

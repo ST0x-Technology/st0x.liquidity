@@ -16,7 +16,7 @@ use st0x_execution::Symbol;
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
-pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry, Never>;
+pub(crate) type VaultRegistryAggregate = Lifecycle<VaultRegistry>;
 
 /// Equity vault holding tokenized shares (base asset for a trading pair).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,7 +118,7 @@ impl VaultRegistry {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<VaultRegistry, Never> {
+impl Aggregate for Lifecycle<VaultRegistry> {
     type Command = VaultRegistryCommand;
     type Event = VaultRegistryEvent;
     type Error = VaultRegistryError;

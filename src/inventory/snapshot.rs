@@ -82,7 +82,7 @@ impl InventorySnapshot {
 }
 
 #[async_trait]
-impl Aggregate for Lifecycle<InventorySnapshot, Never> {
+impl Aggregate for Lifecycle<InventorySnapshot> {
     type Command = InventorySnapshotCommand;
     type Event = InventorySnapshotEvent;
     type Error = InventorySnapshotError;
@@ -214,7 +214,7 @@ mod tests {
 
     use super::*;
 
-    type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
+    type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 
     fn test_symbol(s: &str) -> Symbol {
         Symbol::new(s).unwrap()

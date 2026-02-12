@@ -17,7 +17,7 @@ use super::{Mint, MintError};
 use crate::alpaca_tokenization::{
     AlpacaTokenizationService, TokenizationRequest, TokenizationRequestStatus,
 };
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::tokenized_equity_mint::{
     IssuerRequestId, ReceiptId, TokenizedEquityMint, TokenizedEquityMintCommand,
 };
@@ -25,20 +25,20 @@ use crate::tokenized_equity_mint::{
 pub(crate) struct MintManager<P, ES>
 where
     P: Provider + Clone,
-    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
+    ES: EventStore<Lifecycle<TokenizedEquityMint>>,
 {
     service: Arc<AlpacaTokenizationService<P>>,
-    cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint>, ES>>,
 }
 
 impl<P, ES> MintManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>>,
+    ES: EventStore<Lifecycle<TokenizedEquityMint>>,
 {
     pub(crate) fn new(
         service: Arc<AlpacaTokenizationService<P>>,
-        cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint, Never>, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<TokenizedEquityMint>, ES>>,
     ) -> Self {
         Self { service, cqrs }
     }
@@ -214,7 +214,7 @@ fn decimal_to_u256_18_decimals(value: FractionalShares) -> Result<U256, MintErro
 impl<P, ES> Mint for MintManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<TokenizedEquityMint, Never>> + Send + Sync,
+    ES: EventStore<Lifecycle<TokenizedEquityMint>> + Send + Sync,
     ES::AC: Send,
 {
     async fn execute_mint(
@@ -245,8 +245,8 @@ mod tests {
     };
 
     type TestCqrs = CqrsFramework<
-        Lifecycle<TokenizedEquityMint, Never>,
-        MemStore<Lifecycle<TokenizedEquityMint, Never>>,
+        Lifecycle<TokenizedEquityMint>,
+        MemStore<Lifecycle<TokenizedEquityMint>>,
     >;
 
     fn create_test_cqrs() -> Arc<TestCqrs> {

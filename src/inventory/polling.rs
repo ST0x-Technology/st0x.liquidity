@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotError,
 };
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::onchain::vault::{VaultError, VaultId, VaultService};
 use crate::vault_registry::{VaultRegistry, VaultRegistryError};
 use alloy::primitives::Address;
@@ -25,7 +25,7 @@ use sqlx::SqlitePool;
 use st0x_execution::{Executor, InventoryResult};
 use tracing::debug;
 
-pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot, Never>;
+pub(crate) type InventorySnapshotAggregate = Lifecycle<InventorySnapshot>;
 
 /// Error type for inventory polling operations.
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +127,7 @@ where
         let repo = SqliteEventRepository::new(self.pool.clone());
         let store = PersistedEventStore::<
             SqliteEventRepository,
-            Lifecycle<VaultRegistry, Never>,
+            Lifecycle<VaultRegistry>,
         >::new_event_store(repo);
 
         let aggregate_id = VaultRegistry::aggregate_id(self.orderbook, self.order_owner);
@@ -612,7 +612,7 @@ mod tests {
         vault_id: B256,
         symbol: Symbol,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
 
         cqrs.execute(
@@ -634,7 +634,7 @@ mod tests {
         order_owner: Address,
         vault_id: B256,
     ) {
-        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry, Never>>(pool.clone(), vec![], ());
+        let cqrs = sqlite_cqrs::<Lifecycle<VaultRegistry>>(pool.clone(), vec![], ());
         let aggregate_id = VaultRegistry::aggregate_id(orderbook, order_owner);
 
         cqrs.execute(

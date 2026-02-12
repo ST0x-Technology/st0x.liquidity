@@ -15,25 +15,25 @@ use tracing::{info, instrument, warn};
 use super::{Redeem, RedemptionError};
 use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 
 pub(crate) struct RedemptionManager<P, ES>
 where
     P: Provider + Clone,
-    ES: EventStore<Lifecycle<EquityRedemption, Never>>,
+    ES: EventStore<Lifecycle<EquityRedemption>>,
 {
     service: Arc<AlpacaTokenizationService<P>>,
-    cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption>, ES>>,
 }
 
 impl<P, ES> RedemptionManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<EquityRedemption, Never>>,
+    ES: EventStore<Lifecycle<EquityRedemption>>,
 {
     pub(crate) fn new(
         service: Arc<AlpacaTokenizationService<P>>,
-        cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption, Never>, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<EquityRedemption>, ES>>,
     ) -> Self {
         Self { service, cqrs }
     }
@@ -164,7 +164,7 @@ where
 impl<P, ES> Redeem for RedemptionManager<P, ES>
 where
     P: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<EquityRedemption, Never>> + Send + Sync,
+    ES: EventStore<Lifecycle<EquityRedemption>> + Send + Sync,
     ES::AC: Send,
 {
     async fn execute_redemption(
@@ -193,8 +193,8 @@ mod tests {
     };
 
     type TestCqrs = CqrsFramework<
-        Lifecycle<EquityRedemption, Never>,
-        MemStore<Lifecycle<EquityRedemption, Never>>,
+        Lifecycle<EquityRedemption>,
+        MemStore<Lifecycle<EquityRedemption>>,
     >;
 
     fn create_test_cqrs() -> Arc<TestCqrs> {

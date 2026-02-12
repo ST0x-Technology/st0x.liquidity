@@ -10,7 +10,7 @@ use tracing::warn;
 
 use super::snapshot::InventorySnapshot;
 use super::view::InventoryView;
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 
 /// Query handler that forwards InventorySnapshot events to a shared InventoryView.
 ///
@@ -27,11 +27,11 @@ impl InventorySnapshotQuery {
 }
 
 #[async_trait]
-impl Query<Lifecycle<InventorySnapshot, Never>> for InventorySnapshotQuery {
+impl Query<Lifecycle<InventorySnapshot>> for InventorySnapshotQuery {
     async fn dispatch(
         &self,
         _aggregate_id: &str,
-        events: &[EventEnvelope<Lifecycle<InventorySnapshot, Never>>],
+        events: &[EventEnvelope<Lifecycle<InventorySnapshot>>],
     ) {
         let now = Utc::now();
 
@@ -85,7 +85,7 @@ mod tests {
 
     fn create_event_envelope(
         event: InventorySnapshotEvent,
-    ) -> EventEnvelope<Lifecycle<InventorySnapshot, Never>> {
+    ) -> EventEnvelope<Lifecycle<InventorySnapshot>> {
         EventEnvelope {
             aggregate_id: "test".to_string(),
             sequence: 1,

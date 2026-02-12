@@ -30,7 +30,7 @@ use crate::cctp::{
 };
 use crate::dashboard::EventBroadcaster;
 use crate::equity_redemption::{EquityRedemption, RedemptionEventStore};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::onchain::http_client_with_retry;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::tokenized_equity_mint::{MintEventStore, TokenizedEquityMint};
@@ -70,9 +70,9 @@ type ConfiguredRebalancer<BP> = Rebalancer<
 >;
 
 pub(crate) struct RebalancingCqrsFrameworks {
-    pub(crate) mint: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-    pub(crate) redemption: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
-    pub(crate) usdc: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+    pub(crate) mint: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint>>>,
+    pub(crate) redemption: Arc<SqliteCqrs<Lifecycle<EquityRedemption>>>,
+    pub(crate) usdc: Arc<SqliteCqrs<Lifecycle<UsdcRebalance>>>,
 }
 
 /// Spawns the rebalancing infrastructure.
@@ -202,9 +202,9 @@ where
         ctx: &RebalancingCtx,
         market_maker_wallet: Address,
         operation_receiver: mpsc::Receiver<TriggeredOperation>,
-        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint, Never>>>,
-        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption, Never>>>,
-        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance, Never>>>,
+        mint_cqrs: Arc<SqliteCqrs<Lifecycle<TokenizedEquityMint>>>,
+        redemption_cqrs: Arc<SqliteCqrs<Lifecycle<EquityRedemption>>>,
+        usdc_cqrs: Arc<SqliteCqrs<Lifecycle<UsdcRebalance>>>,
     ) -> ConfiguredRebalancer<BP> {
         let mint_manager = Arc::new(MintManager::new(self.tokenization.clone(), mint_cqrs));
 
@@ -234,13 +234,13 @@ where
 pub(crate) fn build_rebalancing_queries<A>(
     trigger: Arc<RebalancingTrigger>,
     event_broadcast: Option<broadcast::Sender<ServerMessage>>,
-) -> Vec<Box<dyn Query<Lifecycle<A, Never>>>>
+) -> Vec<Box<dyn Query<Lifecycle<A>>>>
 where
-    Lifecycle<A, Never>: cqrs_es::Aggregate,
-    RebalancingTrigger: Query<Lifecycle<A, Never>>,
-    EventBroadcaster: Query<Lifecycle<A, Never>>,
+    Lifecycle<A>: cqrs_es::Aggregate,
+    RebalancingTrigger: Query<Lifecycle<A>>,
+    EventBroadcaster: Query<Lifecycle<A>>,
 {
-    let mut queries: Vec<Box<dyn Query<Lifecycle<A, Never>>>> = vec![Box::new(trigger)];
+    let mut queries: Vec<Box<dyn Query<Lifecycle<A>>>> = vec![Box::new(trigger)];
 
     if let Some(sender) = event_broadcast {
         queries.push(Box::new(EventBroadcaster::new(sender)));

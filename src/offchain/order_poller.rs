@@ -4,13 +4,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use num_traits::ToPrimitive;
 use rand::Rng;
-use sqlite_es::SqliteCqrs;
 use sqlx::SqlitePool;
 use tokio::time::{Interval, interval};
 use tracing::{debug, error, info, warn};
 
 use st0x_execution::{
-    ArithmeticError, ExecutionError, Executor, ExecutorOrderId, FractionalShares, OrderState,
+    ExecutionError, Executor, ExecutorOrderId, FractionalShares, OrderState,
     OrderStatus, PersistenceError, Symbol,
 };
 
@@ -20,7 +19,7 @@ use crate::offchain_order::{
     OffchainOrder, OffchainOrderCommand, OffchainOrderCqrs, OffchainOrderId, PriceCents,
 };
 use crate::onchain::OnChainError;
-use crate::position::{Position, PositionCommand};
+use crate::position::{Position, PositionCommand, PositionCqrs};
 
 /// Order polling errors for order status monitoring.
 #[derive(Debug, thiserror::Error)]

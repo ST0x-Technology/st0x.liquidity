@@ -18,7 +18,7 @@ use crate::alpaca_wallet::{
     AlpacaTransferId, AlpacaWalletService, TokenSymbol, Transfer, TransferStatus,
 };
 use crate::cctp::{AttestationResponse, BridgeDirection, BurnReceipt, CctpBridge, MintReceipt};
-use crate::lifecycle::{Lifecycle, Never};
+use crate::lifecycle::Lifecycle;
 use crate::onchain::vault::{VaultId, VaultService};
 use crate::threshold::Usdc;
 use crate::usdc_rebalance::{
@@ -35,13 +35,13 @@ use st0x_execution::{AlpacaBrokerApi, ConversionDirection};
 pub(crate) struct UsdcRebalanceManager<BP, ES>
 where
     BP: Provider + Clone,
-    ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
+    ES: EventStore<Lifecycle<UsdcRebalance>>,
 {
     alpaca_broker: Arc<AlpacaBrokerApi>,
     alpaca_wallet: Arc<AlpacaWalletService>,
     cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
     vault: Arc<VaultService<BP>>,
-    cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
+    cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance>, ES>>,
     /// Market maker's (our) wallet address
     /// Used for Alpaca withdrawals, CCTP bridging, and vault deposits.
     market_maker_wallet: Address,
@@ -71,14 +71,14 @@ type EthereumHttpProvider = FillProvider<
 impl<BP, ES> UsdcRebalanceManager<BP, ES>
 where
     BP: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<UsdcRebalance, Never>>,
+    ES: EventStore<Lifecycle<UsdcRebalance>>,
 {
     pub(crate) fn new(
         alpaca_broker: Arc<AlpacaBrokerApi>,
         alpaca_wallet: Arc<AlpacaWalletService>,
         cctp_bridge: Arc<CctpBridge<EthereumHttpProvider, BP>>,
         vault: Arc<VaultService<BP>>,
-        cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance, Never>, ES>>,
+        cqrs: Arc<CqrsFramework<Lifecycle<UsdcRebalance>, ES>>,
         market_maker_wallet: Address,
         vault_id: VaultId,
     ) -> Self {
@@ -873,7 +873,7 @@ fn u256_to_usdc(amount: U256) -> Result<Usdc, UsdcRebalanceManagerError> {
 impl<BP, ES> UsdcRebalanceTrait for UsdcRebalanceManager<BP, ES>
 where
     BP: Provider + Clone + Send + Sync + 'static,
-    ES: EventStore<Lifecycle<UsdcRebalance, Never>> + Send + Sync,
+    ES: EventStore<Lifecycle<UsdcRebalance>> + Send + Sync,
     ES::AC: Send,
 {
     async fn execute_alpaca_to_base(
@@ -943,7 +943,7 @@ mod tests {
     >;
 
     type TestCqrs =
-        CqrsFramework<Lifecycle<UsdcRebalance, Never>, MemStore<Lifecycle<UsdcRebalance, Never>>>;
+        CqrsFramework<Lifecycle<UsdcRebalance>, MemStore<Lifecycle<UsdcRebalance>>>;
 
     fn create_test_cqrs() -> Arc<TestCqrs> {
         let store = MemStore::default();
