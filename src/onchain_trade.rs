@@ -323,7 +323,7 @@ pub(crate) struct PythPrice {
 
 #[cfg(test)]
 mod tests {
-    use cqrs_es::EventEnvelope;
+    use cqrs_es::{EventEnvelope, View};
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
 
