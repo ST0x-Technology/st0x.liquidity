@@ -439,7 +439,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
         .clone();
     let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
 
-    assert_events(
+    let events = assert_events(
         &pool,
         &[
             ExpectedEvent::new(
@@ -490,6 +490,21 @@ async fn equity_offchain_imbalance_triggers_mint() {
         ],
     )
     .await;
+
+    // Verify event payloads capture the correct data from the API interaction
+    let mint_requested = &events[5].payload["MintRequested"];
+    assert_eq!(
+        mint_requested["symbol"].as_str().unwrap(),
+        "AAPL",
+        "MintRequested should target the correct symbol"
+    );
+
+    let mint_accepted = &events[6].payload["MintAccepted"];
+    assert_eq!(
+        mint_accepted["tokenization_request_id"].as_str().unwrap(),
+        "mint_int_test",
+        "MintAccepted should capture the request ID from the API response"
+    );
 }
 
 /// Verifies the full equity redemption rebalancing pipeline: position CQRS
@@ -642,7 +657,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         .clone();
     let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
 
-    assert_events(
+    let events = assert_events(
         &pool,
         &[
             ExpectedEvent::new(
@@ -688,6 +703,26 @@ async fn equity_onchain_imbalance_triggers_redemption() {
         ],
     )
     .await;
+
+    // Verify event payloads capture the correct data from the onchain + API interaction
+    let tokens_sent = &events[5].payload["TokensSent"];
+    assert_eq!(
+        tokens_sent["symbol"].as_str().unwrap(),
+        "AAPL",
+        "TokensSent should target the correct symbol"
+    );
+    assert_eq!(
+        tokens_sent["tx_hash"].as_str().unwrap(),
+        format!("{expected_tx_hash:#x}"),
+        "TokensSent tx_hash should match the deterministic Anvil hash"
+    );
+
+    let detected = &events[6].payload["Detected"];
+    assert_eq!(
+        detected["tokenization_request_id"].as_str().unwrap(),
+        "redeem_int_test",
+        "Detected should capture the request ID from the API response"
+    );
 
     assert_eq!(mint.calls(), 0, "Mint should not have been called");
     assert_eq!(
@@ -847,4 +882,249 @@ async fn usdc_onchain_imbalance_triggers_base_to_alpaca() {
         0,
         "alpaca_to_base should not have been called"
     );
+}
+
+/// Tests that when the Alpaca mint API returns an HTTP error, the pipeline
+/// correctly emits MintRequested followed by MintRejected events, capturing
+/// the error context in the rejection reason.
+#[tokio::test]
+async fn mint_api_failure_produces_rejected_event() {
+    let EquityTriggerFixture {
+        pool,
+        symbol,
+        aggregate_id,
+        trigger,
+        position_cqrs,
+        receiver,
+    } = setup_equity_trigger().await;
+
+    // Build inventory: 20 onchain, 80 offchain = 20% ratio -> TooMuchOffchain
+    build_imbalanced_inventory(Imbalance::Equity {
+        position_cqrs: &position_cqrs,
+        aggregate_id: &aggregate_id,
+        onchain: dec!(20),
+        offchain: dec!(80),
+    })
+    .await;
+
+    let token = Address::from_slice(&keccak256(symbol.to_string().as_bytes())[..20]);
+    seed_vault_registry(&pool, &symbol, token).await;
+
+    let server = MockServer::start();
+    let (_anvil, endpoint, key) = setup_anvil();
+    let service = Arc::new(
+        create_test_service_from_mock(&server, &endpoint, &key, TEST_REDEMPTION_WALLET).await,
+    );
+
+    let mint_cqrs = Arc::new(sqlite_cqrs::<Lifecycle<TokenizedEquityMint, Never>>(
+        pool.clone(),
+        vec![],
+        (),
+    ));
+    let mint_mgr = MintManager::new(service, mint_cqrs);
+
+    // Mock returns HTTP 500 for the mint request
+    let mint_mock = server.mock(|when, then| {
+        when.method(POST).path(tokenization_mint_path());
+        then.status(500).body("Internal Server Error");
+    });
+
+    let rebalancer = Rebalancer::new(
+        Arc::new(mint_mgr),
+        Arc::new(MockRedeem::new()),
+        Arc::new(MockUsdcRebalance::new()),
+        receiver,
+        Address::ZERO,
+    );
+
+    // One more sell triggers the CQRS -> trigger -> Mint flow
+    position_cqrs
+        .execute(
+            &aggregate_id,
+            PositionCommand::AcknowledgeOnChainFill {
+                trade_id: crate::position::TradeId {
+                    tx_hash: TxHash::random(),
+                    log_index: 2,
+                },
+                amount: FractionalShares::new(dec!(1)),
+                direction: Direction::Sell,
+                price_usdc: dec!(150.0),
+                block_timestamp: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+
+    drop(trigger);
+    drop(position_cqrs);
+
+    rebalancer.run().await;
+
+    mint_mock.assert();
+
+    let events = fetch_events(&pool).await;
+    let mint_agg_id = events
+        .iter()
+        .find(|e| e.aggregate_type == "TokenizedEquityMint")
+        .expect("Expected at least one TokenizedEquityMint event")
+        .aggregate_id
+        .clone();
+    let vault_agg_id = VaultRegistry::aggregate_id(TEST_ORDERBOOK, TEST_ORDER_OWNER);
+
+    // MintRequested is emitted before the API call, MintRejected after the failure
+    let events = assert_events(
+        &pool,
+        &[
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OffChainOrderPlaced",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OffChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "VaultRegistry",
+                &vault_agg_id,
+                "VaultRegistryEvent::EquityVaultDiscovered",
+            ),
+            ExpectedEvent::new(
+                "Position",
+                &aggregate_id,
+                "PositionEvent::OnChainOrderFilled",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::MintRequested",
+            ),
+            ExpectedEvent::new(
+                "TokenizedEquityMint",
+                &mint_agg_id,
+                "TokenizedEquityMintEvent::MintRejected",
+            ),
+        ],
+    )
+    .await;
+
+    let rejected = &events[6].payload["MintRejected"];
+    assert!(
+        rejected["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Alpaca API error"),
+        "MintRejected should mention API error, got: {}",
+        rejected["reason"]
+    );
+}
+
+/// Tests that threshold configuration controls trigger sensitivity: the same
+/// USDC inventory (35% onchain) is within bounds for a wide threshold but
+/// outside bounds for a tight threshold, causing only the tight config to
+/// dispatch a rebalancing operation.
+#[tokio::test]
+async fn threshold_config_controls_trigger_sensitivity() {
+    let pool = setup_test_db().await;
+
+    // Inventory: 350 onchain / 650 offchain = 35% onchain ratio.
+    // Wide config (deviation=0.4, bounds: 10%-90%): 35% is within bounds -> no trigger.
+    // Tight config (deviation=0.1, bounds: 40%-60%): 35% is below 40% -> triggers.
+
+    // Scenario 1: Wide threshold - no trigger
+    {
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        build_imbalanced_inventory(Imbalance::Usdc {
+            inventory: &inventory,
+            onchain: Usdc(dec!(350)),
+            offchain: Usdc(dec!(650)),
+        })
+        .await;
+
+        let (sender, mut receiver) = mpsc::channel(10);
+        let wide_config = RebalancingTriggerConfig {
+            equity_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.4),
+            },
+            usdc_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.4),
+            },
+        };
+        let trigger = RebalancingTrigger::new(
+            wide_config,
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            Arc::clone(&inventory),
+            sender,
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        drop(trigger);
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "Wide threshold (10%-90%) should not trigger at 35% onchain ratio"
+        );
+    }
+
+    // Scenario 2: Tight threshold - triggers
+    {
+        let inventory = Arc::new(RwLock::new(InventoryView::default()));
+
+        build_imbalanced_inventory(Imbalance::Usdc {
+            inventory: &inventory,
+            onchain: Usdc(dec!(350)),
+            offchain: Usdc(dec!(650)),
+        })
+        .await;
+
+        let (sender, mut receiver) = mpsc::channel(10);
+        let tight_config = RebalancingTriggerConfig {
+            equity_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.1),
+            },
+            usdc_threshold: ImbalanceThreshold {
+                target: dec!(0.5),
+                deviation: dec!(0.1),
+            },
+        };
+        let trigger = RebalancingTrigger::new(
+            tight_config,
+            pool.clone(),
+            TEST_ORDERBOOK,
+            TEST_ORDER_OWNER,
+            Arc::clone(&inventory),
+            sender,
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        drop(trigger);
+
+        let op = receiver
+            .try_recv()
+            .expect("Tight threshold (40%-60%) should trigger at 35% onchain ratio");
+
+        // Excess = target_onchain - actual_onchain = 500 - 350 = $150
+        match op {
+            TriggeredOperation::UsdcAlpacaToBase { amount } => {
+                assert_eq!(
+                    amount,
+                    Usdc(dec!(150)),
+                    "Excess should be $150 (target $500 - actual $350)"
+                );
+            }
+            _ => panic!("Expected UsdcAlpacaToBase operation"),
+        }
+    }
 }
