@@ -112,11 +112,9 @@ mod tests {
     use st0x_execution::Direction;
 
     use super::*;
-    use st0x_execution::ExecutorOrderId;
-
-    use crate::offchain_order::{OffchainOrder, PriceCents};
+    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
-    use st0x_execution::FractionalShares;
+    use crate::shares::FractionalShares;
 
     fn shares(n: i64) -> FractionalShares {
         FractionalShares::new(Decimal::from(n))
@@ -138,10 +136,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            offchain_order_id: OffchainOrder::aggregate_id(),
+            execution_id: ExecutionId(1),
             shares_filled,
             direction,
-            executor_order_id: ExecutorOrderId::new("ORD1"),
+            broker_order_id: BrokerOrderId("ORD1".to_string()),
             price_cents: PriceCents(15000),
             broker_timestamp: chrono::Utc::now(),
         }

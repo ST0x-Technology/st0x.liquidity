@@ -10,11 +10,12 @@ pub(crate) mod mock;
 use alloy::primitives::{Address, U256};
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::Symbol;
 use thiserror::Error;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
 use crate::equity_redemption::{EquityRedemptionError, RedemptionAggregateId};
+use crate::shares::FractionalShares;
 
 #[derive(Debug, Error)]
 pub(crate) enum RedemptionError {

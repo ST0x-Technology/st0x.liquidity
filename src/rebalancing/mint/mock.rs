@@ -2,11 +2,12 @@
 
 use alloy::primitives::Address;
 use async_trait::async_trait;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::Symbol;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::{Mint, MintError};
+use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::IssuerRequestId;
 
 /// Parameters captured from the last `execute_mint` call.

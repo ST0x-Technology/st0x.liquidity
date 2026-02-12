@@ -10,10 +10,11 @@ pub(crate) mod mock;
 use alloy::primitives::Address;
 use async_trait::async_trait;
 use cqrs_es::AggregateError;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::Symbol;
 use thiserror::Error;
 
 use crate::alpaca_tokenization::AlpacaTokenizationError;
+use crate::shares::FractionalShares;
 use crate::tokenized_equity_mint::{IssuerRequestId, TokenizedEquityMintError};
 
 #[derive(Debug, Error)]

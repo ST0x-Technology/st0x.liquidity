@@ -1,9 +1,3 @@
-//! Onchain trade conversion and persistence. Converts raw blockchain events
-//! ([`TradeEvent`]) into structured [`OnchainTrade`]s with symbol resolution,
-//! price calculation, and Pyth oracle pricing. Also provides vault extraction
-//! utilities for the vault registry.
-
-use alloy::primitives::ruint::FromUintError;
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::Log;
@@ -11,17 +5,16 @@ use alloy::sol_types::SolEvent;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
-use st0x_execution::{Direction, FractionalShares, Positive};
-use std::num::ParseFloatError;
 use tracing::{error, warn};
 
-use super::OnChainError;
 use super::pyth::PythPricing;
 use crate::bindings::IOrderBookV5::{ClearV3, OrderV4, TakeOrderV3};
-use crate::onchain::EvmCtx;
+use crate::error::{OnChainError, TradeValidationError};
+use crate::onchain::EvmConfig;
 use crate::onchain::io::{TokenizedEquitySymbol, TradeDetails, Usdc};
 use crate::onchain::pyth::FeedIdCache;
 use crate::symbol::cache::SymbolCache;
+use st0x_execution::Direction;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TradeEvent {
@@ -151,137 +144,6 @@ pub struct OnchainTrade {
 }
 
 impl OnchainTrade {
-    pub async fn save_within_transaction(
-        &self,
-        sql_tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    ) -> Result<i64, OnChainError> {
-        let tx_hash_str = self.tx_hash.to_string();
-        let log_index_i64 = i64::try_from(self.log_index)?;
-
-        let direction_str = self.direction.as_str();
-        let symbol_str = self.symbol.to_string();
-        let block_timestamp_naive = self.block_timestamp.map(|dt| dt.naive_utc());
-
-        let gas_used_i64 = self.gas_used.and_then(|g| i64::try_from(g).ok());
-        let effective_gas_price_i64 = self.effective_gas_price.and_then(|p| i64::try_from(p).ok());
-
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO onchain_trades (
-                tx_hash,
-                log_index,
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                block_timestamp,
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-                pyth_confidence,
-                pyth_exponent,
-                pyth_publish_time
-            )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-            "#,
-            tx_hash_str,
-            log_index_i64,
-            symbol_str,
-            self.amount,
-            direction_str,
-            self.price,
-            block_timestamp_naive,
-            gas_used_i64,
-            effective_gas_price_i64,
-            self.pyth_price,
-            self.pyth_confidence,
-            self.pyth_exponent,
-            self.pyth_publish_time
-        )
-        .execute(&mut **sql_tx)
-        .await?;
-
-        Ok(result.last_insert_rowid())
-    }
-
-    #[cfg(test)]
-    pub async fn find_by_tx_hash_and_log_index(
-        pool: &sqlx::SqlitePool,
-        tx_hash: B256,
-        log_index: u64,
-    ) -> Result<Self, OnChainError> {
-        let tx_hash_str = tx_hash.to_string();
-        let log_index_i64 = i64::try_from(log_index).expect("test log_index should fit in i64");
-
-        let row = sqlx::query!(
-            "
-            SELECT
-                id,
-                tx_hash,
-                log_index,
-                symbol,
-                amount,
-                direction,
-                price_usdc,
-                created_at,
-                block_timestamp,
-                gas_used,
-                effective_gas_price,
-                pyth_price,
-                pyth_confidence,
-                pyth_exponent,
-                pyth_publish_time
-            FROM onchain_trades
-            WHERE tx_hash = ?1 AND log_index = ?2
-            ",
-            tx_hash_str,
-            log_index_i64
-        )
-        .fetch_one(pool)
-        .await?;
-
-        let tx_hash = row
-            .tx_hash
-            .parse()
-            .expect("test db should have valid tx_hash");
-
-        let direction = row.direction.parse()?;
-
-        Ok(Self {
-            id: Some(row.id),
-            tx_hash,
-            log_index: u64::try_from(row.log_index)
-                .expect("test db log_index should be non-negative"),
-            symbol: row.symbol.parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: row.amount,
-            direction,
-            price: Usdc::new(row.price_usdc).expect("db price_usdc should be non-negative"),
-            block_timestamp: row
-                .block_timestamp
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            created_at: row
-                .created_at
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-            gas_used: row.gas_used.and_then(|g| u64::try_from(g).ok()),
-            effective_gas_price: row.effective_gas_price.and_then(|p| u128::try_from(p).ok()),
-            pyth_price: row.pyth_price,
-            pyth_confidence: row.pyth_confidence,
-            pyth_exponent: row.pyth_exponent.and_then(|exp| i32::try_from(exp).ok()),
-            pyth_publish_time: row
-                .pyth_publish_time
-                .map(|naive_dt| DateTime::from_naive_utc_and_offset(naive_dt, Utc)),
-        })
-    }
-
-    #[cfg(test)]
-    pub async fn db_count(pool: &sqlx::SqlitePool) -> Result<i64, sqlx::Error> {
-        let row = sqlx::query!("SELECT COUNT(*) as count FROM onchain_trades")
-            .fetch_one(pool)
-            .await?;
-        Ok(row.count)
-    }
-
     /// Core parsing logic for converting blockchain events to trades
     pub(crate) async fn try_from_order_and_fill_details<P: Provider>(
         cache: &SymbolCache,
@@ -393,7 +255,7 @@ impl OnchainTrade {
         tx_hash: B256,
         provider: P,
         cache: &SymbolCache,
-        evm_ctx: &EvmCtx,
+        config: &EvmConfig,
         feed_id_cache: &FeedIdCache,
         order_owner: Address,
     ) -> Result<Option<Self>, OnChainError> {
@@ -401,7 +263,9 @@ impl OnchainTrade {
             .get_transaction_receipt(tx_hash)
             .await?
             .ok_or_else(|| {
-                OnChainError::Validation(TradeValidationError::TransactionNotFound(tx_hash))
+                OnChainError::Validation(crate::error::TradeValidationError::TransactionNotFound(
+                    tx_hash,
+                ))
             })?;
 
         let trades: Vec<_> = receipt
@@ -411,7 +275,7 @@ impl OnchainTrade {
             .filter(|log| {
                 (log.topic0() == Some(&ClearV3::SIGNATURE_HASH)
                     || log.topic0() == Some(&TakeOrderV3::SIGNATURE_HASH))
-                    && log.address() == evm_ctx.orderbook
+                    && log.address() == config.orderbook
             })
             .collect();
 
@@ -427,7 +291,7 @@ impl OnchainTrade {
                 log,
                 &provider,
                 cache,
-                evm_ctx,
+                config,
                 feed_id_cache,
                 order_owner,
             )
@@ -449,75 +313,11 @@ pub(crate) struct OrderFill {
     pub output_amount: B256,
 }
 
-/// Business logic validation errors for trade processing rules.
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum TradeValidationError {
-    #[error("No transaction hash found in log")]
-    NoTxHash,
-    #[error("No log index found in log")]
-    NoLogIndex,
-    #[error("No block number found in log")]
-    NoBlockNumber,
-    #[error("Integer conversion error: {0}")]
-    IntConversion(#[from] std::num::TryFromIntError),
-    #[error("Invalid IO index: {0}")]
-    InvalidIndex(#[from] FromUintError<usize>),
-    #[error("No input found at index: {0}")]
-    NoInputAtIndex(usize),
-    #[error("No output found at index: {0}")]
-    NoOutputAtIndex(usize),
-    #[error(
-        "Expected IO to contain USDC and one tokenized equity \
-         (t prefix, 0x or s1 suffix) but got {0} and {1}"
-    )]
-    InvalidSymbolConfiguration(String, String),
-    #[error(
-        "Could not fully allocate execution shares for \
-         symbol {symbol}. Remaining: {remaining_shares}"
-    )]
-    InsufficientTradeAllocation {
-        symbol: String,
-        remaining_shares: f64,
-    },
-    #[error("Failed to convert U256 to f64: {0}")]
-    U256ToF64(#[from] ParseFloatError),
-    #[error("Transaction not found: {0}")]
-    TransactionNotFound(B256),
-    #[error(
-        "Node provider issue: tx receipt missing or has no logs. \
-        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
-    )]
-    NodeReceiptMissing {
-        block_number: u64,
-        tx_hash: B256,
-        clear_log_index: u64,
-    },
-    #[error(
-        "Unexpected: tx receipt has ClearV3 but no AfterClearV2 (should be impossible). \
-        block={block_number}, tx={tx_hash}, clear_log_index={clear_log_index}"
-    )]
-    AfterClearMissingFromReceipt {
-        block_number: u64,
-        tx_hash: B256,
-        clear_log_index: u64,
-    },
-    #[error("Negative shares amount: {0}")]
-    NegativeShares(f64),
-    #[error("Share quantity {0} cannot be converted to f64")]
-    ShareConversionFailed(Positive<FractionalShares>),
-    #[error("Negative USDC amount: {0}")]
-    NegativeUsdc(f64),
-    #[error(
-        "Symbol '{0}' is not a tokenized equity (must start with 't' or end with '0x' or 's1')"
-    )]
-    NotTokenizedEquity(String),
-}
-
 async fn try_convert_log_to_onchain_trade<P: Provider>(
     log: &Log,
     provider: P,
     cache: &SymbolCache,
-    evm_ctx: &EvmCtx,
+    config: &EvmConfig,
     feed_id_cache: &FeedIdCache,
     order_owner: Address,
 ) -> Result<Option<OnchainTrade>, OnChainError> {
@@ -534,7 +334,7 @@ async fn try_convert_log_to_onchain_trade<P: Provider>(
 
     if let Ok(clear_event) = log.log_decode::<ClearV3>() {
         return OnchainTrade::try_from_clear_v3(
-            evm_ctx,
+            config,
             cache,
             &provider,
             clear_event.data().clone(),
@@ -578,57 +378,8 @@ mod tests {
 
     use super::*;
     use crate::bindings::IOrderBookV5;
-    use crate::onchain::EvmCtx;
+    use crate::onchain::EvmConfig;
     use crate::symbol::cache::SymbolCache;
-    use crate::test_utils::setup_test_db;
-
-    #[tokio::test]
-    async fn test_onchain_trade_save_within_transaction_and_find() {
-        let pool = setup_test_db().await;
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-            ),
-            log_index: 42,
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: 10.0,
-            direction: Direction::Sell,
-            price: Usdc::new(150.25).unwrap(),
-            block_timestamp: DateTime::from_timestamp(1_672_531_200, 0), // Jan 1, 2023 00:00:00 UTC
-            created_at: None,
-            gas_used: Some(21000),
-            effective_gas_price: Some(2_000_000_000), // 2 gwei
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-        let id = trade.save_within_transaction(&mut sql_tx).await.unwrap();
-        sql_tx.commit().await.unwrap();
-        assert!(id > 0);
-
-        let found =
-            OnchainTrade::find_by_tx_hash_and_log_index(&pool, trade.tx_hash, trade.log_index)
-                .await
-                .unwrap();
-
-        assert_eq!(found.tx_hash, trade.tx_hash);
-        assert_eq!(found.log_index, trade.log_index);
-        assert_eq!(found.symbol, trade.symbol);
-        assert!((found.amount - trade.amount).abs() < f64::EPSILON);
-        assert_eq!(found.direction, trade.direction);
-        assert_eq!(found.price, trade.price);
-        assert_eq!(found.block_timestamp, trade.block_timestamp);
-        assert_eq!(found.gas_used, trade.gas_used);
-        assert_eq!(found.effective_gas_price, trade.effective_gas_price);
-        assert!(found.id.is_some());
-        assert!(found.created_at.is_some());
-    }
 
     #[test]
     fn test_float_constants_from_v5_interface() {
@@ -729,126 +480,6 @@ mod tests {
         assert!((result - 0.5).abs() < f64::EPSILON);
     }
 
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_invalid_formats() {
-        let pool = setup_test_db().await;
-
-        // Attempt to insert invalid tx_hash format - should fail due to constraint
-        let insert_result = sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
-             VALUES ('invalid_hash', 1, 'TEST', 1.0, 'BUY', 1.0)"
-        )
-        .execute(&pool)
-        .await;
-
-        let err = insert_result.unwrap_err();
-        assert!(
-            matches!(err, sqlx::Error::Database(_)),
-            "Expected database constraint error, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_and_log_index_invalid_direction() {
-        let pool = setup_test_db().await;
-
-        let insert_result = sqlx::query!(
-            "INSERT INTO onchain_trades (tx_hash, log_index, symbol, amount, direction, price_usdc)
-             VALUES ('0x1234567890123456789012345678901234567890123456789012345678901234', 1, 'TEST', 1.0, 'INVALID', 1.0)"
-        )
-        .execute(&pool)
-        .await;
-
-        let err = insert_result.unwrap_err();
-        assert!(
-            matches!(err, sqlx::Error::Database(_)),
-            "Expected database constraint error for invalid direction, got: {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_save_within_transaction_constraint_violation() {
-        let pool = setup_test_db().await;
-
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
-            ),
-            log_index: 100,
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: 10.0,
-            direction: Direction::Buy,
-            price: Usdc::new(150.0).unwrap(),
-            block_timestamp: DateTime::from_timestamp(1_672_531_800, 0), // Jan 1, 2023 00:10:00 UTC
-            created_at: None,
-            gas_used: Some(50000), // Complex contract interaction
-            effective_gas_price: Some(1_500_000_000), // 1.5 gwei in wei
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        // Insert first trade
-        let mut sql_tx1 = pool.begin().await.unwrap();
-        trade.save_within_transaction(&mut sql_tx1).await.unwrap();
-        sql_tx1.commit().await.unwrap();
-
-        // Try to insert duplicate trade (same tx_hash and log_index)
-        let mut sql_tx2 = pool.begin().await.unwrap();
-        let err = trade
-            .save_within_transaction(&mut sql_tx2)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, OnChainError::Persistence(_)),
-            "Expected persistence error for duplicate trade, got: {err:?}"
-        );
-        sql_tx2.rollback().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_save_within_transaction_large_log_index_wrapping() {
-        let pool = setup_test_db().await;
-
-        // Test that extremely large log_index values are handled consistently
-        // u64::MAX will wrap to -1 when cast to i64
-        let trade = OnchainTrade {
-            id: None,
-            tx_hash: fixed_bytes!(
-                "0x2222222222222222222222222222222222222222222222222222222222222222"
-            ),
-            log_index: u64::MAX, // Will become -1 when cast to i64
-            symbol: "AAPL0x".parse::<TokenizedEquitySymbol>().unwrap(),
-            equity_token: Address::ZERO,
-            amount: 10.0,
-            direction: Direction::Buy,
-            price: Usdc::new(150.0).unwrap(),
-            block_timestamp: None,
-            created_at: None,
-            gas_used: None,
-            effective_gas_price: None,
-            pyth_price: None,
-            pyth_confidence: None,
-            pyth_exponent: None,
-            pyth_publish_time: None,
-        };
-
-        let mut sql_tx = pool.begin().await.unwrap();
-
-        let err = trade
-            .save_within_transaction(&mut sql_tx)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, OnChainError::IntConversion(_)),
-            "Expected integer conversion error for u64::MAX log_index, got: {err:?}"
-        );
-        sql_tx.rollback().await.unwrap();
-    }
-
     #[test]
     fn test_float_to_f64_precision_loss() {
         // Test with very large coefficient
@@ -905,7 +536,7 @@ mod tests {
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let cache = SymbolCache::default();
         let feed_id_cache = FeedIdCache::default();
-        let evm_ctx = EvmCtx {
+        let config = EvmConfig {
             ws_rpc_url: "ws://localhost:8545".parse().unwrap(),
             orderbook: Address::ZERO,
             order_owner: Some(Address::ZERO),
@@ -920,7 +551,7 @@ mod tests {
             tx_hash,
             provider,
             &cache,
-            &evm_ctx,
+            &config,
             &feed_id_cache,
             Address::ZERO,
         )
@@ -930,65 +561,6 @@ mod tests {
             result.unwrap_err(),
             OnChainError::Validation(TradeValidationError::TransactionNotFound(_))
         ));
-    }
-
-    #[tokio::test]
-    async fn test_find_by_tx_hash_database_error() {
-        let pool = setup_test_db().await;
-
-        // Close the pool to simulate database connection error
-        pool.close().await;
-
-        // Expected database connection error
-        OnchainTrade::find_by_tx_hash_and_log_index(
-            &pool,
-            fixed_bytes!("0x5555555555555555555555555555555555555555555555555555555555555555"),
-            1,
-        )
-        .await
-        .unwrap_err();
-    }
-
-    #[tokio::test]
-    async fn test_db_count_with_data() {
-        let pool = setup_test_db().await;
-
-        // Insert test data
-        for i in 0..5 {
-            let mut tx_hash_bytes = [0u8; 32];
-            tx_hash_bytes[0..31].copy_from_slice(&[
-                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
-                0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56,
-                0x78, 0x90, 0x12,
-            ]);
-            tx_hash_bytes[31] = i;
-
-            let trade = OnchainTrade {
-                id: None,
-                tx_hash: B256::from(tx_hash_bytes),
-                log_index: u64::from(i),
-                symbol: TokenizedEquitySymbol::parse(&format!("TEST{i}0x")).unwrap(),
-                equity_token: Address::ZERO,
-                amount: 10.0,
-                direction: Direction::Buy,
-                price: Usdc::new(150.0).unwrap(),
-                block_timestamp: None,
-                created_at: None,
-                gas_used: None,
-                effective_gas_price: None,
-                pyth_price: None,
-                pyth_confidence: None,
-                pyth_exponent: None,
-                pyth_publish_time: None,
-            };
-
-            let mut sql_tx = pool.begin().await.unwrap();
-            trade.save_within_transaction(&mut sql_tx).await.unwrap();
-            sql_tx.commit().await.unwrap();
-        }
-
-        let count = OnchainTrade::db_count(&pool).await.unwrap();
-        assert_eq!(count, 5);
     }
 
     fn make_io(token: Address, vault_id: B256) -> IOrderBookV5::IOV2 {

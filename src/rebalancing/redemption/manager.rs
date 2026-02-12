@@ -8,7 +8,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
 use async_trait::async_trait;
 use cqrs_es::{CqrsFramework, EventStore};
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::Symbol;
 use std::sync::Arc;
 use tracing::{info, instrument, warn};
 
@@ -16,6 +16,7 @@ use super::{Redeem, RedemptionError};
 use crate::alpaca_tokenization::{AlpacaTokenizationService, TokenizationRequestStatus};
 use crate::equity_redemption::{EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId};
 use crate::lifecycle::{Lifecycle, Never};
+use crate::shares::FractionalShares;
 
 pub(crate) struct RedemptionManager<P, ES>
 where
