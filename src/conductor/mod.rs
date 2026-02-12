@@ -820,9 +820,9 @@ async fn process_next_queued_event<P: Provider + Clone>(
         return Ok(None);
     };
 
-    let event_id = queued_event
-        .id
-        .ok_or(EventProcessingError::Queue(EventQueueError::MissingQueuedEventId))?;
+    let event_id = queued_event.id.ok_or(EventProcessingError::Queue(
+        EventQueueError::MissingQueuedEventId,
+    ))?;
 
     let onchain_trade = convert_event_to_trade(
         ctx,
@@ -1014,7 +1014,6 @@ async fn process_valid_trade(
     process_queued_trade(executor_type, pool, queued_event, event_id, trade, cqrs).await
 }
 
-
 async fn execute_witness_trade(
     onchain_trade_cqrs: &OnChainTradeCqrs,
     trade: &OnchainTrade,
@@ -1117,12 +1116,8 @@ async fn process_queued_trade(
 
     let base_symbol = trade.symbol.base();
 
-    let Some(params) = check_execution_readiness(
-        &cqrs.position_query,
-        base_symbol,
-        executor_type,
-    )
-    .await?
+    let Some(params) =
+        check_execution_readiness(&cqrs.position_query, base_symbol, executor_type).await?
     else {
         return Ok(None);
     };
@@ -1151,7 +1146,7 @@ async fn process_queued_trade(
         ),
     }
 
-    let offchain_agg_id = offchain_order_id.to_string();
+    let offchain_agg_id = OffchainOrder::aggregate_id(offchain_order_id);
 
     let command = OffchainOrderCommand::Place {
         symbol: params.symbol.clone(),
@@ -1160,7 +1155,11 @@ async fn process_queued_trade(
         executor: params.executor,
     };
 
-    match cqrs.offchain_order_cqrs.execute(&offchain_agg_id, command).await {
+    match cqrs
+        .offchain_order_cqrs
+        .execute(&offchain_agg_id, command)
+        .await
+    {
         Ok(()) => info!(
             %offchain_order_id,
             symbol = %params.symbol,
@@ -1218,8 +1217,7 @@ where
     EventProcessingError: From<E::Error>,
 {
     let executor_type = executor.to_supported_executor();
-    let ready_positions =
-        check_all_positions(pool, position_query, executor_type).await?;
+    let ready_positions = check_all_positions(pool, position_query, executor_type).await?;
 
     if ready_positions.is_empty() {
         debug!("No accumulated positions ready for execution");
@@ -1265,7 +1263,7 @@ where
             ),
         }
 
-        let offchain_agg_id = offchain_order_id.to_string();
+        let offchain_agg_id = OffchainOrder::aggregate_id(offchain_order_id);
 
         let command = OffchainOrderCommand::Place {
             symbol: params.symbol.clone(),
@@ -1375,12 +1373,14 @@ mod tests {
     use sqlite_es::{SqliteViewRepository, sqlite_cqrs};
     use std::sync::Arc;
 
-    use st0x_execution::{Direction, MockExecutorConfig, Positive, Symbol, TryIntoExecutor};
+    use st0x_execution::{
+        Direction, ExecutorOrderId, MarketOrder, MockExecutorCtx, Positive, Symbol, TryIntoExecutor,
+    };
 
     use super::*;
-    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4};
+    use crate::bindings::IOrderBookV5::{ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4};
     use crate::conductor::builder::CqrsFrameworks;
-    use crate::config::tests::create_test_ctx;
+    use crate::config::tests::create_test_ctx_with_order_owner;
     use crate::inventory::ImbalanceThreshold;
     use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::onchain::trade::OnchainTrade;
@@ -1429,7 +1429,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_v2_event_filtering_without_errors() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
@@ -1485,7 +1485,7 @@ mod tests {
     #[tokio::test]
     async fn test_logs_info_when_event_is_filtered_out() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
@@ -1539,7 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn test_logs_event_type_when_processing() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
@@ -1592,11 +1592,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_abort_all() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -1621,11 +1621,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_individual_abort() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -1654,11 +1654,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_builder_returns_immediately() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -1688,11 +1688,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_without_rebalancer() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -1719,11 +1719,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_with_rebalancer() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -1757,11 +1757,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_rebalancer_aborted_on_abort_all() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -1796,11 +1796,11 @@ mod tests {
     #[tokio::test]
     async fn test_conductor_rebalancer_aborted_on_abort_trading_tasks() {
         let pool = setup_test_db().await;
-        let config = create_test_ctx();
+        let config = create_test_ctx_with_order_owner(Address::ZERO);
         let cache = SymbolCache::default();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let executor = MockExecutorConfig.try_into_executor().await.unwrap();
+        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
@@ -2734,7 +2734,7 @@ mod tests {
         let offchain_order_query = GenericQuery::new(offchain_order_view_repo);
 
         let offchain_lifecycle = offchain_order_query
-            .load(&offchain_order_id.to_string())
+            .load(&OffchainOrder::aggregate_id(offchain_order_id))
             .await
             .expect("offchain order view should exist");
 
@@ -3394,7 +3394,7 @@ mod tests {
                 &symbol,
                 &PositionEvent::OffChainOrderFilled {
                     offchain_order_id: OffchainOrderId::new(),
-                    shares_filled: FractionalShares::new(dec!(35)),
+                    shares_filled: Positive::new(FractionalShares::new(dec!(35))).unwrap(),
                     direction: Direction::Buy,
                     executor_order_id: ExecutorOrderId::new("ORD1"),
                     price_cents: PriceCents(15000),

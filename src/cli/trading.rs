@@ -8,13 +8,14 @@ use cqrs_es::persist::GenericQuery;
 use rust_decimal::Decimal;
 use sqlite_es::{SqliteCqrs, SqliteViewRepository, sqlite_cqrs};
 use sqlx::SqlitePool;
+use std::io::Write;
+use std::sync::Arc;
+use tracing::{error, info};
+
 use st0x_execution::{
     ArithmeticError, Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder,
     MockExecutorCtx, OrderPlacement, OrderState, Positive, Symbol, TryIntoExecutor,
 };
-use std::io::Write;
-use std::sync::Arc;
-use tracing::{error, info};
 
 use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
@@ -320,12 +321,8 @@ pub(super) async fn process_found_trade<W: Write>(
     let executor_type = ctx.broker.to_supported_executor();
     let base_symbol = onchain_trade.symbol.base();
 
-    let Some(params) = check_execution_readiness(
-        &position_query,
-        base_symbol,
-        executor_type,
-    )
-    .await?
+    let Some(params) =
+        check_execution_readiness(&position_query, base_symbol, executor_type).await?
     else {
         writeln!(
             stdout,
@@ -362,7 +359,7 @@ pub(super) async fn process_found_trade<W: Write>(
         error!(%offchain_order_id, symbol = %params.symbol, "Failed to execute Position::PlaceOffChainOrder: {e}");
     }
 
-    let agg_id = offchain_order_id.to_string();
+    let agg_id = OffchainOrder::aggregate_id(offchain_order_id);
 
     if let Err(error) = offchain_order_cqrs
         .execute(
@@ -488,11 +485,9 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use st0x_execution::schwab::{SchwabAuth, SchwabAuthConfig};
-
     use super::*;
-    use crate::config::LogLevel;
-    use crate::onchain::{EvmConfig, EvmCtx};
+    use crate::config::{LogLevel, SchwabAuth};
+    use crate::onchain::EvmCtx;
     use crate::test_utils::{setup_test_db, setup_test_tokens};
     use crate::threshold::ExecutionThreshold;
 

@@ -306,8 +306,7 @@ mod tests {
             let endpoint = anvil.endpoint();
 
             let private_key_bytes = anvil.keys()[0].to_bytes();
-            let signer =
-                PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes))?;
+            let signer = PrivateKeySigner::from_bytes(&B256::from_slice(&private_key_bytes))?;
 
             let wallet = EthereumWallet::from(signer.clone());
             let provider = ProviderBuilder::new()
@@ -404,7 +403,7 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     enum LocalEvmError {
         #[error("Invalid private key")]
-        InvalidPrivateKey(#[from] alloy::signers::Error),
+        InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
         #[error("Contract error")]
         Contract(#[from] alloy::contract::Error),
         #[error("Provider error")]

@@ -178,10 +178,9 @@ mod tests {
         )
         .await;
 
-        let result =
-            check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab)
-                .await
-                .unwrap();
+        let result = check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab)
+            .await
+            .unwrap();
 
         assert!(result.is_none());
     }
@@ -200,11 +199,10 @@ mod tests {
         )
         .await;
 
-        let params =
-            check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab)
-                .await
-                .unwrap()
-                .expect("should be ready for execution");
+        let params = check_execution_readiness(&query, &symbol, SupportedExecutor::Schwab)
+            .await
+            .unwrap()
+            .expect("should be ready for execution");
 
         assert_eq!(params.symbol, symbol);
         assert_eq!(

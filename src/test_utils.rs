@@ -6,13 +6,13 @@ use alloy::rpc::types::Log;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use sqlx::SqlitePool;
+
 use st0x_execution::{
-    Direction, FractionalShares, OrderState, Positive, SchwabTokens, SupportedExecutor, Symbol,
+    Direction, FractionalShares, SchwabTokens,
 };
 
 use crate::bindings::IOrderBookV5::{EvaluableV4, IOV2, OrderV4};
 use crate::config::SchwabAuth;
-use crate::offchain::execution::OffchainExecution;
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedEquitySymbol, Usdc};
 
@@ -175,36 +175,5 @@ impl OnchainTradeBuilder {
 
     pub(crate) fn build(self) -> OnchainTrade {
         self.trade
-    }
-}
-
-/// Builder for creating OffchainExecution test instances with sensible defaults.
-/// Reduces duplication in test data setup.
-pub(crate) struct OffchainExecutionBuilder {
-    execution: OffchainExecution,
-}
-
-impl Default for OffchainExecutionBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OffchainExecutionBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            execution: OffchainExecution {
-                id: None,
-                symbol: Symbol::new("AAPL").unwrap(),
-                shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
-                direction: Direction::Buy,
-                executor: SupportedExecutor::Schwab,
-                state: OrderState::Pending,
-            },
-        }
-    }
-
-    pub(crate) fn build(self) -> OffchainExecution {
-        self.execution
     }
 }

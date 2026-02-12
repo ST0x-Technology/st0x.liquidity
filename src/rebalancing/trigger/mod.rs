@@ -600,7 +600,7 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use sqlite_es::sqlite_cqrs;
-    use st0x_execution::{AlpacaBrokerApiMode, Direction};
+    use st0x_execution::{AlpacaBrokerApiMode, Direction, ExecutorOrderId, Positive};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -610,7 +610,7 @@ mod tests {
     use super::*;
     use crate::alpaca_wallet::AlpacaTransferId;
     use crate::lifecycle::Lifecycle;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::TradeId;
     use crate::threshold::Usdc;
     use crate::tokenized_equity_mint::{IssuerRequestId, ReceiptId, TokenizationRequestId};
@@ -753,10 +753,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
-            shares_filled,
+            offchain_order_id: OffchainOrderId::new(),
+            shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
-            broker_order_id: BrokerOrderId("ORD1".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD1"),
             price_cents: PriceCents(15000),
             broker_timestamp: Utc::now(),
         }

@@ -1,9 +1,9 @@
 //! Mock implementation of the Mint trait for testing.
 
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloy::primitives::Address;
 use async_trait::async_trait;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use st0x_execution::{FractionalShares, Symbol};
 

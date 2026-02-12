@@ -745,4 +745,51 @@ mod tests {
             "canceled"
         );
     }
+
+    #[tokio::test]
+    async fn test_place_market_order_side_mismatch() {
+        let server = MockServer::start();
+        let ctx = create_test_ctx(AlpacaBrokerApiMode::Mock(server.base_url()));
+
+        let mock = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/test_account_123/orders")
+                .json_body(json!({
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "buy",
+                    "type": "market",
+                    "time_in_force": "day",
+                    "extended_hours": false
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "id": "904837e3-3b76-47ec-b432-046db621571b",
+                    "symbol": "AAPL",
+                    "qty": "100",
+                    "side": "sell",
+                    "status": "new",
+                    "filled_avg_price": null
+                }));
+        });
+
+        let client = AlpacaBrokerApiClient::new(&ctx).unwrap();
+        let market_order = MarketOrder {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(Decimal::from(100))).unwrap(),
+            direction: Direction::Buy,
+        };
+
+        let result = place_market_order(&client, market_order).await;
+
+        mock.assert();
+        assert!(matches!(
+            result.unwrap_err(),
+            AlpacaBrokerApiError::SideMismatch {
+                requested_side: OrderSide::Buy,
+                response_side: OrderSide::Sell
+            }
+        ));
+    }
 }

@@ -1,5 +1,5 @@
-use std::fmt;
 use reqwest::header::InvalidHeaderValue;
+use std::fmt;
 use thiserror::Error;
 
 use crate::InvalidSharesError;
@@ -127,9 +127,7 @@ pub enum SchwabError {
     /// `action`: The attempted operation.
     /// `response_text`: Raw API response body.
     /// `source`: The JSON deserialization error.
-    #[error(
-        "Failed to parse API response: {action}, response: {response_text}, error: {source}"
-    )]
+    #[error("Failed to parse API response: {action}, response: {response_text}, error: {source}")]
     ApiResponseParse {
         action: SchwabAction,
         response_text: String,

@@ -6,9 +6,9 @@
 //! computes the trade direction (buy/sell), and validates
 //! amounts before further processing.
 
+use rust_decimal::Decimal;
 use std::fmt;
 use std::str::FromStr;
-use rust_decimal::Decimal;
 
 use st0x_execution::{Direction, Symbol};
 
@@ -459,16 +459,14 @@ mod tests {
 
     #[test]
     fn test_trade_details_try_from_io_nvda() {
-        let details =
-            TradeDetails::try_from_io("USDC", dec!(64.17), "tNVDA", dec!(0.374)).unwrap();
+        let details = TradeDetails::try_from_io("USDC", dec!(64.17), "tNVDA", dec!(0.374)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert_eq!(details.equity_amount().value(), dec!(0.374));
         assert_eq!(details.usdc_amount().value(), dec!(64.17));
         assert_eq!(details.direction(), Direction::Sell);
 
-        let details =
-            TradeDetails::try_from_io("tNVDA", dec!(0.374), "USDC", dec!(64.17)).unwrap();
+        let details = TradeDetails::try_from_io("tNVDA", dec!(0.374), "USDC", dec!(64.17)).unwrap();
 
         assert_eq!(details.ticker(), &symbol!("NVDA"));
         assert_eq!(details.equity_amount().value(), dec!(0.374));
@@ -567,8 +565,7 @@ mod tests {
 
     #[test]
     fn test_edge_case_validation_very_small_amounts() {
-        let details =
-            TradeDetails::try_from_io("USDC", dec!(0.01), "tAAPL", dec!(0.0001)).unwrap();
+        let details = TradeDetails::try_from_io("USDC", dec!(0.01), "tAAPL", dec!(0.0001)).unwrap();
         assert_eq!(details.ticker(), &symbol!("AAPL"));
         assert_eq!(details.equity_amount().value(), dec!(0.0001));
         assert_eq!(details.usdc_amount().value(), dec!(0.01));
@@ -576,11 +573,9 @@ mod tests {
 
     #[test]
     fn test_edge_case_validation_very_large_amounts() {
-        let details =
-            TradeDetails::try_from_io("USDC", dec!(1000000), "tBRK", dec!(100)).unwrap();
+        let details = TradeDetails::try_from_io("USDC", dec!(1000000), "tBRK", dec!(100)).unwrap();
         assert_eq!(details.ticker(), &symbol!("BRK"));
         assert_eq!(details.equity_amount().value(), dec!(100));
         assert_eq!(details.usdc_amount().value(), dec!(1000000));
     }
-
 }

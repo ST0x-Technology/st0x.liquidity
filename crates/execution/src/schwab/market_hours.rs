@@ -430,7 +430,7 @@ mod tests {
         assert!(matches!(
             error,
             SchwabError::RequestFailed { action, status, .. }
-            if action == "fetch market hours" && status.as_u16() == 500
+            if action == SchwabAction::FetchMarketHours && status.as_u16() == 500
         ));
     }
 
@@ -512,7 +512,7 @@ mod tests {
         assert!(matches!(
             parse_datetime("invalid-time", date).unwrap_err(),
             SchwabError::RequestFailed { action, .. }
-            if action == "parse datetime"
+            if action == SchwabAction::ParseDatetime
         ));
     }
 }

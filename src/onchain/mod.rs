@@ -139,7 +139,6 @@ impl From<alloy::contract::Error> for OnChainError {
     }
 }
 
-
 impl From<FromUintError<usize>> for OnChainError {
     fn from(err: FromUintError<usize>) -> Self {
         Self::Validation(TradeValidationError::InvalidIndex(err))

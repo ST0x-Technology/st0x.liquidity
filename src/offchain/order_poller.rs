@@ -232,7 +232,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         offchain_order_id: OffchainOrderId,
         price_cents: PriceCents,
     ) {
-        let offchain_aggregate_id = offchain_order_id.to_string();
+        let offchain_aggregate_id = OffchainOrder::aggregate_id(offchain_order_id);
         if let Err(e) = self
             .offchain_order_cqrs
             .execute(
@@ -306,7 +306,7 @@ impl<E: Executor> OrderStatusPoller<E> {
         offchain_order_id: OffchainOrderId,
         error_message: &str,
     ) {
-        let offchain_aggregate_id = offchain_order_id.to_string();
+        let offchain_aggregate_id = OffchainOrder::aggregate_id(offchain_order_id);
         if let Err(e) = self
             .offchain_order_cqrs
             .execute(
@@ -362,7 +362,9 @@ impl<E: Executor> OrderStatusPoller<E> {
 mod tests {
     use chrono::Utc;
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use sqlite_es::sqlite_cqrs;
+
     use st0x_execution::{
         Direction, FractionalShares, MockExecutor, Positive, SupportedExecutor, Symbol,
     };
@@ -387,14 +389,14 @@ mod tests {
         position_cqrs: &PositionCqrs,
         symbol: &Symbol,
         tokenized_symbol: &str,
-        amount: f64,
+        amount: Decimal,
     ) {
         let aggregate_id = Position::aggregate_id(symbol);
 
         let mut onchain_trade = OnchainTradeBuilder::new()
             .with_symbol(tokenized_symbol)
             .with_amount(amount)
-            .with_price(150.0)
+            .with_price(dec!(150.0))
             .build();
         onchain_trade.direction = Direction::Buy;
         onchain_trade.block_timestamp = Some(Utc::now());
@@ -435,7 +437,7 @@ mod tests {
         offchain_order_id: OffchainOrderId,
         params: TestOrderParams<'_>,
     ) {
-        let offchain_agg_id = offchain_order_id.to_string();
+        let offchain_agg_id = OffchainOrder::aggregate_id(offchain_order_id);
 
         offchain_order_cqrs
             .execute(
@@ -486,9 +488,9 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(10))).unwrap();
 
-        setup_position_with_onchain_fill(&position_cqrs, &symbol, "tAAPL", 10.0).await;
+        setup_position_with_onchain_fill(&position_cqrs, &symbol, "tAAPL", dec!(10)).await;
 
-        let offchain_order_id = OffchainOrder::aggregate_id();
+        let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(
             &offchain_order_cqrs,
             &position_cqrs,
@@ -513,7 +515,7 @@ mod tests {
 
         let order = OffchainOrder::Submitted {
             symbol: symbol.clone(),
-            shares: shares.inner(),
+            shares,
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             executor_order_id: ExecutorOrderId::new("ORD123"),
@@ -532,7 +534,7 @@ mod tests {
             .await
             .unwrap();
 
-        let aggregate_id = offchain_order_id.to_string();
+        let aggregate_id = OffchainOrder::aggregate_id(offchain_order_id);
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
             "SELECT event_type FROM events \
             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",
@@ -571,9 +573,9 @@ mod tests {
         let symbol = Symbol::new("TSLA").unwrap();
         let shares = Positive::new(FractionalShares::new(Decimal::from(5))).unwrap();
 
-        setup_position_with_onchain_fill(&position_cqrs, &symbol, "tTSLA", 5.0).await;
+        setup_position_with_onchain_fill(&position_cqrs, &symbol, "tTSLA", dec!(5)).await;
 
-        let offchain_order_id = OffchainOrder::aggregate_id();
+        let offchain_order_id = OffchainOrderId::new();
         setup_offchain_order_aggregate(
             &offchain_order_cqrs,
             &position_cqrs,
@@ -598,7 +600,7 @@ mod tests {
 
         let order = OffchainOrder::Submitted {
             symbol: symbol.clone(),
-            shares: shares.inner(),
+            shares,
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             executor_order_id: ExecutorOrderId::new("ORD456"),
@@ -611,7 +613,7 @@ mod tests {
             .await
             .unwrap();
 
-        let aggregate_id = offchain_order_id.to_string();
+        let aggregate_id = OffchainOrder::aggregate_id(offchain_order_id);
         let offchain_order_events: Vec<String> = sqlx::query_scalar!(
             "SELECT event_type FROM events \
             WHERE aggregate_type = 'OffchainOrder' AND aggregate_id = ? ORDER BY sequence",

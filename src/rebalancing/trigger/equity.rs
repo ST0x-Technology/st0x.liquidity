@@ -109,12 +109,11 @@ mod tests {
     use alloy::primitives::{TxHash, address};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use st0x_execution::Direction;
 
-    use st0x_execution::FractionalShares;
+    use st0x_execution::{Direction, ExecutorOrderId, FractionalShares, Positive};
 
     use super::*;
-    use crate::offchain_order::{BrokerOrderId, ExecutionId, PriceCents};
+    use crate::offchain_order::{OffchainOrderId, PriceCents};
     use crate::position::{PositionEvent, TradeId};
 
     fn shares(n: i64) -> FractionalShares {
@@ -137,10 +136,10 @@ mod tests {
 
     fn make_offchain_fill(shares_filled: FractionalShares, direction: Direction) -> PositionEvent {
         PositionEvent::OffChainOrderFilled {
-            execution_id: ExecutionId(1),
-            shares_filled,
+            offchain_order_id: OffchainOrderId::new(),
+            shares_filled: Positive::new(shares_filled).unwrap(),
             direction,
-            broker_order_id: BrokerOrderId("ORD1".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD1"),
             price_cents: PriceCents(15000),
             broker_timestamp: chrono::Utc::now(),
         }

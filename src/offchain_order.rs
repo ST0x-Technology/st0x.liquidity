@@ -47,7 +47,7 @@ impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
         order: MarketOrder,
     ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
         let placement = self.0.place_market_order(order).await?;
-        Ok(ExecutorOrderId::new(&placement.order_id.to_string()))
+        Ok(ExecutorOrderId::new(&placement.order_id))
     }
 }
 
@@ -71,15 +71,6 @@ pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExecutionId(pub(crate) i64);
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct BrokerOrderId(pub(crate) String);
-
-impl AsRef<str> for BrokerOrderId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct PriceCents(pub(crate) u64);
 
@@ -97,7 +88,7 @@ pub(crate) enum OffchainOrder {
         shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
     },
@@ -107,7 +98,7 @@ pub(crate) enum OffchainOrder {
         shares_filled: FractionalShares,
         direction: Direction,
         executor: SupportedExecutor,
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         avg_price_cents: PriceCents,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
@@ -118,7 +109,7 @@ pub(crate) enum OffchainOrder {
         shares: Positive<FractionalShares>,
         direction: Direction,
         executor: SupportedExecutor,
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         price_cents: PriceCents,
         placed_at: DateTime<Utc>,
         submitted_at: DateTime<Utc>,
@@ -136,8 +127,8 @@ pub(crate) enum OffchainOrder {
 }
 
 impl OffchainOrder {
-    pub(crate) fn aggregate_id(id: i64) -> String {
-        format!("{id}")
+    pub(crate) fn aggregate_id(id: OffchainOrderId) -> String {
+        id.to_string()
     }
 
     pub(crate) fn symbol(&self) -> &Symbol {
@@ -173,18 +164,18 @@ impl OffchainOrder {
         }
     }
 
-    pub(crate) fn executor_order_id(&self) -> Option<&BrokerOrderId> {
+    pub(crate) fn executor_order_id(&self) -> Option<&ExecutorOrderId> {
         use OffchainOrder::*;
         match self {
             Submitted {
-                broker_order_id, ..
+                executor_order_id, ..
             }
             | PartiallyFilled {
-                broker_order_id, ..
+                executor_order_id, ..
             }
             | Filled {
-                broker_order_id, ..
-            } => Some(broker_order_id),
+                executor_order_id, ..
+            } => Some(executor_order_id),
 
             Pending { .. } | Failed { .. } => None,
         }
@@ -196,9 +187,9 @@ impl OffchainOrder {
     ) -> Result<Self, LifecycleError<Never>> {
         match event {
             OffchainOrderEvent::Submitted {
-                broker_order_id,
+                executor_order_id,
                 submitted_at,
-            } => Self::apply_submitted(order, broker_order_id, *submitted_at, event),
+            } => Self::apply_submitted(order, executor_order_id, *submitted_at, event),
 
             OffchainOrderEvent::PartiallyFilled {
                 shares_filled,
@@ -232,7 +223,7 @@ impl OffchainOrder {
 
     fn apply_submitted(
         order: &Self,
-        broker_order_id: &BrokerOrderId,
+        executor_order_id: &ExecutorOrderId,
         submitted_at: DateTime<Utc>,
         event: &OffchainOrderEvent,
     ) -> Result<Self, LifecycleError<Never>> {
@@ -255,7 +246,7 @@ impl OffchainOrder {
             shares: *shares,
             direction: *direction,
             executor: *executor,
-            broker_order_id: broker_order_id.clone(),
+            executor_order_id: executor_order_id.clone(),
             placed_at: *placed_at,
             submitted_at,
         })
@@ -274,7 +265,7 @@ impl OffchainOrder {
                 shares,
                 direction,
                 executor,
-                broker_order_id,
+                executor_order_id,
                 placed_at,
                 submitted_at,
             }
@@ -283,7 +274,7 @@ impl OffchainOrder {
                 shares,
                 direction,
                 executor,
-                broker_order_id,
+                executor_order_id,
                 placed_at,
                 submitted_at,
                 ..
@@ -293,7 +284,7 @@ impl OffchainOrder {
                 shares_filled,
                 direction: *direction,
                 executor: *executor,
-                broker_order_id: broker_order_id.clone(),
+                executor_order_id: executor_order_id.clone(),
                 avg_price_cents,
                 placed_at: *placed_at,
                 submitted_at: *submitted_at,
@@ -321,7 +312,7 @@ impl OffchainOrder {
                 shares,
                 direction,
                 executor,
-                broker_order_id,
+                executor_order_id,
                 placed_at,
                 submitted_at,
             }
@@ -330,7 +321,7 @@ impl OffchainOrder {
                 shares,
                 direction,
                 executor,
-                broker_order_id,
+                executor_order_id,
                 placed_at,
                 submitted_at,
                 ..
@@ -339,7 +330,7 @@ impl OffchainOrder {
                 shares: *shares,
                 direction: *direction,
                 executor: *executor,
-                broker_order_id: broker_order_id.clone(),
+                executor_order_id: executor_order_id.clone(),
                 price_cents,
                 placed_at: *placed_at,
                 submitted_at: *submitted_at,
@@ -423,7 +414,7 @@ impl OffchainOrder {
                 direction,
                 executor,
                 status,
-                broker_order_id,
+                executor_order_id,
                 price_cents,
                 executed_at,
                 migrated_at,
@@ -440,9 +431,9 @@ impl OffchainOrder {
                     shares: *shares,
                     direction: *direction,
                     executor: *executor,
-                    broker_order_id: broker_order_id
+                    executor_order_id: executor_order_id
                         .clone()
-                        .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
+                        .unwrap_or_else(|| ExecutorOrderId::new("unknown")),
                     placed_at: *migrated_at,
                     submitted_at: executed_at.unwrap_or(*migrated_at),
                 }),
@@ -451,9 +442,9 @@ impl OffchainOrder {
                     shares: *shares,
                     direction: *direction,
                     executor: *executor,
-                    broker_order_id: broker_order_id
+                    executor_order_id: executor_order_id
                         .clone()
-                        .unwrap_or_else(|| BrokerOrderId("unknown".to_string())),
+                        .unwrap_or_else(|| ExecutorOrderId::new("unknown")),
                     price_cents: price_cents.unwrap_or(PriceCents(0)),
                     placed_at: *migrated_at,
                     submitted_at: *migrated_at,
@@ -510,7 +501,7 @@ impl Aggregate for Lifecycle<OffchainOrder> {
                     direction,
                     executor,
                     status,
-                    broker_order_id,
+                    executor_order_id,
                     price_cents,
                     executed_at,
                 },
@@ -520,7 +511,7 @@ impl Aggregate for Lifecycle<OffchainOrder> {
                 direction: *direction,
                 executor: *executor,
                 status: status.clone(),
-                broker_order_id: broker_order_id.clone(),
+                executor_order_id: executor_order_id.clone(),
                 price_cents: *price_cents,
                 executed_at: *executed_at,
                 migrated_at: Utc::now(),
@@ -548,8 +539,8 @@ impl Aggregate for Lifecycle<OffchainOrder> {
 
             (Err(e), _) => Err(e.into()),
 
-            (Ok(order), OffchainOrderCommand::ConfirmSubmission { broker_order_id }) => {
-                handle_confirm_submission(order, broker_order_id)
+            (Ok(order), OffchainOrderCommand::ConfirmSubmission { executor_order_id }) => {
+                handle_confirm_submission(order, executor_order_id)
             }
 
             (
@@ -602,23 +593,23 @@ impl Aggregate for Lifecycle<OffchainOrder> {
 
 fn handle_confirm_submission(
     order: &OffchainOrder,
-    broker_order_id: &BrokerOrderId,
+    executor_order_id: &ExecutorOrderId,
 ) -> Result<Vec<OffchainOrderEvent>, OffchainOrderError> {
     match order {
         OffchainOrder::Pending { .. } => Ok(vec![OffchainOrderEvent::Submitted {
-            broker_order_id: broker_order_id.clone(),
+            executor_order_id: executor_order_id.clone(),
             submitted_at: Utc::now(),
         }]),
         OffchainOrder::Submitted {
-            broker_order_id: existing_id,
+            executor_order_id: existing_id,
             ..
         } => {
-            if existing_id == broker_order_id {
+            if existing_id == executor_order_id {
                 Ok(vec![])
             } else {
-                Err(OffchainOrderError::ConflictingBrokerOrderId {
+                Err(OffchainOrderError::ConflictingExecutorOrderId {
                     existing: existing_id.clone(),
-                    attempted: broker_order_id.clone(),
+                    attempted: executor_order_id.clone(),
                 })
             }
         }
@@ -646,7 +637,7 @@ pub(crate) enum OffchainOrderView {
         direction: Direction,
         executor: SupportedExecutor,
         status: ExecutionStatus,
-        broker_order_id: Option<BrokerOrderId>,
+        executor_order_id: Option<ExecutorOrderId>,
         price_cents: Option<PriceCents>,
         initiated_at: DateTime<Utc>,
         completed_at: Option<DateTime<Utc>>,
@@ -678,7 +669,7 @@ impl View<Lifecycle<OffchainOrder>> for OffchainOrderView {
                 direction,
                 executor,
                 status,
-                broker_order_id,
+                executor_order_id,
                 price_cents,
                 executed_at,
                 migrated_at,
@@ -697,7 +688,7 @@ impl View<Lifecycle<OffchainOrder>> for OffchainOrderView {
                     direction: *direction,
                     executor: *executor,
                     status,
-                    broker_order_id: broker_order_id.clone(),
+                    executor_order_id: executor_order_id.clone(),
                     price_cents: *price_cents,
                     initiated_at: executed_at.unwrap_or(*migrated_at),
                     completed_at,
@@ -720,9 +711,9 @@ impl View<Lifecycle<OffchainOrder>> for OffchainOrderView {
                 );
             }
             OffchainOrderEvent::Submitted {
-                broker_order_id, ..
+                executor_order_id, ..
             } => {
-                self.handle_submitted(broker_order_id.clone());
+                self.handle_submitted(executor_order_id.clone());
             }
             OffchainOrderEvent::PartiallyFilled { .. } => {
                 self.handle_partially_filled();
@@ -757,17 +748,17 @@ impl OffchainOrderView {
             direction,
             executor,
             status: ExecutionStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             initiated_at: placed_at,
             completed_at: None,
         };
     }
 
-    fn handle_submitted(&mut self, broker_order_id: BrokerOrderId) {
+    fn handle_submitted(&mut self, executor_order_id: ExecutorOrderId) {
         let Self::Execution {
             status,
-            broker_order_id: broker_order_id_ref,
+            executor_order_id: executor_order_id_ref,
             ..
         } = self
         else {
@@ -776,7 +767,7 @@ impl OffchainOrderView {
         };
 
         *status = ExecutionStatus::Submitted;
-        *broker_order_id_ref = Some(broker_order_id);
+        *executor_order_id_ref = Some(executor_order_id);
     }
 
     fn handle_partially_filled(&mut self) {
@@ -858,12 +849,12 @@ pub(crate) enum OffchainOrderError {
     #[error("Cannot submit order: order has already been submitted")]
     AlreadySubmitted,
     #[error(
-        "Cannot confirm submission: order already submitted with different broker_order_id \
+        "Cannot confirm submission: order already submitted with different executor_order_id \
          (existing: {existing:?}, attempted: {attempted:?})"
     )]
-    ConflictingBrokerOrderId {
-        existing: BrokerOrderId,
-        attempted: BrokerOrderId,
+    ConflictingExecutorOrderId {
+        existing: ExecutorOrderId,
+        attempted: ExecutorOrderId,
     },
     #[error(transparent)]
     State(#[from] LifecycleError<Never>),
@@ -877,7 +868,7 @@ pub(crate) enum OffchainOrderCommand {
         direction: Direction,
         executor: SupportedExecutor,
         status: MigratedOrderStatus,
-        broker_order_id: Option<BrokerOrderId>,
+        executor_order_id: Option<ExecutorOrderId>,
         price_cents: Option<PriceCents>,
         executed_at: Option<DateTime<Utc>>,
     },
@@ -888,7 +879,7 @@ pub(crate) enum OffchainOrderCommand {
         executor: SupportedExecutor,
     },
     ConfirmSubmission {
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
     },
     UpdatePartialFill {
         shares_filled: FractionalShares,
@@ -952,7 +943,7 @@ pub(crate) enum OffchainOrderEvent {
         direction: Direction,
         executor: SupportedExecutor,
         status: MigratedOrderStatus,
-        broker_order_id: Option<BrokerOrderId>,
+        executor_order_id: Option<ExecutorOrderId>,
         price_cents: Option<PriceCents>,
         executed_at: Option<DateTime<Utc>>,
         migrated_at: DateTime<Utc>,
@@ -965,7 +956,7 @@ pub(crate) enum OffchainOrderEvent {
         placed_at: DateTime<Utc>,
     },
     Submitted {
-        broker_order_id: BrokerOrderId,
+        executor_order_id: ExecutorOrderId,
         submitted_at: DateTime<Utc>,
     },
     PartiallyFilled {
@@ -1063,7 +1054,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1119,7 +1110,7 @@ mod tests {
         });
 
         let command = OffchainOrderCommand::ConfirmSubmission {
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
         };
 
         let events = order.handle(command, &()).await.unwrap();
@@ -1140,7 +1131,7 @@ mod tests {
         let order = Lifecycle::<OffchainOrder, Never>::default();
 
         let command = OffchainOrderCommand::ConfirmSubmission {
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
         };
 
         assert!(matches!(
@@ -1156,18 +1147,18 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
         });
 
         let command = OffchainOrderCommand::ConfirmSubmission {
-            broker_order_id: BrokerOrderId("ORD456".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD456"),
         };
 
         assert!(matches!(
             order.handle(command, &()).await,
-            Err(OffchainOrderError::ConflictingBrokerOrderId { .. })
+            Err(OffchainOrderError::ConflictingExecutorOrderId { .. })
         ));
     }
 
@@ -1178,7 +1169,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
         });
@@ -1212,7 +1203,7 @@ mod tests {
             shares_filled: FractionalShares::new(dec!(50)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             avg_price_cents: PriceCents(15000),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1244,7 +1235,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
         });
@@ -1274,7 +1265,7 @@ mod tests {
             shares_filled: FractionalShares::new(dec!(75)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             avg_price_cents: PriceCents(15000),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1324,7 +1315,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1375,7 +1366,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
         });
@@ -1404,7 +1395,7 @@ mod tests {
             shares_filled: FractionalShares::new(dec!(50)),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             avg_price_cents: PriceCents(15000),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1434,7 +1425,7 @@ mod tests {
             shares: Positive::new(FractionalShares::new(dec!(100))).unwrap(),
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             price_cents: PriceCents(15000),
             placed_at: Utc::now(),
             submitted_at: Utc::now(),
@@ -1461,7 +1452,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: None,
             migrated_at: Utc::now(),
@@ -1485,7 +1476,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Submitted,
-            broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
             price_cents: None,
             executed_at: Some(Utc::now()),
             migrated_at: Utc::now(),
@@ -1509,7 +1500,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
-            broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
             price_cents: Some(PriceCents(15000)),
             executed_at: Some(Utc::now()),
             migrated_at: Utc::now(),
@@ -1535,7 +1526,7 @@ mod tests {
             status: MigratedOrderStatus::Failed {
                 error: "Insufficient funds".to_string(),
             },
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: Some(Utc::now()),
             migrated_at: Utc::now(),
@@ -1561,7 +1552,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: None,
             migrated_at,
@@ -1587,7 +1578,7 @@ mod tests {
             direction,
             executor,
             status,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             initiated_at,
             completed_at,
@@ -1605,7 +1596,7 @@ mod tests {
         assert_eq!(direction, Direction::Buy);
         assert_eq!(executor, SupportedExecutor::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
-        assert_eq!(broker_order_id, None);
+        assert_eq!(executor_order_id, None);
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, migrated_at);
         assert_eq!(completed_at, None);
@@ -1623,7 +1614,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: MigratedOrderStatus::Submitted,
-            broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
             price_cents: None,
             executed_at: None,
             migrated_at,
@@ -1642,7 +1633,7 @@ mod tests {
         let OffchainOrderView::Execution {
             execution_id: view_execution_id,
             status,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             initiated_at,
             completed_at,
@@ -1654,7 +1645,7 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(status, ExecutionStatus::Submitted);
-        assert_eq!(broker_order_id, Some(BrokerOrderId("ORD123".to_string())));
+        assert_eq!(executor_order_id, Some(ExecutorOrderId::new("ORD123")));
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, migrated_at);
         assert_eq!(completed_at, None);
@@ -1673,7 +1664,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
-            broker_order_id: Some(BrokerOrderId("ORD456".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD456")),
             price_cents: Some(PriceCents(45025)),
             executed_at: Some(executed_at),
             migrated_at,
@@ -1692,7 +1683,7 @@ mod tests {
         let OffchainOrderView::Execution {
             execution_id: view_execution_id,
             status,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             initiated_at,
             completed_at,
@@ -1704,7 +1695,7 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(status, ExecutionStatus::Filled);
-        assert_eq!(broker_order_id, Some(BrokerOrderId("ORD456".to_string())));
+        assert_eq!(executor_order_id, Some(ExecutorOrderId::new("ORD456")));
         assert_eq!(price_cents, Some(PriceCents(45025)));
         assert_eq!(initiated_at, executed_at);
         assert_eq!(completed_at, Some(executed_at));
@@ -1725,7 +1716,7 @@ mod tests {
             status: MigratedOrderStatus::Failed {
                 error: "Insufficient funds".to_string(),
             },
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: Some(executed_at),
             migrated_at,
@@ -1744,7 +1735,7 @@ mod tests {
         let OffchainOrderView::Execution {
             execution_id: view_execution_id,
             status,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             initiated_at,
             completed_at,
@@ -1756,7 +1747,7 @@ mod tests {
 
         assert_eq!(view_execution_id, execution_id);
         assert_eq!(status, ExecutionStatus::Failed);
-        assert_eq!(broker_order_id, None);
+        assert_eq!(executor_order_id, None);
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, executed_at);
         assert_eq!(completed_at, Some(executed_at));
@@ -1793,7 +1784,7 @@ mod tests {
             direction,
             executor,
             status,
-            broker_order_id,
+            executor_order_id,
             price_cents,
             initiated_at,
             completed_at,
@@ -1811,7 +1802,7 @@ mod tests {
         assert_eq!(direction, Direction::Buy);
         assert_eq!(executor, SupportedExecutor::Schwab);
         assert_eq!(status, ExecutionStatus::Pending);
-        assert_eq!(broker_order_id, None);
+        assert_eq!(executor_order_id, None);
         assert_eq!(price_cents, None);
         assert_eq!(initiated_at, placed_at);
         assert_eq!(completed_at, None);
@@ -1831,14 +1822,14 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: ExecutionStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             initiated_at: placed_at,
             completed_at: None,
         };
 
         let event = OffchainOrderEvent::Submitted {
-            broker_order_id: BrokerOrderId("ORD789".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD789"),
             submitted_at,
         };
 
@@ -1853,7 +1844,7 @@ mod tests {
 
         let OffchainOrderView::Execution {
             status,
-            broker_order_id,
+            executor_order_id,
             ..
         } = view
         else {
@@ -1861,7 +1852,7 @@ mod tests {
         };
 
         assert_eq!(status, ExecutionStatus::Submitted);
-        assert_eq!(broker_order_id, Some(BrokerOrderId("ORD789".to_string())));
+        assert_eq!(executor_order_id, Some(ExecutorOrderId::new("ORD789")));
     }
 
     #[test]
@@ -1878,7 +1869,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: ExecutionStatus::Submitted,
-            broker_order_id: Some(BrokerOrderId("ORD999".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD999")),
             price_cents: None,
             initiated_at: placed_at,
             completed_at: None,
@@ -1920,7 +1911,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::AlpacaTradingApi,
             status: ExecutionStatus::Submitted,
-            broker_order_id: Some(BrokerOrderId("ORD111".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD111")),
             price_cents: None,
             initiated_at: placed_at,
             completed_at: None,
@@ -1969,7 +1960,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: ExecutionStatus::Submitted,
-            broker_order_id: Some(BrokerOrderId("ORD222".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD222")),
             price_cents: None,
             initiated_at: placed_at,
             completed_at: None,
@@ -2007,7 +1998,7 @@ mod tests {
         let mut view = OffchainOrderView::Unavailable;
 
         let event = OffchainOrderEvent::Submitted {
-            broker_order_id: BrokerOrderId("ORD333".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD333"),
             submitted_at: chrono::Utc::now(),
         };
 
@@ -2098,7 +2089,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: None,
             migrated_at: chrono::Utc::now(),
@@ -2146,7 +2137,7 @@ mod tests {
         let mut order = Lifecycle::<OffchainOrder, Never>::default();
 
         let event = OffchainOrderEvent::Submitted {
-            broker_order_id: BrokerOrderId("ORD123".to_string()),
+            executor_order_id: ExecutorOrderId::new("ORD123"),
             submitted_at: Utc::now(),
         };
 
@@ -2166,7 +2157,7 @@ mod tests {
             direction: Direction::Buy,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: None,
         };
@@ -2181,7 +2172,7 @@ mod tests {
                 direction,
                 executor,
                 status,
-                broker_order_id,
+                executor_order_id,
                 price_cents,
                 executed_at,
                 ..
@@ -2191,7 +2182,7 @@ mod tests {
                 assert_eq!(direction, &Direction::Buy);
                 assert_eq!(executor, &SupportedExecutor::Schwab);
                 assert!(matches!(status, MigratedOrderStatus::Pending));
-                assert!(broker_order_id.is_none());
+                assert!(executor_order_id.is_none());
                 assert!(price_cents.is_none());
                 assert!(executed_at.is_none());
             }
@@ -2211,7 +2202,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: None,
         };
@@ -2232,7 +2223,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Submitted,
-            broker_order_id: Some(BrokerOrderId("ORD123".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD123")),
             price_cents: None,
             executed_at: Some(Utc::now()),
         };
@@ -2253,7 +2244,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Filled,
-            broker_order_id: Some(BrokerOrderId("ORD456".to_string())),
+            executor_order_id: Some(ExecutorOrderId::new("ORD456")),
             price_cents: Some(PriceCents(20000)),
             executed_at: Some(Utc::now()),
         };
@@ -2276,7 +2267,7 @@ mod tests {
             status: MigratedOrderStatus::Failed {
                 error: "Insufficient funds".to_string(),
             },
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: Some(Utc::now()),
         };
@@ -2306,7 +2297,7 @@ mod tests {
             direction: Direction::Sell,
             executor: SupportedExecutor::Schwab,
             status: MigratedOrderStatus::Pending,
-            broker_order_id: None,
+            executor_order_id: None,
             price_cents: None,
             executed_at: None,
         };
@@ -2321,7 +2312,7 @@ mod tests {
     /// dual-write failures.
     ///
     /// If ES write succeeds but legacy write fails, retrying with the same
-    /// broker_order_id fails with AlreadySubmitted. System stuck in inconsistent
+    /// executor_order_id fails with AlreadySubmitted. System stuck in inconsistent
     /// state with no programmatic recovery path.
     #[tokio::test]
     async fn test_confirm_submission_not_idempotent_blocks_retry_recovery() {
@@ -2333,32 +2324,32 @@ mod tests {
             placed_at: Utc::now(),
         });
 
-        let broker_order_id = BrokerOrderId("ORD-SAME-123".to_string());
+        let executor_order_id = ExecutorOrderId::new("ORD-SAME-123");
 
         let command = OffchainOrderCommand::ConfirmSubmission {
-            broker_order_id: broker_order_id.clone(),
+            executor_order_id: executor_order_id.clone(),
         };
         let events = order.handle(command, &()).await.unwrap();
         assert_eq!(events.len(), 1);
         order.apply(events[0].clone());
 
         let Lifecycle::Live(OffchainOrder::Submitted {
-            broker_order_id: stored_id,
+            executor_order_id: stored_id,
             ..
         }) = &order
         else {
             panic!("Expected Submitted state");
         };
-        assert_eq!(stored_id, &broker_order_id);
+        assert_eq!(stored_id, &executor_order_id);
 
         let retry_command = OffchainOrderCommand::ConfirmSubmission {
-            broker_order_id: broker_order_id.clone(),
+            executor_order_id: executor_order_id.clone(),
         };
 
         let events = order
             .handle(retry_command, &())
             .await
-            .expect("Retry with same broker_order_id should succeed for idempotent behavior");
+            .expect("Retry with same executor_order_id should succeed for idempotent behavior");
 
         assert!(
             events.is_empty(),

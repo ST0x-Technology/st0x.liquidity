@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::error;
 
-use super::{SchwabAction, SchwabAuthCtx, SchwabError, SchwabTokens, order_status::OrderStatusResponse};
+use super::{
+    SchwabAction, SchwabAuthCtx, SchwabError, SchwabTokens, order_status::OrderStatusResponse,
+};
 
 /// Response from Schwab order placement API.
 /// According to Schwab OpenAPI spec, successful order placement (201) returns
@@ -313,6 +315,8 @@ pub(crate) struct Instrument {
 
 #[cfg(test)]
 mod tests {
+    use url::Url;
+
     use super::*;
     use crate::test_utils::{TEST_ENCRYPTION_KEY, setup_test_db, setup_test_tokens};
     use serde_json::json;

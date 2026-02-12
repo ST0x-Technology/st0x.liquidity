@@ -747,6 +747,7 @@ pub(crate) enum TriggerReason {
 #[cfg(test)]
 mod tests {
     use cqrs_es::EventEnvelope;
+    use cqrs_es::View;
     use cqrs_es::test::TestFramework;
     use rust_decimal_macros::dec;
     use std::collections::HashMap;
