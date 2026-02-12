@@ -1,3 +1,8 @@
+//! Onchain trade conversion and persistence. Converts raw blockchain events
+//! ([`TradeEvent`]) into structured [`OnchainTrade`]s with symbol resolution,
+//! price calculation, and Pyth oracle pricing. Also provides vault extraction
+//! utilities for the vault registry.
+
 use alloy::primitives::{Address, B256, U256};
 use alloy::primitives::ruint::FromUintError;
 use alloy::providers::Provider;

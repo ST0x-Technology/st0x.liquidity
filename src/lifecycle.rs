@@ -56,22 +56,11 @@ use sqlite_es::SqliteViewRepository;
 use tracing::error;
 
 /// A query that materializes a `Lifecycle<T, E>` aggregate as its own view in SQLite.
-pub(crate) type SqliteQuery<T, E> = GenericQuery<
+pub(crate) type SqliteQuery<T, E = Never> = GenericQuery<
     SqliteViewRepository<Lifecycle<T, E>, Lifecycle<T, E>>,
     Lifecycle<T, E>,
     Lifecycle<T, E>,
 >;
-
-/// An uninhabited type for entities with no fallible operations.
-///
-/// Similar to `std::convert::Infallible` but implements `Serialize`/`Deserialize`
-/// for compatibility with `cqrs_es` bounds.
-///
-/// Since this enum has no variants, values of type `Never` cannot be constructed,
-/// making `LifecycleError::Custom(Never)` unreachable at runtime.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("never")]
-pub(crate) enum Never {}
 
 /// A lifecycle wrapper for event-sourced entities.
 ///
@@ -108,6 +97,18 @@ impl<T, E> Default for Lifecycle<T, E> {
     }
 }
 
+/// An uninhabited type for entities with no fallible operations.
+///
+/// Similar to `std::convert::Infallible` but implements `Serialize`/`Deserialize`
+/// for compatibility with `cqrs_es` bounds.
+///
+/// Since this enum has no variants, values of type `Never` cannot be constructed,
+/// making `LifecycleError::Custom(Never)` unreachable at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("never")]
+pub(crate) enum Never {}
+
+
 /// Errors that can occur during lifecycle transitions.
 ///
 /// Wraps both infrastructure-level errors (uninitialized state, event mismatch)
@@ -117,15 +118,12 @@ pub(crate) enum LifecycleError<E> {
     /// A transition event was applied to an uninitialized entity.
     #[error("operation on uninitialized state")]
     Uninitialized,
-
     /// An initialization event was applied to an already-live entity.
     #[error("initialization on already-live state")]
     AlreadyInitialized,
-
     /// An event was applied that doesn't match the current state.
     #[error("event '{event}' not applicable to state '{state}'")]
     Mismatch { state: String, event: String },
-
     /// A domain-specific error (e.g., arithmetic overflow).
     #[error(transparent)]
     Custom(#[from] E),

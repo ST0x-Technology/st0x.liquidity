@@ -11,13 +11,60 @@ use tracing::error;
 use uuid::Uuid;
 
 use st0x_execution::{
-    Direction, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor, Symbol,
+    Direction, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor, Symbol,
 };
 
 use crate::lifecycle::{Lifecycle, LifecycleError, Never};
 
-pub(crate) type OffchainOrderAggregate = Lifecycle<OffchainOrder>;
-pub(crate) type OffchainOrderCqrs = SqliteCqrs<OffchainOrderAggregate>;
+pub(crate) type OffchainOrderCqrs = SqliteCqrs<Lifecycle<OffchainOrder>>;
+
+/// Type-erased order placement capability injected into the OffchainOrder
+/// aggregate via cqrs-es Services.
+///
+/// This trait exists because the `Executor` trait has associated types
+/// (`Error`, `OrderId`, `Ctx`) which make it non-object-safe - you cannot
+/// write `Arc<dyn Executor>`. This trait provides the minimal surface needed
+/// by the aggregate (just `place_market_order`) with erased error/ID types,
+/// allowing different executor implementations to be used via `Arc<dyn OrderPlacer>`.
+#[async_trait]
+pub(crate) trait OrderPlacer: Send + Sync {
+    async fn place_market_order(
+        &self,
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Bridges `Executor` (which has associated types and is not object-safe)
+/// to `OrderPlacer` (object-safe).
+pub(crate) struct ExecutorOrderPlacer<E>(pub E);
+
+#[async_trait]
+impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
+    async fn place_market_order(
+        &self,
+        order: MarketOrder,
+    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+        let placement = self.0.place_market_order(order).await?;
+        Ok(ExecutorOrderId::new(&placement.order_id.to_string()))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn noop_order_placer() -> Arc<dyn OrderPlacer> {
+    struct Noop;
+
+    #[async_trait]
+    impl OrderPlacer for Noop {
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(ExecutorOrderId::new("noop"))
+        }
+    }
+
+    Arc::new(Noop)
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ExecutionId(pub(crate) i64);
@@ -384,7 +431,7 @@ impl Aggregate for Lifecycle<OffchainOrder> {
     type Command = OffchainOrderCommand;
     type Event = OffchainOrderEvent;
     type Error = OffchainOrderError;
-    type Services = ();
+    type Services = Arc<dyn OrderPlacer>;
 
     fn aggregate_type() -> String {
         "OffchainOrder".to_string()

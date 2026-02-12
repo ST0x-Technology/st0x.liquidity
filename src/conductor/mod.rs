@@ -28,8 +28,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use st0x_dto::ServerMessage;
 use st0x_execution::{
-    EmptySymbolError, Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor,
-    Symbol,
+    Executor, ExecutorOrderId, FractionalShares, MarketOrder, SupportedExecutor, Symbol,
 };
 
 pub(crate) use builder::{ConductorBuilder, CqrsFrameworks};
@@ -43,7 +42,7 @@ use crate::inventory::{
 use crate::offchain::order_poller::OrderStatusPoller;
 use crate::offchain_order::{
     OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderCqrs,
-    OffchainOrderId,
+    OffchainOrderId, OrderPlacer,
 };
 use crate::onchain::accumulator::{
     ExecutionParams, check_all_positions, check_execution_readiness,
@@ -76,26 +75,6 @@ struct TradeProcessingCqrs {
     position_query: Arc<PositionQuery>,
     offchain_order_cqrs: Arc<OffchainOrderCqrs>,
     execution_threshold: ExecutionThreshold,
-}
-
-/// Adapter that bridges the generic Executor trait to the OrderPlacer
-/// trait used by the OffchainOrder aggregate's Services.
-pub(crate) struct ExecutorOrderPlacer<E>(pub E);
-
-#[async_trait::async_trait]
-impl<E: Executor> OrderPlacer for ExecutorOrderPlacer<E> {
-    async fn place_market_order(
-        &self,
-        order: MarketOrder,
-    ) -> Result<ExecutorOrderId, Box<dyn std::error::Error + Send + Sync>> {
-        let mapped_order = MarketOrder {
-            symbol: to_executor_ticker(&order.symbol)?,
-            ..order
-        };
-
-        let placement = self.0.place_market_order(mapped_order).await?;
-        Ok(ExecutorOrderId::new(&placement.order_id.to_string()))
-    }
 }
 
 pub(crate) struct Conductor {
@@ -327,7 +306,7 @@ impl Conductor {
         >::new(
             pool.clone(), "offchain_order_view".to_string()
         ));
-        let order_placer: OffchainOrderServices = Arc::new(ExecutorOrderPlacer(executor.clone()));
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer(executor.clone()));
         let offchain_order_cqrs = Arc::new(sqlite_cqrs(
             pool.clone(),
             vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
@@ -1415,15 +1394,6 @@ where
 }
 
 /// Maps database symbols to current executor-recognized tickers.
-/// Handles corporate actions like SPLG -> SPYM rename (Oct 31, 2025).
-/// Remove once proper tSPYM tokens are issued onchain.
-fn to_executor_ticker(symbol: &Symbol) -> Result<Symbol, EmptySymbolError> {
-    match symbol.to_string().as_str() {
-        "SPLG" => Symbol::new("SPYM"),
-        _ => Ok(symbol.clone()),
-    }
-}
-
 async fn wait_for_first_event_with_timeout<S1, S2>(
     clear_stream: &mut S1,
     take_stream: &mut S2,
@@ -1561,45 +1531,6 @@ mod tests {
         }
     }
 
-    fn create_test_cqrs_frameworks(pool: &SqlitePool) -> CqrsFrameworks {
-        let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
-
-        let position_view_repo = Arc::new(SqliteViewRepository::new(
-            pool.clone(),
-            "position_view".to_string(),
-        ));
-        let position_query = Arc::new(GenericQuery::new(position_view_repo.clone()));
-        let position_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(position_view_repo))],
-            (),
-        ));
-
-        let offchain_order_view_repo = Arc::new(SqliteViewRepository::<
-            OffchainOrderAggregate,
-            OffchainOrderAggregate,
-        >::new(
-            pool.clone(), "offchain_order_view".to_string()
-        ));
-        let offchain_order_cqrs = Arc::new(sqlite_cqrs(
-            pool.clone(),
-            vec![Box::new(GenericQuery::new(offchain_order_view_repo))],
-            crate::offchain_order::noop_order_placer(),
-        ));
-        let vault_registry_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-        let snapshot_cqrs = sqlite_cqrs(pool.clone(), vec![], ());
-
-        CqrsFrameworks {
-            pool: pool.clone(),
-            onchain_trade_cqrs,
-            position_cqrs,
-            position_query,
-            offchain_order_cqrs,
-            vault_registry_cqrs,
-            snapshot_cqrs,
-        }
-    }
-
     fn abort_all_conductor_tasks(conductor: Conductor) {
         conductor.order_poller.abort();
         conductor.event_processor.abort();
@@ -1653,7 +1584,7 @@ mod tests {
         let config = create_test_config();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -1709,7 +1640,7 @@ mod tests {
         let config = create_test_config();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -1763,7 +1694,7 @@ mod tests {
         let config = create_test_config();
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let alice = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
         let bob = create_order_with_usdc_and_equity_vaults(OTHER_OWNER);
@@ -1818,7 +1749,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1847,7 +1778,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1880,7 +1811,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1914,7 +1845,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1945,7 +1876,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -1983,7 +1914,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -2022,7 +1953,7 @@ mod tests {
         let asserter = Asserter::new();
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorConfig.try_into_executor().await.unwrap();
-        let frameworks = create_test_cqrs_frameworks(&pool);
+        let frameworks = create_cqrs_frameworks_with_order_placer(&pool, succeeding_order_placer());
 
         let clear_stream = stream::empty::<Result<(ClearV3, Log), sol_types::Error>>();
         let take_stream = stream::empty::<Result<(TakeOrderV3, Log), sol_types::Error>>();
@@ -2450,20 +2381,6 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[test]
-    fn test_to_executor_ticker_splg_maps_to_spym() {
-        let splg = Symbol::new("SPLG").unwrap();
-        assert_eq!(to_executor_ticker(&splg).unwrap().to_string(), "SPYM");
-    }
-
-    #[test]
-    fn test_to_executor_ticker_other_symbols_unchanged() {
-        for ticker in ["AAPL", "NVDA", "MSTR", "IAU", "COIN"] {
-            let symbol = Symbol::new(ticker).unwrap();
-            assert_eq!(to_executor_ticker(&symbol).unwrap().to_string(), ticker);
-        }
-    }
-
     use crate::bindings::IOrderBookV5::TakeOrderConfigV4;
     use crate::cctp::USDC_BASE;
     use crate::queue::QueuedEvent;
@@ -2764,10 +2681,12 @@ mod tests {
             equity_event.1
         );
     }
+
+    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
         struct TestOrderPlacer;
 
         #[async_trait::async_trait]
-        impl crate::offchain_order::OrderPlacer for TestOrderPlacer {
+        impl OrderPlacer for TestOrderPlacer {
             async fn place_market_order(
                 &self,
                 _order: MarketOrder,
@@ -2781,7 +2700,7 @@ mod tests {
 
     fn create_cqrs_frameworks_with_order_placer(
         pool: &SqlitePool,
-        order_placer: crate::offchain_order::OffchainOrderServices,
+        order_placer: Arc<dyn OrderPlacer>,
     ) -> CqrsFrameworks {
         let onchain_trade_cqrs = Arc::new(sqlite_cqrs(pool.clone(), vec![], ()));
 

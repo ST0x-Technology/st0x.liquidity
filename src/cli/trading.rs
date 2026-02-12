@@ -22,7 +22,7 @@ use super::auth::ensure_schwab_authentication;
 use crate::config::{BrokerCtx, Ctx};
 use crate::lifecycle::Lifecycle;
 use crate::offchain_order::{
-    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OffchainOrderServices, OrderPlacer,
+    OffchainOrder, OffchainOrderAggregate, OffchainOrderCommand, OrderPlacer,
 };
 use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError};
 use crate::onchain::accumulator::check_execution_readiness;
@@ -50,7 +50,7 @@ impl OrderPlacer for CliOrderPlacer {
     }
 }
 
-pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> OffchainOrderServices {
+pub(super) fn create_order_placer(ctx: &Ctx, pool: &SqlitePool) -> Arc<dyn OrderPlacer> {
     Arc::new(CliOrderPlacer {
         ctx: ctx.clone(),
         pool: pool.clone(),
@@ -191,7 +191,7 @@ pub(super) async fn process_tx_with_provider<W: Write, P: Provider + Clone>(
     stdout: &mut W,
     provider: &P,
     cache: &SymbolCache,
-    order_placer: OffchainOrderServices,
+    order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     let evm = &ctx.evm;
     let feed_id_cache = FeedIdCache::new();
@@ -292,7 +292,7 @@ pub(super) async fn process_found_trade<W: Write>(
     ctx: &Ctx,
     pool: &SqlitePool,
     stdout: &mut W,
-    order_placer: OffchainOrderServices,
+    order_placer: Arc<dyn OrderPlacer>,
 ) -> anyhow::Result<()> {
     display_trade_details(&onchain_trade, stdout)?;
 
