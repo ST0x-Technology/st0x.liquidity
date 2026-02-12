@@ -120,14 +120,14 @@ impl Executor for AlpacaBrokerApi {
 
         if asset.status != AssetStatus::Active {
             return Err(AlpacaBrokerApiError::AssetNotActive {
-                symbol: order.symbol.to_string(),
+                symbol: order.symbol,
                 status: asset.status,
             });
         }
 
         if !asset.tradable {
             return Err(AlpacaBrokerApiError::AssetNotTradable {
-                symbol: order.symbol.to_string(),
+                symbol: order.symbol,
             });
         }
 
@@ -590,7 +590,9 @@ mod tests {
 
         let result = executor.get_inventory().await.unwrap();
 
-        account_mock.assert();
+        // Account endpoint is hit twice: once during try_from_ctx (verify_account)
+        // and once during get_inventory (get_account_details for cash balance)
+        account_mock.assert_hits(2);
         positions_mock.assert();
         assert!(matches!(result, crate::InventoryResult::Fetched(_)));
     }
@@ -656,7 +658,7 @@ mod tests {
             matches!(
                 &err,
                 AlpacaBrokerApiError::AssetNotActive { symbol, status }
-                    if symbol == "AAPL" && *status == AssetStatus::Inactive
+                    if *symbol == Symbol::new("AAPL").unwrap() && *status == AssetStatus::Inactive
             ),
             "Expected AssetNotActive error, got: {err:?}"
         );
@@ -686,7 +688,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                AlpacaBrokerApiError::AssetNotTradable { symbol } if symbol == "AAPL"
+                AlpacaBrokerApiError::AssetNotTradable { symbol } if *symbol == Symbol::new("AAPL").unwrap()
             ),
             "Expected AssetNotTradable error, got: {err:?}"
         );

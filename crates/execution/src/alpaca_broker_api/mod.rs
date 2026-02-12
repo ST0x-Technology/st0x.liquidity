@@ -1,9 +1,8 @@
-use std::fmt;
-use std::str::FromStr;
-
 use chrono::{NaiveDate, NaiveTime};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::fmt;
+use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -132,10 +131,10 @@ pub enum AlpacaBrokerApiError {
     CalendarIterationInvariantViolation,
 
     #[error("Asset {symbol} is not active (status: {status:?})")]
-    AssetNotActive { symbol: String, status: AssetStatus },
+    AssetNotActive { symbol: Symbol, status: AssetStatus },
 
     #[error("Asset {symbol} is not tradable on Alpaca")]
-    AssetNotTradable { symbol: String },
+    AssetNotTradable { symbol: Symbol },
 
     #[error("Cash balance {0} cannot be converted to cents")]
     CashBalanceConversion(Decimal),
